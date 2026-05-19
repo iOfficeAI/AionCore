@@ -329,6 +329,123 @@ mod tests {
     }
 
     #[test]
+    fn codex_image_tool_update_omits_base64_result() {
+        let large_png_base64 = format!("iVBORw0KGgo{}", "A".repeat(128 * 1024));
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "ig_test_image",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "call_id": "ig_test_image",
+                        "status": "generating",
+                        "saved_path": "/Users/test/.codex/generated_images/session/ig_test_image.png",
+                        "revised_prompt": "一只小猫",
+                        "result": large_png_base64
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+        let raw_output = &json["data"]["update"]["rawOutput"];
+
+        assert_eq!(
+            raw_output["saved_path"],
+            "/Users/test/.codex/generated_images/session/ig_test_image.png"
+        );
+        assert_eq!(
+            raw_output["image"]["path"],
+            "/Users/test/.codex/generated_images/session/ig_test_image.png"
+        );
+        assert_eq!(raw_output["result_omitted"], true);
+        assert!(raw_output.get("result").is_none());
+    }
+
+    #[test]
+    fn codex_image_tool_update_with_saved_path_is_completed() {
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "ig_done_image",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "call_id": "ig_done_image",
+                        "status": "generating",
+                        "saved_path": "/Users/test/.codex/generated_images/session/ig_done_image.png",
+                        "result": format!("iVBORw0KGgo{}", "A".repeat(128 * 1024))
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+
+        assert_eq!(json["data"]["update"]["status"], "completed");
+        assert_eq!(json["data"]["update"]["rawOutput"]["status"], "completed");
+    }
+
+    #[test]
+    fn codex_image_tool_update_keeps_small_text_result_in_progress() {
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "small-result",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "status": "generating",
+                        "saved_path": "/tmp/result.txt",
+                        "result": "not an inline image"
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        let json = serde_json::to_value(&events[0]).unwrap();
+        let raw_output = &json["data"]["update"]["rawOutput"];
+
+        assert_eq!(json["data"]["update"]["status"], "in_progress");
+        assert_eq!(raw_output["result"], "not an inline image");
+        assert!(raw_output.get("image").is_none());
+        assert!(raw_output.get("result_omitted").is_none());
+    }
+
+    #[test]
+    fn codex_image_tool_update_detects_image_mime_types_from_saved_path() {
+        let cases = [
+            ("photo.jpg", "image/jpeg", "/9j/"),
+            ("photo.webp", "image/webp", "UklGR"),
+            ("photo.gif", "image/gif", "data:image/gif;base64,"),
+            ("photo.bin", "image/png", "iVBORw0KGgo"),
+        ];
+
+        for (file_name, expected_mime, prefix) in cases {
+            let saved_path = format!("/Users/test/.codex/generated_images/session/{file_name}");
+            let notif = SessionNotification::new(
+                "sess-1",
+                SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                    "ig_mime",
+                    ToolCallUpdateFields::new().raw_output(json!({
+                        "saved_path": saved_path,
+                        "result": format!("{prefix}{}", "A".repeat(128 * 1024))
+                    })),
+                )),
+            );
+
+            let events = session_notification_to_events(&notif);
+            let json = serde_json::to_value(&events[0]).unwrap();
+
+            assert_eq!(json["data"]["update"]["rawOutput"]["image"]["mime_type"], expected_mime);
+            assert!(json["data"]["update"]["rawOutput"].get("result").is_none());
+        }
+    }
+
+    #[test]
     fn permission_request_maps_to_snake_case_event_data() {
         let request = RequestPermissionRequest::new(
             "sess-1",
