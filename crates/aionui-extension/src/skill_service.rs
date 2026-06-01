@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use include_dir::{Dir, include_dir};
 use tracing::{debug, warn};
@@ -453,6 +455,95 @@ pub async fn import_skill_with_symlink(paths: &SkillPaths, skill_path: &Path) ->
 
     debug!(skill = %name, link = %target_link.display(), "skill imported (symlink)");
     Ok(name)
+}
+
+/// Import one skill, a parent directory containing skills, or a zip archive.
+///
+/// Directory inputs preserve the existing symlink behavior. Zip inputs are
+/// extracted into an internal temporary directory, then copied into the user
+/// skills directory so imported skills do not point at disposable files.
+pub async fn import_skills_with_symlink(paths: &SkillPaths, source_path: &Path) -> Result<Vec<String>, ExtensionError> {
+    if is_zip_path(source_path) {
+        return import_skills_from_zip(paths, source_path).await;
+    }
+
+    if source_path.is_dir() {
+        if source_path.join(SKILL_MANIFEST_FILE).exists() {
+            return Ok(vec![import_skill_with_symlink(paths, source_path).await?]);
+        }
+
+        let skills = scan_skill_dirs(source_path).await?;
+        if skills.is_empty() {
+            return Err(ExtensionError::InvalidSkillPath(format!(
+                "No skill directories found in {}",
+                source_path.display()
+            )));
+        }
+
+        let mut imported = Vec::new();
+        for skill in skills {
+            imported.push(import_skill_with_symlink(paths, Path::new(&skill.path)).await?);
+        }
+        imported.sort();
+        imported.dedup();
+        return Ok(imported);
+    }
+
+    Ok(vec![import_skill_with_symlink(paths, source_path).await?])
+}
+
+async fn import_skills_from_zip(paths: &SkillPaths, archive_path: &Path) -> Result<Vec<String>, ExtensionError> {
+    let temp_root = paths.user_skills_dir.join(".import-tmp");
+    tokio::fs::create_dir_all(&temp_root).await?;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let extract_dir = temp_root.join(format!("skills-{}-{nonce}", std::process::id()));
+    tokio::fs::create_dir_all(&extract_dir).await?;
+
+    let archive = archive_path.to_path_buf();
+    let destination = extract_dir.clone();
+    let extraction = tokio::task::spawn_blocking(move || extract_zip_archive(&archive, &destination))
+        .await
+        .map_err(|e| ExtensionError::InvalidSkillPath(format!("Zip extraction task failed: {e}")))?;
+
+    if let Err(err) = extraction {
+        let _ = tokio::fs::remove_dir_all(&extract_dir).await;
+        let _ = tokio::fs::remove_dir(&temp_root).await;
+        return Err(err);
+    }
+
+    let result = async {
+        let mut skill_dirs = Vec::new();
+        collect_skill_dirs_recursive(&extract_dir, &mut skill_dirs).await?;
+        if skill_dirs.is_empty() {
+            return Err(ExtensionError::InvalidSkillPath(format!(
+                "No skill directories found in {}",
+                archive_path.display()
+            )));
+        }
+
+        let mut imported = Vec::new();
+        for skill_dir in skill_dirs {
+            imported.push(import_skill(paths, &skill_dir).await?);
+        }
+        imported.sort();
+        imported.dedup();
+        Ok(imported)
+    }
+    .await;
+
+    let _ = tokio::fs::remove_dir_all(&extract_dir).await;
+    let _ = tokio::fs::remove_dir(&temp_root).await;
+    result
+}
+
+fn is_zip_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
 }
 
 /// Export a skill by creating a symlink in the target directory.
@@ -969,6 +1060,94 @@ async fn scan_skill_dirs(dir: &Path) -> Result<Vec<ScannedSkill>, ExtensionError
     Ok(result)
 }
 
+async fn collect_skill_dirs_recursive(dir: &Path, result: &mut Vec<PathBuf>) -> Result<(), ExtensionError> {
+    if dir.join(SKILL_MANIFEST_FILE).exists() {
+        result.push(dir.to_path_buf());
+        return Ok(());
+    }
+
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(ExtensionError::Io(e)),
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            Box::pin(collect_skill_dirs_recursive(&entry_path, result)).await?;
+        }
+    }
+
+    result.sort();
+    Ok(())
+}
+
+fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), ExtensionError> {
+    let file = std::fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(zip_error)?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(zip_error)?;
+        let entry_name = entry.name().to_string();
+        reject_zip_symlink(&entry)?;
+        let relative_path = safe_zip_entry_path(&entry_name)?;
+        let output_path = destination.join(relative_path);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&output_path)?;
+            continue;
+        }
+
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut output = std::fs::File::create(&output_path)?;
+        io::copy(&mut entry, &mut output)?;
+    }
+
+    Ok(())
+}
+
+fn safe_zip_entry_path(name: &str) -> Result<PathBuf, ExtensionError> {
+    if name.is_empty() || name.contains('\\') {
+        return Err(ExtensionError::PathTraversal(name.to_string()));
+    }
+
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return Err(ExtensionError::PathTraversal(name.to_string()));
+    }
+
+    let mut safe_path = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => safe_path.push(part),
+            Component::CurDir => {}
+            _ => return Err(ExtensionError::PathTraversal(name.to_string())),
+        }
+    }
+
+    if safe_path.as_os_str().is_empty() {
+        return Err(ExtensionError::PathTraversal(name.to_string()));
+    }
+
+    Ok(safe_path)
+}
+
+fn reject_zip_symlink(entry: &zip::read::ZipFile<'_>) -> Result<(), ExtensionError> {
+    if let Some(mode) = entry.unix_mode()
+        && mode & 0o170000 == 0o120000
+    {
+        return Err(ExtensionError::PathTraversal(entry.name().to_string()));
+    }
+    Ok(())
+}
+
+fn zip_error(err: zip::result::ZipError) -> ExtensionError {
+    ExtensionError::InvalidSkillPath(format!("Invalid zip archive: {err}"))
+}
+
 /// Parse SKILL.md frontmatter to extract name and description.
 ///
 /// Expected format:
@@ -1160,6 +1339,7 @@ async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::TempDir;
 
     // -----------------------------------------------------------------------
@@ -1584,6 +1764,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_skills_with_symlink_imports_parent_directory_children() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+
+        let source_dir = tmp.path().join("skill-pack");
+        create_skill_in_dir(&source_dir, "alpha", "Alpha skill");
+        create_skill_in_dir(&source_dir, "beta", "Beta skill");
+
+        let names = import_skills_with_symlink(&paths, &source_dir).await.unwrap();
+        assert_eq!(names, vec!["alpha", "beta"]);
+        assert!(paths.user_skills_dir.join("alpha").is_symlink());
+        assert!(paths.user_skills_dir.join("beta").is_symlink());
+    }
+
+    #[tokio::test]
+    async fn import_skills_with_symlink_imports_zip_package() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+        let zip_path = tmp.path().join("skills.zip");
+
+        write_test_zip(
+            &zip_path,
+            &[
+                (
+                    "bundle/zip-one/SKILL.md",
+                    "---\nname: zip-one\ndescription: First zipped skill\n---\nBody",
+                ),
+                ("bundle/zip-one/data.txt", "payload"),
+                (
+                    "bundle/zip-two/SKILL.md",
+                    "---\nname: zip-two\ndescription: Second zipped skill\n---\nBody",
+                ),
+            ],
+        );
+
+        let names = import_skills_with_symlink(&paths, &zip_path).await.unwrap();
+        assert_eq!(names, vec!["zip-one", "zip-two"]);
+        assert!(paths.user_skills_dir.join("zip-one").join(SKILL_MANIFEST_FILE).exists());
+        assert!(paths.user_skills_dir.join("zip-one").join("data.txt").exists());
+        assert!(!paths.user_skills_dir.join("zip-one").is_symlink());
+        assert!(!paths.user_skills_dir.join(".import-tmp").join("skills.zip").exists());
+    }
+
+    #[tokio::test]
+    async fn import_skills_with_symlink_rejects_zip_slip_entries() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+        let zip_path = tmp.path().join("evil.zip");
+
+        write_test_zip(&zip_path, &[("../escape.txt", "outside")]);
+
+        let result = import_skills_with_symlink(&paths, &zip_path).await;
+        assert!(matches!(result, Err(ExtensionError::PathTraversal(_))));
+        assert!(!tmp.path().join("escape.txt").exists());
+    }
+
+    #[tokio::test]
     async fn import_skill_rejects_traversal_name() {
         let tmp = TempDir::new().unwrap();
         let paths = make_test_paths(tmp.path());
@@ -1760,6 +1997,19 @@ mod tests {
             format!("---\nname: {name}\ndescription: {description}\n---\nBody content for {name}."),
         )
         .unwrap();
+    }
+
+    fn write_test_zip(path: &Path, entries: &[(&str, &str)]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+
+        for (name, content) in entries {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+
+        zip.finish().unwrap();
     }
 
     // -----------------------------------------------------------------------

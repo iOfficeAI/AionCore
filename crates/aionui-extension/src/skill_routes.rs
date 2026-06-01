@@ -162,7 +162,10 @@ async fn import_skill(
 ) -> Result<Json<ApiResponse<ImportSkillResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let name = skill_service::import_skill(&state.skill_paths, Path::new(&req.skill_path)).await?;
-    Ok(Json(ApiResponse::ok(ImportSkillResponse { skill_name: name })))
+    Ok(Json(ApiResponse::ok(ImportSkillResponse {
+        skill_name: name.clone(),
+        skill_names: vec![name],
+    })))
 }
 
 /// `POST /api/skills/import-symlink` — import a skill by symlink.
@@ -171,8 +174,12 @@ async fn import_skill_symlink(
     body: Result<Json<ImportSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportSkillResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let name = skill_service::import_skill_with_symlink(&state.skill_paths, Path::new(&req.skill_path)).await?;
-    Ok(Json(ApiResponse::ok(ImportSkillResponse { skill_name: name })))
+    let names = skill_service::import_skills_with_symlink(&state.skill_paths, Path::new(&req.skill_path)).await?;
+    let first_name = names.first().cloned().unwrap_or_default();
+    Ok(Json(ApiResponse::ok(ImportSkillResponse {
+        skill_name: first_name,
+        skill_names: names,
+    })))
 }
 
 /// `POST /api/skills/export-symlink` — export a skill symlink.

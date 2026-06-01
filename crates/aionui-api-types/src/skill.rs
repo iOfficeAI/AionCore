@@ -73,6 +73,8 @@ pub struct ImportSkillRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImportSkillResponse {
     pub skill_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_names: Vec<String>,
 }
 
 /// Request body for `POST /api/skills/export-symlink`.
@@ -405,9 +407,11 @@ mod tests {
     fn test_import_skill_response() {
         let resp = ImportSkillResponse {
             skill_name: "imported-skill".into(),
+            skill_names: vec!["imported-skill".into(), "second-skill".into()],
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["skill_name"], "imported-skill");
+        assert_eq!(json["skill_names"], json!(["imported-skill", "second-skill"]));
         assert!(json.get("skillName").is_none());
     }
 
