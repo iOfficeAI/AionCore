@@ -337,6 +337,14 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
             AgentErrorResolutionKind::CheckAgentInstallation,
         ));
     }
+    if lower.contains("process exited with code") {
+        return Some(agent_error(
+            "The selected Agent process exited unexpectedly",
+            AgentErrorCode::UserAgentDisconnected,
+            true,
+            AgentErrorResolutionKind::ReconnectAgent,
+        ));
+    }
     if lower.contains("initialize handshake timed out") {
         return Some(agent_error(
             "The selected Agent did not finish starting in time",
@@ -885,6 +893,25 @@ mod tests {
             AgentErrorOwnership::UserAgent,
             AgentErrorResolutionKind::ReconnectAgent,
         );
+    }
+
+    #[test]
+    fn classifies_mid_session_cli_exit_as_agent_disconnected() {
+        // Mid-session ACP CLI exit (e.g. Claude Code) surfaces as -32603 with
+        // `details: "Claude Code process exited with code 1"`. Previously this
+        // fell through to UNKNOWN_UPSTREAM_ERROR; it now maps to a retryable
+        // agent disconnect.
+        assert_classification(
+            "Agent internal error (code -32603) ({\"details\":\"Claude Code process exited with code 1\"})",
+            AgentErrorCode::UserAgentDisconnected,
+            AgentErrorOwnership::UserAgent,
+            AgentErrorResolutionKind::ReconnectAgent,
+        );
+        let err = AgentSendError::from_app_error(AppError::BadGateway(
+            "Agent internal error (code -32603) ({\"details\":\"Claude Code process exited with code 1\"})".into(),
+        ));
+        assert_eq!(err.stream_error().retryable, Some(true));
+        assert_eq!(err.stream_error().feedback_recommended, Some(false));
     }
 
     #[test]
