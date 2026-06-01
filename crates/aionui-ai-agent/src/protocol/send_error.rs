@@ -403,7 +403,17 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
 }
 
 fn classify_provider_api(lower: &str) -> Option<ClassifiedError> {
-    if contains_any(lower, &["402", "insufficient balance"]) {
+    if contains_any(
+        lower,
+        &[
+            "402",
+            "insufficient balance",
+            "credit balance is too low",
+            "purchase credits",
+            "plans & billing",
+            "plans and billing",
+        ],
+    ) {
         return Some(provider_error(
             "The model provider account requires billing attention",
             AgentErrorCode::UserLlmProviderBillingRequired,
@@ -966,6 +976,12 @@ mod tests {
     fn classifies_provider_billing_auth_and_rate_limit() {
         assert_classification(
             "Aionrs agent error: Provider error: API error 402: {\"error\":{\"message\":\"Insufficient Balance\"}}",
+            AgentErrorCode::UserLlmProviderBillingRequired,
+            AgentErrorOwnership::UserLlmProvider,
+            AgentErrorResolutionKind::CheckProviderBilling,
+        );
+        assert_classification(
+            "Aionrs agent error: Provider error: API error 400: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.\"}}",
             AgentErrorCode::UserLlmProviderBillingRequired,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::CheckProviderBilling,
