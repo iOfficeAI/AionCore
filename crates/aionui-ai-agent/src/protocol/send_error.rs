@@ -529,9 +529,7 @@ fn classify_provider_api(lower: &str) -> Option<ClassifiedError> {
             Some(AgentErrorResolutionTarget::ProviderSettings),
         ));
     }
-    if (lower.contains("404") || lower.contains("not found"))
-        && contains_any(lower, &["/chat/completions", "\"path\"", "endpoint", "base url"])
-    {
+    if lower.contains("404") || lower.contains("not found") {
         return Some(provider_error(
             "The model provider endpoint was not found",
             AgentErrorCode::UserLlmProviderEndpointNotFound,
@@ -1117,6 +1115,20 @@ mod tests {
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::Retry,
         );
+    }
+
+    #[test]
+    fn classifies_bare_provider_404_as_endpoint_not_found() {
+        let detail = "Aionrs agent error: Provider error: API error 404: {\"detail\":\"Not Found\"}";
+        assert_classification(
+            detail,
+            AgentErrorCode::UserLlmProviderEndpointNotFound,
+            AgentErrorOwnership::UserLlmProvider,
+            AgentErrorResolutionKind::CheckProviderBaseUrl,
+        );
+        assert_resolution_target(detail, AgentErrorResolutionTarget::ProviderSettings);
+        let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
+        assert_eq!(err.stream_error().retryable, Some(false));
     }
 
     #[test]
