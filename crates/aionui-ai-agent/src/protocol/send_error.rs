@@ -529,6 +529,7 @@ fn classify_provider_api(lower: &str) -> Option<ClassifiedError> {
             "unknown model",
             "invalid model",
             "model_not_found",
+            "model identifier is invalid",
         ],
     ) {
         return Some(provider_error(
@@ -1055,6 +1056,20 @@ mod tests {
             AgentErrorCode::UserLlmProviderModelNotFound,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::ChangeModel,
+        );
+    }
+
+    #[test]
+    fn classifies_bedrock_invalid_model_identifier_as_model_not_found() {
+        assert_classification(
+            "Aionrs agent error: Provider error: API error 400: {\"message\":\"The provided model identifier is invalid.\"}",
+            AgentErrorCode::UserLlmProviderModelNotFound,
+            AgentErrorOwnership::UserLlmProvider,
+            AgentErrorResolutionKind::ChangeModel,
+        );
+        assert_resolution_target(
+            "Aionrs agent error: Provider error: API error 400: {\"message\":\"The provided model identifier is invalid.\"}",
+            AgentErrorResolutionTarget::ProviderSettings,
         );
     }
 
