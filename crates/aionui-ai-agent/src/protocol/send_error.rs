@@ -726,19 +726,43 @@ fn strip_error_prefix(message: &str) -> String {
 }
 
 pub(crate) fn sanitize_error_detail(input: &str) -> String {
-    let without_query = redact_url_queries(input);
-    let mut out = String::new();
-    for line in without_query.lines() {
-        if is_sensitive_header_line(line) {
-            push_bounded_line(&mut out, "<redacted header>");
-        } else {
-            push_bounded_line(&mut out, &redact_secret_words(line));
+    let stripped = strip_markup(input);
+    let without_query = redact_url_queries(&stripped);
+    let redacted = redact_lines(&without_query);
+    truncate_chars(redacted.trim(), MAX_DETAIL_CHARS)
+}
+
+fn strip_markup(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match (ch, in_tag) {
+            ('<', _) => in_tag = true,
+            ('>', true) => {
+                in_tag = false;
+                out.push(' ');
+            }
+            (c, false) => out.push(c),
+            _ => {}
         }
+    }
+    out
+}
+
+fn redact_lines(input: &str) -> String {
+    let mut out = String::new();
+    for line in input.lines() {
+        let cleaned = if is_sensitive_header_line(line) {
+            "<redacted header>".to_owned()
+        } else {
+            redact_secret_words(line)
+        };
+        push_bounded_line(&mut out, &cleaned);
         if out.chars().count() >= MAX_DETAIL_CHARS {
             break;
         }
     }
-    truncate_chars(out.trim(), MAX_DETAIL_CHARS)
+    out
 }
 
 fn push_bounded_line(out: &mut String, line: &str) {
@@ -886,6 +910,52 @@ mod tests {
             redact_url_queries("GET https://example.com/v1?api_key=sk-secret"),
             "GET https://example.com/v1?<redacted>"
         );
+    }
+
+    #[test]
+    fn strip_markup_removes_html_tags_keeping_visible_text() {
+        let detail = sanitize_error_detail(
+            "Provider error: API error 504: <html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body><center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>openresty</center></body></html>",
+        );
+
+        assert!(!detail.contains('<'));
+        assert!(!detail.contains('>'));
+        assert!(detail.contains("504 Gateway Time-out"));
+        assert!(detail.contains("openresty"));
+        assert!(detail.starts_with("Provider error: API error 504:"));
+    }
+
+    #[test]
+    fn strip_markup_is_identity_for_plain_text() {
+        let detail = sanitize_error_detail("Provider error: API error 504: error code: 524");
+
+        assert_eq!(detail, "Provider error: API error 504: error code: 524");
+    }
+
+    #[test]
+    fn redaction_runs_after_strip_markup() {
+        let detail = sanitize_error_detail(
+            "<html><body>Authorization: Bearer sk-secret\nGET https://example.com/v1?api_key=sk-secret</body></html>",
+        );
+
+        assert!(!detail.contains("sk-secret"));
+        assert!(!detail.contains("api_key=sk"));
+        assert!(detail.contains("<redacted header>"));
+        assert!(!detail.contains("<html"));
+        assert!(!detail.contains("</body>"));
+    }
+
+    #[test]
+    fn classifies_provider_504_html_body_as_timeout_with_stripped_detail() {
+        let raw = "Aionrs agent error: Provider error: API error 504: <html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>openresty</center>\r\n</body>\r\n</html>";
+        let err = AgentSendError::from_app_error(AppError::BadGateway(raw.into()));
+
+        assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderTimeout));
+        let detail = err.stream_error().detail.clone().expect("detail present");
+        assert!(!detail.contains('<'));
+        assert!(!detail.contains('>'));
+        assert!(detail.chars().count() <= MAX_DETAIL_CHARS);
+        assert!(detail.contains("504 Gateway Time-out"));
     }
 
     #[test]
