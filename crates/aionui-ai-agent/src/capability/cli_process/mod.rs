@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,7 +8,7 @@ use aionui_common::AppError;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, broadcast, watch};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 mod spawn_legacy;
 mod spawn_sdk;
@@ -23,6 +25,49 @@ pub(super) const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Maximum stderr ring-buffer size in bytes.
 pub(super) const STDERR_BUFFER_MAX: usize = 8192;
+
+pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AppError> {
+    let trimmed = cwd.trim_end();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest("Workspace directory is empty".into()));
+    }
+
+    if trimmed != cwd {
+        warn!(
+            original_cwd = %cwd,
+            normalized_cwd = %trimmed,
+            "Normalized CLI process cwd by trimming trailing whitespace"
+        );
+    }
+
+    let path = PathBuf::from(trimmed);
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => Ok(path),
+        Ok(_) => Err(AppError::BadRequest(format!(
+            "Workspace path is not a directory: {}",
+            path.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&path).map_err(|create_err| {
+                AppError::BadRequest(format!(
+                    "Workspace directory no longer exists and could not be recreated: {}: {}",
+                    path.display(),
+                    create_err
+                ))
+            })?;
+            info!(
+                cwd = %path.display(),
+                "Recreated missing workspace directory before spawning CLI process"
+            );
+            Ok(path)
+        }
+        Err(e) => Err(AppError::BadRequest(format!(
+            "Workspace directory is not accessible: {}: {}",
+            path.display(),
+            e
+        ))),
+    }
+}
 
 /// Manages a CLI subprocess with optional JSON-over-stdin/stdout communication.
 ///
@@ -346,6 +391,51 @@ pub(super) mod tests {
             .expect("Timed out")
             .expect("Channel closed");
         assert_eq!(event["val"], "hello_env");
+    }
+
+    #[tokio::test]
+    async fn spawn_recreates_missing_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_cwd = dir.path().join("missing").join("workspace");
+        assert!(!missing_cwd.exists());
+
+        let config = CommandSpec {
+            command: "sh".into(),
+            args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
+            env: vec![],
+            cwd: Some(missing_cwd.to_string_lossy().into_owned()),
+        };
+        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let mut rx = proc.subscribe();
+
+        let event = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("Timed out")
+            .expect("Channel closed");
+        assert!(missing_cwd.is_dir());
+        assert_eq!(
+            fs::canonicalize(event["cwd"].as_str().unwrap()).unwrap(),
+            fs::canonicalize(&missing_cwd).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_for_sdk_recreates_missing_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let missing_cwd = dir.path().join("missing-sdk").join("workspace");
+        assert!(!missing_cwd.exists());
+
+        let config = CommandSpec {
+            command: "sh".into(),
+            args: vec!["-c".into(), "sleep 10".into()],
+            env: vec![],
+            cwd: Some(missing_cwd.to_string_lossy().into_owned()),
+        };
+        let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
+
+        assert!(missing_cwd.is_dir());
+        proc.kill(Duration::from_millis(100)).await.unwrap();
     }
 
     #[tokio::test]

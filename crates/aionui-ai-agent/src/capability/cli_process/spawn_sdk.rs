@@ -7,7 +7,9 @@ use tokio::process::Child;
 use tokio::sync::{Mutex, broadcast, watch};
 use tracing::{debug, error, info, warn};
 
-use super::{CliAgentProcess, EVENT_CHANNEL_CAPACITY, STDERR_BUFFER_MAX, tracked_process_group_id};
+use super::{
+    CliAgentProcess, EVENT_CHANNEL_CAPACITY, STDERR_BUFFER_MAX, prepare_command_cwd, tracked_process_group_id,
+};
 
 impl CliAgentProcess {
     /// Spawn a new CLI subprocess in **SDK mode**.
@@ -34,7 +36,7 @@ impl CliAgentProcess {
             .stderr(std::process::Stdio::piped());
 
         if let Some(ref cwd) = config.cwd {
-            cmd.current_dir(cwd);
+            cmd.current_dir(prepare_command_cwd(cwd)?);
         }
         let preview = cmd.to_string();
         info!(command = %preview, "Spawning CLI process (SDK mode)");
