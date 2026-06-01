@@ -9,7 +9,7 @@ use aionui_ai_agent::{
 };
 
 use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResult};
-use aionui_api_types::WebSocketMessage;
+use aionui_api_types::{ConversationRuntimeSummary, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
 use crate::service::ConversationService;
@@ -870,6 +870,16 @@ impl StreamRelay {
         broadcaster: &Arc<dyn EventBroadcaster>,
         conversation_id: &str,
     ) {
+        Self::complete_conversation_with_runtime(repo, broadcaster, conversation_id, None).await;
+    }
+
+    #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
+    pub async fn complete_conversation_with_runtime(
+        repo: &Arc<dyn IConversationRepository>,
+        broadcaster: &Arc<dyn EventBroadcaster>,
+        conversation_id: &str,
+        runtime: Option<ConversationRuntimeSummary>,
+    ) {
         let update = aionui_db::ConversationRowUpdate {
             status: Some("finished".to_owned()),
             updated_at: Some(now_ms()),
@@ -884,6 +894,7 @@ impl StreamRelay {
             "session_id": conversation_id,
             "status": "finished",
             "canSendMessage": true,
+            "runtime": runtime,
         });
         let msg = WebSocketMessage::new("turn.completed", payload);
         broadcaster.broadcast(msg);

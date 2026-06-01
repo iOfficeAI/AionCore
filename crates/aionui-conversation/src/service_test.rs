@@ -636,6 +636,29 @@ async fn get_existing_conversation() {
     let fetched = svc.get("user_1", &created.id).await.unwrap();
     assert_eq!(fetched.id, created.id);
     assert_eq!(fetched.name, created.name);
+    assert!(fetched.runtime.is_some());
+}
+
+#[tokio::test]
+async fn get_reports_idle_runtime_when_only_persisted_status_is_running() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let created = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.update(
+        &created.id,
+        &ConversationRowUpdate {
+            status: Some("running".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let fetched = svc.get("user_1", &created.id).await.unwrap();
+    let runtime = fetched.runtime.expect("runtime summary should be present");
+
+    assert_eq!(fetched.status, ConversationStatus::Running);
+    assert_eq!(runtime.state, aionui_api_types::ConversationRuntimeStateKind::Idle);
+    assert!(runtime.can_send_message);
 }
 
 #[tokio::test]
@@ -1630,7 +1653,11 @@ async fn send_message_returns_before_cold_agent_build_completes() {
     );
 
     let updated = repo.get(&conv.id).await.unwrap().unwrap();
-    assert_eq!(updated.status.as_deref(), Some("running"));
+    assert_ne!(updated.status.as_deref(), Some("running"));
+    assert!(
+        svc.runtime_state().is_claimed(&conv.id),
+        "runtime claim must cover the cold agent build window"
+    );
 }
 
 #[tokio::test]
@@ -1710,6 +1737,10 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
 
     let updated = repo.get(&conv.id).await.unwrap().unwrap();
     assert_eq!(updated.status.as_deref(), Some("finished"));
+    assert!(
+        !svc.runtime_state().is_claimed(&conv.id),
+        "runtime claim must be released after failed turn"
+    );
 
     let events = broadcaster.take_events();
     let error_tip_event = events
@@ -1776,7 +1807,7 @@ async fn send_message_wrong_user_returns_not_found() {
 }
 
 #[tokio::test]
-async fn send_message_running_conversation_returns_conflict() {
+async fn send_message_allows_stale_db_running_without_runtime_claim() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
@@ -1788,6 +1819,21 @@ async fn send_message_running_conversation_returns_conflict() {
         ..Default::default()
     };
     repo.update(&conv.id, &update).await.unwrap();
+
+    let result = svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr).await;
+    assert!(result.is_ok(), "stale DB running must not block sending");
+}
+
+#[tokio::test]
+async fn send_message_rejects_active_runtime_claim() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id)
+        .expect("test claim should be created");
 
     let err = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
@@ -1901,8 +1947,10 @@ async fn send_message_continues_cron_system_responses() {
     assert_eq!(finished.status, ConversationStatus::Finished);
 
     let events = broadcaster.take_events();
-    let turn_completed = events.iter().filter(|evt| evt.name == "turn.completed").count();
-    assert_eq!(turn_completed, 1);
+    let turn_events: Vec<_> = events.iter().filter(|evt| evt.name == "turn.completed").collect();
+    assert_eq!(turn_events.len(), 1);
+    assert_eq!(turn_events[0].data["runtime"]["is_processing"], false);
+    assert_eq!(turn_events[0].data["runtime"]["can_send_message"], true);
 }
 
 // ── stop_stream tests ───────────────────────────────────────────

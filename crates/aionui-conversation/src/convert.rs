@@ -65,6 +65,7 @@ pub fn row_to_response_with_extra(
         r#type: agent_type,
         model,
         status,
+        runtime: None,
         source,
         pinned: row.pinned,
         pinned_at: row.pinned_at,

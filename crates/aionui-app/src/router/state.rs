@@ -254,7 +254,8 @@ pub fn build_conversation_state(
         conversaion_repo,
         agent_metadata_repo,
         acp_session_repo,
-    );
+    )
+    .with_runtime_state(services.conversation_runtime_state.clone());
     conversation_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
     )));
@@ -390,15 +391,18 @@ pub async fn build_channel_state(
     let acp_session_repo: Arc<dyn aionui_db::IAcpSessionRepository> = Arc::new(
         aionui_db::SqliteAcpSessionRepository::new(services.database.pool().clone()),
     );
-    let conversation_svc = Arc::new(ConversationService::new(
-        services.work_dir.clone(),
-        services.event_bus.clone(),
-        skill_resolver,
-        services.worker_task_manager.clone(),
-        conv_repo,
-        agent_metadata_repo,
-        acp_session_repo,
-    ));
+    let conversation_svc = Arc::new(
+        ConversationService::new(
+            services.work_dir.clone(),
+            services.event_bus.clone(),
+            skill_resolver,
+            services.worker_task_manager.clone(),
+            conv_repo,
+            agent_metadata_repo,
+            acp_session_repo,
+        )
+        .with_runtime_state(services.conversation_runtime_state.clone()),
+    );
     conversation_svc.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
     )));
@@ -479,7 +483,8 @@ pub fn build_team_state(
         conv_repo,
         agent_metadata_repo,
         acp_session_repo,
-    );
+    )
+    .with_runtime_state(services.conversation_runtime_state.clone());
     conv_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
     )));
@@ -524,7 +529,8 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         conv_repo.clone(),
         agent_metadata_repo,
         acp_session_repo,
-    );
+    )
+    .with_runtime_state(services.conversation_runtime_state.clone());
     conv_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
     )));

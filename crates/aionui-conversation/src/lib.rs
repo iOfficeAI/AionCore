@@ -4,6 +4,7 @@ mod message_persistence;
 pub mod response_middleware;
 pub mod routes;
 pub mod routes_aux;
+pub mod runtime_state;
 pub mod service;
 mod service_ops;
 pub mod skill_resolver;

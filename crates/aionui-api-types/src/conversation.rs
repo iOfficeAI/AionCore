@@ -78,6 +78,25 @@ pub struct SendMessageResponse {
     pub msg_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationRuntimeStateKind {
+    Idle,
+    Starting,
+    Running,
+    WaitingConfirmation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationRuntimeSummary {
+    pub state: ConversationRuntimeStateKind,
+    pub can_send_message: bool,
+    pub has_task: bool,
+    pub task_status: Option<ConversationStatus>,
+    pub is_processing: bool,
+    pub pending_confirmations: usize,
+}
+
 // ── Query types ────────────────────────────────────────────────────
 
 /// Query parameters for `GET /api/conversations`.
@@ -135,6 +154,8 @@ pub struct ConversationResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ProviderWithModel>,
     pub status: ConversationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<ConversationRuntimeSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ConversationSource>,
     pub pinned: bool,
@@ -441,6 +462,7 @@ mod tests {
                 use_model: None,
             }),
             status: ConversationStatus::Pending,
+            runtime: None,
             source: Some(ConversationSource::Aionui),
             pinned: false,
             pinned_at: None,
@@ -477,6 +499,7 @@ mod tests {
             r#type: AgentType::Acp,
             model: None,
             status: ConversationStatus::Pending,
+            runtime: None,
             source: None,
             pinned: false,
             pinned_at: None,
@@ -507,6 +530,7 @@ mod tests {
             r#type: AgentType::Acp,
             model: None,
             status: ConversationStatus::Running,
+            runtime: None,
             source: None,
             pinned: true,
             pinned_at: Some(1712345678000),
@@ -589,6 +613,7 @@ mod tests {
                 r#type: AgentType::Acp,
                 model: None,
                 status: ConversationStatus::Finished,
+                runtime: None,
                 source: None,
                 pinned: false,
                 pinned_at: None,
@@ -624,6 +649,7 @@ mod tests {
                 r#type: AgentType::Acp,
                 model: None,
                 status: ConversationStatus::Finished,
+                runtime: None,
                 source: None,
                 pinned: false,
                 pinned_at: None,
@@ -693,6 +719,7 @@ mod tests {
                 r#type: AgentType::Acp,
                 model: None,
                 status: ConversationStatus::Pending,
+                runtime: None,
                 source: None,
                 pinned: false,
                 pinned_at: None,
@@ -736,6 +763,7 @@ mod tests {
                     r#type: AgentType::Acp,
                     model: None,
                     status: ConversationStatus::Finished,
+                    runtime: None,
                     source: None,
                     pinned: false,
                     pinned_at: None,
