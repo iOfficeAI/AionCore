@@ -233,32 +233,40 @@ pub struct SkillListItem {
 /// resolve the path on disk. `relative_location` is populated for
 /// built-ins only.
 pub async fn list_available_skills(paths: &SkillPaths) -> Result<Vec<SkillListItem>, ExtensionError> {
-    let mut skills = std::collections::HashMap::new();
+    let mut builtin_skills = std::collections::HashMap::new();
 
     // 1. Built-in skills (lower priority)
     for item in list_builtin_skills(paths).await {
-        skills.insert(item.name.clone(), item);
+        builtin_skills.insert(item.name.clone(), item);
     }
 
     // 2. User custom skills (higher priority, overrides builtin)
+    let mut custom_skills = Vec::new();
     if let Ok(entries) = scan_skill_dirs(&paths.user_skills_dir).await {
         for item in entries {
-            skills.insert(
-                item.name.clone(),
-                SkillListItem {
-                    name: item.name,
-                    description: item.description,
-                    location: item.path,
-                    relative_location: None,
-                    is_custom: true,
-                    source: SkillSource::Custom,
-                },
-            );
+            builtin_skills.remove(&item.name);
+            custom_skills.push(SkillListItem {
+                name: item.name,
+                description: item.description,
+                location: item.path,
+                relative_location: None,
+                is_custom: true,
+                source: SkillSource::Custom,
+            });
         }
     }
 
-    let mut result: Vec<SkillListItem> = skills.into_values().collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
+    custom_skills.sort_by(|a, b| {
+        skill_modified_time(&b.location)
+            .cmp(&skill_modified_time(&a.location))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let mut builtin_items: Vec<SkillListItem> = builtin_skills.into_values().collect();
+    builtin_items.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut result = custom_skills;
+    result.extend(builtin_items);
     Ok(result)
 }
 
@@ -467,12 +475,14 @@ pub async fn import_skills_with_symlink(paths: &SkillPaths, source_path: &Path) 
         return import_skills_from_zip(paths, source_path).await;
     }
 
+    let source_path = normalize_import_source_path(source_path)?;
+
     if source_path.is_dir() {
         if source_path.join(SKILL_MANIFEST_FILE).exists() {
-            return Ok(vec![import_skill_with_symlink(paths, source_path).await?]);
+            return Ok(vec![import_skill_with_symlink(paths, &source_path).await?]);
         }
 
-        let skills = scan_skill_dirs(source_path).await?;
+        let skills = scan_skill_dirs(&source_path).await?;
         if skills.is_empty() {
             return Err(ExtensionError::InvalidSkillPath(format!(
                 "No skill directories found in {}",
@@ -489,7 +499,10 @@ pub async fn import_skills_with_symlink(paths: &SkillPaths, source_path: &Path) 
         return Ok(imported);
     }
 
-    Ok(vec![import_skill_with_symlink(paths, source_path).await?])
+    Err(ExtensionError::InvalidSkillPath(format!(
+        "Expected a skill directory, parent directory, SKILL.md, or zip archive: {}",
+        source_path.display()
+    )))
 }
 
 async fn import_skills_from_zip(paths: &SkillPaths, archive_path: &Path) -> Result<Vec<String>, ExtensionError> {
@@ -544,6 +557,28 @@ fn is_zip_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+}
+
+fn skill_modified_time(path: &str) -> SystemTime {
+    std::fs::symlink_metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(UNIX_EPOCH)
+}
+
+fn normalize_import_source_path(source_path: &Path) -> Result<PathBuf, ExtensionError> {
+    if source_path.is_file() {
+        let file_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if file_name == SKILL_MANIFEST_FILE {
+            return source_path
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| ExtensionError::InvalidSkillPath(source_path.display().to_string()));
+        }
+    }
+    Ok(source_path.to_path_buf())
 }
 
 /// Export a skill by creating a symlink in the target directory.
@@ -1764,6 +1799,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_skills_with_symlink_imports_selected_skill_manifest_parent() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+
+        let source_dir = tmp.path().join("single-skill");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join(SKILL_MANIFEST_FILE),
+            "---\nname: selected-manifest\ndescription: Selected manifest skill\n---\nBody",
+        )
+        .unwrap();
+
+        let names = import_skills_with_symlink(&paths, &source_dir.join(SKILL_MANIFEST_FILE))
+            .await
+            .unwrap();
+        assert_eq!(names, vec!["selected-manifest"]);
+
+        let link_path = paths.user_skills_dir.join("selected-manifest");
+        assert!(link_path.is_symlink());
+        assert_eq!(std::fs::read_link(&link_path).unwrap(), source_dir);
+        assert!(link_path.join(SKILL_MANIFEST_FILE).exists());
+    }
+
+    #[tokio::test]
     async fn import_skills_with_symlink_imports_parent_directory_children() {
         let tmp = TempDir::new().unwrap();
         let paths = make_test_paths(tmp.path());
@@ -1776,6 +1835,36 @@ mod tests {
         assert_eq!(names, vec!["alpha", "beta"]);
         assert!(paths.user_skills_dir.join("alpha").is_symlink());
         assert!(paths.user_skills_dir.join("beta").is_symlink());
+    }
+
+    #[tokio::test]
+    async fn list_available_skills_orders_custom_skills_by_newest_import_first() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+
+        let older_dir = tmp.path().join("older-source");
+        let newer_dir = tmp.path().join("newer-source");
+        std::fs::create_dir_all(&older_dir).unwrap();
+        std::fs::create_dir_all(&newer_dir).unwrap();
+        std::fs::write(
+            older_dir.join(SKILL_MANIFEST_FILE),
+            "---\nname: older-skill\ndescription: Older skill\n---\nBody",
+        )
+        .unwrap();
+        std::fs::write(
+            newer_dir.join(SKILL_MANIFEST_FILE),
+            "---\nname: newer-skill\ndescription: Newer skill\n---\nBody",
+        )
+        .unwrap();
+
+        import_skill_with_symlink(&paths, &older_dir).await.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        import_skill_with_symlink(&paths, &newer_dir).await.unwrap();
+
+        let skills = list_available_skills(&paths).await.unwrap();
+        let names: Vec<_> = skills.into_iter().map(|skill| skill.name).collect();
+        assert_eq!(names[0], "newer-skill");
+        assert_eq!(names[1], "older-skill");
     }
 
     #[tokio::test]
