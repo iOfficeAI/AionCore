@@ -87,7 +87,7 @@ pub fn row_to_response_with_extra(
 /// field that can be an array of model objects. The backend only needs
 /// `provider_id`, `model` (the selected model name), and `use_model`.
 /// Accepts both snake_case and legacy camelCase key names for backward compatibility.
-fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, ConversationError> {
+pub(crate) fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, ConversationError> {
     let v: serde_json::Value =
         serde_json::from_str(s).map_err(|e| ConversationError::internal(format!("Invalid model JSON: {e}")))?;
 

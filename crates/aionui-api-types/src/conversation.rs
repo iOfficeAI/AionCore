@@ -77,6 +77,20 @@ pub struct UpdateConversationRequest {
     pub extra: Option<serde_json::Value>,
 }
 
+/// Body for `POST /api/conversations/:id/side`.
+#[derive(Debug, Deserialize)]
+pub struct CreateSideConversationRequest {
+    pub guardrail: Option<String>,
+    pub initial_prompt: Option<String>,
+    pub forked_at_msg_id: Option<String>,
+}
+
+/// Response for `POST /api/conversations/:id/side`.
+#[derive(Debug, Serialize)]
+pub struct CreateSideConversationResponse {
+    pub conversation_id: String,
+}
+
 /// Body for `POST /api/conversations/clone`.
 ///
 /// Despite the name, this endpoint no longer supports cloning from an

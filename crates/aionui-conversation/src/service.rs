@@ -2035,6 +2035,10 @@ impl ConversationService {
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
+        let parent_extra: serde_json::Value =
+            serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+        self.delete_ephemeral_side_child(user_id, &parent_extra).await?;
+
         let source: Option<ConversationSource> = existing
             .source
             .as_deref()

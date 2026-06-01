@@ -2,14 +2,16 @@
 
 use crate::state::ConversationRouterState;
 use aionui_api_types::{
-    ApiResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse,
-    SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    ApiResponse, CreateSideConversationRequest, CreateSideConversationResponse, SetConfigOptionRequest,
+    SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery,
+    WorkspaceEntry,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 
 /// Build the conversation-ops router (no auth layer applied — the caller is
@@ -17,6 +19,7 @@ use axum::routing::{get, post, put};
 pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/conversations/{id}/side-question", post(side_question))
+        .route("/api/conversations/{id}/side", post(create_side))
         .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/usage", get(get_usage))
         .route(
@@ -68,6 +71,21 @@ async fn side_question(
             .await
             .map_err(ApiError::from)?,
     )))
+}
+
+async fn create_side(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateSideConversationRequest>,
+) -> Result<(StatusCode, Json<ApiResponse<CreateSideConversationResponse>>), ApiError> {
+    let (resp, created) = state
+        .service
+        .create_side_conversation(&user.id, &id, req, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+    Ok((status, Json(ApiResponse::ok(resp))))
 }
 
 async fn get_slash_commands(
