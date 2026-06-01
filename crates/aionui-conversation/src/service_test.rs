@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -34,7 +35,67 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 use crate::service::ConversationService;
-use crate::skill_resolver::FixedSkillResolver;
+use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
+
+#[derive(Clone, Debug)]
+struct SkillLinkCall {
+    workspace: PathBuf,
+    rel_dirs: Vec<String>,
+    skill_names: Vec<String>,
+}
+
+struct RecordingSkillResolver {
+    names: Vec<String>,
+    links: Arc<Mutex<Vec<SkillLinkCall>>>,
+}
+
+impl RecordingSkillResolver {
+    fn new(names: Vec<String>) -> Self {
+        Self {
+            names,
+            links: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SkillResolver for RecordingSkillResolver {
+    async fn auto_inject_names(&self) -> Vec<String> {
+        self.names.clone()
+    }
+
+    async fn resolve_skills(&self, names: &[String]) -> Vec<ResolvedAgentSkill> {
+        names
+            .iter()
+            .map(|name| ResolvedAgentSkill {
+                name: name.clone(),
+                source_path: std::env::temp_dir().join(format!("skill-source-{name}")),
+            })
+            .collect()
+    }
+
+    async fn link_workspace_skills(&self, workspace: &Path, rel_dirs: &[&str], skills: &[ResolvedAgentSkill]) -> usize {
+        self.links.lock().unwrap().push(SkillLinkCall {
+            workspace: workspace.to_path_buf(),
+            rel_dirs: rel_dirs.iter().map(|s| (*s).to_owned()).collect(),
+            skill_names: skills.iter().map(|skill| skill.name.clone()).collect(),
+        });
+
+        let mut linked = 0;
+        for rel_dir in rel_dirs {
+            let target_dir = workspace.join(rel_dir);
+            if std::fs::create_dir_all(&target_dir).is_err() {
+                continue;
+            }
+            for skill in skills {
+                if std::fs::create_dir_all(target_dir.join(&skill.name)).is_ok() {
+                    linked += 1;
+                }
+            }
+        }
+        linked
+    }
+}
 
 // ── Mock EventBroadcaster ──────────────────────────────────────────
 
@@ -2287,6 +2348,37 @@ async fn create_writes_empty_skills_when_no_auto_inject_and_no_preset() {
     let resp = svc.create("user-1", req).await.unwrap();
 
     assert_eq!(resp.extra["skills"], json!([]));
+}
+
+#[tokio::test]
+async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let links = resolver.links.clone();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "aionrs",
+        "extra": {},
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+    let workspace = PathBuf::from(resp.extra["workspace"].as_str().unwrap());
+    assert!(workspace.join(".aionrs/skills/cron").is_dir());
+
+    std::fs::remove_dir_all(&workspace).unwrap();
+    assert!(!workspace.exists());
+    links.lock().unwrap().clear();
+
+    let task_mgr: Arc<dyn IWorkerTaskManager> =
+        Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
+    svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
+
+    assert!(workspace.join(".aionrs/skills/cron").is_dir());
+    let calls = links.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].workspace, workspace);
+    assert_eq!(calls[0].rel_dirs, vec![".aionrs/skills"]);
+    assert_eq!(calls[0].skill_names, vec!["cron"]);
 }
 
 #[tokio::test]

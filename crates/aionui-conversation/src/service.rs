@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
@@ -16,7 +17,7 @@ use aionui_common::{
     AgentType, AppError, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
     PaginatedResult, generate_short_id, now_ms,
 };
-use aionui_db::models::MessageRow;
+use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IConversationRepository, IMcpServerRepository, SaveRuntimeStateParams, SortOrder,
@@ -86,7 +87,7 @@ impl McpSupportPolicy {
 
 #[derive(Clone)]
 pub struct ConversationService {
-    workspace_root: std::path::PathBuf,
+    workspace_root: PathBuf,
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
     task_manager: Arc<dyn IWorkerTaskManager>,
@@ -109,7 +110,7 @@ pub struct ConversationService {
 
 impl ConversationService {
     pub fn new(
-        workspace_root: std::path::PathBuf,
+        workspace_root: PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
         skill_resolver: Arc<dyn SkillResolver>,
         task_manager: Arc<dyn IWorkerTaskManager>,
@@ -1285,6 +1286,7 @@ impl ConversationService {
                 return Err(err);
             }
         };
+        self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.workspace.clone();
 
         // TODO: 好蠢的设计, status 写数据库, 最好干掉啦
@@ -1532,6 +1534,7 @@ impl ConversationService {
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
 
         let build_opts = self.build_task_options(&row)?;
+        self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.workspace.clone();
         let agent = task_manager.get_or_build_task(conversation_id, build_opts).await?;
 
@@ -1579,6 +1582,65 @@ impl ConversationService {
             conversation_id: row.id.clone(),
             extra,
         })
+    }
+
+    async fn ensure_auto_workspace_skill_links(&self, row: &ConversationRow, build_opts: &BuildTaskOptions) {
+        let expected_workspace = self.workspace_root.join("conversations").join(format!(
+            "{}-temp-{}",
+            conversation_label(&build_opts.agent_type, build_opts.extra.get("backend")),
+            row.id
+        ));
+
+        let stored_workspace = build_opts.workspace.trim();
+        let workspace = if stored_workspace.is_empty() {
+            expected_workspace
+        } else {
+            let workspace = PathBuf::from(stored_workspace);
+            if workspace != expected_workspace {
+                return;
+            }
+            workspace
+        };
+
+        let skill_names = build_opts
+            .extra
+            .get("skills")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+            .unwrap_or_default();
+        if skill_names.is_empty() {
+            return;
+        }
+
+        let Some(rel_dirs) = native_skills_dirs(
+            &self.agent_metadata_repo,
+            &build_opts.agent_type,
+            build_opts.extra.get("backend"),
+        )
+        .await
+        else {
+            return;
+        };
+        if rel_dirs.is_empty() {
+            return;
+        }
+
+        let resolved = self.skill_resolver.resolve_skills(&skill_names).await;
+        if resolved.is_empty() {
+            return;
+        }
+
+        let rel_dirs_refs: Vec<&str> = rel_dirs.iter().map(String::as_str).collect();
+        let n = self
+            .skill_resolver
+            .link_workspace_skills(&workspace, &rel_dirs_refs, &resolved)
+            .await;
+        debug!(
+            conversation_id = %row.id,
+            workspace = %workspace.display(),
+            links = n,
+            "ensured skill symlinks in auto workspace"
+        );
     }
 
     /// Write the resolved workspace back to `conversation.extra.workspace` when
