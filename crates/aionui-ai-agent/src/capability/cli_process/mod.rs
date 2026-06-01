@@ -8,7 +8,7 @@ use aionui_common::AppError;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, broadcast, watch};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 mod spawn_legacy;
 mod spawn_sdk;
@@ -47,20 +47,10 @@ pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AppError> {
             "Workspace path is not a directory: {}",
             path.display()
         ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(&path).map_err(|create_err| {
-                AppError::BadRequest(format!(
-                    "Workspace directory no longer exists and could not be recreated: {}: {}",
-                    path.display(),
-                    create_err
-                ))
-            })?;
-            info!(
-                cwd = %path.display(),
-                "Recreated missing workspace directory before spawning CLI process"
-            );
-            Ok(path)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::BadRequest(format!(
+            "Workspace directory does not exist: {}",
+            path.display()
+        ))),
         Err(e) => Err(AppError::BadRequest(format!(
             "Workspace directory is not accessible: {}: {}",
             path.display(),
@@ -394,7 +384,32 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_recreates_missing_cwd() {
+    async fn spawn_trims_trailing_cwd_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("workspace");
+        fs::create_dir(&cwd).unwrap();
+
+        let config = CommandSpec {
+            command: "sh".into(),
+            args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
+            env: vec![],
+            cwd: Some(format!("{} ", cwd.to_string_lossy())),
+        };
+        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let mut rx = proc.subscribe();
+
+        let event = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("Timed out")
+            .expect("Channel closed");
+        assert_eq!(
+            fs::canonicalize(event["cwd"].as_str().unwrap()).unwrap(),
+            fs::canonicalize(&cwd).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_missing_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let missing_cwd = dir.path().join("missing").join("workspace");
         assert!(!missing_cwd.exists());
@@ -405,22 +420,17 @@ pub(super) mod tests {
             env: vec![],
             cwd: Some(missing_cwd.to_string_lossy().into_owned()),
         };
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
-        let mut rx = proc.subscribe();
 
-        let event = timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("Timed out")
-            .expect("Channel closed");
-        assert!(missing_cwd.is_dir());
-        assert_eq!(
-            fs::canonicalize(event["cwd"].as_str().unwrap()).unwrap(),
-            fs::canonicalize(&missing_cwd).unwrap()
-        );
+        let result = CliAgentProcess::spawn(config).await;
+        assert!(matches!(
+            result,
+            Err(AppError::BadRequest(message)) if message.contains("Workspace directory does not exist")
+        ));
+        assert!(!missing_cwd.exists());
     }
 
     #[tokio::test]
-    async fn spawn_for_sdk_recreates_missing_cwd() {
+    async fn spawn_for_sdk_rejects_missing_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let missing_cwd = dir.path().join("missing-sdk").join("workspace");
@@ -432,10 +442,13 @@ pub(super) mod tests {
             env: vec![],
             cwd: Some(missing_cwd.to_string_lossy().into_owned()),
         };
-        let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
 
-        assert!(missing_cwd.is_dir());
-        proc.kill(Duration::from_millis(100)).await.unwrap();
+        let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
+        assert!(matches!(
+            result,
+            Err(AppError::BadRequest(message)) if message.contains("Workspace directory does not exist")
+        ));
+        assert!(!missing_cwd.exists());
     }
 
     #[tokio::test]
