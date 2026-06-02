@@ -588,7 +588,7 @@ async fn create_returns_conversation_with_defaults() {
 }
 
 #[tokio::test]
-async fn create_trims_user_workspace_trailing_whitespace() {
+async fn create_rejects_workspace_with_trailing_whitespace_in_request() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
     std::fs::create_dir(&dir).unwrap();
@@ -601,18 +601,23 @@ async fn create_trims_user_workspace_trailing_whitespace() {
         "extra": { "workspace": workspace_with_trailing_space }
     }))
     .unwrap();
-    let resp = svc.create("user_1", req).await.unwrap();
+    let err = svc.create("user_1", req).await.unwrap_err();
 
-    assert_eq!(resp.extra["workspace"], workspace.to_string_lossy().as_ref());
+    assert!(matches!(
+        err,
+        AppError::WorkspacePathContainsWhitespace(message)
+            if message == workspace_with_trailing_space
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
-async fn create_rejects_existing_workspace_with_trailing_whitespace_name() {
+async fn create_rejects_workspace_with_whitespace_in_any_path_segment() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
     std::fs::create_dir(&dir).unwrap();
-    let workspace = dir.join("workspace ");
+    let workspace = dir.join("my project").join("workspace");
+    std::fs::create_dir(dir.join("my project")).unwrap();
     std::fs::create_dir(&workspace).unwrap();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
@@ -624,8 +629,8 @@ async fn create_rejects_existing_workspace_with_trailing_whitespace_name() {
 
     assert!(matches!(
         err,
-        AppError::BadRequest(message)
-            if message.contains("ending in whitespace are not supported")
+        AppError::WorkspacePathContainsWhitespace(message)
+            if message == workspace.to_string_lossy()
     ));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1626,6 +1631,61 @@ async fn send_message_returns_accepted() {
 }
 
 #[tokio::test]
+async fn send_message_rejects_legacy_workspace_with_runtime_error_code() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let legacy_workspace = "/tmp/my project".to_owned();
+    repo.update(
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(json!({ "workspace": legacy_workspace }).to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let err = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message) if message == "/tmp/my project"
+    ));
+
+    let messages = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+            if messages.iter().any(|message| message.r#type == "tips") {
+                return messages;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("legacy workspace failure should persist an error tip");
+
+    let error_tip = messages
+        .iter()
+        .find(|message| message.r#type == "tips")
+        .expect("legacy workspace failure should persist an error tips message");
+    let content: serde_json::Value = serde_json::from_str(&error_tip.content).unwrap();
+    assert_eq!(
+        content["code"],
+        "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
+    );
+    assert_eq!(content["details"]["workspace_path"], "/tmp/my project");
+    assert_eq!(
+        content["error"]["code"],
+        "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
+    );
+    assert_eq!(content["error"]["workspacePath"], "/tmp/my project");
+}
+
+#[tokio::test]
 async fn send_message_broadcasts_user_created_event() {
     let (svc, broadcaster, _repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
@@ -2039,6 +2099,30 @@ async fn warmup_wrong_user_returns_not_found() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let err = svc.warmup("user_2", &conv.id, &task_mgr).await.unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let legacy_workspace = "/tmp/my project".to_owned();
+    repo.update(
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(json!({ "workspace": legacy_workspace }).to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+    assert!(matches!(
+        err,
+        AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message) if message == "/tmp/my project"
+    ));
 }
 
 // ── Confirmation system tests ────────────────────────────────────

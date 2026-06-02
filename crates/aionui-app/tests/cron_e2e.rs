@@ -11,6 +11,8 @@ use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
+use aionui_db::{ICronRepository, SqliteCronRepository};
+
 use common::{body_json, build_app, delete_with_token, get_request, get_with_token, json_with_token, setup_and_login};
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -173,6 +175,40 @@ async fn cj3_create_missing_required_fields() {
     }
 }
 
+#[tokio::test]
+async fn cj3b_create_rejects_workspace_with_whitespace_segment() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let body = json!({
+        "name": "Whitespace Workspace",
+        "schedule": { "kind": "every", "every_ms": 60000, "description": "every minute" },
+        "message": "test message",
+        "conversation_id": "",
+        "agent_type": "acp",
+        "created_by": "user",
+        "execution_mode": "new_conversation",
+        "agent_config": {
+            "backend": "acp",
+            "name": "Cron Agent",
+            "workspace": "/Users/zhoukai/Documents/Archive "
+        }
+    });
+
+    let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("Workspace path contains whitespace")
+    );
+}
+
 // ── CJ-4: Get single job ────────────────────────────────────────────
 
 #[tokio::test]
@@ -202,6 +238,72 @@ async fn cj5_get_nonexistent() {
     let req = get_with_token("/api/cron/jobs/cron_nonexistent", &token);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn cj5b_run_now_legacy_workspace_uses_runtime_whitespace_code() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let cron_repo = SqliteCronRepository::new(services.database.pool().clone());
+    let now = aionui_common::now_ms();
+
+    cron_repo
+        .insert(&aionui_db::models::CronJobRow {
+            id: "cron_whitespace_workspace".into(),
+            name: "Legacy Workspace".into(),
+            enabled: true,
+            schedule_kind: "every".into(),
+            schedule_value: "60000".into(),
+            schedule_tz: None,
+            schedule_description: Some("every minute".into()),
+            payload_message: "test message".into(),
+            execution_mode: "new_conversation".into(),
+            agent_config: Some(
+                json!({
+                    "backend": "acp",
+                    "name": "Cron Agent",
+                    "workspace": "/Users/zhoukai/Documents/Archive "
+                })
+                .to_string(),
+            ),
+            conversation_id: String::new(),
+            conversation_title: None,
+            agent_type: "acp".into(),
+            created_by: "user".into(),
+            skill_content: None,
+            description: None,
+            created_at: now,
+            updated_at: now,
+            next_run_at: Some(now + 60_000),
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            run_count: 0,
+            retry_count: 0,
+            max_retries: 3,
+        })
+        .await
+        .unwrap();
+
+    let req = json_with_token(
+        "POST",
+        "/api/cron/jobs/cron_whitespace_workspace/run",
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("Workspace path contains whitespace")
+    );
+    assert_eq!(json["details"]["operation"], "runtime");
 }
 
 // ── CJ-6: List all jobs ─────────────────────────────────────────────

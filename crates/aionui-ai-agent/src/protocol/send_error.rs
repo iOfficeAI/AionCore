@@ -68,6 +68,21 @@ impl AgentSendError {
     pub fn from_app_error_ref(err: &AppError) -> Self {
         let detail = strip_error_prefix(&err.to_string());
         match err {
+            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => Self {
+                stream_error: AgentStreamErrorData {
+                    message: "This workspace path is no longer supported for execution".into(),
+                    code: Some(AgentErrorCode::WorkspacePathContainsWhitespaceRuntimeUnsupported),
+                    ownership: Some(AgentErrorOwnership::Aionui),
+                    detail: Some(sanitize_error_detail(&detail)),
+                    workspace_path: Some(path.clone()),
+                    retryable: Some(false),
+                    feedback_recommended: Some(false),
+                    resolution: Some(AgentErrorResolution::new(
+                        AgentErrorResolutionKind::StartNewSession,
+                        Some(AgentErrorResolutionTarget::NewConversation),
+                    )),
+                },
+            },
             AppError::Internal(_) => Self::new(
                 "AionUI failed while sending the message",
                 AgentErrorCode::AionuiInternalError,
@@ -874,6 +889,29 @@ mod tests {
         assert_eq!(err.code(), Some(AgentErrorCode::UnknownUpstreamError));
         assert_eq!(err.ownership(), Some(AgentErrorOwnership::UnknownUpstream));
         assert_eq!(err.stream_error().feedback_recommended, Some(true));
+    }
+
+    #[test]
+    fn preserves_runtime_workspace_validation_as_structured_aionui_error() {
+        let err = AgentSendError::from_app_error(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
+            "/Users/test/Archive ".into(),
+        ));
+
+        assert_eq!(
+            err.code(),
+            Some(AgentErrorCode::WorkspacePathContainsWhitespaceRuntimeUnsupported)
+        );
+        assert_eq!(err.ownership(), Some(AgentErrorOwnership::Aionui));
+        assert_eq!(
+            err.stream_error().workspace_path.as_deref(),
+            Some("/Users/test/Archive ")
+        );
+        assert_eq!(err.stream_error().retryable, Some(false));
+        assert_eq!(err.stream_error().feedback_recommended, Some(false));
+        assert_eq!(
+            err.stream_error().resolution.map(|value| value.kind),
+            Some(AgentErrorResolutionKind::StartNewSession)
+        );
     }
 
     #[test]

@@ -7,7 +7,8 @@ use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app, get_request, get_with_token, setup_and_login};
+use aionui_db::{ConversationRowUpdate, IConversationRepository};
+use common::{body_json, build_app, build_app_with_mock_agents, get_request, get_with_token, setup_and_login};
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -48,6 +49,20 @@ async fn insert_message(
     aionui_db::IConversationRepository::insert_message(&repo, &msg)
         .await
         .unwrap();
+}
+
+async fn update_conversation_workspace(services: &aionui_app::AppServices, conv_id: &str, workspace: &str) {
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    IConversationRepository::update(
+        &repo,
+        conv_id,
+        &ConversationRowUpdate {
+            extra: Some(json!({ "workspace": workspace, "backend": "gemini" }).to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 }
 
 async fn insert_acp_tool_message(
@@ -748,6 +763,30 @@ async fn t2_1_send_message_conversation_not_found() {
 }
 
 #[tokio::test]
+async fn t2_1b_send_message_legacy_workspace_returns_runtime_whitespace_code() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Legacy Workspace").await;
+    update_conversation_workspace(&services, &conv_id, "/tmp/my project").await;
+
+    let body = json!({ "content": "Hello" });
+    let req = common::json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        body,
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
+    assert_eq!(json["details"]["workspace_path"], "/tmp/my project");
+    assert_eq!(json["details"]["operation"], "runtime");
+}
+
+#[tokio::test]
 async fn t2_1_send_message_requires_auth() {
     let (app, _services) = build_app().await;
 
@@ -810,6 +849,29 @@ async fn t2_3_warmup_conversation_not_found() {
     );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn t2_3b_warmup_legacy_workspace_returns_runtime_whitespace_code() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Legacy Warmup").await;
+    update_conversation_workspace(&services, &conv_id, "/tmp/my project").await;
+
+    let req = common::json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/warmup"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
+    assert_eq!(json["details"]["workspace_path"], "/tmp/my project");
+    assert_eq!(json["details"]["operation"], "runtime");
 }
 
 #[tokio::test]

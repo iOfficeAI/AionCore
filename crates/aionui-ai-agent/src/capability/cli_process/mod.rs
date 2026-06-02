@@ -4,7 +4,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_common::AppError;
+use aionui_common::{AppError, workspace_path_has_whitespace_segment};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, broadcast, watch};
@@ -27,48 +27,30 @@ pub(super) const EVENT_CHANNEL_CAPACITY: usize = 256;
 pub(super) const STDERR_BUFFER_MAX: usize = 8192;
 
 pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AppError> {
-    if cwd.is_empty() {
+    if cwd.trim().is_empty() {
         return Err(AppError::BadRequest("Workspace directory is empty".into()));
     }
 
-    let trimmed = cwd.trim_end();
-    if trimmed.is_empty() {
-        return Err(AppError::BadRequest("Workspace directory is empty".into()));
+    let workspace_path = PathBuf::from(cwd);
+    if workspace_path_has_whitespace_segment(&workspace_path) {
+        return Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
+            workspace_path.display().to_string(),
+        ));
     }
 
-    let normalized_path = PathBuf::from(trimmed);
-    if trimmed != cwd {
-        warn!(
-            original_cwd = %cwd,
-            normalized_cwd = %trimmed,
-            "Normalized CLI process cwd by trimming trailing whitespace"
-        );
-    }
-
-    match fs::metadata(&normalized_path) {
-        Ok(metadata) if metadata.is_dir() => Ok(normalized_path),
+    match fs::metadata(&workspace_path) {
+        Ok(metadata) if metadata.is_dir() => Ok(workspace_path),
         Ok(_) => Err(AppError::BadRequest(format!(
             "Workspace path is not a directory: {}",
-            normalized_path.display()
+            workspace_path.display()
         ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if trimmed != cwd {
-                let original_path = PathBuf::from(cwd);
-                if fs::metadata(&original_path).is_ok_and(|metadata| metadata.is_dir()) {
-                    return Err(AppError::BadRequest(format!(
-                        "Workspace directory names ending in whitespace are not supported: {}. Rename the directory or choose a path without trailing whitespace.",
-                        original_path.display()
-                    )));
-                }
-            }
-            Err(AppError::BadRequest(format!(
-                "Workspace directory does not exist: {}",
-                normalized_path.display()
-            )))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::BadRequest(format!(
+            "Workspace directory does not exist: {}",
+            workspace_path.display()
+        ))),
         Err(e) => Err(AppError::BadRequest(format!(
             "Workspace directory is not accessible: {}: {}",
-            normalized_path.display(),
+            workspace_path.display(),
             e
         ))),
     }
@@ -399,34 +381,32 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_trims_trailing_cwd_whitespace() {
+    async fn spawn_rejects_cwd_with_trailing_whitespace_in_request() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("workspace");
         fs::create_dir(&cwd).unwrap();
+        let cwd_with_trailing_space = format!("{} ", cwd.to_string_lossy());
 
         let config = CommandSpec {
             command: "sh".into(),
             args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
             env: vec![],
-            cwd: Some(format!("{} ", cwd.to_string_lossy())),
+            cwd: Some(cwd_with_trailing_space.clone()),
         };
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
-        let mut rx = proc.subscribe();
-
-        let event = timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("Timed out")
-            .expect("Channel closed");
-        assert_eq!(
-            fs::canonicalize(event["cwd"].as_str().unwrap()).unwrap(),
-            fs::canonicalize(&cwd).unwrap()
-        );
+        let result = CliAgentProcess::spawn(config).await;
+        assert!(matches!(
+            result,
+            Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
+                if message == cwd_with_trailing_space
+        ));
     }
 
     #[tokio::test]
-    async fn spawn_rejects_existing_trailing_space_cwd() {
+    async fn spawn_rejects_cwd_with_whitespace_in_any_segment() {
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("workspace ");
+        let workspace_parent = dir.path().join("my workspace");
+        fs::create_dir(&workspace_parent).unwrap();
+        let cwd = workspace_parent.join("project");
         fs::create_dir(&cwd).unwrap();
 
         let config = CommandSpec {
@@ -439,8 +419,32 @@ pub(super) mod tests {
         let result = CliAgentProcess::spawn(config).await;
         assert!(matches!(
             result,
-            Err(AppError::BadRequest(message))
-                if message.contains("ending in whitespace are not supported")
+            Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
+                if message == cwd.to_string_lossy()
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_for_sdk_rejects_cwd_with_whitespace_in_any_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_parent = dir.path().join("my workspace");
+        fs::create_dir(&workspace_parent).unwrap();
+        let cwd = workspace_parent.join("project");
+        fs::create_dir(&cwd).unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let config = CommandSpec {
+            command: "sh".into(),
+            args: vec!["-c".into(), "echo ready".into()],
+            env: vec![],
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+        };
+
+        let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
+        assert!(matches!(
+            result,
+            Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
+                if message == cwd.to_string_lossy()
         ));
     }
 

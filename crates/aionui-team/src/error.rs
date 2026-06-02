@@ -29,6 +29,9 @@ pub enum TeamError {
     #[error("Agent name already taken: {0}")]
     DuplicateAgentName(String),
 
+    #[error(transparent)]
+    App(#[from] AppError),
+
     #[error("{0}")]
     Database(#[from] aionui_db::DbError),
 
@@ -48,8 +51,19 @@ impl From<TeamError> for AppError {
             TeamError::BlockedTaskNotFound(msg) => AppError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => AppError::BadRequest(msg),
             TeamError::DuplicateAgentName(msg) => AppError::BadRequest(format!("Agent name already taken: {msg}")),
+            TeamError::App(app_err) => app_err,
             TeamError::Database(db_err) => AppError::from(db_err),
             TeamError::Json(e) => AppError::Internal(format!("JSON error: {e}")),
+        }
+    }
+}
+
+impl TeamError {
+    pub(crate) fn from_conversation_create(error: AppError) -> Self {
+        match error {
+            AppError::WorkspacePathContainsWhitespace(_) => Self::App(error),
+            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(_) => Self::App(error),
+            other => Self::InvalidRequest(format!("failed to create conversation: {other}")),
         }
     }
 }
@@ -110,6 +124,24 @@ mod tests {
     fn duplicate_agent_name_maps_to_bad_request() {
         let err: AppError = TeamError::DuplicateAgentName("alice".into()).into();
         assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("alice")));
+    }
+
+    #[test]
+    fn app_error_passthrough_preserves_code() {
+        let err: AppError = TeamError::App(AppError::WorkspacePathContainsWhitespace("/tmp/a b".into())).into();
+        assert!(matches!(err, AppError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
+    }
+
+    #[test]
+    fn runtime_workspace_app_error_passthrough_preserves_code() {
+        let err: AppError = TeamError::App(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
+            "/tmp/a b".into(),
+        ))
+        .into();
+        assert!(matches!(
+            err,
+            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(msg) if msg == "/tmp/a b"
+        ));
     }
 
     #[test]

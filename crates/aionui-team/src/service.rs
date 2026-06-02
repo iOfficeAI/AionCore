@@ -230,7 +230,7 @@ impl TeamSessionService {
                     .conversation_service
                     .create(user_id, conv_req)
                     .await
-                    .map_err(|e| TeamError::InvalidRequest(format!("failed to create conversation: {e}")))?;
+                    .map_err(TeamError::from_conversation_create)?;
                 conv.id
             };
 
@@ -447,7 +447,7 @@ impl TeamSessionService {
             .conversation_service
             .create(user_id, conv_req)
             .await
-            .map_err(|e| TeamError::InvalidRequest(format!("failed to create conversation: {e}")))?;
+            .map_err(TeamError::from_conversation_create)?;
 
         let agent = TeamAgent {
             slot_id,

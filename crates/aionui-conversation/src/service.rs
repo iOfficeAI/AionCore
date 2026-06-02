@@ -15,7 +15,7 @@ use aionui_api_types::{
 };
 use aionui_common::{
     AgentType, AppError, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    PaginatedResult, generate_short_id, now_ms,
+    PaginatedResult, generate_short_id, now_ms, workspace_path_has_whitespace_segment,
 };
 use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
@@ -1587,7 +1587,7 @@ impl ConversationService {
         // Extract workspace from extra (common across agent types)
         let workspace = match extra.get("workspace").and_then(|v| v.as_str()) {
             Some(workspace) if !workspace.is_empty() => {
-                let normalized = normalize_workspace_path(workspace)?;
+                let normalized = validate_runtime_workspace_path(workspace)?;
                 if normalized != workspace {
                     extra["workspace"] = serde_json::Value::String(normalized.clone());
                 }
@@ -1813,38 +1813,33 @@ fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), AppErr
 }
 
 fn normalize_workspace_path(workspace: &str) -> Result<String, AppError> {
-    let trimmed = workspace.trim_end();
-    if trimmed == workspace {
-        return Ok(workspace.to_owned());
-    }
-    if trimmed.is_empty() {
+    if workspace.trim().is_empty() {
         return Err(AppError::BadRequest("Workspace directory is empty".into()));
     }
 
-    let trimmed_path = PathBuf::from(trimmed);
-    if std::fs::metadata(&trimmed_path).is_ok_and(|metadata| metadata.is_dir()) {
-        warn!(
-            original_workspace = %workspace,
-            normalized_workspace = %trimmed,
-            "Normalized conversation workspace by trimming trailing whitespace"
-        );
-        return Ok(trimmed.to_owned());
+    let workspace_path = PathBuf::from(workspace);
+    if workspace_path_has_whitespace_segment(&workspace_path) {
+        return Err(AppError::WorkspacePathContainsWhitespace(
+            workspace_path.display().to_string(),
+        ));
     }
 
-    let original_path = PathBuf::from(workspace);
-    if std::fs::metadata(&original_path).is_ok_and(|metadata| metadata.is_dir()) {
-        return Err(AppError::BadRequest(format!(
-            "Workspace directory names ending in whitespace are not supported: {}. Rename the directory or choose a path without trailing whitespace.",
-            original_path.display()
-        )));
+    Ok(workspace.to_owned())
+}
+
+fn validate_runtime_workspace_path(workspace: &str) -> Result<String, AppError> {
+    if workspace.trim().is_empty() {
+        return Err(AppError::BadRequest("Workspace directory is empty".into()));
     }
 
-    warn!(
-        original_workspace = %workspace,
-        normalized_workspace = %trimmed,
-        "Normalized conversation workspace by trimming trailing whitespace"
-    );
-    Ok(trimmed.to_owned())
+    let workspace_path = PathBuf::from(workspace);
+    if workspace_path_has_whitespace_segment(&workspace_path) {
+        return Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
+            workspace_path.display().to_string(),
+        ));
+    }
+
+    Ok(workspace.to_owned())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

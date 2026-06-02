@@ -6,7 +6,7 @@ use aionui_ai_agent::task_manager::IWorkerTaskManager;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentRegistry, AgentStreamEvent};
 use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
-use aionui_common::{AgentType, ProviderWithModel, now_ms};
+use aionui_common::{AgentType, AppError, ProviderWithModel, now_ms, workspace_path_has_whitespace_segment};
 use aionui_conversation::ConversationService;
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationRowUpdate, IConversationRepository};
@@ -113,6 +113,11 @@ impl JobExecutor {
             }
         };
 
+        if let Err(e) = self.validate_runtime_job_workspace(job).await {
+            error!(job_id = %job.id, error = %e, "Failed cron workspace validation");
+            return ExecutionResult::Error { message: e.to_string() };
+        }
+
         let target_conversation_id = match self.resolve_conversation(job, saved_skill.as_ref()).await {
             Ok(id) => id,
             Err(e) => {
@@ -145,6 +150,7 @@ impl JobExecutor {
             }
         };
 
+        self.validate_runtime_job_workspace(job).await?;
         let conversation_id = self.resolve_conversation(job, saved_skill.as_ref()).await?;
 
         Ok(PreparedExecution {
@@ -186,6 +192,25 @@ impl JobExecutor {
             .get(conversation_id)
             .await
             .map_err(CronError::Database)
+    }
+
+    pub(crate) async fn resolve_job_workspace_raw(&self, job: &CronJob) -> Result<String, CronError> {
+        self.resolve_execution_workspace_raw(job, &job.conversation_id).await
+    }
+
+    pub(crate) async fn validate_runtime_job_workspace(&self, job: &CronJob) -> Result<(), CronError> {
+        let workspace = self.resolve_job_workspace_raw(job).await?;
+        if workspace.trim().is_empty() {
+            return Ok(());
+        }
+
+        if workspace_path_has_whitespace_segment(Path::new(&workspace)) {
+            return Err(CronError::App(
+                AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(workspace),
+            ));
+        }
+
+        Ok(())
     }
 
     pub async fn insert_tips_message(
@@ -422,7 +447,7 @@ impl JobExecutor {
             .conversation_service
             .create(&user_id, req)
             .await
-            .map_err(|e| CronError::Scheduler(format!("create conversation: {e}")))?;
+            .map_err(CronError::from_conversation_create)?;
 
         let response_workspace = response
             .extra
@@ -674,14 +699,8 @@ impl JobExecutor {
         Ok(())
     }
 
-    async fn resolve_execution_workspace(&self, job: &CronJob, conversation_id: &str) -> Result<String, CronError> {
-        if let Some(workspace) = job
-            .agent_config
-            .as_ref()
-            .and_then(|config| config.workspace.as_deref())
-            .map(str::trim)
-            .filter(|workspace| !workspace.is_empty())
-        {
+    async fn resolve_execution_workspace_raw(&self, job: &CronJob, conversation_id: &str) -> Result<String, CronError> {
+        if let Some(workspace) = job.agent_config.as_ref().and_then(|config| config.workspace.as_deref()) {
             return Ok(workspace.to_owned());
         }
 
@@ -693,9 +712,15 @@ impl JobExecutor {
         Ok(extra
             .get("workspace")
             .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|workspace| !workspace.is_empty())
             .unwrap_or_default()
+            .to_owned())
+    }
+
+    async fn resolve_execution_workspace(&self, job: &CronJob, conversation_id: &str) -> Result<String, CronError> {
+        Ok(self
+            .resolve_execution_workspace_raw(job, conversation_id)
+            .await?
+            .trim()
             .to_owned())
     }
 

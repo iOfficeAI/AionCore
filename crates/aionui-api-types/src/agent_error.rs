@@ -17,6 +17,7 @@ pub enum AgentErrorCode {
     AionuiStateInconsistent,
     AionuiPermissionError,
     AionuiInternalError,
+    WorkspacePathContainsWhitespaceRuntimeUnsupported,
     UserAgentHandshakeFailed,
     UserAgentHandshakeTimeout,
     UserAgentAcpInitFailed,
@@ -100,6 +101,13 @@ pub struct AgentStreamErrorData {
     pub ownership: Option<AgentErrorOwnership>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "workspacePath",
+        alias = "workspace_path"
+    )]
+    pub workspace_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +123,7 @@ impl AgentStreamErrorData {
             code,
             ownership: None,
             detail: None,
+            workspace_path: None,
             retryable: None,
             feedback_recommended: None,
             resolution: None,
@@ -135,6 +144,7 @@ impl AgentStreamErrorData {
             code: Some(code),
             ownership: Some(ownership),
             detail,
+            workspace_path: None,
             retryable: Some(retryable),
             feedback_recommended: Some(feedback_recommended),
             resolution,
@@ -162,6 +172,7 @@ mod tests {
         assert_eq!(json["message"], "The model provider rejected the request");
         assert_eq!(json["code"], "USER_LLM_PROVIDER_AUTH_FAILED");
         assert_eq!(json["ownership"], "user_llm_provider");
+        assert!(json.get("workspacePath").is_none());
         assert_eq!(json["retryable"], false);
         assert_eq!(json["feedback_recommended"], false);
         assert!(json.get("resolution").is_none());
@@ -199,6 +210,7 @@ mod tests {
         assert_eq!(payload.message, "legacy failure");
         assert_eq!(payload.code, Some(AgentErrorCode::UnknownUpstreamError));
         assert_eq!(payload.ownership, None);
+        assert_eq!(payload.workspace_path, None);
         assert_eq!(payload.retryable, None);
         assert_eq!(payload.feedback_recommended, None);
     }
@@ -212,5 +224,26 @@ mod tests {
 
         let payload: AgentStreamErrorData = serde_json::from_value(json).unwrap();
         assert_eq!(payload.resolution, None);
+    }
+
+    #[test]
+    fn workspace_path_field_serializes_and_deserializes() {
+        let payload = AgentStreamErrorData {
+            message: "workspace path rejected".into(),
+            code: Some(AgentErrorCode::WorkspacePathContainsWhitespaceRuntimeUnsupported),
+            ownership: Some(AgentErrorOwnership::Aionui),
+            detail: Some("workspace detail".into()),
+            workspace_path: Some("/tmp/Archive ".into()),
+            retryable: Some(false),
+            feedback_recommended: Some(false),
+            resolution: None,
+        };
+
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
+        assert_eq!(json["workspacePath"], "/tmp/Archive ");
+
+        let roundtrip: AgentStreamErrorData = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip.workspace_path.as_deref(), Some("/tmp/Archive "));
     }
 }

@@ -18,6 +18,7 @@ impl ConversationService {
                 "type": "error",
                 "source": "send_failed",
                 "code": err.error_code(),
+                "details": err.error_details(),
                 "error": stream_error,
             })
             .to_string(),
