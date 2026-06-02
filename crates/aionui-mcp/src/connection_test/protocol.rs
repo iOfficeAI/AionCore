@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use aionui_api_types::{McpAuthMethod, McpConnectionTestResult, McpToolResponse};
+use aionui_api_types::{McpAuthMethod, McpConnectionTestErrorCode, McpConnectionTestResult, McpToolResponse};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -86,11 +86,21 @@ pub(super) async fn run_stdio_protocol(
 
     // 1. initialize
     if let Err(e) = write_jsonrpc_line(&mut stdin, &build_initialize_request(1)).await {
-        return error_result(format!("Failed to send initialize: {e}"));
+        return error_result(
+            McpConnectionTestErrorCode::ProtocolError,
+            format!("Failed to send initialize: {e}"),
+            Some(serde_json::json!({ "transport": "stdio", "stage": "initialize_send" })),
+        );
     }
     let init_resp = match read_jsonrpc_response(&mut reader).await {
         Ok(r) => r,
-        Err(e) => return error_result(format!("initialize response: {e}")),
+        Err(e) => {
+            return error_result(
+                McpConnectionTestErrorCode::ProtocolError,
+                format!("initialize response: {e}"),
+                Some(serde_json::json!({ "transport": "stdio", "stage": "initialize_response" })),
+            );
+        }
     };
     if let Some(err) = init_resp.error {
         return rpc_error_result("initialize", &err);
@@ -98,16 +108,30 @@ pub(super) async fn run_stdio_protocol(
 
     // 2. initialized notification
     if let Err(e) = write_jsonrpc_line(&mut stdin, &build_initialized_notification()).await {
-        return error_result(format!("Failed to send initialized: {e}"));
+        return error_result(
+            McpConnectionTestErrorCode::ProtocolError,
+            format!("Failed to send initialized: {e}"),
+            Some(serde_json::json!({ "transport": "stdio", "stage": "initialized_send" })),
+        );
     }
 
     // 3. tools/list
     if let Err(e) = write_jsonrpc_line(&mut stdin, &build_tools_list_request(2)).await {
-        return error_result(format!("Failed to send tools/list: {e}"));
+        return error_result(
+            McpConnectionTestErrorCode::ProtocolError,
+            format!("Failed to send tools/list: {e}"),
+            Some(serde_json::json!({ "transport": "stdio", "stage": "tools_list_send" })),
+        );
     }
     let tools_resp = match read_jsonrpc_response(&mut reader).await {
         Ok(r) => r,
-        Err(e) => return error_result(format!("tools/list response: {e}")),
+        Err(e) => {
+            return error_result(
+                McpConnectionTestErrorCode::ProtocolError,
+                format!("tools/list response: {e}"),
+                Some(serde_json::json!({ "transport": "stdio", "stage": "tools_list_response" })),
+            );
+        }
     };
     if let Some(err) = tools_resp.error {
         return rpc_error_result("tools/list", &err);
@@ -356,17 +380,25 @@ pub(super) fn success_result(tools_value: Option<serde_json::Value>) -> McpConne
         success: true,
         tools: Some(tools),
         error: None,
+        code: None,
+        details: None,
         needs_auth: None,
         auth_method: None,
         www_authenticate: None,
     }
 }
 
-pub(super) fn error_result(msg: String) -> McpConnectionTestResult {
+pub(super) fn error_result(
+    code: McpConnectionTestErrorCode,
+    msg: String,
+    details: Option<serde_json::Value>,
+) -> McpConnectionTestResult {
     McpConnectionTestResult {
         success: false,
         tools: None,
         error: Some(msg),
+        code: Some(code),
+        details,
         needs_auth: None,
         auth_method: None,
         www_authenticate: None,
@@ -374,19 +406,43 @@ pub(super) fn error_result(msg: String) -> McpConnectionTestResult {
 }
 
 pub(super) fn timeout_result(duration: Duration) -> McpConnectionTestResult {
-    error_result(format!("Connection test timed out after {}s", duration.as_secs()))
+    error_result(
+        McpConnectionTestErrorCode::Timeout,
+        format!("Connection test timed out after {}s", duration.as_secs()),
+        Some(serde_json::json!({ "timeout_seconds": duration.as_secs() })),
+    )
 }
 
 pub(super) fn spawn_error_result(command: &str, error: &std::io::Error) -> McpConnectionTestResult {
-    let msg = match error.kind() {
-        std::io::ErrorKind::NotFound => command_not_found_message(command),
-        std::io::ErrorKind::PermissionDenied => format!("Permission denied: {command}"),
-        _ => format!("Failed to start '{command}': {error}"),
-    };
-    error_result(msg)
+    match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            let runtime = missing_command_runtime(command);
+            error_result(
+                McpConnectionTestErrorCode::CommandNotFound,
+                command_not_found_message(command),
+                Some(serde_json::json!({
+                    "command": command,
+                    "runtime": runtime,
+                })),
+            )
+        }
+        std::io::ErrorKind::PermissionDenied => error_result(
+            McpConnectionTestErrorCode::CommandPermissionDenied,
+            format!("Permission denied: {command}"),
+            Some(serde_json::json!({ "command": command })),
+        ),
+        _ => error_result(
+            McpConnectionTestErrorCode::CommandStartFailed,
+            format!("Failed to start '{command}': {error}"),
+            Some(serde_json::json!({
+                "command": command,
+                "io_error": error.to_string(),
+            })),
+        ),
+    }
 }
 
-fn command_not_found_message(command: &str) -> String {
+fn command_basename(command: &str) -> String {
     let mut command_name = command
         .rsplit(['/', '\\'])
         .next()
@@ -398,8 +454,20 @@ fn command_not_found_message(command: &str) -> String {
             break;
         }
     }
+    command_name
+}
 
+fn missing_command_runtime(command: &str) -> &'static str {
+    let command_name = command_basename(command);
     if matches!(command_name.as_str(), "npx" | "npm" | "node") {
+        "node"
+    } else {
+        "generic"
+    }
+}
+
+fn command_not_found_message(command: &str) -> String {
+    if missing_command_runtime(command) == "node" {
         return format!(
             "Command not found: {command}. Install Node.js (which includes npm/npx), then restart AionUI or configure this MCP server to use an absolute command path."
         );
@@ -411,7 +479,14 @@ fn command_not_found_message(command: &str) -> String {
 }
 
 pub(super) fn rpc_error_result(method: &str, err: &JsonRpcError) -> McpConnectionTestResult {
-    error_result(format!("{method} error: {} (code {})", err.message, err.code))
+    error_result(
+        McpConnectionTestErrorCode::RpcError,
+        format!("{method} error: {} (code {})", err.message, err.code),
+        Some(serde_json::json!({
+            "method": method,
+            "rpc_code": err.code,
+        })),
+    )
 }
 
 pub(super) fn auth_result(headers: &reqwest::header::HeaderMap) -> McpConnectionTestResult {
@@ -426,6 +501,8 @@ pub(super) fn auth_result(headers: &reqwest::header::HeaderMap) -> McpConnection
         success: false,
         tools: None,
         error: None,
+        code: None,
+        details: None,
         needs_auth: Some(true),
         auth_method,
         www_authenticate,
@@ -601,9 +678,15 @@ mod tests {
 
     #[test]
     fn error_result_fields() {
-        let result = error_result("something broke".into());
+        let result = error_result(
+            McpConnectionTestErrorCode::ProtocolError,
+            "something broke".into(),
+            Some(serde_json::json!({ "stage": "initialize" })),
+        );
         assert!(!result.success);
         assert_eq!(result.error.as_deref(), Some("something broke"));
+        assert_eq!(result.code, Some(McpConnectionTestErrorCode::ProtocolError));
+        assert_eq!(result.details.unwrap()["stage"], "initialize");
         assert!(result.tools.is_none());
         assert!(result.needs_auth.is_none());
     }
@@ -612,41 +695,47 @@ mod tests {
     fn timeout_result_message() {
         let result = timeout_result(Duration::from_secs(30));
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("30s"));
+        assert!(result.error.as_deref().unwrap().contains("30s"));
+        assert_eq!(result.code, Some(McpConnectionTestErrorCode::Timeout));
     }
 
     #[test]
     fn spawn_error_not_found() {
         let err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
         let result = spawn_error_result("npx", &err);
-        let error = result.error.unwrap();
+        let error = result.error.as_deref().unwrap();
         assert!(error.contains("Command not found: npx"));
         assert!(error.contains("Install Node.js"));
         assert!(error.contains("absolute command path"));
+        assert_eq!(result.code, Some(McpConnectionTestErrorCode::CommandNotFound));
+        assert_eq!(result.details.as_ref().unwrap()["runtime"], "node");
     }
 
     #[test]
     fn spawn_error_not_found_generic_command() {
         let err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
         let result = spawn_error_result("missing-mcp", &err);
-        let error = result.error.unwrap();
+        let error = result.error.as_deref().unwrap();
         assert!(error.contains("Command not found: missing-mcp"));
         assert!(error.contains("Install the command"));
         assert!(error.contains("absolute command path"));
+        assert_eq!(result.details.as_ref().unwrap()["runtime"], "generic");
     }
 
     #[test]
     fn spawn_error_permission_denied() {
         let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let result = spawn_error_result("./script.sh", &err);
-        assert!(result.error.unwrap().contains("Permission denied"));
+        assert!(result.error.as_deref().unwrap().contains("Permission denied"));
+        assert_eq!(result.code, Some(McpConnectionTestErrorCode::CommandPermissionDenied));
     }
 
     #[test]
     fn spawn_error_other() {
         let err = std::io::Error::other("broken pipe");
         let result = spawn_error_result("cmd", &err);
-        assert!(result.error.unwrap().contains("Failed to start"));
+        assert!(result.error.as_deref().unwrap().contains("Failed to start"));
+        assert_eq!(result.code, Some(McpConnectionTestErrorCode::CommandStartFailed));
     }
 
     #[test]
@@ -658,6 +747,7 @@ mod tests {
         assert_eq!(result.needs_auth, Some(true));
         assert!(matches!(result.auth_method, Some(McpAuthMethod::Oauth)));
         assert!(result.www_authenticate.is_some());
+        assert!(result.code.is_none());
     }
 
     #[test]

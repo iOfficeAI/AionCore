@@ -2,11 +2,12 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
 use aionui_api_types::{
-    ApiResponse, BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerResponse,
-    McpConnectionTestResult, McpServerResponse, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse,
+    ApiResponse, BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerResponse, ErrorResponse,
+    McpConnectionTestErrorCode, McpServerResponse, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse,
     OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
 use aionui_common::AppError;
@@ -136,11 +137,10 @@ async fn batch_import(
 /// `POST /api/mcp/test-connection` — test MCP server connectivity.
 ///
 /// Creates a temporary MCP client, connects, lists tools, and closes.
-/// Always returns 200; failures are encoded in the response body.
 async fn test_connection(
     State(state): State<McpRouterState>,
     body: Result<Json<TestMcpConnectionRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<McpConnectionTestResult>>, AppError> {
+) -> Result<Response, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let transport = McpServerTransport::from(req.transport);
     let result = state
@@ -150,7 +150,41 @@ async fn test_connection(
     if let Some(server_id) = req.id.as_deref() {
         state.config_service.persist_test_result(server_id, &result).await?;
     }
-    Ok(Json(ApiResponse::ok(result)))
+    if result.success || result.needs_auth == Some(true) {
+        return Ok(Json(ApiResponse::ok(result)).into_response());
+    }
+
+    let status = result
+        .code
+        .map(connection_test_failure_status)
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let error = result
+        .error
+        .clone()
+        .unwrap_or_else(|| "MCP connection test failed".to_string());
+    let code = result
+        .code
+        .map(McpConnectionTestErrorCode::as_str)
+        .unwrap_or("MCP_CONNECTION_FAILED");
+
+    Ok((
+        status,
+        Json(ErrorResponse::new_with_details(error, code, result.details.clone())),
+    )
+        .into_response())
+}
+
+fn connection_test_failure_status(code: McpConnectionTestErrorCode) -> StatusCode {
+    match code {
+        McpConnectionTestErrorCode::CommandNotFound
+        | McpConnectionTestErrorCode::CommandPermissionDenied
+        | McpConnectionTestErrorCode::CommandStartFailed => StatusCode::UNPROCESSABLE_ENTITY,
+        McpConnectionTestErrorCode::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        McpConnectionTestErrorCode::ConnectionFailed
+        | McpConnectionTestErrorCode::HttpError
+        | McpConnectionTestErrorCode::RpcError
+        | McpConnectionTestErrorCode::ProtocolError => StatusCode::BAD_GATEWAY,
+    }
 }
 
 // ---------------------------------------------------------------------------

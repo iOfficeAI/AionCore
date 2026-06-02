@@ -169,6 +169,35 @@ pub enum McpAuthMethod {
     Basic,
 }
 
+/// Machine-readable error code for MCP connection test failures.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum McpConnectionTestErrorCode {
+    CommandNotFound,
+    CommandPermissionDenied,
+    CommandStartFailed,
+    ConnectionFailed,
+    HttpError,
+    Timeout,
+    RpcError,
+    ProtocolError,
+}
+
+impl McpConnectionTestErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandNotFound => "MCP_COMMAND_NOT_FOUND",
+            Self::CommandPermissionDenied => "MCP_COMMAND_PERMISSION_DENIED",
+            Self::CommandStartFailed => "MCP_COMMAND_START_FAILED",
+            Self::ConnectionFailed => "MCP_CONNECTION_FAILED",
+            Self::HttpError => "MCP_HTTP_ERROR",
+            Self::Timeout => "MCP_TIMEOUT",
+            Self::RpcError => "MCP_RPC_ERROR",
+            Self::ProtocolError => "MCP_PROTOCOL_ERROR",
+        }
+    }
+}
+
 /// Result of an MCP server connection test.
 #[derive(Debug, Clone, Serialize)]
 pub struct McpConnectionTestResult {
@@ -177,6 +206,10 @@ pub struct McpConnectionTestResult {
     pub tools: Option<Vec<McpToolResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<McpConnectionTestErrorCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs_auth: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -442,6 +475,8 @@ mod tests {
                 input_schema: None,
             }]),
             error: None,
+            code: None,
+            details: None,
             needs_auth: None,
             auth_method: None,
             www_authenticate: None,
@@ -459,6 +494,8 @@ mod tests {
             success: false,
             tools: None,
             error: None,
+            code: None,
+            details: None,
             needs_auth: Some(true),
             auth_method: Some(McpAuthMethod::Oauth),
             www_authenticate: Some("Bearer realm=\"mcp\"".into()),
@@ -467,6 +504,27 @@ mod tests {
         assert_eq!(json["needs_auth"], true);
         assert_eq!(json["auth_method"], "oauth");
         assert_eq!(json["www_authenticate"], "Bearer realm=\"mcp\"");
+    }
+
+    #[test]
+    fn test_connection_test_error_code_serialization() {
+        let result = McpConnectionTestResult {
+            success: false,
+            tools: None,
+            error: Some("Command not found: npx".into()),
+            code: Some(McpConnectionTestErrorCode::CommandNotFound),
+            details: Some(serde_json::json!({ "command": "npx", "runtime": "node" })),
+            needs_auth: None,
+            auth_method: None,
+            www_authenticate: None,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["code"], "COMMAND_NOT_FOUND");
+        assert_eq!(json["details"]["command"], "npx");
+        assert_eq!(
+            McpConnectionTestErrorCode::CommandNotFound.as_str(),
+            "MCP_COMMAND_NOT_FOUND"
+        );
     }
 
     // -- TestMcpConnectionRequest ---------------------------------------------

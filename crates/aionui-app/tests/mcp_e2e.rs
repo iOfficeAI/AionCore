@@ -34,13 +34,13 @@ async fn connection_test_enoent_command() {
         &csrf,
     );
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     let json = body_json(resp).await;
-    assert!(json["success"].as_bool().unwrap());
-    let data = &json["data"];
-    assert!(!data["success"].as_bool().unwrap());
-    assert!(!data["error"].as_str().unwrap().is_empty());
+    assert!(!json["success"].as_bool().unwrap());
+    assert_eq!(json["code"], "MCP_COMMAND_NOT_FOUND");
+    assert_eq!(json["details"]["command"], "nonexistent-mcp-command-xyz-12345");
+    assert!(!json["error"].as_str().unwrap().is_empty());
 }
 
 // ===========================================================================
@@ -66,13 +66,13 @@ async fn connection_test_unreachable_url() {
         &csrf,
     );
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
     let json = body_json(resp).await;
-    assert!(json["success"].as_bool().unwrap());
-    let data = &json["data"];
-    assert!(!data["success"].as_bool().unwrap());
-    assert!(!data["error"].as_str().unwrap().is_empty());
+    assert!(!json["success"].as_bool().unwrap());
+    assert_eq!(json["code"], "MCP_CONNECTION_FAILED");
+    assert_eq!(json["details"]["transport"], "http");
+    assert!(!json["error"].as_str().unwrap().is_empty());
 }
 
 // ===========================================================================
