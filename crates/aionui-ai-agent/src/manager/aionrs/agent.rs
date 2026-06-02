@@ -365,7 +365,7 @@ fn parse_session_mode(s: &str) -> SessionMode {
 
 fn aionrs_engine_error_to_send_error(error_msg: String) -> AgentSendError {
     let lower = error_msg.to_ascii_lowercase();
-    if lower.contains("provider error") || lower.contains("provider:") {
+    if lower.contains("provider error") || lower.contains("provider:") || lower.contains("api error:") {
         return AgentSendError::from_app_error(AppError::BadGateway(error_msg));
     }
     AgentSendError::from_app_error(AppError::Internal(error_msg))
@@ -573,5 +573,22 @@ mod tests {
             Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
         );
         assert_eq!(send_error.stream_error().retryable, Some(false));
+    }
+
+    #[test]
+    fn aionrs_api_connection_error_is_user_llm_provider_network_error() {
+        let send_error = aionrs_engine_error_to_send_error(
+            "Aionrs agent error: API error: Connection error: error decoding response body".to_owned(),
+        );
+
+        assert_eq!(
+            send_error.code(),
+            Some(aionui_api_types::AgentErrorCode::UserLlmProviderNetworkError)
+        );
+        assert_eq!(
+            send_error.ownership(),
+            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
+        );
+        assert_eq!(send_error.stream_error().retryable, Some(true));
     }
 }
