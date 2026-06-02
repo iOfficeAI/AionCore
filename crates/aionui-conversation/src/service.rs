@@ -7,7 +7,7 @@ use aionui_ai_agent::{AgentInstance, IWorkerTaskManager};
 use crate::response_middleware::ICronService;
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::{
-    ApprovalCheckResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
+    AgentErrorCode, ApprovalCheckResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
@@ -215,7 +215,66 @@ impl ConversationService {
         .await;
     }
 
+    async fn clear_persisted_acp_model_after_model_not_found(
+        &self,
+        conversation_id: &str,
+        error_code: Option<AgentErrorCode>,
+    ) {
+        if error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound) {
+            return;
+        }
+
+        let previous_model_id = match self.acp_session_repo.load_runtime_state(conversation_id).await {
+            Ok(Some(state)) => state.current_model_id,
+            Ok(None) => None,
+            Err(err) => {
+                warn!(
+                    conversation_id,
+                    error = %err,
+                    "Failed to load ACP persisted model before clearing after model_not_found"
+                );
+                None
+            }
+        };
+
+        let params = SaveRuntimeStateParams {
+            current_model_id: Some(None),
+            ..Default::default()
+        };
+        match self.acp_session_repo.save_runtime_state(conversation_id, &params).await {
+            Ok(true) => {
+                info!(
+                    conversation_id,
+                    ?previous_model_id,
+                    error_code = ?error_code,
+                    reason = ?AgentKillReason::AgentErrorRecovery,
+                    "ACP persisted model cleared after model_not_found"
+                );
+            }
+            Ok(false) => {
+                warn!(
+                    conversation_id,
+                    ?previous_model_id,
+                    error_code = ?error_code,
+                    reason = ?AgentKillReason::AgentErrorRecovery,
+                    "ACP persisted model clear skipped because session row is missing"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    conversation_id,
+                    ?previous_model_id,
+                    error = %err,
+                    error_code = ?error_code,
+                    reason = ?AgentKillReason::AgentErrorRecovery,
+                    "Failed to clear ACP persisted model after model_not_found"
+                );
+            }
+        }
+    }
+
     async fn evict_acp_task_after_terminal_error(
+        &self,
         conversation_id: &str,
         agent_type: AgentType,
         outcome: &RelayOutcome,
@@ -238,6 +297,8 @@ impl ConversationService {
         );
         task_manager
             .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
+            .await;
+        self.clear_persisted_acp_model_after_model_not_found(conversation_id, error_code)
             .await;
         info!(
             conversation_id,
@@ -1463,7 +1524,8 @@ impl ConversationService {
                     persist_session_key(&repo, &conv_id, &session_key).await;
                 }
 
-                if Self::evict_acp_task_after_terminal_error(&conv_id, agent.agent_type(), &outcome, &task_manager)
+                if service
+                    .evict_acp_task_after_terminal_error(&conv_id, agent.agent_type(), &outcome, &task_manager)
                     .await
                 {
                     break;

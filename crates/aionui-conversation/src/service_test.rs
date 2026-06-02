@@ -478,7 +478,22 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     }
 }
 
-struct StubAcpSessionRepo;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeStateSaveCall {
+    conversation_id: String,
+    current_model_id: Option<Option<String>>,
+}
+
+#[derive(Default)]
+struct StubAcpSessionRepo {
+    runtime_state_saves: Mutex<Vec<RuntimeStateSaveCall>>,
+}
+
+impl StubAcpSessionRepo {
+    fn runtime_state_saves(&self) -> Vec<RuntimeStateSaveCall> {
+        self.runtime_state_saves.lock().unwrap().clone()
+    }
+}
 
 #[async_trait::async_trait]
 impl IAcpSessionRepository for StubAcpSessionRepo {
@@ -507,14 +522,21 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
         Ok(false)
     }
     async fn load_runtime_state(&self, _conversation_id: &str) -> Result<Option<PersistedSessionState>, DbError> {
-        Ok(None)
+        Ok(Some(PersistedSessionState {
+            current_model_id: Some("deepseek-v4-pro".to_owned()),
+            ..Default::default()
+        }))
     }
     async fn save_runtime_state(
         &self,
-        _conversation_id: &str,
-        _params: &SaveRuntimeStateParams<'_>,
+        conversation_id: &str,
+        params: &SaveRuntimeStateParams<'_>,
     ) -> Result<bool, DbError> {
-        Ok(false)
+        self.runtime_state_saves.lock().unwrap().push(RuntimeStateSaveCall {
+            conversation_id: conversation_id.to_owned(),
+            current_model_id: params.current_model_id.map(|outer| outer.map(ToOwned::to_owned)),
+        });
+        Ok(true)
     }
 }
 
@@ -535,10 +557,21 @@ fn make_service_with_resolver(
     Arc<MockRepo>,
     Arc<dyn IWorkerTaskManager>,
 ) {
+    make_service_with_resolver_and_acp_session_repo(skill_resolver, Arc::new(StubAcpSessionRepo::default()))
+}
+
+fn make_service_with_resolver_and_acp_session_repo(
+    skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
+    acp_session_repo: Arc<dyn IAcpSessionRepository>,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<dyn IWorkerTaskManager>,
+) {
     let repo = Arc::new(MockRepo::new());
     let broadcaster = Arc::new(MockBroadcaster::new());
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
     let svc = ConversationService::new(
         std::env::temp_dir(),
@@ -2027,6 +2060,85 @@ async fn send_message_evicts_acp_task_after_terminal_error() {
         task_mgr.kill_records(),
         vec![(conv.id.clone(), Some(AgentKillReason::AgentErrorRecovery))]
     );
+}
+
+#[tokio::test]
+async fn send_message_clears_persisted_acp_model_after_model_not_found() {
+    let acp_session_repo = Arc::new(StubAcpSessionRepo::default());
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_session_repo.clone(),
+    );
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
+            "The configured model was not found by the provider.",
+            Some(AgentErrorCode::UserLlmProviderModelNotFound),
+        ))]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let saves = acp_session_repo.runtime_state_saves();
+            if saves
+                .iter()
+                .any(|call| call.conversation_id == conv.id && call.current_model_id == Some(None))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("model_not_found should clear persisted ACP model");
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.active_count(), 0);
+    assert_eq!(
+        acp_session_repo.runtime_state_saves(),
+        vec![RuntimeStateSaveCall {
+            conversation_id: conv.id,
+            current_model_id: Some(None),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn send_message_does_not_clear_persisted_acp_model_for_other_terminal_errors() {
+    let acp_session_repo = Arc::new(StubAcpSessionRepo::default());
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_session_repo.clone(),
+    );
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
+            "Unknown upstream error.",
+            Some(AgentErrorCode::UnknownUpstreamError),
+        ))]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.active_count(), 0);
+    assert!(acp_session_repo.runtime_state_saves().is_empty());
 }
 
 #[tokio::test]
