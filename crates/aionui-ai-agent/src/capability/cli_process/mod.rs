@@ -27,25 +27,48 @@ pub(super) const EVENT_CHANNEL_CAPACITY: usize = 256;
 pub(super) const STDERR_BUFFER_MAX: usize = 8192;
 
 pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AppError> {
+    if cwd.is_empty() {
+        return Err(AppError::BadRequest("Workspace directory is empty".into()));
+    }
+
+    let path = PathBuf::from(cwd);
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => return Ok(path),
+        Ok(_) => {
+            return Err(AppError::BadRequest(format!(
+                "Workspace path is not a directory: {}",
+                path.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(AppError::BadRequest(format!(
+                "Workspace directory is not accessible: {}: {}",
+                path.display(),
+                e
+            )));
+        }
+    };
+
     let trimmed = cwd.trim_end();
     if trimmed.is_empty() {
         return Err(AppError::BadRequest("Workspace directory is empty".into()));
     }
 
+    let normalized_path = PathBuf::from(trimmed);
     if trimmed != cwd {
         warn!(
             original_cwd = %cwd,
             normalized_cwd = %trimmed,
-            "Normalized CLI process cwd by trimming trailing whitespace"
+            "Normalized CLI process cwd by trimming trailing whitespace after exact path lookup failed"
         );
     }
 
-    let path = PathBuf::from(trimmed);
-    match fs::metadata(&path) {
-        Ok(metadata) if metadata.is_dir() => Ok(path),
+    match fs::metadata(&normalized_path) {
+        Ok(metadata) if metadata.is_dir() => Ok(normalized_path),
         Ok(_) => Err(AppError::BadRequest(format!(
             "Workspace path is not a directory: {}",
-            path.display()
+            normalized_path.display()
         ))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::BadRequest(format!(
             "Workspace directory does not exist: {}",
@@ -53,7 +76,7 @@ pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AppError> {
         ))),
         Err(e) => Err(AppError::BadRequest(format!(
             "Workspace directory is not accessible: {}: {}",
-            path.display(),
+            normalized_path.display(),
             e
         ))),
     }
@@ -394,6 +417,31 @@ pub(super) mod tests {
             args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
             env: vec![],
             cwd: Some(format!("{} ", cwd.to_string_lossy())),
+        };
+        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let mut rx = proc.subscribe();
+
+        let event = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("Timed out")
+            .expect("Channel closed");
+        assert_eq!(
+            fs::canonicalize(event["cwd"].as_str().unwrap()).unwrap(),
+            fs::canonicalize(&cwd).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_preserves_existing_trailing_space_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("workspace ");
+        fs::create_dir(&cwd).unwrap();
+
+        let config = CommandSpec {
+            command: "sh".into(),
+            args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
+            env: vec![],
+            cwd: Some(cwd.to_string_lossy().into_owned()),
         };
         let proc = CliAgentProcess::spawn(config).await.unwrap();
         let mut rx = proc.subscribe();
