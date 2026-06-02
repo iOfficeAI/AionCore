@@ -10,6 +10,7 @@ use aionui_ai_agent::{
 use aionui_api_types::GuideMcpConfig;
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
+use aionui_conversation::runtime_state::ConversationRuntimeStateService;
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
     IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteConversationRepository,
@@ -29,6 +30,7 @@ pub struct AppServices {
     pub ws_manager: Arc<WebSocketManager>,
     pub event_bus: Arc<BroadcastEventBus>,
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
+    pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -179,6 +181,7 @@ impl AppServices {
         let task_manager_concrete = Arc::new(WorkerTaskManagerImpl::new(factory));
         let worker_task_manager: Arc<dyn IWorkerTaskManager> = task_manager_concrete.clone();
         let task_manager_delete_hook: Arc<dyn OnConversationDelete> = task_manager_concrete;
+        let conversation_runtime_state = Arc::new(ConversationRuntimeStateService::default());
 
         Ok(Self {
             database,
@@ -189,6 +192,7 @@ impl AppServices {
             ws_manager: Arc::new(WebSocketManager::new()),
             event_bus: Arc::new(BroadcastEventBus::new(256)),
             worker_task_manager,
+            conversation_runtime_state,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,

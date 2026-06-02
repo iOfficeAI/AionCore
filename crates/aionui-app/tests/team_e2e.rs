@@ -125,6 +125,30 @@ async fn tc6_missing_name_returns_error() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn tc6b_workspace_with_whitespace_segment_returns_specific_code() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let body = json!({
+        "name": "Alpha",
+        "workspace": "/Users/zhoukai/Documents/Archive ",
+        "agents": [{ "name": "Lead", "role": "lead", "backend": "acp", "model": "claude" }]
+    });
+    let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("Workspace path contains whitespace")
+    );
+}
+
 // TC-7: Unauthenticated returns 403
 #[tokio::test]
 async fn tc7_unauthenticated_returns_403() {

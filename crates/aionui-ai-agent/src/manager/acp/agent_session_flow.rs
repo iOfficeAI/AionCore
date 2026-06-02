@@ -158,12 +158,11 @@ impl AcpAgentManager {
             };
         }
 
-        let (supports_load, preloaded_mode, preloaded_model) = {
+        let (supports_load, preloaded_mode) = {
             let session = self.session.read().await;
             (
                 session.agent_capabilities().map(|c| c.load_session).unwrap_or(false),
                 session.modes().map(|m| m.current_mode_id.to_string()),
-                session.model_info().map(|m| m.current_model_id.to_string()),
             )
         };
 
@@ -182,10 +181,7 @@ impl AcpAgentManager {
 
             {
                 let mut session = self.session.write().await;
-                if let Some(mut models) = load_response.models {
-                    if let Some(db_current) = preloaded_model {
-                        models.current_model_id = db_current.into();
-                    }
+                if let Some(models) = load_response.models {
                     session.apply_advertised_models(models);
                 }
                 if let Some(mut modes) = load_response.modes {

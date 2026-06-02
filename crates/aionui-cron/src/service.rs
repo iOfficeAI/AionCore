@@ -6,7 +6,7 @@ use aionui_api_types::{
     CreateCronJobRequest, CronJobResponse, CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse,
     SaveCronSkillRequest, UpdateCronJobRequest,
 };
-use aionui_common::{AgentType, generate_prefixed_id, now_ms};
+use aionui_common::{AgentType, AppError, generate_prefixed_id, now_ms, workspace_path_has_whitespace_segment};
 use aionui_db::{ICronRepository, UpdateCronJobParams};
 use tracing::{error, info, warn};
 
@@ -114,6 +114,8 @@ impl CronService {
             max_retries: 3,
         };
 
+        self.validate_job_workspace(&job).await?;
+
         let row = cron_job_to_row(&job)?;
         self.repo.insert(&row).await?;
         self.bind_existing_conversation_if_needed(&job).await;
@@ -179,6 +181,7 @@ impl CronService {
         }
 
         job.updated_at = now_ms();
+        self.validate_job_workspace(&job).await?;
 
         let params = build_update_params(&job, &req);
         self.repo.update(job_id, &params).await?;
@@ -476,6 +479,19 @@ impl CronService {
                 false
             }
         }
+    }
+
+    async fn validate_job_workspace(&self, job: &CronJob) -> Result<(), CronError> {
+        let workspace = self.executor.resolve_job_workspace_raw(job).await?;
+        if workspace.trim().is_empty() {
+            return Ok(());
+        }
+
+        if workspace_path_has_whitespace_segment(Path::new(&workspace)) {
+            return Err(CronError::App(AppError::WorkspacePathContainsWhitespace(workspace)));
+        }
+
+        Ok(())
     }
 
     async fn handle_execution_result(&self, job: CronJob, result: ExecutionResult) {

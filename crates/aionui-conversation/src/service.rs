@@ -5,17 +5,19 @@ use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentInstance, IWorkerTaskManager};
 
 use crate::response_middleware::ICronService;
+use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::{
     ApprovalCheckResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationResponse, CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse,
-    MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SessionMcpServer,
-    SessionMcpTransport, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
+    SendMessageRequest, SessionMcpServer, SessionMcpTransport, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentType, AppError, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    PaginatedResult, generate_short_id, now_ms,
+    PaginatedResult, generate_short_id, now_ms, workspace_path_has_whitespace_segment,
 };
 use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
@@ -99,6 +101,7 @@ pub struct ConversationService {
     delete_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationDelete>>>>,
     cron_service: Arc<RwLock<Option<Arc<dyn ICronService>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
+    runtime_state: Arc<ConversationRuntimeStateService>,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -127,11 +130,17 @@ impl ConversationService {
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             cron_service: Arc::new(RwLock::new(None)),
             mcp_server_repo: Arc::new(RwLock::new(None)),
+            runtime_state: Arc::new(ConversationRuntimeStateService::default()),
 
             conversation_repo,
             agent_metadata_repo,
             acp_session_repo,
         }
+    }
+
+    pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
+        self.runtime_state = runtime_state;
+        self
     }
 
     pub fn with_cron_service(&self, cron_service: Option<Arc<dyn ICronService>>) {
@@ -175,10 +184,39 @@ impl ConversationService {
         &self.conversation_repo
     }
 
+    pub(crate) fn acp_session_repo(&self) -> &Arc<dyn IAcpSessionRepository> {
+        &self.acp_session_repo
+    }
+
+    pub fn runtime_state(&self) -> Arc<ConversationRuntimeStateService> {
+        self.runtime_state.clone()
+    }
+
     pub(crate) fn task(&self, conversation_id: &str) -> Result<AgentInstance, AppError> {
         self.task_manager
             .get_task(conversation_id)
             .ok_or_else(|| AppError::NotFound(format!("No active agent for conversation '{conversation_id}'")))
+    }
+
+    pub async fn runtime_summary_for(&self, conversation_id: &str) -> ConversationRuntimeSummary {
+        let agent = self.task_manager.get_task(conversation_id);
+        let has_task = agent.is_some();
+        let task_status = agent.as_ref().and_then(|agent| agent.status());
+        let pending_confirmations = agent.as_ref().map(|agent| agent.get_confirmations().len()).unwrap_or(0);
+
+        self.runtime_state
+            .summary_from_parts(conversation_id, task_status, has_task, pending_confirmations)
+    }
+
+    pub async fn complete_turn(&self, conversation_id: &str) {
+        let runtime = self.runtime_summary_for(conversation_id).await;
+        StreamRelay::complete_conversation_with_runtime(
+            &self.conversation_repo,
+            &self.broadcaster,
+            conversation_id,
+            Some(runtime),
+        )
+        .await;
     }
 }
 
@@ -227,12 +265,18 @@ impl ConversationService {
         // `is_custom_workspace` is the authoritative signal consumed later to
         // decide whether we should wire skill symlinks (temp workspaces only
         // — user-chosen paths must not be mutated).
-        let user_supplied_workspace = extra
+        let user_supplied_workspace = match extra
             .get("workspace")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned());
+        {
+            Some(workspace) => Some(normalize_workspace_path(workspace)?),
+            None => None,
+        };
         let is_custom_workspace = user_supplied_workspace.is_some();
+        if let Some(workspace) = user_supplied_workspace.as_ref() {
+            extra["workspace"] = serde_json::Value::String(workspace.clone());
+        }
 
         let auto_provisioned_workspace = if user_supplied_workspace.is_none() {
             // Per-conversation temp workspaces live under
@@ -544,7 +588,9 @@ impl ConversationService {
         let mut extra: serde_json::Value =
             serde_json::from_str(&row.extra).map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
         self.backfill_extra_inplace(&row.id, &mut extra).await;
-        row_to_response_with_extra(row, extra, &self.workspace_root)
+        let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
+        response.runtime = Some(self.runtime_summary_for(id).await);
+        Ok(response)
     }
 
     /// List conversations with cursor-based pagination and optional filters.
@@ -660,6 +706,9 @@ impl ConversationService {
             {
                 warn!("aionrs update: stripped legacy `extra.model` from merged extra");
             }
+            if new_extra.get("workspace").is_some() {
+                normalize_workspace_extra(&mut existing_extra)?;
+            }
             Some(
                 serde_json::to_string(&existing_extra)
                     .map_err(|e| AppError::Internal(format!("Failed to serialize merged extra: {e}")))?,
@@ -739,6 +788,9 @@ impl ConversationService {
         let mut merged: serde_json::Value =
             serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
         merge_json(&mut merged, &patch);
+        if patch.get("workspace").is_some() {
+            normalize_workspace_extra(&mut merged)?;
+        }
 
         let updates = ConversationRowUpdate {
             extra: Some(
@@ -1188,7 +1240,7 @@ impl ConversationService {
     ///
     /// 1. Validates the conversation belongs to the user
     /// 2. Stores the user message (position: "right", status: "finish")
-    /// 3. Marks the conversation as running
+    /// 3. Claims the conversation in runtime state
     /// 4. Spawns background agent build/send and stream relay work
     /// 5. Returns immediately (202 Accepted semantics)
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
@@ -1226,16 +1278,7 @@ impl ConversationService {
             ));
         }
 
-        // Check if conversation is already processing (simple guard)
-        let status: ConversationStatus = match row.status.as_deref() {
-            None | Some("") => ConversationStatus::Finished,
-            Some(s) => string_to_enum(s)?,
-        };
-        if status == ConversationStatus::Running {
-            return Err(AppError::Conflict(
-                "Conversation is already processing a message".into(),
-            ));
-        }
+        let turn_claim = self.runtime_state.try_claim_turn(conversation_id)?;
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same
@@ -1289,17 +1332,6 @@ impl ConversationService {
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.workspace.clone();
 
-        // TODO: 好蠢的设计, status 写数据库, 最好干掉啦
-        let update = ConversationRowUpdate {
-            status: Some(enum_to_db(&ConversationStatus::Running)?),
-            updated_at: Some(now_ms()),
-            ..Default::default()
-        };
-
-        if let Err(e) = self.conversation_repo.update(conversation_id, &update).await {
-            warn!(error = %ErrorChain(&e), "Failed to set conversation status to Running");
-            return Err(e.into());
-        }
         let conv_id = conversation_id.to_owned();
         let repo = Arc::clone(&self.conversation_repo);
         let broadcaster = Arc::clone(&self.broadcaster);
@@ -1317,6 +1349,7 @@ impl ConversationService {
         // agent-internal tracing all share one identifier per turn.
         let user_msg_id_ret = user_msg_id.clone();
         tokio::spawn(async move {
+            let mut turn_claim = turn_claim;
             let build_started_at = now_ms();
             info!(conversation_id = %conv_id, "Agent task build started");
             let agent = match task_manager.get_or_build_task(&conv_id, build_opts).await {
@@ -1329,7 +1362,8 @@ impl ConversationService {
                         "Agent task build failed"
                     );
                     service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
-                    StreamRelay::complete_conversation(&repo, &broadcaster, &conv_id).await;
+                    turn_claim.release();
+                    service.complete_turn(&conv_id).await;
                     return;
                 }
             };
@@ -1347,7 +1381,8 @@ impl ConversationService {
                     "Failed to persist resolved workspace"
                 );
                 service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
-                StreamRelay::complete_conversation(&repo, &broadcaster, &conv_id).await;
+                turn_claim.release();
+                service.complete_turn(&conv_id).await;
                 return;
             }
 
@@ -1408,6 +1443,13 @@ impl ConversationService {
                     persist_session_key(&repo, &conv_id, &session_key).await;
                 }
 
+                if service
+                    .evict_acp_task_after_terminal_error(&conv_id, agent.agent_type(), &outcome, &task_manager)
+                    .await
+                {
+                    break;
+                }
+
                 if outcome.system_responses.is_empty() {
                     break;
                 }
@@ -1424,7 +1466,8 @@ impl ConversationService {
                 ));
             }
 
-            StreamRelay::complete_conversation(&repo, &broadcaster, &conv_id).await;
+            turn_claim.release();
+            service.complete_turn(&conv_id).await;
         });
 
         info!(
@@ -1573,7 +1616,16 @@ impl ConversationService {
         }
 
         // Extract workspace from extra (common across agent types)
-        let workspace = extra.get("workspace").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+        let workspace = match extra.get("workspace").and_then(|v| v.as_str()) {
+            Some(workspace) if !workspace.is_empty() => {
+                let normalized = validate_runtime_workspace_path(workspace)?;
+                if normalized != workspace {
+                    extra["workspace"] = serde_json::Value::String(normalized.clone());
+                }
+                normalized
+            }
+            _ => String::new(),
+        };
 
         Ok(BuildTaskOptions {
             agent_type,
@@ -1688,7 +1740,12 @@ impl ConversationService {
     }
 
     /// Broadcast a `conversation.listChanged` WebSocket event.
-    fn broadcast_list_changed(&self, conversation_id: &str, action: &str, source: Option<&ConversationSource>) {
+    pub(crate) fn broadcast_list_changed(
+        &self,
+        conversation_id: &str,
+        action: &str,
+        source: Option<&ConversationSource>,
+    ) {
         let payload = serde_json::json!({
             "conversation_id": conversation_id,
             "action": action,
@@ -1767,6 +1824,58 @@ fn backfill_cron_job_id_alias(extra: &mut serde_json::Value) -> bool {
     }
 
     mutated
+}
+
+fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), AppError> {
+    let Some(obj) = extra.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(workspace) = obj
+        .get("workspace")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+    else {
+        return Ok(());
+    };
+    if workspace.is_empty() {
+        return Ok(());
+    }
+
+    let normalized = normalize_workspace_path(&workspace)?;
+    if normalized != workspace.as_str() {
+        obj.insert("workspace".to_owned(), serde_json::Value::String(normalized));
+    }
+    Ok(())
+}
+
+fn normalize_workspace_path(workspace: &str) -> Result<String, AppError> {
+    if workspace.trim().is_empty() {
+        return Err(AppError::BadRequest("Workspace directory is empty".into()));
+    }
+
+    let workspace_path = PathBuf::from(workspace);
+    if workspace_path_has_whitespace_segment(&workspace_path) {
+        return Err(AppError::WorkspacePathContainsWhitespace(
+            workspace_path.display().to_string(),
+        ));
+    }
+
+    Ok(workspace.to_owned())
+}
+
+fn validate_runtime_workspace_path(workspace: &str) -> Result<String, AppError> {
+    if workspace.trim().is_empty() {
+        return Err(AppError::BadRequest("Workspace directory is empty".into()));
+    }
+
+    let workspace_path = PathBuf::from(workspace);
+    if workspace_path_has_whitespace_segment(&workspace_path) {
+        return Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
+            workspace_path.display().to_string(),
+        ));
+    }
+
+    Ok(workspace.to_owned())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -2215,6 +2324,7 @@ mod tests {
             r#type: agent_type,
             model: None,
             status: ConversationStatus::Pending,
+            runtime: None,
             source: None,
             pinned: false,
             pinned_at: None,

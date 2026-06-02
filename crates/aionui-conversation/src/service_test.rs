@@ -2,17 +2,17 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
-use aionui_ai_agent::protocol::events::{AgentStreamEvent, FinishEventData, TextEventData};
+use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
-use aionui_api_types::ConversationArtifactKind;
+use aionui_api_types::{AgentErrorCode, ConversationArtifactKind};
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
     SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
@@ -36,6 +36,9 @@ use tokio::sync::broadcast;
 
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
+
+#[path = "service_test/acp_error_recovery_test.rs"]
+mod acp_error_recovery_test;
 
 #[derive(Clone, Debug)]
 struct SkillLinkCall {
@@ -478,7 +481,22 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     }
 }
 
-struct StubAcpSessionRepo;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeStateSaveCall {
+    conversation_id: String,
+    current_model_id: Option<Option<String>>,
+}
+
+#[derive(Default)]
+struct StubAcpSessionRepo {
+    runtime_state_saves: Mutex<Vec<RuntimeStateSaveCall>>,
+}
+
+impl StubAcpSessionRepo {
+    fn runtime_state_saves(&self) -> Vec<RuntimeStateSaveCall> {
+        self.runtime_state_saves.lock().unwrap().clone()
+    }
+}
 
 #[async_trait::async_trait]
 impl IAcpSessionRepository for StubAcpSessionRepo {
@@ -507,14 +525,21 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
         Ok(false)
     }
     async fn load_runtime_state(&self, _conversation_id: &str) -> Result<Option<PersistedSessionState>, DbError> {
-        Ok(None)
+        Ok(Some(PersistedSessionState {
+            current_model_id: Some("deepseek-v4-pro".to_owned()),
+            ..Default::default()
+        }))
     }
     async fn save_runtime_state(
         &self,
-        _conversation_id: &str,
-        _params: &SaveRuntimeStateParams<'_>,
+        conversation_id: &str,
+        params: &SaveRuntimeStateParams<'_>,
     ) -> Result<bool, DbError> {
-        Ok(false)
+        self.runtime_state_saves.lock().unwrap().push(RuntimeStateSaveCall {
+            conversation_id: conversation_id.to_owned(),
+            current_model_id: params.current_model_id.map(|outer| outer.map(ToOwned::to_owned)),
+        });
+        Ok(true)
     }
 }
 
@@ -535,10 +560,21 @@ fn make_service_with_resolver(
     Arc<MockRepo>,
     Arc<dyn IWorkerTaskManager>,
 ) {
+    make_service_with_resolver_and_acp_session_repo(skill_resolver, Arc::new(StubAcpSessionRepo::default()))
+}
+
+fn make_service_with_resolver_and_acp_session_repo(
+    skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
+    acp_session_repo: Arc<dyn IAcpSessionRepository>,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<dyn IWorkerTaskManager>,
+) {
     let repo = Arc::new(MockRepo::new());
     let broadcaster = Arc::new(MockBroadcaster::new());
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
     let svc = ConversationService::new(
         std::env::temp_dir(),
@@ -585,6 +621,54 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "aionui");
+}
+
+#[tokio::test]
+async fn create_rejects_workspace_with_trailing_whitespace_in_request() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
+    std::fs::create_dir(&dir).unwrap();
+    let workspace = dir.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace_with_trailing_space = format!("{} ", workspace.to_string_lossy());
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace_with_trailing_space }
+    }))
+    .unwrap();
+    let err = svc.create("user_1", req).await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        AppError::WorkspacePathContainsWhitespace(message)
+            if message == workspace_with_trailing_space
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn create_rejects_workspace_with_whitespace_in_any_path_segment() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
+    std::fs::create_dir(&dir).unwrap();
+    let workspace = dir.join("my project").join("workspace");
+    std::fs::create_dir(dir.join("my project")).unwrap();
+    std::fs::create_dir(&workspace).unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace.to_string_lossy() }
+    }))
+    .unwrap();
+    let err = svc.create("user_1", req).await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        AppError::WorkspacePathContainsWhitespace(message)
+            if message == workspace.to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -636,6 +720,29 @@ async fn get_existing_conversation() {
     let fetched = svc.get("user_1", &created.id).await.unwrap();
     assert_eq!(fetched.id, created.id);
     assert_eq!(fetched.name, created.name);
+    assert!(fetched.runtime.is_some());
+}
+
+#[tokio::test]
+async fn get_reports_idle_runtime_when_only_persisted_status_is_running() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let created = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.update(
+        &created.id,
+        &ConversationRowUpdate {
+            status: Some("running".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let fetched = svc.get("user_1", &created.id).await.unwrap();
+    let runtime = fetched.runtime.expect("runtime summary should be present");
+
+    assert_eq!(fetched.status, ConversationStatus::Running);
+    assert_eq!(runtime.state, aionui_api_types::ConversationRuntimeStateKind::Idle);
+    assert!(runtime.can_send_message);
 }
 
 #[tokio::test]
@@ -1216,17 +1323,29 @@ impl IMockAgent for MockAgent {
 
 struct MockTaskManager {
     agents: Mutex<std::collections::HashMap<String, AgentInstance>>,
+    kill_records: Mutex<Vec<(String, Option<AgentKillReason>)>>,
+    kill_count: AtomicUsize,
 }
 
 impl MockTaskManager {
     fn new() -> Self {
         Self {
             agents: Mutex::new(std::collections::HashMap::new()),
+            kill_records: Mutex::new(Vec::new()),
+            kill_count: AtomicUsize::new(0),
         }
     }
 
     fn insert_agent(&self, conversation_id: &str, agent: AgentInstance) {
         self.agents.lock().unwrap().insert(conversation_id.to_owned(), agent);
+    }
+
+    fn kill_count(&self) -> usize {
+        self.kill_count.load(Ordering::SeqCst)
+    }
+
+    fn kill_records(&self) -> Vec<(String, Option<AgentKillReason>)> {
+        self.kill_records.lock().unwrap().clone()
     }
 }
 
@@ -1298,6 +1417,11 @@ impl IWorkerTaskManager for MockTaskManager {
     }
 
     fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        self.kill_count.fetch_add(1, Ordering::SeqCst);
+        self.kill_records
+            .lock()
+            .unwrap()
+            .push((conversation_id.to_owned(), _reason));
         self.agents.lock().unwrap().remove(conversation_id);
         Ok(())
     }
@@ -1448,6 +1572,7 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
 
 struct ScriptedAgent {
     conversation_id: String,
+    agent_type: AgentType,
     event_tx: broadcast::Sender<AgentStreamEvent>,
     scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
     sent_contents: Mutex<Vec<String>>,
@@ -1458,10 +1583,16 @@ impl ScriptedAgent {
         let (event_tx, _) = broadcast::channel(64);
         Self {
             conversation_id: conversation_id.to_owned(),
+            agent_type: AgentType::Acp,
             event_tx,
             scripts: Mutex::new(VecDeque::from(scripts)),
             sent_contents: Mutex::new(vec![]),
         }
+    }
+
+    fn with_agent_type(mut self, agent_type: AgentType) -> Self {
+        self.agent_type = agent_type;
+        self
     }
 
     fn sent_contents(&self) -> Vec<String> {
@@ -1472,7 +1603,7 @@ impl ScriptedAgent {
 #[async_trait::async_trait]
 impl IAgentTask for ScriptedAgent {
     fn agent_type(&self) -> AgentType {
-        AgentType::Acp
+        self.agent_type
     }
 
     fn conversation_id(&self) -> &str {
@@ -1567,6 +1698,19 @@ fn make_send_req() -> SendMessageRequest {
     .unwrap()
 }
 
+async fn wait_for_turn_released(svc: &ConversationService, conversation_id: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !svc.runtime_state().is_claimed(conversation_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("turn should release runtime claim");
+}
+
 #[tokio::test]
 async fn send_message_returns_accepted() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
@@ -1580,6 +1724,61 @@ async fn send_message_returns_accepted() {
 
     assert!(!msg_id.is_empty(), "msg_id must be non-empty");
     assert_eq!(msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
+}
+
+#[tokio::test]
+async fn send_message_rejects_legacy_workspace_with_runtime_error_code() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let legacy_workspace = "/tmp/my project".to_owned();
+    repo.update(
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(json!({ "workspace": legacy_workspace }).to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let err = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message) if message == "/tmp/my project"
+    ));
+
+    let messages = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+            if messages.iter().any(|message| message.r#type == "tips") {
+                return messages;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("legacy workspace failure should persist an error tip");
+
+    let error_tip = messages
+        .iter()
+        .find(|message| message.r#type == "tips")
+        .expect("legacy workspace failure should persist an error tips message");
+    let content: serde_json::Value = serde_json::from_str(&error_tip.content).unwrap();
+    assert_eq!(
+        content["code"],
+        "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
+    );
+    assert_eq!(content["details"]["workspace_path"], "/tmp/my project");
+    assert_eq!(
+        content["error"]["code"],
+        "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
+    );
+    assert_eq!(content["error"]["workspacePath"], "/tmp/my project");
 }
 
 #[tokio::test]
@@ -1630,7 +1829,11 @@ async fn send_message_returns_before_cold_agent_build_completes() {
     );
 
     let updated = repo.get(&conv.id).await.unwrap().unwrap();
-    assert_eq!(updated.status.as_deref(), Some("running"));
+    assert_ne!(updated.status.as_deref(), Some("running"));
+    assert!(
+        svc.runtime_state().is_claimed(&conv.id),
+        "runtime claim must cover the cold agent build window"
+    );
 }
 
 #[tokio::test]
@@ -1710,6 +1913,10 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
 
     let updated = repo.get(&conv.id).await.unwrap().unwrap();
     assert_eq!(updated.status.as_deref(), Some("finished"));
+    assert!(
+        !svc.runtime_state().is_claimed(&conv.id),
+        "runtime claim must be released after failed turn"
+    );
 
     let events = broadcaster.take_events();
     let error_tip_event = events
@@ -1776,7 +1983,7 @@ async fn send_message_wrong_user_returns_not_found() {
 }
 
 #[tokio::test]
-async fn send_message_running_conversation_returns_conflict() {
+async fn send_message_allows_stale_db_running_without_runtime_claim() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
@@ -1788,6 +1995,21 @@ async fn send_message_running_conversation_returns_conflict() {
         ..Default::default()
     };
     repo.update(&conv.id, &update).await.unwrap();
+
+    let result = svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr).await;
+    assert!(result.is_ok(), "stale DB running must not block sending");
+}
+
+#[tokio::test]
+async fn send_message_rejects_active_runtime_claim() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id)
+        .expect("test claim should be created");
 
     let err = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
@@ -1901,8 +2123,60 @@ async fn send_message_continues_cron_system_responses() {
     assert_eq!(finished.status, ConversationStatus::Finished);
 
     let events = broadcaster.take_events();
-    let turn_completed = events.iter().filter(|evt| evt.name == "turn.completed").count();
-    assert_eq!(turn_completed, 1);
+    let turn_events: Vec<_> = events.iter().filter(|evt| evt.name == "turn.completed").collect();
+    assert_eq!(turn_events.len(), 1);
+    assert_eq!(turn_events[0].data["runtime"]["is_processing"], false);
+    assert_eq!(turn_events[0].data["runtime"]["can_send_message"], true);
+}
+
+#[tokio::test]
+async fn send_message_keeps_acp_task_after_normal_finish() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.kill_count(), 0);
+    assert_eq!(task_mgr.active_count(), 1);
+}
+
+#[tokio::test]
+async fn send_message_does_not_evict_non_acp_task_after_terminal_error() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
+                "aionrs terminal error",
+                Some(AgentErrorCode::UnknownUpstreamError),
+            ))]],
+        )
+        .with_agent_type(AgentType::Aionrs),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.kill_count(), 0);
+    assert_eq!(task_mgr.active_count(), 1);
 }
 
 // ── stop_stream tests ───────────────────────────────────────────
@@ -1996,6 +2270,30 @@ async fn warmup_wrong_user_returns_not_found() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let err = svc.warmup("user_2", &conv.id, &task_mgr).await.unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let legacy_workspace = "/tmp/my project".to_owned();
+    repo.update(
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(json!({ "workspace": legacy_workspace }).to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+    assert!(matches!(
+        err,
+        AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message) if message == "/tmp/my project"
+    ));
 }
 
 // ── Confirmation system tests ────────────────────────────────────

@@ -74,6 +74,7 @@ fn t3_2_error_response_has_all_fields() {
     assert!(json.get("success").is_some());
     assert!(json.get("error").is_some());
     assert!(json.get("code").is_some());
+    assert!(json.get("details").is_none());
 }
 
 // --- T3.3: AppError auto-conversion ---
@@ -159,4 +160,50 @@ fn t3_3_app_error_timeout_to_error_response() {
 
     assert!(!resp.success);
     assert_eq!(resp.code, "TIMEOUT");
+}
+
+#[test]
+fn t3_3_workspace_error_exposes_structured_details() {
+    let err = AppError::WorkspacePathContainsWhitespace("/tmp/Archive ".into());
+    let resp = ErrorResponse::from(err);
+
+    assert!(!resp.success);
+    assert_eq!(resp.code, "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
+    assert_eq!(
+        resp.details.as_ref().and_then(|details| details.get("workspace_path")),
+        Some(&serde_json::json!("/tmp/Archive "))
+    );
+    assert_eq!(
+        resp.details
+            .as_ref()
+            .and_then(|details| details.get("offending_segments")),
+        Some(&serde_json::json!(["Archive "]))
+    );
+    assert_eq!(
+        resp.details.as_ref().and_then(|details| details.get("operation")),
+        Some(&serde_json::json!("create"))
+    );
+}
+
+#[test]
+fn t3_3_runtime_workspace_error_exposes_structured_details() {
+    let err = AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/Archive ".into());
+    let resp = ErrorResponse::from(err);
+
+    assert!(!resp.success);
+    assert_eq!(resp.code, "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
+    assert_eq!(
+        resp.details.as_ref().and_then(|details| details.get("workspace_path")),
+        Some(&serde_json::json!("/tmp/Archive "))
+    );
+    assert_eq!(
+        resp.details
+            .as_ref()
+            .and_then(|details| details.get("offending_segments")),
+        Some(&serde_json::json!(["Archive "]))
+    );
+    assert_eq!(
+        resp.details.as_ref().and_then(|details| details.get("operation")),
+        Some(&serde_json::json!("runtime"))
+    );
 }

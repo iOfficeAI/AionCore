@@ -75,13 +75,13 @@ impl ErrorResponse {
     pub fn new_with_details(
         error: impl Into<String>,
         code: impl Into<String>,
-        details: Option<serde_json::Value>,
+        details: impl Into<Option<serde_json::Value>>,
     ) -> Self {
         Self {
             success: false,
             error: error.into(),
             code: code.into(),
-            details,
+            details: details.into(),
         }
     }
 }
@@ -92,7 +92,7 @@ impl From<AppError> for ErrorResponse {
             success: false,
             error: err.to_string(),
             code: err.error_code().to_owned(),
-            details: None,
+            details: err.error_details(),
         }
     }
 }
@@ -196,6 +196,49 @@ mod tests {
         assert_eq!(resp.error, "Rate limited");
         assert_eq!(resp.code, "RATE_LIMITED");
         assert!(resp.details.is_none());
+    }
+
+    #[test]
+    fn test_error_response_new_with_details() {
+        let resp = ErrorResponse::new_with_details(
+            "Bad request: invalid workspace",
+            "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED",
+            serde_json::json!({ "workspace_path": "/tmp/Archive " }),
+        );
+        assert_eq!(
+            resp.details,
+            Some(serde_json::json!({ "workspace_path": "/tmp/Archive " }))
+        );
+    }
+
+    #[test]
+    fn test_error_response_from_workspace_error_includes_details() {
+        let resp = ErrorResponse::from(AppError::WorkspacePathContainsWhitespace("/tmp/Archive ".into()));
+        assert_eq!(resp.code, "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
+        assert_eq!(
+            resp.details.as_ref().and_then(|details| details.get("workspace_path")),
+            Some(&serde_json::json!("/tmp/Archive "))
+        );
+        assert_eq!(
+            resp.details.as_ref().and_then(|details| details.get("operation")),
+            Some(&serde_json::json!("create"))
+        );
+    }
+
+    #[test]
+    fn test_error_response_from_runtime_workspace_error_includes_details() {
+        let resp = ErrorResponse::from(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
+            "/tmp/Archive ".into(),
+        ));
+        assert_eq!(resp.code, "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
+        assert_eq!(
+            resp.details.as_ref().and_then(|details| details.get("workspace_path")),
+            Some(&serde_json::json!("/tmp/Archive "))
+        );
+        assert_eq!(
+            resp.details.as_ref().and_then(|details| details.get("operation")),
+            Some(&serde_json::json!("runtime"))
+        );
     }
 
     #[test]

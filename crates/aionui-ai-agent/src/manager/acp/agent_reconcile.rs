@@ -39,11 +39,19 @@ impl AcpAgentManager {
     pub(super) async fn reconcile_session(&self, session_id: &str) -> Result<(), AppError> {
         use crate::manager::acp::ReconcileAction;
 
-        let actions = {
-            let session = self.session.read().await;
-            session.plan_reconcile()
+        let (invalid_model, actions) = {
+            let mut session = self.session.write().await;
+            let invalid_model = session.clear_invalid_desired_model();
+            let actions = session.plan_reconcile();
+            (invalid_model, actions)
         };
-
+        if let Some(model) = invalid_model {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                model_id = %model,
+                "reconcile_session: dropped unavailable desired model"
+            );
+        }
         for action in actions {
             match action {
                 ReconcileAction::SetMode { mode } => {

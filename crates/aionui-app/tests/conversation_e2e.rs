@@ -137,6 +137,36 @@ async fn t1_5_create_invalid_type() {
 }
 
 #[tokio::test]
+async fn t1_5b_create_rejects_workspace_paths_with_whitespace_segments() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("my project").join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let body = json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace.to_string_lossy()
+        }
+    });
+    let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Workspace path contains whitespace"),
+        "unexpected error payload: {json}"
+    );
+}
+
+#[tokio::test]
 async fn t1_6_create_requires_auth() {
     let (app, _services) = build_app().await;
 

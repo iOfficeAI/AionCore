@@ -32,6 +32,9 @@ pub enum CronError {
     #[error("Scheduler error: {0}")]
     Scheduler(String),
 
+    #[error(transparent)]
+    App(#[from] AppError),
+
     #[error("{0}")]
     Database(#[from] aionui_db::DbError),
 
@@ -52,8 +55,19 @@ impl From<CronError> for AppError {
             CronError::InvalidSkillContent(msg) => AppError::BadRequest(msg),
             CronError::InvalidAgentConfig(msg) => AppError::BadRequest(msg),
             CronError::Scheduler(msg) => AppError::Internal(msg),
+            CronError::App(app_err) => app_err,
             CronError::Database(db_err) => AppError::from(db_err),
             CronError::Json(e) => AppError::Internal(format!("JSON error: {e}")),
+        }
+    }
+}
+
+impl CronError {
+    pub(crate) fn from_conversation_create(error: AppError) -> Self {
+        match error {
+            AppError::WorkspacePathContainsWhitespace(_) => Self::App(error),
+            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(_) => Self::App(error),
+            other => Self::Scheduler(format!("create conversation: {other}")),
         }
     }
 }
@@ -120,6 +134,24 @@ mod tests {
     fn scheduler_error_maps_to_internal() {
         let err: AppError = CronError::Scheduler("timer failed".into()).into();
         assert!(matches!(err, AppError::Internal(_)));
+    }
+
+    #[test]
+    fn app_error_passthrough_preserves_code() {
+        let err: AppError = CronError::App(AppError::WorkspacePathContainsWhitespace("/tmp/a b".into())).into();
+        assert!(matches!(err, AppError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
+    }
+
+    #[test]
+    fn runtime_workspace_app_error_passthrough_preserves_code() {
+        let err: AppError = CronError::App(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
+            "/tmp/a b".into(),
+        ))
+        .into();
+        assert!(matches!(
+            err,
+            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(msg) if msg == "/tmp/a b"
+        ));
     }
 
     #[test]

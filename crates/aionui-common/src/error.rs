@@ -1,6 +1,9 @@
+use std::path::{Component, Path};
+
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
+use serde_json::{Value, json};
 
 /// Application-level error with HTTP status code mapping.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +46,16 @@ pub enum AppError {
     /// bad-request banner.
     #[error("Conversation archived: {0}")]
     ConversationArchived(String),
+
+    #[error(
+        "Workspace path contains whitespace in one or more directory names: {0}. Rename the affected directory or choose a path without whitespace in any directory name."
+    )]
+    WorkspacePathContainsWhitespace(String),
+
+    #[error(
+        "Workspace path contains whitespace in one or more directory names and is no longer supported for send or warmup: {0}. Rename the affected directory, then update this conversation or task to use a path without whitespace in any directory name."
+    )]
+    WorkspacePathContainsWhitespaceRuntimeUnsupported(String),
 }
 
 /// Internal error response body matching the `ErrorResponse` format from `aionui-api-types`.
@@ -51,6 +64,8 @@ struct ErrorBody {
     success: bool,
     error: String,
     code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Value>,
 }
 
 impl AppError {
@@ -68,6 +83,8 @@ impl AppError {
             Self::Timeout(_) => StatusCode::BAD_GATEWAY,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::ConversationArchived(_) => StatusCode::GONE,
+            Self::WorkspacePathContainsWhitespace(_) => StatusCode::BAD_REQUEST,
+            Self::WorkspacePathContainsWhitespaceRuntimeUnsupported(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -91,8 +108,58 @@ impl AppError {
             Self::Timeout(_) => "TIMEOUT",
             Self::UnprocessableEntity(_) => "UNPROCESSABLE_ENTITY",
             Self::ConversationArchived(_) => "CONVERSATION_ARCHIVED",
+            Self::WorkspacePathContainsWhitespace(_) => "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED",
+            Self::WorkspacePathContainsWhitespaceRuntimeUnsupported(_) => {
+                "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
+            }
         }
     }
+
+    /// Structured error metadata for clients that need stable machine-readable
+    /// context in addition to the top-level error code.
+    pub fn error_details(&self) -> Option<Value> {
+        match self {
+            Self::WorkspacePathContainsWhitespace(path) => Some(workspace_path_whitespace_details(path, "create")),
+            Self::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => {
+                Some(workspace_path_whitespace_details(path, "runtime"))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn workspace_path_whitespace_details(path: &str, operation: &str) -> Value {
+    json!({
+        "field": "workspace",
+        "workspace_path": path,
+        "offending_segments": workspace_path_whitespace_segments(Path::new(path)),
+        "operation": operation,
+    })
+}
+
+/// Return true when any normal directory/file name component in `path`
+/// contains a Unicode whitespace character.
+pub fn workspace_path_has_whitespace_segment(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(segment) => segment.to_string_lossy().chars().any(char::is_whitespace),
+        _ => false,
+    })
+}
+
+fn workspace_path_whitespace_segments(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(segment) => {
+                let value = segment.to_string_lossy().to_string();
+                if value.chars().any(char::is_whitespace) {
+                    Some(value)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 impl IntoResponse for AppError {
@@ -102,6 +169,7 @@ impl IntoResponse for AppError {
             success: false,
             error: self.to_string(),
             code: self.error_code().to_owned(),
+            details: self.error_details(),
         };
         (status, axum::Json(body)).into_response()
     }
@@ -148,6 +216,14 @@ mod tests {
             AppError::UnprocessableEntity("x".into()).status_code(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
+        assert_eq!(
+            AppError::WorkspacePathContainsWhitespace("x".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported("x".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
@@ -168,6 +244,14 @@ mod tests {
         assert_eq!(
             AppError::UnprocessableEntity("x".into()).error_code(),
             "UNPROCESSABLE_ENTITY"
+        );
+        assert_eq!(
+            AppError::WorkspacePathContainsWhitespace("x".into()).error_code(),
+            "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED"
+        );
+        assert_eq!(
+            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported("x".into()).error_code(),
+            "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
         );
     }
 
@@ -207,6 +291,52 @@ mod tests {
         assert_eq!(json["success"], false);
         assert_eq!(json["error"], "Rate limited");
         assert_eq!(json["code"], "RATE_LIMITED");
+        assert!(json.get("details").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_workspace_whitespace_response_contains_details() {
+        let resp = AppError::WorkspacePathContainsWhitespace("/tmp/Archive ".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
+        assert_eq!(json["details"]["field"], "workspace");
+        assert_eq!(json["details"]["workspace_path"], "/tmp/Archive ");
+        assert_eq!(json["details"]["offending_segments"], serde_json::json!(["Archive "]));
+        assert_eq!(json["details"]["operation"], "create");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_runtime_whitespace_response_contains_details() {
+        let resp = AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/Archive ".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
+        assert_eq!(json["details"]["field"], "workspace");
+        assert_eq!(json["details"]["workspace_path"], "/tmp/Archive ");
+        assert_eq!(json["details"]["offending_segments"], serde_json::json!(["Archive "]));
+        assert_eq!(json["details"]["operation"], "runtime");
+    }
+
+    #[test]
+    fn test_workspace_path_has_whitespace_segment() {
+        assert!(workspace_path_has_whitespace_segment(Path::new("/tmp/my project")));
+        assert!(workspace_path_has_whitespace_segment(Path::new("/tmp/project ")));
+        assert!(!workspace_path_has_whitespace_segment(Path::new("/tmp/my-project")));
+    }
+
+    #[test]
+    fn test_workspace_path_whitespace_segments() {
+        assert_eq!(
+            workspace_path_whitespace_segments(Path::new("/tmp/my project/Archive ")),
+            vec!["my project".to_owned(), "Archive ".to_owned()]
+        );
     }
 
     #[derive(Debug, thiserror::Error)]

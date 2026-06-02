@@ -9,7 +9,7 @@ use aionui_ai_agent::{
 };
 
 use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResult};
-use aionui_api_types::WebSocketMessage;
+use aionui_api_types::{AgentErrorCode, ConversationRuntimeSummary, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
 use crate::service::ConversationService;
@@ -48,6 +48,38 @@ struct ThinkingSegmentState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelayOutcome {
     pub system_responses: Vec<String>,
+    pub terminal: RelayTerminal,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RelayTerminal {
+    #[default]
+    Finish,
+    Error {
+        code: Option<AgentErrorCode>,
+        retryable: Option<bool>,
+    },
+    ChannelClosed,
+}
+
+impl RelayTerminal {
+    pub fn is_error(&self) -> bool {
+        matches!(self, Self::Error { .. })
+    }
+
+    pub fn code(&self) -> Option<AgentErrorCode> {
+        match self {
+            Self::Error { code, .. } => *code,
+            Self::Finish | Self::ChannelClosed => None,
+        }
+    }
+
+    pub fn retryable(&self) -> Option<bool> {
+        match self {
+            Self::Error { retryable, .. } => *retryable,
+            Self::Finish | Self::ChannelClosed => None,
+        }
+    }
 }
 
 /// Relays agent stream events to WebSocket and persists messages.
@@ -229,12 +261,27 @@ impl StreamRelay {
                             } else {
                                 "Error"
                             };
-                            info!(
-                                event_type,
-                                elapsed_ms,
-                                text_len = full_text_buffer.len(),
-                                "StreamRelay received terminal event"
-                            );
+                            let terminal = Self::terminal_from_event(&event);
+                            match &terminal {
+                                RelayTerminal::Error { code, retryable } => {
+                                    info!(
+                                        event_type,
+                                        elapsed_ms,
+                                        text_len = full_text_buffer.len(),
+                                        error_code = ?code,
+                                        retryable = ?retryable,
+                                        "StreamRelay received terminal event"
+                                    );
+                                }
+                                RelayTerminal::Finish | RelayTerminal::ChannelClosed => {
+                                    info!(
+                                        event_type,
+                                        elapsed_ms,
+                                        text_len = full_text_buffer.len(),
+                                        "StreamRelay received terminal event"
+                                    );
+                                }
+                            }
 
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(
@@ -248,7 +295,7 @@ impl StreamRelay {
                             )
                             .await;
                             self.forward_to_websocket(&event);
-                            let outcome = self.finalize(&full_text_buffer, &text_segments, &event).await;
+                            let outcome = self.finalize(&full_text_buffer, &text_segments, &event, terminal).await;
                             if self.complete_turn {
                                 Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
                             }
@@ -297,6 +344,7 @@ impl StreamRelay {
                             &full_text_buffer,
                             &text_segments,
                             &AgentStreamEvent::Finish(aionui_ai_agent::protocol::events::FinishEventData::default()),
+                            RelayTerminal::ChannelClosed,
                         )
                         .await;
                     if self.complete_turn {
@@ -339,6 +387,17 @@ impl StreamRelay {
             AgentStreamEvent::System(_) => "System",
             AgentStreamEvent::RequestTrace(_) => "RequestTrace",
             AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
+        }
+    }
+
+    fn terminal_from_event(event: &AgentStreamEvent) -> RelayTerminal {
+        match event {
+            AgentStreamEvent::Error(data) => RelayTerminal::Error {
+                code: data.code,
+                retryable: data.retryable,
+            },
+            AgentStreamEvent::Finish(_) => RelayTerminal::Finish,
+            _ => RelayTerminal::ChannelClosed,
         }
     }
 
@@ -462,8 +521,12 @@ impl StreamRelay {
         text: &str,
         text_segments: &[PersistedTextSegment],
         event: &AgentStreamEvent,
+        terminal: RelayTerminal,
     ) -> RelayOutcome {
-        let mut outcome = RelayOutcome::default();
+        let mut outcome = RelayOutcome {
+            system_responses: Vec::new(),
+            terminal,
+        };
         let status = match event {
             AgentStreamEvent::Error(_) => "error",
             _ => "finish",
@@ -870,6 +933,16 @@ impl StreamRelay {
         broadcaster: &Arc<dyn EventBroadcaster>,
         conversation_id: &str,
     ) {
+        Self::complete_conversation_with_runtime(repo, broadcaster, conversation_id, None).await;
+    }
+
+    #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
+    pub async fn complete_conversation_with_runtime(
+        repo: &Arc<dyn IConversationRepository>,
+        broadcaster: &Arc<dyn EventBroadcaster>,
+        conversation_id: &str,
+        runtime: Option<ConversationRuntimeSummary>,
+    ) {
         let update = aionui_db::ConversationRowUpdate {
             status: Some("finished".to_owned()),
             updated_at: Some(now_ms()),
@@ -884,6 +957,7 @@ impl StreamRelay {
             "session_id": conversation_id,
             "status": "finished",
             "canSendMessage": true,
+            "runtime": runtime,
         });
         let msg = WebSocketMessage::new("turn.completed", payload);
         broadcaster.broadcast(msg);
@@ -962,6 +1036,7 @@ mod tests {
 
         let outcome = relay.consume(rx).await;
         assert!(outcome.system_responses.is_empty());
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
 
         // Should have inserted a message with accumulated text
         let inserts = repo.take_inserts();
@@ -1058,6 +1133,13 @@ mod tests {
 
         let outcome = relay.consume(rx).await;
         assert!(outcome.system_responses.is_empty());
+        assert_eq!(
+            outcome.terminal,
+            RelayTerminal::Error {
+                code: None,
+                retryable: None
+            }
+        );
 
         let inserts = repo.take_inserts();
         assert_eq!(inserts.len(), 1);
@@ -1096,6 +1178,13 @@ mod tests {
 
         let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
         assert!(outcome.system_responses.is_empty());
+        assert_eq!(
+            outcome.terminal,
+            RelayTerminal::Error {
+                code: Some(aionui_api_types::AgentErrorCode::UserLlmProviderAuthFailed),
+                retryable: Some(false)
+            }
+        );
 
         let inserts = repo.take_inserts();
         assert_eq!(inserts.len(), 1);
@@ -1201,6 +1290,13 @@ mod tests {
         let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
         delayed_stream_error.await.unwrap();
         assert!(outcome.system_responses.is_empty());
+        assert_eq!(
+            outcome.terminal,
+            RelayTerminal::Error {
+                code: Some(aionui_api_types::AgentErrorCode::UserLlmProviderAuthFailed),
+                retryable: Some(false)
+            }
+        );
 
         let inserts = repo.take_inserts();
         assert_eq!(inserts.len(), 1);
