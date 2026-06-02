@@ -459,23 +459,37 @@ fn command_basename(command: &str) -> String {
 
 fn missing_command_runtime(command: &str) -> &'static str {
     let command_name = command_basename(command);
-    if matches!(command_name.as_str(), "npx" | "npm" | "node") {
-        "node"
-    } else {
-        "generic"
+    match command_name.as_str() {
+        "npx" | "npm" | "node" | "pnpx" => "node",
+        "bun" | "bunx" => "bun",
+        "uv" | "uvx" => "uv",
+        "python" | "python3" => "python",
+        "deno" => "deno",
+        _ => "generic",
     }
 }
 
 fn command_not_found_message(command: &str) -> String {
-    if missing_command_runtime(command) == "node" {
-        return format!(
+    match missing_command_runtime(command) {
+        "node" => format!(
             "Command not found: {command}. Install Node.js (which includes npm/npx), then restart AionUI or configure this MCP server to use an absolute command path."
-        );
+        ),
+        "bun" => format!(
+            "Command not found: {command}. Install Bun (which includes bun/bunx), then restart AionUI or configure this MCP server to use an absolute command path."
+        ),
+        "uv" => format!(
+            "Command not found: {command}. Install uv, then restart AionUI or configure this MCP server to use an absolute command path."
+        ),
+        "python" => format!(
+            "Command not found: {command}. Install Python, then restart AionUI or configure this MCP server to use an absolute command path."
+        ),
+        "deno" => format!(
+            "Command not found: {command}. Install Deno, then restart AionUI or configure this MCP server to use an absolute command path."
+        ),
+        _ => format!(
+            "Command not found: {command}. Install the command or configure this MCP server to use an absolute command path."
+        ),
     }
-
-    format!(
-        "Command not found: {command}. Install the command or configure this MCP server to use an absolute command path."
-    )
 }
 
 pub(super) fn rpc_error_result(method: &str, err: &JsonRpcError) -> McpConnectionTestResult {
@@ -720,6 +734,46 @@ mod tests {
         assert!(error.contains("Install the command"));
         assert!(error.contains("absolute command path"));
         assert_eq!(result.details.as_ref().unwrap()["runtime"], "generic");
+    }
+
+    #[test]
+    fn spawn_error_not_found_bun_command() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let result = spawn_error_result("bunx", &err);
+        let error = result.error.as_deref().unwrap();
+        assert!(error.contains("Command not found: bunx"));
+        assert!(error.contains("Install Bun"));
+        assert_eq!(result.details.as_ref().unwrap()["runtime"], "bun");
+    }
+
+    #[test]
+    fn spawn_error_not_found_uv_command() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let result = spawn_error_result("uvx", &err);
+        let error = result.error.as_deref().unwrap();
+        assert!(error.contains("Command not found: uvx"));
+        assert!(error.contains("Install uv"));
+        assert_eq!(result.details.as_ref().unwrap()["runtime"], "uv");
+    }
+
+    #[test]
+    fn spawn_error_not_found_python_command() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let result = spawn_error_result("python3", &err);
+        let error = result.error.as_deref().unwrap();
+        assert!(error.contains("Command not found: python3"));
+        assert!(error.contains("Install Python"));
+        assert_eq!(result.details.as_ref().unwrap()["runtime"], "python");
+    }
+
+    #[test]
+    fn spawn_error_not_found_deno_command() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let result = spawn_error_result("deno", &err);
+        let error = result.error.as_deref().unwrap();
+        assert!(error.contains("Command not found: deno"));
+        assert!(error.contains("Install Deno"));
+        assert_eq!(result.details.as_ref().unwrap()["runtime"], "deno");
     }
 
     #[test]
