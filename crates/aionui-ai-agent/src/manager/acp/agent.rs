@@ -429,6 +429,16 @@ impl AcpAgentManager {
 
         {
             let mut session = self.session.write().await;
+            if !session.can_select_model(model_id) {
+                warn!(
+                    conversation_id = %self.params.conversation_id,
+                    model_id = %model_id,
+                    "set_model rejected unavailable ACP model"
+                );
+                return Err(AppError::BadRequest(format!(
+                    "Model '{model_id}' is not available for this ACP session"
+                )));
+            }
             session.set_desired_model(ModelId::new(model_id));
             self.commit_session_changes(&mut session).await;
         }

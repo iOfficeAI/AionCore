@@ -218,6 +218,14 @@ impl AcpSession {
         &self.desired.config_selections
     }
 
+    /// Whether the requested model can be selected in the current session.
+    ///
+    /// Before the ACP backend advertises models, keep the historical permissive
+    /// behavior so initial seeds can still be reconciled once the session opens.
+    pub fn can_select_model(&self, model_id: &str) -> bool {
+        !model_id.is_empty() && self.is_model_valid(model_id)
+    }
+
     /// Set the user's desired mode. Emits `DesiredModeChanged` if the
     /// value actually changed. When advertised modes are known, the mode
     /// must be in the list (otherwise the call is a no-op).

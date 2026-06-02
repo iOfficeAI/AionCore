@@ -320,6 +320,23 @@ fn set_desired_model_validates_against_advertised() {
 }
 
 #[test]
+fn can_select_model_reports_unavailable_advertised_model() {
+    use agent_client_protocol::schema::ModelInfo;
+    let mut session = make_session();
+    session.apply_advertised_models(SessionModelState::new(
+        "claude-sonnet-4",
+        vec![
+            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
+            ModelInfo::new("claude-opus-4", "Opus 4"),
+        ],
+    ));
+
+    assert!(session.can_select_model("claude-opus-4"));
+    assert!(!session.can_select_model("nonexistent"));
+    assert!(!session.can_select_model(""));
+}
+
+#[test]
 fn set_desired_model_allows_any_when_advertised_empty() {
     let mut session = make_session();
     assert!(session.set_desired_model(ModelId::new("anything")));
