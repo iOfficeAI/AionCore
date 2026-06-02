@@ -21,8 +21,22 @@ pub async fn run_server(env: ServerEnvironment, services: AppServices) -> Result
     }
 
     let router = create_router(&services).await;
+    info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        "startup: router ready for socket bind"
+    );
     let addr = env.config.socket_addr();
+    info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        address = %addr,
+        "startup: socket bind started"
+    );
     let listener = TcpListener::bind(&addr).await?;
+    info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        address = %addr,
+        "startup: socket bind completed"
+    );
     info!(elapsed_ms = boot.elapsed().as_millis(), "Server listening on {addr}");
 
     // Kick off the idle-ACP-agent reaper. `start_idle_scanner` returns

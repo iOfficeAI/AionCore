@@ -92,6 +92,10 @@ pub async fn create_router(services: &AppServices) -> Router {
         "startup: channel plugin restore scheduled"
     );
 
+    tracing::info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        "startup: route tree build started"
+    );
     let router = create_router_with_states(services, states);
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -114,6 +118,9 @@ pub fn create_router_with_states(services: &AppServices, states: ModuleStates) -
 /// Full-control variant used by tests that need to override
 /// module services and WebSocket behaviour.
 pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates, ws_state: WsHandlerState) -> Router {
+    let boot = Instant::now();
+    tracing::info!("startup: route tree build with states started");
+
     let auth_state = AuthRouterState {
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
@@ -212,6 +219,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // WebSocket upgrade route — exempt from CSRF (no cookie-based
     // double-submit) but still gets security response headers.
     let ws_routes = Router::new().route("/ws", get(ws_upgrade_handler)).with_state(ws_state);
+    tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: route groups built");
 
     let router = Router::new()
         .route("/health", get(health_check))
@@ -258,6 +266,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let router = router.layer(DefaultBodyLimit::max(aionui_common::constants::BODY_LIMIT));
 
     let router = with_access_log(router);
+    tracing::info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        "startup: route tree build with states completed"
+    );
 
     if services.local {
         let cors = CorsLayer::new()

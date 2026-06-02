@@ -144,6 +144,10 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
             .and_then(|p| p.canonicalize().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("aioncore")),
     );
+    tracing::info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        "startup: backend binary path resolved"
+    );
 
     let pool = services.database.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool));
@@ -154,7 +158,12 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
         encryption_key,
         services.data_dir.clone(),
     );
+    tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: agent service built");
 
+    tracing::info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        "startup: module states bundle started"
+    );
     let states = ModuleStates {
         system: build_system_state(services),
         conversation: build_conversation_state(services, Some(cron.cron_service.clone())),
