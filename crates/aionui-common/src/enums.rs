@@ -204,6 +204,10 @@ pub enum RemoteAgentStatus {
 #[serde(rename_all = "snake_case")]
 pub enum AgentKillReason {
     IdleTimeout,
+    /// The ACP session ended a turn with a terminal error. The conversation is
+    /// preserved; only the in-memory agent task is recycled before the next send
+    /// so a potentially desynchronised upstream session is not reused.
+    AgentErrorRecovery,
     /// Team session is rebuilding the agent process to inject a fresh
     /// `team_mcp_stdio_config`. The conversation is preserved; only the
     /// in-memory ACP CLI is recycled.

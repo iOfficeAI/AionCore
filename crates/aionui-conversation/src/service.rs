@@ -16,8 +16,8 @@ use aionui_api_types::{
     UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
-    AgentType, AppError, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    PaginatedResult, generate_short_id, now_ms,
+    AgentKillReason, AgentType, AppError, ConversationSource, ConversationStatus, ErrorChain, MessageType,
+    OnConversationDelete, PaginatedResult, generate_short_id, now_ms,
 };
 use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
@@ -37,7 +37,7 @@ use crate::convert::{
 };
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
-use crate::stream_relay::StreamRelay;
+use crate::stream_relay::{RelayOutcome, StreamRelay};
 use std::sync::RwLock;
 
 const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
@@ -213,6 +213,42 @@ impl ConversationService {
             Some(runtime),
         )
         .await;
+    }
+
+    async fn evict_acp_task_after_terminal_error(
+        conversation_id: &str,
+        agent_type: AgentType,
+        outcome: &RelayOutcome,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> bool {
+        if agent_type != AgentType::Acp || !outcome.terminal.is_error() {
+            return false;
+        }
+
+        let started_at = now_ms();
+        let error_code = outcome.terminal.code();
+        let retryable = outcome.terminal.retryable();
+        info!(
+            conversation_id,
+            ?agent_type,
+            error_code = ?error_code,
+            retryable = ?retryable,
+            reason = ?AgentKillReason::AgentErrorRecovery,
+            "ACP task marked unhealthy after terminal error; evicting task"
+        );
+        task_manager
+            .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
+            .await;
+        info!(
+            conversation_id,
+            ?agent_type,
+            error_code = ?error_code,
+            retryable = ?retryable,
+            elapsed_ms = now_ms().saturating_sub(started_at),
+            reason = ?AgentKillReason::AgentErrorRecovery,
+            "ACP task eviction completed after terminal error"
+        );
+        true
     }
 }
 
@@ -1425,6 +1461,12 @@ impl ConversationService {
 
                 if let Some(session_key) = agent.get_session_key() {
                     persist_session_key(&repo, &conv_id, &session_key).await;
+                }
+
+                if Self::evict_acp_task_after_terminal_error(&conv_id, agent.agent_type(), &outcome, &task_manager)
+                    .await
+                {
+                    break;
                 }
 
                 if outcome.system_responses.is_empty() {

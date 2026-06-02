@@ -2,17 +2,17 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
-use aionui_ai_agent::protocol::events::{AgentStreamEvent, FinishEventData, TextEventData};
+use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
-use aionui_api_types::ConversationArtifactKind;
+use aionui_api_types::{AgentErrorCode, ConversationArtifactKind};
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
     SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
@@ -1239,17 +1239,29 @@ impl IMockAgent for MockAgent {
 
 struct MockTaskManager {
     agents: Mutex<std::collections::HashMap<String, AgentInstance>>,
+    kill_records: Mutex<Vec<(String, Option<AgentKillReason>)>>,
+    kill_count: AtomicUsize,
 }
 
 impl MockTaskManager {
     fn new() -> Self {
         Self {
             agents: Mutex::new(std::collections::HashMap::new()),
+            kill_records: Mutex::new(Vec::new()),
+            kill_count: AtomicUsize::new(0),
         }
     }
 
     fn insert_agent(&self, conversation_id: &str, agent: AgentInstance) {
         self.agents.lock().unwrap().insert(conversation_id.to_owned(), agent);
+    }
+
+    fn kill_count(&self) -> usize {
+        self.kill_count.load(Ordering::SeqCst)
+    }
+
+    fn kill_records(&self) -> Vec<(String, Option<AgentKillReason>)> {
+        self.kill_records.lock().unwrap().clone()
     }
 }
 
@@ -1321,6 +1333,11 @@ impl IWorkerTaskManager for MockTaskManager {
     }
 
     fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        self.kill_count.fetch_add(1, Ordering::SeqCst);
+        self.kill_records
+            .lock()
+            .unwrap()
+            .push((conversation_id.to_owned(), _reason));
         self.agents.lock().unwrap().remove(conversation_id);
         Ok(())
     }
@@ -1471,6 +1488,7 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
 
 struct ScriptedAgent {
     conversation_id: String,
+    agent_type: AgentType,
     event_tx: broadcast::Sender<AgentStreamEvent>,
     scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
     sent_contents: Mutex<Vec<String>>,
@@ -1481,10 +1499,16 @@ impl ScriptedAgent {
         let (event_tx, _) = broadcast::channel(64);
         Self {
             conversation_id: conversation_id.to_owned(),
+            agent_type: AgentType::Acp,
             event_tx,
             scripts: Mutex::new(VecDeque::from(scripts)),
             sent_contents: Mutex::new(vec![]),
         }
+    }
+
+    fn with_agent_type(mut self, agent_type: AgentType) -> Self {
+        self.agent_type = agent_type;
+        self
     }
 
     fn sent_contents(&self) -> Vec<String> {
@@ -1495,7 +1519,7 @@ impl ScriptedAgent {
 #[async_trait::async_trait]
 impl IAgentTask for ScriptedAgent {
     fn agent_type(&self) -> AgentType {
-        AgentType::Acp
+        self.agent_type
     }
 
     fn conversation_id(&self) -> &str {
@@ -1588,6 +1612,19 @@ fn make_send_req() -> SendMessageRequest {
         "content": "Hello"
     }))
     .unwrap()
+}
+
+async fn wait_for_turn_released(svc: &ConversationService, conversation_id: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !svc.runtime_state().is_claimed(conversation_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("turn should release runtime claim");
 }
 
 #[tokio::test]
@@ -1951,6 +1988,95 @@ async fn send_message_continues_cron_system_responses() {
     assert_eq!(turn_events.len(), 1);
     assert_eq!(turn_events[0].data["runtime"]["is_processing"], false);
     assert_eq!(turn_events[0].data["runtime"]["can_send_message"], true);
+}
+
+#[tokio::test]
+async fn send_message_evicts_acp_task_after_terminal_error() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
+            "Agent completed the turn without producing visible output.",
+            Some(AgentErrorCode::UnknownUpstreamError),
+        ))]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if task_mgr.kill_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ACP terminal error should evict the cached task");
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.active_count(), 0);
+    assert_eq!(
+        task_mgr.kill_records(),
+        vec![(conv.id.clone(), Some(AgentKillReason::AgentErrorRecovery))]
+    );
+}
+
+#[tokio::test]
+async fn send_message_keeps_acp_task_after_normal_finish() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.kill_count(), 0);
+    assert_eq!(task_mgr.active_count(), 1);
+}
+
+#[tokio::test]
+async fn send_message_does_not_evict_non_acp_task_after_terminal_error() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
+                "aionrs terminal error",
+                Some(AgentErrorCode::UnknownUpstreamError),
+            ))]],
+        )
+        .with_agent_type(AgentType::Aionrs),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.kill_count(), 0);
+    assert_eq!(task_mgr.active_count(), 1);
 }
 
 // ── stop_stream tests ───────────────────────────────────────────
