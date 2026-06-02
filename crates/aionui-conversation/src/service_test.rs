@@ -588,6 +588,49 @@ async fn create_returns_conversation_with_defaults() {
 }
 
 #[tokio::test]
+async fn create_trims_user_workspace_trailing_whitespace() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
+    std::fs::create_dir(&dir).unwrap();
+    let workspace = dir.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace_with_trailing_space = format!("{} ", workspace.to_string_lossy());
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace_with_trailing_space }
+    }))
+    .unwrap();
+    let resp = svc.create("user_1", req).await.unwrap();
+
+    assert_eq!(resp.extra["workspace"], workspace.to_string_lossy().as_ref());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn create_rejects_existing_workspace_with_trailing_whitespace_name() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
+    std::fs::create_dir(&dir).unwrap();
+    let workspace = dir.join("workspace ");
+    std::fs::create_dir(&workspace).unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace.to_string_lossy() }
+    }))
+    .unwrap();
+    let err = svc.create("user_1", req).await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        AppError::BadRequest(message)
+            if message.contains("ending in whitespace are not supported")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn create_with_custom_name_and_source() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
 

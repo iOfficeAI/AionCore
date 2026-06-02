@@ -31,25 +31,6 @@ pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AppError> {
         return Err(AppError::BadRequest("Workspace directory is empty".into()));
     }
 
-    let path = PathBuf::from(cwd);
-    match fs::metadata(&path) {
-        Ok(metadata) if metadata.is_dir() => return Ok(path),
-        Ok(_) => {
-            return Err(AppError::BadRequest(format!(
-                "Workspace path is not a directory: {}",
-                path.display()
-            )));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(AppError::BadRequest(format!(
-                "Workspace directory is not accessible: {}: {}",
-                path.display(),
-                e
-            )));
-        }
-    };
-
     let trimmed = cwd.trim_end();
     if trimmed.is_empty() {
         return Err(AppError::BadRequest("Workspace directory is empty".into()));
@@ -60,7 +41,7 @@ pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AppError> {
         warn!(
             original_cwd = %cwd,
             normalized_cwd = %trimmed,
-            "Normalized CLI process cwd by trimming trailing whitespace after exact path lookup failed"
+            "Normalized CLI process cwd by trimming trailing whitespace"
         );
     }
 
@@ -70,10 +51,21 @@ pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AppError> {
             "Workspace path is not a directory: {}",
             normalized_path.display()
         ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::BadRequest(format!(
-            "Workspace directory does not exist: {}",
-            path.display()
-        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if trimmed != cwd {
+                let original_path = PathBuf::from(cwd);
+                if fs::metadata(&original_path).is_ok_and(|metadata| metadata.is_dir()) {
+                    return Err(AppError::BadRequest(format!(
+                        "Workspace directory names ending in whitespace are not supported: {}. Rename the directory or choose a path without trailing whitespace.",
+                        original_path.display()
+                    )));
+                }
+            }
+            Err(AppError::BadRequest(format!(
+                "Workspace directory does not exist: {}",
+                normalized_path.display()
+            )))
+        }
         Err(e) => Err(AppError::BadRequest(format!(
             "Workspace directory is not accessible: {}: {}",
             normalized_path.display(),
@@ -432,7 +424,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_preserves_existing_trailing_space_cwd() {
+    async fn spawn_rejects_existing_trailing_space_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("workspace ");
         fs::create_dir(&cwd).unwrap();
@@ -443,17 +435,13 @@ pub(super) mod tests {
             env: vec![],
             cwd: Some(cwd.to_string_lossy().into_owned()),
         };
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
-        let mut rx = proc.subscribe();
 
-        let event = timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("Timed out")
-            .expect("Channel closed");
-        assert_eq!(
-            fs::canonicalize(event["cwd"].as_str().unwrap()).unwrap(),
-            fs::canonicalize(&cwd).unwrap()
-        );
+        let result = CliAgentProcess::spawn(config).await;
+        assert!(matches!(
+            result,
+            Err(AppError::BadRequest(message))
+                if message.contains("ending in whitespace are not supported")
+        ));
     }
 
     #[tokio::test]
