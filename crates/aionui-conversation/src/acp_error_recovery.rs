@@ -1,15 +1,129 @@
 use std::sync::Arc;
 
 use aionui_api_types::AgentErrorCode;
-use aionui_common::{AgentKillReason, AgentType, now_ms};
-use aionui_db::SaveRuntimeStateParams;
+use aionui_common::{AgentKillReason, AgentType, ConversationSource, now_ms};
+use aionui_db::{ConversationRowUpdate, SaveRuntimeStateParams};
 use tracing::{info, warn};
 
+use crate::convert::string_to_enum;
 use crate::service::ConversationService;
 use crate::stream_relay::RelayOutcome;
 use aionui_ai_agent::IWorkerTaskManager;
 
 impl ConversationService {
+    async fn clear_conversation_model_seed_after_model_not_found(
+        &self,
+        conversation_id: &str,
+        error_code: Option<AgentErrorCode>,
+    ) {
+        if error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound) {
+            return;
+        }
+
+        let row = match self.conversation_repo().get(conversation_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                warn!(
+                    conversation_id,
+                    error_code = ?error_code,
+                    reason = ?AgentKillReason::AgentErrorRecovery,
+                    "Conversation ACP model seed clear skipped because conversation row is missing"
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    conversation_id,
+                    error = %err,
+                    error_code = ?error_code,
+                    reason = ?AgentKillReason::AgentErrorRecovery,
+                    "Failed to load conversation before clearing ACP model seed"
+                );
+                return;
+            }
+        };
+
+        let mut extra: serde_json::Value = match serde_json::from_str(&row.extra) {
+            Ok(extra) => extra,
+            Err(err) => {
+                warn!(
+                    conversation_id,
+                    error = %err,
+                    error_code = ?error_code,
+                    reason = ?AgentKillReason::AgentErrorRecovery,
+                    "Conversation ACP model seed clear skipped because extra JSON is invalid"
+                );
+                return;
+            }
+        };
+
+        let Some(extra_obj) = extra.as_object_mut() else {
+            warn!(
+                conversation_id,
+                error_code = ?error_code,
+                reason = ?AgentKillReason::AgentErrorRecovery,
+                "Conversation ACP model seed clear skipped because extra is not an object"
+            );
+            return;
+        };
+        let Some(previous_model_value) = extra_obj.remove("current_model_id") else {
+            return;
+        };
+        let previous_model_id = previous_model_value.as_str().map(ToOwned::to_owned);
+        if previous_model_id.is_none() {
+            warn!(
+                conversation_id,
+                error_code = ?error_code,
+                reason = ?AgentKillReason::AgentErrorRecovery,
+                "Conversation ACP model seed was malformed and will be cleared"
+            );
+        }
+
+        let extra_json = match serde_json::to_string(&extra) {
+            Ok(json) => json,
+            Err(err) => {
+                warn!(
+                    conversation_id,
+                    ?previous_model_id,
+                    error = %err,
+                    error_code = ?error_code,
+                    reason = ?AgentKillReason::AgentErrorRecovery,
+                    "Failed to serialize conversation extra after clearing ACP model seed"
+                );
+                return;
+            }
+        };
+        let update = ConversationRowUpdate {
+            extra: Some(extra_json),
+            updated_at: Some(now_ms()),
+            ..Default::default()
+        };
+        if let Err(err) = self.conversation_repo().update(conversation_id, &update).await {
+            warn!(
+                conversation_id,
+                ?previous_model_id,
+                error = %err,
+                error_code = ?error_code,
+                reason = ?AgentKillReason::AgentErrorRecovery,
+                "Failed to clear conversation ACP model seed after model_not_found"
+            );
+            return;
+        }
+
+        let source = row
+            .source
+            .as_deref()
+            .and_then(|value| string_to_enum::<ConversationSource>(value).ok());
+        self.broadcast_list_changed(conversation_id, "updated", source.as_ref());
+        info!(
+            conversation_id,
+            ?previous_model_id,
+            error_code = ?error_code,
+            reason = ?AgentKillReason::AgentErrorRecovery,
+            "Conversation ACP model seed cleared after model_not_found"
+        );
+    }
+
     async fn clear_persisted_acp_model_after_model_not_found(
         &self,
         conversation_id: &str,
@@ -98,6 +212,8 @@ impl ConversationService {
             .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
             .await;
         self.clear_persisted_acp_model_after_model_not_found(conversation_id, error_code)
+            .await;
+        self.clear_conversation_model_seed_after_model_not_found(conversation_id, error_code)
             .await;
         info!(
             conversation_id,

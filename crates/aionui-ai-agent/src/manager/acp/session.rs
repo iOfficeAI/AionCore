@@ -254,6 +254,23 @@ impl AcpSession {
         true
     }
 
+    /// Drop a desired model that is not advertised by the active ACP session.
+    ///
+    /// Initial model seeds can be loaded before `session/new` reports the
+    /// provider's available models. Once advertised models are known, reconcile
+    /// must not issue `session/set_model` for a stale seed.
+    pub fn clear_invalid_desired_model(&mut self) -> Option<ModelId> {
+        let model = self.desired.model_id.clone()?;
+        if self.is_model_valid(model.as_str()) {
+            return None;
+        }
+        self.desired.model_id = None;
+        if self.pending_model_notice.as_ref() == Some(&model) {
+            self.pending_model_notice = None;
+        }
+        Some(model)
+    }
+
     /// Set a user's desired config selection.
     pub fn set_desired_config(&mut self, key: ConfigKey, value: ConfigValue) {
         let changed = self.desired.config_selections.get(&key) != Some(&value);

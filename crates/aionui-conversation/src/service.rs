@@ -1719,7 +1719,12 @@ impl ConversationService {
     }
 
     /// Broadcast a `conversation.listChanged` WebSocket event.
-    fn broadcast_list_changed(&self, conversation_id: &str, action: &str, source: Option<&ConversationSource>) {
+    pub(crate) fn broadcast_list_changed(
+        &self,
+        conversation_id: &str,
+        action: &str,
+        source: Option<&ConversationSource>,
+    ) {
         let payload = serde_json::json!({
             "conversation_id": conversation_id,
             "action": action,

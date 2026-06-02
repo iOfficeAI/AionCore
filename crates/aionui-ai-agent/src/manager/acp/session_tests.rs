@@ -364,6 +364,31 @@ fn new_with_initial_model_sets_desired_model() {
 }
 
 #[test]
+fn clear_invalid_desired_model_drops_stale_initial_model() {
+    use agent_client_protocol::schema::ModelInfo;
+
+    let mut session = AcpSession::new(None, Some(ModelId::new("deepseek-v4-pro")), HashMap::new());
+    session.apply_advertised_models(SessionModelState::new(
+        "opus",
+        vec![
+            ModelInfo::new("default", "Default"),
+            ModelInfo::new("opus", "Opus"),
+            ModelInfo::new("sonnet", "Sonnet"),
+        ],
+    ));
+
+    assert_eq!(
+        session.clear_invalid_desired_model(),
+        Some(ModelId::new("deepseek-v4-pro"))
+    );
+    assert_eq!(session.desired_model(), None);
+    assert!(
+        session.plan_reconcile().is_empty(),
+        "invalid desired model must not produce session/set_model"
+    );
+}
+
+#[test]
 fn apply_advertised_config_options_emits_observed_config_synced_on_change() {
     let mut session = AcpSession::new(None, None, HashMap::new());
     session.apply_advertised_config_options(vec![SessionConfigOption::select(

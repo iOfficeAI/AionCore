@@ -42,12 +42,27 @@ async fn send_message_evicts_acp_task_after_terminal_error() {
 #[tokio::test]
 async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     let acp_session_repo = Arc::new(StubAcpSessionRepo::default());
-    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
         Arc::new(FixedSkillResolver { names: vec![] }),
         acp_session_repo.clone(),
     );
     let task_mgr = Arc::new(MockTaskManager::new());
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.update(
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(
+                serde_json::to_string(&json!({
+                    "workspace": "/project",
+                    "current_model_id": "deepseek-v4-pro",
+                }))
+                .unwrap(),
+            ),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     let scripted_agent = Arc::new(ScriptedAgent::new(
         &conv.id,
@@ -83,9 +98,17 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     assert_eq!(
         acp_session_repo.runtime_state_saves(),
         vec![RuntimeStateSaveCall {
-            conversation_id: conv.id,
+            conversation_id: conv.id.clone(),
             current_model_id: Some(None),
         }]
+    );
+
+    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert!(extra.get("workspace").is_some());
+    assert!(
+        extra.get("current_model_id").is_none(),
+        "model_not_found must clear conversation.extra.current_model_id so rebuild cannot reseed stale desired model"
     );
 }
 
