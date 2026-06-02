@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.19](https://github.com/iOfficeAI/AionCore/compare/v0.1.18...v0.1.19) (2026-06-02)
+
+
+### Bug Fixes
+
+* **aionui-ai-agent:** classify aionrs API connection errors ([#389](https://github.com/iOfficeAI/AionCore/issues/389)) ([c3f16f7](https://github.com/iOfficeAI/AionCore/commit/c3f16f7453d061d0865cb7c61eca183a6d6e797f))
+* classify missing MCP launcher runtimes ([#387](https://github.com/iOfficeAI/AionCore/issues/387)) ([fd8c20c](https://github.com/iOfficeAI/AionCore/commit/fd8c20cc0f6f36805cf5acc1fee3c708296d661a))
+* enforce workspace path whitespace errors across create and runtime ([#381](https://github.com/iOfficeAI/AionCore/issues/381)) ([9448a36](https://github.com/iOfficeAI/AionCore/commit/9448a36cec456648bd87a680e9dc84083038a63a))
+* **startup:** add startup phase diagnostics ([#388](https://github.com/iOfficeAI/AionCore/issues/388)) ([d24d027](https://github.com/iOfficeAI/AionCore/commit/d24d02726e03b852c8ee87caa872ed1605509143))
+
 ## [0.1.18](https://github.com/iOfficeAI/AionCore/compare/v0.1.17...v0.1.18) (2026-06-01)
 
 
