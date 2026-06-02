@@ -55,6 +55,7 @@ impl CloseReason {
             CloseReason::UserCancel => "Conversation cancelled".to_owned(),
             CloseReason::Killed { reason } => match reason {
                 Some(AgentKillReason::IdleTimeout) => "Agent killed: idle timeout".to_owned(),
+                Some(AgentKillReason::AgentErrorRecovery) => "Agent killed: error recovery".to_owned(),
                 Some(AgentKillReason::TeamMcpRebuild) => "Agent killed: team MCP rebuild".to_owned(),
                 Some(AgentKillReason::TeamDeleted) => "Agent killed: team deleted".to_owned(),
                 Some(AgentKillReason::ConversationDeleted) => "Agent killed: conversation deleted".to_owned(),

@@ -320,6 +320,23 @@ fn set_desired_model_validates_against_advertised() {
 }
 
 #[test]
+fn can_select_model_reports_unavailable_advertised_model() {
+    use agent_client_protocol::schema::ModelInfo;
+    let mut session = make_session();
+    session.apply_advertised_models(SessionModelState::new(
+        "claude-sonnet-4",
+        vec![
+            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
+            ModelInfo::new("claude-opus-4", "Opus 4"),
+        ],
+    ));
+
+    assert!(session.can_select_model("claude-opus-4"));
+    assert!(!session.can_select_model("nonexistent"));
+    assert!(!session.can_select_model(""));
+}
+
+#[test]
 fn set_desired_model_allows_any_when_advertised_empty() {
     let mut session = make_session();
     assert!(session.set_desired_model(ModelId::new("anything")));
@@ -361,6 +378,31 @@ fn plan_reconcile_model_aligned_when_observed_matches() {
 fn new_with_initial_model_sets_desired_model() {
     let session = AcpSession::new(None, Some(ModelId::new("claude-opus-4")), HashMap::new());
     assert_eq!(session.desired_model(), Some("claude-opus-4"));
+}
+
+#[test]
+fn clear_invalid_desired_model_drops_stale_initial_model() {
+    use agent_client_protocol::schema::ModelInfo;
+
+    let mut session = AcpSession::new(None, Some(ModelId::new("deepseek-v4-pro")), HashMap::new());
+    session.apply_advertised_models(SessionModelState::new(
+        "opus",
+        vec![
+            ModelInfo::new("default", "Default"),
+            ModelInfo::new("opus", "Opus"),
+            ModelInfo::new("sonnet", "Sonnet"),
+        ],
+    ));
+
+    assert_eq!(
+        session.clear_invalid_desired_model(),
+        Some(ModelId::new("deepseek-v4-pro"))
+    );
+    assert_eq!(session.desired_model(), None);
+    assert!(
+        session.plan_reconcile().is_empty(),
+        "invalid desired model must not produce session/set_model"
+    );
 }
 
 #[test]

@@ -44,7 +44,19 @@ impl ConversationService {
         if req.model_id.trim().is_empty() {
             return Err(AppError::BadRequest("model_id must not be empty".into()));
         }
-        self.task(conversation_id)?.set_model(&req.model_id).await
+        let task = match self.task(conversation_id) {
+            Ok(task) => task,
+            Err(err) => {
+                tracing::warn!(
+                    conversation_id,
+                    model_id = %req.model_id,
+                    error_code = err.error_code(),
+                    "Set model skipped because active agent task is unavailable"
+                );
+                return Err(err);
+            }
+        };
+        task.set_model(&req.model_id).await
     }
 
     // ── Usage / Slash commands ──────────────────────────────────────

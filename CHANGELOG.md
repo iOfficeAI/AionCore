@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.18](https://github.com/iOfficeAI/AionCore/compare/v0.1.17...v0.1.18) (2026-06-01)
+
+
+### Bug Fixes
+
+* **agent:** classify Bedrock 'model identifier is invalid' as model-not-found (AIO-12) ([#377](https://github.com/iOfficeAI/AionCore/issues/377)) ([07dc3ac](https://github.com/iOfficeAI/AionCore/commit/07dc3ac8b2fae8962e8a7e31a223875669e11ba1))
+* **agent:** preserve process-group cleanup after leader exit ([#369](https://github.com/iOfficeAI/AionCore/issues/369)) ([73d4fb4](https://github.com/iOfficeAI/AionCore/commit/73d4fb4f4e4647352ba3dcac07e4a6b277e46c7b))
+* **agent:** tighten send_error classifier (AIO-87, AIO-89, AIO-90) ([#375](https://github.com/iOfficeAI/AionCore/issues/375)) ([d9a2f76](https://github.com/iOfficeAI/AionCore/commit/d9a2f763d14ec642c09f3aef5a2d8b716f4b0648))
+* **aionui-ai-agent:** strip HTML body from sanitized error detail (AIO-13) ([#380](https://github.com/iOfficeAI/AionCore/issues/380)) ([9fc5d8c](https://github.com/iOfficeAI/AionCore/commit/9fc5d8c088c644f771457bf50658ac7c6e98c1dc))
+* recover deleted conversation workspaces ([#379](https://github.com/iOfficeAI/AionCore/issues/379)) ([759afb8](https://github.com/iOfficeAI/AionCore/commit/759afb88ed404a055abd686c427e5805161b812b))
+
 ## [0.1.17](https://github.com/iOfficeAI/AionCore/compare/v0.1.16...v0.1.17) (2026-05-30)
 
 

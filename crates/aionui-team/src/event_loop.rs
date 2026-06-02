@@ -5,6 +5,7 @@ use aionui_ai_agent::IWorkerTaskManager;
 use aionui_ai_agent::types::SendMessageData;
 use aionui_common::ConversationStatus;
 use aionui_conversation::ConversationService;
+use aionui_conversation::runtime_state::TurnClaim;
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use tokio::sync::Notify;
@@ -96,6 +97,11 @@ pub struct AgentLoopContext {
     pub registry: Arc<EventLoopRegistry>,
 }
 
+struct TurnExecution {
+    finish_ok: bool,
+    claim: TurnClaim,
+}
+
 /// The event loop for one agent slot. Spawned as a tokio task.
 ///
 /// Flow:
@@ -154,7 +160,7 @@ async fn run_event_loop(
             }
 
             match execute_turn(&ctx, &input).await {
-                Some(finish_ok) => finalize_turn(&ctx, finish_ok, &input.conversation_id).await,
+                Some(turn) => finalize_turn(&ctx, turn, &input.conversation_id).await,
                 None => break, // Turn not started (guard/warmup); retry on next signal
             }
         }
@@ -164,7 +170,7 @@ async fn run_event_loop(
 /// Execute one agent turn: warmup → guard → set Working → StreamRelay → send_message (blocking).
 /// Returns `Some(true)` on success, `Some(false)` on error,
 /// `None` if the turn was not started (guard hit, warmup fail, etc.).
-async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput) -> Option<bool> {
+async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput) -> Option<TurnExecution> {
     ctx.session.mirror_unread_to_conversation(input).await;
 
     // Ensure agent task exists
@@ -204,21 +210,27 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
     if handle.status() == Some(ConversationStatus::Running) {
         return None;
     }
-    let repo = ctx.conversation_service.conversation_repo();
-    if let Ok(Some(row)) = repo.get(&input.conversation_id).await
-        && row.status.as_deref() == Some("running")
+    let claim = match ctx
+        .conversation_service
+        .runtime_state()
+        .try_claim_turn(&input.conversation_id)
     {
-        return None;
-    }
-
-    // Point-of-no-return: set Working + claim DB running
-    let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Working).await;
-    let update = aionui_db::ConversationRowUpdate {
-        status: Some("running".to_owned()),
-        updated_at: Some(aionui_common::now_ms()),
-        ..Default::default()
+        Ok(claim) => claim,
+        Err(e) => {
+            warn!(
+                team_id = %ctx.team_id,
+                slot_id = %ctx.slot_id,
+                conversation_id = %input.conversation_id,
+                error = %e,
+                "event loop: runtime turn claim rejected"
+            );
+            return None;
+        }
     };
-    let _ = repo.update(&input.conversation_id, &update).await;
+
+    // Point-of-no-return: set Working. Runtime state, not DB status, is the turn guard.
+    let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Working).await;
+    let repo = ctx.conversation_service.conversation_repo();
 
     // StreamRelay for response persistence + WebSocket forwarding
     let msg_id = ConversationService::mint_msg_id();
@@ -276,21 +288,17 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
         );
     }
 
-    Some(turn_ok)
+    Some(TurnExecution {
+        finish_ok: turn_ok,
+        claim,
+    })
 }
 
-/// Finalize a completed turn: reset DB status, mark idle (or error), cascade to leader.
-async fn finalize_turn(ctx: &AgentLoopContext, finish_ok: bool, conversation_id: &str) {
-    // Reset conversation DB status so future turns pass the guard check.
-    let repo = ctx.conversation_service.conversation_repo();
-    let update = aionui_db::ConversationRowUpdate {
-        status: Some("finished".to_owned()),
-        updated_at: Some(aionui_common::now_ms()),
-        ..Default::default()
-    };
-    let _ = repo.update(conversation_id, &update).await;
+/// Finalize a completed turn: release runtime claim, mark idle (or error), cascade to leader.
+async fn finalize_turn(ctx: &AgentLoopContext, mut turn: TurnExecution, _conversation_id: &str) {
+    turn.claim.release();
 
-    if !finish_ok {
+    if !turn.finish_ok {
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
     }
     match ctx.scheduler.finalize_turn(&ctx.slot_id, &[]).await {

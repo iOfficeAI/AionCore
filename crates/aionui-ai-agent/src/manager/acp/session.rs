@@ -218,6 +218,14 @@ impl AcpSession {
         &self.desired.config_selections
     }
 
+    /// Whether the requested model can be selected in the current session.
+    ///
+    /// Before the ACP backend advertises models, keep the historical permissive
+    /// behavior so initial seeds can still be reconciled once the session opens.
+    pub fn can_select_model(&self, model_id: &str) -> bool {
+        !model_id.is_empty() && self.is_model_valid(model_id)
+    }
+
     /// Set the user's desired mode. Emits `DesiredModeChanged` if the
     /// value actually changed. When advertised modes are known, the mode
     /// must be in the list (otherwise the call is a no-op).
@@ -252,6 +260,23 @@ impl AcpSession {
         self.desired.model_id = Some(model.clone());
         self.pending_events.push(AcpSessionEvent::DesiredModelChanged { model });
         true
+    }
+
+    /// Drop a desired model that is not advertised by the active ACP session.
+    ///
+    /// Initial model seeds can be loaded before `session/new` reports the
+    /// provider's available models. Once advertised models are known, reconcile
+    /// must not issue `session/set_model` for a stale seed.
+    pub fn clear_invalid_desired_model(&mut self) -> Option<ModelId> {
+        let model = self.desired.model_id.clone()?;
+        if self.is_model_valid(model.as_str()) {
+            return None;
+        }
+        self.desired.model_id = None;
+        if self.pending_model_notice.as_ref() == Some(&model) {
+            self.pending_model_notice = None;
+        }
+        Some(model)
     }
 
     /// Set a user's desired config selection.
