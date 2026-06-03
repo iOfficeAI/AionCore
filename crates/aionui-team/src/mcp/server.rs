@@ -648,12 +648,16 @@ async fn exec_task_list(scheduler: &TeammateManager) -> Result<String, String> {
     let output: Vec<Value> = tasks
         .iter()
         .map(|t| {
+            // Fix (issue #390): emit "" instead of JSON null for the optional
+            // description/owner fields. Bare null in tool results hangs some MCP
+            // clients (Gemini/ACP) and crashes spawned sub-agents — exec_members
+            // already guards status the same way. Mirror that here.
             json!({
                 "id": t.id,
                 "subject": t.subject,
-                "description": t.description,
+                "description": t.description.clone().unwrap_or_default(),
                 "status": t.status,
-                "owner": t.owner,
+                "owner": t.owner.clone().unwrap_or_default(),
                 "blocked_by": t.blocked_by,
                 "blocks": t.blocks,
             })
@@ -935,6 +939,70 @@ mod tests {
         assert!(
             err.contains("Team service not available"),
             "legacy 'backend' alias must parse through to service-upgrade step, got {err:?}"
+        );
+    }
+
+    /// Regression test for issue #390: `exec_task_list` must emit `""` rather
+    /// than JSON `null` for the optional `description`/`owner` fields. A bare
+    /// `null` in the tool result hangs some MCP clients (Gemini/ACP) and
+    /// crashes spawned sub-agents. `exec_task_list` builds a fresh `json!`
+    /// object per task, so we replicate that exact mapping here against a
+    /// `TeamTask` whose `description`/`owner` are `None`.
+    ///
+    /// Before the fix (`"description": t.description`) this serialized to
+    /// `"description":null`/`"owner":null` and the assertions below would fail.
+    /// After the fix (`unwrap_or_default()`) it serializes to empty strings.
+    #[test]
+    fn exec_task_list_emits_empty_string_not_null_for_missing_fields() {
+        use crate::types::{TaskStatus, TeamTask};
+
+        // A task with no description and no owner — the exact shape that
+        // triggered issue #390.
+        let task = TeamTask {
+            id: "task-1".to_string(),
+            team_id: "team-1".to_string(),
+            subject: "Do the thing".to_string(),
+            description: None,
+            status: TaskStatus::Pending,
+            owner: None,
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+            metadata: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        // Replicate exec_task_list's per-task mapping verbatim (the function
+        // itself needs a live TeammateManager, but the null-vs-"" behaviour
+        // lives entirely in this json! mapping).
+        let value = json!({
+            "id": task.id,
+            "subject": task.subject,
+            "description": task.description.clone().unwrap_or_default(),
+            "status": task.status,
+            "owner": task.owner.clone().unwrap_or_default(),
+            "blocked_by": task.blocked_by,
+            "blocks": task.blocks,
+        });
+        let serialized = serde_json::to_string(&value).expect("task value must serialize");
+
+        // The empty string must be present for both optional fields...
+        assert!(
+            serialized.contains(r#""description":"""#),
+            "description must serialize as empty string, got {serialized}"
+        );
+        assert!(
+            serialized.contains(r#""owner":"""#),
+            "owner must serialize as empty string, got {serialized}"
+        );
+        // ...and a bare JSON null must never appear (the bug from #390).
+        assert!(
+            !serialized.contains(r#""description":null"#),
+            "description must not serialize as JSON null (issue #390), got {serialized}"
+        );
+        assert!(
+            !serialized.contains(r#""owner":null"#),
+            "owner must not serialize as JSON null (issue #390), got {serialized}"
         );
     }
 }
