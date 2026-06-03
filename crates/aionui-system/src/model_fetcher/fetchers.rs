@@ -9,20 +9,32 @@ use super::FetchConfig;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Extract the first API key from a potentially comma/newline-separated string.
+/// If the input contains multiple keys (e.g., "key1,key2"), only the first one
+/// is used for fetching the model list.
+fn primary_key(api_key: &str) -> &str {
+    api_key
+        .split([',', '\n'])
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .unwrap_or(api_key)
+}
+
 /// Dispatch to the appropriate platform-specific fetcher.
 pub(crate) async fn fetch_for_platform(
     client: &reqwest::Client,
     config: &FetchConfig,
 ) -> Result<Vec<ModelInfo>, AppError> {
+    let key = primary_key(&config.api_key);
     match config.platform.as_str() {
-        "anthropic" | "claude" => fetch_anthropic(client, &config.base_url, &config.api_key).await,
-        "gemini" => fetch_gemini(client, &config.base_url, &config.api_key).await,
+        "anthropic" | "claude" => fetch_anthropic(client, &config.base_url, key).await,
+        "gemini" => fetch_gemini(client, &config.base_url, key).await,
         "bedrock" => fetch_bedrock(config).await,
         "vertex-ai" => Ok(vertex_ai_models()),
-        "new-api" => fetch_new_api(client, &config.base_url, &config.api_key).await,
+        "new-api" => fetch_new_api(client, &config.base_url, key).await,
         "minimax" => Ok(minimax_models()),
-        "dashscope-coding" => fetch_dashscope_coding(client, &config.base_url, &config.api_key).await,
-        _ => fetch_openai_compatible(client, &config.base_url, &config.api_key).await,
+        "dashscope-coding" => fetch_dashscope_coding(client, &config.base_url, key).await,
+        _ => fetch_openai_compatible(client, &config.base_url, key).await,
     }
 }
 

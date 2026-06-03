@@ -66,7 +66,18 @@ impl AionrsAgentManager {
 
         let cli_args = CliArgs {
             provider: Some(config_extra.provider.clone()),
-            api_key: Some(config_extra.api_key.clone()),
+            // When multiple keys are stored as comma-separated string,
+            // use the first valid key for the aionrs engine.
+            // Full key rotation on failure is handled at a higher layer.
+            api_key: Some(
+                config_extra
+                    .api_key
+                    .split([',', '\n'])
+                    .map(|s| s.trim())
+                    .find(|s| !s.is_empty())
+                    .unwrap_or(&config_extra.api_key)
+                    .to_owned(),
+            ),
             base_url: config_extra.base_url.clone(),
             model: Some(config_extra.model.clone()),
             max_tokens: Some(config_extra.max_tokens),
