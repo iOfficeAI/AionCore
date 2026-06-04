@@ -12,7 +12,7 @@ use aion_protocol::commands::SessionMode;
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
 use aionui_api_types::{AgentModeResponse, SlashCommandItem};
 use aionui_common::{
-    AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms,
+    AgentKillReason, AgentType, ApiError, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -63,7 +63,7 @@ impl AionrsAgentManager {
         workspace: String,
         config_extra: AionrsResolvedConfig,
         resume_session: Option<Session>,
-    ) -> Result<Self, AppError> {
+    ) -> Result<Self, ApiError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
 
@@ -81,7 +81,7 @@ impl AionrsAgentManager {
         };
 
         let mut config =
-            Config::resolve(&cli_args).map_err(|e| AppError::Internal(format!("Config resolve failed: {e}")))?;
+            Config::resolve(&cli_args).map_err(|e| ApiError::Internal(format!("Config resolve failed: {e}")))?;
 
         // Backend-specific overrides
         config.bedrock = config_extra.bedrock_config;
@@ -116,7 +116,7 @@ impl AionrsAgentManager {
         let result = bootstrap
             .build()
             .await
-            .map_err(|e| AppError::Internal(format!("Agent bootstrap failed: {e}")))?;
+            .map_err(|e| ApiError::Internal(format!("Agent bootstrap failed: {e}")))?;
 
         let mut engine = result.engine;
         if !is_resume && let Err(e) = engine.init_session(&provider_label, &workspace, Some(&conversation_id)) {
@@ -270,12 +270,12 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         send_result
     }
 
-    async fn cancel(&self) -> Result<(), AppError> {
+    async fn cancel(&self) -> Result<(), ApiError> {
         self.request_stop(None, "cancel");
         Ok(())
     }
 
-    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), ApiError> {
         self.request_stop(reason, "kill");
         Ok(())
     }
@@ -313,7 +313,7 @@ impl AionrsAgentManager {
 /// Aionrs-specific operations reached through `AgentInstance::Aionrs(..)`
 /// matches in the routes + services.
 impl AionrsAgentManager {
-    pub fn confirm(&self, _msg_id: &str, call_id: &str, data: Value, always_allow: bool) -> Result<(), AppError> {
+    pub fn confirm(&self, _msg_id: &str, call_id: &str, data: Value, always_allow: bool) -> Result<(), ApiError> {
         if let Ok(mut confs) = self.confirmations.write() {
             confs.retain(|c| c.call_id != call_id);
         }
@@ -356,14 +356,14 @@ impl AionrsAgentManager {
         self.approval_manager.is_auto_approved(action)
     }
 
-    pub async fn mode(&self) -> Result<AgentModeResponse, AppError> {
+    pub async fn mode(&self) -> Result<AgentModeResponse, ApiError> {
         Ok(AgentModeResponse {
             mode: self.approval_manager.current_mode(),
             initialized: true,
         })
     }
 
-    pub async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
+    pub async fn set_mode(&self, mode: &str) -> Result<(), ApiError> {
         let prev = self.approval_manager.current_mode();
         self.approval_manager.set_mode(parse_session_mode(mode));
         info!(
@@ -375,7 +375,7 @@ impl AionrsAgentManager {
         Ok(())
     }
 
-    pub async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AppError> {
+    pub async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, ApiError> {
         Ok(self.slash_commands.clone())
     }
 }
@@ -391,9 +391,9 @@ fn parse_session_mode(s: &str) -> SessionMode {
 fn aionrs_engine_error_to_send_error(error_msg: String) -> AgentSendError {
     let lower = error_msg.to_ascii_lowercase();
     if lower.contains("provider error") || lower.contains("provider:") || lower.contains("api error:") {
-        return AgentSendError::from_app_error(AppError::BadGateway(error_msg));
+        return AgentSendError::from_api_error(ApiError::BadGateway(error_msg));
     }
-    AgentSendError::from_app_error(AppError::Internal(error_msg))
+    AgentSendError::from_api_error(ApiError::Internal(error_msg))
 }
 
 #[cfg(test)]

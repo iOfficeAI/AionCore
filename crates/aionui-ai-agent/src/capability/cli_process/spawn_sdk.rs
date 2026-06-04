@@ -1,4 +1,4 @@
-use aionui_common::{AppError, CommandSpec, ErrorChain};
+use aionui_common::{ApiError, CommandSpec, ErrorChain};
 use aionui_runtime::Builder as CmdBuilder;
 use std::path::Path;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ impl CliAgentProcess {
     /// Background tasks are still spawned for:
     /// - stderr buffering
     /// - Process exit monitoring
-    pub async fn spawn_for_sdk(config: CommandSpec, data_dir: &Path) -> Result<Self, AppError> {
+    pub async fn spawn_for_sdk(config: CommandSpec, data_dir: &Path) -> Result<Self, ApiError> {
         let mut cmd = CmdBuilder::new(&config.command);
         cmd.args(&config.args)
             .envs(config.env.iter().map(|e| (&e.name, &e.value)))
@@ -42,26 +42,26 @@ impl CliAgentProcess {
         info!(command = %preview, "Spawning CLI process (SDK mode)");
         let mut child: Child = cmd.spawn().map_err(|e| {
             error!(command = %preview, error = %ErrorChain(&e), "Failed to spawn CLI process");
-            AppError::Internal(format!("Failed to spawn CLI process '{preview}': {e}"))
+            ApiError::Internal(format!("Failed to spawn CLI process '{preview}': {e}"))
         })?;
 
         let pid = child.id().ok_or_else(|| {
             error!(command = %preview, "Failed to obtain PID from spawned process");
-            AppError::Internal("Failed to obtain PID from spawned process".into())
+            ApiError::Internal("Failed to obtain PID from spawned process".into())
         })?;
         info!(pid, command = %preview, "CLI process spawned (SDK mode)");
 
         let stdout = child.stdout.take().ok_or_else(|| {
             error!(pid, "Failed to capture stdout from child process");
-            AppError::Internal("Failed to capture stdout from child process".into())
+            ApiError::Internal("Failed to capture stdout from child process".into())
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             error!(pid, "Failed to capture stderr from child process");
-            AppError::Internal("Failed to capture stderr from child process".into())
+            ApiError::Internal("Failed to capture stderr from child process".into())
         })?;
         let stdin = child.stdin.take().ok_or_else(|| {
             error!(pid, "Failed to capture stdin for child process");
-            AppError::Internal("Failed to capture stdin for child process".into())
+            ApiError::Internal("Failed to capture stdin for child process".into())
         })?;
 
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);

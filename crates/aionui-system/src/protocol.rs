@@ -5,7 +5,7 @@ use aionui_api_types::{
     DetectProtocolRequest, DetectionSuggestion, KeyTestResult, MultiKeyResult, ProtocolDetectionResponse,
     SuggestionType,
 };
-use aionui_common::{AppError, ProtocolType};
+use aionui_common::{ApiError, ProtocolType};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::debug;
@@ -96,7 +96,7 @@ impl ProtocolDetectionService {
         Self { http_client }
     }
 
-    pub async fn detect_protocol(&self, req: &DetectProtocolRequest) -> Result<ProtocolDetectionResponse, AppError> {
+    pub async fn detect_protocol(&self, req: &DetectProtocolRequest) -> Result<ProtocolDetectionResponse, ApiError> {
         validate_request(req)?;
 
         let keys = parse_keys(&req.api_key);
@@ -190,17 +190,17 @@ impl ProtocolDetectionService {
         base_url: &str,
         api_key: &str,
         timeout: Duration,
-    ) -> Result<ProbeOutcome, AppError> {
+    ) -> Result<ProbeOutcome, ApiError> {
         let base = base_url.trim_end_matches('/');
         match protocol {
             ProtocolType::OpenAI => self.probe_openai(base, api_key, timeout).await,
             ProtocolType::Anthropic => self.probe_anthropic(base, api_key, timeout).await,
             ProtocolType::Gemini => self.probe_gemini(base, api_key, timeout).await,
-            ProtocolType::Unknown => Err(AppError::Internal("Cannot probe unknown".into())),
+            ProtocolType::Unknown => Err(ApiError::Internal("Cannot probe unknown".into())),
         }
     }
 
-    async fn probe_openai(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, AppError> {
+    async fn probe_openai(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, ApiError> {
         let urls = [
             (format!("{base}/models"), None),
             (format!("{base}/v1/models"), Some(format!("{base}/v1"))),
@@ -222,7 +222,7 @@ impl ProtocolDetectionService {
                     let body: DataResponse = r
                         .json()
                         .await
-                        .map_err(|e| AppError::BadGateway(format!("Parse failed: {e}")))?;
+                        .map_err(|e| ApiError::BadGateway(format!("Parse failed: {e}")))?;
                     let confidence = if fixed.is_some() { 80 } else { 90 };
                     return Ok(ProbeOutcome::Success {
                         models: body.data.into_iter().map(|m| m.id).collect(),
@@ -241,10 +241,10 @@ impl ProtocolDetectionService {
             return Ok(ProbeOutcome::AuthFailure { fixed_base_url: fixed });
         }
 
-        Err(AppError::BadGateway("OpenAI probe failed".into()))
+        Err(ApiError::BadGateway("OpenAI probe failed".into()))
     }
 
-    async fn probe_anthropic(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, AppError> {
+    async fn probe_anthropic(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, ApiError> {
         let url = format!("{base}/v1/models");
         let resp = self
             .http_client
@@ -254,13 +254,13 @@ impl ProtocolDetectionService {
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| AppError::BadGateway(format!("Anthropic probe failed: {e}")))?;
+            .map_err(|e| ApiError::BadGateway(format!("Anthropic probe failed: {e}")))?;
 
         if resp.status().is_success() {
             let body: DataResponse = resp
                 .json()
                 .await
-                .map_err(|e| AppError::BadGateway(format!("Parse failed: {e}")))?;
+                .map_err(|e| ApiError::BadGateway(format!("Parse failed: {e}")))?;
             return Ok(ProbeOutcome::Success {
                 models: body.data.into_iter().map(|m| m.id).collect(),
                 fixed_base_url: None,
@@ -272,10 +272,10 @@ impl ProtocolDetectionService {
             return Ok(ProbeOutcome::AuthFailure { fixed_base_url: None });
         }
 
-        Err(AppError::BadGateway(format!("Anthropic returned {}", resp.status())))
+        Err(ApiError::BadGateway(format!("Anthropic returned {}", resp.status())))
     }
 
-    async fn probe_gemini(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, AppError> {
+    async fn probe_gemini(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, ApiError> {
         let url = format!("{base}/v1beta/models?key={api_key}");
         let resp = self
             .http_client
@@ -283,13 +283,13 @@ impl ProtocolDetectionService {
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| AppError::BadGateway(format!("Gemini probe failed: {e}")))?;
+            .map_err(|e| ApiError::BadGateway(format!("Gemini probe failed: {e}")))?;
 
         if resp.status().is_success() {
             let body: GeminiResponse = resp
                 .json()
                 .await
-                .map_err(|e| AppError::BadGateway(format!("Parse failed: {e}")))?;
+                .map_err(|e| ApiError::BadGateway(format!("Parse failed: {e}")))?;
             let models = body
                 .models
                 .into_iter()
@@ -306,7 +306,7 @@ impl ProtocolDetectionService {
             return Ok(ProbeOutcome::AuthFailure { fixed_base_url: None });
         }
 
-        Err(AppError::BadGateway(format!("Gemini returned {}", resp.status())))
+        Err(ApiError::BadGateway(format!("Gemini returned {}", resp.status())))
     }
 
     // -- Multi-key testing --
@@ -366,12 +366,12 @@ impl ProtocolDetectionService {
 // Free functions
 // ---------------------------------------------------------------------------
 
-fn validate_request(req: &DetectProtocolRequest) -> Result<(), AppError> {
+fn validate_request(req: &DetectProtocolRequest) -> Result<(), ApiError> {
     if req.base_url.trim().is_empty() {
-        return Err(AppError::BadRequest("baseUrl is required".into()));
+        return Err(ApiError::BadRequest("baseUrl is required".into()));
     }
     if req.api_key.trim().is_empty() {
-        return Err(AppError::BadRequest("apiKey is required".into()));
+        return Err(ApiError::BadRequest("apiKey is required".into()));
     }
     Ok(())
 }
@@ -478,7 +478,7 @@ async fn test_single_key(
     base: &str,
     api_key: &str,
     timeout: Duration,
-) -> Result<(), AppError> {
+) -> Result<(), ApiError> {
     let (url, headers) = match protocol {
         ProtocolType::OpenAI => (
             format!("{base}/models"),
@@ -493,7 +493,7 @@ async fn test_single_key(
         ),
         ProtocolType::Gemini => (format!("{base}/v1beta/models?key={api_key}"), vec![]),
         ProtocolType::Unknown => {
-            return Err(AppError::Internal("Cannot test unknown protocol".into()));
+            return Err(ApiError::Internal("Cannot test unknown protocol".into()));
         }
     };
 
@@ -505,12 +505,12 @@ async fn test_single_key(
     let resp = req
         .send()
         .await
-        .map_err(|e| AppError::BadGateway(format!("Request failed: {e}")))?;
+        .map_err(|e| ApiError::BadGateway(format!("Request failed: {e}")))?;
 
     if resp.status().is_success() {
         Ok(())
     } else {
-        Err(AppError::BadGateway(format!("Status: {}", resp.status())))
+        Err(ApiError::BadGateway(format!("Status: {}", resp.status())))
     }
 }
 

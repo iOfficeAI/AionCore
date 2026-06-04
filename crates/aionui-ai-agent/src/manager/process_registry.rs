@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aionui_common::{AgentType, AppError, ErrorChain};
+use aionui_common::{AgentType, ApiError, ErrorChain};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -55,7 +55,7 @@ pub(crate) fn register_session_process(
     agent_type: AgentType,
     backend: Option<String>,
     command_preview: Option<String>,
-) -> Result<(), AppError> {
+) -> Result<(), ApiError> {
     let pid = process.pid();
     let process_group_id = process.process_group_id();
     let entry = RegisteredAgentProcess {
@@ -69,7 +69,7 @@ pub(crate) fn register_session_process(
     };
 
     register_agent_process(data_dir, entry).map_err(|e| {
-        AppError::Internal(format!(
+        ApiError::Internal(format!(
             "Failed to register agent process {pid} in runtime registry: {e}"
         ))
     })?;

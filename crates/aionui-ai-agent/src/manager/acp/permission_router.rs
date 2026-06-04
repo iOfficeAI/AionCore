@@ -123,20 +123,20 @@ impl PermissionRouter {
         call_id: &str,
         option_id: String,
         conversation_id: &str,
-    ) -> Result<(), aionui_common::AppError> {
+    ) -> Result<(), aionui_common::ApiError> {
         let pending = self
             .pending_permissions
             .lock()
             .unwrap()
             .remove(call_id)
             .ok_or_else(|| {
-                aionui_common::AppError::BadRequest(format!("Pending ACP permission not found: {call_id}"))
+                aionui_common::ApiError::BadRequest(format!("Pending ACP permission not found: {call_id}"))
             })?;
 
         pending
             .responder
             .send(PermissionDecision::Selected { option_id })
-            .map_err(|_| aionui_common::AppError::BadRequest(format!("Pending ACP permission expired: {call_id}")))?;
+            .map_err(|_| aionui_common::ApiError::BadRequest(format!("Pending ACP permission expired: {call_id}")))?;
 
         debug!(conversation_id = %conversation_id, call_id, "ACP permission response forwarded");
         Ok(())

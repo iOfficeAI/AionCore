@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::GuideMcpConfig;
-use aionui_common::{AgentType, AppError};
+use aionui_common::{AgentType, ApiError};
 use aionui_db::{IMcpServerRepository, IProviderRepository, IRemoteAgentRepository};
 use aionui_realtime::EventBroadcaster;
 use futures_util::FutureExt;
@@ -64,10 +64,10 @@ pub fn build_agent_factory(deps: AgentFactoryDeps) -> AgentFactory {
     })
 }
 
-async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AppError> {
+async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, ApiError> {
     let ctx = FactoryContext::resolve(&deps, &options).await?;
     match options.agent_type {
-        AgentType::Gemini => Err(AppError::ConversationArchived(
+        AgentType::Gemini => Err(ApiError::ConversationArchived(
             "This conversation was created with the legacy Gemini runtime, which has been \
              removed. Please start a new conversation with the Gemini ACP backend to continue."
                 .into(),

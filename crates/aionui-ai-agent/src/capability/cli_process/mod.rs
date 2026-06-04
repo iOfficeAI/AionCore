@@ -4,7 +4,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_common::{AppError, workspace_path_has_whitespace_segment};
+use aionui_common::{ApiError, workspace_path_has_whitespace_segment};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, broadcast, watch};
@@ -26,29 +26,29 @@ pub(super) const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Maximum stderr ring-buffer size in bytes.
 pub(super) const STDERR_BUFFER_MAX: usize = 8192;
 
-pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AppError> {
+pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, ApiError> {
     if cwd.trim().is_empty() {
-        return Err(AppError::BadRequest("Workspace directory is empty".into()));
+        return Err(ApiError::BadRequest("Workspace directory is empty".into()));
     }
 
     let workspace_path = PathBuf::from(cwd);
     if workspace_path_has_whitespace_segment(&workspace_path) {
-        return Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
+        return Err(ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
             workspace_path.display().to_string(),
         ));
     }
 
     match fs::metadata(&workspace_path) {
         Ok(metadata) if metadata.is_dir() => Ok(workspace_path),
-        Ok(_) => Err(AppError::BadRequest(format!(
+        Ok(_) => Err(ApiError::BadRequest(format!(
             "Workspace path is not a directory: {}",
             workspace_path.display()
         ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::BadRequest(format!(
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ApiError::BadRequest(format!(
             "Workspace directory does not exist: {}",
             workspace_path.display()
         ))),
-        Err(e) => Err(AppError::BadRequest(format!(
+        Err(e) => Err(ApiError::BadRequest(format!(
             "Workspace directory is not accessible: {}: {}",
             workspace_path.display(),
             e
@@ -114,24 +114,24 @@ impl CliAgentProcess {
     /// The message is serialized as a single line followed by a newline.
     /// Returns an error if stdin has been closed (process exited) or taken
     /// by [`take_stdio`](Self::take_stdio).
-    pub async fn send(&self, message: &serde_json::Value) -> Result<(), AppError> {
+    pub async fn send(&self, message: &serde_json::Value) -> Result<(), ApiError> {
         let mut guard = self.stdin.lock().await;
         let stdin = guard
             .as_mut()
-            .ok_or_else(|| AppError::Internal("Cannot send: stdin is closed (process exited or taken)".into()))?;
+            .ok_or_else(|| ApiError::Internal("Cannot send: stdin is closed (process exited or taken)".into()))?;
 
         let mut buf =
-            serde_json::to_vec(message).map_err(|e| AppError::Internal(format!("Failed to serialize message: {e}")))?;
+            serde_json::to_vec(message).map_err(|e| ApiError::Internal(format!("Failed to serialize message: {e}")))?;
         buf.push(b'\n');
 
         stdin.write_all(&buf).await.map_err(|e| {
             error!(pid = self.pid, error = %e, "Failed to write to stdin");
-            AppError::Internal(format!("Failed to write to stdin: {e}"))
+            ApiError::Internal(format!("Failed to write to stdin: {e}"))
         })?;
 
         stdin.flush().await.map_err(|e| {
             error!(pid = self.pid, error = %e, "Failed to flush stdin");
-            AppError::Internal(format!("Failed to flush stdin: {e}"))
+            ApiError::Internal(format!("Failed to flush stdin: {e}"))
         })?;
 
         Ok(())
@@ -168,7 +168,7 @@ impl CliAgentProcess {
     /// 1. Close stdin
     /// 2. Wait up to `grace_period` for the process to exit on its own
     /// 3. If still running after grace period, send SIGKILL
-    pub async fn kill(&self, grace_period: Duration) -> Result<(), AppError> {
+    pub async fn kill(&self, grace_period: Duration) -> Result<(), ApiError> {
         // Close stdin first to signal the child
         self.close_stdin().await;
 
@@ -203,7 +203,7 @@ impl CliAgentProcess {
             let _ = rx.changed().await;
         })
         .await
-        .map_err(|_| AppError::Internal(format!("Process {} did not exit after force_kill", self.pid)))?;
+        .map_err(|_| ApiError::Internal(format!("Process {} did not exit after force_kill", self.pid)))?;
 
         Ok(())
     }
@@ -396,7 +396,7 @@ pub(super) mod tests {
         let result = CliAgentProcess::spawn(config).await;
         assert!(matches!(
             result,
-            Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
+            Err(ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
                 if message == cwd_with_trailing_space
         ));
     }
@@ -419,7 +419,7 @@ pub(super) mod tests {
         let result = CliAgentProcess::spawn(config).await;
         assert!(matches!(
             result,
-            Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
+            Err(ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
                 if message == cwd.to_string_lossy()
         ));
     }
@@ -443,7 +443,7 @@ pub(super) mod tests {
         let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(matches!(
             result,
-            Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
+            Err(ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
                 if message == cwd.to_string_lossy()
         ));
     }
@@ -464,7 +464,7 @@ pub(super) mod tests {
         let result = CliAgentProcess::spawn(config).await;
         assert!(matches!(
             result,
-            Err(AppError::BadRequest(message)) if message.contains("Workspace directory does not exist")
+            Err(ApiError::BadRequest(message)) if message.contains("Workspace directory does not exist")
         ));
         assert!(!missing_cwd.exists());
     }
@@ -486,7 +486,7 @@ pub(super) mod tests {
         let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(matches!(
             result,
-            Err(AppError::BadRequest(message)) if message.contains("Workspace directory does not exist")
+            Err(ApiError::BadRequest(message)) if message.contains("Workspace directory does not exist")
         ));
         assert!(!missing_cwd.exists());
     }

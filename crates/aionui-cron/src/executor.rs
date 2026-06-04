@@ -1994,10 +1994,10 @@ mod tests {
                 &self,
                 _: &str,
                 _: BuildTaskOptions,
-            ) -> Result<AgentInstance, aionui_common::AppError> {
-                Err(aionui_common::AppError::Internal("stub".into()))
+            ) -> Result<AgentInstance, aionui_common::ApiError> {
+                Err(aionui_common::ApiError::Internal("stub".into()))
             }
-            fn kill(&self, _: &str, _: Option<aionui_common::AgentKillReason>) -> Result<(), aionui_common::AppError> {
+            fn kill(&self, _: &str, _: Option<aionui_common::AgentKillReason>) -> Result<(), aionui_common::ApiError> {
                 Ok(())
             }
             fn kill_and_wait(
@@ -2243,25 +2243,25 @@ mod tests {
             Ok(())
         }
 
-        async fn cancel(&self) -> Result<(), aionui_common::AppError> {
+        async fn cancel(&self) -> Result<(), aionui_common::ApiError> {
             Ok(())
         }
 
-        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), aionui_common::AppError> {
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), aionui_common::ApiError> {
             Ok(())
         }
     }
 
     #[async_trait::async_trait]
     impl IMockAgent for RecordingAgent {
-        async fn mode(&self) -> Result<AgentModeResponse, aionui_common::AppError> {
+        async fn mode(&self) -> Result<AgentModeResponse, aionui_common::ApiError> {
             Ok(AgentModeResponse {
                 mode: self.mode().await,
                 initialized: self.initialized,
             })
         }
 
-        async fn set_mode(&self, mode: &str) -> Result<(), aionui_common::AppError> {
+        async fn set_mode(&self, mode: &str) -> Result<(), aionui_common::ApiError> {
             self.set_mode_calls.fetch_add(1, Ordering::Relaxed);
             let mut guard = self.mode.write().await;
             *guard = mode.to_owned();
@@ -2283,7 +2283,7 @@ mod tests {
             &self,
             _conversation_id: &str,
             _options: BuildTaskOptions,
-        ) -> Result<AgentInstance, aionui_common::AppError> {
+        ) -> Result<AgentInstance, aionui_common::ApiError> {
             Ok(self.agent.clone())
         }
 
@@ -2291,7 +2291,7 @@ mod tests {
             &self,
             _conversation_id: &str,
             _reason: Option<AgentKillReason>,
-        ) -> Result<(), aionui_common::AppError> {
+        ) -> Result<(), aionui_common::ApiError> {
             Ok(())
         }
 
@@ -2346,7 +2346,7 @@ mod tests {
             &self,
             _conversation_id: &str,
             options: BuildTaskOptions,
-        ) -> Result<AgentInstance, aionui_common::AppError> {
+        ) -> Result<AgentInstance, aionui_common::ApiError> {
             self.options.lock().unwrap().push(options);
             Ok(self.agent.clone())
         }
@@ -2355,7 +2355,7 @@ mod tests {
             &self,
             _conversation_id: &str,
             _reason: Option<AgentKillReason>,
-        ) -> Result<(), aionui_common::AppError> {
+        ) -> Result<(), aionui_common::ApiError> {
             Ok(())
         }
 

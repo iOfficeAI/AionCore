@@ -37,7 +37,9 @@ impl From<ConversationError> for ApiError {
             ConversationError::Timeout { reason } => ApiError::Timeout(reason),
             ConversationError::Unprocessable { reason } => ApiError::UnprocessableEntity(reason),
             ConversationError::Internal { reason } => ApiError::Internal(reason),
-            ConversationError::WorkspacePathContainsWhitespace { path } => ApiError::WorkspacePathContainsWhitespace(path),
+            ConversationError::WorkspacePathContainsWhitespace { path } => {
+                ApiError::WorkspacePathContainsWhitespace(path)
+            }
             ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported { path } => {
                 ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
             }

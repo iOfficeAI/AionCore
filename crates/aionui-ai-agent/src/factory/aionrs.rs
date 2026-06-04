@@ -6,7 +6,7 @@ use aion_config::config::{McpServerConfig, TransportType};
 use aionui_api_types::{
     AionrsBuildExtra, GuideMcpConfig, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
-use aionui_common::AppError;
+use aionui_common::ApiError;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_realtime::EventBroadcaster;
@@ -27,7 +27,7 @@ pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     options: BuildTaskOptions,
     ctx: FactoryContext,
-) -> Result<AgentInstance, AppError> {
+) -> Result<AgentInstance, ApiError> {
     let belongs_to_team = options
         .extra
         .get("teamId")
@@ -105,8 +105,8 @@ pub(super) async fn build(
         .provider_repo
         .find_by_id(provider_id)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to load provider config: {e}")))?
-        .ok_or_else(|| AppError::BadRequest(format!("Provider '{provider_id}' not found")))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to load provider config: {e}")))?
+        .ok_or_else(|| ApiError::BadRequest(format!("Provider '{provider_id}' not found")))?;
 
     let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &deps.encryption_key)?;
 

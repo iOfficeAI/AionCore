@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_api_types::RemoteBuildExtra;
-use aionui_common::AppError;
+use aionui_common::ApiError;
 use tracing::warn;
 
 use crate::agent_task::AgentInstance;
@@ -14,15 +14,15 @@ pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     options: BuildTaskOptions,
     ctx: FactoryContext,
-) -> Result<AgentInstance, AppError> {
+) -> Result<AgentInstance, ApiError> {
     let extra: RemoteBuildExtra = serde_json::from_value(options.extra)
-        .map_err(|e| AppError::BadRequest(format!("Invalid Remote build options: {e}")))?;
+        .map_err(|e| ApiError::BadRequest(format!("Invalid Remote build options: {e}")))?;
     let row = deps
         .remote_agent_repo
         .find_by_id(&extra.remote_agent_id)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to load remote agent config: {e}")))?
-        .ok_or_else(|| AppError::NotFound(format!("Remote agent '{}' not found", extra.remote_agent_id)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to load remote agent config: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("Remote agent '{}' not found", extra.remote_agent_id)))?;
     let auth_token = row
         .auth_token
         .as_deref()

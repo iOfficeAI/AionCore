@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aionui_common::{
-    AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, ErrorChain, RemoteAgentStatus, TimestampMs,
+    AgentKillReason, AgentType, ApiError, Confirmation, ConversationStatus, ErrorChain, RemoteAgentStatus, TimestampMs,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -62,7 +62,7 @@ impl RemoteAgentManager {
         conversation_id: String,
         workspace: String,
         remote_config: RemoteAgentConfig,
-    ) -> Result<Self, AppError> {
+    ) -> Result<Self, ApiError> {
         let runtime = AgentRuntime::new(conversation_id, workspace, 256);
 
         let manager = Self {
@@ -83,12 +83,12 @@ impl RemoteAgentManager {
     }
 
     /// Connect to the remote WebSocket endpoint and start the reader task.
-    pub async fn connect(self: &Arc<Self>) -> Result<(), AppError> {
+    pub async fn connect(self: &Arc<Self>) -> Result<(), ApiError> {
         let url = &self.remote_config.url;
 
         let (ws_stream, _response) = tokio_tungstenite::connect_async(url).await.map_err(|e| {
             error!(url = url, error = %ErrorChain(&e), "Failed to connect to remote agent");
-            AppError::Internal(format!("WebSocket connection failed: {e}"))
+            ApiError::Internal(format!("WebSocket connection failed: {e}"))
         })?;
 
         info!(
@@ -220,14 +220,14 @@ impl RemoteAgentManager {
     }
 
     /// Send a JSON message over the WebSocket.
-    async fn ws_send(&self, payload: &Value) -> Result<(), AppError> {
+    async fn ws_send(&self, payload: &Value) -> Result<(), ApiError> {
         let text = serde_json::to_string(payload)
-            .map_err(|e| AppError::Internal(format!("Failed to serialize WebSocket message: {e}")))?;
+            .map_err(|e| ApiError::Internal(format!("Failed to serialize WebSocket message: {e}")))?;
 
         let mut guard = self.ws_sink.lock().await;
         let sink = guard
             .as_mut()
-            .ok_or_else(|| AppError::Internal("WebSocket not connected".into()))?;
+            .ok_or_else(|| ApiError::Internal("WebSocket not connected".into()))?;
 
         sink.send(Message::Text(text.into())).await.map_err(|e| {
             error!(
@@ -235,7 +235,7 @@ impl RemoteAgentManager {
                 error = %ErrorChain(&e),
                 "Failed to send WebSocket message"
             );
-            AppError::Internal(format!("WebSocket send failed: {e}"))
+            ApiError::Internal(format!("WebSocket send failed: {e}"))
         })
     }
 
@@ -302,7 +302,7 @@ impl crate::agent_task::IAgentTask for RemoteAgentManager {
                         error = %ErrorChain(&err),
                         "Remote send_message failed, emitting Error"
                     );
-                    let send_error = AgentSendError::from_app_error(err);
+                    let send_error = AgentSendError::from_api_error(err);
                     self.runtime.emit_error_data(send_error.stream_error().clone());
                     Err(send_error)
                 }
@@ -331,7 +331,7 @@ impl crate::agent_task::IAgentTask for RemoteAgentManager {
                         error = %ErrorChain(&err),
                         "Remote send_message failed, emitting Error"
                     );
-                    let send_error = AgentSendError::from_app_error(err);
+                    let send_error = AgentSendError::from_api_error(err);
                     self.runtime.emit_error_data(send_error.stream_error().clone());
                     Err(send_error)
                 }
@@ -339,9 +339,9 @@ impl crate::agent_task::IAgentTask for RemoteAgentManager {
         }
     }
 
-    async fn cancel(&self) -> Result<(), AppError> {
+    async fn cancel(&self) -> Result<(), ApiError> {
         if self.ws_sink.lock().await.is_none() {
-            return Err(AppError::Conflict("WebSocket not connected; nothing to cancel".into()));
+            return Err(ApiError::Conflict("WebSocket not connected; nothing to cancel".into()));
         }
         let payload = json!({ "type": "session/cancel", "data": {} });
         self.ws_send(&payload).await?;
@@ -351,7 +351,7 @@ impl crate::agent_task::IAgentTask for RemoteAgentManager {
         Ok(())
     }
 
-    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), ApiError> {
         info!(
             conversation_id = %self.runtime.conversation_id(),
             ?reason,
@@ -382,7 +382,7 @@ impl RemoteAgentManager {
 
 /// Remote-specific operations reached through `AgentInstance::Remote(..)`.
 impl RemoteAgentManager {
-    pub fn confirm(&self, _msg_id: &str, call_id: &str, _data: Value, always_allow: bool) -> Result<(), AppError> {
+    pub fn confirm(&self, _msg_id: &str, call_id: &str, _data: Value, always_allow: bool) -> Result<(), ApiError> {
         if let Ok(mut state) = self.state.try_write() {
             if always_allow && let Some(conf) = state.confirmations.iter().find(|c| c.call_id == call_id) {
                 let key = approval_key(conf.action.as_deref(), conf.command_type.as_deref());

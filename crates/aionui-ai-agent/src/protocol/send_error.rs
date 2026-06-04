@@ -2,7 +2,7 @@ use aionui_api_types::{
     AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, AgentErrorResolutionTarget,
     AgentStreamErrorData,
 };
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
 use super::error::AcpError;
 
@@ -61,14 +61,14 @@ impl AgentSendError {
         }
     }
 
-    pub fn from_app_error(err: AppError) -> Self {
-        Self::from_app_error_ref(&err)
+    pub fn from_api_error(err: ApiError) -> Self {
+        Self::from_api_error_ref(&err)
     }
 
-    pub fn from_app_error_ref(err: &AppError) -> Self {
+    pub fn from_api_error_ref(err: &ApiError) -> Self {
         let detail = strip_error_prefix(&err.to_string());
         match err {
-            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => Self {
+            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => Self {
                 stream_error: AgentStreamErrorData {
                     message: "This workspace path is no longer supported for execution".into(),
                     code: Some(AgentErrorCode::WorkspacePathContainsWhitespaceRuntimeUnsupported),
@@ -83,7 +83,7 @@ impl AgentSendError {
                     )),
                 },
             },
-            AppError::Internal(_) => Self::new(
+            ApiError::Internal(_) => Self::new(
                 "AionUI failed while sending the message",
                 AgentErrorCode::AionuiInternalError,
                 AgentErrorOwnership::Aionui,
@@ -95,7 +95,7 @@ impl AgentSendError {
                     Some(AgentErrorResolutionTarget::Feedback),
                 ),
             ),
-            AppError::Forbidden(_) => Self::new(
+            ApiError::Forbidden(_) => Self::new(
                 "AionUI blocked the request before it reached the Agent",
                 AgentErrorCode::AionuiPermissionError,
                 AgentErrorOwnership::Aionui,
@@ -107,7 +107,7 @@ impl AgentSendError {
                     Some(AgentErrorResolutionTarget::Feedback),
                 ),
             ),
-            AppError::Unauthorized(_) => Self::new(
+            ApiError::Unauthorized(_) => Self::new(
                 "The selected Agent requires authentication",
                 AgentErrorCode::UserAgentAuthRequired,
                 AgentErrorOwnership::UserAgent,
@@ -119,7 +119,7 @@ impl AgentSendError {
                     Some(AgentErrorResolutionTarget::AgentSettings),
                 ),
             ),
-            AppError::NotFound(msg) if msg.starts_with("Session not found") => Self::new(
+            ApiError::NotFound(msg) if msg.starts_with("Session not found") => Self::new(
                 "The Agent session was not found",
                 AgentErrorCode::UserAgentSessionNotFound,
                 AgentErrorOwnership::UserAgent,
@@ -131,7 +131,7 @@ impl AgentSendError {
                     Some(AgentErrorResolutionTarget::NewConversation),
                 ),
             ),
-            AppError::BadRequest(msg) if msg.contains("Method not supported") => Self::new(
+            ApiError::BadRequest(msg) if msg.contains("Method not supported") => Self::new(
                 "The selected Agent does not support this operation",
                 AgentErrorCode::UserAgentUnsupportedMethod,
                 AgentErrorOwnership::UserAgent,
@@ -143,7 +143,7 @@ impl AgentSendError {
                     Some(AgentErrorResolutionTarget::AgentSettings),
                 ),
             ),
-            AppError::BadRequest(msg) if msg.contains("Invalid parameters") => Self::new(
+            ApiError::BadRequest(msg) if msg.contains("Invalid parameters") => Self::new(
                 "The selected Agent rejected the request parameters",
                 AgentErrorCode::UserAgentInvalidParams,
                 AgentErrorOwnership::UserAgent,
@@ -155,7 +155,7 @@ impl AgentSendError {
                     Some(AgentErrorResolutionTarget::Feedback),
                 ),
             ),
-            AppError::Timeout(_) => Self::new(
+            ApiError::Timeout(_) => Self::new(
                 "The model provider did not respond in time",
                 AgentErrorCode::UserLlmProviderTimeout,
                 AgentErrorOwnership::UserLlmProvider,
@@ -164,7 +164,7 @@ impl AgentSendError {
                 false,
                 resolution(AgentErrorResolutionKind::Retry, None),
             ),
-            AppError::RateLimited => Self::new(
+            ApiError::RateLimited => Self::new(
                 "The model provider rate limited the request",
                 AgentErrorCode::UserLlmProviderRateLimited,
                 AgentErrorOwnership::UserLlmProvider,
@@ -173,7 +173,7 @@ impl AgentSendError {
                 false,
                 resolution(AgentErrorResolutionKind::Retry, None),
             ),
-            AppError::BadGateway(_) => classify_upstream_detail(&detail),
+            ApiError::BadGateway(_) => classify_upstream_detail(&detail),
             _ => Self::new(
                 "The upstream Agent failed while handling the request",
                 AgentErrorCode::UnknownUpstreamError,
@@ -320,9 +320,9 @@ impl std::fmt::Display for AgentSendError {
 
 impl std::error::Error for AgentSendError {}
 
-impl From<AppError> for AgentSendError {
-    fn from(err: AppError) -> Self {
-        Self::from_app_error(err)
+impl From<ApiError> for AgentSendError {
+    fn from(err: ApiError) -> Self {
+        Self::from_api_error(err)
     }
 }
 
@@ -959,7 +959,7 @@ mod tests {
         ownership: AgentErrorOwnership,
         resolution: AgentErrorResolutionKind,
     ) {
-        let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
+        let err = AgentSendError::from_api_error(ApiError::BadGateway(detail.into()));
         assert_eq!(err.code(), Some(code));
         assert_eq!(err.ownership(), Some(ownership));
         assert_eq!(err.stream_error().resolution.map(|value| value.kind), Some(resolution));
@@ -979,7 +979,7 @@ mod tests {
     }
 
     fn assert_resolution_target(detail: &str, target: AgentErrorResolutionTarget) {
-        let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
+        let err = AgentSendError::from_api_error(ApiError::BadGateway(detail.into()));
         assert_eq!(
             err.stream_error().resolution.and_then(|value| value.target),
             Some(target)
@@ -988,7 +988,7 @@ mod tests {
 
     #[test]
     fn classifies_provider_auth_failure() {
-        let err = AgentSendError::from_app_error(AppError::BadGateway("provider returned 401 invalid api key".into()));
+        let err = AgentSendError::from_api_error(ApiError::BadGateway("provider returned 401 invalid api key".into()));
 
         assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderAuthFailed));
         assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserLlmProvider));
@@ -997,7 +997,7 @@ mod tests {
 
     #[test]
     fn classifies_unknown_upstream_when_heuristics_do_not_match() {
-        let err = AgentSendError::from_app_error(AppError::BadGateway("agent exploded".into()));
+        let err = AgentSendError::from_api_error(ApiError::BadGateway("agent exploded".into()));
 
         assert_eq!(err.code(), Some(AgentErrorCode::UnknownUpstreamError));
         assert_eq!(err.ownership(), Some(AgentErrorOwnership::UnknownUpstream));
@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn preserves_runtime_workspace_validation_as_structured_aionui_error() {
-        let err = AgentSendError::from_app_error(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
+        let err = AgentSendError::from_api_error(ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
             "/Users/test/Archive ".into(),
         ));
 
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn classifies_provider_error_without_specific_signal_as_provider_gateway() {
-        let err = AgentSendError::from_app_error(AppError::BadGateway("Provider error: upstream failed".into()));
+        let err = AgentSendError::from_api_error(ApiError::BadGateway("Provider error: upstream failed".into()));
 
         assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderGatewayError));
         assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserLlmProvider));
@@ -1038,7 +1038,7 @@ mod tests {
 
     #[test]
     fn classifies_provider_config_errors_as_not_retryable() {
-        let err = AgentSendError::from_app_error(AppError::BadGateway(
+        let err = AgentSendError::from_api_error(ApiError::BadGateway(
             "Provider error: Connection error: Signable request error: failed to create canonical request".into(),
         ));
 
@@ -1099,7 +1099,7 @@ mod tests {
     #[test]
     fn classifies_provider_504_html_body_as_timeout_with_stripped_detail() {
         let raw = "Aionrs agent error: Provider error: API error 504: <html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>openresty</center>\r\n</body>\r\n</html>";
-        let err = AgentSendError::from_app_error(AppError::BadGateway(raw.into()));
+        let err = AgentSendError::from_api_error(ApiError::BadGateway(raw.into()));
 
         assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderTimeout));
         let detail = err.stream_error().detail.clone().expect("detail present");
@@ -1137,7 +1137,7 @@ mod tests {
             AgentErrorOwnership::UserAgent,
             AgentErrorResolutionKind::ReconnectAgent,
         );
-        let err = AgentSendError::from_app_error(AppError::BadGateway(
+        let err = AgentSendError::from_api_error(ApiError::BadGateway(
             "Agent internal error (code -32603) ({\"details\":\"Claude Code process exited with code 1\"})".into(),
         ));
         assert_eq!(err.stream_error().retryable, Some(true));
@@ -1250,7 +1250,7 @@ mod tests {
 
     #[test]
     fn provider_free_text_still_uses_provider_heuristic_boundary() {
-        let err = AgentSendError::from_app_error(AppError::BadGateway(
+        let err = AgentSendError::from_api_error(ApiError::BadGateway(
             "Provider error: API error 401: invalid x-api-key".into(),
         ));
 
@@ -1426,20 +1426,20 @@ mod tests {
                 AgentErrorOwnership::UserLlmProvider,
                 AgentErrorResolutionKind::SendFeedback,
             );
-            let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
+            let err = AgentSendError::from_api_error(ApiError::BadGateway(detail.into()));
             assert_eq!(err.stream_error().retryable, Some(false));
         }
     }
 
     #[test]
     fn non_retryable_agent_invalid_params_do_not_suggest_retry() {
-        let app_err =
-            AgentSendError::from_app_error(AppError::BadRequest("Invalid parameters: malformed request".into()));
-        assert_eq!(app_err.code(), Some(AgentErrorCode::UserAgentInvalidParams));
-        assert_eq!(app_err.stream_error().retryable, Some(false));
-        assert_eq!(app_err.stream_error().feedback_recommended, Some(true));
+        let api_err =
+            AgentSendError::from_api_error(ApiError::BadRequest("Invalid parameters: malformed request".into()));
+        assert_eq!(api_err.code(), Some(AgentErrorCode::UserAgentInvalidParams));
+        assert_eq!(api_err.stream_error().retryable, Some(false));
+        assert_eq!(api_err.stream_error().feedback_recommended, Some(true));
         assert_eq!(
-            app_err.stream_error().resolution.map(|value| value.kind),
+            api_err.stream_error().resolution.map(|value| value.kind),
             Some(AgentErrorResolutionKind::SendFeedback)
         );
 
@@ -1497,7 +1497,7 @@ mod tests {
             AgentErrorResolutionKind::CheckProviderBaseUrl,
         );
         assert_resolution_target(detail, AgentErrorResolutionTarget::ProviderSettings);
-        let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
+        let err = AgentSendError::from_api_error(ApiError::BadGateway(detail.into()));
         assert_eq!(err.stream_error().retryable, Some(false));
     }
 

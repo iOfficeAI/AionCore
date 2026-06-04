@@ -80,7 +80,7 @@ fn t3_2_error_response_has_all_fields() {
 // --- T3.3: ApiError auto-conversion ---
 
 #[test]
-fn t3_3_app_error_not_found_to_error_response() {
+fn t3_3_api_error_not_found_to_error_response() {
     let err = ApiError::NotFound("user 42".into());
     let resp = ErrorResponse::from(err);
 
@@ -90,7 +90,7 @@ fn t3_3_app_error_not_found_to_error_response() {
 }
 
 #[test]
-fn t3_3_app_error_bad_request_to_error_response() {
+fn t3_3_api_error_bad_request_to_error_response() {
     let err = ApiError::BadRequest("missing field: username".into());
     let resp = ErrorResponse::from(err);
 
@@ -100,7 +100,7 @@ fn t3_3_app_error_bad_request_to_error_response() {
 }
 
 #[test]
-fn t3_3_app_error_unauthorized_to_error_response() {
+fn t3_3_api_error_unauthorized_to_error_response() {
     let err = ApiError::Unauthorized("invalid token".into());
     let resp = ErrorResponse::from(err);
 
@@ -109,7 +109,7 @@ fn t3_3_app_error_unauthorized_to_error_response() {
 }
 
 #[test]
-fn t3_3_app_error_forbidden_to_error_response() {
+fn t3_3_api_error_forbidden_to_error_response() {
     let err = ApiError::Forbidden("access denied".into());
     let resp = ErrorResponse::from(err);
 
@@ -118,7 +118,7 @@ fn t3_3_app_error_forbidden_to_error_response() {
 }
 
 #[test]
-fn t3_3_app_error_conflict_to_error_response() {
+fn t3_3_api_error_conflict_to_error_response() {
     let err = ApiError::Conflict("username taken".into());
     let resp = ErrorResponse::from(err);
 
@@ -127,7 +127,7 @@ fn t3_3_app_error_conflict_to_error_response() {
 }
 
 #[test]
-fn t3_3_app_error_rate_limited_to_error_response() {
+fn t3_3_api_error_rate_limited_to_error_response() {
     let resp = ErrorResponse::from(ApiError::RateLimited);
 
     assert!(!resp.success);
@@ -136,7 +136,7 @@ fn t3_3_app_error_rate_limited_to_error_response() {
 }
 
 #[test]
-fn t3_3_app_error_internal_to_error_response() {
+fn t3_3_api_error_internal_to_error_response() {
     let err = ApiError::Internal("db connection lost".into());
     let resp = ErrorResponse::from(err);
 
@@ -145,7 +145,7 @@ fn t3_3_app_error_internal_to_error_response() {
 }
 
 #[test]
-fn t3_3_app_error_bad_gateway_to_error_response() {
+fn t3_3_api_error_bad_gateway_to_error_response() {
     let err = ApiError::BadGateway("upstream timeout".into());
     let resp = ErrorResponse::from(err);
 
@@ -154,7 +154,7 @@ fn t3_3_app_error_bad_gateway_to_error_response() {
 }
 
 #[test]
-fn t3_3_app_error_timeout_to_error_response() {
+fn t3_3_api_error_timeout_to_error_response() {
     let err = ApiError::Timeout("request timed out".into());
     let resp = ErrorResponse::from(err);
 

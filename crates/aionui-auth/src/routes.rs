@@ -787,49 +787,49 @@ mod error_mapping_tests {
 
     #[test]
     fn invalid_credentials_maps_to_unauthorized() {
-        let app_err = ApiError::from(AuthError::InvalidCredentials);
-        assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
+        let api_err = ApiError::from(AuthError::InvalidCredentials);
+        assert_eq!(api_err.status_code(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn weak_password_maps_to_bad_request() {
-        let app_err = ApiError::from(AuthError::WeakPassword("too short".into()));
-        assert_eq!(app_err.status_code(), StatusCode::BAD_REQUEST);
+        let api_err = ApiError::from(AuthError::WeakPassword("too short".into()));
+        assert_eq!(api_err.status_code(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn invalid_username_maps_to_bad_request() {
-        let app_err = ApiError::from(AuthError::InvalidUsername("bad chars".into()));
-        assert_eq!(app_err.status_code(), StatusCode::BAD_REQUEST);
+        let api_err = ApiError::from(AuthError::InvalidUsername("bad chars".into()));
+        assert_eq!(api_err.status_code(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn token_expired_maps_to_unauthorized() {
-        let app_err = ApiError::from(AuthError::TokenExpired);
-        assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
+        let api_err = ApiError::from(AuthError::TokenExpired);
+        assert_eq!(api_err.status_code(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn token_invalid_maps_to_unauthorized() {
-        let app_err = ApiError::from(AuthError::TokenInvalid("bad".into()));
-        assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
+        let api_err = ApiError::from(AuthError::TokenInvalid("bad".into()));
+        assert_eq!(api_err.status_code(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn token_blacklisted_maps_to_unauthorized() {
-        let app_err = ApiError::from(AuthError::TokenBlacklisted);
-        assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
+        let api_err = ApiError::from(AuthError::TokenBlacklisted);
+        assert_eq!(api_err.status_code(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn rate_limited_maps_to_rate_limited() {
-        let app_err = ApiError::from(AuthError::RateLimited);
-        assert_eq!(app_err.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        let api_err = ApiError::from(AuthError::RateLimited);
+        assert_eq!(api_err.status_code(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
     fn hash_error_maps_to_internal() {
-        let app_err = ApiError::from(AuthError::HashError("failed".into()));
-        assert_eq!(app_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        let api_err = ApiError::from(AuthError::HashError("failed".into()));
+        assert_eq!(api_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

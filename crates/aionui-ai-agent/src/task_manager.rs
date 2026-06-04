@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_common::{
-    AgentKillReason, AgentType, AppError, ConversationStatus, ErrorChain, OnConversationDelete, TimestampMs, now_ms,
+    AgentKillReason, AgentType, ApiError, ConversationStatus, ErrorChain, OnConversationDelete, TimestampMs, now_ms,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -19,7 +19,7 @@ use crate::types::BuildTaskOptions;
 /// `IWorkerTaskManager` call site. Returning `BoxFuture` keeps the trait
 /// object-safe for DI.
 pub type AgentFactory =
-    Arc<dyn Fn(BuildTaskOptions) -> BoxFuture<'static, Result<AgentInstance, AppError>> + Send + Sync>;
+    Arc<dyn Fn(BuildTaskOptions) -> BoxFuture<'static, Result<AgentInstance, ApiError>> + Send + Sync>;
 
 /// Manages the lifecycle of active Agent tasks.
 ///
@@ -41,10 +41,10 @@ pub trait IWorkerTaskManager: Send + Sync {
         &self,
         conversation_id: &str,
         options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError>;
+    ) -> Result<AgentInstance, ApiError>;
 
     /// Kill and remove a task.
-    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError>;
+    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), ApiError>;
 
     /// Kill a task and return a future that resolves when the process has terminated.
     fn kill_and_wait(
@@ -103,7 +103,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         &self,
         conversation_id: &str,
         options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError> {
+    ) -> Result<AgentInstance, ApiError> {
         // Atomically obtain the per-conversation slot. `DashMap::entry` is
         // synchronous and side-effect-free — only an empty OnceCell is
         // allocated on the miss path, so concurrent callers for the same id
@@ -123,7 +123,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         Ok(instance.clone())
     }
 
-    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), ApiError> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
             info!(conversation_id = %id, ?reason, "Killing agent task");
             if let Some(agent) = slot.get() {
@@ -270,10 +270,10 @@ mod tests {
         ) -> Result<(), crate::protocol::send_error::AgentSendError> {
             Ok(())
         }
-        async fn cancel(&self) -> Result<(), AppError> {
+        async fn cancel(&self) -> Result<(), ApiError> {
             Ok(())
         }
-        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), ApiError> {
             Ok(())
         }
     }
@@ -386,7 +386,7 @@ mod tests {
             let flag = Arc::clone(&flag);
             async move {
                 if flag.swap(false, Ordering::SeqCst) {
-                    Err(AppError::Internal("first call fails".into()))
+                    Err(ApiError::Internal("first call fails".into()))
                 } else {
                     Ok(mock_instance(MockAgent::new(&opts.conversation_id, None)))
                 }

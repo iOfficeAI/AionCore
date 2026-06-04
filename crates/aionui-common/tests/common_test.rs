@@ -96,7 +96,7 @@ fn test_encrypt_large_text() {
 // --- ApiError ---
 
 #[test]
-fn test_app_error_status_codes() {
+fn test_api_error_status_codes() {
     use axum::http::StatusCode;
 
     assert_eq!(ApiError::NotFound("x".into()).status_code(), StatusCode::NOT_FOUND);
@@ -117,7 +117,7 @@ fn test_app_error_status_codes() {
 }
 
 #[test]
-fn test_app_error_json_format() {
+fn test_api_error_json_format() {
     use axum::response::IntoResponse;
     let resp = ApiError::NotFound("user 123".into()).into_response();
     assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);

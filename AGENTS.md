@@ -61,6 +61,7 @@ Every domain crate must follow:
 - Response format: `ApiResponse<T>` (success) / `ErrorResponse` (failure)
 - All request/response types defined in `aionui-api-types`
 - `aionui-api-types` must NOT depend on axum/tower or any HTTP framework
+- Use `aionui_common::ApiError` only at API/HTTP boundaries such as routes and middleware. Service/domain code must prefer crate-owned errors (`ConversationError`, `TeamError`, etc.) and map them to `ApiError` in route modules. Do not introduce new `AppError` usages; it exists only as a temporary compatibility alias.
 
 ### WebSocket Events
 

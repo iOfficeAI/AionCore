@@ -236,10 +236,10 @@ fn validate_office_path(
 ) -> Result<PathBuf, ApiError> {
     let allowed_roots: Vec<&FsPath> = state.allowed_roots.iter().map(PathBuf::as_path).collect();
     validate_path_with_extra_root(file_path, &allowed_roots, workspace.map(FsPath::new))
-        .map_err(file_error_to_app_error)
+        .map_err(file_error_to_api_error)
 }
 
-fn file_error_to_app_error(error: FileError) -> ApiError {
+fn file_error_to_api_error(error: FileError) -> ApiError {
     match error {
         FileError::BadRequest(message) => ApiError::BadRequest(message),
         FileError::Forbidden(message) => ApiError::Forbidden(message),

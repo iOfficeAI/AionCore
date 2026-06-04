@@ -11,7 +11,7 @@ use aion_config::config::{CliArgs, Config};
 use aionui_api_types::{
     HealthStatus, ProviderHealthCheckErrorKind, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
 };
-use aionui_common::AppError;
+use aionui_common::ApiError;
 use aionui_db::{IProviderRepository, models::Provider};
 use regex::Regex;
 use tracing::{info, warn};
@@ -38,12 +38,12 @@ impl ProviderHealthCheckService {
         }
     }
 
-    pub async fn health_check(&self, req: ProviderHealthCheckRequest) -> Result<ProviderHealthCheckResponse, AppError> {
+    pub async fn health_check(&self, req: ProviderHealthCheckRequest) -> Result<ProviderHealthCheckResponse, ApiError> {
         if req.provider_id.trim().is_empty() {
-            return Err(AppError::BadRequest("provider_id is required".into()));
+            return Err(ApiError::BadRequest("provider_id is required".into()));
         }
         if req.model.trim().is_empty() {
-            return Err(AppError::BadRequest("model is required".into()));
+            return Err(ApiError::BadRequest("model is required".into()));
         }
 
         let provider_id = req.provider_id.trim();
@@ -52,14 +52,14 @@ impl ProviderHealthCheckService {
             .provider_repo
             .find_by_id(provider_id)
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to load provider config: {e}")))?
-            .ok_or_else(|| AppError::BadRequest(format!("Provider '{provider_id}' not found")))?;
+            .map_err(|e| ApiError::Internal(format!("Failed to load provider config: {e}")))?
+            .ok_or_else(|| ApiError::BadRequest(format!("Provider '{provider_id}' not found")))?;
 
         let config = self.resolve_probe_config(&row, model)?;
         run_probe(row.id, row.platform, config).await
     }
 
-    fn resolve_probe_config(&self, row: &Provider, model_id: &str) -> Result<AionrsResolvedConfig, AppError> {
+    fn resolve_probe_config(&self, row: &Provider, model_id: &str) -> Result<AionrsResolvedConfig, ApiError> {
         let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &self.encryption_key)?;
         let provider = map_aionrs_provider(&row.platform, model_id, row.model_protocols.as_deref());
         let (base_url, compat_overrides) =
@@ -91,7 +91,7 @@ async fn run_probe(
     provider_id: String,
     platform: String,
     config_extra: AionrsResolvedConfig,
-) -> Result<ProviderHealthCheckResponse, AppError> {
+) -> Result<ProviderHealthCheckResponse, ApiError> {
     let started = Instant::now();
     let model = config_extra.model.clone();
 
@@ -176,7 +176,7 @@ fn log_health_check_result(response: &ProviderHealthCheckResponse) {
     }
 }
 
-async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentEngine, AppError> {
+async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentEngine, ApiError> {
     let workspace = config_extra
         .session_directory
         .parent()
@@ -196,7 +196,7 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
         project_dir: Some(PathBuf::from(&workspace)),
     };
     let mut config =
-        Config::resolve(&cli_args).map_err(|error| AppError::Internal(format!("Config resolve failed: {error}")))?;
+        Config::resolve(&cli_args).map_err(|error| ApiError::Internal(format!("Config resolve failed: {error}")))?;
 
     config.bedrock = config_extra.bedrock_config;
     config.session.enabled = false;
@@ -213,7 +213,7 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
         .build()
         .await
         .map(|result| result.engine)
-        .map_err(|error| AppError::Internal(error.to_string()))
+        .map_err(|error| ApiError::Internal(error.to_string()))
 }
 
 fn unhealthy_response(

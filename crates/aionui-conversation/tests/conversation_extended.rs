@@ -4,7 +4,7 @@ use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListMessagesQuery, SearchMessagesQuery, WebSocketMessage,
 };
-use aionui_common::{AgentKillReason, AppError, ConversationStatus, TimestampMs, generate_prefixed_id, now_ms};
+use aionui_common::{AgentKillReason, ApiError, ConversationStatus, TimestampMs, generate_prefixed_id, now_ms};
 use aionui_conversation::skill_resolver::SkillResolver;
 use aionui_conversation::{ConversationError, ConversationService};
 use aionui_db::models::MessageRow;
@@ -44,10 +44,10 @@ impl IWorkerTaskManager for NoopTaskManager {
         &self,
         _: &str,
         _: aionui_ai_agent::types::BuildTaskOptions,
-    ) -> Result<aionui_ai_agent::AgentInstance, AppError> {
-        Err(AppError::Internal("noop".into()))
+    ) -> Result<aionui_ai_agent::AgentInstance, ApiError> {
+        Err(ApiError::Internal("noop".into()))
     }
-    fn kill(&self, _: &str, _: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, _: &str, _: Option<AgentKillReason>) -> Result<(), ApiError> {
         Ok(())
     }
     fn kill_and_wait(

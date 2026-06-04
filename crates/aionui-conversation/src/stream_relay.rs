@@ -1239,7 +1239,7 @@ mod tests {
         let rx = tx.subscribe();
         let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
         send_error_tx
-            .send(AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
+            .send(AgentSendError::from_api_error(aionui_common::ApiError::BadGateway(
                 "provider returned 401 invalid api key".into(),
             )))
             .unwrap();
@@ -1299,7 +1299,7 @@ mod tests {
         );
 
         let rx = tx.subscribe();
-        let send_error = AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
+        let send_error = AgentSendError::from_api_error(aionui_common::ApiError::BadGateway(
             "provider returned 401 invalid api key".into(),
         ));
         tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
@@ -1343,7 +1343,7 @@ mod tests {
         let rx = tx.subscribe();
         let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
         send_error_tx
-            .send(AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
+            .send(AgentSendError::from_api_error(aionui_common::ApiError::BadGateway(
                 "provider returned 401 invalid api key".into(),
             )))
             .unwrap();

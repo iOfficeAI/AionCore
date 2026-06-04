@@ -47,7 +47,7 @@ aionui-common 没有任何内部依赖。
 
 | Crate | 职责 |
 |-------|------|
-| `aionui-common` | 共享错误类型（AppError）、枚举、ID 生成、加密工具、时间戳、分页 |
+| `aionui-common` | 共享错误类型（ApiError）、枚举、ID 生成、加密工具、时间戳、分页 |
 | `aionui-api-types` | 所有 HTTP/WebSocket 的请求和响应类型，是 API 契约的唯一定义处 |
 | `aionui-db` | SQLite 数据库层，定义 Repository trait 和实现 |
 | `aionui-assets` | 嵌入式静态资源（Agent 元数据、提示词） |
@@ -145,7 +145,7 @@ async fn handler(
     Extension(user): Extension<CurrentUser>, // 当前认证用户
     Path(id): Path<String>,                  // 路径参数
     Json(body): Json<RequestType>,           // 请求体
-) -> Result<(StatusCode, Json<ApiResponse<ResponseType>>), AppError>
+) -> Result<(StatusCode, Json<ApiResponse<ResponseType>>), ApiError>
 ```
 
 ### 何时新建 Crate vs 扩展现有 Crate
@@ -201,7 +201,7 @@ async fn handler(
 
 ### HTTP 状态码映射
 
-| AppError 变体 | 状态码 | 错误码 | 使用场景 |
+| ApiError 变体 | 状态码 | 错误码 | 使用场景 |
 |---------------|--------|--------|----------|
 | BadRequest | 400 | BAD_REQUEST | 请求参数无效 |
 | Unauthorized | 401 | UNAUTHORIZED | 未认证或 token 过期 |
@@ -318,15 +318,15 @@ Handler 不做业务判断，Service 不做 HTTP 处理。
 ```
 DbError（数据库层）
   ↓ From trait 实现（aionui-db/src/error.rs）
-AppError（统一错误类型）
+ApiError（统一错误类型）
   ↓ IntoResponse 实现
 HTTP 响应（状态码 + ErrorResponse JSON）
 ```
 
 映射规则：
-- `DbError::NotFound` → `AppError::NotFound`（保留语义）
-- `DbError::Conflict` → `AppError::Conflict`（保留语义）
-- `DbError::Query` / `Migration` / `Init` → `AppError::Internal`（屏蔽内部细节）
+- `DbError::NotFound` → `ApiError::NotFound`（保留语义）
+- `DbError::Conflict` → `ApiError::Conflict`（保留语义）
+- `DbError::Query` / `Migration` / `Init` → `ApiError::Internal`（屏蔽内部细节）
 
 ## 依赖注入
 
@@ -391,8 +391,8 @@ async fn create(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateConversationRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let conversation = state.conversation_service.create(&user.id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }

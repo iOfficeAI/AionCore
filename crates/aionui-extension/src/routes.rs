@@ -588,27 +588,27 @@ mod tests {
 
     #[test]
     fn extension_path_traversal_maps_to_bad_request() {
-        let app_err = ApiError::from(ExtensionError::PathTraversal("../secret".into()));
-        assert!(matches!(app_err, ApiError::BadRequest(_)));
+        let api_err = ApiError::from(ExtensionError::PathTraversal("../secret".into()));
+        assert!(matches!(api_err, ApiError::BadRequest(_)));
     }
 
     #[test]
     fn extension_manifest_validation_maps_to_bad_request() {
-        let app_err = ApiError::from(ExtensionError::ManifestValidation("test".into()));
-        assert!(matches!(app_err, ApiError::BadRequest(_)));
+        let api_err = ApiError::from(ExtensionError::ManifestValidation("test".into()));
+        assert!(matches!(api_err, ApiError::BadRequest(_)));
     }
 
     #[test]
     fn extension_file_reference_not_found_maps_to_not_found() {
-        let app_err = ApiError::from(ExtensionError::FileReferenceNotFound("missing.md".into()));
-        assert!(matches!(app_err, ApiError::NotFound(_)));
+        let api_err = ApiError::from(ExtensionError::FileReferenceNotFound("missing.md".into()));
+        assert!(matches!(api_err, ApiError::NotFound(_)));
     }
 
     #[test]
     fn extension_io_error_maps_to_internal() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
-        let app_err = ApiError::from(ExtensionError::Io(io_err));
-        assert!(matches!(app_err, ApiError::Internal(_)));
+        let api_err = ApiError::from(ExtensionError::Io(io_err));
+        assert!(matches!(api_err, ApiError::Internal(_)));
     }
 
     async fn make_router_with_extension() -> (Router, tempfile::TempDir, PathBuf) {

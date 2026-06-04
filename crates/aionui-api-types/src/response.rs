@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn test_error_response_from_app_error() {
+    fn test_error_response_from_api_error() {
         let err = ApiError::Unauthorized("invalid token".into());
         let resp = ErrorResponse::from(err);
         assert!(!resp.success);

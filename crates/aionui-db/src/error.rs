@@ -1,4 +1,4 @@
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
 /// Database-layer errors.
 #[derive(Debug, thiserror::Error)]
@@ -19,14 +19,14 @@ pub enum DbError {
     Init(String),
 }
 
-impl From<DbError> for AppError {
+impl From<DbError> for ApiError {
     fn from(err: DbError) -> Self {
         match err {
-            DbError::NotFound(msg) => AppError::NotFound(msg),
-            DbError::Conflict(msg) => AppError::Conflict(msg),
-            DbError::Query(e) => AppError::Internal(format!("Database error: {e}")),
-            DbError::Migration(e) => AppError::Internal(format!("Migration error: {e}")),
-            DbError::Init(msg) => AppError::Internal(format!("Database init error: {msg}")),
+            DbError::NotFound(msg) => ApiError::NotFound(msg),
+            DbError::Conflict(msg) => ApiError::Conflict(msg),
+            DbError::Query(e) => ApiError::Internal(format!("Database error: {e}")),
+            DbError::Migration(e) => ApiError::Internal(format!("Migration error: {e}")),
+            DbError::Init(msg) => ApiError::Internal(format!("Database init error: {msg}")),
         }
     }
 }
@@ -38,21 +38,21 @@ mod tests {
     #[test]
     fn not_found_converts_to_app_not_found() {
         let db_err = DbError::NotFound("user".into());
-        let app_err: AppError = db_err.into();
-        assert!(matches!(app_err, AppError::NotFound(msg) if msg == "user"));
+        let api_err: ApiError = db_err.into();
+        assert!(matches!(api_err, ApiError::NotFound(msg) if msg == "user"));
     }
 
     #[test]
     fn conflict_converts_to_app_conflict() {
         let db_err = DbError::Conflict("duplicate".into());
-        let app_err: AppError = db_err.into();
-        assert!(matches!(app_err, AppError::Conflict(msg) if msg == "duplicate"));
+        let api_err: ApiError = db_err.into();
+        assert!(matches!(api_err, ApiError::Conflict(msg) if msg == "duplicate"));
     }
 
     #[test]
     fn init_converts_to_app_internal() {
         let db_err = DbError::Init("broken".into());
-        let app_err: AppError = db_err.into();
-        assert!(matches!(app_err, AppError::Internal(_)));
+        let api_err: ApiError = db_err.into();
+        assert!(matches!(api_err, ApiError::Internal(_)));
     }
 }

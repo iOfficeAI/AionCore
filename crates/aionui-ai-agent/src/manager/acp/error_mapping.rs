@@ -1,32 +1,32 @@
 use crate::protocol::error::AcpError;
 use crate::protocol::send_error::AgentSendError;
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
 #[derive(Debug)]
 pub(super) enum AcpSendFailure {
-    App(AppError),
+    Api(ApiError),
     Acp(AcpError),
 }
 
 impl AcpSendFailure {
     pub(super) fn to_agent_send_error(&self) -> AgentSendError {
         match self {
-            AcpSendFailure::App(err) => AgentSendError::from_app_error_ref(err),
+            AcpSendFailure::Api(err) => AgentSendError::from_api_error_ref(err),
             AcpSendFailure::Acp(err) => AgentSendError::from_acp_error_ref(err),
         }
     }
 
-    pub(super) fn into_app_error(self) -> AppError {
+    pub(super) fn into_api_error(self) -> ApiError {
         match self {
-            AcpSendFailure::App(err) => err,
-            AcpSendFailure::Acp(err) => acp_error_to_app_error(err),
+            AcpSendFailure::Api(err) => err,
+            AcpSendFailure::Acp(err) => acp_error_to_api_error(err),
         }
     }
 }
 
-impl From<AppError> for AcpSendFailure {
-    fn from(err: AppError) -> Self {
-        AcpSendFailure::App(err)
+impl From<ApiError> for AcpSendFailure {
+    fn from(err: ApiError) -> Self {
+        AcpSendFailure::Api(err)
     }
 }
 
@@ -39,7 +39,7 @@ impl From<AcpError> for AcpSendFailure {
 impl std::fmt::Display for AcpSendFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AcpSendFailure::App(err) => std::fmt::Display::fmt(err, f),
+            AcpSendFailure::Api(err) => std::fmt::Display::fmt(err, f),
             AcpSendFailure::Acp(err) => f.write_str(&acp_error_public_message(err)),
         }
     }
@@ -48,24 +48,24 @@ impl std::fmt::Display for AcpSendFailure {
 impl std::error::Error for AcpSendFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            AcpSendFailure::App(err) => Some(err),
+            AcpSendFailure::Api(err) => Some(err),
             AcpSendFailure::Acp(err) => Some(err),
         }
     }
 }
 
-pub(super) fn acp_error_to_app_error(err: AcpError) -> AppError {
+pub(super) fn acp_error_to_api_error(err: AcpError) -> ApiError {
     match &err {
         AcpError::SpawnFailed { .. } | AcpError::StartupCrash { .. } | AcpError::Disconnected { .. } => {
-            AppError::BadGateway(err.to_string())
+            ApiError::BadGateway(err.to_string())
         }
-        AcpError::AuthRequired => AppError::Unauthorized("Agent requires authentication".into()),
-        AcpError::SessionNotFound { .. } => AppError::NotFound(err.to_string()),
-        AcpError::MethodNotFound { .. } => AppError::BadRequest(err.to_string()),
-        AcpError::InvalidParams { .. } => AppError::BadRequest(err.to_string()),
-        AcpError::AgentInternal { .. } => AppError::BadGateway(acp_error_public_message(&err)),
-        AcpError::NotConnected => AppError::Internal("ACP protocol not connected".into()),
-        AcpError::InitTimeout { .. } => AppError::BadGateway(err.to_string()),
+        AcpError::AuthRequired => ApiError::Unauthorized("Agent requires authentication".into()),
+        AcpError::SessionNotFound { .. } => ApiError::NotFound(err.to_string()),
+        AcpError::MethodNotFound { .. } => ApiError::BadRequest(err.to_string()),
+        AcpError::InvalidParams { .. } => ApiError::BadRequest(err.to_string()),
+        AcpError::AgentInternal { .. } => ApiError::BadGateway(acp_error_public_message(&err)),
+        AcpError::NotConnected => ApiError::Internal("ACP protocol not connected".into()),
+        AcpError::InitTimeout { .. } => ApiError::BadGateway(err.to_string()),
     }
 }
 
@@ -73,8 +73,8 @@ pub(super) fn is_acp_session_not_found(err: &AcpError) -> bool {
     matches!(err, AcpError::SessionNotFound { .. })
 }
 
-pub(super) fn is_mapped_acp_session_not_found(err: &AppError) -> bool {
-    matches!(err, AppError::NotFound(msg) if msg.starts_with("Session not found"))
+pub(super) fn is_mapped_acp_session_not_found(err: &ApiError) -> bool {
+    matches!(err, ApiError::NotFound(msg) if msg.starts_with("Session not found"))
 }
 
 fn acp_error_public_message(err: &AcpError) -> String {
@@ -90,7 +90,7 @@ mod tests {
     use axum::http::StatusCode;
 
     #[test]
-    fn acp_error_to_app_error_status_codes() {
+    fn acp_error_to_api_error_status_codes() {
         let cases = vec![
             (AcpError::SpawnFailed { message: "x".into() }, StatusCode::BAD_GATEWAY),
             (AcpError::AuthRequired, StatusCode::UNAUTHORIZED),
@@ -113,14 +113,14 @@ mod tests {
         ];
 
         for (acp_err, expected_status) in cases {
-            let app_err = acp_error_to_app_error(acp_err);
-            assert_eq!(app_err.status_code(), expected_status, "Mismatch for {app_err:?}");
+            let api_err = acp_error_to_api_error(acp_err);
+            assert_eq!(api_err.status_code(), expected_status, "Mismatch for {api_err:?}");
         }
     }
 
     #[test]
-    fn acp_error_to_app_error_omits_stderr_and_structured_data() {
-        let startup = acp_error_to_app_error(AcpError::StartupCrash {
+    fn acp_error_to_api_error_omits_stderr_and_structured_data() {
+        let startup = acp_error_to_api_error(AcpError::StartupCrash {
             exit_code: Some(1),
             signal: None,
             stderr: "Authorization: Bearer sk-secret".into(),
@@ -128,7 +128,7 @@ mod tests {
         assert!(!startup.to_string().contains("sk-secret"));
         assert!(!startup.to_string().contains("Authorization"));
 
-        let internal = acp_error_to_app_error(AcpError::AgentInternal {
+        let internal = acp_error_to_api_error(AcpError::AgentInternal {
             message: "Internal error".into(),
             code: -32603,
             data: Some(serde_json::json!({

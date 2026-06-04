@@ -4,7 +4,7 @@ use crate::models::User;
 /// User data access abstraction.
 ///
 /// All methods return `Result<_, DbError>` so callers can handle
-/// database failures uniformly via the `DbError → AppError` conversion.
+/// database failures uniformly via the `DbError → ApiError` conversion.
 ///
 /// Object-safe via `async_trait` to support `Arc<dyn IUserRepository>`.
 #[async_trait::async_trait]

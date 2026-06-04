@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use aionui_api_types::{BedrockAuthMethod, BedrockConfig};
-use aionui_common::AppError;
+use aionui_common::ApiError;
 use aws_sdk_bedrock::config::Credentials;
 use tracing::{info, warn};
 
@@ -29,7 +29,7 @@ impl ConnectionTestService {
     ///
     /// Constructs an isolated credential provider (no global env pollution)
     /// and calls `get_foundation_model` as a zero-cost validation.
-    pub async fn test_bedrock_connection(&self, config: BedrockConfig) -> Result<(), AppError> {
+    pub async fn test_bedrock_connection(&self, config: BedrockConfig) -> Result<(), ApiError> {
         validate_bedrock_config(&config)?;
 
         let aws_config = build_aws_config(&config).await;
@@ -49,7 +49,7 @@ impl ConnectionTestService {
             .await
             .map_err(|e| {
                 warn!(error = %e, "Bedrock connection test failed");
-                AppError::UnprocessableEntity(format!("Bedrock credentials invalid: {e}"))
+                ApiError::UnprocessableEntity(format!("Bedrock credentials invalid: {e}"))
             })?;
 
         info!("Bedrock connection test passed");
@@ -58,27 +58,27 @@ impl ConnectionTestService {
 }
 
 /// Validate required fields in BedrockConfig based on auth method.
-fn validate_bedrock_config(config: &BedrockConfig) -> Result<(), AppError> {
+fn validate_bedrock_config(config: &BedrockConfig) -> Result<(), ApiError> {
     if config.region.is_empty() {
-        return Err(AppError::BadRequest("region is required".into()));
+        return Err(ApiError::BadRequest("region is required".into()));
     }
 
     match config.auth_method {
         BedrockAuthMethod::AccessKey => {
             if config.access_key_id.as_deref().unwrap_or("").is_empty() {
-                return Err(AppError::BadRequest(
+                return Err(ApiError::BadRequest(
                     "accessKeyId is required for accessKey auth method".into(),
                 ));
             }
             if config.secret_access_key.as_deref().unwrap_or("").is_empty() {
-                return Err(AppError::BadRequest(
+                return Err(ApiError::BadRequest(
                     "secretAccessKey is required for accessKey auth method".into(),
                 ));
             }
         }
         BedrockAuthMethod::Profile => {
             if config.profile.as_deref().unwrap_or("").is_empty() {
-                return Err(AppError::BadRequest(
+                return Err(ApiError::BadRequest(
                     "profile is required for profile auth method".into(),
                 ));
             }

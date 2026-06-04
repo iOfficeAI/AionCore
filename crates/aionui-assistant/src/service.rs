@@ -9,7 +9,7 @@ use aionui_api_types::{
     AssistantResponse, AssistantSource, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult,
     ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
 };
-use aionui_common::{AppError, now_ms};
+use aionui_common::{ApiError, now_ms};
 use aionui_db::{
     AssistantOverrideRow, AssistantRow, CreateAssistantParams, IAssistantOverrideRepository, IAssistantRepository,
     IProviderRepository, UpdateAssistantParams, UpsertOverrideParams,
@@ -94,7 +94,7 @@ impl AssistantService {
     /// Three-source merge (built-in + user + extension) with per-assistant
     /// override application. Also performs opportunistic orphan cleanup on
     /// the overrides table.
-    pub async fn list(&self) -> Result<Vec<AssistantResponse>, AppError> {
+    pub async fn list(&self) -> Result<Vec<AssistantResponse>, ApiError> {
         let user_rows = self.repo.list().await?;
         let extensions = self.extension_registry.get_assistants().await;
         let overrides = self.override_repo.get_all().await?;
@@ -131,13 +131,13 @@ impl AssistantService {
         Ok(result)
     }
 
-    pub async fn get(&self, id: &str) -> Result<AssistantResponse, AppError> {
+    pub async fn get(&self, id: &str) -> Result<AssistantResponse, ApiError> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => {
                 let b = self
                     .builtin
                     .get(id)
-                    .ok_or_else(|| AppError::NotFound(format!("assistant '{id}' not found")))?;
+                    .ok_or_else(|| ApiError::NotFound(format!("assistant '{id}' not found")))?;
                 let ov = self.override_repo.get(id).await?;
                 Ok(builtin_to_response(b, ov.as_ref()))
             }
@@ -146,7 +146,7 @@ impl AssistantService {
                     .extension_registry
                     .get_assistant_by_id(id)
                     .await
-                    .ok_or_else(|| AppError::NotFound(format!("assistant '{id}' not found")))?;
+                    .ok_or_else(|| ApiError::NotFound(format!("assistant '{id}' not found")))?;
                 Ok(extension_to_response(&e))
             }
             AssistantSource::User => {
@@ -154,7 +154,7 @@ impl AssistantService {
                     .repo
                     .get(id)
                     .await?
-                    .ok_or_else(|| AppError::NotFound(format!("assistant '{id}' not found")))?;
+                    .ok_or_else(|| ApiError::NotFound(format!("assistant '{id}' not found")))?;
                 let ov = self.override_repo.get(id).await?;
                 user_row_to_response(&row, ov.as_ref())
             }
@@ -181,17 +181,17 @@ impl AssistantService {
     ///    error. The previous code silently fell back to `"gemini"`,
     ///    which on machines without the Gemini CLI 400'd within 1 ms
     ///    with `Agent 'Gemini CLI' CLI not found in PATH`.
-    pub async fn resolve_default_agent_type(&self) -> Result<String, AppError> {
+    pub async fn resolve_default_agent_type(&self) -> Result<String, ApiError> {
         let providers = self
             .provider_repo
             .list()
             .await
-            .map_err(|e| AppError::Internal(format!("failed to list providers: {e}")))?;
+            .map_err(|e| ApiError::Internal(format!("failed to list providers: {e}")))?;
 
         if providers.iter().any(|p| p.enabled) {
             Ok("aionrs".to_string())
         } else {
-            Err(AppError::BadRequest(
+            Err(ApiError::BadRequest(
                 "Cannot create assistant: no providers configured. Add a provider before creating an assistant, \
                  or pass an explicit `preset_agent_type` in the request body."
                     .into(),
@@ -203,10 +203,10 @@ impl AssistantService {
     // Create / Update / Delete
     // -----------------------------------------------------------------------
 
-    pub async fn create(&self, req: CreateAssistantRequest) -> Result<AssistantResponse, AppError> {
+    pub async fn create(&self, req: CreateAssistantRequest) -> Result<AssistantResponse, ApiError> {
         let name = req.name.trim().to_string();
         if name.is_empty() {
-            return Err(AppError::BadRequest("name is required".into()));
+            return Err(ApiError::BadRequest("name is required".into()));
         }
 
         let id = match req.id.as_deref() {
@@ -216,10 +216,10 @@ impl AssistantService {
 
         // Reject id collisions with built-in / extension-contributed.
         if self.builtin.has(&id) {
-            return Err(AppError::BadRequest("Id conflicts with built-in assistant".into()));
+            return Err(ApiError::BadRequest("Id conflicts with built-in assistant".into()));
         }
         if self.extension_registry.has_assistant(&id).await {
-            return Err(AppError::BadRequest(
+            return Err(ApiError::BadRequest(
                 "Id conflicts with extension-contributed assistant".into(),
             ));
         }
@@ -254,7 +254,7 @@ impl AssistantService {
         user_row_to_response(&row, ov.as_ref())
     }
 
-    pub async fn update(&self, id: &str, req: UpdateAssistantRequest) -> Result<AssistantResponse, AppError> {
+    pub async fn update(&self, id: &str, req: UpdateAssistantRequest) -> Result<AssistantResponse, ApiError> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => {
                 // Built-in rows are sourced from the embedded bundle and can't
@@ -273,13 +273,13 @@ impl AssistantService {
                     || req.description_i18n.is_some()
                     || req.prompts_i18n.is_some()
                 {
-                    return Err(AppError::Forbidden(
+                    return Err(ApiError::Forbidden(
                         "Only 'preset_agent_type' can be overridden on built-in assistants".into(),
                     ));
                 }
 
                 let preset_agent_type = req.preset_agent_type.as_deref().ok_or_else(|| {
-                    AppError::BadRequest("'preset_agent_type' is required when updating a built-in assistant".into())
+                    ApiError::BadRequest("'preset_agent_type' is required when updating a built-in assistant".into())
                 })?;
 
                 let existing = self.override_repo.get(id).await?;
@@ -298,7 +298,7 @@ impl AssistantService {
                 return self.get(id).await;
             }
             AssistantSource::Extension => {
-                return Err(AppError::Forbidden(
+                return Err(ApiError::Forbidden(
                     "Cannot modify extension-contributed assistant".into(),
                 ));
             }
@@ -325,18 +325,18 @@ impl AssistantService {
             .repo
             .update(id, &params)
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("assistant '{id}' not found")))?;
+            .ok_or_else(|| ApiError::NotFound(format!("assistant '{id}' not found")))?;
         let ov = self.override_repo.get(id).await?;
         user_row_to_response(&row, ov.as_ref())
     }
 
-    pub async fn delete(&self, id: &str) -> Result<(), AppError> {
+    pub async fn delete(&self, id: &str) -> Result<(), ApiError> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => {
-                return Err(AppError::Forbidden("Cannot delete built-in assistant".into()));
+                return Err(ApiError::Forbidden("Cannot delete built-in assistant".into()));
             }
             AssistantSource::Extension => {
-                return Err(AppError::Forbidden(
+                return Err(ApiError::Forbidden(
                     "Cannot delete extension-contributed assistant".into(),
                 ));
             }
@@ -345,7 +345,7 @@ impl AssistantService {
 
         let removed = self.repo.delete(id).await?;
         if !removed {
-            return Err(AppError::NotFound(format!("assistant '{id}' not found")));
+            return Err(ApiError::NotFound(format!("assistant '{id}' not found")));
         }
 
         // Drop the override row (best-effort).
@@ -359,16 +359,16 @@ impl AssistantService {
         Ok(())
     }
 
-    pub async fn set_state(&self, id: &str, req: SetAssistantStateRequest) -> Result<AssistantResponse, AppError> {
+    pub async fn set_state(&self, id: &str, req: SetAssistantStateRequest) -> Result<AssistantResponse, ApiError> {
         match self.classify_source(id).await {
             AssistantSource::Extension => {
-                return Err(AppError::BadRequest("Extension assistants are read-only".into()));
+                return Err(ApiError::BadRequest("Extension assistants are read-only".into()));
             }
             AssistantSource::Builtin => {}
             AssistantSource::User => {
                 // Confirm the user row exists (otherwise 404).
                 if self.repo.get(id).await?.is_none() {
-                    return Err(AppError::NotFound(format!("assistant '{id}' not found")));
+                    return Err(ApiError::NotFound(format!("assistant '{id}' not found")));
                 }
             }
         }
@@ -405,7 +405,7 @@ impl AssistantService {
     /// Bulk insert-only import of legacy Electron config rows. Skip on
     /// built-in / extension id collision or already-imported user-id collision.
     /// Never overwrites an existing user row.
-    pub async fn import(&self, req: ImportAssistantsRequest) -> Result<ImportAssistantsResult, AppError> {
+    pub async fn import(&self, req: ImportAssistantsRequest) -> Result<ImportAssistantsResult, ApiError> {
         let mut result = ImportAssistantsResult::default();
 
         // Resolved-once cache for the inferred default agent type. We only
@@ -530,7 +530,7 @@ impl AssistantService {
     // -----------------------------------------------------------------------
 
     /// Read an assistant rule file, dispatching by source.
-    pub async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, AppError> {
+    pub async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, ApiError> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => {
                 let locale = locale.unwrap_or("");
@@ -554,36 +554,36 @@ impl AssistantService {
     }
 
     /// Write an assistant rule file. User only; built-in / extension reject.
-    pub async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AppError> {
+    pub async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ApiError> {
         match self.classify_source(id).await {
-            AssistantSource::Builtin => Err(AppError::BadRequest("Cannot write rule for built-in assistant".into())),
-            AssistantSource::Extension => Err(AppError::BadRequest(
+            AssistantSource::Builtin => Err(ApiError::BadRequest("Cannot write rule for built-in assistant".into())),
+            AssistantSource::Extension => Err(ApiError::BadRequest(
                 "Cannot write rule for extension-contributed assistant".into(),
             )),
             AssistantSource::User => {
                 let path = self.user_rule_path(id, locale);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
-                        .map_err(|e| AppError::Internal(format!("create dir failed: {e}")))?;
+                        .map_err(|e| ApiError::Internal(format!("create dir failed: {e}")))?;
                 }
-                std::fs::write(&path, content).map_err(|e| AppError::Internal(format!("write failed: {e}")))?;
+                std::fs::write(&path, content).map_err(|e| ApiError::Internal(format!("write failed: {e}")))?;
                 Ok(())
             }
         }
     }
 
     /// Delete all locale versions of an assistant rule. User only.
-    pub async fn delete_rule(&self, id: &str) -> Result<bool, AppError> {
+    pub async fn delete_rule(&self, id: &str) -> Result<bool, ApiError> {
         match self.classify_source(id).await {
-            AssistantSource::Builtin => Err(AppError::BadRequest("Cannot delete rule for built-in assistant".into())),
-            AssistantSource::Extension => Err(AppError::BadRequest(
+            AssistantSource::Builtin => Err(ApiError::BadRequest("Cannot delete rule for built-in assistant".into())),
+            AssistantSource::Extension => Err(ApiError::BadRequest(
                 "Cannot delete rule for extension-contributed assistant".into(),
             )),
             AssistantSource::User => Ok(remove_assistant_md_files(&self.user_rules_dir(), id)),
         }
     }
 
-    pub async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, AppError> {
+    pub async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, ApiError> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => {
                 let locale = locale.unwrap_or("");
@@ -601,30 +601,30 @@ impl AssistantService {
         }
     }
 
-    pub async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AppError> {
+    pub async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ApiError> {
         match self.classify_source(id).await {
-            AssistantSource::Builtin => Err(AppError::BadRequest("Cannot write skill for built-in assistant".into())),
-            AssistantSource::Extension => Err(AppError::BadRequest(
+            AssistantSource::Builtin => Err(ApiError::BadRequest("Cannot write skill for built-in assistant".into())),
+            AssistantSource::Extension => Err(ApiError::BadRequest(
                 "Cannot write skill for extension-contributed assistant".into(),
             )),
             AssistantSource::User => {
                 let path = self.user_skill_path(id, locale);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
-                        .map_err(|e| AppError::Internal(format!("create dir failed: {e}")))?;
+                        .map_err(|e| ApiError::Internal(format!("create dir failed: {e}")))?;
                 }
-                std::fs::write(&path, content).map_err(|e| AppError::Internal(format!("write failed: {e}")))?;
+                std::fs::write(&path, content).map_err(|e| ApiError::Internal(format!("write failed: {e}")))?;
                 Ok(())
             }
         }
     }
 
-    pub async fn delete_skill(&self, id: &str) -> Result<bool, AppError> {
+    pub async fn delete_skill(&self, id: &str) -> Result<bool, ApiError> {
         match self.classify_source(id).await {
-            AssistantSource::Builtin => Err(AppError::BadRequest(
+            AssistantSource::Builtin => Err(ApiError::BadRequest(
                 "Cannot delete skill for built-in assistant".into(),
             )),
-            AssistantSource::Extension => Err(AppError::BadRequest(
+            AssistantSource::Extension => Err(ApiError::BadRequest(
                 "Cannot delete skill for extension-contributed assistant".into(),
             )),
             AssistantSource::User => Ok(remove_assistant_md_files(&self.user_skills_dir(), id)),
@@ -717,45 +717,45 @@ impl AssistantRuleDispatcher for AssistantService {
     async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
         AssistantService::read_rule(self, id, locale)
             .await
-            .map_err(assistant_app_error_to_extension_error)
+            .map_err(assistant_api_error_to_extension_error)
     }
 
     async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError> {
         AssistantService::write_rule(self, id, locale, content)
             .await
-            .map_err(assistant_app_error_to_extension_error)
+            .map_err(assistant_api_error_to_extension_error)
     }
 
     async fn delete_rule(&self, id: &str) -> Result<bool, ExtensionError> {
         AssistantService::delete_rule(self, id)
             .await
-            .map_err(assistant_app_error_to_extension_error)
+            .map_err(assistant_api_error_to_extension_error)
     }
 
     async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
         AssistantService::read_skill(self, id, locale)
             .await
-            .map_err(assistant_app_error_to_extension_error)
+            .map_err(assistant_api_error_to_extension_error)
     }
 
     async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError> {
         AssistantService::write_skill(self, id, locale, content)
             .await
-            .map_err(assistant_app_error_to_extension_error)
+            .map_err(assistant_api_error_to_extension_error)
     }
 
     async fn delete_skill(&self, id: &str) -> Result<bool, ExtensionError> {
         AssistantService::delete_skill(self, id)
             .await
-            .map_err(assistant_app_error_to_extension_error)
+            .map_err(assistant_api_error_to_extension_error)
     }
 }
 
-fn assistant_app_error_to_extension_error(error: AppError) -> ExtensionError {
+fn assistant_api_error_to_extension_error(error: ApiError) -> ExtensionError {
     match error {
-        AppError::BadRequest(message) => ExtensionError::InvalidRequest(message),
-        AppError::NotFound(message) => ExtensionError::NotFound(message),
-        AppError::Internal(message) => ExtensionError::Internal(message),
+        ApiError::BadRequest(message) => ExtensionError::InvalidRequest(message),
+        ApiError::NotFound(message) => ExtensionError::NotFound(message),
+        ApiError::Internal(message) => ExtensionError::Internal(message),
         other => ExtensionError::Internal(other.to_string()),
     }
 }
@@ -801,7 +801,7 @@ fn builtin_to_response(b: &BuiltinAssistant, ov: Option<&AssistantOverrideRow>) 
     }
 }
 
-fn user_row_to_response(row: &AssistantRow, ov: Option<&AssistantOverrideRow>) -> Result<AssistantResponse, AppError> {
+fn user_row_to_response(row: &AssistantRow, ov: Option<&AssistantOverrideRow>) -> Result<AssistantResponse, ApiError> {
     Ok(AssistantResponse {
         id: row.id.clone(),
         source: AssistantSource::User,
@@ -867,7 +867,7 @@ struct SerializedFields {
 }
 
 impl SerializedFields {
-    fn from_create(req: &CreateAssistantRequest) -> Result<Self, AppError> {
+    fn from_create(req: &CreateAssistantRequest) -> Result<Self, ApiError> {
         Ok(Self {
             enabled_skills: encode_str_list(req.enabled_skills.as_deref())?,
             custom_skill_names: encode_str_list(req.custom_skill_names.as_deref())?,
@@ -880,7 +880,7 @@ impl SerializedFields {
         })
     }
 
-    fn from_update(req: &UpdateAssistantRequest) -> Result<Self, AppError> {
+    fn from_update(req: &UpdateAssistantRequest) -> Result<Self, ApiError> {
         Ok(Self {
             enabled_skills: encode_str_list(req.enabled_skills.as_deref())?,
             custom_skill_names: encode_str_list(req.custom_skill_names.as_deref())?,
@@ -894,52 +894,52 @@ impl SerializedFields {
     }
 }
 
-fn encode_str_list(value: Option<&[String]>) -> Result<Option<String>, AppError> {
+fn encode_str_list(value: Option<&[String]>) -> Result<Option<String>, ApiError> {
     match value {
         Some(v) => Ok(Some(
-            serde_json::to_string(v).map_err(|e| AppError::Internal(format!("encode list: {e}")))?,
+            serde_json::to_string(v).map_err(|e| ApiError::Internal(format!("encode list: {e}")))?,
         )),
         None => Ok(None),
     }
 }
 
-fn encode_str_map(value: Option<&HashMap<String, String>>) -> Result<Option<String>, AppError> {
+fn encode_str_map(value: Option<&HashMap<String, String>>) -> Result<Option<String>, ApiError> {
     match value {
         Some(v) => Ok(Some(
-            serde_json::to_string(v).map_err(|e| AppError::Internal(format!("encode map: {e}")))?,
+            serde_json::to_string(v).map_err(|e| ApiError::Internal(format!("encode map: {e}")))?,
         )),
         None => Ok(None),
     }
 }
 
-fn encode_list_map(value: Option<&HashMap<String, Vec<String>>>) -> Result<Option<String>, AppError> {
+fn encode_list_map(value: Option<&HashMap<String, Vec<String>>>) -> Result<Option<String>, ApiError> {
     match value {
         Some(v) => Ok(Some(
-            serde_json::to_string(v).map_err(|e| AppError::Internal(format!("encode map: {e}")))?,
+            serde_json::to_string(v).map_err(|e| ApiError::Internal(format!("encode map: {e}")))?,
         )),
         None => Ok(None),
     }
 }
 
-fn decode_str_list(raw: Option<&str>) -> Result<Vec<String>, AppError> {
+fn decode_str_list(raw: Option<&str>) -> Result<Vec<String>, ApiError> {
     match raw {
         Some(s) if !s.is_empty() => {
-            serde_json::from_str(s).map_err(|e| AppError::Internal(format!("decode list: {e}")))
+            serde_json::from_str(s).map_err(|e| ApiError::Internal(format!("decode list: {e}")))
         }
         _ => Ok(Vec::new()),
     }
 }
 
-fn decode_str_map(raw: Option<&str>) -> Result<HashMap<String, String>, AppError> {
+fn decode_str_map(raw: Option<&str>) -> Result<HashMap<String, String>, ApiError> {
     match raw {
-        Some(s) if !s.is_empty() => serde_json::from_str(s).map_err(|e| AppError::Internal(format!("decode map: {e}"))),
+        Some(s) if !s.is_empty() => serde_json::from_str(s).map_err(|e| ApiError::Internal(format!("decode map: {e}"))),
         _ => Ok(HashMap::new()),
     }
 }
 
-fn decode_list_map(raw: Option<&str>) -> Result<HashMap<String, Vec<String>>, AppError> {
+fn decode_list_map(raw: Option<&str>) -> Result<HashMap<String, Vec<String>>, ApiError> {
     match raw {
-        Some(s) if !s.is_empty() => serde_json::from_str(s).map_err(|e| AppError::Internal(format!("decode map: {e}"))),
+        Some(s) if !s.is_empty() => serde_json::from_str(s).map_err(|e| ApiError::Internal(format!("decode map: {e}"))),
         _ => Ok(HashMap::new()),
     }
 }
@@ -1209,7 +1209,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     #[tokio::test]
@@ -1224,7 +1224,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     #[tokio::test]
@@ -1247,7 +1247,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::Conflict(_)));
+        assert!(matches!(err, ApiError::Conflict(_)));
     }
 
     #[tokio::test]
@@ -1264,7 +1264,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(matches!(err, ApiError::Forbidden(_)));
     }
 
     #[tokio::test]
@@ -1353,7 +1353,7 @@ mod tests {
     async fn delete_builtin_rejects() {
         let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
         let err = fx.service.delete("builtin-office").await.unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)));
+        assert!(matches!(err, ApiError::Forbidden(_)));
     }
 
     #[tokio::test]
@@ -1390,7 +1390,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::NotFound(_)));
+        assert!(matches!(err, ApiError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -1527,7 +1527,7 @@ mod tests {
             .write_rule("builtin-office", Some("en-US"), "x")
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     #[tokio::test]
@@ -1645,7 +1645,7 @@ mod tests {
         .await;
         let err = fx.service.resolve_default_agent_type().await.unwrap_err();
         match err {
-            AppError::BadRequest(msg) => {
+            ApiError::BadRequest(msg) => {
                 assert!(
                     msg.to_lowercase().contains("no providers"),
                     "unexpected error message: {msg}"
@@ -1692,7 +1692,7 @@ mod tests {
             .unwrap();
 
         let err = fx.service.resolve_default_agent_type().await.unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     /// End-to-end regression for ELECTRON-1J1 / 1KV: creating an

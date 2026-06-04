@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_api_types::{ClientPreferencesResponse, UpdateClientPreferencesRequest};
-use aionui_common::AppError;
+use aionui_common::ApiError;
 use aionui_db::IClientPreferenceRepository;
 
 /// Maximum allowed key length for client preferences.
@@ -19,12 +19,12 @@ impl ClientPrefService {
     }
 
     /// Get all client preferences, or only the specified keys.
-    pub async fn get_preferences(&self, keys: Option<&[&str]>) -> Result<ClientPreferencesResponse, AppError> {
+    pub async fn get_preferences(&self, keys: Option<&[&str]>) -> Result<ClientPreferencesResponse, ApiError> {
         let rows = match keys {
             Some(k) if !k.is_empty() => self.repo.get_by_keys(k).await,
             _ => self.repo.get_all().await,
         }
-        .map_err(|e| AppError::Internal(format!("Failed to get preferences: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to get preferences: {e}")))?;
 
         let mut map = ClientPreferencesResponse::new();
         for row in rows {
@@ -36,7 +36,7 @@ impl ClientPrefService {
     }
 
     /// Batch update client preferences. Null values delete the key.
-    pub async fn update_preferences(&self, req: UpdateClientPreferencesRequest) -> Result<(), AppError> {
+    pub async fn update_preferences(&self, req: UpdateClientPreferencesRequest) -> Result<(), ApiError> {
         let mut upserts: Vec<(String, String)> = Vec::new();
         let mut deletes: Vec<String> = Vec::new();
 
@@ -49,7 +49,7 @@ impl ClientPrefService {
                 upserts.push((
                     key,
                     serde_json::to_string(&value)
-                        .map_err(|e| AppError::Internal(format!("Failed to serialize value: {e}")))?,
+                        .map_err(|e| ApiError::Internal(format!("Failed to serialize value: {e}")))?,
                 ));
             }
         }
@@ -59,7 +59,7 @@ impl ClientPrefService {
             self.repo
                 .upsert_batch(&entries)
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to upsert preferences: {e}")))?;
+                .map_err(|e| ApiError::Internal(format!("Failed to upsert preferences: {e}")))?;
         }
 
         if !deletes.is_empty() {
@@ -67,19 +67,19 @@ impl ClientPrefService {
             self.repo
                 .delete_keys(&keys)
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to delete preferences: {e}")))?;
+                .map_err(|e| ApiError::Internal(format!("Failed to delete preferences: {e}")))?;
         }
 
         Ok(())
     }
 }
 
-fn validate_key(key: &str) -> Result<(), AppError> {
+fn validate_key(key: &str) -> Result<(), ApiError> {
     if key.is_empty() {
-        return Err(AppError::BadRequest("Preference key must not be empty".into()));
+        return Err(ApiError::BadRequest("Preference key must not be empty".into()));
     }
     if key.len() > MAX_KEY_LENGTH {
-        return Err(AppError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "Preference key exceeds maximum length of {MAX_KEY_LENGTH} characters"
         )));
     }
