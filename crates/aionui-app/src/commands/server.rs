@@ -1,5 +1,7 @@
 //! `aioncore` (no subcommand): the main HTTP server.
 
+use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -7,12 +9,164 @@ use anyhow::Result;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use aionui_app::{AppServices, create_router};
+use aionui_app::{AppConfig, AppServices, create_router};
 
 use crate::bootstrap::ServerEnvironment;
 
+const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
+const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
+
+pub(crate) struct BoundHttpListener {
+    listener: TcpListener,
+    addr: SocketAddr,
+}
+
+/// Bind the main HTTP listener before constructing services that may start
+/// their own local listeners. When `config.port == 0`, the OS-selected port is
+/// written back to the config before downstream services are built.
+pub(crate) async fn bind_http_listener(config: &mut AppConfig) -> Result<BoundHttpListener> {
+    if config.port != 0 && is_fetch_forbidden_backend_port(config.port) {
+        anyhow::bail!("backend port {} is blocked by Fetch clients", config.port);
+    }
+
+    let dynamic_port = config.port == 0;
+    let max_attempts = if dynamic_port {
+        DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS
+    } else {
+        1
+    };
+
+    for attempt in 1..=max_attempts {
+        let addr = config.socket_addr();
+        info!(address = %addr, attempt, "startup: socket bind started");
+        let listener = TcpListener::bind(&addr).await?;
+        let local_addr = listener.local_addr()?;
+
+        if dynamic_port && is_fetch_forbidden_backend_port(local_addr.port()) {
+            warn!(
+                port = local_addr.port(),
+                attempt, "startup: skipped Fetch-forbidden dynamic backend port"
+            );
+            continue;
+        }
+
+        config.port = local_addr.port();
+        info!(address = %local_addr, "startup: socket bind completed");
+        emit_listening_event(local_addr);
+
+        return Ok(BoundHttpListener {
+            listener,
+            addr: local_addr,
+        });
+    }
+
+    anyhow::bail!("failed to bind a Fetch-compatible dynamic backend port");
+}
+
+fn is_fetch_forbidden_backend_port(port: u16) -> bool {
+    matches!(
+        port,
+        1 | 7
+            | 9
+            | 11
+            | 13
+            | 15
+            | 17
+            | 19
+            | 20
+            | 21
+            | 22
+            | 23
+            | 25
+            | 37
+            | 42
+            | 43
+            | 53
+            | 69
+            | 77
+            | 79
+            | 87
+            | 95
+            | 101
+            | 102
+            | 103
+            | 104
+            | 109
+            | 110
+            | 111
+            | 113
+            | 115
+            | 117
+            | 119
+            | 123
+            | 135
+            | 137
+            | 139
+            | 143
+            | 161
+            | 179
+            | 389
+            | 427
+            | 465
+            | 512
+            | 513
+            | 514
+            | 515
+            | 526
+            | 530
+            | 531
+            | 532
+            | 540
+            | 548
+            | 554
+            | 556
+            | 563
+            | 587
+            | 601
+            | 636
+            | 989
+            | 990
+            | 993
+            | 995
+            | 1719
+            | 1720
+            | 1723
+            | 2049
+            | 3659
+            | 4045
+            | 5060
+            | 5061
+            | 6000
+            | 6566
+            | 6665
+            | 6666
+            | 6667
+            | 6668
+            | 6669
+            | 6697
+            | 10080
+    )
+}
+
+fn format_listening_event(addr: SocketAddr) -> String {
+    let payload = serde_json::json!({
+        "host": addr.ip().to_string(),
+        "port": addr.port(),
+    });
+    format!("{LISTENING_EVENT_PREFIX} {payload}")
+}
+
+fn emit_listening_event(addr: SocketAddr) {
+    println!("{}", format_listening_event(addr));
+    let _ = io::stdout().flush();
+}
+
 /// Start the HTTP server with fully constructed services.
-pub async fn run_server(env: ServerEnvironment, services: AppServices) -> Result<ExitCode> {
+pub(crate) async fn run_server(
+    env: ServerEnvironment,
+    services: AppServices,
+    bound: BoundHttpListener,
+) -> Result<ExitCode> {
     let boot = Instant::now();
 
     let has_users = services.user_repo.has_users().await?;
@@ -23,20 +177,10 @@ pub async fn run_server(env: ServerEnvironment, services: AppServices) -> Result
     let router = create_router(&services).await;
     info!(
         elapsed_ms = boot.elapsed().as_millis(),
-        "startup: router ready for socket bind"
+        "startup: router ready for bound socket"
     );
-    let addr = env.config.socket_addr();
-    info!(
-        elapsed_ms = boot.elapsed().as_millis(),
-        address = %addr,
-        "startup: socket bind started"
-    );
-    let listener = TcpListener::bind(&addr).await?;
-    info!(
-        elapsed_ms = boot.elapsed().as_millis(),
-        address = %addr,
-        "startup: socket bind completed"
-    );
+    let listener = bound.listener;
+    let addr = bound.addr;
     info!(elapsed_ms = boot.elapsed().as_millis(), "Server listening on {addr}");
 
     // Kick off the idle-ACP-agent reaper. `start_idle_scanner` returns
@@ -93,5 +237,48 @@ async fn shutdown_signal() {
         () = terminate => {
             info!("Received SIGTERM, shutting down...");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use aionui_app::AppConfig;
+
+    use super::*;
+
+    #[test]
+    fn listening_event_line_is_machine_readable() {
+        let addr: SocketAddr = "127.0.0.1:49153".parse().unwrap();
+
+        let line = format_listening_event(addr);
+
+        let payload = line
+            .strip_prefix("AIONCORE_LISTENING ")
+            .expect("line should start with the listening event prefix");
+        let parsed: serde_json::Value = serde_json::from_str(payload).expect("payload should be valid JSON");
+        assert_eq!(parsed["host"], "127.0.0.1");
+        assert_eq!(parsed["port"], 49153);
+    }
+
+    #[test]
+    fn fetch_forbidden_backend_ports_are_rejected() {
+        assert!(is_fetch_forbidden_backend_port(1720));
+        assert!(is_fetch_forbidden_backend_port(10080));
+        assert!(!is_fetch_forbidden_backend_port(49153));
+    }
+
+    #[tokio::test]
+    async fn bind_http_listener_updates_dynamic_port_config() {
+        let mut config = AppConfig {
+            port: 0,
+            ..AppConfig::default()
+        };
+
+        let bound = bind_http_listener(&mut config).await.expect("bind should succeed");
+
+        assert!(config.port > 0);
+        assert_eq!(config.port, bound.addr.port());
     }
 }
