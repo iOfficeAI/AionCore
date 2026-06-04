@@ -6,7 +6,10 @@ use crate::protocol::events::{
 };
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
-use agent_client_protocol::schema::{ContentBlock, LoadSessionRequest, PromptRequest, SessionId, StopReason};
+use agent_client_protocol::schema::{
+    ContentBlock, LoadSessionRequest, PromptRequest, SessionConfigKind, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionId, SessionModelState, StopReason,
+};
 use aionui_api_types::{
     AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, AgentErrorResolutionTarget,
 };
@@ -27,6 +30,45 @@ pub(super) enum PromptOutcome {
     EmptyResponse { session_id: String, error: ErrorEventData },
 }
 
+/// Per the ACP spec, `configOptions` with `category: "model"` is the
+/// stable, recommended way for agents to advertise available models.
+/// Some agents (e.g. OpenCode) use this exclusively and omit the
+/// legacy `models` field. When `models` is absent, derive a
+/// `SessionModelState` from the "model" config option so the frontend
+/// can still render the model selector.
+fn derive_models_from_config_options(
+    config_options: &[agent_client_protocol::schema::SessionConfigOption],
+) -> Option<SessionModelState> {
+    use agent_client_protocol::schema::{ModelId as AcpModelId, ModelInfo, SessionConfigSelectGroup};
+    for opt in config_options {
+        if opt.category.as_ref() != Some(&SessionConfigOptionCategory::Model) {
+            continue;
+        }
+        if let SessionConfigKind::Select(ref select) = opt.kind {
+            let current_model_id = AcpModelId::new(select.current_value.0.as_ref());
+            let available: Vec<ModelInfo> = match &select.options {
+                SessionConfigSelectOptions::Ungrouped(options) => options
+                    .iter()
+                    .map(|o| ModelInfo::new(AcpModelId::new(o.value.0.as_ref()), o.name.clone()))
+                    .collect(),
+                SessionConfigSelectOptions::Grouped(groups) => groups
+                    .iter()
+                    .flat_map(|g: &SessionConfigSelectGroup| &g.options)
+                    .map(|o| ModelInfo::new(AcpModelId::new(o.value.0.as_ref()), o.name.clone()))
+                    .collect(),
+                // `SessionConfigSelectOptions` is non-exhaustive; future variants
+                // are treated as having no model entries.
+                _ => Vec::new(),
+            };
+            if available.is_empty() {
+                return None;
+            }
+            return Some(SessionModelState::new(current_model_id, available));
+        }
+    }
+    None
+}
+
 impl AcpAgentManager {
     /// Establish a fresh ACP session (session/new) and apply desired
     /// mode/model/config via reconcile. Does NOT send a prompt and
@@ -43,6 +85,13 @@ impl AcpAgentManager {
             let mut session = self.session.write().await;
             if let Some(models) = session_response.models {
                 session.apply_advertised_models(models);
+            } else if let Some(ref config_options) = session_response.config_options {
+                // `configOptions` with category "model" is the ACP-recommended
+                // way to advertise models; fall back to it when `models` is
+                // absent (e.g. OpenCode).
+                if let Some(models) = derive_models_from_config_options(config_options) {
+                    session.apply_advertised_models(models);
+                }
             }
             if let Some(modes) = session_response.modes {
                 session.apply_advertised_modes(modes);
@@ -136,6 +185,10 @@ impl AcpAgentManager {
                 let mut session = self.session.write().await;
                 if let Some(models) = new_response.models {
                     session.apply_advertised_models(models);
+                } else if let Some(ref config_options) = new_response.config_options {
+                    if let Some(models) = derive_models_from_config_options(config_options) {
+                        session.apply_advertised_models(models);
+                    }
                 }
                 if let Some(modes) = new_response.modes {
                     session.apply_advertised_modes(modes);
@@ -189,6 +242,10 @@ impl AcpAgentManager {
                 let mut session = self.session.write().await;
                 if let Some(models) = load_response.models {
                     session.apply_advertised_models(models);
+                } else if let Some(ref config_options) = load_response.config_options {
+                    if let Some(models) = derive_models_from_config_options(config_options) {
+                        session.apply_advertised_models(models);
+                    }
                 }
                 if let Some(mut modes) = load_response.modes {
                     if let Some(db_current) = preloaded_mode {
