@@ -1,5 +1,6 @@
 use aionui_ai_agent::AcpError;
 use aionui_common::AppError;
+use aionui_db::DbError;
 
 /// Application-level error contract for the conversation domain.
 ///
@@ -11,8 +12,17 @@ pub enum ConversationError {
     #[error("Conversation not found: {id}")]
     NotFound { id: String },
 
-    #[error("Conversation is archived: {id}")]
-    Archived { id: String },
+    #[error("Message not found: {id}")]
+    MessageNotFound { id: String },
+
+    #[error("Conversation is archived: {reason}")]
+    Archived { id: String, reason: String },
+
+    #[error("Bad request: {reason}")]
+    BadRequest { reason: String },
+
+    #[error("Conversation is busy: {reason}")]
+    Busy { reason: String },
 
     #[error("Forbidden: {reason}")]
     Forbidden { reason: String },
@@ -20,8 +30,25 @@ pub enum ConversationError {
     #[error("ACP error")]
     Acp(#[from] AcpError),
 
-    #[error(transparent)]
-    App(#[from] AppError),
+    #[error("{0}")]
+    App(#[source] AppError),
+}
+
+impl From<AppError> for ConversationError {
+    fn from(error: AppError) -> Self {
+        match error {
+            AppError::BadRequest(reason) => Self::BadRequest { reason },
+            AppError::Conflict(reason) => Self::Busy { reason },
+            AppError::Forbidden(reason) => Self::Forbidden { reason },
+            other => Self::App(other),
+        }
+    }
+}
+
+impl From<DbError> for ConversationError {
+    fn from(error: DbError) -> Self {
+        AppError::from(error).into()
+    }
 }
 
 #[cfg(test)]
@@ -32,6 +59,8 @@ mod tests {
 
     fn assert_from_acp<T: From<AcpError>>() {}
 
+    fn assert_from_db<T: From<DbError>>() {}
+
     #[test]
     fn conversation_error_is_error_contract() {
         assert_error::<ConversationError>();
@@ -40,5 +69,10 @@ mod tests {
     #[test]
     fn conversation_error_has_acp_from_impl() {
         assert_from_acp::<ConversationError>();
+    }
+
+    #[test]
+    fn conversation_error_has_db_from_impl() {
+        assert_from_db::<ConversationError>();
     }
 }

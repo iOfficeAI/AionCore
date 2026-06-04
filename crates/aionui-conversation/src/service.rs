@@ -35,6 +35,7 @@ use crate::convert::{
     TOOL_CONTENT_COMPACT_THRESHOLD_BYTES, row_to_artifact_response, row_to_message_response,
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
+use crate::error::ConversationError;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::stream_relay::StreamRelay;
@@ -577,13 +578,13 @@ impl ConversationService {
     /// Returns `NotFound` if the conversation does not exist or does not
     /// belong to the given user (avoids leaking existence to other users).
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
-    pub async fn get(&self, user_id: &str, id: &str) -> Result<ConversationResponse, AppError> {
+    pub async fn get(&self, user_id: &str, id: &str) -> Result<ConversationResponse, ConversationError> {
         let row = self
             .conversation_repo
             .get(id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let mut extra: serde_json::Value =
             serde_json::from_str(&row.extra).map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
@@ -934,13 +935,15 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         query: ListMessagesQuery,
-    ) -> Result<MessageListResponse, AppError> {
+    ) -> Result<MessageListResponse, ConversationError> {
         // Verify conversation exists and belongs to user
         self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let page = query.page.unwrap_or(1);
         let page_size = query.page_size.unwrap_or(50);
@@ -1011,18 +1014,22 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         message_id: &str,
-    ) -> Result<MessageResponse, AppError> {
+    ) -> Result<MessageResponse, ConversationError> {
         self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let row = self
             .conversation_repo
             .get_message(conversation_id, message_id)
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("Message {message_id} not found")))?;
+            .ok_or_else(|| ConversationError::MessageNotFound {
+                id: message_id.to_owned(),
+            })?;
 
         let content_bytes = row.content.len();
         let response = row_to_message_response(row)?;
@@ -1250,9 +1257,11 @@ impl ConversationService {
         conversation_id: &str,
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<String, AppError> {
+    ) -> Result<String, ConversationError> {
         if req.content.trim().is_empty() {
-            return Err(AppError::BadRequest("Message content must not be empty".into()));
+            return Err(ConversationError::BadRequest {
+                reason: "Message content must not be empty".into(),
+            });
         }
         let send_started_at = now_ms();
 
@@ -1262,7 +1271,9 @@ impl ConversationService {
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         // Short-circuit for legacy Gemini conversations: the dedicated Gemini
         // runtime has been removed, so we cannot build an agent for this row.
@@ -1271,11 +1282,12 @@ impl ConversationService {
         // deserialize. The client identifies this case by `code` and renders
         // a dedicated archived-conversation UI rather than a generic banner.
         if row.r#type == "gemini" {
-            return Err(AppError::ConversationArchived(
-                "This conversation was created with the legacy Gemini runtime, which has been \
-                 removed. Please start a new conversation with the Gemini ACP backend to continue."
+            return Err(ConversationError::Archived {
+                id: conversation_id.to_owned(),
+                reason: "This conversation was created with the legacy Gemini runtime, which has been \
+                         removed. Please start a new conversation with the Gemini ACP backend to continue."
                     .into(),
-            ));
+            });
         }
 
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id)?;
@@ -1326,7 +1338,7 @@ impl ConversationService {
                     "Failed to build task options for message send"
                 );
                 let _ = self.persist_send_failure_tip(conversation_id, &err).await;
-                return Err(err);
+                return Err(err.into());
             }
         };
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
@@ -1536,13 +1548,15 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), ConversationError> {
         // Verify conversation exists and belongs to user
         self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let Some(agent) = task_manager.get_task(conversation_id) else {
             info!("No active agent to cancel; treating as idempotent success");
@@ -1551,7 +1565,7 @@ impl ConversationService {
 
         if let Err(e) = agent.cancel().await {
             warn!(error = %ErrorChain(&e), "Failed to cancel agent");
-            return Err(e);
+            return Err(e.into());
         }
 
         info!("Stream canceled");
@@ -1568,13 +1582,15 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), ConversationError> {
         let row = self
             .conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let build_opts = self.build_task_options(&row)?;
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;

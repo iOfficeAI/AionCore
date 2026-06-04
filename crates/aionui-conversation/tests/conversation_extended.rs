@@ -5,8 +5,8 @@ use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListMessagesQuery, SearchMessagesQuery, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AppError, ConversationStatus, TimestampMs, generate_prefixed_id, now_ms};
-use aionui_conversation::ConversationService;
 use aionui_conversation::skill_resolver::SkillResolver;
+use aionui_conversation::{ConversationError, ConversationService};
 use aionui_db::models::MessageRow;
 use aionui_db::{IConversationRepository, SqliteConversationRepository, init_database_memory};
 use aionui_realtime::EventBroadcaster;
@@ -306,7 +306,7 @@ async fn t8_5_conversation_not_found() {
         .list_messages(USER_ID, "nonexistent", ListMessagesQuery::default())
         .await
         .unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── T9: Message search ─────────────────────────────────────────────
@@ -384,6 +384,19 @@ async fn t8_7_get_message_returns_full_tool_content_after_compact_list() {
             .unwrap(),
         large_output
     );
+}
+
+#[tokio::test]
+async fn t8_8_get_message_not_found() {
+    let (svc, _repo, _b) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let err = svc.get_message(USER_ID, &conv.id, "missing-message").await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConversationError::MessageNotFound { id } if id == "missing-message"
+    ));
 }
 
 #[tokio::test]
@@ -644,7 +657,7 @@ async fn messages_wrong_user_returns_not_found() {
         .list_messages("other_user", &conv.id, ListMessagesQuery::default())
         .await
         .unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]

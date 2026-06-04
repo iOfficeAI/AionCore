@@ -14,7 +14,23 @@ use aionui_api_types::{
 use aionui_auth::CurrentUser;
 use aionui_common::AppError;
 
+use crate::ConversationError;
 use crate::state::ConversationRouterState;
+
+impl From<ConversationError> for AppError {
+    fn from(error: ConversationError) -> Self {
+        match error {
+            ConversationError::NotFound { id } => AppError::NotFound(format!("Conversation {id} not found")),
+            ConversationError::MessageNotFound { id } => AppError::NotFound(format!("Message {id} not found")),
+            ConversationError::Archived { reason, .. } => AppError::ConversationArchived(reason),
+            ConversationError::BadRequest { reason } => AppError::BadRequest(reason),
+            ConversationError::Busy { reason } => AppError::Conflict(reason),
+            ConversationError::Forbidden { reason } => AppError::Forbidden(reason),
+            ConversationError::Acp(_) => AppError::BadGateway("Agent protocol error".into()),
+            ConversationError::App(error) => error,
+        }
+    }
+}
 
 /// Build the conversation router (CRUD + message flow + confirmation + extended operations).
 ///
@@ -77,7 +93,7 @@ async fn get_one(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<ConversationResponse>>, AppError> {
-    let conversation = state.service.get(&user.id, &id).await?;
+    let conversation = state.service.get(&user.id, &id).await.map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(conversation)))
 }
 
@@ -125,7 +141,11 @@ async fn list_msg(
     Path(id): Path<String>,
     Query(query): Query<ListMessagesQuery>,
 ) -> Result<Json<ApiResponse<MessageListResponse>>, AppError> {
-    let result = state.service.list_messages(&user.id, &id, query).await?;
+    let result = state
+        .service
+        .list_messages(&user.id, &id, query)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -144,7 +164,8 @@ async fn get_msg(
     let result = state
         .service
         .get_message(&user.id, &params.id, &params.message_id)
-        .await?;
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -158,7 +179,8 @@ async fn send_msg(
     let msg_id = state
         .service
         .send_message(&user.id, &id, req, &state.task_manager)
-        .await?;
+        .await
+        .map_err(AppError::from)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(ApiResponse::ok(SendMessageResponse { msg_id })),
@@ -200,7 +222,11 @@ async fn cancel(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.cancel(&user.id, &id, &state.task_manager).await?;
+    state
+        .service
+        .cancel(&user.id, &id, &state.task_manager)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -209,7 +235,11 @@ async fn warmup(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.warmup(&user.id, &id, &state.task_manager).await?;
+    state
+        .service
+        .warmup(&user.id, &id, &state.task_manager)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -286,4 +316,41 @@ async fn active_count(
 ) -> Result<Json<ApiResponse<ActiveCountResponse>>, AppError> {
     let count = state.task_manager.active_count();
     Ok(Json(ApiResponse::ok(ActiveCountResponse { count })))
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn conversation_not_found_maps_to_app_not_found() {
+        let app = AppError::from(ConversationError::NotFound { id: "conv_1".into() });
+        assert!(matches!(app, AppError::NotFound(message) if message == "Conversation conv_1 not found"));
+    }
+
+    #[test]
+    fn conversation_archived_maps_to_app_conversation_archived() {
+        let app = AppError::from(ConversationError::Archived {
+            id: "conv_1".into(),
+            reason: "legacy runtime".into(),
+        });
+        assert!(matches!(app, AppError::ConversationArchived(message) if message == "legacy runtime"));
+    }
+
+    #[test]
+    fn message_not_found_maps_to_app_not_found() {
+        let app = AppError::from(ConversationError::MessageNotFound { id: "msg_1".into() });
+        assert!(matches!(app, AppError::NotFound(message) if message == "Message msg_1 not found"));
+    }
+
+    #[test]
+    fn conversation_app_error_passthrough_preserves_special_codes() {
+        let app = AppError::from(ConversationError::from(
+            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/my project".into()),
+        ));
+        assert!(matches!(
+            app,
+            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message) if message == "/tmp/my project"
+        ));
+    }
 }

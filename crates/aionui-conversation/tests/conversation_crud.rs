@@ -5,8 +5,8 @@ use aionui_api_types::{
     CreateConversationRequest, ListConversationsQuery, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, AppError, ConversationSource, ConversationStatus, TimestampMs};
-use aionui_conversation::ConversationService;
 use aionui_conversation::skill_resolver::SkillResolver;
+use aionui_conversation::{ConversationError, ConversationService};
 use aionui_db::{SqliteConversationRepository, init_database_memory};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
@@ -344,7 +344,7 @@ async fn t3_1_get_existing() {
 async fn t3_2_get_not_found() {
     let (svc, _, _task_mgr) = setup().await;
     let err = svc.get(USER_ID, "non-existent-uuid").await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── T4: Update conversation ────────────────────────────────────────
@@ -460,7 +460,7 @@ async fn t5_1_delete_conversation() {
 
     // Verify gone
     let err = svc.get(USER_ID, &conv.id).await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 
     // Verify broadcast
     let events = broadcaster.take_events();
@@ -476,7 +476,7 @@ async fn t5_2_delete_then_get_returns_404() {
 
     svc.delete(USER_ID, &conv.id).await.unwrap();
     let err = svc.get(USER_ID, &conv.id).await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
