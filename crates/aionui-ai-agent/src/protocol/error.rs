@@ -1,5 +1,5 @@
 use agent_client_protocol::{Error as SdkError, ErrorCode};
-use aionui_common::{AgentKillReason, AppError};
+use aionui_common::AgentKillReason;
 
 /// Why an ACP session was closed / terminated.
 ///
@@ -78,13 +78,16 @@ impl CloseReason {
     }
 }
 
-/// ACP-specific error type for protocol and process lifecycle errors.
+/// Workspace-facing owned ACP error contract.
 ///
-/// This error is internal to the `aionui-ai-agent` crate. External callers
-/// see it only after conversion to [`AppError`] via the `From` impl.
+/// Variants and fields are exposed for structured classification by workspace
+/// callers, but must not be rendered directly to public HTTP or WebSocket
+/// output. The `stderr` fields may contain sensitive data; `Display`
+/// intentionally omits them.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 #[allow(dead_code)] // Variants constructed as error paths mature; kept for complete ACP error model.
-pub(crate) enum AcpError {
+pub enum AcpError {
     // ── Process lifecycle ──────────────────────────────────────────
     /// CLI binary not found or not executable.
     SpawnFailed { message: String },
@@ -136,8 +139,8 @@ pub(crate) enum AcpError {
 }
 
 /// Format the human-readable suffix for `StartupCrash` / `Disconnected`.
-/// stderr is deliberately omitted — see the `From<AcpError> for AppError`
-/// security note.
+/// stderr is deliberately omitted; app-layer mappers must use `Display`
+/// instead of serializing raw process output.
 fn format_exit_detail(exit_code: Option<i32>, signal: Option<&str>) -> String {
     match (exit_code, signal) {
         (Some(code), Some(sig)) => format!(" (exit code {code}, {sig})"),
@@ -302,49 +305,9 @@ fn extract_session_not_found(data: Option<&serde_json::Value>) -> Option<String>
     if sid.is_empty() { None } else { Some(sid.to_owned()) }
 }
 
-/// Conversion from [`AcpError`] to [`AppError`] — the only way `AcpError`
-/// leaves this crate.
-///
-/// **Security:** `StartupCrash` and `Disconnected` contain `stderr` which may
-/// hold sensitive data. The `Display` impl only includes
-/// `exit_code` and `signal`. `stderr` is available for structured logging
-/// (`tracing`) but never serialized into HTTP responses.
-impl From<AcpError> for AppError {
-    fn from(err: AcpError) -> Self {
-        match &err {
-            // Process lifecycle → 502 Bad Gateway (upstream failure)
-            AcpError::SpawnFailed { .. } | AcpError::StartupCrash { .. } | AcpError::Disconnected { .. } => {
-                AppError::BadGateway(err.to_string())
-            }
-
-            // Authentication → 401
-            AcpError::AuthRequired => AppError::Unauthorized("Agent requires authentication".into()),
-
-            // Session not found → 404
-            AcpError::SessionNotFound { .. } => AppError::NotFound(err.to_string()),
-
-            // Method not found → 400
-            AcpError::MethodNotFound { .. } => AppError::BadRequest(err.to_string()),
-
-            // Invalid parameters → 400
-            AcpError::InvalidParams { .. } => AppError::BadRequest(err.to_string()),
-
-            // Agent internal error → 502 (upstream failure)
-            AcpError::AgentInternal { .. } => AppError::BadGateway(err.to_string()),
-
-            // Not connected → 500 (our bug)
-            AcpError::NotConnected => AppError::Internal("ACP protocol not connected".into()),
-
-            // Init timeout → 502
-            AcpError::InitTimeout { .. } => AppError::BadGateway(err.to_string()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
 
     // ── CloseReason ─────────────────────────────────────────────────────
 
@@ -610,35 +573,6 @@ mod tests {
     }
 
     #[test]
-    fn to_app_error_status_codes() {
-        let cases: Vec<(AcpError, StatusCode)> = vec![
-            (AcpError::SpawnFailed { message: "x".into() }, StatusCode::BAD_GATEWAY),
-            (AcpError::AuthRequired, StatusCode::UNAUTHORIZED),
-            (
-                AcpError::SessionNotFound { session_id: "s".into() },
-                StatusCode::NOT_FOUND,
-            ),
-            (AcpError::MethodNotFound { method: "m".into() }, StatusCode::BAD_REQUEST),
-            (AcpError::InvalidParams { message: "p".into() }, StatusCode::BAD_REQUEST),
-            (
-                AcpError::AgentInternal {
-                    message: "e".into(),
-                    code: -1,
-                    data: None,
-                },
-                StatusCode::BAD_GATEWAY,
-            ),
-            (AcpError::NotConnected, StatusCode::INTERNAL_SERVER_ERROR),
-            (AcpError::InitTimeout { timeout_secs: 30 }, StatusCode::BAD_GATEWAY),
-        ];
-
-        for (acp_err, expected_status) in cases {
-            let app_err: AppError = acp_err.into();
-            assert_eq!(app_err.status_code(), expected_status, "Mismatch for {app_err:?}");
-        }
-    }
-
-    #[test]
     fn display_does_not_contain_stderr() {
         let err = AcpError::StartupCrash {
             exit_code: Some(1),
@@ -698,6 +632,23 @@ mod tests {
             AcpError::AgentInternal { code, message, data } => {
                 assert_eq!(code, -32603);
                 assert_eq!(message, "Internal error");
+                let data = data.expect("data must be preserved");
+                assert_eq!(data["reason"], "rate_limited");
+                assert_eq!(data["retry_after"], 30);
+            }
+            other => panic!("Expected AgentInternal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_internal_preserves_code_and_data() {
+        let sdk_err = SdkError::new(-32099, "custom upstream error")
+            .data(serde_json::json!({"reason": "rate_limited", "retry_after": 30}));
+        let acp = AcpError::from_sdk(sdk_err, "context");
+        match acp {
+            AcpError::AgentInternal { code, message, data } => {
+                assert_eq!(code, -32099);
+                assert_eq!(message, "custom upstream error");
                 let data = data.expect("data must be preserved");
                 assert_eq!(data["reason"], "rate_limited");
                 assert_eq!(data["retry_after"], 30);

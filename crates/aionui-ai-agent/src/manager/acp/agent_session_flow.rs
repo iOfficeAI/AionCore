@@ -1,5 +1,6 @@
 use crate::manager::acp::AcpAgentManager;
 use crate::manager::acp::mode_normalize::agent_metadata_uses_meta_resume;
+use crate::protocol::error::AcpError;
 use crate::protocol::events::{
     AgentStreamEvent, AvailableCommandsEventData, ErrorEventData, FinishEventData, SessionAssignedEventData,
     StartEventData,
@@ -15,18 +16,10 @@ use serde_json::Value;
 use tokio::sync::broadcast::error::TryRecvError;
 
 use super::agent::sdk_to_snake_value;
+use super::error_mapping::{
+    AcpSendFailure, acp_error_to_app_error, is_acp_session_not_found, is_mapped_acp_session_not_found,
+};
 use tracing::warn;
-
-/// True when an `AppError` originates from an ACP `SessionNotFound`
-/// reply. Used to decide whether `open_session_resume` should drop a
-/// stale sid and fall through to `open_session_new` instead of
-/// surfacing the error. The `AcpError::SessionNotFound -> AppError`
-/// converter renders as "Session not found: <sid>", so we match on
-/// that text rather than `AppError::NotFound` alone — other 404 paths
-/// (e.g. "Workspace not found") must not trigger a session rebuild.
-fn is_session_not_found(err: &AppError) -> bool {
-    matches!(err, AppError::NotFound(msg) if msg.starts_with("Session not found"))
-}
 
 impl AcpAgentManager {
     /// Establish a fresh ACP session (session/new) and apply desired
@@ -36,7 +29,7 @@ impl AcpAgentManager {
     /// Returns the CLI-assigned session id.
     pub(super) async fn open_session_new(&self) -> Result<String, AppError> {
         let req = self.params.new_session_request();
-        let session_response = self.protocol.new_session(req).await.map_err(AppError::from)?;
+        let session_response = self.protocol.new_session(req).await.map_err(acp_error_to_app_error)?;
 
         let sid = session_response.session_id.to_string();
 
@@ -92,6 +85,11 @@ impl AcpAgentManager {
         self.open_session_new().await
     }
 
+    async fn rebuild_after_acp_session_not_found(&self, stale_sid: &str, err: AcpError) -> Result<String, AppError> {
+        let err = acp_error_to_app_error(err);
+        self.rebuild_after_session_not_found(stale_sid, &err).await
+    }
+
     /// Resume an existing ACP session and apply desired mode/model/config.
     /// Does NOT send a prompt. Returns the (possibly rewritten) session id.
     ///
@@ -119,12 +117,12 @@ impl AcpAgentManager {
             meta.insert("claudeCode".into(), Value::Object(claude_code));
 
             let req = self.params.new_session_request().meta(meta);
-            let new_response = match self.protocol.new_session(req).await.map_err(AppError::from) {
+            let new_response = match self.protocol.new_session(req).await {
                 Ok(r) => r,
-                Err(e) if is_session_not_found(&e) => {
-                    return self.rebuild_after_session_not_found(session_id, &e).await;
+                Err(e) if is_acp_session_not_found(&e) => {
+                    return self.rebuild_after_acp_session_not_found(session_id, e).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(acp_error_to_app_error(e)),
             };
             let new_sid = new_response.session_id.to_string();
 
@@ -153,7 +151,9 @@ impl AcpAgentManager {
 
             return match self.reconcile_session(&new_sid).await {
                 Ok(()) => Ok(new_sid),
-                Err(e) if is_session_not_found(&e) => self.rebuild_after_session_not_found(&new_sid, &e).await,
+                Err(e) if is_mapped_acp_session_not_found(&e) => {
+                    self.rebuild_after_session_not_found(&new_sid, &e).await
+                }
                 Err(e) => Err(e),
             };
         }
@@ -171,12 +171,12 @@ impl AcpAgentManager {
             if !self.params.mcp_servers.is_empty() {
                 load_req = load_req.mcp_servers(self.params.mcp_servers.clone());
             }
-            let load_response = match self.protocol.load_session(load_req).await.map_err(AppError::from) {
+            let load_response = match self.protocol.load_session(load_req).await {
                 Ok(r) => r,
-                Err(e) if is_session_not_found(&e) => {
-                    return self.rebuild_after_session_not_found(session_id, &e).await;
+                Err(e) if is_acp_session_not_found(&e) => {
+                    return self.rebuild_after_acp_session_not_found(session_id, e).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(acp_error_to_app_error(e)),
             };
 
             {
@@ -200,7 +200,9 @@ impl AcpAgentManager {
 
             return match self.reconcile_session(session_id).await {
                 Ok(()) => Ok(session_id.to_owned()),
-                Err(e) if is_session_not_found(&e) => self.rebuild_after_session_not_found(session_id, &e).await,
+                Err(e) if is_mapped_acp_session_not_found(&e) => {
+                    self.rebuild_after_session_not_found(session_id, &e).await
+                }
                 Err(e) => Err(e),
             };
         }
@@ -216,7 +218,7 @@ impl AcpAgentManager {
         self.emit_snapshot_events().await;
         match self.reconcile_session(session_id).await {
             Ok(()) => Ok(session_id.to_owned()),
-            Err(e) if is_session_not_found(&e) => self.rebuild_after_session_not_found(session_id, &e).await,
+            Err(e) if is_mapped_acp_session_not_found(&e) => self.rebuild_after_session_not_found(session_id, &e).await,
             Err(e) => Err(e),
         }
     }
@@ -226,8 +228,10 @@ impl AcpAgentManager {
         &self,
         data: &SendMessageData,
         session_id: Option<&str>,
-    ) -> Result<(), AppError> {
-        let sid = session_id.ok_or_else(|| AppError::Internal("Cannot prompt: no session ID available".into()))?;
+    ) -> Result<(), AcpSendFailure> {
+        let sid = session_id
+            .ok_or_else(|| AppError::Internal("Cannot prompt: no session ID available".into()))
+            .map_err(AcpSendFailure::from)?;
 
         let content = data.content.clone();
 
@@ -249,7 +253,7 @@ impl AcpAgentManager {
                 vec![ContentBlock::from(content)],
             ))
             .await
-            .map_err(AppError::from)?;
+            .map_err(AcpSendFailure::from)?;
 
         // Diagnose the "blank reply" case: the agent finished a turn without
         // producing any user-visible output. We surface a structured error to
@@ -425,6 +429,7 @@ mod tests {
     //! `session_id()` — the same terminal state the real `open_session_new`
     //! / `open_session_resume` helpers leave behind.
     use crate::manager::acp::{AcpSession, AcpSessionEvent};
+    use crate::protocol::error::AcpError;
     use crate::shared_kernel::SessionId as DomainSessionId;
     use agent_client_protocol::schema::AgentCapabilities;
 
@@ -567,23 +572,25 @@ mod tests {
         );
     }
 
-    /// The `is_session_not_found` discriminator powers
+    /// The `is_acp_session_not_found` discriminator powers
     /// `open_session_resume`'s rescue path. Match strictly on the
-    /// `AcpError::SessionNotFound -> AppError::NotFound` rendering;
-    /// other 404s (e.g. workspace lookup) must surface to callers
-    /// instead of triggering a phantom session rebuild.
+    /// structured `AcpError::SessionNotFound` variant; other ACP failures
+    /// must surface to callers instead of triggering a phantom session
+    /// rebuild.
     #[test]
-    fn is_session_not_found_matches_session_not_found_only() {
-        use aionui_common::AppError;
+    fn is_acp_session_not_found_matches_session_not_found_only() {
+        let session_err = AcpError::SessionNotFound {
+            session_id: "ses-1".into(),
+        };
+        assert!(super::is_acp_session_not_found(&session_err));
 
-        let session_err = AppError::NotFound("Session not found: ses-1".into());
-        assert!(super::is_session_not_found(&session_err));
+        let invalid_params = AcpError::InvalidParams {
+            message: "Workspace not found".into(),
+        };
+        assert!(!super::is_acp_session_not_found(&invalid_params));
 
-        let workspace_err = AppError::NotFound("Workspace not found".into());
-        assert!(!super::is_session_not_found(&workspace_err));
-
-        let bad_request = AppError::BadRequest("anything".into());
-        assert!(!super::is_session_not_found(&bad_request));
+        let auth_required = AcpError::AuthRequired;
+        assert!(!super::is_acp_session_not_found(&auth_required));
     }
 
     // -- empty-finish diagnostic (ELECTRON-1JG) -------------------------------

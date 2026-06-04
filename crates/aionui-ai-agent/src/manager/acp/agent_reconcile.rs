@@ -1,7 +1,7 @@
 use crate::manager::acp::AcpAgentManager;
 
+use crate::manager::acp::error_mapping::{acp_error_to_app_error, is_acp_session_not_found};
 use crate::manager::acp::mode_normalize::normalize_requested_mode;
-use crate::protocol::error::AcpError;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId};
 use agent_client_protocol::schema::{
     SessionId, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest,
@@ -67,14 +67,14 @@ impl AcpAgentManager {
                         ))
                         .await
                     {
-                        if matches!(e, AcpError::SessionNotFound { .. }) {
+                        if is_acp_session_not_found(&e) {
                             warn!(
                                 conversation_id = %self.params.conversation_id,
                                 mode_id = %normalized,
                                 error = %e,
                                 "reconcile_session: set_mode hit SessionNotFound; aborting reconcile"
                             );
-                            return Err(AppError::from(e));
+                            return Err(acp_error_to_app_error(e));
                         }
                         error!(
                             conversation_id = %self.params.conversation_id,
@@ -101,14 +101,14 @@ impl AcpAgentManager {
                         ))
                         .await
                     {
-                        if matches!(e, AcpError::SessionNotFound { .. }) {
+                        if is_acp_session_not_found(&e) {
                             warn!(
                                 conversation_id = %self.params.conversation_id,
                                 model_id = %model,
                                 error = %e,
                                 "reconcile_session: set_model hit SessionNotFound; aborting reconcile"
                             );
-                            return Err(AppError::from(e));
+                            return Err(acp_error_to_app_error(e));
                         }
                         error!(
                             conversation_id = %self.params.conversation_id,
@@ -139,7 +139,7 @@ impl AcpAgentManager {
                         ))
                         .await
                     {
-                        if matches!(err, AcpError::SessionNotFound { .. }) {
+                        if is_acp_session_not_found(&err) {
                             warn!(
                                 conversation_id = %self.params.conversation_id,
                                 config_id = %key,
@@ -147,7 +147,7 @@ impl AcpAgentManager {
                                 error = %err,
                                 "reconcile_session: set_config_option hit SessionNotFound; aborting reconcile"
                             );
-                            return Err(AppError::from(err));
+                            return Err(acp_error_to_app_error(err));
                         }
                         info!(
                             conversation_id = %self.params.conversation_id,
