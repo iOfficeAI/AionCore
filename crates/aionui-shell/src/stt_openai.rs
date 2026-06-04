@@ -21,21 +21,30 @@ pub async fn transcribe(
         .base_url
         .as_deref()
         .unwrap_or(DEFAULT_BASE_URL)
-        .trim_end_matches('/');
+        .trim_end_matches('/')
+        .trim_end_matches("/v1");
     let url = format!("{base_url}/v1/audio/transcriptions");
 
+    // Normalize MIME type: strip codec parameters (e.g. "audio/webm;codecs=opus" → "audio/webm")
+    let clean_mime_type = mime_type.split(';').next().unwrap_or(mime_type).trim();
     let file_part = reqwest::multipart::Part::bytes(audio_data)
         .file_name(file_name.to_owned())
-        .mime_str(mime_type)
+        .mime_str(clean_mime_type)
         .map_err(|e| SttError::Unknown(format!("invalid MIME type: {e}")))?;
 
     let mut form = reqwest::multipart::Form::new()
         .part("file", file_part)
         .text("model", config.model.clone());
 
-    let language = language_hint.or(config.language.as_deref()).filter(|s| !s.is_empty());
+    // User-configured language takes precedence over browser languageHint.
+    // This lets users override the browser's locale (e.g. browser sends "en-US"
+    // but user prefers "es" for transcription).
+    let language = config.language.as_deref().filter(|s| !s.is_empty()).or(language_hint);
     if let Some(lang) = language {
-        form = form.text("language", lang.to_owned());
+        // Normalize language codes: "en-US" → "en", "es-MX" → "es"
+        // Groq/OpenAI Whisper only accepts base language codes (e.g. "en", "es")
+        let normalized = lang.split('-').next().unwrap_or(lang).to_owned();
+        form = form.text("language", normalized);
     }
 
     if let Some(prompt) = config.prompt.as_deref().filter(|s| !s.is_empty()) {

@@ -113,7 +113,24 @@ async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartF
     {
         let name = field.name().unwrap_or("").to_owned();
         match name.as_str() {
-            "file" => {
+            "file" | "audio" => {
+                // Extract filename from Content-Disposition if not already set
+                if file_name.is_none() {
+                    if let Some(cd) = field.headers().get("content-disposition") {
+                        // Parse filename from Content-Disposition: form-data; name="audio"; filename="recording.webm"
+                        if let Ok(cd_str) = cd.to_str() {
+                            for part in cd_str.split(';') {
+                                let part = part.trim();
+                                if part.starts_with("filename=") {
+                                    let fname = part.trim_start_matches("filename=").trim_matches('"');
+                                    if !fname.is_empty() {
+                                        file_name = Some(fname.to_owned());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 file_data = Some(
                     field
                         .bytes()
@@ -177,9 +194,12 @@ async fn speech_to_text(
         (status, Json(body))
     })?;
 
+    // Key mismatch fix: frontend stores as "tools.speechToText" but backend
+    // previously queried only "speechToText". Request both keys to ensure
+    // we find the config regardless of which key name was used.
     let prefs = state
         .client_pref_service
-        .get_preferences(Some(&["speechToText"]))
+        .get_preferences(Some(&["speechToText", "tools.speechToText"]))
         .await
         .map_err(|e| {
             let status = e.status_code();
@@ -191,8 +211,11 @@ async fn speech_to_text(
             (status, Json(body))
         })?;
 
+    // Key mismatch fix: AionUI frontend sends "tools.speechToText" but backend
+    // expects "speechToText". Try both keys for backward compatibility.
     let config: SpeechToTextConfig = prefs
-        .get("speechToText")
+        .get("tools.speechToText")
+        .or_else(|| prefs.get("speechToText"))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or(SpeechToTextConfig {
             enabled: false,
