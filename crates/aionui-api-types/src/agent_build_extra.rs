@@ -73,6 +73,12 @@ pub struct AcpBuildExtra {
     pub session_mcp_servers: Vec<SessionMcpServer>,
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Parent ACP session id for side conversations using `session/fork`.
+    #[serde(default)]
+    pub fork_parent_session_id: Option<String>,
+    /// `agent_fork` | `text_snapshot` — set on side child rows.
+    #[serde(default)]
+    pub fork_mode: Option<String>,
 }
 
 /// Aionrs-specific fields extracted from `extra` in build task options.

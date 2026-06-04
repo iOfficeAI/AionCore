@@ -89,6 +89,17 @@ pub struct CreateSideConversationRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateSideConversationResponse {
     pub conversation_id: String,
+    /// Always `true` in v0.2 — each open creates a new side tab.
+    pub created: bool,
+    pub fork_mode: SideForkMode,
+}
+
+/// How the side child session inherited parent context.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SideForkMode {
+    AgentFork,
+    TextSnapshot,
 }
 
 /// Body for `POST /api/conversations/clone`.

@@ -898,8 +898,21 @@ impl AcpAgentManager {
             (s.session_id().map(ToOwned::to_owned), s.is_opened())
         };
 
+        let fork_parent = self
+            .params
+            .config
+            .fork_parent_session_id
+            .as_deref()
+            .filter(|s| !s.is_empty());
+
         let sid = match (session_id, opened) {
-            (None, _) => self.open_session_new().await?,
+            (None, _) => {
+                if let Some(parent_sid) = fork_parent {
+                    self.open_session_fork(parent_sid).await?
+                } else {
+                    self.open_session_new().await?
+                }
+            }
             (Some(sid), false) => self.open_session_resume(&sid).await?,
             (Some(sid), true) => sid,
         };

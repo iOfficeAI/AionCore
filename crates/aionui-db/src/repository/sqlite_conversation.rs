@@ -362,6 +362,26 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(rows)
     }
 
+    async fn list_side_children(
+        &self,
+        user_id: &str,
+        parent_conversation_id: &str,
+    ) -> Result<Vec<ConversationRow>, DbError> {
+        let rows = sqlx::query_as::<_, ConversationRow>(
+            "SELECT * FROM conversations \
+             WHERE user_id = ? \
+             AND json_extract(extra, '$.parent_conversation_id') = ? \
+             AND json_extract(extra, '$.side_mode') = true \
+             ORDER BY updated_at DESC",
+        )
+        .bind(user_id)
+        .bind(parent_conversation_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError> {
         // First get the target conversation's workspace
         let target = sqlx::query_as::<_, ConversationRow>("SELECT * FROM conversations WHERE id = ? AND user_id = ?")

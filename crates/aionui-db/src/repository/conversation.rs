@@ -77,6 +77,13 @@ pub trait IConversationRepository: Send + Sync {
         Ok(false)
     }
 
+    /// Ephemeral side children forked from `parent_conversation_id` in `extra`.
+    async fn list_side_children(
+        &self,
+        user_id: &str,
+        parent_conversation_id: &str,
+    ) -> Result<Vec<ConversationRow>, DbError>;
+
     // ── Message operations ──────────────────────────────────────────
 
     /// Returns cursor-paginated messages for a conversation in ascending display order.

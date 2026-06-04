@@ -391,6 +391,30 @@ impl IConversationRepository for MockRepo {
         Ok(rows.len() != before)
     }
 
+    async fn list_side_children(
+        &self,
+        user_id: &str,
+        parent_conversation_id: &str,
+    ) -> Result<Vec<ConversationRow>, aionui_db::DbError> {
+        let rows = self.rows.lock().unwrap();
+        Ok(rows
+            .iter()
+            .filter(|row| row.user_id == user_id)
+            .filter(|row| {
+                serde_json::from_str::<serde_json::Value>(&row.extra)
+                    .ok()
+                    .and_then(|extra| {
+                        let is_side = extra.get("side_mode").and_then(|value| value.as_bool()) == Some(true);
+                        let parent_matches = extra.get("parent_conversation_id").and_then(|value| value.as_str())
+                            == Some(parent_conversation_id);
+                        (is_side && parent_matches).then_some(())
+                    })
+                    .is_some()
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn list_messages_page(
         &self,
         conv_id: &str,

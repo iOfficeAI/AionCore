@@ -242,6 +242,26 @@ impl AgentInstance {
         }
     }
 
+    /// Whether the connected ACP CLI advertised `session/fork`.
+    pub async fn acp_supports_session_fork(&self) -> bool {
+        match self {
+            Self::Acp(m) => m.supports_session_fork().await,
+            _ => false,
+        }
+    }
+
+    /// Warm the parent session and return its ACP session id (for side fork).
+    pub async fn acp_ensure_warm_session_id(&self) -> Result<String, AgentError> {
+        match self {
+            Self::Acp(m) => {
+                m.warmup_session().await?;
+                let sid = m.session_id().await;
+                sid.ok_or_else(|| AgentError::internal("ACP session id missing after warmup"))
+            }
+            _ => Err(AgentError::bad_request("Side fork requires an ACP parent")),
+        }
+    }
+
     // ── Cross-variant semi-specific helpers ──────────────────────────
     //
     // These fan out to inherent methods on concrete managers. Variants

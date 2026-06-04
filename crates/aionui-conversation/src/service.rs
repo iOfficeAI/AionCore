@@ -2035,9 +2035,7 @@ impl ConversationService {
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
-        let parent_extra: serde_json::Value =
-            serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
-        self.delete_ephemeral_side_child(user_id, &parent_extra).await?;
+        self.delete_ephemeral_side_children(user_id, id).await?;
 
         let source: Option<ConversationSource> = existing
             .source
@@ -2641,6 +2639,9 @@ impl ConversationService {
 
         info!(msg_id = %user_msg_id, "User message persisted");
 
+        let child_extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let agent_content = self.enrich_side_agent_content(&child_extra, &req.content).await?;
+
         self.broadcaster.broadcast(WebSocketMessage::new(
             "message.userCreated",
             serde_json::json!({
@@ -2683,11 +2684,17 @@ impl ConversationService {
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
+        let agent_request = SendMessageRequest {
+            content: agent_content,
+            files: req.files,
+            inject_skills: req.inject_skills,
+            hidden: req.hidden,
+        };
         let user_msg_id_ret = user_msg_id.clone();
         ConversationTurnOrchestrator::new(self.clone(), Arc::clone(task_manager)).spawn_user_turn(TurnStartInput {
             user_id: user_id.to_owned(),
             conversation: row,
-            request: req,
+            request: agent_request,
             required_runtime_mode: None,
             build_options: build_opts,
             stored_workspace,
@@ -3239,7 +3246,7 @@ impl ConversationService {
             .await
     }
 
-    fn apply_conversation_runtime_context(
+    pub(crate) fn apply_conversation_runtime_context(
         &self,
         build_opts: &mut BuildTaskOptions,
         user_id: &str,

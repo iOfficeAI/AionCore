@@ -9,7 +9,9 @@ use crate::protocol::events::{
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
-use agent_client_protocol::schema::{ContentBlock, LoadSessionRequest, PromptRequest, SessionId, StopReason};
+use agent_client_protocol::schema::{
+    ContentBlock, ForkSessionRequest, LoadSessionRequest, PromptRequest, SessionId, StopReason,
+};
 use aionui_api_types::SlashCommandItem;
 use serde_json::Value;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -69,6 +71,51 @@ impl AcpAgentManager {
         // Best-effort reconcile on a freshly-opened session. SessionNotFound
         // here would be pathological (we just created the session) but is
         // still surfaced for consistency.
+        self.reconcile_session(&sid).await?;
+        Ok(sid)
+    }
+
+    /// Whether the connected CLI advertised `session/fork` during initialize.
+    pub(crate) async fn supports_session_fork(&self) -> bool {
+        self.session
+            .read()
+            .await
+            .agent_capabilities()
+            .and_then(|c| c.session_capabilities.fork.as_ref())
+            .is_some()
+    }
+
+    /// Fork an existing session into a new session id (ACP `session/fork`).
+    pub(super) async fn open_session_fork(&self, parent_session_id: &str) -> Result<String, AgentError> {
+        use std::path::PathBuf;
+
+        let req = ForkSessionRequest::new(
+            SessionId::new(parent_session_id.to_owned()),
+            PathBuf::from(&self.params.workspace.path),
+        );
+        let resp = self.protocol.fork_session(req).await?;
+        let sid = resp.session_id.to_string();
+
+        {
+            let mut session = self.session.write().await;
+            if let Some(models) = resp.models {
+                session.apply_advertised_models(models);
+            }
+            if let Some(modes) = resp.modes {
+                session.apply_advertised_modes(modes);
+            }
+            if let Some(config_options) = resp.config_options {
+                session.apply_advertised_config_options(config_options);
+            }
+            session.set_session_id(DomainSessionId::new(sid.clone()));
+            session.mark_pending_session_new_prelude();
+            self.commit_session_changes(&mut session).await;
+        }
+        self.emit_snapshot_events().await;
+        self.runtime
+            .emit(AgentStreamEvent::SessionAssigned(SessionAssignedEventData {
+                session_id: sid.clone(),
+            }));
         self.reconcile_session(&sid).await?;
         Ok(sid)
     }

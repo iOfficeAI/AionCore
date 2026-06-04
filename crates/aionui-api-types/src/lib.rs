@@ -81,7 +81,7 @@ pub use conversation::{
     ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
     CreateSideConversationRequest, CreateSideConversationResponse, EnsureConversationRuntimeResponse,
     ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SideForkMode,
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{

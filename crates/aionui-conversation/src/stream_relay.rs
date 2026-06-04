@@ -2123,6 +2123,13 @@ mod tests {
         ) -> Result<Vec<aionui_db::models::ConversationRow>, DbError> {
             Ok(vec![])
         }
+        async fn list_side_children(
+            &self,
+            _user_id: &str,
+            _parent_conversation_id: &str,
+        ) -> Result<Vec<aionui_db::models::ConversationRow>, DbError> {
+            Ok(vec![])
+        }
         async fn list_messages_page(
             &self,
             _conv_id: &str,
