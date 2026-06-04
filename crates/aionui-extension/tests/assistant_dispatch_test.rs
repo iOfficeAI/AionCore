@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use aionui_api_types::{ApiResponse, AssistantSource};
-use aionui_common::AppError;
 use aionui_extension::classifier::{AssistantClassifier, AssistantRuleDispatcher};
+use aionui_extension::error::ExtensionError;
 use aionui_extension::external_paths::ExternalPathsManager;
 use aionui_extension::skill_routes::{SkillRouterState, skill_routes};
 use aionui_extension::skill_service::SkillPaths;
@@ -55,7 +55,7 @@ impl AssistantClassifier for FakeDispatcher {
 
 #[async_trait::async_trait]
 impl AssistantRuleDispatcher for FakeDispatcher {
-    async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, AppError> {
+    async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
         self.log
             .lock()
             .unwrap()
@@ -64,9 +64,11 @@ impl AssistantRuleDispatcher for FakeDispatcher {
         Ok(self.rule_content.get(id).cloned().unwrap_or_default())
     }
 
-    async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AppError> {
+    async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError> {
         if self.reject_writes_for.contains(id) {
-            return Err(AppError::BadRequest("Cannot write rule for built-in assistant".into()));
+            return Err(ExtensionError::InvalidRequest(
+                "Cannot write rule for built-in assistant".into(),
+            ));
         }
         self.log
             .lock()
@@ -76,15 +78,17 @@ impl AssistantRuleDispatcher for FakeDispatcher {
         Ok(())
     }
 
-    async fn delete_rule(&self, id: &str) -> Result<bool, AppError> {
+    async fn delete_rule(&self, id: &str) -> Result<bool, ExtensionError> {
         if self.reject_writes_for.contains(id) {
-            return Err(AppError::BadRequest("Cannot delete rule for built-in assistant".into()));
+            return Err(ExtensionError::InvalidRequest(
+                "Cannot delete rule for built-in assistant".into(),
+            ));
         }
         self.log.lock().unwrap().rule_deletes.push(id.to_string());
         Ok(true)
     }
 
-    async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, AppError> {
+    async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
         self.log
             .lock()
             .unwrap()
@@ -93,9 +97,11 @@ impl AssistantRuleDispatcher for FakeDispatcher {
         Ok(self.skill_content.get(id).cloned().unwrap_or_default())
     }
 
-    async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AppError> {
+    async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError> {
         if self.reject_writes_for.contains(id) {
-            return Err(AppError::BadRequest("Cannot write skill for built-in assistant".into()));
+            return Err(ExtensionError::InvalidRequest(
+                "Cannot write skill for built-in assistant".into(),
+            ));
         }
         self.log
             .lock()
@@ -105,9 +111,9 @@ impl AssistantRuleDispatcher for FakeDispatcher {
         Ok(())
     }
 
-    async fn delete_skill(&self, id: &str) -> Result<bool, AppError> {
+    async fn delete_skill(&self, id: &str) -> Result<bool, ExtensionError> {
         if self.reject_writes_for.contains(id) {
-            return Err(AppError::BadRequest(
+            return Err(ExtensionError::InvalidRequest(
                 "Cannot delete skill for built-in assistant".into(),
             ));
         }

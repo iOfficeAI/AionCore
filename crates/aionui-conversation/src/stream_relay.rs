@@ -12,9 +12,10 @@ use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResu
 use aionui_api_types::{AgentErrorCode, ConversationRuntimeSummary, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
+use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
-use aionui_db::IConversationRepository;
 use aionui_db::models::MessageRow;
+use aionui_db::{DbError, IConversationRepository};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::{broadcast, oneshot};
@@ -22,6 +23,26 @@ use tracing::{debug, error, info, warn};
 
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
+
+fn is_not_found(err: &DbError) -> bool {
+    matches!(err, DbError::NotFound(_))
+}
+
+fn is_foreign_key_constraint(err: &DbError) -> bool {
+    err.to_string().contains("FOREIGN KEY constraint failed")
+}
+
+fn is_deleted_during_stream_persistence(err: &DbError) -> bool {
+    is_not_found(err) || is_foreign_key_constraint(err)
+}
+
+fn log_persist_error(err: &DbError, message: &'static str) {
+    if is_deleted_during_stream_persistence(err) {
+        debug!(error = %ErrorChain(err), "{message}; conversation was likely deleted during stream finalization");
+    } else {
+        error!(error = %ErrorChain(err), "{message}");
+    }
+}
 
 #[derive(Debug, Clone)]
 struct TextSegmentState {
@@ -93,6 +114,7 @@ pub struct StreamRelay {
     repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     cron_service: Option<Arc<dyn ICronService>>,
+    runtime_state: Option<Arc<ConversationRuntimeStateService>>,
     complete_turn: bool,
 }
 
@@ -112,8 +134,14 @@ impl StreamRelay {
             repo,
             broadcaster,
             cron_service,
+            runtime_state: None,
             complete_turn: true,
         }
+    }
+
+    pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
+        self.runtime_state = Some(runtime_state);
+        self
     }
 
     pub fn with_turn_completion(mut self, enabled: bool) -> Self {
@@ -192,6 +220,15 @@ impl StreamRelay {
 
             match recv_result {
                 Ok(event) => {
+                    let deleting = self.is_deleting();
+                    if deleting && !matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) {
+                        debug!(
+                            event_type = Self::event_kind(&event),
+                            "Skipping non-terminal stream event because conversation is deleting"
+                        );
+                        continue;
+                    }
+
                     if !first_agent_event_logged {
                         first_agent_event_logged = true;
                         info!(
@@ -283,20 +320,31 @@ impl StreamRelay {
                                 }
                             }
 
-                            self.complete_active_thinking(&mut active_thinking).await;
-                            self.close_active_text_segment(
-                                &mut active_text,
-                                &mut text_segments,
-                                if matches!(event, AgentStreamEvent::Error(_)) {
-                                    "error"
-                                } else {
-                                    "finish"
-                                },
-                            )
-                            .await;
+                            if deleting {
+                                debug!("Skipping terminal DB finalization because conversation is deleting");
+                            } else {
+                                self.complete_active_thinking(&mut active_thinking).await;
+                                self.close_active_text_segment(
+                                    &mut active_text,
+                                    &mut text_segments,
+                                    if matches!(event, AgentStreamEvent::Error(_)) {
+                                        "error"
+                                    } else {
+                                        "finish"
+                                    },
+                                )
+                                .await;
+                            }
                             self.forward_to_websocket(&event);
-                            let outcome = self.finalize(&full_text_buffer, &text_segments, &event, terminal).await;
-                            if self.complete_turn {
+                            let outcome = if deleting {
+                                RelayOutcome {
+                                    system_responses: Vec::new(),
+                                    terminal,
+                                }
+                            } else {
+                                self.finalize(&full_text_buffer, &text_segments, &event, terminal).await
+                            };
+                            if self.complete_turn && !deleting {
                                 Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
                             }
                             break outcome;
@@ -335,19 +383,30 @@ impl StreamRelay {
                         "StreamRelay channel closed without terminal event"
                     );
 
-                    self.complete_active_thinking(&mut active_thinking).await;
-                    self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
-                        .await;
+                    let deleting = self.is_deleting();
+                    if deleting {
+                        debug!("Skipping channel-closed DB finalization because conversation is deleting");
+                    } else {
+                        self.complete_active_thinking(&mut active_thinking).await;
+                        self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                            .await;
+                    }
                     // Channel closed without finish/error — still finalize
-                    let outcome = self
-                        .finalize(
+                    let outcome = if deleting {
+                        RelayOutcome {
+                            system_responses: Vec::new(),
+                            terminal: RelayTerminal::ChannelClosed,
+                        }
+                    } else {
+                        self.finalize(
                             &full_text_buffer,
                             &text_segments,
                             &AgentStreamEvent::Finish(aionui_ai_agent::protocol::events::FinishEventData::default()),
                             RelayTerminal::ChannelClosed,
                         )
-                        .await;
-                    if self.complete_turn {
+                        .await
+                    };
+                    if self.complete_turn && !deleting {
                         Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
                     }
                     break outcome;
@@ -357,6 +416,12 @@ impl StreamRelay {
                 }
             }
         }
+    }
+
+    fn is_deleting(&self) -> bool {
+        self.runtime_state
+            .as_ref()
+            .is_some_and(|state| state.is_deleting(&self.conversation_id))
     }
 
     fn event_kind(event: &AgentStreamEvent) -> &'static str {
@@ -457,7 +522,7 @@ impl StreamRelay {
                 hidden: None,
             };
             if let Err(e) = self.repo.update_message(&segment.id, &update).await {
-                error!(error = %ErrorChain(&e), "Failed to update streaming text segment");
+                log_persist_error(&e, "Failed to update streaming text segment");
             }
         } else {
             let row = MessageRow {
@@ -472,7 +537,7 @@ impl StreamRelay {
                 created_at: segment.created_at,
             };
             if let Err(e) = self.repo.insert_message(&row).await {
-                error!(error = %ErrorChain(&e), "Failed to create streaming text segment");
+                log_persist_error(&e, "Failed to create streaming text segment");
             }
             segment.record_created = true;
         }
@@ -492,7 +557,8 @@ impl StreamRelay {
                 hidden: Some(false),
             };
             if let Err(e) = self.repo.update_message(&segment.id, &update).await {
-                error!(error = %ErrorChain(&e), "Failed to finalize text segment");
+                log_persist_error(&e, "Failed to finalize text segment");
+                return None;
             }
         } else {
             let row = MessageRow {
@@ -507,7 +573,8 @@ impl StreamRelay {
                 created_at: segment.created_at,
             };
             if let Err(e) = self.repo.insert_message(&row).await {
-                error!(error = %ErrorChain(&e), "Failed to create finalized text segment");
+                log_persist_error(&e, "Failed to create finalized text segment");
+                return None;
             }
         }
 
@@ -546,7 +613,7 @@ impl StreamRelay {
                         hidden: Some(hidden),
                     };
                     if let Err(e) = self.repo.update_message(&primary_segment.id, &update).await {
-                        error!(error = %ErrorChain(&e), "Failed to rewrite finalized text segment");
+                        log_persist_error(&e, "Failed to rewrite finalized text segment");
                     }
                     self.send_final_text_override(&primary_segment.id, &processed.message, hidden);
 
@@ -557,7 +624,7 @@ impl StreamRelay {
                             hidden: Some(true),
                         };
                         if let Err(e) = self.repo.update_message(&segment.id, &hide_update).await {
-                            error!(error = %ErrorChain(&e), "Failed to hide superseded text segment");
+                            log_persist_error(&e, "Failed to hide superseded text segment");
                         }
                         self.send_final_text_override(&segment.id, "", true);
                     }
@@ -569,7 +636,7 @@ impl StreamRelay {
                             hidden: Some(false),
                         };
                         if let Err(e) = self.repo.update_message(&segment.id, &status_update).await {
-                            error!(error = %ErrorChain(&e), "Failed to finalize text segment status");
+                            log_persist_error(&e, "Failed to finalize text segment status");
                         }
                     }
                 }
@@ -586,7 +653,7 @@ impl StreamRelay {
                     created_at: now_ms(),
                 };
                 if let Err(e) = self.repo.insert_message(&row).await {
-                    error!(error = %ErrorChain(&e), "Failed to create final fallback message");
+                    log_persist_error(&e, "Failed to create final fallback message");
                 }
             }
 
@@ -607,7 +674,7 @@ impl StreamRelay {
                 created_at: now_ms(),
             };
             if let Err(e) = self.repo.insert_message(&row).await {
-                error!(error = %ErrorChain(&e), "Failed to store error message");
+                log_persist_error(&e, "Failed to store error message");
             }
         }
 
@@ -642,7 +709,7 @@ impl StreamRelay {
             created_at: segment.started_at,
         };
         if let Err(e) = self.repo.insert_message(&row).await {
-            error!(error = %ErrorChain(&e), "Failed to persist thinking message");
+            log_persist_error(&e, "Failed to persist thinking message");
         }
     }
 
@@ -949,7 +1016,7 @@ impl StreamRelay {
             ..Default::default()
         };
         if let Err(e) = repo.update(conversation_id, &update).await {
-            error!(error = %ErrorChain(&e), "Failed to update conversation status");
+            log_persist_error(&e, "Failed to update conversation status");
         }
 
         let payload = json!({
@@ -1003,6 +1070,7 @@ mod tests {
     use aionui_ai_agent::protocol::events::{ErrorEventData, FinishEventData, TextEventData, ThinkingEventData};
     use aionui_db::DbError;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // ── run() async tests ─────────────────────────────────────────
 
@@ -1460,6 +1528,7 @@ mod tests {
 
         let outcome = relay.consume(rx).await;
         assert!(outcome.system_responses.is_empty());
+        assert_eq!(outcome.terminal, RelayTerminal::ChannelClosed);
 
         // Should still persist the partial text
         let inserts = repo.take_inserts();
@@ -1776,6 +1845,140 @@ mod tests {
         assert_eq!(content.as_array().unwrap().len(), 2);
     }
 
+    #[tokio::test]
+    async fn close_active_text_segment_treats_not_found_as_deleted_conversation() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.set_not_found(true);
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+
+        let relay = StreamRelay::new(
+            "deleted-conv".into(),
+            "assistant-msg".into(),
+            "user-1".into(),
+            repo,
+            bus,
+            None,
+        );
+        let mut active_text = Some(TextSegmentState {
+            id: "missing-segment".into(),
+            buffer: "partial answer".into(),
+            created_at: now_ms(),
+            record_created: true,
+            flush_counter: 0,
+        });
+        let mut text_segments = Vec::new();
+
+        relay
+            .close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+            .await;
+
+        assert!(active_text.is_none());
+        assert!(
+            text_segments.is_empty(),
+            "missing DB rows should not be treated as persisted text segments"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_conversation_ignores_not_found_after_delete() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.set_not_found(true);
+        let repo: Arc<dyn IConversationRepository> = repo;
+        let bus: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+
+        StreamRelay::complete_conversation_with_runtime(&repo, &bus, "deleted-conv", None).await;
+    }
+
+    #[tokio::test]
+    async fn run_skips_db_finalization_when_conversation_is_deleting() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let runtime_state = Arc::new(ConversationRuntimeStateService::default());
+        runtime_state.mark_deleting("deleted-conv");
+        let (tx, _) = broadcast::channel(16);
+
+        let relay = StreamRelay::new(
+            "deleted-conv".into(),
+            "assistant-msg".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        )
+        .with_runtime_state(runtime_state);
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "partial answer".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert!(repo.take_inserts().is_empty());
+        assert!(repo.take_updates().is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalize_treats_foreign_key_failure_as_deleted_conversation() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.set_foreign_key_failure(true);
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let relay = StreamRelay::new(
+            "deleted-conv".into(),
+            "assistant-msg".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+
+        let outcome = relay
+            .finalize(
+                "partial answer",
+                &[],
+                &AgentStreamEvent::Finish(FinishEventData::default()),
+                RelayTerminal::Finish,
+            )
+            .await;
+
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert!(
+            repo.take_inserts().is_empty(),
+            "failed fallback writes must not be recorded as persisted messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_active_thinking_treats_foreign_key_failure_as_deleted_conversation() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.set_foreign_key_failure(true);
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let relay = StreamRelay::new(
+            "deleted-conv".into(),
+            "assistant-msg".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let mut active_thinking = Some(ThinkingSegmentState {
+            id: "thinking-1".into(),
+            buffer: "working".into(),
+            started_at: now_ms(),
+        });
+
+        relay.complete_active_thinking(&mut active_thinking).await;
+
+        assert!(active_thinking.is_none());
+        assert!(
+            repo.take_inserts().is_empty(),
+            "failed thinking writes must not be recorded as persisted messages"
+        );
+    }
+
     // ── Helpers ──────────────────────────────────────────────────
 
     struct MockCronService;
@@ -1829,6 +2032,8 @@ mod tests {
     struct RecordingRepo {
         inserts: Mutex<Vec<MessageRow>>,
         updates: Mutex<Vec<(String, aionui_db::MessageRowUpdate)>>,
+        not_found: AtomicBool,
+        foreign_key_failure: AtomicBool,
     }
 
     impl RecordingRepo {
@@ -1836,7 +2041,17 @@ mod tests {
             Self {
                 inserts: Mutex::new(vec![]),
                 updates: Mutex::new(vec![]),
+                not_found: AtomicBool::new(false),
+                foreign_key_failure: AtomicBool::new(false),
             }
+        }
+
+        fn set_not_found(&self, value: bool) {
+            self.not_found.store(value, Ordering::Release);
+        }
+
+        fn set_foreign_key_failure(&self, value: bool) {
+            self.foreign_key_failure.store(value, Ordering::Release);
         }
 
         fn take_inserts(&self) -> Vec<MessageRow> {
@@ -1858,6 +2073,9 @@ mod tests {
             Ok(())
         }
         async fn update(&self, _id: &str, _updates: &aionui_db::ConversationRowUpdate) -> Result<(), DbError> {
+            if self.not_found.load(Ordering::Acquire) {
+                return Err(DbError::NotFound("Conversation deleted-conv not found".into()));
+            }
             Ok(())
         }
         async fn delete(&self, _id: &str) -> Result<(), DbError> {
@@ -1911,10 +2129,19 @@ mod tests {
             })
         }
         async fn insert_message(&self, row: &MessageRow) -> Result<(), DbError> {
+            if self.not_found.load(Ordering::Acquire) {
+                return Err(DbError::NotFound(format!("Message '{}'", row.id)));
+            }
+            if self.foreign_key_failure.load(Ordering::Acquire) {
+                return Err(DbError::Init("FOREIGN KEY constraint failed".into()));
+            }
             self.inserts.lock().unwrap().push(row.clone());
             Ok(())
         }
         async fn update_message(&self, id: &str, updates: &aionui_db::MessageRowUpdate) -> Result<(), DbError> {
+            if self.not_found.load(Ordering::Acquire) {
+                return Err(DbError::NotFound(format!("Message '{id}' not found")));
+            }
             self.updates.lock().unwrap().push((id.to_owned(), updates.clone()));
             Ok(())
         }

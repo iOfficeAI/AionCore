@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 
-/// Notified when a conversation row is deleted via
+/// Notified before a conversation row is deleted via
 /// `ConversationService::delete`.
 ///
 /// Implementors are responsible for cleaning up their per-conversation state

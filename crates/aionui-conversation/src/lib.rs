@@ -1,6 +1,7 @@
 //! Conversation and message CRUD with streaming relay and event emission.
 mod acp_error_recovery;
 mod convert;
+pub mod error;
 mod message_persistence;
 pub mod response_middleware;
 pub mod routes;
@@ -14,6 +15,7 @@ pub mod state;
 pub mod stream_relay;
 pub mod task_options;
 
+pub use error::ConversationError;
 pub use response_middleware::{
     CronCommand, CronCommandResult, CronCreateParams, CronUpdateParams, ICronService, MessageMiddleware,
     MiddlewareResult, detect_cron_commands, has_cron_commands, strip_cron_commands, strip_think_tags,

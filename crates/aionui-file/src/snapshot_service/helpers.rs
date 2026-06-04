@@ -7,7 +7,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use aionui_common::{AppError, FileChangeOperation};
+use aionui_common::FileChangeOperation;
+
+use crate::error::FileError;
 use git2::{IndexAddOption, Repository, Signature, Status, StatusOptions};
 
 use crate::types::{CompareResult, FileChangeInfo, SnapshotInfo, SnapshotMode};
@@ -74,9 +76,9 @@ pub(super) fn temp_repo_path(workspace: &str) -> PathBuf {
 }
 
 /// Open the git repository for a workspace state.
-pub(super) fn open_repo(state: &WorkspaceState) -> Result<Repository, AppError> {
+pub(super) fn open_repo(state: &WorkspaceState) -> Result<Repository, FileError> {
     Repository::open(&state.repo_path).map_err(|e| {
-        AppError::Internal(format!(
+        FileError::Internal(format!(
             "Failed to open git repo at {}: {}",
             state.repo_path.display(),
             e
@@ -90,11 +92,11 @@ pub(super) fn open_repo(state: &WorkspaceState) -> Result<Repository, AppError> 
 /// 2. Sets `core.worktree` to point at the real workspace.
 /// 3. Writes exclude rules to `.git/info/exclude`.
 /// 4. Adds all workspace files and creates an initial commit as the baseline.
-pub(super) fn init_snapshot_repo(workspace: &Path, temp_dir: &Path) -> Result<(), AppError> {
+pub(super) fn init_snapshot_repo(workspace: &Path, temp_dir: &Path) -> Result<(), FileError> {
     // Clean up any leftover directory from a previous run with the same hash
     if temp_dir.exists() {
         std::fs::remove_dir_all(temp_dir).map_err(|e| {
-            AppError::Internal(format!(
+            FileError::Internal(format!(
                 "Failed to clean up existing snapshot dir {}: {}",
                 temp_dir.display(),
                 e
@@ -102,55 +104,55 @@ pub(super) fn init_snapshot_repo(workspace: &Path, temp_dir: &Path) -> Result<()
         })?;
     }
     std::fs::create_dir_all(temp_dir)
-        .map_err(|e| AppError::Internal(format!("Failed to create snapshot dir {}: {}", temp_dir.display(), e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to create snapshot dir {}: {}", temp_dir.display(), e)))?;
 
     // Init a standard repo (creates .git/ inside temp_dir)
     let repo = Repository::init(temp_dir)
-        .map_err(|e| AppError::Internal(format!("Failed to init snapshot repo at {}: {}", temp_dir.display(), e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to init snapshot repo at {}: {}", temp_dir.display(), e)))?;
 
     // Set workdir to the actual workspace (in-memory)
     repo.set_workdir(workspace, false)
-        .map_err(|e| AppError::Internal(format!("Failed to set workdir to {}: {}", workspace.display(), e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to set workdir to {}: {}", workspace.display(), e)))?;
 
     // Persist core.worktree in config so future opens resolve the workdir
     let mut config = repo
         .config()
-        .map_err(|e| AppError::Internal(format!("Failed to open repo config: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to open repo config: {}", e)))?;
     let ws_str = workspace.to_string_lossy();
     config
         .set_str("core.worktree", &ws_str)
-        .map_err(|e| AppError::Internal(format!("Failed to set core.worktree to {}: {}", ws_str, e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to set core.worktree to {}: {}", ws_str, e)))?;
 
     // Write exclude rules to .git/info/exclude (avoids polluting the workspace)
     let git_dir = repo.path(); // .git/ directory
     let info_dir = git_dir.join("info");
     std::fs::create_dir_all(&info_dir)
-        .map_err(|e| AppError::Internal(format!("Failed to create info dir {}: {}", info_dir.display(), e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to create info dir {}: {}", info_dir.display(), e)))?;
     std::fs::write(info_dir.join("exclude"), SNAPSHOT_EXCLUDE_RULES)
-        .map_err(|e| AppError::Internal(format!("Failed to write exclude rules: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to write exclude rules: {}", e)))?;
 
     // Stage all workspace files
     let mut index = repo
         .index()
-        .map_err(|e| AppError::Internal(format!("Failed to get index: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to get index: {}", e)))?;
     index
         .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-        .map_err(|e| AppError::Internal(format!("Failed to add files to index: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to add files to index: {}", e)))?;
     index
         .write()
-        .map_err(|e| AppError::Internal(format!("Failed to write index: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to write index: {}", e)))?;
 
     // Create initial commit
     let tree_oid = index
         .write_tree()
-        .map_err(|e| AppError::Internal(format!("Failed to write tree: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to write tree: {}", e)))?;
     let tree = repo
         .find_tree(tree_oid)
-        .map_err(|e| AppError::Internal(format!("Failed to find tree: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to find tree: {}", e)))?;
     let sig = Signature::now(SNAPSHOT_SIG_NAME, SNAPSHOT_SIG_EMAIL)
-        .map_err(|e| AppError::Internal(format!("Failed to create signature: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to create signature: {}", e)))?;
     repo.commit(Some("HEAD"), &sig, &sig, SNAPSHOT_INITIAL_MSG, &tree, &[])
-        .map_err(|e| AppError::Internal(format!("Failed to create initial commit: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to create initial commit: {}", e)))?;
 
     Ok(())
 }
@@ -197,7 +199,7 @@ pub(super) fn worktree_operation(status: Status) -> Option<FileChangeOperation> 
 }
 
 /// Parse git2 statuses into staged and unstaged change lists.
-pub(super) fn parse_statuses(repo: &Repository, workspace: &Path) -> Result<CompareResult, AppError> {
+pub(super) fn parse_statuses(repo: &Repository, workspace: &Path) -> Result<CompareResult, FileError> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
@@ -205,7 +207,7 @@ pub(super) fn parse_statuses(repo: &Repository, workspace: &Path) -> Result<Comp
 
     let statuses = repo
         .statuses(Some(&mut opts))
-        .map_err(|e| AppError::Internal(format!("Failed to get git status: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to get git status: {}", e)))?;
 
     let ws_str = workspace.to_string_lossy();
     let mut staged = Vec::new();
@@ -240,17 +242,17 @@ pub(super) fn parse_statuses(repo: &Repository, workspace: &Path) -> Result<Comp
 
 /// Read a file's content from HEAD.
 /// Returns `None` if the file is not tracked or the repo has no commits.
-pub(super) fn read_baseline(repo: &Repository, rel_path: &str) -> Result<Option<String>, AppError> {
+pub(super) fn read_baseline(repo: &Repository, rel_path: &str) -> Result<Option<String>, FileError> {
     let head = match repo.head() {
         Ok(h) => h,
         Err(_) => return Ok(None),
     };
     let commit = head
         .peel_to_commit()
-        .map_err(|e| AppError::Internal(format!("Failed to peel HEAD to commit: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to peel HEAD to commit: {}", e)))?;
     let tree = commit
         .tree()
-        .map_err(|e| AppError::Internal(format!("Failed to get commit tree: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to get commit tree: {}", e)))?;
 
     let entry = match tree.get_path(Path::new(rel_path)) {
         Ok(e) => e,
@@ -259,7 +261,7 @@ pub(super) fn read_baseline(repo: &Repository, rel_path: &str) -> Result<Option<
 
     let blob = repo
         .find_blob(entry.id())
-        .map_err(|e| AppError::Internal(format!("Failed to read blob: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to read blob: {}", e)))?;
 
     match std::str::from_utf8(blob.content()) {
         Ok(s) => Ok(Some(s.to_string())),
@@ -268,48 +270,48 @@ pub(super) fn read_baseline(repo: &Repository, rel_path: &str) -> Result<Option<
 }
 
 /// Canonicalize a workspace path and validate it exists.
-pub(super) fn resolve_workspace(workspace: &str) -> Result<PathBuf, AppError> {
+pub(super) fn resolve_workspace(workspace: &str) -> Result<PathBuf, FileError> {
     let path = Path::new(workspace);
     if !path.exists() {
-        return Err(AppError::NotFound(format!("Workspace not found: {}", workspace)));
+        return Err(FileError::NotFound(format!("Workspace not found: {}", workspace)));
     }
     std::fs::canonicalize(path)
-        .map_err(|e| AppError::Internal(format!("Failed to canonicalize workspace path {}: {}", workspace, e)))
+        .map_err(|e| FileError::Internal(format!("Failed to canonicalize workspace path {}: {}", workspace, e)))
 }
 
 /// Stage all changes including deletions.
 ///
 /// `index.add_all` with `DEFAULT` only handles new/modified files.
 /// Deleted files must be explicitly removed from the index.
-pub(super) fn stage_all_with_deletions(repo: &Repository) -> Result<(), AppError> {
+pub(super) fn stage_all_with_deletions(repo: &Repository) -> Result<(), FileError> {
     let mut index = repo
         .index()
-        .map_err(|e| AppError::Internal(format!("Failed to get index: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to get index: {}", e)))?;
 
     // Stage new and modified files
     index
         .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-        .map_err(|e| AppError::Internal(format!("Failed to stage all files: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to stage all files: {}", e)))?;
 
     // Find and remove deleted files from the index
     let mut opts = StatusOptions::new();
     opts.include_untracked(false).include_ignored(false);
     let statuses = repo
         .statuses(Some(&mut opts))
-        .map_err(|e| AppError::Internal(format!("Failed to get status: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to get status: {}", e)))?;
     for entry in statuses.iter() {
         if entry.status().intersects(Status::WT_DELETED)
             && let Some(path) = entry.path()
         {
-            index
-                .remove_path(Path::new(path))
-                .map_err(|e| AppError::Internal(format!("Failed to remove deleted file {} from index: {}", path, e)))?;
+            index.remove_path(Path::new(path)).map_err(|e| {
+                FileError::Internal(format!("Failed to remove deleted file {} from index: {}", path, e))
+            })?;
         }
     }
 
     index
         .write()
-        .map_err(|e| AppError::Internal(format!("Failed to write index: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to write index: {}", e)))?;
     Ok(())
 }
 
@@ -317,57 +319,57 @@ pub(super) fn stage_all_with_deletions(repo: &Repository) -> Result<(), AppError
 ///
 /// For existing files, adds to the index. For deleted files, removes from
 /// the index (equivalent to `git add <deleted-file>`).
-pub(super) fn stage_single_file(repo: &Repository, rel_path: &str) -> Result<(), AppError> {
+pub(super) fn stage_single_file(repo: &Repository, rel_path: &str) -> Result<(), FileError> {
     let workdir = repo
         .workdir()
-        .ok_or_else(|| AppError::Internal("Repository has no workdir".into()))?;
+        .ok_or_else(|| FileError::Internal("Repository has no workdir".into()))?;
     let abs_path = workdir.join(rel_path);
 
     let mut index = repo
         .index()
-        .map_err(|e| AppError::Internal(format!("Failed to get index: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to get index: {}", e)))?;
 
     if abs_path.exists() {
         index
             .add_path(Path::new(rel_path))
-            .map_err(|e| AppError::Internal(format!("Failed to stage file {}: {}", rel_path, e)))?;
+            .map_err(|e| FileError::Internal(format!("Failed to stage file {}: {}", rel_path, e)))?;
     } else {
         // File was deleted from disk; remove from index
         index
             .remove_path(Path::new(rel_path))
-            .map_err(|e| AppError::Internal(format!("Failed to stage deleted file {}: {}", rel_path, e)))?;
+            .map_err(|e| FileError::Internal(format!("Failed to stage deleted file {}: {}", rel_path, e)))?;
     }
 
     index
         .write()
-        .map_err(|e| AppError::Internal(format!("Failed to write index: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to write index: {}", e)))?;
     Ok(())
 }
 
 /// Unstage a single file (reset it in the index to match HEAD).
-pub(super) fn unstage_single_file(repo: &Repository, rel_path: &str) -> Result<(), AppError> {
+pub(super) fn unstage_single_file(repo: &Repository, rel_path: &str) -> Result<(), FileError> {
     let head = repo
         .head()
-        .map_err(|e| AppError::Internal(format!("Failed to get HEAD: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to get HEAD: {}", e)))?;
     let commit = head
         .peel_to_commit()
-        .map_err(|e| AppError::Internal(format!("Failed to peel HEAD: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to peel HEAD: {}", e)))?;
     // reset_default expects a commit-ish object, not a tree
     repo.reset_default(Some(commit.as_object()), [rel_path])
-        .map_err(|e| AppError::Internal(format!("Failed to unstage file {}: {}", rel_path, e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to unstage file {}: {}", rel_path, e)))?;
     Ok(())
 }
 
 /// Unstage all staged changes (mixed reset to HEAD).
-pub(super) fn unstage_all_files(repo: &Repository) -> Result<(), AppError> {
+pub(super) fn unstage_all_files(repo: &Repository) -> Result<(), FileError> {
     let head = repo
         .head()
-        .map_err(|e| AppError::Internal(format!("Failed to get HEAD: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to get HEAD: {}", e)))?;
     let commit = head
         .peel_to_commit()
-        .map_err(|e| AppError::Internal(format!("Failed to peel HEAD: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to peel HEAD: {}", e)))?;
     repo.reset(commit.as_object(), git2::ResetType::Mixed, None)
-        .map_err(|e| AppError::Internal(format!("Failed to unstage all: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to unstage all: {}", e)))?;
     Ok(())
 }
 
@@ -381,14 +383,14 @@ pub(super) fn discard_single_file(
     workspace: &Path,
     rel_path: &str,
     operation: FileChangeOperation,
-) -> Result<(), AppError> {
+) -> Result<(), FileError> {
     match operation {
         FileChangeOperation::Create => {
             // New/untracked file: just delete it
             let abs_path = workspace.join(rel_path);
             if abs_path.exists() {
                 std::fs::remove_file(&abs_path)
-                    .map_err(|e| AppError::Internal(format!("Failed to delete file {}: {}", abs_path.display(), e)))?;
+                    .map_err(|e| FileError::Internal(format!("Failed to delete file {}: {}", abs_path.display(), e)))?;
             }
             Ok(())
         }
@@ -409,7 +411,7 @@ pub(super) fn reset_single_file(
     workspace: &Path,
     rel_path: &str,
     operation: FileChangeOperation,
-) -> Result<(), AppError> {
+) -> Result<(), FileError> {
     // Step 1: unstage (ignore errors for files not in index)
     let _ = unstage_single_file(repo, rel_path);
 
@@ -418,27 +420,27 @@ pub(super) fn reset_single_file(
 }
 
 /// Checkout a single file from HEAD, restoring it in the working tree.
-fn checkout_path_from_head(repo: &Repository, rel_path: &str) -> Result<(), AppError> {
+fn checkout_path_from_head(repo: &Repository, rel_path: &str) -> Result<(), FileError> {
     let mut cb = git2::build::CheckoutBuilder::new();
     cb.force().path(rel_path);
 
     repo.checkout_head(Some(&mut cb))
-        .map_err(|e| AppError::Internal(format!("Failed to checkout {} from HEAD: {}", rel_path, e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to checkout {} from HEAD: {}", rel_path, e)))?;
     Ok(())
 }
 
 /// List all branch names in the repository.
-pub(super) fn list_branches(repo: &Repository) -> Result<Vec<String>, AppError> {
+pub(super) fn list_branches(repo: &Repository) -> Result<Vec<String>, FileError> {
     let branches = repo
         .branches(Some(git2::BranchType::Local))
-        .map_err(|e| AppError::Internal(format!("Failed to list branches: {}", e)))?;
+        .map_err(|e| FileError::Internal(format!("Failed to list branches: {}", e)))?;
 
     let mut names = Vec::new();
     for branch_result in branches {
-        let (branch, _) = branch_result.map_err(|e| AppError::Internal(format!("Failed to read branch: {}", e)))?;
+        let (branch, _) = branch_result.map_err(|e| FileError::Internal(format!("Failed to read branch: {}", e)))?;
         if let Some(name) = branch
             .name()
-            .map_err(|e| AppError::Internal(format!("Failed to get branch name: {}", e)))?
+            .map_err(|e| FileError::Internal(format!("Failed to get branch name: {}", e)))?
         {
             names.push(name.to_string());
         }
@@ -536,7 +538,7 @@ mod tests {
     #[test]
     fn resolve_workspace_not_found() {
         let err = resolve_workspace("/nonexistent/path/xyz123").unwrap_err();
-        assert!(matches!(err, AppError::NotFound(_)));
+        assert!(matches!(err, FileError::NotFound(_)));
     }
 
     #[test]

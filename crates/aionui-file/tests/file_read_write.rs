@@ -8,7 +8,7 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 
 use aionui_api_types::WebSocketMessage;
-use aionui_file::{FileService, IFileService};
+use aionui_file::{FileError, FileService, IFileService};
 use aionui_realtime::EventBroadcaster;
 
 /// A broadcaster that records every event for later assertion.
@@ -155,8 +155,8 @@ async fn read_file_rejects_outside_sandbox_without_workspace() {
     let svc = make_service(sandbox.path());
     let err = svc.read_file(file.to_str().unwrap(), None).await.unwrap_err();
 
-    assert!(matches!(err, aionui_common::AppError::Forbidden(_)));
-    assert_eq!(err.error_code(), "PATH_OUTSIDE_SANDBOX");
+    assert!(matches!(err, FileError::Forbidden(_)));
+    assert!(err.to_string().contains("outside the allowed sandbox"));
 }
 
 #[tokio::test]
@@ -179,7 +179,7 @@ async fn read_file_rejects_directory() {
     let svc = make_service(dir.path());
     let err = svc.read_file(folder.to_str().unwrap(), None).await.unwrap_err();
 
-    assert!(matches!(err, aionui_common::AppError::BadRequest(_)));
+    assert!(matches!(err, FileError::BadRequest(_)));
     assert!(err.to_string().contains("is a directory"));
 }
 

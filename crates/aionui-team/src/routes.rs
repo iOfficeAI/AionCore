@@ -13,11 +13,32 @@ use aionui_api_types::{
 use aionui_auth::CurrentUser;
 use aionui_common::AppError;
 
+use crate::error::TeamError;
 use crate::service::TeamSessionService;
 
 #[derive(Clone)]
 pub struct TeamRouterState {
     pub service: Arc<TeamSessionService>,
+}
+
+impl From<TeamError> for AppError {
+    fn from(err: TeamError) -> Self {
+        match err {
+            TeamError::TeamNotFound(msg) => AppError::NotFound(msg),
+            TeamError::AgentNotFound(msg) => AppError::NotFound(msg),
+            TeamError::TaskNotFound(msg) => AppError::NotFound(msg),
+            TeamError::InvalidRequest(msg) => AppError::BadRequest(msg),
+            TeamError::LeaderOnly(msg) => AppError::Forbidden(msg),
+            TeamError::SessionNotFound(msg) => AppError::NotFound(msg),
+            TeamError::BlockedTaskNotFound(msg) => AppError::BadRequest(msg),
+            TeamError::BackendNotAllowed(msg) => AppError::BadRequest(msg),
+            TeamError::DuplicateAgentName(msg) => AppError::BadRequest(format!("Agent name already taken: {msg}")),
+            TeamError::App(app_err) => app_err,
+            TeamError::Conversation(conversation_err) => AppError::from(conversation_err),
+            TeamError::Database(db_err) => AppError::from(db_err),
+            TeamError::Json(e) => AppError::Internal(format!("JSON error: {e}")),
+        }
+    }
 }
 
 pub fn team_routes(state: TeamRouterState) -> Router {
@@ -179,5 +200,91 @@ mod tests {
     fn team_router_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<TeamRouterState>();
+    }
+
+    #[test]
+    fn team_not_found_maps_to_app_not_found() {
+        let err: AppError = TeamError::TeamNotFound("t1".into()).into();
+        assert!(matches!(err, AppError::NotFound(msg) if msg == "t1"));
+    }
+
+    #[test]
+    fn agent_not_found_maps_to_app_not_found() {
+        let err: AppError = TeamError::AgentNotFound("slot-1".into()).into();
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn task_not_found_maps_to_app_not_found() {
+        let err: AppError = TeamError::TaskNotFound("tk-1".into()).into();
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn invalid_request_maps_to_bad_request() {
+        let err: AppError = TeamError::InvalidRequest("empty agents".into()).into();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn leader_only_maps_to_forbidden() {
+        let err: AppError = TeamError::LeaderOnly("spawn_agent".into()).into();
+        assert!(matches!(err, AppError::Forbidden(msg) if msg == "spawn_agent"));
+    }
+
+    #[test]
+    fn session_not_found_maps_to_not_found() {
+        let err: AppError = TeamError::SessionNotFound("t1".into()).into();
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn blocked_task_not_found_maps_to_bad_request() {
+        let err: AppError = TeamError::BlockedTaskNotFound("tk-x".into()).into();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn backend_not_allowed_maps_to_bad_request() {
+        let err: AppError = TeamError::BackendNotAllowed("gemini".into()).into();
+        assert!(matches!(err, AppError::BadRequest(msg) if msg == "gemini"));
+    }
+
+    #[test]
+    fn duplicate_agent_name_maps_to_bad_request() {
+        let err: AppError = TeamError::DuplicateAgentName("alice".into()).into();
+        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("alice")));
+    }
+
+    #[test]
+    fn app_error_passthrough_preserves_code() {
+        let err: AppError = TeamError::App(AppError::WorkspacePathContainsWhitespace("/tmp/a b".into())).into();
+        assert!(matches!(err, AppError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
+    }
+
+    #[test]
+    fn conversation_error_maps_through_boundary_mapper() {
+        let err: AppError =
+            TeamError::Conversation(aionui_conversation::ConversationError::NotFound { id: "conv-1".into() }).into();
+        assert!(matches!(err, AppError::NotFound(msg) if msg == "Conversation conv-1 not found"));
+    }
+
+    #[test]
+    fn runtime_workspace_app_error_passthrough_preserves_code() {
+        let err: AppError = TeamError::App(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
+            "/tmp/a b".into(),
+        ))
+        .into();
+        assert!(matches!(
+            err,
+            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(msg) if msg == "/tmp/a b"
+        ));
+    }
+
+    #[test]
+    fn json_error_maps_to_internal() {
+        let json_err = serde_json::from_str::<serde_json::Value>("bad").unwrap_err();
+        let err: AppError = TeamError::Json(json_err).into();
+        assert!(matches!(err, AppError::Internal(_)));
     }
 }

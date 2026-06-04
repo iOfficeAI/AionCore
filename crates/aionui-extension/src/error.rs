@@ -1,5 +1,3 @@
-use aionui_common::AppError;
-
 /// Extension system domain errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ExtensionError {
@@ -79,46 +77,17 @@ pub enum ExtensionError {
     #[error("Invalid skill path: {0}")]
     InvalidSkillPath(String),
 
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+
+    #[error("Internal extension error: {0}")]
+    Internal(String),
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 
     #[error("{0}")]
     JsonParse(#[from] serde_json::Error),
-}
-
-impl From<ExtensionError> for AppError {
-    fn from(err: ExtensionError) -> Self {
-        match err {
-            ExtensionError::ManifestValidation(msg) => AppError::BadRequest(msg),
-            ExtensionError::ReservedNamePrefix { .. } => AppError::BadRequest(err.to_string()),
-            ExtensionError::InvalidVersion { .. } => AppError::BadRequest(err.to_string()),
-            ExtensionError::UndefinedEnvVariable(var) => {
-                AppError::BadRequest(format!("Undefined environment variable: {var}"))
-            }
-            ExtensionError::FileReferenceNotFound(path) => {
-                AppError::NotFound(format!("File reference not found: {path}"))
-            }
-            ExtensionError::PathTraversal(path) => AppError::BadRequest(format!("Path traversal detected: {path}")),
-            ExtensionError::EngineIncompatible { .. } => AppError::BadRequest(err.to_string()),
-            ExtensionError::ApiVersionIncompatible { .. } => AppError::BadRequest(err.to_string()),
-            ExtensionError::InvalidWebuiRouteNamespace { .. } => AppError::BadRequest(err.to_string()),
-            ExtensionError::ReservedWebuiRoute { .. } => AppError::BadRequest(err.to_string()),
-            ExtensionError::ThemeCssNotFound(path) => AppError::NotFound(format!("Theme CSS not found: {path}")),
-            ExtensionError::HookTimeout { .. } => AppError::Internal(err.to_string()),
-            ExtensionError::HookFailed { .. } => AppError::Internal(err.to_string()),
-            ExtensionError::HookNotFound(path) => AppError::NotFound(format!("Hook script not found: {path}")),
-            ExtensionError::ResolutionFailed { .. } => AppError::Internal(err.to_string()),
-            ExtensionError::NotFound(name) => AppError::NotFound(format!("Extension not found: {name}")),
-            ExtensionError::StatePersistence(msg) => AppError::Internal(msg),
-            ExtensionError::BuiltinSkillDeletion(name) => {
-                AppError::BadRequest(format!("Cannot delete built-in skill: {name}"))
-            }
-            ExtensionError::SkillNotFound(name) => AppError::NotFound(format!("Skill not found: {name}")),
-            ExtensionError::InvalidSkillPath(path) => AppError::BadRequest(format!("Invalid skill path: {path}")),
-            ExtensionError::Io(e) => AppError::Internal(e.to_string()),
-            ExtensionError::JsonParse(e) => AppError::BadRequest(e.to_string()),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -171,32 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn test_into_app_error_path_traversal() {
-        let err = ExtensionError::PathTraversal("../secret".into());
-        let app_err: AppError = err.into();
-        assert!(matches!(app_err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn test_into_app_error_bad_request() {
-        let err = ExtensionError::ManifestValidation("test".into());
-        let app_err: AppError = err.into();
-        assert!(matches!(app_err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn test_into_app_error_not_found() {
-        let err = ExtensionError::FileReferenceNotFound("missing.md".into());
-        let app_err: AppError = err.into();
-        assert!(matches!(app_err, AppError::NotFound(_)));
-    }
-
-    #[test]
     fn test_io_error_conversion() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
         let err = ExtensionError::from(io_err);
         assert!(matches!(err, ExtensionError::Io(_)));
-        let app_err: AppError = err.into();
-        assert!(matches!(app_err, AppError::Internal(_)));
     }
 }

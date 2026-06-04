@@ -555,49 +555,155 @@ fn is_streaming_chunk(body: &str) -> bool {
     matches!(kind, Some(k) if STREAMING_KINDS.contains(&k))
 }
 
+struct AcpLogSummary {
+    payload_bytes: usize,
+    payload_json: bool,
+    session_id: Option<String>,
+    session_update_kind: Option<String>,
+}
+
+impl AcpLogSummary {
+    fn from_payload(payload: &str) -> Self {
+        let payload_bytes = payload.len();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return Self {
+                payload_bytes,
+                payload_json: false,
+                session_id: None,
+                session_update_kind: None,
+            };
+        };
+
+        Self {
+            payload_bytes,
+            payload_json: true,
+            session_id: string_pointer(&value, &["/sessionId", "/session_id"]),
+            session_update_kind: string_pointer(&value, &["/update/sessionUpdate", "/update/session_update"]),
+        }
+    }
+}
+
+fn string_pointer(value: &serde_json::Value, pointers: &[&str]) -> Option<String> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+}
+
 /// Log a JSON-RPC request from AionUi to the ACP agent.
 /// `session/prompt` carries large user input and stays at debug.
 fn log_client_request(method: &str, body: &str) {
+    let summary = AcpLogSummary::from_payload(body);
     if method == "session/prompt" {
-        debug!(direction = "client_request", method, body, "[ACP] ->");
+        debug!(
+            direction = "client_request",
+            method,
+            payload_bytes = summary.payload_bytes,
+            payload_json = summary.payload_json,
+            session_id = summary.session_id.as_deref().unwrap_or("none"),
+            "[ACP] ->"
+        );
     } else {
-        info!(direction = "client_request", method, body, "[ACP] ->");
+        info!(
+            direction = "client_request",
+            method,
+            payload_bytes = summary.payload_bytes,
+            payload_json = summary.payload_json,
+            session_id = summary.session_id.as_deref().unwrap_or("none"),
+            "[ACP] ->"
+        );
     }
 }
 
 /// Log a JSON-RPC response from the ACP agent.
 /// `session/prompt` reply is large; stays at debug.
 fn log_agent_response(method: &str, body: &str) {
+    let summary = AcpLogSummary::from_payload(body);
     if method == "session/prompt" {
-        debug!(direction = "agent_response", method, body, "[ACP] <- ${method}");
+        debug!(
+            direction = "agent_response",
+            method,
+            payload_bytes = summary.payload_bytes,
+            payload_json = summary.payload_json,
+            session_id = summary.session_id.as_deref().unwrap_or("none"),
+            "[ACP] <- ${method}"
+        );
     } else {
-        info!(direction = "agent_response", method, body, "[ACP] <- ${method}");
+        info!(
+            direction = "agent_response",
+            method,
+            payload_bytes = summary.payload_bytes,
+            payload_json = summary.payload_json,
+            session_id = summary.session_id.as_deref().unwrap_or("none"),
+            "[ACP] <- ${method}"
+        );
     }
 }
 
 /// Log a fire-and-forget notification from AionUi to the agent.
 fn log_client_notify(method: &str, body: &str) {
-    info!(direction = "client_notify", method, body, "[ACP] -> ${method}");
+    let summary = AcpLogSummary::from_payload(body);
+    info!(
+        direction = "client_notify",
+        method,
+        payload_bytes = summary.payload_bytes,
+        payload_json = summary.payload_json,
+        session_id = summary.session_id.as_deref().unwrap_or("none"),
+        "[ACP] -> ${method}"
+    );
 }
 
 /// Log an inbound notification from the agent.
 /// `session/update` requires per-kind filtering — streaming chunks stay at debug.
 fn log_agent_notify(method: &str, body: &str) {
+    let summary = AcpLogSummary::from_payload(body);
     if method == "session/update" && is_streaming_chunk(body) {
-        debug!(direction = "agent_notify", method, body, "[ACP] <- ${method}");
+        debug!(
+            direction = "agent_notify",
+            method,
+            payload_bytes = summary.payload_bytes,
+            payload_json = summary.payload_json,
+            session_id = summary.session_id.as_deref().unwrap_or("none"),
+            session_update_kind = summary.session_update_kind.as_deref().unwrap_or("none"),
+            "[ACP] <- ${method}"
+        );
     } else {
-        info!(direction = "agent_notify", method, body, "[ACP] <- ${method}");
+        info!(
+            direction = "agent_notify",
+            method,
+            payload_bytes = summary.payload_bytes,
+            payload_json = summary.payload_json,
+            session_id = summary.session_id.as_deref().unwrap_or("none"),
+            session_update_kind = summary.session_update_kind.as_deref().unwrap_or("none"),
+            "[ACP] <- ${method}"
+        );
     }
 }
 
 /// Log an inbound request from the agent (e.g. session/request_permission).
 fn log_agent_request(method: &str, body: &str) {
-    info!(direction = "agent_request", method, body, "[ACP] <- ${method}");
+    let summary = AcpLogSummary::from_payload(body);
+    info!(
+        direction = "agent_request",
+        method,
+        payload_bytes = summary.payload_bytes,
+        payload_json = summary.payload_json,
+        session_id = summary.session_id.as_deref().unwrap_or("none"),
+        "[ACP] <- ${method}"
+    );
 }
 
 /// Log a JSON-RPC response from AionUi back to the agent.
 fn log_client_response(method: &str, body: &str) {
-    info!(direction = "client_response", method, body, "[ACP] -> ${method}");
+    let summary = AcpLogSummary::from_payload(body);
+    info!(
+        direction = "client_response",
+        method,
+        payload_bytes = summary.payload_bytes,
+        payload_json = summary.payload_json,
+        session_id = summary.session_id.as_deref().unwrap_or("none"),
+        "[ACP] -> ${method}"
+    );
 }
 
 impl std::fmt::Debug for AcpProtocol {
@@ -611,6 +717,40 @@ impl std::fmt::Debug for AcpProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt;
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedBuf(Arc::clone(&buffer))
+        };
+
+        let subscriber = fmt::Subscriber::builder()
+            .with_max_level(max_level)
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
 
     #[test]
     fn replay_suppression_guard_sets_and_clears_flag() {
@@ -663,40 +803,13 @@ mod tests {
     }
 
     #[test]
-    fn log_agent_notify_filters_streaming_chunks_at_info_level() {
-        use std::io::Write;
-        use std::sync::{Arc, Mutex};
+    fn log_agent_notify_filters_streaming_chunks_and_omits_raw_body() {
         use tracing::Level;
-        use tracing_subscriber::fmt;
 
-        #[derive(Clone)]
-        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
-        impl Write for SharedBuf {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let make_writer = {
-            let buffer = Arc::clone(&buffer);
-            move || SharedBuf(Arc::clone(&buffer))
-        };
-
-        let subscriber = fmt::Subscriber::builder()
-            .with_max_level(Level::INFO)
-            .with_writer(make_writer)
-            .with_ansi(false)
-            .finish();
-
-        tracing::subscriber::with_default(subscriber, || {
+        let captured = capture_logs(Level::INFO, || {
             log_agent_notify(
                 "session/update",
-                r#"{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk"}}"#,
+                r#"{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hidden stream text"}}}"#,
             );
             log_agent_notify(
                 "session/update",
@@ -704,7 +817,6 @@ mod tests {
             );
         });
 
-        let captured = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
         assert!(
             !captured.contains("agent_message_chunk"),
             "streaming chunk should NOT appear at info level: {captured}"
@@ -714,12 +826,53 @@ mod tests {
             "non-streaming update should appear at info level: {captured}"
         );
         assert!(
+            !captured.contains("hidden stream text"),
+            "streaming content should not be logged: {captured}"
+        );
+        assert!(
+            !captured.contains("modeId") && !captured.contains("yolo"),
+            "raw notification body should not be logged: {captured}"
+        );
+        assert!(
             captured.contains("agent_notify"),
             "structured `direction` field should be `agent_notify`: {captured}"
         );
         assert!(
             captured.contains("session/update"),
             "structured `method` field should be present: {captured}"
+        );
+        assert!(
+            captured.contains("payload_bytes"),
+            "payload size summary should be present: {captured}"
+        );
+    }
+
+    #[test]
+    fn log_client_request_omits_prompt_body_even_at_debug_level() {
+        use tracing::Level;
+
+        let captured = capture_logs(Level::DEBUG, || {
+            log_client_request(
+                "session/prompt",
+                r#"{"sessionId":"s1","prompt":[{"type":"text","text":"secret prompt text"}]}"#,
+            );
+        });
+
+        assert!(
+            captured.contains("client_request"),
+            "structured `direction` field should be present: {captured}"
+        );
+        assert!(
+            captured.contains("session/prompt"),
+            "structured `method` field should be present: {captured}"
+        );
+        assert!(
+            captured.contains("payload_bytes"),
+            "payload size summary should be present: {captured}"
+        );
+        assert!(
+            !captured.contains("secret prompt text") && !captured.contains("\"prompt\""),
+            "raw prompt body should not be logged: {captured}"
         );
     }
 

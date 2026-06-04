@@ -192,17 +192,6 @@ pub enum ProxyError {
     RequestFailed(String),
 }
 
-impl From<ProxyError> for aionui_common::AppError {
-    fn from(err: ProxyError) -> Self {
-        match err {
-            ProxyError::PortNotActive(_) => aionui_common::AppError::Forbidden(err.to_string()),
-            ProxyError::Timeout => aionui_common::AppError::Timeout(err.to_string()),
-            ProxyError::ConnectionFailed(msg) => aionui_common::AppError::BadGateway(msg),
-            ProxyError::RequestFailed(msg) => aionui_common::AppError::BadGateway(msg),
-        }
-    }
-}
-
 fn build_target_url(port: u16, path: &str) -> String {
     let normalized = if path.starts_with('/') {
         path.to_owned()
@@ -435,30 +424,6 @@ mod tests {
     #[test]
     fn find_head_tag_end_missing() {
         assert_eq!(find_head_tag_end("<html><body>"), None);
-    }
-
-    #[test]
-    fn proxy_error_port_not_active_to_forbidden() {
-        let err: aionui_common::AppError = ProxyError::PortNotActive(8080).into();
-        assert!(matches!(err, aionui_common::AppError::Forbidden(_)));
-    }
-
-    #[test]
-    fn proxy_error_timeout_to_timeout() {
-        let err: aionui_common::AppError = ProxyError::Timeout.into();
-        assert!(matches!(err, aionui_common::AppError::Timeout(_)));
-    }
-
-    #[test]
-    fn proxy_error_connection_failed_to_bad_gateway() {
-        let err: aionui_common::AppError = ProxyError::ConnectionFailed("refused".into()).into();
-        assert!(matches!(err, aionui_common::AppError::BadGateway(_)));
-    }
-
-    #[test]
-    fn proxy_error_request_failed_to_bad_gateway() {
-        let err: aionui_common::AppError = ProxyError::RequestFailed("network error".into()).into();
-        assert!(matches!(err, aionui_common::AppError::BadGateway(_)));
     }
 
     #[test]

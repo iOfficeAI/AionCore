@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aion_agent::bootstrap::AgentBootstrap;
 use aion_agent::engine::AgentEngine;
@@ -15,7 +16,7 @@ use aionui_common::{
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::agent_runtime::AgentRuntime;
 use crate::capability::backend_output_sink::BackendOutputSink;
@@ -42,6 +43,8 @@ pub struct AionrsAgentManager {
     /// Signalled by `cancel()` to abort an in-flight `engine.run()` via
     /// `tokio::select!` in `send_message()`.
     cancel_notify: Arc<Notify>,
+    /// Signalled after an in-flight turn emits its terminal event.
+    turn_finished_notify: Arc<Notify>,
 }
 
 impl Drop for AionrsAgentManager {
@@ -156,10 +159,11 @@ impl AionrsAgentManager {
             approval_manager,
             confirmations,
             cancel_notify: Arc::new(Notify::new()),
+            turn_finished_notify: Arc::new(Notify::new()),
         })
     }
 
-    fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) {
+    fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) -> bool {
         let was_running = self.runtime.status() == Some(ConversationStatus::Running);
 
         if let Ok(mut confs) = self.confirmations.write() {
@@ -177,6 +181,8 @@ impl AionrsAgentManager {
             operation,
             "Aionrs stop signal requested"
         );
+
+        was_running
     }
 }
 
@@ -233,7 +239,7 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         let elapsed_ms = now_ms() - started_at;
         self.runtime.bump_activity();
 
-        match result {
+        let send_result = match result {
             Some(Ok(_)) => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
@@ -249,19 +255,19 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,
                     error = %ErrorChain(&e),
-                    "Aionrs engine.run() failed, emitting Error+Finish"
+                    "Aionrs engine.run() failed, emitting Error"
                 );
                 let send_error = aionrs_engine_error_to_send_error(error_msg);
                 self.runtime.emit_error_data(send_error.stream_error().clone());
-                self.runtime.emit_finish(None);
                 Err(send_error)
             }
             None => {
-                self.runtime.emit_error("Stopped by user");
                 self.runtime.emit_finish(None);
                 Ok(())
             }
-        }
+        };
+        self.turn_finished_notify.notify_waiters();
+        send_result
     }
 
     async fn cancel(&self) -> Result<(), AppError> {
@@ -280,8 +286,27 @@ impl AionrsAgentManager {
         &self,
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let _ = crate::agent_task::IAgentTask::kill(self, reason);
-        Box::pin(std::future::ready(()))
+        let was_running = self.request_stop(reason, "kill");
+        let turn_finished_notify = Arc::clone(&self.turn_finished_notify);
+        let runtime = self.runtime.clone();
+        let conversation_id = self.runtime.conversation_id().to_owned();
+
+        Box::pin(async move {
+            if was_running
+                && tokio::time::timeout(Duration::from_secs(5), async {
+                    while runtime.status() == Some(ConversationStatus::Running) {
+                        turn_finished_notify.notified().await;
+                    }
+                })
+                .await
+                .is_err()
+            {
+                warn!(
+                    conversation_id,
+                    "Timed out waiting for aionrs turn to finish after kill"
+                );
+            }
+        })
     }
 }
 
@@ -471,6 +496,30 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(50), &mut notified)
             .await
             .expect("running kill should wake in-flight turn");
+    }
+
+    #[tokio::test]
+    async fn aionrs_agent_kill_and_wait_waits_for_running_turn_terminal() {
+        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
+            .await
+            .unwrap();
+        agent.runtime.reset_for_new_turn(ConversationStatus::Running);
+
+        let wait = agent.kill_and_wait(Some(AgentKillReason::ConversationDeleted));
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut wait)
+                .await
+                .is_err(),
+            "kill_and_wait must not return before a running turn reaches a terminal event"
+        );
+
+        agent.runtime.emit_finish(None);
+        agent.turn_finished_notify.notify_waiters();
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut wait)
+            .await
+            .expect("kill_and_wait should return after terminal notification");
     }
 
     #[tokio::test]

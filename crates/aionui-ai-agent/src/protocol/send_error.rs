@@ -204,26 +204,13 @@ impl AgentSendError {
     pub fn ownership(&self) -> Option<AgentErrorOwnership> {
         self.stream_error.ownership
     }
-}
 
-impl std::fmt::Display for AgentSendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.stream_error.message)
+    pub(crate) fn from_acp_error_ref(err: &AcpError) -> Self {
+        classify_acp_error(err)
     }
-}
 
-impl std::error::Error for AgentSendError {}
-
-impl From<AppError> for AgentSendError {
-    fn from(err: AppError) -> Self {
-        Self::from_app_error(err)
-    }
-}
-
-impl From<AcpError> for AgentSendError {
-    fn from(err: AcpError) -> Self {
-        let detail = err.to_string();
-        match &err {
+    fn from_acp_non_internal(err: &AcpError, detail: String) -> Self {
+        match err {
             AcpError::SpawnFailed { .. } => Self::new(
                 "The selected Agent executable could not be started",
                 AgentErrorCode::UserAgentNotInstalled,
@@ -320,27 +307,131 @@ impl From<AcpError> for AgentSendError {
                     Some(AgentErrorResolutionTarget::Feedback),
                 ),
             ),
-            AcpError::AgentInternal { .. } => classify_upstream_detail(&detail),
+            AcpError::AgentInternal { .. } => unknown_upstream_error(detail),
         }
     }
+}
+
+impl std::fmt::Display for AgentSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.stream_error.message)
+    }
+}
+
+impl std::error::Error for AgentSendError {}
+
+impl From<AppError> for AgentSendError {
+    fn from(err: AppError) -> Self {
+        Self::from_app_error(err)
+    }
+}
+
+impl From<AcpError> for AgentSendError {
+    fn from(err: AcpError) -> Self {
+        Self::from_acp_error_ref(&err)
+    }
+}
+
+fn classify_acp_error(err: &AcpError) -> AgentSendError {
+    match err {
+        AcpError::AgentInternal { message, code, data } => {
+            let detail = acp_agent_internal_public_detail(*code);
+            if *code != -32603 {
+                return unknown_upstream_error(detail);
+            }
+
+            let classified = acp_agent_internal_texts(message, data.as_ref())
+                .into_iter()
+                .find_map(|text| {
+                    let lower = text.to_ascii_lowercase();
+                    classify_agent_lifecycle(&lower)
+                        .or_else(|| classify_provider_text(&lower))
+                        .or_else(|| classify_aionui_state(&lower))
+                });
+
+            match classified {
+                Some(classification) => classification.into_send_error(detail),
+                None => unknown_upstream_error(detail),
+            }
+        }
+        _ => AgentSendError::from_acp_non_internal(err, err.to_string()),
+    }
+}
+
+fn acp_agent_internal_public_detail(code: i32) -> String {
+    format!("Agent internal error (code {code})")
+}
+
+fn acp_agent_internal_texts<'a>(message: &'a str, data: Option<&'a serde_json::Value>) -> Vec<&'a str> {
+    let mut texts = Vec::new();
+    if let Some(data) = data {
+        collect_acp_data_texts(data, &mut texts);
+    }
+
+    let trimmed = message.trim();
+    if !is_uninformative_acp_message(trimmed) {
+        texts.push(trimmed);
+    }
+
+    texts
+}
+
+fn collect_acp_data_texts<'a>(value: &'a serde_json::Value, texts: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(text) => texts.push(text.as_str()),
+        serde_json::Value::Object(map) => {
+            for key in ["error", "details", "message"] {
+                if let Some(value) = map.get(key) {
+                    collect_acp_data_texts(value, texts);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_acp_data_texts(value, texts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_uninformative_acp_message(message: &str) -> bool {
+    message.is_empty()
+        || [
+            "Parse error",
+            "Invalid request",
+            "Method not found",
+            "Invalid params",
+            "Internal error",
+        ]
+        .iter()
+        .any(|default| default.eq_ignore_ascii_case(message))
 }
 
 fn classify_upstream_detail(detail: &str) -> AgentSendError {
     let lower = detail.to_ascii_lowercase();
     let classified = classify_agent_lifecycle(&lower)
-        .or_else(|| classify_provider_api(&lower))
+        .or_else(|| classify_provider_text(&lower))
         .or_else(|| classify_aionui_state(&lower))
-        .unwrap_or(ClassifiedError {
-            message: "The upstream Agent failed while handling the request",
-            code: AgentErrorCode::UnknownUpstreamError,
-            ownership: AgentErrorOwnership::UnknownUpstream,
-            retryable: true,
-            feedback_recommended: true,
-            resolution_kind: AgentErrorResolutionKind::SendFeedback,
-            resolution_target: Some(AgentErrorResolutionTarget::Feedback),
-        });
+        .unwrap_or_else(unknown_upstream_classification);
 
     classified.into_send_error(detail.to_owned())
+}
+
+fn unknown_upstream_error(detail: String) -> AgentSendError {
+    unknown_upstream_classification().into_send_error(detail)
+}
+
+fn unknown_upstream_classification() -> ClassifiedError {
+    ClassifiedError {
+        message: "The upstream Agent failed while handling the request",
+        code: AgentErrorCode::UnknownUpstreamError,
+        ownership: AgentErrorOwnership::UnknownUpstream,
+        retryable: true,
+        feedback_recommended: true,
+        resolution_kind: AgentErrorResolutionKind::SendFeedback,
+        resolution_target: Some(AgentErrorResolutionTarget::Feedback),
+    }
 }
 
 fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
@@ -391,6 +482,14 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
             AgentErrorCode::UserAgentNoPreviousSession,
         ));
     }
+    if lower.contains("failed to connect mcp") {
+        return Some(agent_error(
+            "The selected Agent disconnected from an MCP server",
+            AgentErrorCode::UserAgentDisconnected,
+            true,
+            AgentErrorResolutionKind::ReconnectAgent,
+        ));
+    }
     if lower.contains("session not found") {
         return Some(agent_session_error(
             "The Agent session was not found",
@@ -417,7 +516,7 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
     None
 }
 
-fn classify_provider_api(lower: &str) -> Option<ClassifiedError> {
+fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
     if contains_any(
         lower,
         &[
@@ -852,6 +951,7 @@ fn truncate_chars(value: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use aionui_api_types::{AgentErrorResolutionKind, AgentErrorResolutionTarget};
+    use serde_json::json;
 
     fn assert_classification(
         detail: &str,
@@ -863,6 +963,19 @@ mod tests {
         assert_eq!(err.code(), Some(code));
         assert_eq!(err.ownership(), Some(ownership));
         assert_eq!(err.stream_error().resolution.map(|value| value.kind), Some(resolution));
+    }
+
+    fn assert_acp_classification(
+        err: AcpError,
+        code: AgentErrorCode,
+        ownership: AgentErrorOwnership,
+        resolution: AgentErrorResolutionKind,
+    ) -> AgentSendError {
+        let err = AgentSendError::from(err);
+        assert_eq!(err.code(), Some(code));
+        assert_eq!(err.ownership(), Some(ownership));
+        assert_eq!(err.stream_error().resolution.map(|value| value.kind), Some(resolution));
+        err
     }
 
     fn assert_resolution_target(detail: &str, target: AgentErrorResolutionTarget) {
@@ -1029,6 +1142,124 @@ mod tests {
         ));
         assert_eq!(err.stream_error().retryable, Some(true));
         assert_eq!(err.stream_error().feedback_recommended, Some(false));
+    }
+
+    #[test]
+    fn classifies_acp_internal_mcp_connect_failure_from_structured_data() {
+        let err = assert_acp_classification(
+            AcpError::AgentInternal {
+                message: "Internal error".into(),
+                code: -32603,
+                data: Some(json!({"error": "Failed to connect MCP servers"})),
+            },
+            AgentErrorCode::UserAgentDisconnected,
+            AgentErrorOwnership::UserAgent,
+            AgentErrorResolutionKind::ReconnectAgent,
+        );
+
+        let detail = err.stream_error().detail.as_deref().expect("detail present");
+        assert_eq!(detail, "Agent internal error (code -32603)");
+        assert!(!detail.contains("Failed to connect MCP servers"));
+    }
+
+    #[test]
+    fn classifies_acp_internal_process_exit_from_structured_details() {
+        let err = assert_acp_classification(
+            AcpError::AgentInternal {
+                message: "Internal error".into(),
+                code: -32603,
+                data: Some(json!({"details": "Claude Code process exited with code 1"})),
+            },
+            AgentErrorCode::UserAgentDisconnected,
+            AgentErrorOwnership::UserAgent,
+            AgentErrorResolutionKind::ReconnectAgent,
+        );
+
+        assert_eq!(err.stream_error().retryable, Some(true));
+        assert_eq!(err.stream_error().feedback_recommended, Some(false));
+    }
+
+    #[test]
+    fn classifies_acp_internal_provider_failure_from_structured_message() {
+        assert_acp_classification(
+            AcpError::AgentInternal {
+                message: "Provider error: API error 401: invalid x-api-key".into(),
+                code: -32603,
+                data: None,
+            },
+            AgentErrorCode::UserLlmProviderAuthFailed,
+            AgentErrorOwnership::UserLlmProvider,
+            AgentErrorResolutionKind::CheckProviderCredentials,
+        );
+    }
+
+    #[test]
+    fn classifies_acp_internal_nested_provider_error_message() {
+        assert_acp_classification(
+            AcpError::AgentInternal {
+                message: "Internal error".into(),
+                code: -32603,
+                data: Some(json!({
+                    "type": "error",
+                    "error": {
+                        "message": "Your credit balance is too low to access the Anthropic API"
+                    }
+                })),
+            },
+            AgentErrorCode::UserLlmProviderBillingRequired,
+            AgentErrorOwnership::UserLlmProvider,
+            AgentErrorResolutionKind::CheckProviderBilling,
+        );
+    }
+
+    #[test]
+    fn classifies_acp_internal_nested_provider_data_before_generic_message() {
+        assert_acp_classification(
+            AcpError::AgentInternal {
+                message: "Provider error".into(),
+                code: -32603,
+                data: Some(json!({
+                    "error": {
+                        "message": "invalid x-api-key"
+                    }
+                })),
+            },
+            AgentErrorCode::UserLlmProviderAuthFailed,
+            AgentErrorOwnership::UserLlmProvider,
+            AgentErrorResolutionKind::CheckProviderCredentials,
+        );
+    }
+
+    #[test]
+    fn acp_internal_public_detail_does_not_include_structured_data() {
+        let err = AgentSendError::from(AcpError::AgentInternal {
+            message: "Internal error".into(),
+            code: -32603,
+            data: Some(json!({
+                "error": "Failed to connect MCP servers",
+                "api_key": "sk-secret"
+            })),
+        });
+
+        let detail = err.stream_error().detail.as_deref().expect("detail present");
+        assert_eq!(detail, "Agent internal error (code -32603)");
+        assert!(!detail.contains("Failed to connect MCP servers"));
+        assert!(!detail.contains("sk-secret"));
+        assert!(!detail.contains("api_key"));
+    }
+
+    #[test]
+    fn provider_free_text_still_uses_provider_heuristic_boundary() {
+        let err = AgentSendError::from_app_error(AppError::BadGateway(
+            "Provider error: API error 401: invalid x-api-key".into(),
+        ));
+
+        assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderAuthFailed));
+        assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserLlmProvider));
+        assert_eq!(
+            err.stream_error().resolution.map(|value| value.kind),
+            Some(AgentErrorResolutionKind::CheckProviderCredentials)
+        );
     }
 
     #[test]

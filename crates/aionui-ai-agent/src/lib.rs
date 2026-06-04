@@ -31,6 +31,7 @@ pub use capability::skill_manager::{
 pub use factory::{AgentFactoryDeps, build_agent_factory};
 pub use idle_scanner::start_idle_scanner;
 pub use persistence::AcpSessionSyncService;
+pub use protocol::error::AcpError;
 pub use protocol::events::AgentStreamEvent;
 pub use protocol::send_error::AgentSendError;
 pub use registry::{AgentRegistry, UnavailableReason};

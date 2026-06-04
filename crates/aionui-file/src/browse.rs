@@ -14,8 +14,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::FileError;
 use aionui_api_types::{BrowseDirectoryResponse, BrowseEntry};
-use aionui_common::AppError;
 
 /// Sentinel returned as `parent_path` on Windows drive roots, signaling the
 /// frontend to navigate back to the drive-list screen.
@@ -114,15 +114,15 @@ pub fn drive_list_response() -> BrowseDirectoryResponse {
 /// `~` expansion is handled explicitly so users can paste `~/Documents`
 /// into the picker. Symlinks are resolved via `canonicalize` before the
 /// sandbox check, so a link pointing outside the allow-list is rejected.
-pub fn resolve_browse_path(raw: &str, allowed_roots: &[PathBuf]) -> Result<PathBuf, AppError> {
+pub fn resolve_browse_path(raw: &str, allowed_roots: &[PathBuf]) -> Result<PathBuf, FileError> {
     if raw.contains('\0') {
-        return Err(AppError::BadRequest("path contains null byte".into()));
+        return Err(FileError::BadRequest("path contains null byte".into()));
     }
 
     let expanded = expand_tilde(raw.trim());
     let canonical = fs::canonicalize(&expanded).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => AppError::NotFound(format!("path not found: {}", raw)),
-        _ => AppError::BadRequest(format!("cannot resolve path '{}': {}", raw, e)),
+        std::io::ErrorKind::NotFound => FileError::NotFound(format!("path not found: {}", raw)),
+        _ => FileError::BadRequest(format!("cannot resolve path '{}': {}", raw, e)),
     })?;
 
     let allowed = allowed_roots.iter().any(|root| match fs::canonicalize(root) {
@@ -131,7 +131,7 @@ pub fn resolve_browse_path(raw: &str, allowed_roots: &[PathBuf]) -> Result<PathB
     });
 
     if !allowed {
-        return Err(AppError::Forbidden(format!(
+        return Err(FileError::Forbidden(format!(
             "path '{}' is outside the allowed sandbox",
             raw
         )));
@@ -163,13 +163,13 @@ pub fn list_directory(
     dir: &Path,
     show_files: bool,
     allowed_roots: &[PathBuf],
-) -> Result<BrowseDirectoryResponse, AppError> {
-    let metadata = fs::metadata(dir).map_err(|e| AppError::NotFound(format!("cannot access directory: {}", e)))?;
+) -> Result<BrowseDirectoryResponse, FileError> {
+    let metadata = fs::metadata(dir).map_err(|e| FileError::NotFound(format!("cannot access directory: {}", e)))?;
     if !metadata.is_dir() {
-        return Err(AppError::BadRequest("path is not a directory".into()));
+        return Err(FileError::BadRequest("path is not a directory".into()));
     }
 
-    let read = fs::read_dir(dir).map_err(|e| AppError::Internal(format!("readdir failed: {}", e)))?;
+    let read = fs::read_dir(dir).map_err(|e| FileError::Internal(format!("readdir failed: {}", e)))?;
 
     let mut items: Vec<BrowseEntry> = Vec::new();
     for entry in read.flatten() {
@@ -266,7 +266,7 @@ pub fn browse(
     raw_path: Option<&str>,
     show_files: bool,
     allowed_roots: &[PathBuf],
-) -> Result<BrowseDirectoryResponse, AppError> {
+) -> Result<BrowseDirectoryResponse, FileError> {
     let requested = raw_path.map(str::trim).unwrap_or("");
 
     #[cfg(windows)]
@@ -278,7 +278,7 @@ pub fn browse(
 
     let target = if requested.is_empty() {
         std::env::current_dir()
-            .map_err(|e| AppError::Internal(format!("cannot read cwd: {}", e)))?
+            .map_err(|e| FileError::Internal(format!("cannot read cwd: {}", e)))?
             .to_string_lossy()
             .into_owned()
     } else {
@@ -350,7 +350,7 @@ mod tests {
         let roots = roots_from(&[sandbox.path()]);
 
         let err = browse(Some(outside.path().to_str().unwrap()), false, &roots).unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)), "expected forbidden, got {err}");
+        assert!(matches!(err, FileError::Forbidden(_)), "expected forbidden, got {err}");
     }
 
     #[test]
@@ -360,7 +360,7 @@ mod tests {
         let roots = roots_from(&[sandbox.path()]);
 
         let err = browse(Some(fake.to_str().unwrap()), false, &roots).unwrap_err();
-        assert!(matches!(err, AppError::NotFound(_)), "expected not-found, got {err}");
+        assert!(matches!(err, FileError::NotFound(_)), "expected not-found, got {err}");
     }
 
     #[test]
@@ -369,7 +369,7 @@ mod tests {
         let roots = roots_from(&[sandbox.path()]);
 
         let err = browse(Some("/tmp/\0evil"), false, &roots).unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(matches!(err, FileError::BadRequest(_)));
     }
 
     #[test]
@@ -381,7 +381,7 @@ mod tests {
 
         let err = browse(Some(file.to_str().unwrap()), false, &roots).unwrap_err();
         assert!(
-            matches!(err, AppError::BadRequest(_)),
+            matches!(err, FileError::BadRequest(_)),
             "expected bad-request, got {err}"
         );
     }
@@ -447,7 +447,7 @@ mod tests {
         let roots = roots_from(&[sandbox.path()]);
 
         let err = browse(Some(link.to_str().unwrap()), false, &roots).unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)), "expected forbidden, got {err}");
+        assert!(matches!(err, FileError::Forbidden(_)), "expected forbidden, got {err}");
     }
 
     #[test]

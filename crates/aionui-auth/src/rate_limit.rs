@@ -8,6 +8,7 @@ use dashmap::DashMap;
 
 use aionui_common::AppError;
 
+use crate::error::AuthError;
 use crate::extract::extract_client_ip;
 use crate::middleware::CurrentUser;
 
@@ -55,13 +56,13 @@ impl RateLimiter {
     ///
     /// For the auth rate limiter: check first, record failure later
     /// via [`record_attempt`](Self::record_attempt).
-    pub fn check(&self, key: &str) -> Result<(), AppError> {
+    pub fn check(&self, key: &str) -> Result<(), AuthError> {
         let now = now_ms();
         if let Some(entry) = self.entries.get(key)
             && now < entry.reset_time_ms
             && entry.count >= self.max_requests
         {
-            return Err(AppError::RateLimited);
+            return Err(AuthError::RateLimited);
         }
         Ok(())
     }
@@ -69,7 +70,7 @@ impl RateLimiter {
     /// Check rate limit and increment the counter atomically.
     ///
     /// For API and authenticated-action rate limiters.
-    pub fn check_and_increment(&self, key: &str) -> Result<(), AppError> {
+    pub fn check_and_increment(&self, key: &str) -> Result<(), AuthError> {
         let now = now_ms();
         let window_ms = self.window.as_millis() as u64;
 
@@ -84,7 +85,7 @@ impl RateLimiter {
         }
 
         if entry.count >= self.max_requests {
-            return Err(AppError::RateLimited);
+            return Err(AuthError::RateLimited);
         }
 
         entry.count += 1;
@@ -152,7 +153,7 @@ pub async fn auth_rate_limit_middleware(
     next: Next,
 ) -> Result<Response, AppError> {
     let ip = extract_client_ip(&request);
-    limiter.check(&ip)?;
+    limiter.check(&ip).map_err(AppError::from)?;
 
     let response = next.run(request).await;
 
@@ -170,7 +171,7 @@ pub async fn api_rate_limit_middleware(
     next: Next,
 ) -> Result<Response, AppError> {
     let ip = extract_client_ip(&request);
-    limiter.check_and_increment(&ip)?;
+    limiter.check_and_increment(&ip).map_err(AppError::from)?;
     Ok(next.run(request).await)
 }
 
@@ -188,7 +189,7 @@ pub async fn authenticated_action_rate_limit_middleware(
         .get::<CurrentUser>()
         .map(|u| format!("user:{}", u.id))
         .unwrap_or_else(|| format!("ip:{}", extract_client_ip(&request)));
-    limiter.check_and_increment(&key)?;
+    limiter.check_and_increment(&key).map_err(AppError::from)?;
     Ok(next.run(request).await)
 }
 

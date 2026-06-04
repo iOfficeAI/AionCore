@@ -5,8 +5,8 @@ use aionui_api_types::{
     CreateConversationRequest, ListConversationsQuery, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, AppError, ConversationSource, ConversationStatus, TimestampMs};
-use aionui_conversation::ConversationService;
 use aionui_conversation::skill_resolver::SkillResolver;
+use aionui_conversation::{ConversationError, ConversationService};
 use aionui_db::{SqliteConversationRepository, init_database_memory};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
@@ -344,7 +344,7 @@ async fn t3_1_get_existing() {
 async fn t3_2_get_not_found() {
     let (svc, _, _task_mgr) = setup().await;
     let err = svc.get(USER_ID, "non-existent-uuid").await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── T4: Update conversation ────────────────────────────────────────
@@ -445,7 +445,7 @@ async fn t4_6_update_not_found() {
     let (svc, _, task_mgr) = setup().await;
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();
     let err = svc.update(USER_ID, "non-existent", req, &task_mgr).await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── T5: Delete conversation ────────────────────────────────────────
@@ -460,7 +460,7 @@ async fn t5_1_delete_conversation() {
 
     // Verify gone
     let err = svc.get(USER_ID, &conv.id).await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 
     // Verify broadcast
     let events = broadcaster.take_events();
@@ -476,14 +476,14 @@ async fn t5_2_delete_then_get_returns_404() {
 
     svc.delete(USER_ID, &conv.id).await.unwrap();
     let err = svc.get(USER_ID, &conv.id).await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]
 async fn t5_3_delete_not_found() {
     let (svc, _, _task_mgr) = setup().await;
     let err = svc.delete(USER_ID, "non-existent").await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── T11: WebSocket event verification ──────────────────────────────
@@ -644,7 +644,7 @@ async fn create_rejects_top_level_model_for_acp() {
 
     let err = svc.create(USER_ID, req).await.unwrap_err();
     match err {
-        AppError::BadRequest(msg) => {
+        ConversationError::BadRequest { reason: msg } => {
             assert!(msg.contains("model"), "error message should mention model: {msg}");
             assert!(msg.contains("extra"), "error message should mention extra: {msg}");
         }
@@ -663,7 +663,10 @@ async fn create_rejects_top_level_model_for_remote() {
     }))
     .unwrap();
 
-    assert!(matches!(svc.create(USER_ID, req).await, Err(AppError::BadRequest(_))));
+    assert!(matches!(
+        svc.create(USER_ID, req).await,
+        Err(ConversationError::BadRequest { .. })
+    ));
 }
 
 #[tokio::test]
@@ -720,7 +723,7 @@ async fn update_rejects_top_level_model_for_acp() {
 
     let err = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap_err();
     assert!(
-        matches!(err, AppError::BadRequest(_)),
+        matches!(err, ConversationError::BadRequest { .. }),
         "expected BadRequest, got {err:?}"
     );
 }
@@ -743,6 +746,18 @@ async fn update_accepts_top_level_model_for_aionrs() {
     .unwrap();
     let updated = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap();
     assert_eq!(updated.model.unwrap().model, "gpt-4o-mini");
+}
+
+#[tokio::test]
+async fn complete_turn_skips_status_update_when_conversation_is_deleting() {
+    let (svc, _, _task_mgr) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    svc.runtime_state().mark_deleting(&conv.id);
+    svc.complete_turn(&conv.id).await;
+
+    let row = svc.conversation_repo().get(&conv.id).await.unwrap().unwrap();
+    assert_eq!(row.status.as_deref(), Some("pending"));
 }
 
 #[tokio::test]

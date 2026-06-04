@@ -10,7 +10,7 @@ use crate::manager::acp::{
 use crate::manager::process_registry::{register_session_process, unregister_agent_process};
 use crate::protocol::acp::AcpProtocol;
 use crate::protocol::error::{AcpError, CloseReason};
-use crate::protocol::events::{AgentStreamEvent, FinishEventData};
+use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::registry::CatalogSender;
 use crate::shared_kernel::{ModeId, ModelId, SessionId as DomainSessionId};
@@ -27,6 +27,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
+
+use super::agent_session_flow::PromptOutcome;
+use super::error_mapping::{AcpSendFailure, acp_error_to_app_error};
 
 /// The user-visible body inside an [`AppError`].
 ///
@@ -262,7 +265,7 @@ impl AcpAgentManager {
                     "Agent process exited before ACP handshake completed"
                 );
                 let _ = unregister_agent_process(&params.data_dir, process.pid());
-                return Err(AppError::from(AcpError::StartupCrash { exit_code, signal, stderr }));
+                return Err(acp_error_to_app_error(AcpError::StartupCrash { exit_code, signal, stderr }));
             }
             res = &mut connect_fut => res.map_err(|e| {
                 error!(
@@ -271,7 +274,7 @@ impl AcpAgentManager {
                     "Failed to establish ACP protocol connection"
                 );
                 let _ = unregister_agent_process(&params.data_dir, process.pid());
-                AppError::from(e)
+                acp_error_to_app_error(e)
             })?,
         };
         let permission_router = Arc::new(PermissionRouter::new(permission_rx));
@@ -549,8 +552,8 @@ impl AcpAgentManager {
     /// forwarded to the CLI. Each hook in the pipeline reads one-shot flags
     /// on `AcpSession` (e.g. `pending_session_new_prelude`,
     /// `pending_model_notice`) and prepends the appropriate block when set.
-    async fn ensure_session_and_send(&self, data: &SendMessageData) -> Result<(), AppError> {
-        let sid = self.ensure_session_opened().await?;
+    async fn ensure_session_and_send(&self, data: &SendMessageData) -> Result<PromptOutcome, AcpSendFailure> {
+        let sid = self.ensure_session_opened().await.map_err(AcpSendFailure::from)?;
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
 
         let content = {
@@ -620,15 +623,40 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
         self.runtime.bump_activity();
 
         match self.ensure_session_and_send(&data).await {
-            Ok(()) => {
-                info!("ACP send_message completed");
-                // ACP pattern: Finish with session_id = None (default).
-                // If ACP later wants to include the session_id in Finish,
-                // read it from `self.session.read().await.session_id()`.
-                self.runtime.emit_finish(None);
+            Ok(PromptOutcome::Completed { session_id }) => {
+                info!(
+                    agent_type = "acp",
+                    terminal_kind = "finish",
+                    source = "prompt_outcome",
+                    "ACP send_message completed"
+                );
+                self.runtime.emit_finish(Some(session_id));
+                Ok(())
+            }
+            Ok(PromptOutcome::Cancelled { session_id }) => {
+                info!(
+                    agent_type = "acp",
+                    terminal_kind = "finish",
+                    source = "prompt_cancelled",
+                    "ACP send_message cancelled"
+                );
+                self.runtime.emit_finish(Some(session_id));
+                Ok(())
+            }
+            Ok(PromptOutcome::EmptyResponse { session_id, error }) => {
+                info!(
+                    agent_type = "acp",
+                    terminal_kind = "error",
+                    source = "empty_response",
+                    session_id = %session_id,
+                    "ACP send_message completed without visible output"
+                );
+                self.runtime.emit_error_data(error);
                 Ok(())
             }
             Err(err) => {
+                let send_error = err.to_agent_send_error();
+                let app_err = err.into_app_error();
                 // Build a CloseReason that captures whatever context we still
                 // have. Two cases matter:
                 //   1. The CLI process has already exited — we can read the
@@ -639,19 +667,18 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
                 //      stderr-augmentation heuristic for the SDK's "default
                 //      Internal error" shape; otherwise the user-facing form
                 //      of the AppError is the best we can do.
-                let close_reason = self.build_close_reason_from_error(&err).await;
+                let close_reason = self.build_close_reason_from_error(&app_err).await;
 
                 // Operator log: full error chain + the (raw, pre-redaction)
                 // stderr peek so on-call can correlate. The redacted summary
                 // is what reaches the UI.
                 let summary = close_reason.user_facing_message();
-                error!(error = %ErrorChain(&err), close_reason_summary = %summary, "ACP send_message failed");
+                error!(error = %ErrorChain(&app_err), close_reason_summary = %summary, "ACP send_message failed");
 
                 {
                     let mut session = self.session.write().await;
                     session.record_close_reason(Some(close_reason));
                 }
-                let send_error = AgentSendError::from_app_error(err);
                 self.runtime.emit_error_data(send_error.stream_error().clone());
                 Err(send_error)
             }
@@ -678,12 +705,14 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
             session.record_close_reason(Some(CloseReason::UserCancel));
         }
 
-        // Force status to Finished and emit unconditionally, bypassing the
-        // absorbing-state guard. This ensures StreamRelay always receives
-        // its terminal event regardless of prior state.
-        self.runtime.reset_for_new_turn(ConversationStatus::Finished);
-        self.runtime
-            .emit(AgentStreamEvent::Finish(FinishEventData { session_id: None }));
+        info!(
+            agent_type = "acp",
+            terminal_kind = "finish",
+            source = "cancel_request",
+            session_id = session_id.as_deref().unwrap_or("none"),
+            "ACP cancel emitting terminal finish"
+        );
+        self.runtime.emit_finish(None);
 
         Ok(())
     }

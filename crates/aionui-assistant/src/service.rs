@@ -14,7 +14,9 @@ use aionui_db::{
     AssistantOverrideRow, AssistantRow, CreateAssistantParams, IAssistantOverrideRepository, IAssistantRepository,
     IProviderRepository, UpdateAssistantParams, UpsertOverrideParams,
 };
-use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionRegistry, ResolvedAssistant};
+use aionui_extension::{
+    AssistantClassifier, AssistantRuleDispatcher, ExtensionError, ExtensionRegistry, ResolvedAssistant,
+};
 use serde_json;
 use tracing::{debug, warn};
 
@@ -712,28 +714,49 @@ impl AssistantClassifier for AssistantService {
 
 #[async_trait::async_trait]
 impl AssistantRuleDispatcher for AssistantService {
-    async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, AppError> {
-        AssistantService::read_rule(self, id, locale).await
+    async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
+        AssistantService::read_rule(self, id, locale)
+            .await
+            .map_err(assistant_app_error_to_extension_error)
     }
 
-    async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AppError> {
-        AssistantService::write_rule(self, id, locale, content).await
+    async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError> {
+        AssistantService::write_rule(self, id, locale, content)
+            .await
+            .map_err(assistant_app_error_to_extension_error)
     }
 
-    async fn delete_rule(&self, id: &str) -> Result<bool, AppError> {
-        AssistantService::delete_rule(self, id).await
+    async fn delete_rule(&self, id: &str) -> Result<bool, ExtensionError> {
+        AssistantService::delete_rule(self, id)
+            .await
+            .map_err(assistant_app_error_to_extension_error)
     }
 
-    async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, AppError> {
-        AssistantService::read_skill(self, id, locale).await
+    async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
+        AssistantService::read_skill(self, id, locale)
+            .await
+            .map_err(assistant_app_error_to_extension_error)
     }
 
-    async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AppError> {
-        AssistantService::write_skill(self, id, locale, content).await
+    async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError> {
+        AssistantService::write_skill(self, id, locale, content)
+            .await
+            .map_err(assistant_app_error_to_extension_error)
     }
 
-    async fn delete_skill(&self, id: &str) -> Result<bool, AppError> {
-        AssistantService::delete_skill(self, id).await
+    async fn delete_skill(&self, id: &str) -> Result<bool, ExtensionError> {
+        AssistantService::delete_skill(self, id)
+            .await
+            .map_err(assistant_app_error_to_extension_error)
+    }
+}
+
+fn assistant_app_error_to_extension_error(error: AppError) -> ExtensionError {
+    match error {
+        AppError::BadRequest(message) => ExtensionError::InvalidRequest(message),
+        AppError::NotFound(message) => ExtensionError::NotFound(message),
+        AppError::Internal(message) => ExtensionError::Internal(message),
+        other => ExtensionError::Internal(other.to_string()),
     }
 }
 

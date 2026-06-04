@@ -44,10 +44,11 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode> {
         Some(Command::McpTeamStdio) => Ok(commands::run_team_stdio().await),
         Some(Command::Doctor) => commands::run_doctor(&cli, &merged_path).await,
         None => {
-            let env = bootstrap::init_environment(&cli, &merged_path)?;
+            let mut env = bootstrap::init_environment(&cli, &merged_path)?;
+            let listener = commands::bind_http_listener(&mut env.config).await?;
             let database = bootstrap::init_data_layer(&env.config).await?;
             let services = AppServices::from_config(database, &env.config).await?;
-            commands::run_server(env, services).await
+            commands::run_server(env, services, listener).await
         }
     }
 }

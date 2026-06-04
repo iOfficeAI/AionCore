@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 
-use aionui_common::AppError;
+use crate::error::AuthError;
 
 /// QR token time-to-live: 5 minutes.
 const QR_TOKEN_TTL_MS: i64 = 5 * 60 * 1000;
@@ -72,20 +72,20 @@ impl QrTokenStore {
     /// Validate and consume a QR token (one-time use).
     ///
     /// Checks existence, expiry (5 min), and used status atomically.
-    pub fn validate_and_consume(&self, token: &str) -> Result<(), AppError> {
+    pub fn validate_and_consume(&self, token: &str) -> Result<(), AuthError> {
         let mut entry = self
             .tokens
             .get_mut(token)
-            .ok_or_else(|| AppError::Unauthorized("Invalid QR token".into()))?;
+            .ok_or_else(|| AuthError::TokenInvalid("Invalid QR token".into()))?;
 
         if entry.used {
-            return Err(AppError::Unauthorized("QR token already used".into()));
+            return Err(AuthError::TokenInvalid("QR token already used".into()));
         }
 
         let now = aionui_common::now_ms();
         let elapsed_ms = now.saturating_sub(entry.created_at_ms);
         if elapsed_ms > QR_TOKEN_TTL_MS {
-            return Err(AppError::Unauthorized("QR token expired".into()));
+            return Err(AuthError::TokenInvalid("QR token expired".into()));
         }
 
         entry.used = true;
@@ -158,7 +158,7 @@ mod tests {
     fn validate_nonexistent_token_fails() {
         let store = QrTokenStore::new();
         let err = store.validate_and_consume("nonexistent").unwrap_err();
-        assert!(matches!(err, AppError::Unauthorized(_)));
+        assert!(matches!(err, AuthError::TokenInvalid(_)));
     }
 
     #[test]
@@ -168,7 +168,7 @@ mod tests {
         store.validate_and_consume(&token).unwrap();
 
         let err = store.validate_and_consume(&token).unwrap_err();
-        assert!(matches!(err, AppError::Unauthorized(_)));
+        assert!(matches!(err, AuthError::TokenInvalid(_)));
     }
 
     #[test]
@@ -184,7 +184,7 @@ mod tests {
         );
 
         let err = store.validate_and_consume("expired_token").unwrap_err();
-        assert!(matches!(err, AppError::Unauthorized(_)));
+        assert!(matches!(err, AuthError::TokenInvalid(_)));
     }
 
     #[test]

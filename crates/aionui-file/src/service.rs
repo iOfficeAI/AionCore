@@ -9,8 +9,8 @@ use dashmap::DashMap;
 use ignore::WalkBuilder;
 use tracing::warn;
 
+use crate::error::FileError;
 use aionui_api_types::WebSocketMessage;
-use aionui_common::AppError;
 use aionui_realtime::EventBroadcaster;
 
 use crate::path_safety::{has_traversal, validate_path, validate_path_for_write, validate_path_with_extra_root};
@@ -116,30 +116,30 @@ impl FileService {
 
     /// List immediate children of `dir`, building a single-level tree.
     /// Each child directory also lists *its* children (depth = 2 from `dir`).
-    async fn build_dir_tree(&self, dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, AppError> {
+    async fn build_dir_tree(&self, dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileError> {
         let dir_owned = dir.to_path_buf();
         let root_owned = root.to_path_buf();
 
         tokio::task::spawn_blocking(move || build_dir_tree_sync(&dir_owned, &root_owned))
             .await
-            .map_err(|e| AppError::Internal(format!("directory listing task failed: {e}")))?
+            .map_err(|e| FileError::Internal(format!("directory listing task failed: {e}")))?
     }
 }
 
 /// Synchronous directory tree builder (runs in blocking thread pool).
-fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, AppError> {
+fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileError> {
     let entries = std::fs::read_dir(dir)
-        .map_err(|e| AppError::BadRequest(format!("cannot read directory '{}': {e}", dir.display())))?;
+        .map_err(|e| FileError::BadRequest(format!("cannot read directory '{}': {e}", dir.display())))?;
 
     let mut result = Vec::new();
 
     for entry in entries {
-        let entry = entry.map_err(|e| AppError::Internal(format!("error reading directory entry: {e}")))?;
+        let entry = entry.map_err(|e| FileError::Internal(format!("error reading directory entry: {e}")))?;
 
         let path = entry.path();
         let metadata = entry
             .metadata()
-            .map_err(|e| AppError::Internal(format!("cannot read metadata for '{}': {e}", path.display())))?;
+            .map_err(|e| FileError::Internal(format!("cannot read metadata for '{}': {e}", path.display())))?;
 
         let name = entry.file_name().to_string_lossy().into_owned();
 
@@ -171,7 +171,7 @@ fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, AppErr
 }
 
 /// Read immediate children of a directory (one level, no grandchildren).
-fn read_children_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, AppError> {
+fn read_children_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Ok(Vec::new()),
@@ -208,7 +208,7 @@ fn read_children_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, AppErro
 }
 
 /// Recursively list files using the `ignore` crate (respects .gitignore).
-fn list_workspace_files_sync(root: &Path) -> Result<Vec<WorkspaceFlatFile>, AppError> {
+fn list_workspace_files_sync(root: &Path) -> Result<Vec<WorkspaceFlatFile>, FileError> {
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
@@ -267,14 +267,14 @@ fn list_workspace_files_sync(root: &Path) -> Result<Vec<WorkspaceFlatFile>, AppE
 /// Validate that a file exists and is within the size limit.
 /// Returns `Ok(None)` if the file does not exist.
 /// Returns `Ok(Some(()))` if the file is valid for reading.
-fn validate_file_for_read(path: &Path) -> Result<Option<()>, AppError> {
+fn validate_file_for_read(path: &Path) -> Result<Option<()>, FileError> {
     let metadata = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(None);
         }
         Err(e) => {
-            return Err(AppError::Internal(format!(
+            return Err(FileError::Internal(format!(
                 "cannot read metadata for '{}': {e}",
                 path.display()
             )));
@@ -282,7 +282,7 @@ fn validate_file_for_read(path: &Path) -> Result<Option<()>, AppError> {
     };
 
     if metadata.len() > MAX_FILE_SIZE {
-        return Err(AppError::BadRequest(format!(
+        return Err(FileError::BadRequest(format!(
             "file '{}' exceeds 256 MB limit ({} bytes)",
             path.display(),
             metadata.len()
@@ -290,7 +290,7 @@ fn validate_file_for_read(path: &Path) -> Result<Option<()>, AppError> {
     }
 
     if metadata.is_dir() {
-        return Err(AppError::BadRequest(format!(
+        return Err(FileError::BadRequest(format!(
             "path '{}' is a directory; expected a file",
             path.display()
         )));
@@ -301,35 +301,35 @@ fn validate_file_for_read(path: &Path) -> Result<Option<()>, AppError> {
 
 /// Read a file as UTF-8 text. Returns `None` if the file does not exist.
 /// Rejects files larger than 256 MB.
-fn read_file_sync(path: &Path) -> Result<Option<String>, AppError> {
+fn read_file_sync(path: &Path) -> Result<Option<String>, FileError> {
     if validate_file_for_read(path)?.is_none() {
         return Ok(None);
     }
 
     let content = std::fs::read_to_string(path)
-        .map_err(|e| AppError::Internal(format!("cannot read file '{}': {e}", path.display())))?;
+        .map_err(|e| FileError::Internal(format!("cannot read file '{}': {e}", path.display())))?;
 
     Ok(Some(content))
 }
 
 /// Read a file as raw bytes. Returns `None` if the file does not exist.
 /// Rejects files larger than 256 MB.
-fn read_file_buffer_sync(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+fn read_file_buffer_sync(path: &Path) -> Result<Option<Vec<u8>>, FileError> {
     if validate_file_for_read(path)?.is_none() {
         return Ok(None);
     }
 
     let bytes =
-        std::fs::read(path).map_err(|e| AppError::Internal(format!("cannot read file '{}': {e}", path.display())))?;
+        std::fs::read(path).map_err(|e| FileError::Internal(format!("cannot read file '{}': {e}", path.display())))?;
 
     Ok(Some(bytes))
 }
 
 /// Write data to a file synchronously. Creates the file if it does not exist.
 /// Returns `true` on success.
-fn write_file_sync(path: &Path, data: &[u8]) -> Result<bool, AppError> {
+fn write_file_sync(path: &Path, data: &[u8]) -> Result<bool, FileError> {
     std::fs::write(path, data)
-        .map_err(|e| AppError::Internal(format!("cannot write file '{}': {e}", path.display())))?;
+        .map_err(|e| FileError::Internal(format!("cannot write file '{}': {e}", path.display())))?;
     Ok(true)
 }
 
@@ -353,9 +353,9 @@ fn split_base_ext(name: &str) -> (&str, &str) {
 }
 
 /// Get file metadata synchronously.
-fn get_file_metadata_sync(path: &Path) -> Result<FileMetadata, AppError> {
+fn get_file_metadata_sync(path: &Path) -> Result<FileMetadata, FileError> {
     let metadata = std::fs::metadata(path)
-        .map_err(|e| AppError::NotFound(format!("cannot read metadata for '{}': {e}", path.display())))?;
+        .map_err(|e| FileError::NotFound(format!("cannot read metadata for '{}': {e}", path.display())))?;
 
     let name = path
         .file_name()
@@ -392,36 +392,36 @@ fn get_file_metadata_sync(path: &Path) -> Result<FileMetadata, AppError> {
 }
 
 /// Remove a file or directory synchronously. Directories are removed recursively.
-fn remove_entry_sync(path: &Path) -> Result<(), AppError> {
+fn remove_entry_sync(path: &Path) -> Result<(), FileError> {
     let metadata =
-        std::fs::metadata(path).map_err(|e| AppError::NotFound(format!("cannot remove '{}': {e}", path.display())))?;
+        std::fs::metadata(path).map_err(|e| FileError::NotFound(format!("cannot remove '{}': {e}", path.display())))?;
 
     if metadata.is_dir() {
         std::fs::remove_dir_all(path)
-            .map_err(|e| AppError::Internal(format!("cannot remove directory '{}': {e}", path.display())))
+            .map_err(|e| FileError::Internal(format!("cannot remove directory '{}': {e}", path.display())))
     } else {
         std::fs::remove_file(path)
-            .map_err(|e| AppError::Internal(format!("cannot remove file '{}': {e}", path.display())))
+            .map_err(|e| FileError::Internal(format!("cannot remove file '{}': {e}", path.display())))
     }
 }
 
 /// Rename a file or directory synchronously. Returns the new absolute path.
-fn rename_entry_sync(path: &Path, new_name: &str) -> Result<PathBuf, AppError> {
+fn rename_entry_sync(path: &Path, new_name: &str) -> Result<PathBuf, FileError> {
     let parent = path
         .parent()
-        .ok_or_else(|| AppError::BadRequest(format!("path '{}' has no parent", path.display())))?;
+        .ok_or_else(|| FileError::BadRequest(format!("path '{}' has no parent", path.display())))?;
 
     let new_path = parent.join(new_name);
 
     if new_path.exists() {
-        return Err(AppError::BadRequest(format!(
+        return Err(FileError::BadRequest(format!(
             "target '{}' already exists",
             new_path.display()
         )));
     }
 
     std::fs::rename(path, &new_path).map_err(|e| {
-        AppError::Internal(format!(
+        FileError::Internal(format!(
             "cannot rename '{}' to '{}': {e}",
             path.display(),
             new_path.display()
@@ -432,22 +432,22 @@ fn rename_entry_sync(path: &Path, new_name: &str) -> Result<PathBuf, AppError> {
 }
 
 /// Copy a single file, creating parent directories as needed.
-fn copy_single_file_sync(src: &Path, dest: &Path) -> Result<(), AppError> {
+fn copy_single_file_sync(src: &Path, dest: &Path) -> Result<(), FileError> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| AppError::Internal(format!("cannot create directory '{}': {e}", parent.display())))?;
+            .map_err(|e| FileError::Internal(format!("cannot create directory '{}': {e}", parent.display())))?;
     }
 
     std::fs::copy(src, dest)
-        .map_err(|e| AppError::Internal(format!("cannot copy '{}' to '{}': {e}", src.display(), dest.display())))?;
+        .map_err(|e| FileError::Internal(format!("cannot copy '{}' to '{}': {e}", src.display(), dest.display())))?;
 
     Ok(())
 }
 
 /// Read a local image file and return a base64 Data URL.
-fn get_image_base64_sync(path: &Path) -> Result<String, AppError> {
+fn get_image_base64_sync(path: &Path) -> Result<String, FileError> {
     let bytes =
-        std::fs::read(path).map_err(|e| AppError::NotFound(format!("cannot read image '{}': {e}", path.display())))?;
+        std::fs::read(path).map_err(|e| FileError::NotFound(format!("cannot read image '{}': {e}", path.display())))?;
 
     let mime = mime_guess::from_path(path)
         .first()
@@ -501,10 +501,10 @@ fn validate_remote_image_url(raw_url: &str) -> Result<reqwest::Url, String> {
 /// Writes entries into a ZIP archive at `output_path`. Checks the
 /// `cancelled` flag between entries and aborts early if set.
 /// On cancellation, the partial ZIP file is removed.
-fn create_zip_sync(output_path: &Path, entries: &[ZipEntry], cancelled: &AtomicBool) -> Result<bool, AppError> {
+fn create_zip_sync(output_path: &Path, entries: &[ZipEntry], cancelled: &AtomicBool) -> Result<bool, FileError> {
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            AppError::Internal(format!(
+            FileError::Internal(format!(
                 "cannot create parent directory for '{}': {e}",
                 output_path.display()
             ))
@@ -512,7 +512,7 @@ fn create_zip_sync(output_path: &Path, entries: &[ZipEntry], cancelled: &AtomicB
     }
 
     let file = std::fs::File::create(output_path)
-        .map_err(|e| AppError::Internal(format!("cannot create ZIP file '{}': {e}", output_path.display())))?;
+        .map_err(|e| FileError::Internal(format!("cannot create ZIP file '{}': {e}", output_path.display())))?;
 
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
@@ -534,7 +534,7 @@ fn create_zip_sync(output_path: &Path, entries: &[ZipEntry], cancelled: &AtomicB
 
     zip.finish().map_err(|e| {
         let _ = std::fs::remove_file(output_path);
-        AppError::Internal(format!("ZIP: failed to finalize '{}': {e}", output_path.display()))
+        FileError::Internal(format!("ZIP: failed to finalize '{}': {e}", output_path.display()))
     })?;
 
     Ok(true)
@@ -547,7 +547,7 @@ fn write_zip_entries(
     entries: &[ZipEntry],
     cancelled: &AtomicBool,
     options: zip::write::SimpleFileOptions,
-) -> Result<bool, AppError> {
+) -> Result<bool, FileError> {
     for entry in entries {
         if cancelled.load(Ordering::Relaxed) {
             return Ok(false);
@@ -556,17 +556,17 @@ fn write_zip_entries(
         match entry {
             ZipEntry::Text { name, content } => {
                 zip.start_file(name, options)
-                    .map_err(|e| AppError::Internal(format!("ZIP: failed to start entry '{name}': {e}")))?;
+                    .map_err(|e| FileError::Internal(format!("ZIP: failed to start entry '{name}': {e}")))?;
                 zip.write_all(content.as_bytes())
-                    .map_err(|e| AppError::Internal(format!("ZIP: failed to write entry '{name}': {e}")))?;
+                    .map_err(|e| FileError::Internal(format!("ZIP: failed to write entry '{name}': {e}")))?;
             }
             ZipEntry::Disk { name, file_path } => {
                 let data = std::fs::read(file_path)
-                    .map_err(|e| AppError::Internal(format!("ZIP: cannot read source file '{file_path}': {e}")))?;
+                    .map_err(|e| FileError::Internal(format!("ZIP: cannot read source file '{file_path}': {e}")))?;
                 zip.start_file(name, options)
-                    .map_err(|e| AppError::Internal(format!("ZIP: failed to start entry '{name}': {e}")))?;
+                    .map_err(|e| FileError::Internal(format!("ZIP: failed to start entry '{name}': {e}")))?;
                 zip.write_all(&data)
-                    .map_err(|e| AppError::Internal(format!("ZIP: failed to write entry '{name}': {e}")))?;
+                    .map_err(|e| FileError::Internal(format!("ZIP: failed to write entry '{name}': {e}")))?;
             }
         }
     }
@@ -581,7 +581,7 @@ fn write_zip_entries(
 
 #[async_trait::async_trait]
 impl crate::traits::IFileService for FileService {
-    async fn get_files_by_dir(&self, dir: &str, root: &str) -> Result<Vec<DirOrFile>, AppError> {
+    async fn get_files_by_dir(&self, dir: &str, root: &str) -> Result<Vec<DirOrFile>, FileError> {
         let roots = self.allowed_roots_refs();
         let canonical_dir = validate_path(dir, &roots)?;
         let canonical_root = validate_path(root, &roots)?;
@@ -589,7 +589,7 @@ impl crate::traits::IFileService for FileService {
         self.build_dir_tree(&canonical_dir, &canonical_root).await
     }
 
-    async fn list_workspace_files(&self, root: &str) -> Result<Vec<WorkspaceFlatFile>, AppError> {
+    async fn list_workspace_files(&self, root: &str) -> Result<Vec<WorkspaceFlatFile>, FileError> {
         let roots = self.allowed_roots_refs();
         let canonical_root = validate_path(root, &roots)?;
         let cache_key = canonical_root.to_string_lossy().into_owned();
@@ -602,7 +602,7 @@ impl crate::traits::IFileService for FileService {
         let root_owned = canonical_root.clone();
         let files = tokio::task::spawn_blocking(move || list_workspace_files_sync(&root_owned))
             .await
-            .map_err(|e| AppError::Internal(format!("workspace file listing task failed: {e}")))??;
+            .map_err(|e| FileError::Internal(format!("workspace file listing task failed: {e}")))??;
 
         // Store in cache
         self.workspace_files_cache.insert(cache_key, files.clone());
@@ -610,22 +610,22 @@ impl crate::traits::IFileService for FileService {
         Ok(files)
     }
 
-    async fn get_file_metadata(&self, path: &str, extra_root: Option<&Path>) -> Result<FileMetadata, AppError> {
+    async fn get_file_metadata(&self, path: &str, extra_root: Option<&Path>) -> Result<FileMetadata, FileError> {
         let roots = self.allowed_roots_refs();
         let canonical = validate_path_with_extra_root(path, &roots, extra_root)?;
 
         let result = tokio::task::spawn_blocking(move || get_file_metadata_sync(&canonical))
             .await
-            .map_err(|e| AppError::Internal(format!("file metadata task failed: {e}")))??;
+            .map_err(|e| FileError::Internal(format!("file metadata task failed: {e}")))??;
 
         Ok(result)
     }
 
     // -- File read/write (task 7.4) --
 
-    async fn read_file(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<String>, AppError> {
+    async fn read_file(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<String>, FileError> {
         if has_traversal(path) {
-            return Err(AppError::BadRequest(format!(
+            return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
                 path
             )));
@@ -635,12 +635,12 @@ impl crate::traits::IFileService for FileService {
         let canonical = match validate_path_with_extra_root(path, &roots, extra_root) {
             Ok(c) => c,
             Err(err) => {
-                if matches!(err, AppError::BadRequest(_))
+                if matches!(err, FileError::BadRequest(_))
                     && validate_path_for_write(path, &self.allowed_roots_with_extra(extra_root)).is_ok()
                 {
                     return Ok(None);
                 }
-                if matches!(err, AppError::BadRequest(_)) && self.path_uses_allowed_root(Path::new(path), extra_root) {
+                if matches!(err, FileError::BadRequest(_)) && self.path_uses_allowed_root(Path::new(path), extra_root) {
                     return Ok(None);
                 }
                 return Err(err);
@@ -649,12 +649,12 @@ impl crate::traits::IFileService for FileService {
 
         tokio::task::spawn_blocking(move || read_file_sync(&canonical))
             .await
-            .map_err(|e| AppError::Internal(format!("read file task failed: {e}")))?
+            .map_err(|e| FileError::Internal(format!("read file task failed: {e}")))?
     }
 
-    async fn read_file_buffer(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<Vec<u8>>, AppError> {
+    async fn read_file_buffer(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<Vec<u8>>, FileError> {
         if has_traversal(path) {
-            return Err(AppError::BadRequest(format!(
+            return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
                 path
             )));
@@ -664,12 +664,12 @@ impl crate::traits::IFileService for FileService {
         let canonical = match validate_path_with_extra_root(path, &roots, extra_root) {
             Ok(c) => c,
             Err(err) => {
-                if matches!(err, AppError::BadRequest(_))
+                if matches!(err, FileError::BadRequest(_))
                     && validate_path_for_write(path, &self.allowed_roots_with_extra(extra_root)).is_ok()
                 {
                     return Ok(None);
                 }
-                if matches!(err, AppError::BadRequest(_)) && self.path_uses_allowed_root(Path::new(path), extra_root) {
+                if matches!(err, FileError::BadRequest(_)) && self.path_uses_allowed_root(Path::new(path), extra_root) {
                     return Ok(None);
                 }
                 return Err(err);
@@ -678,12 +678,12 @@ impl crate::traits::IFileService for FileService {
 
         tokio::task::spawn_blocking(move || read_file_buffer_sync(&canonical))
             .await
-            .map_err(|e| AppError::Internal(format!("read file buffer task failed: {e}")))?
+            .map_err(|e| FileError::Internal(format!("read file buffer task failed: {e}")))?
     }
 
-    async fn write_file(&self, path: &str, data: &[u8], workspace: &str) -> Result<bool, AppError> {
+    async fn write_file(&self, path: &str, data: &[u8], workspace: &str) -> Result<bool, FileError> {
         if has_traversal(path) {
-            return Err(AppError::BadRequest(format!(
+            return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
                 path
             )));
@@ -696,7 +696,7 @@ impl crate::traits::IFileService for FileService {
         let data_owned = data.to_vec();
         tokio::task::spawn_blocking(move || write_file_sync(&path_owned, &data_owned))
             .await
-            .map_err(|e| AppError::Internal(format!("write file task failed: {e}")))??;
+            .map_err(|e| FileError::Internal(format!("write file task failed: {e}")))??;
 
         // Compute relative path from workspace
         let workspace_path = Path::new(workspace);
@@ -733,7 +733,7 @@ impl crate::traits::IFileService for FileService {
         file_paths: &[String],
         workspace: &str,
         source_root: Option<&str>,
-    ) -> Result<CopyResult, AppError> {
+    ) -> Result<CopyResult, FileError> {
         let roots = self.allowed_roots_refs();
         let ws_canonical = validate_path(workspace, &roots)?;
 
@@ -780,12 +780,12 @@ impl crate::traits::IFileService for FileService {
             })
         })
         .await
-        .map_err(|e| AppError::Internal(format!("copy task failed: {e}")))?
+        .map_err(|e| FileError::Internal(format!("copy task failed: {e}")))?
     }
 
-    async fn remove_entry(&self, path: &str, workspace: &str) -> Result<(), AppError> {
+    async fn remove_entry(&self, path: &str, workspace: &str) -> Result<(), FileError> {
         if has_traversal(path) {
-            return Err(AppError::BadRequest(format!(
+            return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
                 path
             )));
@@ -797,7 +797,7 @@ impl crate::traits::IFileService for FileService {
         let path_owned = canonical.clone();
         tokio::task::spawn_blocking(move || remove_entry_sync(&path_owned))
             .await
-            .map_err(|e| AppError::Internal(format!("remove entry task failed: {e}")))??;
+            .map_err(|e| FileError::Internal(format!("remove entry task failed: {e}")))??;
 
         // Compute relative path from workspace
         let workspace_path = Path::new(workspace);
@@ -827,16 +827,16 @@ impl crate::traits::IFileService for FileService {
         Ok(())
     }
 
-    async fn rename_entry(&self, path: &str, new_name: &str) -> Result<String, AppError> {
+    async fn rename_entry(&self, path: &str, new_name: &str) -> Result<String, FileError> {
         if has_traversal(path) {
-            return Err(AppError::BadRequest(format!(
+            return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
                 path
             )));
         }
 
         if new_name.contains('/') || new_name.contains('\\') {
-            return Err(AppError::BadRequest(format!(
+            return Err(FileError::BadRequest(format!(
                 "new name '{}' must not contain path separators",
                 new_name
             )));
@@ -849,21 +849,21 @@ impl crate::traits::IFileService for FileService {
         let path_owned = canonical;
         let new_path: PathBuf = tokio::task::spawn_blocking(move || rename_entry_sync(&path_owned, &new_name_owned))
             .await
-            .map_err(|e| AppError::Internal(format!("rename entry task failed: {e}")))??;
+            .map_err(|e| FileError::Internal(format!("rename entry task failed: {e}")))??;
 
         Ok(new_path.to_string_lossy().into_owned())
     }
 
-    async fn create_temp_file(&self, file_name: &str) -> Result<String, AppError> {
+    async fn create_temp_file(&self, file_name: &str) -> Result<String, FileError> {
         if has_traversal(file_name) {
-            return Err(AppError::BadRequest(format!(
+            return Err(FileError::BadRequest(format!(
                 "file name '{}' contains invalid traversal patterns",
                 file_name
             )));
         }
 
         if file_name.contains('/') || file_name.contains('\\') {
-            return Err(AppError::BadRequest(format!(
+            return Err(FileError::BadRequest(format!(
                 "file name '{}' must not contain path separators",
                 file_name
             )));
@@ -874,16 +874,16 @@ impl crate::traits::IFileService for FileService {
         tokio::task::spawn_blocking(move || {
             let tmp_dir = std::env::temp_dir().join("aionui");
             std::fs::create_dir_all(&tmp_dir)
-                .map_err(|e| AppError::Internal(format!("cannot create temp directory: {e}")))?;
+                .map_err(|e| FileError::Internal(format!("cannot create temp directory: {e}")))?;
 
             let file_path = tmp_dir.join(&name);
             std::fs::File::create(&file_path)
-                .map_err(|e| AppError::Internal(format!("cannot create temp file '{}': {e}", file_path.display())))?;
+                .map_err(|e| FileError::Internal(format!("cannot create temp file '{}': {e}", file_path.display())))?;
 
             Ok(file_path.to_string_lossy().into_owned())
         })
         .await
-        .map_err(|e| AppError::Internal(format!("create temp file task failed: {e}")))?
+        .map_err(|e| FileError::Internal(format!("create temp file task failed: {e}")))?
     }
 
     async fn create_upload_file(
@@ -891,18 +891,18 @@ impl crate::traits::IFileService for FileService {
         file_name: &str,
         data: &[u8],
         conversation_id: Option<&str>,
-    ) -> Result<String, AppError> {
+    ) -> Result<String, FileError> {
         if file_name.is_empty() {
-            return Err(AppError::BadRequest("file name must not be empty".to_owned()));
+            return Err(FileError::BadRequest("file name must not be empty".to_owned()));
         }
         if has_traversal(file_name) {
-            return Err(AppError::BadRequest(format!(
+            return Err(FileError::BadRequest(format!(
                 "file name '{}' contains invalid traversal patterns",
                 file_name
             )));
         }
         if file_name.contains('/') || file_name.contains('\\') {
-            return Err(AppError::BadRequest(format!(
+            return Err(FileError::BadRequest(format!(
                 "file name '{}' must not contain path separators",
                 file_name
             )));
@@ -912,7 +912,7 @@ impl crate::traits::IFileService for FileService {
         let conv_id = match conversation_id {
             Some(id) if !id.is_empty() => {
                 if has_traversal(id) || id.contains('/') || id.contains('\\') {
-                    return Err(AppError::BadRequest(format!(
+                    return Err(FileError::BadRequest(format!(
                         "conversation id '{}' contains invalid characters",
                         id
                     )));
@@ -933,7 +933,7 @@ impl crate::traits::IFileService for FileService {
                 dir = dir.join("general");
             }
             std::fs::create_dir_all(&dir)
-                .map_err(|e| AppError::Internal(format!("cannot create upload directory: {e}")))?;
+                .map_err(|e| FileError::Internal(format!("cannot create upload directory: {e}")))?;
 
             let (base, ext) = split_base_ext(&name);
             let mut candidate = name.clone();
@@ -947,13 +947,13 @@ impl crate::traits::IFileService for FileService {
                 {
                     Ok(mut f) => {
                         f.write_all(&bytes).map_err(|e| {
-                            AppError::Internal(format!("cannot write upload file '{}': {e}", file_path.display()))
+                            FileError::Internal(format!("cannot write upload file '{}': {e}", file_path.display()))
                         })?;
                         return Ok(file_path.to_string_lossy().into_owned());
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         if counter > 1000 {
-                            return Err(AppError::Internal(format!(
+                            return Err(FileError::Internal(format!(
                                 "too many name collisions for upload file '{}'",
                                 name
                             )));
@@ -962,7 +962,7 @@ impl crate::traits::IFileService for FileService {
                         counter += 1;
                     }
                     Err(e) => {
-                        return Err(AppError::Internal(format!(
+                        return Err(FileError::Internal(format!(
                             "cannot write upload file '{}': {e}",
                             file_path.display()
                         )));
@@ -971,12 +971,12 @@ impl crate::traits::IFileService for FileService {
             }
         })
         .await
-        .map_err(|e| AppError::Internal(format!("create upload file task failed: {e}")))?
+        .map_err(|e| FileError::Internal(format!("create upload file task failed: {e}")))?
     }
 
-    async fn get_image_base64(&self, path: &str, extra_root: Option<&Path>) -> Result<String, AppError> {
+    async fn get_image_base64(&self, path: &str, extra_root: Option<&Path>) -> Result<String, FileError> {
         if has_traversal(path) {
-            return Err(AppError::BadRequest(format!(
+            return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
                 path
             )));
@@ -987,7 +987,7 @@ impl crate::traits::IFileService for FileService {
 
         tokio::task::spawn_blocking(move || get_image_base64_sync(&canonical))
             .await
-            .map_err(|e| AppError::Internal(format!("image base64 task failed: {e}")))?
+            .map_err(|e| FileError::Internal(format!("image base64 task failed: {e}")))?
     }
 
     async fn fetch_remote_image(&self, url: &str) -> String {
@@ -1069,7 +1069,7 @@ impl crate::traits::IFileService for FileService {
         path: &str,
         entries: Vec<ZipEntry>,
         request_id: Option<String>,
-    ) -> Result<bool, AppError> {
+    ) -> Result<bool, FileError> {
         // Validate output path is within the sandbox
         let roots = self.allowed_roots_refs();
         let output = validate_path_for_write(path, &roots)?;
@@ -1089,7 +1089,7 @@ impl crate::traits::IFileService for FileService {
 
         let result = tokio::task::spawn_blocking(move || create_zip_sync(&output, &entries, &cancelled))
             .await
-            .map_err(|e| AppError::Internal(format!("ZIP creation task failed: {e}")))??;
+            .map_err(|e| FileError::Internal(format!("ZIP creation task failed: {e}")))??;
 
         // Clean up cancellation token after task completes
         if let Some(ref id) = request_id {
@@ -1345,7 +1345,7 @@ mod tests {
         fs::create_dir(&folder).unwrap();
 
         let err = read_file_sync(&folder).unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(matches!(err, FileError::BadRequest(_)));
         assert!(err.to_string().contains("is a directory"));
     }
 
@@ -1911,9 +1911,9 @@ mod tests {
         use crate::traits::IFileService;
         let svc = make_service();
         let result = svc.create_upload_file("nested/file.png", b"x", None).await;
-        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        assert!(matches!(result, Err(FileError::BadRequest(_))));
         let result = svc.create_upload_file("nested\\file.png", b"x", None).await;
-        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        assert!(matches!(result, Err(FileError::BadRequest(_))));
     }
 
     #[tokio::test]
@@ -1921,7 +1921,7 @@ mod tests {
         use crate::traits::IFileService;
         let svc = make_service();
         let result = svc.create_upload_file("..", b"x", None).await;
-        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        assert!(matches!(result, Err(FileError::BadRequest(_))));
     }
 
     #[tokio::test]
@@ -1929,7 +1929,7 @@ mod tests {
         use crate::traits::IFileService;
         let svc = make_service();
         let result = svc.create_upload_file("", b"x", None).await;
-        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        assert!(matches!(result, Err(FileError::BadRequest(_))));
     }
 
     #[tokio::test]
@@ -1937,9 +1937,9 @@ mod tests {
         use crate::traits::IFileService;
         let svc = make_service();
         let result = svc.create_upload_file("good.png", b"x", Some("../escape")).await;
-        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        assert!(matches!(result, Err(FileError::BadRequest(_))));
         let result = svc.create_upload_file("good.png", b"x", Some("nested/id")).await;
-        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        assert!(matches!(result, Err(FileError::BadRequest(_))));
     }
 
     // ---- name collision behaviour -----------------------------------------

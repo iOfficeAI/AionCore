@@ -35,6 +35,7 @@ use crate::convert::{
     TOOL_CONTENT_COMPACT_THRESHOLD_BYTES, row_to_artifact_response, row_to_message_response,
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
+use crate::error::ConversationError;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::stream_relay::StreamRelay;
@@ -93,7 +94,7 @@ pub struct ConversationService {
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
     task_manager: Arc<dyn IWorkerTaskManager>,
-    /// Hooks invoked at the end of `delete()` so other services
+    /// Hooks invoked during `delete()` before the DB row is removed so other services
     /// (`WorkerTaskManagerImpl`, `CronService`, …) can clean up their
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
     /// can happen post-construction without breaking the `Clone` impl —
@@ -157,8 +158,8 @@ impl ConversationService {
 
     /// Register a hook to be notified when a conversation is deleted.
     ///
-    /// Hooks are dispatched sequentially in registration order from
-    /// `delete()`. Used by `aionui-app` to wire up `WorkerTaskManagerImpl`
+    /// Hooks are dispatched sequentially in registration order before
+    /// `delete()` removes the conversation row. Used by `aionui-app` to wire up `WorkerTaskManagerImpl`
     /// (kill the agent process) and `CronService` (cascade-delete cron jobs).
     pub fn with_delete_hook(&self, hook: Arc<dyn OnConversationDelete>) {
         if let Ok(mut guard) = self.delete_hooks.write() {
@@ -192,10 +193,12 @@ impl ConversationService {
         self.runtime_state.clone()
     }
 
-    pub(crate) fn task(&self, conversation_id: &str) -> Result<AgentInstance, AppError> {
+    pub(crate) fn task(&self, conversation_id: &str) -> Result<AgentInstance, ConversationError> {
         self.task_manager
             .get_task(conversation_id)
-            .ok_or_else(|| AppError::NotFound(format!("No active agent for conversation '{conversation_id}'")))
+            .ok_or_else(|| ConversationError::ActiveAgentNotFound {
+                conversation_id: conversation_id.to_owned(),
+            })
     }
 
     pub async fn runtime_summary_for(&self, conversation_id: &str) -> ConversationRuntimeSummary {
@@ -209,6 +212,14 @@ impl ConversationService {
     }
 
     pub async fn complete_turn(&self, conversation_id: &str) {
+        if self.runtime_state.is_deleting(conversation_id) {
+            debug!(
+                conversation_id,
+                "Skipping turn completion because conversation is deleting"
+            );
+            return;
+        }
+
         let runtime = self.runtime_summary_for(conversation_id).await;
         StreamRelay::complete_conversation_with_runtime(
             &self.conversation_repo,
@@ -217,6 +228,18 @@ impl ConversationService {
             Some(runtime),
         )
         .await;
+    }
+
+    async fn complete_released_turn(&self, conversation_id: &str, was_deleting: bool) {
+        if was_deleting {
+            debug!(
+                conversation_id,
+                "Skipping turn completion because conversation was deleting at claim release"
+            );
+            return;
+        }
+
+        self.complete_turn(conversation_id).await;
     }
 }
 
@@ -232,7 +255,7 @@ impl ConversationService {
         &self,
         user_id: &str,
         req: CreateConversationRequest,
-    ) -> Result<ConversationResponse, AppError> {
+    ) -> Result<ConversationResponse, ConversationError> {
         let id = generate_short_id();
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
@@ -242,10 +265,12 @@ impl ConversationService {
         // clients that still ship the legacy shape get a loud 400 instead of
         // a silent write to a column nobody reads.
         if req.r#type != AgentType::Aionrs && req.model.is_some() {
-            return Err(AppError::BadRequest(format!(
-                "top-level `model` is only accepted for aionrs conversations; pass model via `extra` for {}",
-                req.r#type.serde_name()
-            )));
+            return Err(ConversationError::BadRequest {
+                reason: format!(
+                    "top-level `model` is only accepted for aionrs conversations; pass model via `extra` for {}",
+                    req.r#type.serde_name()
+                ),
+            });
         }
 
         let mut extra = req.extra;
@@ -375,10 +400,11 @@ impl ConversationService {
         };
         let selected_session_mcp_servers = match extra.as_object_mut() {
             Some(obj) => match obj.remove("selected_session_mcp_servers") {
-                Some(value) => Some(
-                    serde_json::from_value::<Vec<SessionMcpServer>>(value)
-                        .map_err(|e| AppError::BadRequest(format!("Invalid selected_session_mcp_servers: {e}")))?,
-                ),
+                Some(value) => Some(serde_json::from_value::<Vec<SessionMcpServer>>(value).map_err(|e| {
+                    ConversationError::BadRequest {
+                        reason: format!("Invalid selected_session_mcp_servers: {e}"),
+                    }
+                })?),
                 None => None,
             },
             None => None,
@@ -577,13 +603,13 @@ impl ConversationService {
     /// Returns `NotFound` if the conversation does not exist or does not
     /// belong to the given user (avoids leaking existence to other users).
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
-    pub async fn get(&self, user_id: &str, id: &str) -> Result<ConversationResponse, AppError> {
+    pub async fn get(&self, user_id: &str, id: &str) -> Result<ConversationResponse, ConversationError> {
         let row = self
             .conversation_repo
             .get(id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let mut extra: serde_json::Value =
             serde_json::from_str(&row.extra).map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
@@ -599,7 +625,7 @@ impl ConversationService {
         &self,
         user_id: &str,
         query: ListConversationsQuery,
-    ) -> Result<ConversationListResponse, AppError> {
+    ) -> Result<ConversationListResponse, ConversationError> {
         let filters = ConversationFilters {
             cursor: query.cursor,
             limit: query.limit.unwrap_or(0),
@@ -658,13 +684,13 @@ impl ConversationService {
         id: &str,
         req: UpdateConversationRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<ConversationResponse, AppError> {
+    ) -> Result<ConversationResponse, ConversationError> {
         let existing = self
             .conversation_repo
             .get(id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         // Snapshot invariant: once written at create time, `extra.skills`
         // must not be re-shaped by PATCH. The frontend must clone the
@@ -676,9 +702,9 @@ impl ConversationService {
                 || incoming.get("mcp_statuses").is_some()
                 || incoming.get("session_mcp_servers").is_some())
         {
-            return Err(AppError::BadRequest(
-                "extra.skills and MCP snapshots are immutable post-creation".into(),
-            ));
+            return Err(ConversationError::BadRequest {
+                reason: "extra.skills and MCP snapshots are immutable post-creation".into(),
+            });
         }
 
         // Type-aware rule: top-level `model` is aionrs-only. For non-aionrs
@@ -686,10 +712,12 @@ impl ConversationService {
         // 2026-05-12).
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
         if existing_type != AgentType::Aionrs && req.model.is_some() {
-            return Err(AppError::BadRequest(format!(
-                "top-level `model` is only accepted for aionrs conversations; pass model via `extra` for {}",
-                existing.r#type
-            )));
+            return Err(ConversationError::BadRequest {
+                reason: format!(
+                    "top-level `model` is only accepted for aionrs conversations; pass model via `extra` for {}",
+                    existing.r#type
+                ),
+            });
         }
 
         let now = now_ms();
@@ -778,12 +806,14 @@ impl ConversationService {
     /// `team_mcp_stdio_config`) where a full `update()` would kill the agent
     /// on a spurious model comparison.
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
-    pub async fn update_extra(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), AppError> {
-        let existing = self
-            .conversation_repo
-            .get(conversation_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+    pub async fn update_extra(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), ConversationError> {
+        let existing =
+            self.conversation_repo
+                .get(conversation_id)
+                .await?
+                .ok_or_else(|| ConversationError::NotFound {
+                    id: conversation_id.to_owned(),
+                })?;
 
         let mut merged: serde_json::Value =
             serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
@@ -805,7 +835,7 @@ impl ConversationService {
         Ok(())
     }
 
-    pub async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), AppError> {
+    pub async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), ConversationError> {
         let params = SaveRuntimeStateParams {
             current_mode_id: Some(Some(mode)),
             ..Default::default()
@@ -821,30 +851,21 @@ impl ConversationService {
     ///
     /// Broadcasts `conversation.listChanged(deleted)`.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
-    pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), AppError> {
+    pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
         // Get existing to retrieve source for broadcast and verify ownership
         let existing = self
             .conversation_repo
             .get(id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let source: Option<ConversationSource> = existing
             .source
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
 
-        self.conversation_repo.delete(id).await?;
-        // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
-        // conversations that used to be ACP (shouldn't happen but is
-        // cheap to cover) still drop their orphaned session row.
-        if let Err(err) = self.acp_session_repo.delete(id).await {
-            warn!(
-                error = %ErrorChain(&err),
-                "Failed to delete acp_session row on conversation delete"
-            );
-        }
+        let had_active_turn = self.runtime_state.mark_deleting(id);
 
         // Snapshot the hook list under the read lock, then drop the guard
         // before awaiting — `RwLockReadGuard` is not `Send`, so holding it
@@ -853,6 +874,23 @@ impl ConversationService {
             self.delete_hooks.read().map(|guard| guard.clone()).unwrap_or_default();
         for hook in hooks {
             hook.on_conversation_deleted(id).await;
+        }
+
+        if let Err(err) = self.conversation_repo.delete(id).await {
+            self.runtime_state.clear_deleting(id);
+            return Err(err.into());
+        }
+        if !had_active_turn {
+            self.runtime_state.clear_deleting(id);
+        }
+        // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
+        // conversations that used to be ACP (shouldn't happen but is
+        // cheap to cover) still drop their orphaned session row.
+        if let Err(err) = self.acp_session_repo.delete(id).await {
+            warn!(
+                error = %ErrorChain(&err),
+                "Failed to delete acp_session row on conversation delete"
+            );
         }
 
         info!("Conversation deleted");
@@ -873,19 +911,19 @@ impl ConversationService {
         &self,
         user_id: &str,
         req: CloneConversationRequest,
-    ) -> Result<ConversationResponse, AppError> {
+    ) -> Result<ConversationResponse, ConversationError> {
         self.create(user_id, req.conversation).await
     }
 
     /// Reset a conversation: clear messages and set status back to pending.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
-    pub async fn reset(&self, user_id: &str, id: &str) -> Result<(), AppError> {
+    pub async fn reset(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
         // Verify existence and ownership
         self.conversation_repo
             .get(id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         // Delete all messages
         self.conversation_repo.delete_messages_by_conversation(id).await?;
@@ -905,11 +943,22 @@ impl ConversationService {
     }
 
     /// List conversations associated by the same workspace.
-    pub async fn list_associated(&self, user_id: &str, id: &str) -> Result<Vec<ConversationResponse>, AppError> {
+    pub async fn list_associated(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<Vec<ConversationResponse>, ConversationError> {
+        self.conversation_repo
+            .get(id)
+            .await?
+            .filter(|r| r.user_id == user_id)
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+
         let rows = self.conversation_repo.list_associated(user_id, id).await?;
         rows.into_iter()
             .map(|row| row_to_response(row, &self.workspace_root))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ConversationError::from)
     }
 
     /// List conversations spawned by a specific cron job.
@@ -917,11 +966,12 @@ impl ConversationService {
         &self,
         user_id: &str,
         cron_job_id: &str,
-    ) -> Result<Vec<ConversationResponse>, AppError> {
+    ) -> Result<Vec<ConversationResponse>, ConversationError> {
         let rows = self.conversation_repo.list_by_cron_job(user_id, cron_job_id).await?;
         rows.into_iter()
             .map(|row| row_to_response(row, &self.workspace_root))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ConversationError::from)
     }
 }
 
@@ -934,13 +984,15 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         query: ListMessagesQuery,
-    ) -> Result<MessageListResponse, AppError> {
+    ) -> Result<MessageListResponse, ConversationError> {
         // Verify conversation exists and belongs to user
         self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let page = query.page.unwrap_or(1);
         let page_size = query.page_size.unwrap_or(50);
@@ -1011,18 +1063,22 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         message_id: &str,
-    ) -> Result<MessageResponse, AppError> {
+    ) -> Result<MessageResponse, ConversationError> {
         self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let row = self
             .conversation_repo
             .get_message(conversation_id, message_id)
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("Message {message_id} not found")))?;
+            .ok_or_else(|| ConversationError::MessageNotFound {
+                id: message_id.to_owned(),
+            })?;
 
         let content_bytes = row.content.len();
         let response = row_to_message_response(row)?;
@@ -1044,12 +1100,14 @@ impl ConversationService {
         &self,
         user_id: &str,
         conversation_id: &str,
-    ) -> Result<ConversationArtifactListResponse, AppError> {
+    ) -> Result<ConversationArtifactListResponse, ConversationError> {
         self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let mut items = self
             .conversation_repo
@@ -1084,12 +1142,14 @@ impl ConversationService {
         conversation_id: &str,
         artifact_id: &str,
         req: UpdateConversationArtifactRequest,
-    ) -> Result<ConversationArtifactResponse, AppError> {
+    ) -> Result<ConversationArtifactResponse, ConversationError> {
         self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let status = serde_json::to_value(req.status)
             .ok()
@@ -1100,7 +1160,9 @@ impl ConversationService {
             .conversation_repo
             .update_artifact_status(conversation_id, artifact_id, &status, now_ms())
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("Artifact {artifact_id} not found")))?;
+            .ok_or_else(|| ConversationError::ArtifactNotFound {
+                id: artifact_id.to_owned(),
+            })?;
 
         let response = row_to_artifact_response(row)?;
         self.broadcaster.broadcast(WebSocketMessage::new(
@@ -1117,9 +1179,11 @@ impl ConversationService {
         &self,
         user_id: &str,
         query: SearchMessagesQuery,
-    ) -> Result<MessageSearchResponse, AppError> {
+    ) -> Result<MessageSearchResponse, ConversationError> {
         if query.keyword.trim().is_empty() {
-            return Err(AppError::BadRequest("keyword must not be empty".into()));
+            return Err(ConversationError::BadRequest {
+                reason: "keyword must not be empty".into(),
+            });
         }
 
         let page = query.page.unwrap_or(1);
@@ -1153,12 +1217,14 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<ConfirmationListResponse, AppError> {
+    ) -> Result<ConfirmationListResponse, ConversationError> {
         self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let agent = match task_manager.get_task(conversation_id) {
             Some(a) => a,
@@ -1179,16 +1245,20 @@ impl ConversationService {
         call_id: &str,
         req: ConfirmRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), ConversationError> {
         self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let agent = task_manager
             .get_task(conversation_id)
-            .ok_or_else(|| AppError::NotFound("No active agent for this conversation".into()))?;
+            .ok_or_else(|| ConversationError::ActiveAgentNotFound {
+                conversation_id: conversation_id.to_owned(),
+            })?;
 
         let confirmations = agent.get_confirmations();
         let conf_id = confirmations
@@ -1218,12 +1288,14 @@ impl ConversationService {
         action: &str,
         command_type: Option<&str>,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<ApprovalCheckResponse, AppError> {
+    ) -> Result<ApprovalCheckResponse, ConversationError> {
         self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let approved = task_manager
             .get_task(conversation_id)
@@ -1250,9 +1322,11 @@ impl ConversationService {
         conversation_id: &str,
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<String, AppError> {
+    ) -> Result<String, ConversationError> {
         if req.content.trim().is_empty() {
-            return Err(AppError::BadRequest("Message content must not be empty".into()));
+            return Err(ConversationError::BadRequest {
+                reason: "Message content must not be empty".into(),
+            });
         }
         let send_started_at = now_ms();
 
@@ -1262,7 +1336,9 @@ impl ConversationService {
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         // Short-circuit for legacy Gemini conversations: the dedicated Gemini
         // runtime has been removed, so we cannot build an agent for this row.
@@ -1271,11 +1347,12 @@ impl ConversationService {
         // deserialize. The client identifies this case by `code` and renders
         // a dedicated archived-conversation UI rather than a generic banner.
         if row.r#type == "gemini" {
-            return Err(AppError::ConversationArchived(
-                "This conversation was created with the legacy Gemini runtime, which has been \
-                 removed. Please start a new conversation with the Gemini ACP backend to continue."
+            return Err(ConversationError::Archived {
+                id: conversation_id.to_owned(),
+                reason: "This conversation was created with the legacy Gemini runtime, which has been \
+                         removed. Please start a new conversation with the Gemini ACP backend to continue."
                     .into(),
-            ));
+            });
         }
 
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id)?;
@@ -1326,7 +1403,7 @@ impl ConversationService {
                     "Failed to build task options for message send"
                 );
                 let _ = self.persist_send_failure_tip(conversation_id, &err).await;
-                return Err(err);
+                return Err(err.into());
             }
         };
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
@@ -1336,6 +1413,7 @@ impl ConversationService {
         let repo = Arc::clone(&self.conversation_repo);
         let broadcaster = Arc::clone(&self.broadcaster);
         let cron_service = self.current_cron_service();
+        let runtime_state = self.runtime_state();
         let user_id_owned = user_id.to_owned();
         let service = self.clone();
         let task_manager = Arc::clone(task_manager);
@@ -1361,9 +1439,16 @@ impl ConversationService {
                         error = %ErrorChain(&err),
                         "Agent task build failed"
                     );
-                    service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
-                    turn_claim.release();
-                    service.complete_turn(&conv_id).await;
+                    if service.runtime_state.is_deleting(&conv_id) {
+                        debug!(
+                            conversation_id = %conv_id,
+                            "Skipping send failure persistence because conversation is deleting"
+                        );
+                    } else {
+                        service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
+                    }
+                    let was_deleting = turn_claim.release();
+                    service.complete_released_turn(&conv_id, was_deleting).await;
                     return;
                 }
             };
@@ -1380,9 +1465,16 @@ impl ConversationService {
                     error = %ErrorChain(&err),
                     "Failed to persist resolved workspace"
                 );
-                service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
-                turn_claim.release();
-                service.complete_turn(&conv_id).await;
+                if service.runtime_state.is_deleting(&conv_id) {
+                    debug!(
+                        conversation_id = %conv_id,
+                        "Skipping workspace failure persistence because conversation is deleting"
+                    );
+                } else {
+                    service.persist_and_broadcast_send_failure_tip(&conv_id, &err).await;
+                }
+                let was_deleting = turn_claim.release();
+                service.complete_released_turn(&conv_id, was_deleting).await;
                 return;
             }
 
@@ -1423,6 +1515,7 @@ impl ConversationService {
                     Arc::clone(&broadcaster),
                     cron_service.clone(),
                 )
+                .with_runtime_state(Arc::clone(&runtime_state))
                 .with_turn_completion(false);
 
                 let rx = agent.subscribe();
@@ -1432,12 +1525,43 @@ impl ConversationService {
                 // 1. Send the message to the agent and concurrently run the relay to stream events.
                 tokio::spawn(async move {
                     if let Err(e) = send_agent.send_message(current_send).await {
-                        error!(conversation_id = %conv_id_send, error = %ErrorChain(&e), "Agent send_message failed");
-                        let _ = send_error_tx.send(e);
+                        let task_status = send_agent.status();
+                        let agent_type = send_agent.agent_type();
+                        error!(
+                            conversation_id = %conv_id_send,
+                            ?agent_type,
+                            ?task_status,
+                            error = %ErrorChain(&e),
+                            "Agent send_message failed"
+                        );
+                        if task_status == Some(ConversationStatus::Finished) {
+                            debug!(
+                                conversation_id = %conv_id_send,
+                                ?agent_type,
+                                "Agent send_message failure already published runtime terminal; skipping fallback stream error"
+                            );
+                        } else {
+                            warn!(
+                                conversation_id = %conv_id_send,
+                                ?agent_type,
+                                code = ?e.code(),
+                                ownership = ?e.ownership(),
+                                "Agent send_message returned error without runtime terminal; injecting fallback stream error"
+                            );
+                            let _ = send_error_tx.send(e);
+                        }
                     }
                 });
                 // 2. Wait for the agent to process the message and complete the turn, while the relay streams events in real time.
                 let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
+
+                if runtime_state.is_deleting(&conv_id) {
+                    debug!(
+                        conversation_id = %conv_id,
+                        "Skipping post-terminal persistence because conversation is deleting"
+                    );
+                    break;
+                }
 
                 if let Some(session_key) = agent.get_session_key() {
                     persist_session_key(&repo, &conv_id, &session_key).await;
@@ -1466,8 +1590,8 @@ impl ConversationService {
                 ));
             }
 
-            turn_claim.release();
-            service.complete_turn(&conv_id).await;
+            let was_deleting = turn_claim.release();
+            service.complete_released_turn(&conv_id, was_deleting).await;
         });
 
         info!(
@@ -1508,7 +1632,7 @@ impl ConversationService {
     /// Used by paths outside the normal user→agent turn (e.g. the team
     /// scheduler writing an incoming teammate message as a left bubble in the
     /// target agent's conversation so the UI shows who spoke).
-    pub async fn insert_raw_message(&self, row: &MessageRow) -> Result<(), AppError> {
+    pub async fn insert_raw_message(&self, row: &MessageRow) -> Result<(), ConversationError> {
         self.conversation_repo.insert_message(row).await?;
 
         let msg_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
@@ -1536,13 +1660,15 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), ConversationError> {
         // Verify conversation exists and belongs to user
         self.conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let Some(agent) = task_manager.get_task(conversation_id) else {
             info!("No active agent to cancel; treating as idempotent success");
@@ -1551,7 +1677,7 @@ impl ConversationService {
 
         if let Err(e) = agent.cancel().await {
             warn!(error = %ErrorChain(&e), "Failed to cancel agent");
-            return Err(e);
+            return Err(e.into());
         }
 
         info!("Stream canceled");
@@ -1568,13 +1694,15 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), ConversationError> {
         let row = self
             .conversation_repo
             .get(conversation_id)
             .await?
             .filter(|r| r.user_id == user_id)
-            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
 
         let build_opts = self.build_task_options(&row)?;
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;

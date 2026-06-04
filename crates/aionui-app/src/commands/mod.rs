@@ -11,6 +11,6 @@ mod team_stdio;
 
 pub use bridge::run_mcp_bridge;
 pub use doctor::run_doctor;
-pub use server::run_server;
+pub(crate) use server::{bind_http_listener, run_server};
 pub use team_guide::run_team_guide;
 pub use team_stdio::run_team_stdio;
