@@ -60,13 +60,29 @@ fn derive_models_from_config_options(
                 // are treated as having no model entries.
                 _ => Vec::new(),
             };
-            if available.is_empty() {
-                return None;
+            if !available.is_empty() {
+                return Some(SessionModelState::new(current_model_id, available));
             }
-            return Some(SessionModelState::new(current_model_id, available));
         }
     }
     None
+}
+
+/// Apply advertised models to the session, preferring the dedicated
+/// `models` field and falling back to `configOptions` (category
+/// "model") when absent.
+fn apply_advertised_models(
+    session: &mut crate::manager::acp::session::AcpSession,
+    models: Option<SessionModelState>,
+    config_options: Option<&[agent_client_protocol::schema::SessionConfigOption]>,
+) {
+    if let Some(models) = models {
+        session.apply_advertised_models(models);
+    } else if let Some(config_options) = config_options
+        && let Some(models) = derive_models_from_config_options(config_options)
+    {
+        session.apply_advertised_models(models);
+    }
 }
 
 impl AcpAgentManager {
@@ -83,16 +99,11 @@ impl AcpAgentManager {
 
         {
             let mut session = self.session.write().await;
-            if let Some(models) = session_response.models {
-                session.apply_advertised_models(models);
-            } else if let Some(ref config_options) = session_response.config_options {
-                // `configOptions` with category "model" is the ACP-recommended
-                // way to advertise models; fall back to it when `models` is
-                // absent (e.g. OpenCode).
-                if let Some(models) = derive_models_from_config_options(config_options) {
-                    session.apply_advertised_models(models);
-                }
-            }
+            apply_advertised_models(
+                &mut session,
+                session_response.models,
+                session_response.config_options.as_deref(),
+            );
             if let Some(modes) = session_response.modes {
                 session.apply_advertised_modes(modes);
             }
@@ -183,13 +194,11 @@ impl AcpAgentManager {
 
             {
                 let mut session = self.session.write().await;
-                if let Some(models) = new_response.models {
-                    session.apply_advertised_models(models);
-                } else if let Some(ref config_options) = new_response.config_options {
-                    if let Some(models) = derive_models_from_config_options(config_options) {
-                        session.apply_advertised_models(models);
-                    }
-                }
+                apply_advertised_models(
+                    &mut session,
+                    new_response.models,
+                    new_response.config_options.as_deref(),
+                );
                 if let Some(modes) = new_response.modes {
                     session.apply_advertised_modes(modes);
                 }
@@ -240,13 +249,11 @@ impl AcpAgentManager {
 
             {
                 let mut session = self.session.write().await;
-                if let Some(models) = load_response.models {
-                    session.apply_advertised_models(models);
-                } else if let Some(ref config_options) = load_response.config_options {
-                    if let Some(models) = derive_models_from_config_options(config_options) {
-                        session.apply_advertised_models(models);
-                    }
-                }
+                apply_advertised_models(
+                    &mut session,
+                    load_response.models,
+                    load_response.config_options.as_deref(),
+                );
                 if let Some(mut modes) = load_response.modes {
                     if let Some(db_current) = preloaded_mode {
                         modes.current_mode_id = db_current.into();
