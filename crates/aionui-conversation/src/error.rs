@@ -1,5 +1,5 @@
 use aionui_ai_agent::AcpError;
-use aionui_common::AppError;
+use aionui_common::ApiError;
 use aionui_db::DbError;
 
 /// Application-level error contract for the conversation domain.
@@ -33,27 +33,77 @@ pub enum ConversationError {
     #[error("Forbidden: {reason}")]
     Forbidden { reason: String },
 
+    #[error("Not found: {reason}")]
+    NotFoundReason { reason: String },
+
+    #[error("Unauthorized: {reason}")]
+    Unauthorized { reason: String },
+
+    #[error("Rate limited")]
+    RateLimited,
+
+    #[error("Bad gateway: {reason}")]
+    BadGateway { reason: String },
+
+    #[error("Request timeout: {reason}")]
+    Timeout { reason: String },
+
+    #[error("Unprocessable entity: {reason}")]
+    Unprocessable { reason: String },
+
+    #[error("Internal error: {reason}")]
+    Internal { reason: String },
+
+    #[error("Workspace path contains whitespace: {path}")]
+    WorkspacePathContainsWhitespace { path: String },
+
+    #[error("Workspace path contains whitespace and is unsupported at runtime: {path}")]
+    WorkspacePathContainsWhitespaceRuntimeUnsupported { path: String },
+
     #[error("ACP error")]
     Acp(#[from] AcpError),
-
-    #[error("{0}")]
-    App(#[source] AppError),
 }
 
-impl From<AppError> for ConversationError {
-    fn from(error: AppError) -> Self {
+impl From<ApiError> for ConversationError {
+    fn from(error: ApiError) -> Self {
         match error {
-            AppError::BadRequest(reason) => Self::BadRequest { reason },
-            AppError::Conflict(reason) => Self::Busy { reason },
-            AppError::Forbidden(reason) => Self::Forbidden { reason },
-            other => Self::App(other),
+            ApiError::NotFound(reason) => Self::NotFoundReason { reason },
+            ApiError::BadRequest(reason) => Self::BadRequest { reason },
+            ApiError::Unauthorized(reason) => Self::Unauthorized { reason },
+            ApiError::Forbidden(reason) => Self::Forbidden { reason },
+            ApiError::Conflict(reason) => Self::Busy { reason },
+            ApiError::RateLimited => Self::RateLimited,
+            ApiError::Internal(reason) => Self::Internal { reason },
+            ApiError::BadGateway(reason) => Self::BadGateway { reason },
+            ApiError::Timeout(reason) => Self::Timeout { reason },
+            ApiError::UnprocessableEntity(reason) => Self::Unprocessable { reason },
+            ApiError::ConversationArchived(reason) => Self::Archived {
+                id: String::new(),
+                reason,
+            },
+            ApiError::WorkspacePathContainsWhitespace(path) => Self::WorkspacePathContainsWhitespace { path },
+            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => {
+                Self::WorkspacePathContainsWhitespaceRuntimeUnsupported { path }
+            }
         }
     }
 }
 
 impl From<DbError> for ConversationError {
     fn from(error: DbError) -> Self {
-        AppError::from(error).into()
+        match error {
+            DbError::NotFound(reason) => Self::NotFoundReason { reason },
+            DbError::Conflict(reason) => Self::Busy { reason },
+            DbError::Query(e) => Self::Internal {
+                reason: format!("Database error: {e}"),
+            },
+            DbError::Migration(e) => Self::Internal {
+                reason: format!("Migration error: {e}"),
+            },
+            DbError::Init(reason) => Self::Internal {
+                reason: format!("Database init error: {reason}"),
+            },
+        }
     }
 }
 

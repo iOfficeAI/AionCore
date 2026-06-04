@@ -28,7 +28,10 @@ impl From<CronError> for ApiError {
             CronError::InvalidSkillContent(msg) => ApiError::BadRequest(msg),
             CronError::InvalidAgentConfig(msg) => ApiError::BadRequest(msg),
             CronError::Scheduler(msg) => ApiError::Internal(msg),
-            CronError::App(app_err) => app_err,
+            CronError::WorkspacePathContainsWhitespace(path) => ApiError::WorkspacePathContainsWhitespace(path),
+            CronError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => {
+                ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
+            }
             CronError::Conversation(conversation_err) => ApiError::from(conversation_err),
             CronError::Database(db_err) => ApiError::from(db_err),
             CronError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
@@ -225,8 +228,8 @@ mod tests {
     }
 
     #[test]
-    fn app_error_passthrough_preserves_code() {
-        let err: ApiError = CronError::App(ApiError::WorkspacePathContainsWhitespace("/tmp/a b".into())).into();
+    fn workspace_error_preserves_code() {
+        let err: ApiError = CronError::WorkspacePathContainsWhitespace("/tmp/a b".into()).into();
         assert!(matches!(err, ApiError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
     }
 
@@ -238,11 +241,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_workspace_app_error_passthrough_preserves_code() {
-        let err: ApiError = CronError::App(ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
-            "/tmp/a b".into(),
-        ))
-        .into();
+    fn runtime_workspace_error_preserves_code() {
+        let err: ApiError = CronError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/a b".into()).into();
         assert!(matches!(
             err,
             ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(msg) if msg == "/tmp/a b"

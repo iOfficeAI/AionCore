@@ -33,7 +33,10 @@ impl From<TeamError> for ApiError {
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
             TeamError::DuplicateAgentName(msg) => ApiError::BadRequest(format!("Agent name already taken: {msg}")),
-            TeamError::App(app_err) => app_err,
+            TeamError::WorkspacePathContainsWhitespace(path) => ApiError::WorkspacePathContainsWhitespace(path),
+            TeamError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => {
+                ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
+            }
             TeamError::Conversation(conversation_err) => ApiError::from(conversation_err),
             TeamError::Database(db_err) => ApiError::from(db_err),
             TeamError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
@@ -257,8 +260,8 @@ mod tests {
     }
 
     #[test]
-    fn app_error_passthrough_preserves_code() {
-        let err: ApiError = TeamError::App(ApiError::WorkspacePathContainsWhitespace("/tmp/a b".into())).into();
+    fn workspace_error_preserves_code() {
+        let err: ApiError = TeamError::WorkspacePathContainsWhitespace("/tmp/a b".into()).into();
         assert!(matches!(err, ApiError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
     }
 
@@ -270,11 +273,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_workspace_app_error_passthrough_preserves_code() {
-        let err: ApiError = TeamError::App(ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
-            "/tmp/a b".into(),
-        ))
-        .into();
+    fn runtime_workspace_error_preserves_code() {
+        let err: ApiError = TeamError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/a b".into()).into();
         assert!(matches!(
             err,
             ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(msg) if msg == "/tmp/a b"

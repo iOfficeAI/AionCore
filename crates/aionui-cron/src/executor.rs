@@ -6,7 +6,7 @@ use aionui_ai_agent::task_manager::IWorkerTaskManager;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentRegistry, AgentStreamEvent};
 use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
-use aionui_common::{AgentType, AppError, ProviderWithModel, now_ms, workspace_path_has_whitespace_segment};
+use aionui_common::{AgentType, ProviderWithModel, now_ms, workspace_path_has_whitespace_segment};
 use aionui_conversation::ConversationService;
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationRowUpdate, IConversationRepository};
@@ -205,9 +205,7 @@ impl JobExecutor {
         }
 
         if workspace_path_has_whitespace_segment(Path::new(&workspace)) {
-            return Err(CronError::App(
-                AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(workspace),
-            ));
+            return Err(CronError::WorkspacePathContainsWhitespaceRuntimeUnsupported(workspace));
         }
 
         Ok(())

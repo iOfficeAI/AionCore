@@ -30,8 +30,18 @@ impl From<ConversationError> for ApiError {
             ConversationError::BadRequest { reason } => ApiError::BadRequest(reason),
             ConversationError::Busy { reason } => ApiError::Conflict(reason),
             ConversationError::Forbidden { reason } => ApiError::Forbidden(reason),
+            ConversationError::NotFoundReason { reason } => ApiError::NotFound(reason),
+            ConversationError::Unauthorized { reason } => ApiError::Unauthorized(reason),
+            ConversationError::RateLimited => ApiError::RateLimited,
+            ConversationError::BadGateway { reason } => ApiError::BadGateway(reason),
+            ConversationError::Timeout { reason } => ApiError::Timeout(reason),
+            ConversationError::Unprocessable { reason } => ApiError::UnprocessableEntity(reason),
+            ConversationError::Internal { reason } => ApiError::Internal(reason),
+            ConversationError::WorkspacePathContainsWhitespace { path } => ApiError::WorkspacePathContainsWhitespace(path),
+            ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported { path } => {
+                ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
+            }
             ConversationError::Acp(_) => ApiError::BadGateway("Agent protocol error".into()),
-            ConversationError::App(error) => error,
         }
     }
 }
@@ -388,7 +398,7 @@ mod error_mapping_tests {
     }
 
     #[test]
-    fn conversation_app_error_passthrough_preserves_special_codes() {
+    fn conversation_api_error_compat_preserves_special_codes() {
         let app = ApiError::from(ConversationError::from(
             ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/my project".into()),
         ));

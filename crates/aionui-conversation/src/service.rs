@@ -1954,7 +1954,7 @@ fn backfill_cron_job_id_alias(extra: &mut serde_json::Value) -> bool {
     mutated
 }
 
-fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), AppError> {
+fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), ConversationError> {
     let Some(obj) = extra.as_object_mut() else {
         return Ok(());
     };
@@ -1976,31 +1976,35 @@ fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), AppErr
     Ok(())
 }
 
-fn normalize_workspace_path(workspace: &str) -> Result<String, AppError> {
+fn normalize_workspace_path(workspace: &str) -> Result<String, ConversationError> {
     if workspace.trim().is_empty() {
-        return Err(AppError::BadRequest("Workspace directory is empty".into()));
+        return Err(ConversationError::BadRequest {
+            reason: "Workspace directory is empty".into(),
+        });
     }
 
     let workspace_path = PathBuf::from(workspace);
     if workspace_path_has_whitespace_segment(&workspace_path) {
-        return Err(AppError::WorkspacePathContainsWhitespace(
-            workspace_path.display().to_string(),
-        ));
+        return Err(ConversationError::WorkspacePathContainsWhitespace {
+            path: workspace_path.display().to_string(),
+        });
     }
 
     Ok(workspace.to_owned())
 }
 
-fn validate_runtime_workspace_path(workspace: &str) -> Result<String, AppError> {
+fn validate_runtime_workspace_path(workspace: &str) -> Result<String, ConversationError> {
     if workspace.trim().is_empty() {
-        return Err(AppError::BadRequest("Workspace directory is empty".into()));
+        return Err(ConversationError::BadRequest {
+            reason: "Workspace directory is empty".into(),
+        });
     }
 
     let workspace_path = PathBuf::from(workspace);
     if workspace_path_has_whitespace_segment(&workspace_path) {
-        return Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
-            workspace_path.display().to_string(),
-        ));
+        return Err(ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported {
+            path: workspace_path.display().to_string(),
+        });
     }
 
     Ok(workspace.to_owned())

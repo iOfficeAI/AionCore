@@ -41,6 +41,30 @@ pub struct ChannelRouterState {
     pub extension_registry: ExtensionRegistry,
 }
 
+impl From<ChannelError> for ApiError {
+    fn from(err: ChannelError) -> Self {
+        match err {
+            ChannelError::PluginNotFound(msg) => ApiError::NotFound(msg),
+            ChannelError::InvalidPluginType(msg) => ApiError::BadRequest(msg),
+            ChannelError::PluginAlreadyRunning(msg) => ApiError::Conflict(msg),
+            ChannelError::InvalidConfig(msg) => ApiError::BadRequest(msg),
+            ChannelError::ConnectionFailed(msg) => ApiError::BadGateway(msg),
+            ChannelError::PairingNotFound(msg) => ApiError::NotFound(msg),
+            ChannelError::PairingExpired(msg) => ApiError::BadRequest(msg),
+            ChannelError::PairingAlreadyProcessed(msg) => ApiError::BadRequest(msg),
+            ChannelError::UserNotFound(msg) => ApiError::NotFound(msg),
+            ChannelError::UserNotAuthorized(msg) => ApiError::Forbidden(msg),
+            ChannelError::SessionNotFound(msg) => ApiError::NotFound(msg),
+            ChannelError::EncryptionFailed(msg) => ApiError::Internal(msg),
+            ChannelError::DecryptionFailed(msg) => ApiError::Internal(msg),
+            ChannelError::PlatformApi(msg) => ApiError::BadGateway(msg),
+            ChannelError::MessageSendFailed(msg) => ApiError::Internal(msg),
+            ChannelError::Database(db_err) => ApiError::from(db_err),
+            ChannelError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Router builder
 // ---------------------------------------------------------------------------
@@ -725,6 +749,103 @@ fn field_default_entry(value: &serde_json::Value) -> Option<(&str, serde_json::V
 mod tests {
     use super::*;
     use aionui_api_types::TestPluginExtraConfig;
+
+    #[test]
+    fn plugin_not_found_maps_to_api_not_found() {
+        let err = ApiError::from(ChannelError::PluginNotFound("telegram".into()));
+        assert!(matches!(err, ApiError::NotFound(msg) if msg == "telegram"));
+    }
+
+    #[test]
+    fn invalid_plugin_type_maps_to_bad_request() {
+        let err = ApiError::from(ChannelError::InvalidPluginType("unknown".into()));
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn plugin_already_running_maps_to_conflict() {
+        let err = ApiError::from(ChannelError::PluginAlreadyRunning("telegram".into()));
+        assert!(matches!(err, ApiError::Conflict(_)));
+    }
+
+    #[test]
+    fn invalid_config_maps_to_bad_request() {
+        let err = ApiError::from(ChannelError::InvalidConfig("missing token".into()));
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn connection_failed_maps_to_bad_gateway() {
+        let err = ApiError::from(ChannelError::ConnectionFailed("timeout".into()));
+        assert!(matches!(err, ApiError::BadGateway(_)));
+    }
+
+    #[test]
+    fn pairing_not_found_maps_to_not_found() {
+        let err = ApiError::from(ChannelError::PairingNotFound("123456".into()));
+        assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    #[test]
+    fn pairing_expired_maps_to_bad_request() {
+        let err = ApiError::from(ChannelError::PairingExpired("123456".into()));
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn pairing_already_processed_maps_to_bad_request() {
+        let err = ApiError::from(ChannelError::PairingAlreadyProcessed("123456".into()));
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn user_not_found_maps_to_not_found() {
+        let err = ApiError::from(ChannelError::UserNotFound("user-1".into()));
+        assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    #[test]
+    fn user_not_authorized_maps_to_forbidden() {
+        let err = ApiError::from(ChannelError::UserNotAuthorized("tg_42".into()));
+        assert!(matches!(err, ApiError::Forbidden(_)));
+    }
+
+    #[test]
+    fn session_not_found_maps_to_not_found() {
+        let err = ApiError::from(ChannelError::SessionNotFound("sess-1".into()));
+        assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    #[test]
+    fn encryption_failed_maps_to_internal() {
+        let err = ApiError::from(ChannelError::EncryptionFailed("bad key".into()));
+        assert!(matches!(err, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn decryption_failed_maps_to_internal() {
+        let err = ApiError::from(ChannelError::DecryptionFailed("corrupt".into()));
+        assert!(matches!(err, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn platform_api_maps_to_bad_gateway() {
+        let err = ApiError::from(ChannelError::PlatformApi("429 rate limited".into()));
+        assert!(matches!(err, ApiError::BadGateway(_)));
+    }
+
+    #[test]
+    fn message_send_failed_maps_to_internal() {
+        let err = ApiError::from(ChannelError::MessageSendFailed("chat not found".into()));
+        assert!(matches!(err, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn json_error_maps_to_internal() {
+        let json_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
+        let err = ApiError::from(ChannelError::Json(json_err));
+        assert!(matches!(err, ApiError::Internal(_)));
+    }
 
     #[test]
     fn build_test_config_telegram() {

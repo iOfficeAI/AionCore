@@ -642,7 +642,7 @@ async fn create_rejects_workspace_with_trailing_whitespace_in_request() {
 
     assert!(matches!(
         err,
-        ConversationError::App(AppError::WorkspacePathContainsWhitespace(message))
+        ConversationError::WorkspacePathContainsWhitespace { path: message }
             if message == workspace_with_trailing_space
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -666,7 +666,7 @@ async fn create_rejects_workspace_with_whitespace_in_any_path_segment() {
 
     assert!(matches!(
         err,
-        ConversationError::App(AppError::WorkspacePathContainsWhitespace(message))
+        ConversationError::WorkspacePathContainsWhitespace { path: message }
             if message == workspace.to_string_lossy()
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1799,7 +1799,7 @@ async fn send_message_rejects_legacy_workspace_with_runtime_error_code() {
         .unwrap_err();
     assert!(matches!(
         err,
-        ConversationError::App(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
+        ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported { path: message }
             if message == "/tmp/my project"
     ));
 
@@ -2405,7 +2405,7 @@ async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
     let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
     assert!(matches!(
         err,
-        ConversationError::App(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
+        ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported { path: message }
             if message == "/tmp/my project"
     ));
 }
@@ -2588,7 +2588,7 @@ async fn confirm_nonexistent_call_id_returns_not_found() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, ConversationError::App(AppError::NotFound(_))));
+    assert!(matches!(err, ConversationError::NotFoundReason { .. }));
 }
 
 #[tokio::test]
