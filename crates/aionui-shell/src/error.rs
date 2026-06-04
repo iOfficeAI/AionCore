@@ -1,5 +1,3 @@
-use aionui_common::AppError;
-
 #[derive(Debug, thiserror::Error)]
 pub enum ShellError {
     #[error("file not found: {0}")]
@@ -19,19 +17,6 @@ pub enum ShellError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-}
-
-impl From<ShellError> for AppError {
-    fn from(err: ShellError) -> Self {
-        match err {
-            ShellError::FileNotFound(path) => AppError::BadRequest(format!("file not found: {path}")),
-            ShellError::DirectoryNotFound(path) => AppError::BadRequest(format!("directory not found: {path}")),
-            ShellError::InvalidUrl(msg) => AppError::BadRequest(format!("invalid URL: {msg}")),
-            ShellError::ToolNotInstalled(tool) => AppError::BadRequest(format!("tool not installed: {tool}")),
-            ShellError::CommandFailed(msg) => AppError::Internal(format!("command failed: {msg}")),
-            ShellError::Io(e) => AppError::Internal(format!("IO error: {e}")),
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,58 +57,9 @@ impl SttError {
     }
 }
 
-impl From<SttError> for AppError {
-    fn from(err: SttError) -> Self {
-        match &err {
-            SttError::Disabled | SttError::OpenaiNotConfigured | SttError::DeepgramNotConfigured => {
-                AppError::BadRequest(err.to_string())
-            }
-            SttError::RequestFailed(_) => AppError::BadGateway(err.to_string()),
-            SttError::Unknown(_) => AppError::Internal(err.to_string()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn file_not_found_maps_to_bad_request() {
-        let err: AppError = ShellError::FileNotFound("/tmp/missing.txt".into()).into();
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("/tmp/missing.txt")));
-    }
-
-    #[test]
-    fn directory_not_found_maps_to_bad_request() {
-        let err: AppError = ShellError::DirectoryNotFound("/tmp/nodir".into()).into();
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("/tmp/nodir")));
-    }
-
-    #[test]
-    fn invalid_url_maps_to_bad_request() {
-        let err: AppError = ShellError::InvalidUrl("not a url".into()).into();
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("not a url")));
-    }
-
-    #[test]
-    fn tool_not_installed_maps_to_bad_request() {
-        let err: AppError = ShellError::ToolNotInstalled("vscode".into()).into();
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("vscode")));
-    }
-
-    #[test]
-    fn command_failed_maps_to_internal() {
-        let err: AppError = ShellError::CommandFailed("exit code 1".into()).into();
-        assert!(matches!(err, AppError::Internal(msg) if msg.contains("exit code 1")));
-    }
-
-    #[test]
-    fn io_error_maps_to_internal() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
-        let err: AppError = ShellError::Io(io_err).into();
-        assert!(matches!(err, AppError::Internal(msg) if msg.contains("permission denied")));
-    }
 
     #[test]
     fn shell_error_display_messages() {
@@ -144,36 +80,6 @@ mod tests {
             ShellError::CommandFailed("oops".into()).to_string(),
             "command failed: oops"
         );
-    }
-
-    #[test]
-    fn stt_disabled_maps_to_bad_request() {
-        let err: AppError = SttError::Disabled.into();
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("not enabled")));
-    }
-
-    #[test]
-    fn stt_openai_not_configured_maps_to_bad_request() {
-        let err: AppError = SttError::OpenaiNotConfigured.into();
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("OpenAI")));
-    }
-
-    #[test]
-    fn stt_deepgram_not_configured_maps_to_bad_request() {
-        let err: AppError = SttError::DeepgramNotConfigured.into();
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("Deepgram")));
-    }
-
-    #[test]
-    fn stt_request_failed_maps_to_bad_gateway() {
-        let err: AppError = SttError::RequestFailed("HTTP 401".into()).into();
-        assert!(matches!(err, AppError::BadGateway(msg) if msg.contains("HTTP 401")));
-    }
-
-    #[test]
-    fn stt_unknown_maps_to_internal() {
-        let err: AppError = SttError::Unknown("unexpected".into()).into();
-        assert!(matches!(err, AppError::Internal(msg) if msg.contains("unexpected")));
     }
 
     #[test]

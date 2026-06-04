@@ -8,7 +8,8 @@
 //! `aionui-assistant::AssistantService`.
 
 use aionui_api_types::AssistantSource;
-use aionui_common::AppError;
+
+use crate::error::ExtensionError;
 
 /// Classify an assistant id into its source (builtin / extension / user).
 #[async_trait::async_trait]
@@ -37,11 +38,11 @@ impl AssistantClassifier for DefaultUserClassifier {
 /// `/api/skills/assistant-skill/*` endpoints dispatch per source.
 #[async_trait::async_trait]
 pub trait AssistantRuleDispatcher: Send + Sync {
-    async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, AppError>;
-    async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AppError>;
-    async fn delete_rule(&self, id: &str) -> Result<bool, AppError>;
+    async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError>;
+    async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError>;
+    async fn delete_rule(&self, id: &str) -> Result<bool, ExtensionError>;
 
-    async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, AppError>;
-    async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AppError>;
-    async fn delete_skill(&self, id: &str) -> Result<bool, AppError>;
+    async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError>;
+    async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError>;
+    async fn delete_skill(&self, id: &str) -> Result<bool, ExtensionError>;
 }

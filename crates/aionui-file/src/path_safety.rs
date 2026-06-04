@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use aionui_common::AppError;
+use crate::error::FileError;
 
 /// Canonicalize `path` and verify it falls within one of the `allowed_roots`.
 ///
@@ -10,11 +10,11 @@ use aionui_common::AppError;
 ///
 /// # Errors
 ///
-/// - `AppError::BadRequest` if `path` does not exist or cannot be
+/// - `FileError::BadRequest` if `path` does not exist or cannot be
 ///   canonicalized, or if it falls outside all allowed roots.
-pub fn validate_path(path: &str, allowed_roots: &[&Path]) -> Result<PathBuf, AppError> {
+pub fn validate_path(path: &str, allowed_roots: &[&Path]) -> Result<PathBuf, FileError> {
     let canonical = std::fs::canonicalize(path)
-        .map_err(|e| AppError::BadRequest(format!("cannot resolve path '{}': {}", path, e)))?;
+        .map_err(|e| FileError::BadRequest(format!("cannot resolve path '{}': {}", path, e)))?;
 
     let is_allowed = allowed_roots.iter().any(|root| {
         // Canonicalize the root as well so that symlinks (e.g. macOS
@@ -28,7 +28,7 @@ pub fn validate_path(path: &str, allowed_roots: &[&Path]) -> Result<PathBuf, App
     if is_allowed {
         Ok(canonical)
     } else {
-        Err(AppError::Forbidden(format!(
+        Err(FileError::Forbidden(format!(
             "path '{}' is outside the allowed sandbox",
             path
         )))
@@ -40,7 +40,7 @@ pub fn validate_path_with_extra_root(
     path: &str,
     base_roots: &[&Path],
     extra: Option<&Path>,
-) -> Result<PathBuf, AppError> {
+) -> Result<PathBuf, FileError> {
     let mut allowed_roots = base_roots.to_vec();
     if let Some(extra_root) = extra {
         allowed_roots.push(extra_root);
@@ -56,21 +56,21 @@ pub fn validate_path_with_extra_root(
 ///
 /// # Errors
 ///
-/// Same as [`validate_path`], plus `AppError::BadRequest` if the path has
+/// Same as [`validate_path`], plus `FileError::BadRequest` if the path has
 /// no parent or no file-name component.
-pub fn validate_path_for_write(path: &str, allowed_roots: &[&Path]) -> Result<PathBuf, AppError> {
+pub fn validate_path_for_write(path: &str, allowed_roots: &[&Path]) -> Result<PathBuf, FileError> {
     let p = Path::new(path);
 
     let parent = p
         .parent()
-        .ok_or_else(|| AppError::BadRequest(format!("path '{}' has no parent directory", path)))?;
+        .ok_or_else(|| FileError::BadRequest(format!("path '{}' has no parent directory", path)))?;
 
     let file_name = p
         .file_name()
-        .ok_or_else(|| AppError::BadRequest(format!("path '{}' has no file name component", path)))?;
+        .ok_or_else(|| FileError::BadRequest(format!("path '{}' has no file name component", path)))?;
 
     let canonical_parent = std::fs::canonicalize(parent)
-        .map_err(|e| AppError::BadRequest(format!("cannot resolve parent of '{}': {}", path, e)))?;
+        .map_err(|e| FileError::BadRequest(format!("cannot resolve parent of '{}': {}", path, e)))?;
 
     let is_allowed = allowed_roots.iter().any(|root| match std::fs::canonicalize(root) {
         Ok(canonical_root) => canonical_parent.starts_with(&canonical_root),
@@ -78,7 +78,7 @@ pub fn validate_path_for_write(path: &str, allowed_roots: &[&Path]) -> Result<Pa
     });
 
     if !is_allowed {
-        return Err(AppError::Forbidden(format!(
+        return Err(FileError::Forbidden(format!(
             "path '{}' is outside the allowed sandbox",
             path
         )));
@@ -126,7 +126,7 @@ mod tests {
         let result = validate_path(file.to_str().unwrap(), &[sandbox.path()]);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, AppError::Forbidden(_)), "unexpected error: {err}");
+        assert!(matches!(err, FileError::Forbidden(_)), "unexpected error: {err}");
     }
 
     #[test]

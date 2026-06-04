@@ -16,8 +16,46 @@ use aionui_api_types::{
 use aionui_common::{AppError, now_ms};
 
 use crate::asset_paths::normalize_relative_asset_path;
+use crate::error::ExtensionError;
 use crate::permission::{build_permission_summary, calculate_risk_level};
 use crate::registry::ExtensionRegistry;
+
+impl From<ExtensionError> for AppError {
+    fn from(err: ExtensionError) -> Self {
+        match err {
+            ExtensionError::ManifestValidation(msg) => AppError::BadRequest(msg),
+            ExtensionError::ReservedNamePrefix { .. } => AppError::BadRequest(err.to_string()),
+            ExtensionError::InvalidVersion { .. } => AppError::BadRequest(err.to_string()),
+            ExtensionError::UndefinedEnvVariable(var) => {
+                AppError::BadRequest(format!("Undefined environment variable: {var}"))
+            }
+            ExtensionError::FileReferenceNotFound(path) => {
+                AppError::NotFound(format!("File reference not found: {path}"))
+            }
+            ExtensionError::PathTraversal(path) => AppError::BadRequest(format!("Path traversal detected: {path}")),
+            ExtensionError::EngineIncompatible { .. } => AppError::BadRequest(err.to_string()),
+            ExtensionError::ApiVersionIncompatible { .. } => AppError::BadRequest(err.to_string()),
+            ExtensionError::InvalidWebuiRouteNamespace { .. } => AppError::BadRequest(err.to_string()),
+            ExtensionError::ReservedWebuiRoute { .. } => AppError::BadRequest(err.to_string()),
+            ExtensionError::ThemeCssNotFound(path) => AppError::NotFound(format!("Theme CSS not found: {path}")),
+            ExtensionError::HookTimeout { .. } => AppError::Internal(err.to_string()),
+            ExtensionError::HookFailed { .. } => AppError::Internal(err.to_string()),
+            ExtensionError::HookNotFound(path) => AppError::NotFound(format!("Hook script not found: {path}")),
+            ExtensionError::ResolutionFailed { .. } => AppError::Internal(err.to_string()),
+            ExtensionError::NotFound(name) => AppError::NotFound(format!("Extension not found: {name}")),
+            ExtensionError::StatePersistence(msg) => AppError::Internal(msg),
+            ExtensionError::BuiltinSkillDeletion(name) => {
+                AppError::BadRequest(format!("Cannot delete built-in skill: {name}"))
+            }
+            ExtensionError::SkillNotFound(name) => AppError::NotFound(format!("Skill not found: {name}")),
+            ExtensionError::InvalidSkillPath(path) => AppError::BadRequest(format!("Invalid skill path: {path}")),
+            ExtensionError::InvalidRequest(msg) => AppError::BadRequest(msg),
+            ExtensionError::Internal(msg) => AppError::Internal(msg),
+            ExtensionError::Io(e) => AppError::Internal(e.to_string()),
+            ExtensionError::JsonParse(e) => AppError::BadRequest(e.to_string()),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Router state
@@ -546,6 +584,31 @@ mod tests {
     fn extension_routes_builds_router() {
         let state = make_state();
         let _router = extension_routes(state);
+    }
+
+    #[test]
+    fn extension_path_traversal_maps_to_bad_request() {
+        let app_err = AppError::from(ExtensionError::PathTraversal("../secret".into()));
+        assert!(matches!(app_err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn extension_manifest_validation_maps_to_bad_request() {
+        let app_err = AppError::from(ExtensionError::ManifestValidation("test".into()));
+        assert!(matches!(app_err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn extension_file_reference_not_found_maps_to_not_found() {
+        let app_err = AppError::from(ExtensionError::FileReferenceNotFound("missing.md".into()));
+        assert!(matches!(app_err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn extension_io_error_maps_to_internal() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let app_err = AppError::from(ExtensionError::Io(io_err));
+        assert!(matches!(app_err, AppError::Internal(_)));
     }
 
     async fn make_router_with_extension() -> (Router, tempfile::TempDir, PathBuf) {

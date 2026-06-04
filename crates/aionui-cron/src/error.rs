@@ -46,27 +46,6 @@ pub enum CronError {
     Json(#[from] serde_json::Error),
 }
 
-impl From<CronError> for AppError {
-    fn from(err: CronError) -> Self {
-        match err {
-            CronError::JobNotFound(msg) => AppError::NotFound(msg),
-            CronError::InvalidSchedule(msg) => AppError::BadRequest(msg),
-            CronError::InvalidCronExpression(msg) => AppError::BadRequest(msg),
-            CronError::InvalidExecutionMode(msg) => AppError::BadRequest(msg),
-            CronError::InvalidCreatedBy(msg) => AppError::BadRequest(msg),
-            CronError::InvalidJobStatus(msg) => AppError::BadRequest(msg),
-            CronError::InvalidTimezone(msg) => AppError::BadRequest(msg),
-            CronError::InvalidSkillContent(msg) => AppError::BadRequest(msg),
-            CronError::InvalidAgentConfig(msg) => AppError::BadRequest(msg),
-            CronError::Scheduler(msg) => AppError::Internal(msg),
-            CronError::App(app_err) => app_err,
-            CronError::Conversation(conversation_err) => AppError::from(conversation_err),
-            CronError::Database(db_err) => AppError::from(db_err),
-            CronError::Json(e) => AppError::Internal(format!("JSON error: {e}")),
-        }
-    }
-}
-
 impl CronError {
     pub(crate) fn from_conversation_create(error: ConversationError) -> Self {
         match error {
@@ -84,103 +63,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_not_found_maps_to_not_found() {
-        let err: AppError = CronError::JobNotFound("cron_abc".into()).into();
-        assert!(matches!(err, AppError::NotFound(msg) if msg == "cron_abc"));
-    }
-
-    #[test]
-    fn invalid_schedule_maps_to_bad_request() {
-        let err: AppError = CronError::InvalidSchedule("missing kind".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn invalid_cron_expression_maps_to_bad_request() {
-        let err: AppError = CronError::InvalidCronExpression("bad expr".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn invalid_execution_mode_maps_to_bad_request() {
-        let err: AppError = CronError::InvalidExecutionMode("unknown".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn invalid_created_by_maps_to_bad_request() {
-        let err: AppError = CronError::InvalidCreatedBy("robot".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn invalid_job_status_maps_to_bad_request() {
-        let err: AppError = CronError::InvalidJobStatus("unknown".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn invalid_timezone_maps_to_bad_request() {
-        let err: AppError = CronError::InvalidTimezone("Mars/Olympus".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn invalid_skill_content_maps_to_bad_request() {
-        let err: AppError = CronError::InvalidSkillContent("empty".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn invalid_agent_config_maps_to_bad_request() {
-        let err: AppError = CronError::InvalidAgentConfig("missing backend".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn scheduler_error_maps_to_internal() {
-        let err: AppError = CronError::Scheduler("timer failed".into()).into();
-        assert!(matches!(err, AppError::Internal(_)));
-    }
-
-    #[test]
-    fn app_error_passthrough_preserves_code() {
-        let err: AppError = CronError::App(AppError::WorkspacePathContainsWhitespace("/tmp/a b".into())).into();
-        assert!(matches!(err, AppError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
-    }
-
-    #[test]
-    fn conversation_error_maps_through_boundary_mapper() {
-        let err: AppError = CronError::Conversation(ConversationError::NotFound { id: "conv-1".into() }).into();
-        assert!(matches!(err, AppError::NotFound(msg) if msg == "Conversation conv-1 not found"));
-    }
-
-    #[test]
     fn conversation_create_preserves_workspace_error_code() {
         let err = CronError::from_conversation_create(ConversationError::App(
             AppError::WorkspacePathContainsWhitespace("/tmp/a b".into()),
         ));
-        let app: AppError = err.into();
-        assert!(matches!(app, AppError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
-    }
-
-    #[test]
-    fn runtime_workspace_app_error_passthrough_preserves_code() {
-        let err: AppError = CronError::App(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
-            "/tmp/a b".into(),
-        ))
-        .into();
-        assert!(matches!(
-            err,
-            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(msg) if msg == "/tmp/a b"
-        ));
-    }
-
-    #[test]
-    fn json_error_maps_to_internal() {
-        let json_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
-        let err: AppError = CronError::Json(json_err).into();
-        assert!(matches!(err, AppError::Internal(_)));
+        assert!(matches!(err, CronError::App(AppError::WorkspacePathContainsWhitespace(msg)) if msg == "/tmp/a b"));
     }
 
     #[test]

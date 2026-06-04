@@ -13,11 +13,39 @@ use aionui_api_types::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::AppError;
-use aionui_file::path_safety::validate_path_with_extra_root;
+use aionui_file::{FileError, path_safety::validate_path_with_extra_root};
 
 use crate::error::OfficeError;
+use crate::proxy::ProxyError;
 use crate::state::OfficeRouterState;
 use crate::types::DocType;
+
+impl From<OfficeError> for AppError {
+    fn from(err: OfficeError) -> Self {
+        match err {
+            OfficeError::OfficecliNotFound => AppError::BadRequest("officecli not found".into()),
+            OfficeError::InstallFailed(msg) => AppError::Internal(format!("officecli install failed: {msg}")),
+            OfficeError::StartFailed(msg) => AppError::Internal(format!("preview start failed: {msg}")),
+            OfficeError::PortTimeout(path) => AppError::Timeout(format!("port readiness timeout for {path}")),
+            OfficeError::Io(e) => AppError::Internal(format!("IO error: {e}")),
+            OfficeError::Snapshot(msg) => AppError::Internal(format!("snapshot error: {msg}")),
+            OfficeError::Json(e) => AppError::Internal(format!("JSON error: {e}")),
+            OfficeError::Conversion(msg) => AppError::Internal(format!("conversion error: {msg}")),
+            OfficeError::ToolNotFound(tool) => AppError::BadRequest(format!("{tool} is not installed")),
+        }
+    }
+}
+
+impl From<ProxyError> for AppError {
+    fn from(err: ProxyError) -> Self {
+        match err {
+            ProxyError::PortNotActive(_) => AppError::Forbidden(err.to_string()),
+            ProxyError::Timeout => AppError::Timeout(err.to_string()),
+            ProxyError::ConnectionFailed(msg) => AppError::BadGateway(msg),
+            ProxyError::RequestFailed(msg) => AppError::BadGateway(msg),
+        }
+    }
+}
 
 pub fn office_routes(state: OfficeRouterState) -> Router {
     Router::new()
@@ -208,6 +236,16 @@ fn validate_office_path(
 ) -> Result<PathBuf, AppError> {
     let allowed_roots: Vec<&FsPath> = state.allowed_roots.iter().map(PathBuf::as_path).collect();
     validate_path_with_extra_root(file_path, &allowed_roots, workspace.map(FsPath::new))
+        .map_err(file_error_to_app_error)
+}
+
+fn file_error_to_app_error(error: FileError) -> AppError {
+    match error {
+        FileError::BadRequest(message) => AppError::BadRequest(message),
+        FileError::Forbidden(message) => AppError::Forbidden(message),
+        FileError::NotFound(message) => AppError::NotFound(message),
+        FileError::Internal(message) => AppError::Internal(message),
+    }
 }
 
 fn preview_error_code(error: &OfficeError) -> &'static str {
@@ -298,14 +336,14 @@ mod tests {
 
     use crate::conversion::ConversionService;
     use crate::error::OfficeError;
-    use crate::proxy::ProxyService;
+    use crate::proxy::{ProxyError, ProxyService};
     use crate::snapshot::SnapshotService;
     use crate::star_office::StarOfficeDetector;
     use crate::state::OfficeRouterState;
     use crate::types::DocType;
     use crate::watch_manager::{OfficecliWatchManager, ProcessHandle, ProcessSpawner};
 
-    use super::{office_proxy_routes, office_routes};
+    use super::{AppError, office_proxy_routes, office_routes};
 
     #[test]
     fn office_routes_builds_without_panic() {
@@ -317,6 +355,73 @@ mod tests {
     fn office_proxy_routes_builds_without_panic() {
         let state = build_test_state();
         let _router = office_proxy_routes(state);
+    }
+
+    #[test]
+    fn officecli_not_found_maps_to_bad_request() {
+        let err = AppError::from(OfficeError::OfficecliNotFound);
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn install_failed_maps_to_internal() {
+        let err = AppError::from(OfficeError::InstallFailed("npm error".into()));
+        assert!(matches!(err, AppError::Internal(msg) if msg.contains("npm error")));
+    }
+
+    #[test]
+    fn start_failed_maps_to_internal() {
+        let err = AppError::from(OfficeError::StartFailed("spawn error".into()));
+        assert!(matches!(err, AppError::Internal(msg) if msg.contains("spawn error")));
+    }
+
+    #[test]
+    fn port_timeout_maps_to_timeout() {
+        let err = AppError::from(OfficeError::PortTimeout("/a.docx".into()));
+        assert!(matches!(err, AppError::Timeout(msg) if msg.contains("/a.docx")));
+    }
+
+    #[test]
+    fn io_error_maps_to_internal() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let err = AppError::from(OfficeError::Io(io_err));
+        assert!(matches!(err, AppError::Internal(msg) if msg.contains("file missing")));
+    }
+
+    #[test]
+    fn conversion_error_maps_to_internal() {
+        let err = AppError::from(OfficeError::Conversion("bad format".into()));
+        assert!(matches!(err, AppError::Internal(msg) if msg.contains("bad format")));
+    }
+
+    #[test]
+    fn tool_not_found_maps_to_bad_request() {
+        let err = AppError::from(OfficeError::ToolNotFound("pandoc".into()));
+        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("pandoc")));
+    }
+
+    #[test]
+    fn proxy_error_port_not_active_maps_to_forbidden() {
+        let err = AppError::from(ProxyError::PortNotActive(8080));
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn proxy_error_timeout_maps_to_timeout() {
+        let err = AppError::from(ProxyError::Timeout);
+        assert!(matches!(err, AppError::Timeout(_)));
+    }
+
+    #[test]
+    fn proxy_error_connection_failed_maps_to_bad_gateway() {
+        let err = AppError::from(ProxyError::ConnectionFailed("refused".into()));
+        assert!(matches!(err, AppError::BadGateway(_)));
+    }
+
+    #[test]
+    fn proxy_error_request_failed_maps_to_bad_gateway() {
+        let err = AppError::from(ProxyError::RequestFailed("network error".into()));
+        assert!(matches!(err, AppError::BadGateway(_)));
     }
 
     fn build_test_state() -> OfficeRouterState {

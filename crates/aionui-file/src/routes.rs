@@ -17,11 +17,23 @@ use aionui_common::AppError;
 use aionui_common::constants::UPLOAD_MAX_SIZE;
 
 use crate::browse;
+use crate::error::FileError;
 use crate::traits::{FileServiceRef, FileWatchServiceRef, SnapshotServiceRef};
 use crate::types::{
     CompareResult, CopyResult, DirOrFile, FileChangeInfo, FileMetadata, SnapshotInfo, SnapshotMode, WorkspaceFlatFile,
     ZipEntry,
 };
+
+impl From<FileError> for AppError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::BadRequest(message) => AppError::BadRequest(message),
+            FileError::Forbidden(message) => AppError::Forbidden(message),
+            FileError::NotFound(message) => AppError::NotFound(message),
+            FileError::Internal(message) => AppError::Internal(message),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Router state

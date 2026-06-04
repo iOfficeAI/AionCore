@@ -7,8 +7,8 @@ use dashmap::DashMap;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::warn;
 
+use crate::error::FileError;
 use aionui_api_types::WebSocketMessage;
-use aionui_common::AppError;
 use aionui_realtime::EventBroadcaster;
 
 use crate::types::{FileWatchEvent, OfficeFileAddedEvent};
@@ -83,7 +83,7 @@ pub struct FileWatchService {
 
 impl FileWatchService {
     /// Create a new watch service backed by the platform's recommended watcher.
-    pub fn new(broadcaster: Arc<dyn EventBroadcaster>) -> Result<Self, AppError> {
+    pub fn new(broadcaster: Arc<dyn EventBroadcaster>) -> Result<Self, FileError> {
         let watched_files: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
         let debounce: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 
@@ -121,7 +121,7 @@ impl FileWatchService {
                 bc.broadcast(WebSocketMessage::new("fileWatch.fileChanged", json));
             }
         })
-        .map_err(|e| AppError::Internal(format!("failed to create file watcher: {e}")))?;
+        .map_err(|e| FileError::Internal(format!("failed to create file watcher: {e}")))?;
 
         Ok(Self {
             broadcaster,
@@ -135,9 +135,9 @@ impl FileWatchService {
 
 #[async_trait::async_trait]
 impl crate::traits::IFileWatchService for FileWatchService {
-    async fn start_watch(&self, file_path: &str) -> Result<(), AppError> {
+    async fn start_watch(&self, file_path: &str) -> Result<(), FileError> {
         let canonical = std::fs::canonicalize(file_path)
-            .map_err(|e| AppError::NotFound(format!("cannot resolve path {file_path}: {e}")))?;
+            .map_err(|e| FileError::NotFound(format!("cannot resolve path {file_path}: {e}")))?;
         let key = canonical.to_string_lossy().into_owned();
 
         // Idempotent: already watching → no-op.
@@ -148,15 +148,15 @@ impl crate::traits::IFileWatchService for FileWatchService {
         let mut watcher = self
             .file_watcher
             .lock()
-            .map_err(|e| AppError::Internal(format!("file watcher lock poisoned: {e}")))?;
+            .map_err(|e| FileError::Internal(format!("file watcher lock poisoned: {e}")))?;
         watcher
             .watch(&canonical, RecursiveMode::NonRecursive)
-            .map_err(|e| AppError::Internal(format!("failed to watch {file_path}: {e}")))?;
+            .map_err(|e| FileError::Internal(format!("failed to watch {file_path}: {e}")))?;
         self.watched_files.insert(key, ());
         Ok(())
     }
 
-    async fn stop_watch(&self, file_path: &str) -> Result<(), AppError> {
+    async fn stop_watch(&self, file_path: &str) -> Result<(), FileError> {
         let canonical = std::fs::canonicalize(file_path).unwrap_or_else(|_| file_path.into());
         let key = canonical.to_string_lossy().into_owned();
 
@@ -167,18 +167,18 @@ impl crate::traits::IFileWatchService for FileWatchService {
         let mut watcher = self
             .file_watcher
             .lock()
-            .map_err(|e| AppError::Internal(format!("file watcher lock poisoned: {e}")))?;
+            .map_err(|e| FileError::Internal(format!("file watcher lock poisoned: {e}")))?;
         // Ignore unwatch errors — the file may have been deleted.
         let _ = watcher.unwatch(&canonical);
         self.debounce.remove(&key);
         Ok(())
     }
 
-    async fn stop_all_watches(&self) -> Result<(), AppError> {
+    async fn stop_all_watches(&self) -> Result<(), FileError> {
         let mut watcher = self
             .file_watcher
             .lock()
-            .map_err(|e| AppError::Internal(format!("file watcher lock poisoned: {e}")))?;
+            .map_err(|e| FileError::Internal(format!("file watcher lock poisoned: {e}")))?;
 
         for entry in self.watched_files.iter() {
             let path = std::path::PathBuf::from(entry.key().as_str());
@@ -190,16 +190,16 @@ impl crate::traits::IFileWatchService for FileWatchService {
         Ok(())
     }
 
-    async fn start_office_watch(&self, workspace: &str) -> Result<(), AppError> {
+    async fn start_office_watch(&self, workspace: &str) -> Result<(), FileError> {
         let canonical = std::fs::canonicalize(workspace)
-            .map_err(|e| AppError::NotFound(format!("cannot resolve workspace {workspace}: {e}")))?;
+            .map_err(|e| FileError::NotFound(format!("cannot resolve workspace {workspace}: {e}")))?;
         let key = canonical.to_string_lossy().into_owned();
 
         {
             let watchers = self
                 .office_watchers
                 .lock()
-                .map_err(|e| AppError::Internal(format!("office watcher lock poisoned: {e}")))?;
+                .map_err(|e| FileError::Internal(format!("office watcher lock poisoned: {e}")))?;
             if watchers.contains_key(&key) {
                 return Ok(());
             }
@@ -239,28 +239,28 @@ impl crate::traits::IFileWatchService for FileWatchService {
                 bc.broadcast(WebSocketMessage::new("workspaceOfficeWatch.fileAdded", json));
             }
         })
-        .map_err(|e| AppError::Internal(format!("failed to create office watcher: {e}")))?;
+        .map_err(|e| FileError::Internal(format!("failed to create office watcher: {e}")))?;
 
         watcher
             .watch(&canonical, RecursiveMode::Recursive)
-            .map_err(|e| AppError::Internal(format!("failed to watch workspace {workspace}: {e}")))?;
+            .map_err(|e| FileError::Internal(format!("failed to watch workspace {workspace}: {e}")))?;
 
         let mut watchers = self
             .office_watchers
             .lock()
-            .map_err(|e| AppError::Internal(format!("office watcher lock poisoned: {e}")))?;
+            .map_err(|e| FileError::Internal(format!("office watcher lock poisoned: {e}")))?;
         watchers.insert(key, watcher);
         Ok(())
     }
 
-    async fn stop_office_watch(&self, workspace: &str) -> Result<(), AppError> {
+    async fn stop_office_watch(&self, workspace: &str) -> Result<(), FileError> {
         let canonical = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.into());
         let key = canonical.to_string_lossy().into_owned();
 
         let mut watchers = self
             .office_watchers
             .lock()
-            .map_err(|e| AppError::Internal(format!("office watcher lock poisoned: {e}")))?;
+            .map_err(|e| FileError::Internal(format!("office watcher lock poisoned: {e}")))?;
         // Dropping the watcher stops watching.
         watchers.remove(&key);
         Ok(())
