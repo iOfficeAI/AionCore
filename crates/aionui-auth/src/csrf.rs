@@ -6,7 +6,7 @@ use axum::http::{HeaderValue, Method, header};
 use axum::middleware::Next;
 use axum::response::Response;
 
-use aionui_common::AppError;
+use aionui_common::ApiError;
 use aionui_common::constants::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME};
 
 use crate::cookie::CookieConfig;
@@ -24,7 +24,7 @@ pub async fn csrf_middleware(
     State(cookie_config): State<Arc<CookieConfig>>,
     request: Request,
     next: Next,
-) -> Result<Response, AppError> {
+) -> Result<Response, ApiError> {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
 
@@ -47,7 +47,7 @@ pub async fn csrf_middleware(
                 // Valid: cookie and header match
             }
             _ => {
-                return Err(AppError::Forbidden("CSRF token validation failed".into()));
+                return Err(ApiError::Forbidden("CSRF token validation failed".into()));
             }
         }
     }

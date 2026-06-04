@@ -15,7 +15,7 @@ use aionui_api_types::{
     RefreshResponse, RefreshTokenRequest, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
     WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
 };
-use aionui_common::AppError;
+use aionui_common::ApiError;
 use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
 use aionui_db::{IUserRepository, models::User};
 
@@ -30,17 +30,17 @@ use crate::rate_limit::{
 use crate::validation::{validate_password, validate_username};
 use crate::{CookieConfig, JwtService};
 
-impl From<AuthError> for AppError {
+impl From<AuthError> for ApiError {
     fn from(err: AuthError) -> Self {
         match err {
-            AuthError::InvalidCredentials => AppError::Unauthorized("Invalid username or password".into()),
-            AuthError::WeakPassword(msg) => AppError::BadRequest(msg),
-            AuthError::InvalidUsername(msg) => AppError::BadRequest(msg),
-            AuthError::TokenExpired => AppError::Unauthorized("Token expired".into()),
-            AuthError::TokenInvalid(msg) => AppError::Unauthorized(msg),
-            AuthError::TokenBlacklisted => AppError::Unauthorized("Token has been revoked".into()),
-            AuthError::RateLimited => AppError::RateLimited,
-            AuthError::HashError(msg) => AppError::Internal(format!("Password hash error: {msg}")),
+            AuthError::InvalidCredentials => ApiError::Unauthorized("Invalid username or password".into()),
+            AuthError::WeakPassword(msg) => ApiError::BadRequest(msg),
+            AuthError::InvalidUsername(msg) => ApiError::BadRequest(msg),
+            AuthError::TokenExpired => ApiError::Unauthorized("Token expired".into()),
+            AuthError::TokenInvalid(msg) => ApiError::Unauthorized(msg),
+            AuthError::TokenBlacklisted => ApiError::Unauthorized("Token has been revoked".into()),
+            AuthError::RateLimited => ApiError::RateLimited,
+            AuthError::HashError(msg) => ApiError::Internal(format!("Password hash error: {msg}")),
         }
     }
 }
@@ -82,11 +82,11 @@ struct UpdateJwtSecretRequest {
     jwt_secret: String,
 }
 
-fn ensure_local_mode(local: bool) -> Result<(), AppError> {
+fn ensure_local_mode(local: bool) -> Result<(), ApiError> {
     if local {
         return Ok(());
     }
-    Err(AppError::Forbidden(
+    Err(ApiError::Forbidden(
         "This endpoint is only available in local mode".into(),
     ))
 }
@@ -215,15 +215,15 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
 async fn login_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<LoginRequest>, JsonRejection>,
-) -> Result<Response, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Response, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // Input length validation (per API spec)
     if req.username.len() > 32 {
-        return Err(AppError::BadRequest("Username must not exceed 32 characters".into()));
+        return Err(ApiError::BadRequest("Username must not exceed 32 characters".into()));
     }
     if req.password.len() > 128 {
-        return Err(AppError::BadRequest("Password must not exceed 128 characters".into()));
+        return Err(ApiError::BadRequest("Password must not exceed 128 characters".into()));
     }
 
     // Look up user; run dummy verify on miss to prevent timing attacks
@@ -231,7 +231,7 @@ async fn login_handler(
         .user_repo
         .find_by_username(&req.username)
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     let (found_user, password_valid) = match user {
         Some(u) if u.password_hash.trim().is_empty() => {
@@ -253,15 +253,15 @@ async fn login_handler(
     };
 
     if !password_valid {
-        return Err(AppError::Unauthorized("Invalid username or password".into()));
+        return Err(ApiError::Unauthorized("Invalid username or password".into()));
     }
 
-    let user = found_user.ok_or_else(|| AppError::Unauthorized("Invalid username or password".into()))?;
+    let user = found_user.ok_or_else(|| ApiError::Unauthorized("Invalid username or password".into()))?;
 
     let token = state
         .jwt_service
         .sign(&user.id, &user.username)
-        .map_err(|e| AppError::Internal(format!("Token signing error: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     // Update last login (best-effort)
     if let Err(e) = state.user_repo.update_last_login(&user.id).await {
@@ -284,7 +284,7 @@ async fn login_handler(
 // POST /logout
 // ---------------------------------------------------------------------------
 
-async fn logout_handler(State(state): State<AuthRouterState>, headers: HeaderMap) -> Result<Response, AppError> {
+async fn logout_handler(State(state): State<AuthRouterState>, headers: HeaderMap) -> Result<Response, ApiError> {
     if let Some(token) = extract_token_from_headers(&headers) {
         state.jwt_service.blacklist_token(&token);
     }
@@ -302,18 +302,18 @@ async fn logout_handler(State(state): State<AuthRouterState>, headers: HeaderMap
 async fn status_handler(
     State(state): State<AuthRouterState>,
     headers: HeaderMap,
-) -> Result<Json<AuthStatusResponse>, AppError> {
+) -> Result<Json<AuthStatusResponse>, ApiError> {
     let has_users = state
         .user_repo
         .has_users()
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     let user_count = state
         .user_repo
         .count_users()
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     // Check authentication without requiring it
     let is_authenticated = extract_token_from_headers(&headers)
@@ -334,7 +334,7 @@ async fn status_handler(
 
 async fn list_internal_users_handler(
     State(state): State<AuthRouterState>,
-) -> Result<Json<ApiResponse<Vec<User>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<User>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let users = state.user_repo.list_users().await?;
     Ok(Json(ApiResponse::ok(users)))
@@ -342,7 +342,7 @@ async fn list_internal_users_handler(
 
 async fn get_system_user_handler(
     State(state): State<AuthRouterState>,
-) -> Result<Json<ApiResponse<Option<User>>>, AppError> {
+) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let user = state.user_repo.get_system_user().await?;
     Ok(Json(ApiResponse::ok(user)))
@@ -351,7 +351,7 @@ async fn get_system_user_handler(
 async fn find_user_by_username_handler(
     State(state): State<AuthRouterState>,
     Path(username): Path<String>,
-) -> Result<Json<ApiResponse<Option<User>>>, AppError> {
+) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let user = state.user_repo.find_by_username(&username).await?;
     Ok(Json(ApiResponse::ok(user)))
@@ -360,7 +360,7 @@ async fn find_user_by_username_handler(
 async fn find_user_by_id_handler(
     State(state): State<AuthRouterState>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<Option<User>>>, AppError> {
+) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let user = state.user_repo.find_by_id(&id).await?;
     Ok(Json(ApiResponse::ok(user)))
@@ -369,9 +369,9 @@ async fn find_user_by_id_handler(
 async fn create_internal_user_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<CreateInternalUserRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<User>>, AppError> {
+) -> Result<Json<ApiResponse<User>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let user = state.user_repo.create_user(&req.username, &req.password_hash).await?;
     Ok(Json(ApiResponse::ok(user)))
 }
@@ -379,9 +379,9 @@ async fn create_internal_user_handler(
 async fn set_system_user_credentials_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<SetSystemUserCredentialsRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
+) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state
         .user_repo
         .set_system_user_credentials(&req.username, &req.password_hash)
@@ -393,9 +393,9 @@ async fn update_user_password_hash_handler(
     State(state): State<AuthRouterState>,
     Path(id): Path<String>,
     body: Result<Json<UpdatePasswordHashRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
+) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state.user_repo.update_password(&id, &req.password_hash).await?;
     Ok(Json(ApiResponse::ok(())))
 }
@@ -404,9 +404,9 @@ async fn update_user_username_handler(
     State(state): State<AuthRouterState>,
     Path(id): Path<String>,
     body: Result<Json<UpdateUsernameRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
+) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state.user_repo.update_username(&id, &req.username).await?;
     Ok(Json(ApiResponse::ok(())))
 }
@@ -415,9 +415,9 @@ async fn update_user_jwt_secret_handler(
     State(state): State<AuthRouterState>,
     Path(id): Path<String>,
     body: Result<Json<UpdateJwtSecretRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
+) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state.user_repo.update_jwt_secret(&id, &req.jwt_secret).await?;
     Ok(Json(ApiResponse::ok(())))
 }
@@ -425,7 +425,7 @@ async fn update_user_jwt_secret_handler(
 async fn update_user_last_login_handler(
     State(state): State<AuthRouterState>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
+) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
     state.user_repo.update_last_login(&id).await?;
     Ok(Json(ApiResponse::ok(())))
@@ -453,8 +453,8 @@ async fn change_password_handler(
     State(state): State<AuthRouterState>,
     Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ChangePasswordRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // Validate new password strength
     validate_password(&req.new_password)?;
@@ -464,40 +464,40 @@ async fn change_password_handler(
         .user_repo
         .find_by_id(&current_user.id)
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?
-        .ok_or_else(|| AppError::NotFound("User not found".into()))?;
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound("User not found".into()))?;
 
     // Verify current password
     let valid = verify_password_timed(&req.current_password, &user.password_hash).await?;
     if !valid {
-        return Err(AppError::Unauthorized("Current password is incorrect".into()));
+        return Err(ApiError::Unauthorized("Current password is incorrect".into()));
     }
 
     // Hash new password on blocking thread
     let password = req.new_password.clone();
     let new_hash = tokio::task::spawn_blocking(move || hash_password(&password))
         .await
-        .map_err(|e| AppError::Internal(format!("Task join error: {e}")))??;
+        .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
 
     // Persist new password hash
     state
         .user_repo
         .update_password(&current_user.id, &new_hash)
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     // Rotate JWT secret to invalidate all sessions
     let new_secret = state
         .jwt_service
         .rotate_secret()
-        .map_err(|e| AppError::Internal(format!("Secret rotation error: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Secret rotation error: {e}")))?;
 
     // Persist new secret to database
     state
         .user_repo
         .update_jwt_secret(&current_user.id, &new_secret)
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     Ok(Json(ApiResponse::message("Password changed successfully")))
 }
@@ -509,18 +509,18 @@ async fn change_password_handler(
 async fn refresh_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<RefreshTokenRequest>, JsonRejection>,
-) -> Result<Json<RefreshResponse>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<RefreshResponse>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let payload = state
         .jwt_service
         .verify(&req.token)
-        .map_err(|_| AppError::Unauthorized("Invalid or expired token".into()))?;
+        .map_err(|_| ApiError::Unauthorized("Invalid or expired token".into()))?;
 
     let new_token = state
         .jwt_service
         .sign(&payload.user_id, &payload.username)
-        .map_err(|e| AppError::Internal(format!("Token signing error: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     Ok(Json(RefreshResponse {
         success: true,
@@ -536,17 +536,17 @@ async fn ws_token_handler(
     State(state): State<AuthRouterState>,
     Extension(current_user): Extension<CurrentUser>,
     headers: HeaderMap,
-) -> Result<Json<WsTokenResponse>, AppError> {
+) -> Result<Json<WsTokenResponse>, ApiError> {
     // Reuse the existing session token for WebSocket connections
-    let token = extract_token_from_headers(&headers).ok_or_else(|| AppError::Unauthorized("No token found".into()))?;
+    let token = extract_token_from_headers(&headers).ok_or_else(|| ApiError::Unauthorized("No token found".into()))?;
 
     // Ensure user still exists
     state
         .user_repo
         .find_by_id(&current_user.id)
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?
-        .ok_or_else(|| AppError::Unauthorized("User not found".into()))?;
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
+        .ok_or_else(|| ApiError::Unauthorized("User not found".into()))?;
 
     // Cookie max age in milliseconds
     let expires_in = u64::from(COOKIE_MAX_AGE_DAYS) * 24 * 60 * 60 * 1000;
@@ -565,8 +565,8 @@ async fn ws_token_handler(
 async fn qr_login_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<QrLoginRequest>, JsonRejection>,
-) -> Result<Response, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Response, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // Validate and consume QR token (one-time use)
     state.qr_token_store.validate_and_consume(&req.qr_token)?;
@@ -576,13 +576,13 @@ async fn qr_login_handler(
         .user_repo
         .get_primary_webui_user()
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?
-        .ok_or_else(|| AppError::Internal("No primary user configured".into()))?;
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
+        .ok_or_else(|| ApiError::Internal("No primary user configured".into()))?;
 
     let token = state
         .jwt_service
         .sign(&user.id, &user.username)
-        .map_err(|e| AppError::Internal(format!("Token signing error: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     // Update last login (best-effort)
     if let Err(e) = state.user_repo.update_last_login(&user.id).await {
@@ -673,12 +673,12 @@ const QR_LOGIN_HTML: &str = r#"<!DOCTYPE html>
 const RESET_PASSWORD_LEN: usize = 16;
 
 /// Resolve the WebUI admin user, falling back to NotFound when absent.
-async fn resolve_webui_admin(user_repo: &dyn IUserRepository) -> Result<User, AppError> {
+async fn resolve_webui_admin(user_repo: &dyn IUserRepository) -> Result<User, ApiError> {
     user_repo
         .get_primary_webui_user()
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?
-        .ok_or_else(|| AppError::NotFound("No WebUI admin user configured".into()))
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound("No WebUI admin user configured".into()))
 }
 
 // ---------------------------------------------------------------------------
@@ -688,9 +688,9 @@ async fn resolve_webui_admin(user_repo: &dyn IUserRepository) -> Result<User, Ap
 async fn webui_change_password_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<WebuiChangePasswordRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
+) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     validate_password(&req.new_password)?;
 
@@ -699,13 +699,13 @@ async fn webui_change_password_handler(
     let password = req.new_password;
     let new_hash = tokio::task::spawn_blocking(move || hash_password(&password))
         .await
-        .map_err(|e| AppError::Internal(format!("Task join error: {e}")))??;
+        .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
 
     state
         .user_repo
         .update_password(&user.id, &new_hash)
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     Ok(Json(ApiResponse::message("Password changed successfully")))
 }
@@ -717,9 +717,9 @@ async fn webui_change_password_handler(
 async fn webui_change_username_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<WebuiChangeUsernameRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<WebuiChangeUsernameResponse>>, AppError> {
+) -> Result<Json<ApiResponse<WebuiChangeUsernameResponse>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let trimmed = req.new_username.trim().to_owned();
     validate_username(&trimmed)?;
@@ -731,7 +731,7 @@ async fn webui_change_username_handler(
             .user_repo
             .update_username(&user.id, &trimmed)
             .await
-            .map_err(|e| AppError::Internal(format!("Database error: {e}")))?;
+            .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
     }
 
     Ok(Json(ApiResponse::ok(WebuiChangeUsernameResponse { username: trimmed })))
@@ -743,7 +743,7 @@ async fn webui_change_username_handler(
 
 async fn webui_reset_password_handler(
     State(state): State<AuthRouterState>,
-) -> Result<Json<ApiResponse<WebuiResetPasswordResponse>>, AppError> {
+) -> Result<Json<ApiResponse<WebuiResetPasswordResponse>>, ApiError> {
     ensure_local_mode(state.local)?;
 
     let user = resolve_webui_admin(&*state.user_repo).await?;
@@ -752,13 +752,13 @@ async fn webui_reset_password_handler(
     let password_for_hash = new_password.clone();
     let new_hash = tokio::task::spawn_blocking(move || hash_password(&password_for_hash))
         .await
-        .map_err(|e| AppError::Internal(format!("Task join error: {e}")))??;
+        .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
 
     state
         .user_repo
         .update_password(&user.id, &new_hash)
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     Ok(Json(ApiResponse::ok(WebuiResetPasswordResponse { new_password })))
 }
@@ -769,7 +769,7 @@ async fn webui_reset_password_handler(
 
 async fn webui_generate_qr_token_handler(
     State(state): State<AuthRouterState>,
-) -> Result<Json<ApiResponse<WebuiGenerateQrTokenResponse>>, AppError> {
+) -> Result<Json<ApiResponse<WebuiGenerateQrTokenResponse>>, ApiError> {
     ensure_local_mode(state.local)?;
 
     let (token, expires_at_ms) = state.qr_token_store.generate_with_expiry();
@@ -787,49 +787,49 @@ mod error_mapping_tests {
 
     #[test]
     fn invalid_credentials_maps_to_unauthorized() {
-        let app_err = AppError::from(AuthError::InvalidCredentials);
+        let app_err = ApiError::from(AuthError::InvalidCredentials);
         assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn weak_password_maps_to_bad_request() {
-        let app_err = AppError::from(AuthError::WeakPassword("too short".into()));
+        let app_err = ApiError::from(AuthError::WeakPassword("too short".into()));
         assert_eq!(app_err.status_code(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn invalid_username_maps_to_bad_request() {
-        let app_err = AppError::from(AuthError::InvalidUsername("bad chars".into()));
+        let app_err = ApiError::from(AuthError::InvalidUsername("bad chars".into()));
         assert_eq!(app_err.status_code(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn token_expired_maps_to_unauthorized() {
-        let app_err = AppError::from(AuthError::TokenExpired);
+        let app_err = ApiError::from(AuthError::TokenExpired);
         assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn token_invalid_maps_to_unauthorized() {
-        let app_err = AppError::from(AuthError::TokenInvalid("bad".into()));
+        let app_err = ApiError::from(AuthError::TokenInvalid("bad".into()));
         assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn token_blacklisted_maps_to_unauthorized() {
-        let app_err = AppError::from(AuthError::TokenBlacklisted);
+        let app_err = ApiError::from(AuthError::TokenBlacklisted);
         assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn rate_limited_maps_to_rate_limited() {
-        let app_err = AppError::from(AuthError::RateLimited);
+        let app_err = ApiError::from(AuthError::RateLimited);
         assert_eq!(app_err.status_code(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
     fn hash_error_maps_to_internal() {
-        let app_err = AppError::from(AuthError::HashError("failed".into()));
+        let app_err = ApiError::from(AuthError::HashError("failed".into()));
         assert_eq!(app_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

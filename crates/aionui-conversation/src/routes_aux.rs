@@ -4,7 +4,7 @@ use aionui_api_types::{
     SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_auth::CurrentUser;
-use aionui_common::AppError;
+use aionui_common::ApiError;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
@@ -30,9 +30,9 @@ async fn get_mode(
     State(state): State<ConversationRouterState>,
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<AgentModeResponse>>, AppError> {
+) -> Result<Json<ApiResponse<AgentModeResponse>>, ApiError> {
     Ok(Json(ApiResponse::ok(
-        state.service.get_mode(&id).await.map_err(AppError::from)?,
+        state.service.get_mode(&id).await.map_err(ApiError::from)?,
     )))
 }
 
@@ -41,9 +41,9 @@ async fn set_mode(
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetModeRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state.service.set_mode(&id, req).await.map_err(AppError::from)?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    state.service.set_mode(&id, req).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -51,9 +51,9 @@ async fn get_model(
     State(state): State<ConversationRouterState>,
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<GetModelInfoResponse>>, AppError> {
+) -> Result<Json<ApiResponse<GetModelInfoResponse>>, ApiError> {
     Ok(Json(ApiResponse::ok(
-        state.service.get_model(&id).await.map_err(AppError::from)?,
+        state.service.get_model(&id).await.map_err(ApiError::from)?,
     )))
 }
 
@@ -62,9 +62,9 @@ async fn set_model(
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetModelRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state.service.set_model(&id, req).await.map_err(AppError::from)?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    state.service.set_model(&id, req).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -72,9 +72,9 @@ async fn get_usage(
     State(state): State<ConversationRouterState>,
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<Option<serde_json::Value>>>, AppError> {
+) -> Result<Json<ApiResponse<Option<serde_json::Value>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
-        state.service.get_usage(&id).await.map_err(AppError::from)?,
+        state.service.get_usage(&id).await.map_err(ApiError::from)?,
     )))
 }
 
@@ -83,13 +83,13 @@ async fn side_question(
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     Json(req): Json<SideQuestionRequest>,
-) -> Result<Json<ApiResponse<SideQuestionResponse>>, AppError> {
+) -> Result<Json<ApiResponse<SideQuestionResponse>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state
             .service
             .handle_side_question(&id, req)
             .await
-            .map_err(AppError::from)?,
+            .map_err(ApiError::from)?,
     )))
 }
 
@@ -97,9 +97,9 @@ async fn get_slash_commands(
     State(state): State<ConversationRouterState>,
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<Vec<SlashCommandItem>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<SlashCommandItem>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
-        state.service.get_slash_commands(&id).await.map_err(AppError::from)?,
+        state.service.get_slash_commands(&id).await.map_err(ApiError::from)?,
     )))
 }
 
@@ -107,9 +107,9 @@ async fn get_openclaw_runtime(
     State(state): State<ConversationRouterState>,
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     Ok(Json(ApiResponse::ok(
-        state.service.get_openclaw_runtime(&id).await.map_err(AppError::from)?,
+        state.service.get_openclaw_runtime(&id).await.map_err(ApiError::from)?,
     )))
 }
 
@@ -118,12 +118,12 @@ async fn browse_workspace(
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     Query(query): Query<WorkspaceBrowseQuery>,
-) -> Result<Json<ApiResponse<Vec<WorkspaceEntry>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<WorkspaceEntry>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state
             .service
             .browse_workspace(&id, query)
             .await
-            .map_err(AppError::from)?,
+            .map_err(ApiError::from)?,
     )))
 }

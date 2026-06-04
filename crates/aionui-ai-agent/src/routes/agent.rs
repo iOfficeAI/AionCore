@@ -17,7 +17,7 @@ use aionui_api_types::{
     TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
 use aionui_auth::CurrentUser;
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
 use crate::routes::state::AgentRouterState;
 
@@ -37,14 +37,14 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
 async fn list_agents(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-) -> Result<Json<ApiResponse<Vec<AgentMetadata>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<AgentMetadata>>>, ApiError> {
     Ok(Json(ApiResponse::ok(state.service.list_agents().await?)))
 }
 
 async fn refresh_agents(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-) -> Result<Json<ApiResponse<Vec<AgentMetadata>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<AgentMetadata>>>, ApiError> {
     Ok(Json(ApiResponse::ok(state.service.refresh_agents().await?)))
 }
 
@@ -52,8 +52,8 @@ async fn health_check(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<AcpHealthCheckRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<AcpHealthCheckResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<AcpHealthCheckResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(state.service.acp_health_check(req).await?)))
 }
 
@@ -61,8 +61,8 @@ async fn provider_health_check(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<ProviderHealthCheckRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<ProviderHealthCheckResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<ProviderHealthCheckResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(state.service.provider_health_check(req).await?)))
 }
 
@@ -70,8 +70,8 @@ async fn try_connect_custom(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<TryConnectCustomAgentRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<TryConnectCustomAgentResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<TryConnectCustomAgentResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(
         state.service.try_connect_custom_agent(req).await?,
     )))
@@ -81,8 +81,8 @@ async fn create_custom(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<CustomAgentUpsertRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<AgentMetadata>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<AgentMetadata>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(state.service.create_custom_agent(req).await?)))
 }
 
@@ -91,8 +91,8 @@ async fn update_custom(
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<CustomAgentUpsertRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<AgentMetadata>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<AgentMetadata>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(
         state.service.update_custom_agent(&id, req).await?,
     )))
@@ -102,7 +102,7 @@ async fn delete_custom(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<DeleteCustomAgentResponse>>, AppError> {
+) -> Result<Json<ApiResponse<DeleteCustomAgentResponse>>, ApiError> {
     state.service.delete_custom_agent(&id).await?;
     Ok(Json(ApiResponse::ok(DeleteCustomAgentResponse { deleted: true })))
 }
@@ -112,8 +112,8 @@ async fn set_agent_enabled(
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetEnabledRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<AgentMetadata>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<AgentMetadata>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(
         state.service.set_agent_enabled(&id, req.enabled).await?,
     )))

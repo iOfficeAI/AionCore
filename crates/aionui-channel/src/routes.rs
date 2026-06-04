@@ -11,7 +11,7 @@ use aionui_api_types::{
     DisablePluginRequest, EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest,
     RevokeUserRequest, SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
 };
-use aionui_common::AppError;
+use aionui_common::ApiError;
 use aionui_db::IChannelRepository;
 use aionui_extension::{ExtensionRegistry, ResolvedChannelPlugin};
 use serde::Serialize;
@@ -86,7 +86,7 @@ pub fn weixin_login_route(state: ChannelRouterState) -> Router {
 /// `GET /api/channel/plugins` — get status of all registered plugins.
 async fn get_plugin_status(
     State(state): State<ChannelRouterState>,
-) -> Result<Json<ApiResponse<Vec<ChannelPluginStatusView>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<ChannelPluginStatusView>>>, ApiError> {
     let statuses = state.manager.get_plugin_status().await?;
     let extension_plugins = state.extension_registry.get_channel_plugins().await;
 
@@ -262,8 +262,8 @@ impl From<&ResolvedChannelPlugin> for ChannelExtensionMetaView {
 async fn enable_plugin(
     State(state): State<ChannelRouterState>,
     body: Result<Json<EnablePluginRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<BridgeResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &req.plugin_id).await {
         let config = build_extension_config(&extension_plugin, &req.config)?;
@@ -315,8 +315,8 @@ async fn enable_plugin(
 async fn disable_plugin(
     State(state): State<ChannelRouterState>,
     body: Result<Json<DisablePluginRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<BridgeResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     if resolve_extension_channel_plugin(&state, &req.plugin_id).await.is_some()
         && state.repo.get_plugin(&req.plugin_id).await?.is_none()
@@ -349,8 +349,8 @@ async fn disable_plugin(
 async fn test_plugin(
     State(state): State<ChannelRouterState>,
     body: Result<Json<TestPluginRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<TestPluginResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<TestPluginResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &req.plugin_id).await {
         let _config = build_extension_test_config(&extension_plugin, &req)?;
@@ -388,7 +388,7 @@ async fn test_plugin(
 /// `GET /api/channel/pairings` — get all pending pairing requests.
 async fn get_pending_pairings(
     State(state): State<ChannelRouterState>,
-) -> Result<Json<ApiResponse<Vec<PairingRequestResponse>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<PairingRequestResponse>>>, ApiError> {
     let rows = state.pairing_service.get_pending_pairings().await?;
     let responses: Vec<PairingRequestResponse> = rows
         .into_iter()
@@ -408,8 +408,8 @@ async fn get_pending_pairings(
 async fn approve_pairing(
     State(state): State<ChannelRouterState>,
     body: Result<Json<ApprovePairingRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<BridgeResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     state.pairing_service.approve_pairing(&req.code).await?;
 
@@ -424,8 +424,8 @@ async fn approve_pairing(
 async fn reject_pairing(
     State(state): State<ChannelRouterState>,
     body: Result<Json<RejectPairingRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<BridgeResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     state.pairing_service.reject_pairing(&req.code).await?;
 
@@ -443,7 +443,7 @@ async fn reject_pairing(
 /// `GET /api/channel/users` — get all authorized users.
 async fn get_authorized_users(
     State(state): State<ChannelRouterState>,
-) -> Result<Json<ApiResponse<Vec<ChannelUserResponse>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<ChannelUserResponse>>>, ApiError> {
     let rows = state.repo.get_all_users().await?;
     let responses: Vec<ChannelUserResponse> = rows
         .into_iter()
@@ -465,8 +465,8 @@ async fn get_authorized_users(
 async fn revoke_user(
     State(state): State<ChannelRouterState>,
     body: Result<Json<RevokeUserRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<BridgeResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // Clean up sessions first
     state.session_manager.cleanup_user_sessions(&req.user_id).await?;
@@ -488,7 +488,7 @@ async fn revoke_user(
 /// `GET /api/channel/sessions` — get all active sessions.
 async fn get_active_sessions(
     State(state): State<ChannelRouterState>,
-) -> Result<Json<ApiResponse<Vec<ChannelSessionResponse>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<ChannelSessionResponse>>>, ApiError> {
     let rows = state.session_manager.get_active_sessions().await?;
     let responses: Vec<ChannelSessionResponse> = rows
         .into_iter()
@@ -518,11 +518,11 @@ async fn get_active_sessions(
 async fn sync_channel_settings(
     State(state): State<ChannelRouterState>,
     body: Result<Json<SyncChannelSettingsRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<BridgeResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let _platform = PluginType::from_str_opt(&req.platform)
-        .ok_or_else(|| AppError::BadRequest(format!("Invalid platform: {}", req.platform)))?;
+        .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", req.platform)))?;
 
     state.session_manager.clear_all_sessions().await?;
 
