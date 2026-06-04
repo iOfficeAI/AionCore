@@ -19,6 +19,7 @@ use aionui_common::AppError;
 use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
 use aionui_db::{IUserRepository, models::User};
 
+use crate::error::AuthError;
 use crate::extract::extract_token_from_headers;
 use crate::middleware::{AuthState, CurrentUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
@@ -28,6 +29,21 @@ use crate::rate_limit::{
 };
 use crate::validation::{validate_password, validate_username};
 use crate::{CookieConfig, JwtService};
+
+impl From<AuthError> for AppError {
+    fn from(err: AuthError) -> Self {
+        match err {
+            AuthError::InvalidCredentials => AppError::Unauthorized("Invalid username or password".into()),
+            AuthError::WeakPassword(msg) => AppError::BadRequest(msg),
+            AuthError::InvalidUsername(msg) => AppError::BadRequest(msg),
+            AuthError::TokenExpired => AppError::Unauthorized("Token expired".into()),
+            AuthError::TokenInvalid(msg) => AppError::Unauthorized(msg),
+            AuthError::TokenBlacklisted => AppError::Unauthorized("Token has been revoked".into()),
+            AuthError::RateLimited => AppError::RateLimited,
+            AuthError::HashError(msg) => AppError::Internal(format!("Password hash error: {msg}")),
+        }
+    }
+}
 
 /// Shared state for all auth route handlers.
 #[derive(Clone)]
@@ -762,4 +778,58 @@ async fn webui_generate_qr_token_handler(
         token,
         expires_at_ms,
     })))
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn invalid_credentials_maps_to_unauthorized() {
+        let app_err = AppError::from(AuthError::InvalidCredentials);
+        assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn weak_password_maps_to_bad_request() {
+        let app_err = AppError::from(AuthError::WeakPassword("too short".into()));
+        assert_eq!(app_err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn invalid_username_maps_to_bad_request() {
+        let app_err = AppError::from(AuthError::InvalidUsername("bad chars".into()));
+        assert_eq!(app_err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn token_expired_maps_to_unauthorized() {
+        let app_err = AppError::from(AuthError::TokenExpired);
+        assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn token_invalid_maps_to_unauthorized() {
+        let app_err = AppError::from(AuthError::TokenInvalid("bad".into()));
+        assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn token_blacklisted_maps_to_unauthorized() {
+        let app_err = AppError::from(AuthError::TokenBlacklisted);
+        assert_eq!(app_err.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn rate_limited_maps_to_rate_limited() {
+        let app_err = AppError::from(AuthError::RateLimited);
+        assert_eq!(app_err.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn hash_error_maps_to_internal() {
+        let app_err = AppError::from(AuthError::HashError("failed".into()));
+        assert_eq!(app_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
