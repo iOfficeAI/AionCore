@@ -3,7 +3,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use crate::error::AppError;
+use crate::error::ApiError;
 
 const NONCE_SIZE: usize = 12;
 const KEY_SIZE: usize = 32;
@@ -11,19 +11,19 @@ const KEY_SIZE: usize = 32;
 /// Encrypt a string value using AES-256-GCM.
 ///
 /// The key must be exactly 32 bytes. Output is base64-encoded (nonce + ciphertext + tag).
-pub fn encrypt_string(plaintext: &str, key: &[u8]) -> Result<String, AppError> {
+pub fn encrypt_string(plaintext: &str, key: &[u8]) -> Result<String, ApiError> {
     validate_key_size(key)?;
 
     let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| AppError::Internal(format!("Failed to create cipher: {e}")))?;
+        Aes256Gcm::new_from_slice(key).map_err(|e| ApiError::Internal(format!("Failed to create cipher: {e}")))?;
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
-    getrandom::getrandom(&mut nonce_bytes).map_err(|e| AppError::Internal(format!("RNG failure: {e}")))?;
+    getrandom::getrandom(&mut nonce_bytes).map_err(|e| ApiError::Internal(format!("RNG failure: {e}")))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_bytes())
-        .map_err(|e| AppError::Internal(format!("Encryption failed: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Encryption failed: {e}")))?;
 
     let mut combined = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
     combined.extend_from_slice(&nonce_bytes);
@@ -35,18 +35,18 @@ pub fn encrypt_string(plaintext: &str, key: &[u8]) -> Result<String, AppError> {
 /// Decrypt an AES-256-GCM encrypted string.
 ///
 /// The key must be exactly 32 bytes. Input is base64-encoded (nonce + ciphertext + tag).
-pub fn decrypt_string(ciphertext: &str, key: &[u8]) -> Result<String, AppError> {
+pub fn decrypt_string(ciphertext: &str, key: &[u8]) -> Result<String, ApiError> {
     validate_key_size(key)?;
 
     let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| AppError::Internal(format!("Failed to create cipher: {e}")))?;
+        Aes256Gcm::new_from_slice(key).map_err(|e| ApiError::Internal(format!("Failed to create cipher: {e}")))?;
 
     let combined = BASE64
         .decode(ciphertext)
-        .map_err(|e| AppError::BadRequest(format!("Invalid base64: {e}")))?;
+        .map_err(|e| ApiError::BadRequest(format!("Invalid base64: {e}")))?;
 
     if combined.len() < NONCE_SIZE {
-        return Err(AppError::BadRequest("Ciphertext too short".into()));
+        return Err(ApiError::BadRequest("Ciphertext too short".into()));
     }
 
     let (nonce_bytes, encrypted) = combined.split_at(NONCE_SIZE);
@@ -54,14 +54,14 @@ pub fn decrypt_string(ciphertext: &str, key: &[u8]) -> Result<String, AppError> 
 
     let plaintext = cipher
         .decrypt(nonce, encrypted)
-        .map_err(|_| AppError::BadRequest("Decryption failed: invalid key or corrupted data".into()))?;
+        .map_err(|_| ApiError::BadRequest("Decryption failed: invalid key or corrupted data".into()))?;
 
-    String::from_utf8(plaintext).map_err(|e| AppError::Internal(format!("Invalid UTF-8 in decrypted data: {e}")))
+    String::from_utf8(plaintext).map_err(|e| ApiError::Internal(format!("Invalid UTF-8 in decrypted data: {e}")))
 }
 
-fn validate_key_size(key: &[u8]) -> Result<(), AppError> {
+fn validate_key_size(key: &[u8]) -> Result<(), ApiError> {
     if key.len() != KEY_SIZE {
-        return Err(AppError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "AES-256 key must be exactly {KEY_SIZE} bytes, got {}",
             key.len()
         )));
