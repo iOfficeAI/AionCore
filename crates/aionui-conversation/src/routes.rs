@@ -22,6 +22,10 @@ impl From<ConversationError> for AppError {
         match error {
             ConversationError::NotFound { id } => AppError::NotFound(format!("Conversation {id} not found")),
             ConversationError::MessageNotFound { id } => AppError::NotFound(format!("Message {id} not found")),
+            ConversationError::ArtifactNotFound { id } => AppError::NotFound(format!("Artifact {id} not found")),
+            ConversationError::ActiveAgentNotFound { .. } => {
+                AppError::NotFound("No active agent for this conversation".into())
+            }
             ConversationError::Archived { reason, .. } => AppError::ConversationArchived(reason),
             ConversationError::BadRequest { reason } => AppError::BadRequest(reason),
             ConversationError::Busy { reason } => AppError::Conflict(reason),
@@ -65,7 +69,7 @@ async fn create(
     body: Result<Json<CreateConversationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let conversation = state.service.create(&user.id, req).await?;
+    let conversation = state.service.create(&user.id, req).await.map_err(AppError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }
 
@@ -74,7 +78,7 @@ async fn list(
     Extension(user): Extension<CurrentUser>,
     Query(query): Query<ListConversationsQuery>,
 ) -> Result<Json<ApiResponse<ConversationListResponse>>, AppError> {
-    let result = state.service.list(&user.id, query).await?;
+    let result = state.service.list(&user.id, query).await.map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -84,7 +88,11 @@ async fn clone(
     body: Result<Json<CloneConversationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let conversation = state.service.clone_create(&user.id, req).await?;
+    let conversation = state
+        .service
+        .clone_create(&user.id, req)
+        .await
+        .map_err(AppError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }
 
@@ -104,7 +112,11 @@ async fn update(
     body: Result<Json<UpdateConversationRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ConversationResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let conversation = state.service.update(&user.id, &id, req, &state.task_manager).await?;
+    let conversation = state
+        .service
+        .update(&user.id, &id, req, &state.task_manager)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(conversation)))
 }
 
@@ -113,7 +125,7 @@ async fn delete_one(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.delete(&user.id, &id).await?;
+    state.service.delete(&user.id, &id).await.map_err(AppError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -122,7 +134,7 @@ async fn reset(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.reset(&user.id, &id).await?;
+    state.service.reset(&user.id, &id).await.map_err(AppError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -131,7 +143,11 @@ async fn associated(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<ConversationResponse>>>, AppError> {
-    let items = state.service.list_associated(&user.id, &id).await?;
+    let items = state
+        .service
+        .list_associated(&user.id, &id)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(items)))
 }
 
@@ -192,7 +208,11 @@ async fn list_artifacts(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<ConversationArtifactListResponse>>, AppError> {
-    let result = state.service.list_artifacts(&user.id, &id).await?;
+    let result = state
+        .service
+        .list_artifacts(&user.id, &id)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -213,7 +233,8 @@ async fn update_artifact(
     let artifact = state
         .service
         .update_artifact(&user.id, &params.id, &params.artifact_id, req)
-        .await?;
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(artifact)))
 }
 
@@ -248,7 +269,11 @@ async fn search_messages(
     Extension(user): Extension<CurrentUser>,
     Query(query): Query<SearchMessagesQuery>,
 ) -> Result<Json<ApiResponse<MessageSearchResponse>>, AppError> {
-    let result = state.service.search_messages(&user.id, query).await?;
+    let result = state
+        .service
+        .search_messages(&user.id, query)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -262,7 +287,8 @@ async fn list_confirmations(
     let items = state
         .service
         .list_confirmations(&user.id, &id, &state.task_manager)
-        .await?;
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(items)))
 }
 
@@ -283,7 +309,8 @@ async fn confirm(
     state
         .service
         .confirm(&user.id, &params.id, &params.call_id, req, &state.task_manager)
-        .await?;
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -306,7 +333,8 @@ async fn check_approval(
             query.command_type.as_deref(),
             &state.task_manager,
         )
-        .await?;
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -341,6 +369,22 @@ mod error_mapping_tests {
     fn message_not_found_maps_to_app_not_found() {
         let app = AppError::from(ConversationError::MessageNotFound { id: "msg_1".into() });
         assert!(matches!(app, AppError::NotFound(message) if message == "Message msg_1 not found"));
+    }
+
+    #[test]
+    fn artifact_not_found_maps_to_app_not_found() {
+        let app = AppError::from(ConversationError::ArtifactNotFound {
+            id: "artifact_1".into(),
+        });
+        assert!(matches!(app, AppError::NotFound(message) if message == "Artifact artifact_1 not found"));
+    }
+
+    #[test]
+    fn active_agent_not_found_maps_to_app_not_found() {
+        let app = AppError::from(ConversationError::ActiveAgentNotFound {
+            conversation_id: "conv_1".into(),
+        });
+        assert!(matches!(app, AppError::NotFound(message) if message == "No active agent for this conversation"));
     }
 
     #[test]

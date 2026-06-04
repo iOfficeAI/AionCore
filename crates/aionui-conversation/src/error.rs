@@ -15,6 +15,12 @@ pub enum ConversationError {
     #[error("Message not found: {id}")]
     MessageNotFound { id: String },
 
+    #[error("Artifact not found: {id}")]
+    ArtifactNotFound { id: String },
+
+    #[error("Active agent not found for conversation: {conversation_id}")]
+    ActiveAgentNotFound { conversation_id: String },
+
     #[error("Conversation is archived: {reason}")]
     Archived { id: String, reason: String },
 

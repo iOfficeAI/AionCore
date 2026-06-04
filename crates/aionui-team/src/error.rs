@@ -1,4 +1,5 @@
 use aionui_common::AppError;
+use aionui_conversation::ConversationError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TeamError {
@@ -32,6 +33,9 @@ pub enum TeamError {
     #[error(transparent)]
     App(#[from] AppError),
 
+    #[error(transparent)]
+    Conversation(#[from] ConversationError),
+
     #[error("{0}")]
     Database(#[from] aionui_db::DbError),
 
@@ -52,6 +56,7 @@ impl From<TeamError> for AppError {
             TeamError::BackendNotAllowed(msg) => AppError::BadRequest(msg),
             TeamError::DuplicateAgentName(msg) => AppError::BadRequest(format!("Agent name already taken: {msg}")),
             TeamError::App(app_err) => app_err,
+            TeamError::Conversation(conversation_err) => AppError::from(conversation_err),
             TeamError::Database(db_err) => AppError::from(db_err),
             TeamError::Json(e) => AppError::Internal(format!("JSON error: {e}")),
         }
@@ -59,10 +64,12 @@ impl From<TeamError> for AppError {
 }
 
 impl TeamError {
-    pub(crate) fn from_conversation_create(error: AppError) -> Self {
+    pub(crate) fn from_conversation_create(error: ConversationError) -> Self {
         match error {
-            AppError::WorkspacePathContainsWhitespace(_) => Self::App(error),
-            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(_) => Self::App(error),
+            ConversationError::App(error @ AppError::WorkspacePathContainsWhitespace(_)) => Self::App(error),
+            ConversationError::App(error @ AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(_)) => {
+                Self::App(error)
+            }
             other => Self::InvalidRequest(format!("failed to create conversation: {other}")),
         }
     }
@@ -130,6 +137,21 @@ mod tests {
     fn app_error_passthrough_preserves_code() {
         let err: AppError = TeamError::App(AppError::WorkspacePathContainsWhitespace("/tmp/a b".into())).into();
         assert!(matches!(err, AppError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
+    }
+
+    #[test]
+    fn conversation_error_maps_through_boundary_mapper() {
+        let err: AppError = TeamError::Conversation(ConversationError::NotFound { id: "conv-1".into() }).into();
+        assert!(matches!(err, AppError::NotFound(msg) if msg == "Conversation conv-1 not found"));
+    }
+
+    #[test]
+    fn conversation_create_preserves_workspace_error_code() {
+        let err = TeamError::from_conversation_create(ConversationError::App(
+            AppError::WorkspacePathContainsWhitespace("/tmp/a b".into()),
+        ));
+        let app: AppError = err.into();
+        assert!(matches!(app, AppError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
     }
 
     #[test]

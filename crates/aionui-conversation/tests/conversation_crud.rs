@@ -445,7 +445,7 @@ async fn t4_6_update_not_found() {
     let (svc, _, task_mgr) = setup().await;
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();
     let err = svc.update(USER_ID, "non-existent", req, &task_mgr).await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── T5: Delete conversation ────────────────────────────────────────
@@ -483,7 +483,7 @@ async fn t5_2_delete_then_get_returns_404() {
 async fn t5_3_delete_not_found() {
     let (svc, _, _task_mgr) = setup().await;
     let err = svc.delete(USER_ID, "non-existent").await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── T11: WebSocket event verification ──────────────────────────────
@@ -644,7 +644,7 @@ async fn create_rejects_top_level_model_for_acp() {
 
     let err = svc.create(USER_ID, req).await.unwrap_err();
     match err {
-        AppError::BadRequest(msg) => {
+        ConversationError::BadRequest { reason: msg } => {
             assert!(msg.contains("model"), "error message should mention model: {msg}");
             assert!(msg.contains("extra"), "error message should mention extra: {msg}");
         }
@@ -663,7 +663,10 @@ async fn create_rejects_top_level_model_for_remote() {
     }))
     .unwrap();
 
-    assert!(matches!(svc.create(USER_ID, req).await, Err(AppError::BadRequest(_))));
+    assert!(matches!(
+        svc.create(USER_ID, req).await,
+        Err(ConversationError::BadRequest { .. })
+    ));
 }
 
 #[tokio::test]
@@ -720,7 +723,7 @@ async fn update_rejects_top_level_model_for_acp() {
 
     let err = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap_err();
     assert!(
-        matches!(err, AppError::BadRequest(_)),
+        matches!(err, ConversationError::BadRequest { .. }),
         "expected BadRequest, got {err:?}"
     );
 }

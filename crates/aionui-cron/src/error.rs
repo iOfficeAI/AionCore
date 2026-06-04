@@ -1,4 +1,5 @@
 use aionui_common::AppError;
+use aionui_conversation::ConversationError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CronError {
@@ -35,6 +36,9 @@ pub enum CronError {
     #[error(transparent)]
     App(#[from] AppError),
 
+    #[error(transparent)]
+    Conversation(#[from] ConversationError),
+
     #[error("{0}")]
     Database(#[from] aionui_db::DbError),
 
@@ -56,6 +60,7 @@ impl From<CronError> for AppError {
             CronError::InvalidAgentConfig(msg) => AppError::BadRequest(msg),
             CronError::Scheduler(msg) => AppError::Internal(msg),
             CronError::App(app_err) => app_err,
+            CronError::Conversation(conversation_err) => AppError::from(conversation_err),
             CronError::Database(db_err) => AppError::from(db_err),
             CronError::Json(e) => AppError::Internal(format!("JSON error: {e}")),
         }
@@ -63,10 +68,12 @@ impl From<CronError> for AppError {
 }
 
 impl CronError {
-    pub(crate) fn from_conversation_create(error: AppError) -> Self {
+    pub(crate) fn from_conversation_create(error: ConversationError) -> Self {
         match error {
-            AppError::WorkspacePathContainsWhitespace(_) => Self::App(error),
-            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(_) => Self::App(error),
+            ConversationError::App(error @ AppError::WorkspacePathContainsWhitespace(_)) => Self::App(error),
+            ConversationError::App(error @ AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(_)) => {
+                Self::App(error)
+            }
             other => Self::Scheduler(format!("create conversation: {other}")),
         }
     }
@@ -140,6 +147,21 @@ mod tests {
     fn app_error_passthrough_preserves_code() {
         let err: AppError = CronError::App(AppError::WorkspacePathContainsWhitespace("/tmp/a b".into())).into();
         assert!(matches!(err, AppError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
+    }
+
+    #[test]
+    fn conversation_error_maps_through_boundary_mapper() {
+        let err: AppError = CronError::Conversation(ConversationError::NotFound { id: "conv-1".into() }).into();
+        assert!(matches!(err, AppError::NotFound(msg) if msg == "Conversation conv-1 not found"));
+    }
+
+    #[test]
+    fn conversation_create_preserves_workspace_error_code() {
+        let err = CronError::from_conversation_create(ConversationError::App(
+            AppError::WorkspacePathContainsWhitespace("/tmp/a b".into()),
+        ));
+        let app: AppError = err.into();
+        assert!(matches!(app, AppError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
     }
 
     #[test]

@@ -218,7 +218,7 @@ async fn t7_1_reset_clears_messages_and_status() {
 async fn t7_3_reset_not_found() {
     let (svc, _repo, _b) = setup().await;
     let err = svc.reset(USER_ID, "nonexistent").await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── T8: Message list ───────────────────────────────────────────────
@@ -480,7 +480,7 @@ async fn t9_4_empty_keyword() {
         page_size: None,
     };
     let err = svc.search_messages(USER_ID, query).await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::BadRequest(_)));
+    assert!(matches!(err, ConversationError::BadRequest { .. }));
 }
 
 #[tokio::test]
@@ -622,7 +622,7 @@ async fn t10_2_no_associated() {
 async fn t10_3_associated_not_found() {
     let (svc, _repo, _b) = setup().await;
     let err = svc.list_associated(USER_ID, "nonexistent").await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── T12: Boundary scenarios ────────────────────────────────────────
@@ -666,5 +666,5 @@ async fn reset_wrong_user_returns_not_found() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let err = svc.reset("other_user", &conv.id).await.unwrap_err();
-    assert!(matches!(err, aionui_common::AppError::NotFound(_)));
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
