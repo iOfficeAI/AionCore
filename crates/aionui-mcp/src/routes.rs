@@ -13,10 +13,28 @@ use aionui_api_types::{
 use aionui_common::AppError;
 
 use crate::connection_test::McpConnectionTestService;
+use crate::error::McpError;
 use crate::oauth_service::McpOAuthService;
 use crate::service::McpConfigService;
 use crate::sync_service::McpSyncService;
 use crate::types::McpServerTransport;
+
+impl From<McpError> for AppError {
+    fn from(err: McpError) -> Self {
+        match err {
+            McpError::NotFound(msg) => AppError::NotFound(msg),
+            McpError::Conflict(msg) => AppError::Conflict(msg),
+            McpError::InvalidEdit(msg) => AppError::BadRequest(msg),
+            McpError::InvalidTransport(msg) => AppError::BadRequest(msg),
+            McpError::AgentNotInstalled(msg) => AppError::BadRequest(msg),
+            McpError::AgentOperationFailed(msg) => AppError::Internal(msg),
+            McpError::ConnectionFailed(msg) => AppError::BadGateway(msg),
+            McpError::OAuth(msg) => AppError::Internal(format!("OAuth error: {msg}")),
+            McpError::Database(db_err) => AppError::from(db_err),
+            McpError::Json(e) => AppError::Internal(format!("JSON error: {e}")),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Router state
@@ -68,7 +86,7 @@ pub fn mcp_routes(state: McpRouterState) -> Router {
 async fn list_servers(
     State(state): State<McpRouterState>,
 ) -> Result<Json<ApiResponse<Vec<McpServerResponse>>>, AppError> {
-    let servers = state.config_service.list_servers().await?;
+    let servers = state.config_service.list_servers().await.map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(servers)))
 }
 
@@ -77,7 +95,7 @@ async fn get_server(
     State(state): State<McpRouterState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, AppError> {
-    let server = state.config_service.get_server(&id).await?;
+    let server = state.config_service.get_server(&id).await.map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(server)))
 }
 
@@ -87,7 +105,7 @@ async fn add_server(
     body: Result<Json<CreateMcpServerRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<McpServerResponse>>), AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let server = state.config_service.add_server(req).await?;
+    let server = state.config_service.add_server(req).await.map_err(AppError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(server))))
 }
 
@@ -98,7 +116,11 @@ async fn edit_server(
     body: Result<Json<UpdateMcpServerRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let server = state.config_service.edit_server(&id, req).await?;
+    let server = state
+        .config_service
+        .edit_server(&id, req)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(server)))
 }
 
@@ -107,7 +129,7 @@ async fn delete_server(
     State(state): State<McpRouterState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.config_service.delete_server(&id).await?;
+    state.config_service.delete_server(&id).await.map_err(AppError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -116,7 +138,7 @@ async fn toggle_server(
     State(state): State<McpRouterState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, AppError> {
-    let server = state.config_service.toggle_server(&id).await?;
+    let server = state.config_service.toggle_server(&id).await.map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(server)))
 }
 
@@ -126,7 +148,7 @@ async fn batch_import(
     body: Result<Json<BatchImportMcpServersRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<McpServerResponse>>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let servers = state.config_service.batch_import(req).await?;
+    let servers = state.config_service.batch_import(req).await.map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(servers)))
 }
 
@@ -148,7 +170,11 @@ async fn test_connection(
         .test_connection(&req.name, &transport)
         .await;
     if let Some(server_id) = req.id.as_deref() {
-        state.config_service.persist_test_result(server_id, &result).await?;
+        state
+            .config_service
+            .persist_test_result(server_id, &result)
+            .await
+            .map_err(AppError::from)?;
     }
     if result.success || result.needs_auth == Some(true) {
         return Ok(Json(ApiResponse::ok(result)).into_response());
@@ -196,7 +222,7 @@ fn connection_test_failure_status(code: McpConnectionTestErrorCode) -> StatusCod
 async fn get_agent_configs(
     State(state): State<McpRouterState>,
 ) -> Result<Json<ApiResponse<Vec<DetectedMcpServerResponse>>>, AppError> {
-    let configs = state.sync_service.get_agent_configs().await?;
+    let configs = state.sync_service.get_agent_configs().await.map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(configs)))
 }
 
@@ -210,7 +236,11 @@ async fn oauth_check_status(
     body: Result<Json<OAuthCheckStatusRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<OAuthStatusResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let status = state.oauth_service.check_oauth_status(&req.server_url).await?;
+    let status = state
+        .oauth_service
+        .check_oauth_status(&req.server_url)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(status)))
 }
 
@@ -223,7 +253,11 @@ async fn oauth_login(
     body: Result<Json<OAuthLoginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<OAuthLoginResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let result = state.oauth_service.login(&req.server_url).await?;
+    let result = state
+        .oauth_service
+        .login(&req.server_url)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -233,12 +267,80 @@ async fn oauth_logout(
     body: Result<Json<OAuthLogoutRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state.oauth_service.logout(&req.server_url).await?;
+    state
+        .oauth_service
+        .logout(&req.server_url)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
 /// `GET /api/mcp/oauth/authenticated` — list server URLs with stored tokens.
 async fn oauth_authenticated(State(state): State<McpRouterState>) -> Result<Json<ApiResponse<Vec<String>>>, AppError> {
-    let urls = state.oauth_service.get_authenticated_servers().await?;
+    let urls = state
+        .oauth_service
+        .get_authenticated_servers()
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ApiResponse::ok(urls)))
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn not_found_maps_to_app_not_found() {
+        let err = AppError::from(McpError::NotFound("mcp_123".into()));
+        assert!(matches!(err, AppError::NotFound(msg) if msg == "mcp_123"));
+    }
+
+    #[test]
+    fn conflict_maps_to_app_conflict() {
+        let err = AppError::from(McpError::Conflict("test-server".into()));
+        assert!(matches!(err, AppError::Conflict(_)));
+    }
+
+    #[test]
+    fn invalid_transport_maps_to_bad_request() {
+        let err = AppError::from(McpError::InvalidTransport("missing command".into()));
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn invalid_edit_maps_to_bad_request() {
+        let err = AppError::from(McpError::InvalidEdit("rename forbidden".into()));
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn agent_not_installed_maps_to_bad_request() {
+        let err = AppError::from(McpError::AgentNotInstalled("claude".into()));
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn agent_operation_failed_maps_to_internal() {
+        let err = AppError::from(McpError::AgentOperationFailed("exit code 1".into()));
+        assert!(matches!(err, AppError::Internal(_)));
+    }
+
+    #[test]
+    fn connection_failed_maps_to_bad_gateway() {
+        let err = AppError::from(McpError::ConnectionFailed("timeout".into()));
+        assert!(matches!(err, AppError::BadGateway(_)));
+    }
+
+    #[test]
+    fn oauth_maps_to_internal() {
+        let err = AppError::from(McpError::OAuth("discovery failed".into()));
+        assert!(matches!(err, AppError::Internal(_)));
+    }
+
+    #[test]
+    fn json_error_maps_to_internal() {
+        let json_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
+        let err = AppError::from(McpError::Json(json_err));
+        assert!(matches!(err, AppError::Internal(_)));
+    }
 }
