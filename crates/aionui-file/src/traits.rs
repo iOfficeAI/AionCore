@@ -60,12 +60,13 @@ pub trait IFileService: Send + Sync {
     /// Create an empty temporary file and return its absolute path.
     async fn create_temp_file(&self, file_name: &str) -> Result<String, AppError>;
 
-    /// Write `data` to a temporary file and return its absolute path.
+    /// Write `data` to an upload file and return its absolute path.
     ///
-    /// When `conversation_id` is provided, the file is placed under a
-    /// per-conversation sub-directory (`<tmp>/aionui/<conversation_id>/`);
-    /// otherwise the shared `<tmp>/aionui/` directory is used (same as
-    /// [`create_temp_file`](Self::create_temp_file)).
+    /// When `conversation_id` is provided and upload-to-workspace is enabled,
+    /// the file is placed in that conversation's workspace. Otherwise it is
+    /// placed under a per-conversation temp directory
+    /// (`<tmp>/aionui/<conversation_id>/`) or `<tmp>/aionui/general/` when no
+    /// conversation is provided.
     ///
     /// `file_name` must not contain path separators or traversal patterns.
     async fn create_upload_file(

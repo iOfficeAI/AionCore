@@ -11,6 +11,7 @@ use tracing::warn;
 
 use aionui_api_types::WebSocketMessage;
 use aionui_common::AppError;
+use aionui_db::{IConversationRepository, ISettingsRepository};
 use aionui_realtime::EventBroadcaster;
 
 use crate::path_safety::{has_traversal, validate_path, validate_path_for_write, validate_path_with_extra_root};
@@ -59,6 +60,7 @@ const PLACEHOLDER_SVG: &str = concat!(
 /// A concrete implementation of [`crate::traits::IFileService`].
 pub struct FileService {
     broadcaster: Arc<dyn EventBroadcaster>,
+    upload_workspace_context: Option<UploadWorkspaceContext>,
     /// Allowed root directories for path safety validation.
     allowed_roots: Vec<std::path::PathBuf>,
     /// In-memory cache for `list_workspace_files`, keyed by canonical root.
@@ -67,14 +69,32 @@ pub struct FileService {
     zip_cancellations: DashMap<String, Arc<AtomicBool>>,
 }
 
+struct UploadWorkspaceContext {
+    settings_repo: Arc<dyn ISettingsRepository>,
+    conversation_repo: Arc<dyn IConversationRepository>,
+}
+
 impl FileService {
     pub fn new(broadcaster: Arc<dyn EventBroadcaster>, allowed_roots: Vec<std::path::PathBuf>) -> Self {
         Self {
             broadcaster,
+            upload_workspace_context: None,
             allowed_roots,
             workspace_files_cache: DashMap::new(),
             zip_cancellations: DashMap::new(),
         }
+    }
+
+    pub fn with_upload_workspace_context(
+        mut self,
+        settings_repo: Arc<dyn ISettingsRepository>,
+        conversation_repo: Arc<dyn IConversationRepository>,
+    ) -> Self {
+        self.upload_workspace_context = Some(UploadWorkspaceContext {
+            settings_repo,
+            conversation_repo,
+        });
+        self
     }
 
     /// Invalidate the workspace files cache for a given root.
@@ -112,6 +132,57 @@ impl FileService {
             .chain(extra_root)
             .filter_map(|root| std::fs::canonicalize(root).ok())
             .any(|root| candidate.starts_with(root))
+    }
+
+    async fn resolve_upload_directory(&self, conversation_id: Option<&str>) -> Result<PathBuf, AppError> {
+        let temp_dir = upload_temp_dir(conversation_id);
+        let Some(conversation_id) = conversation_id else {
+            return Ok(temp_dir);
+        };
+        let Some(context) = self.upload_workspace_context.as_ref() else {
+            return Ok(temp_dir);
+        };
+
+        let settings = context
+            .settings_repo
+            .get_settings()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to get upload setting: {e}")))?;
+        if !settings.as_ref().map(|s| s.save_upload_to_workspace).unwrap_or(false) {
+            return Ok(temp_dir);
+        }
+
+        let Some(conversation) = context
+            .conversation_repo
+            .get(conversation_id)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to get conversation for upload workspace: {e}")))?
+        else {
+            warn!(
+                conversation_id,
+                "upload workspace save requested but conversation was not found; falling back to temp upload directory"
+            );
+            return Ok(temp_dir);
+        };
+
+        match workspace_from_conversation_extra(&conversation.extra) {
+            Ok(Some(workspace)) => Ok(workspace),
+            Ok(None) => {
+                warn!(
+                    conversation_id,
+                    "upload workspace save requested but conversation has no workspace; falling back to temp upload directory"
+                );
+                Ok(temp_dir)
+            }
+            Err(e) => {
+                warn!(
+                    conversation_id,
+                    error = %e,
+                    "upload workspace save requested but conversation extra is invalid; falling back to temp upload directory"
+                );
+                Ok(temp_dir)
+            }
+        }
     }
 
     /// List immediate children of `dir`, building a single-level tree.
@@ -350,6 +421,26 @@ fn split_base_ext(name: &str) -> (&str, &str) {
         Some(idx) if idx > 0 => name.split_at(idx),
         _ => (name, ""),
     }
+}
+
+fn upload_temp_dir(conversation_id: Option<&str>) -> PathBuf {
+    let mut dir = std::env::temp_dir().join("aionui");
+    if let Some(conversation_id) = conversation_id {
+        dir = dir.join(conversation_id);
+    } else {
+        dir = dir.join("general");
+    }
+    dir
+}
+
+fn workspace_from_conversation_extra(extra: &str) -> Result<Option<PathBuf>, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(extra)?;
+    Ok(value
+        .get("workspace")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty())
+        .map(PathBuf::from))
 }
 
 /// Get file metadata synchronously.
@@ -924,16 +1015,13 @@ impl crate::traits::IFileService for FileService {
 
         let name = file_name.to_owned();
         let bytes = data.to_vec();
+        let dir = self.resolve_upload_directory(conv_id.as_deref()).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let mut dir = std::env::temp_dir().join("aionui");
-            if let Some(conv_id) = conv_id.as_deref() {
-                dir = dir.join(conv_id);
-            } else {
-                dir = dir.join("general");
-            }
+        let uploaded_path = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&dir)
                 .map_err(|e| AppError::Internal(format!("cannot create upload directory: {e}")))?;
+            let dir = std::fs::canonicalize(&dir)
+                .map_err(|e| AppError::Internal(format!("cannot resolve upload directory: {e}")))?;
 
             let (base, ext) = split_base_ext(&name);
             let mut candidate = name.clone();
@@ -971,7 +1059,14 @@ impl crate::traits::IFileService for FileService {
             }
         })
         .await
-        .map_err(|e| AppError::Internal(format!("create upload file task failed: {e}")))?
+        .map_err(|e| AppError::Internal(format!("create upload file task failed: {e}")))??;
+
+        // Uploads can create files inside a workspace after the file mention
+        // list has already cached an empty result. Clear all roots because an
+        // upload can affect both the exact workspace cache and ancestor roots.
+        self.workspace_files_cache.clear();
+
+        Ok(uploaded_path)
     }
 
     async fn get_image_base64(&self, path: &str, extra_root: Option<&Path>) -> Result<String, AppError> {
@@ -1857,6 +1952,44 @@ mod tests {
         crate::service::FileService::new(Arc::new(NullBroadcaster), vec![])
     }
 
+    async fn make_service_with_upload_context(
+        save_upload_to_workspace: bool,
+        conversation_id: &str,
+        workspace: &std::path::Path,
+    ) -> (crate::service::FileService, aionui_db::Database) {
+        use aionui_db::{IConversationRepository, ISettingsRepository};
+
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let settings_repo = Arc::new(aionui_db::SqliteSettingsRepository::new(db.pool().clone()));
+        settings_repo
+            .upsert_settings("en-US", true, false, false, save_upload_to_workspace)
+            .await
+            .unwrap();
+
+        let conversation_repo = Arc::new(aionui_db::SqliteConversationRepository::new(db.pool().clone()));
+        let now = aionui_common::now_ms();
+        let row = aionui_db::models::ConversationRow {
+            id: conversation_id.to_owned(),
+            user_id: "system_default_user".to_owned(),
+            name: "Upload target".to_owned(),
+            r#type: "acp".to_owned(),
+            extra: serde_json::json!({ "workspace": workspace.to_string_lossy() }).to_string(),
+            model: None,
+            status: Some("pending".to_owned()),
+            source: Some("aionui".to_owned()),
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        conversation_repo.create(&row).await.unwrap();
+
+        let service = crate::service::FileService::new(Arc::new(NullBroadcaster), vec![workspace.to_path_buf()])
+            .with_upload_workspace_context(settings_repo, conversation_repo);
+        (service, db)
+    }
+
     #[tokio::test]
     async fn create_upload_file_writes_bytes_and_returns_path() {
         use crate::traits::IFileService;
@@ -1904,6 +2037,69 @@ mod tests {
         assert_eq!(parent.file_name().unwrap().to_string_lossy(), conv);
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir(parent);
+    }
+
+    #[tokio::test]
+    async fn create_upload_file_uses_conversation_workspace_when_setting_enabled() {
+        use crate::traits::IFileService;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let conv = unique_conv_id("workspace");
+        let (svc, _db) = make_service_with_upload_context(true, &conv, workspace.path()).await;
+
+        let path_str = svc
+            .create_upload_file("project.json", br#"{"ok":true}"#, Some(&conv))
+            .await
+            .unwrap();
+        let path = std::path::Path::new(&path_str);
+        let workspace_root = std::fs::canonicalize(workspace.path()).unwrap();
+
+        assert_eq!(path.parent().unwrap(), workspace_root);
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "project.json");
+        assert_eq!(std::fs::read(path).unwrap(), br#"{"ok":true}"#);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn create_upload_file_invalidates_workspace_file_list_cache() {
+        use crate::traits::IFileService;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let conv = unique_conv_id("workspace-cache");
+        let (svc, _db) = make_service_with_upload_context(true, &conv, workspace.path()).await;
+        let workspace_str = workspace.path().to_string_lossy().into_owned();
+
+        let before = svc.list_workspace_files(&workspace_str).await.unwrap();
+        assert!(before.is_empty());
+
+        let path_str = svc
+            .create_upload_file("cached.md", b"# cached", Some(&conv))
+            .await
+            .unwrap();
+        let after = svc.list_workspace_files(&workspace_str).await.unwrap();
+
+        assert!(after.iter().any(|file| file.name == "cached.md"));
+        let _ = std::fs::remove_file(path_str);
+    }
+
+    #[tokio::test]
+    async fn create_upload_file_uses_temp_directory_when_setting_disabled() {
+        use crate::traits::IFileService;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let conv = unique_conv_id("workspace-disabled");
+        let (svc, _db) = make_service_with_upload_context(false, &conv, workspace.path()).await;
+
+        let path_str = svc.create_upload_file("note.txt", b"temp", Some(&conv)).await.unwrap();
+        let path = std::path::Path::new(&path_str);
+        let parent = path.parent().unwrap();
+
+        assert_eq!(parent.file_name().unwrap().to_string_lossy(), conv);
+        assert_ne!(parent, std::fs::canonicalize(workspace.path()).unwrap());
+        assert_eq!(std::fs::read(path).unwrap(), b"temp");
+
+        let _ = std::fs::remove_dir_all(parent);
     }
 
     #[tokio::test]

@@ -880,6 +880,60 @@ async fn upload_accepts_small_png_and_returns_readable_path() {
 }
 
 #[tokio::test]
+async fn upload_saves_to_conversation_workspace_when_setting_enabled() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "PATCH",
+        "/api/settings",
+        json!({ "save_upload_to_workspace": true }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let workspace = tempfile::tempdir().unwrap();
+    let req = json_with_token(
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "name": "Upload workspace target",
+            "extra": { "workspace": workspace.path().to_str().unwrap() }
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = body_json(resp).await;
+    let conversation_id = created["data"]["id"].as_str().unwrap();
+
+    let bytes = br#"{"uploaded":true}"#.to_vec();
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "workspace-upload.json", "application/json", &bytes)
+        .add_text("conversation_id", conversation_id)
+        .build();
+
+    let req = upload_request(&content_type, body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let path = json["data"].as_str().expect("data should be a string path");
+    let path = std::path::Path::new(path);
+    let workspace_root = std::fs::canonicalize(workspace.path()).unwrap();
+
+    assert_eq!(path.parent().unwrap(), workspace_root);
+    assert_eq!(path.file_name().unwrap().to_string_lossy(), "workspace-upload.json");
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn upload_uses_content_disposition_filename_when_file_name_missing() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

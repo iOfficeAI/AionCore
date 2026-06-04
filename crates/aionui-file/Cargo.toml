@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 aionui-api-types.workspace = true
 aionui-common.workspace = true
+aionui-db.workspace = true
 aionui-realtime.workspace = true
 async-trait.workspace = true
 axum.workspace = true

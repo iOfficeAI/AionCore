@@ -303,7 +303,11 @@ pub fn build_file_state(services: &AppServices) -> FileRouterState {
     let broadcaster = services.event_bus.clone();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
     let browse_roots = aionui_file::browse::default_browse_roots();
-    let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
+    let upload_settings_repo = Arc::new(SqliteSettingsRepository::new(services.database.pool().clone()));
+    let file_service = Arc::new(
+        FileService::new(broadcaster.clone(), allowed_roots.clone())
+            .with_upload_workspace_context(upload_settings_repo, services.conversation_repo.clone()),
+    );
     let watch_service = Arc::new(FileWatchService::new(broadcaster).expect("file watch service initialization"));
     let snapshot_service = Arc::new(SnapshotService::new());
     FileRouterState {
