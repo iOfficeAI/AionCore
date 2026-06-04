@@ -1528,6 +1528,7 @@ mod tests {
 
         let outcome = relay.consume(rx).await;
         assert!(outcome.system_responses.is_empty());
+        assert_eq!(outcome.terminal, RelayTerminal::ChannelClosed);
 
         // Should still persist the partial text
         let inserts = repo.take_inserts();
