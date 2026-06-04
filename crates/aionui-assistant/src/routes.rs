@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 //! HTTP route handlers for `/api/assistants/*`.
 
 use axum::Router;
@@ -14,6 +16,7 @@ use aionui_api_types::{
 };
 use aionui_common::ApiError;
 
+use crate::error::AssistantError;
 pub use crate::state::AssistantRouterState;
 
 /// Build the router for `/api/assistants/*`.
@@ -25,6 +28,18 @@ pub fn assistant_routes(state: AssistantRouterState) -> Router {
         .route("/api/assistants/{id}/avatar", get(get_avatar))
         .route("/api/assistants/import", post(import))
         .with_state(state)
+}
+
+impl From<AssistantError> for ApiError {
+    fn from(error: AssistantError) -> Self {
+        match error {
+            AssistantError::NotFound(message) => Self::NotFound(message),
+            AssistantError::BadRequest(message) => Self::BadRequest(message),
+            AssistantError::Forbidden(message) => Self::Forbidden(message),
+            AssistantError::Conflict(message) => Self::Conflict(message),
+            AssistantError::Internal(message) => Self::Internal(message),
+        }
+    }
 }
 
 async fn list(

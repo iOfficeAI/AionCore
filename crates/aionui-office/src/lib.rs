@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_types)]
+
 //! Office document preview, format conversion, proxy, and snapshot management.
 pub mod conversion;
 pub mod error;

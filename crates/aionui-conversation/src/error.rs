@@ -1,5 +1,4 @@
-use aionui_ai_agent::AcpError;
-use aionui_common::ApiError;
+use aionui_ai_agent::{AcpError, AgentError};
 use aionui_db::DbError;
 
 /// Application-level error contract for the conversation domain.
@@ -64,27 +63,90 @@ pub enum ConversationError {
     Acp(#[from] AcpError),
 }
 
-impl From<ApiError> for ConversationError {
-    fn from(error: ApiError) -> Self {
+impl ConversationError {
+    pub(crate) fn internal(reason: impl Into<String>) -> Self {
+        Self::Internal { reason: reason.into() }
+    }
+
+    pub(crate) fn not_found_reason(reason: impl Into<String>) -> Self {
+        Self::NotFoundReason { reason: reason.into() }
+    }
+
+    pub(crate) fn to_agent_error(&self) -> AgentError {
+        match self {
+            Self::NotFound { id } => AgentError::not_found(format!("Conversation {id} not found")),
+            Self::MessageNotFound { id } => AgentError::not_found(format!("Message {id} not found")),
+            Self::ArtifactNotFound { id } => AgentError::not_found(format!("Artifact {id} not found")),
+            Self::ActiveAgentNotFound { .. } => AgentError::not_found("No active agent for this conversation"),
+            Self::Archived { reason, .. } => AgentError::conversation_archived(reason.clone()),
+            Self::BadRequest { reason } => AgentError::bad_request(reason.clone()),
+            Self::Busy { reason } => AgentError::conflict(reason.clone()),
+            Self::Forbidden { reason } => AgentError::forbidden(reason.clone()),
+            Self::NotFoundReason { reason } => AgentError::not_found(reason.clone()),
+            Self::Unauthorized { reason } => AgentError::unauthorized(reason.clone()),
+            Self::RateLimited => AgentError::RateLimited,
+            Self::BadGateway { reason } => AgentError::bad_gateway(reason.clone()),
+            Self::Timeout { reason } => AgentError::timeout(reason.clone()),
+            Self::Unprocessable { reason } => AgentError::bad_request(reason.clone()),
+            Self::Internal { reason } => AgentError::internal(reason.clone()),
+            Self::WorkspacePathContainsWhitespace { path } => AgentError::bad_request(format!(
+                "Workspace path contains whitespace in one or more directory names: {path}"
+            )),
+            Self::WorkspacePathContainsWhitespaceRuntimeUnsupported { path } => {
+                AgentError::workspace_path_contains_whitespace_runtime_unsupported(path.clone())
+            }
+            Self::Acp(err) => AgentError::bad_gateway(err.to_string()),
+        }
+    }
+
+    pub(crate) fn error_code(&self) -> &'static str {
+        match self {
+            Self::NotFound { .. }
+            | Self::MessageNotFound { .. }
+            | Self::ArtifactNotFound { .. }
+            | Self::ActiveAgentNotFound { .. }
+            | Self::NotFoundReason { .. } => "NOT_FOUND",
+            Self::BadRequest { .. } => "BAD_REQUEST",
+            Self::Unauthorized { .. } => "UNAUTHORIZED",
+            Self::Forbidden { .. } => "FORBIDDEN",
+            Self::Busy { .. } => "CONFLICT",
+            Self::RateLimited => "RATE_LIMITED",
+            Self::Internal { .. } | Self::Acp(_) => "INTERNAL_ERROR",
+            Self::BadGateway { .. } => "BAD_GATEWAY",
+            Self::Timeout { .. } => "TIMEOUT",
+            Self::Unprocessable { .. } => "UNPROCESSABLE_ENTITY",
+            Self::Archived { .. } => "CONVERSATION_ARCHIVED",
+            Self::WorkspacePathContainsWhitespace { .. } => "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED",
+            Self::WorkspacePathContainsWhitespaceRuntimeUnsupported { .. } => {
+                "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
+            }
+        }
+    }
+}
+
+impl From<AgentError> for ConversationError {
+    fn from(error: AgentError) -> Self {
         match error {
-            ApiError::NotFound(reason) => Self::NotFoundReason { reason },
-            ApiError::BadRequest(reason) => Self::BadRequest { reason },
-            ApiError::Unauthorized(reason) => Self::Unauthorized { reason },
-            ApiError::Forbidden(reason) => Self::Forbidden { reason },
-            ApiError::Conflict(reason) => Self::Busy { reason },
-            ApiError::RateLimited => Self::RateLimited,
-            ApiError::Internal(reason) => Self::Internal { reason },
-            ApiError::BadGateway(reason) => Self::BadGateway { reason },
-            ApiError::Timeout(reason) => Self::Timeout { reason },
-            ApiError::UnprocessableEntity(reason) => Self::Unprocessable { reason },
-            ApiError::ConversationArchived(reason) => Self::Archived {
+            AgentError::NotFound(reason) => Self::NotFoundReason { reason },
+            AgentError::BadRequest(reason) => Self::BadRequest { reason },
+            AgentError::Unauthorized(reason) => Self::Unauthorized { reason },
+            AgentError::Forbidden(reason) => Self::Forbidden { reason },
+            AgentError::Conflict(reason) => Self::Busy { reason },
+            AgentError::RateLimited => Self::RateLimited,
+            AgentError::Internal(reason) => Self::Internal { reason },
+            AgentError::BadGateway(reason) => Self::BadGateway { reason },
+            AgentError::Timeout(reason) => Self::Timeout { reason },
+            AgentError::ConversationArchived(reason) => Self::Archived {
                 id: String::new(),
                 reason,
             },
-            ApiError::WorkspacePathContainsWhitespace(path) => Self::WorkspacePathContainsWhitespace { path },
-            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => {
+            AgentError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => {
                 Self::WorkspacePathContainsWhitespaceRuntimeUnsupported { path }
             }
+            AgentError::Acp(err) => Self::Acp(err),
+            _ => Self::Internal {
+                reason: error.to_string(),
+            },
         }
     }
 }
@@ -115,6 +177,8 @@ mod tests {
 
     fn assert_from_acp<T: From<AcpError>>() {}
 
+    fn assert_from_agent<T: From<AgentError>>() {}
+
     fn assert_from_db<T: From<DbError>>() {}
 
     #[test]
@@ -125,6 +189,11 @@ mod tests {
     #[test]
     fn conversation_error_has_acp_from_impl() {
         assert_from_acp::<ConversationError>();
+    }
+
+    #[test]
+    fn conversation_error_has_agent_from_impl() {
+        assert_from_agent::<ConversationError>();
     }
 
     #[test]

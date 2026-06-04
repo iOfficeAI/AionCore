@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
@@ -30,7 +32,7 @@ impl From<McpError> for ApiError {
             McpError::AgentOperationFailed(msg) => ApiError::Internal(msg),
             McpError::ConnectionFailed(msg) => ApiError::BadGateway(msg),
             McpError::OAuth(msg) => ApiError::Internal(format!("OAuth error: {msg}")),
-            McpError::Database(db_err) => ApiError::from(db_err),
+            McpError::Database(db_err) => ApiError::Internal(db_err.to_string()),
             McpError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
         }
     }

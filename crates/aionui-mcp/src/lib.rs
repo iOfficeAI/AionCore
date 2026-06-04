@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_types)]
+
 //! MCP server configuration, multi-agent sync adapters, OAuth, and connection testing.
 pub mod adapter;
 pub mod adapters;

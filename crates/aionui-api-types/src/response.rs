@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use aionui_common::ApiError;
 use serde::{Deserialize, Serialize};
 

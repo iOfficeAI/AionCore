@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, Query, State};
@@ -14,6 +16,7 @@ use aionui_api_types::{
 use aionui_common::ApiError;
 
 use crate::client_pref::ClientPrefService;
+use crate::error::SystemError;
 use crate::model_fetcher::ModelFetchService;
 use crate::protocol::ProtocolDetectionService;
 use crate::provider::ProviderService;
@@ -31,6 +34,20 @@ pub struct SystemRouterState {
     pub protocol_detection_service: ProtocolDetectionService,
     pub version_check_service: VersionCheckService,
     pub runtime_prepare_service: RuntimePrepareService,
+}
+
+impl From<SystemError> for ApiError {
+    fn from(error: SystemError) -> Self {
+        match error {
+            SystemError::NotFound(reason) => ApiError::NotFound(reason),
+            SystemError::BadRequest(reason) => ApiError::BadRequest(reason),
+            SystemError::Conflict(reason) => ApiError::Conflict(reason),
+            SystemError::Internal(reason) => ApiError::Internal(reason),
+            SystemError::BadGateway(reason) => ApiError::BadGateway(reason),
+            SystemError::Timeout(reason) => ApiError::Timeout(reason),
+            SystemError::UnprocessableEntity(reason) => ApiError::UnprocessableEntity(reason),
+        }
+    }
 }
 
 /// Build the system router (settings + client prefs + providers + system).
@@ -87,7 +104,7 @@ pub fn settings_routes(state: SystemRouterState) -> Router {
 async fn get_settings(
     State(state): State<SystemRouterState>,
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, ApiError> {
-    let settings = state.settings_service.get_settings().await?;
+    let settings = state.settings_service.get_settings().await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(settings)))
 }
 
@@ -96,7 +113,11 @@ async fn update_settings(
     body: Result<Json<UpdateSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let settings = state.settings_service.update_settings(req).await?;
+    let settings = state
+        .settings_service
+        .update_settings(req)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(settings)))
 }
 
@@ -122,7 +143,11 @@ async fn get_client_preferences(
 
     let key_refs: Option<Vec<&str>> = keys_filter.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
 
-    let prefs = state.client_pref_service.get_preferences(key_refs.as_deref()).await?;
+    let prefs = state
+        .client_pref_service
+        .get_preferences(key_refs.as_deref())
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(prefs)))
 }
 
@@ -131,7 +156,11 @@ async fn update_client_preferences(
     body: Result<Json<UpdateClientPreferencesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    state.client_pref_service.update_preferences(req).await?;
+    state
+        .client_pref_service
+        .update_preferences(req)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -142,7 +171,7 @@ async fn update_client_preferences(
 async fn list_providers(
     State(state): State<SystemRouterState>,
 ) -> Result<Json<ApiResponse<Vec<ProviderResponse>>>, ApiError> {
-    let providers = state.provider_service.list().await?;
+    let providers = state.provider_service.list().await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(providers)))
 }
 
@@ -151,7 +180,7 @@ async fn create_provider(
     body: Result<Json<CreateProviderRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ProviderResponse>>), ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let provider = state.provider_service.create(req).await?;
+    let provider = state.provider_service.create(req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(provider))))
 }
 
@@ -161,7 +190,7 @@ async fn update_provider(
     body: Result<Json<UpdateProviderRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderResponse>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let provider = state.provider_service.update(&id, req).await?;
+    let provider = state.provider_service.update(&id, req).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(provider)))
 }
 
@@ -169,7 +198,7 @@ async fn delete_provider(
     State(state): State<SystemRouterState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.provider_service.delete(&id).await?;
+    state.provider_service.delete(&id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -179,7 +208,11 @@ async fn fetch_models(
     body: Result<Json<FetchModelsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FetchModelsResponse>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let result = state.model_fetch_service.fetch_models(&id, &req).await?;
+    let result = state
+        .model_fetch_service
+        .fetch_models(&id, &req)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -188,7 +221,11 @@ async fn fetch_models_anonymous(
     body: Result<Json<FetchModelsAnonymousRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FetchModelsResponse>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let result = state.model_fetch_service.fetch_models_anonymous(&req).await?;
+    let result = state
+        .model_fetch_service
+        .fetch_models_anonymous(&req)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -197,7 +234,11 @@ async fn detect_protocol(
     body: Result<Json<DetectProtocolRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProtocolDetectionResponse>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let result = state.protocol_detection_service.detect_protocol(&req).await?;
+    let result = state
+        .protocol_detection_service
+        .detect_protocol(&req)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -215,15 +256,19 @@ async fn check_update(
     body: Result<Json<UpdateCheckRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<UpdateCheckResult>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let result = state.version_check_service.check_update(&req).await?;
+    let result = state
+        .version_check_service
+        .check_update(&req)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
 async fn ensure_node_runtime(
     State(state): State<SystemRouterState>,
     body: Result<Json<EnsureNodeRuntimeRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<EnsureNodeRuntimeResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<EnsureNodeRuntimeResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let result = state.runtime_prepare_service.ensure_node_runtime(req.scope).await?;
     Ok(Json(ApiResponse::ok(result)))
 }
@@ -231,8 +276,8 @@ async fn ensure_node_runtime(
 async fn ensure_managed_acp_tool(
     State(state): State<SystemRouterState>,
     body: Result<Json<EnsureManagedAcpToolRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<EnsureManagedAcpToolResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<EnsureManagedAcpToolResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let result = state
         .runtime_prepare_service
         .ensure_managed_acp_tool(req.scope, &req.tool_id)

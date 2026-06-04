@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +19,7 @@ use aionui_api_types::{
 };
 use aionui_common::ApiError;
 use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
-use aionui_db::{IUserRepository, models::User};
+use aionui_db::{DbError, IUserRepository, models::User};
 
 use crate::error::AuthError;
 use crate::extract::extract_token_from_headers;
@@ -42,6 +44,16 @@ impl From<AuthError> for ApiError {
             AuthError::RateLimited => ApiError::RateLimited,
             AuthError::HashError(msg) => ApiError::Internal(format!("Password hash error: {msg}")),
         }
+    }
+}
+
+fn db_error_to_api_error(err: DbError) -> ApiError {
+    match err {
+        DbError::NotFound(msg) => ApiError::NotFound(msg),
+        DbError::Conflict(msg) => ApiError::Conflict(msg),
+        DbError::Query(e) => ApiError::Internal(format!("Database error: {e}")),
+        DbError::Migration(e) => ApiError::Internal(format!("Migration error: {e}")),
+        DbError::Init(msg) => ApiError::Internal(format!("Database init error: {msg}")),
     }
 }
 
@@ -336,7 +348,7 @@ async fn list_internal_users_handler(
     State(state): State<AuthRouterState>,
 ) -> Result<Json<ApiResponse<Vec<User>>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let users = state.user_repo.list_users().await?;
+    let users = state.user_repo.list_users().await.map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(users)))
 }
 
@@ -344,7 +356,7 @@ async fn get_system_user_handler(
     State(state): State<AuthRouterState>,
 ) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let user = state.user_repo.get_system_user().await?;
+    let user = state.user_repo.get_system_user().await.map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(user)))
 }
 
@@ -353,7 +365,11 @@ async fn find_user_by_username_handler(
     Path(username): Path<String>,
 ) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let user = state.user_repo.find_by_username(&username).await?;
+    let user = state
+        .user_repo
+        .find_by_username(&username)
+        .await
+        .map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(user)))
 }
 
@@ -362,7 +378,7 @@ async fn find_user_by_id_handler(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let user = state.user_repo.find_by_id(&id).await?;
+    let user = state.user_repo.find_by_id(&id).await.map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(user)))
 }
 
@@ -372,7 +388,11 @@ async fn create_internal_user_handler(
 ) -> Result<Json<ApiResponse<User>>, ApiError> {
     ensure_local_mode(state.local)?;
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let user = state.user_repo.create_user(&req.username, &req.password_hash).await?;
+    let user = state
+        .user_repo
+        .create_user(&req.username, &req.password_hash)
+        .await
+        .map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(user)))
 }
 
@@ -385,7 +405,8 @@ async fn set_system_user_credentials_handler(
     state
         .user_repo
         .set_system_user_credentials(&req.username, &req.password_hash)
-        .await?;
+        .await
+        .map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(())))
 }
 
@@ -396,7 +417,11 @@ async fn update_user_password_hash_handler(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    state.user_repo.update_password(&id, &req.password_hash).await?;
+    state
+        .user_repo
+        .update_password(&id, &req.password_hash)
+        .await
+        .map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(())))
 }
 
@@ -407,7 +432,11 @@ async fn update_user_username_handler(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    state.user_repo.update_username(&id, &req.username).await?;
+    state
+        .user_repo
+        .update_username(&id, &req.username)
+        .await
+        .map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(())))
 }
 
@@ -418,7 +447,11 @@ async fn update_user_jwt_secret_handler(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    state.user_repo.update_jwt_secret(&id, &req.jwt_secret).await?;
+    state
+        .user_repo
+        .update_jwt_secret(&id, &req.jwt_secret)
+        .await
+        .map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(())))
 }
 
@@ -427,7 +460,11 @@ async fn update_user_last_login_handler(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
-    state.user_repo.update_last_login(&id).await?;
+    state
+        .user_repo
+        .update_last_login(&id)
+        .await
+        .map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(())))
 }
 

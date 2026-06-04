@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use aionui_api_types::{
     DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig, SpeechToTextConfig, SpeechToTextProvider,
 };

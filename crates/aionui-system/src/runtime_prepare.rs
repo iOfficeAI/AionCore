@@ -4,13 +4,14 @@ use aionui_api_types::{
     EnsureManagedAcpToolResponse, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind,
     RuntimeStatusPayload, RuntimeStatusPhase, RuntimeStatusScope, WebSocketMessage,
 };
-use aionui_common::AppError;
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{
     ManagedAcpToolFailureKind, ManagedAcpToolId, ManagedAcpToolProgress, ManagedAcpToolProgressPhase,
     NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressPhase, SharedManagedAcpToolProgressReporter,
     SharedNodeRuntimeProgressReporter, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter,
 };
+
+use crate::error::SystemError;
 
 #[derive(Clone)]
 pub struct RuntimePrepareService {
@@ -22,11 +23,14 @@ impl RuntimePrepareService {
         Self { broadcaster }
     }
 
-    pub async fn ensure_node_runtime(&self, scope: RuntimeStatusScope) -> Result<EnsureNodeRuntimeResponse, AppError> {
+    pub async fn ensure_node_runtime(
+        &self,
+        scope: RuntimeStatusScope,
+    ) -> Result<EnsureNodeRuntimeResponse, SystemError> {
         let reporter = self.node_runtime_reporter(scope);
         ensure_node_runtime_with_reporter(Some(reporter.as_ref()))
             .await
-            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            .map_err(|error| SystemError::BadRequest(error.to_string()))?;
         Ok(EnsureNodeRuntimeResponse { ready: true })
     }
 
@@ -34,18 +38,18 @@ impl RuntimePrepareService {
         &self,
         scope: RuntimeStatusScope,
         tool_id: &str,
-    ) -> Result<EnsureManagedAcpToolResponse, AppError> {
+    ) -> Result<EnsureManagedAcpToolResponse, SystemError> {
         let tool = ManagedAcpToolId::from_slug(tool_id)
-            .ok_or_else(|| AppError::BadRequest(format!("Unsupported managed ACP tool '{tool_id}'")))?;
+            .ok_or_else(|| SystemError::BadRequest(format!("Unsupported managed ACP tool '{tool_id}'")))?;
         let node_reporter = self.node_runtime_reporter(scope.clone());
         ensure_node_runtime_with_reporter(Some(node_reporter.as_ref()))
             .await
-            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            .map_err(|error| SystemError::BadRequest(error.to_string()))?;
 
         let tool_reporter = self.acp_tool_runtime_reporter(scope, tool);
         ensure_managed_acp_tool_with_reporter(tool, Some(tool_reporter.as_ref()))
             .await
-            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            .map_err(|error| SystemError::BadRequest(error.to_string()))?;
         Ok(EnsureManagedAcpToolResponse { ready: true })
     }
 

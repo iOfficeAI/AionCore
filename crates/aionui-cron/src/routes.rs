@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
@@ -10,10 +12,21 @@ use aionui_api_types::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
+use aionui_db::DbError;
 
 use crate::error::CronError;
 use crate::service::CronService;
 use crate::state::CronRouterState;
+
+fn db_error_to_api_error(err: DbError) -> ApiError {
+    match err {
+        DbError::NotFound(msg) => ApiError::NotFound(msg),
+        DbError::Conflict(msg) => ApiError::Conflict(msg),
+        DbError::Query(e) => ApiError::Internal(format!("Database error: {e}")),
+        DbError::Migration(e) => ApiError::Internal(format!("Migration error: {e}")),
+        DbError::Init(msg) => ApiError::Internal(format!("Database init error: {msg}")),
+    }
+}
 
 impl From<CronError> for ApiError {
     fn from(err: CronError) -> Self {
@@ -33,7 +46,7 @@ impl From<CronError> for ApiError {
                 ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
             }
             CronError::Conversation(conversation_err) => ApiError::from(conversation_err),
-            CronError::Database(db_err) => ApiError::from(db_err),
+            CronError::Database(db_err) => db_error_to_api_error(db_err),
             CronError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
         }
     }

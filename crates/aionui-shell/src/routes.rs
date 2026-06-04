@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::extract::{Multipart, State};
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -182,6 +184,7 @@ async fn speech_to_text(
         .get_preferences(Some(&["speechToText"]))
         .await
         .map_err(|e| {
+            let e = ApiError::from(e);
             let status = e.status_code();
             let body = serde_json::json!({
                 "success": false,

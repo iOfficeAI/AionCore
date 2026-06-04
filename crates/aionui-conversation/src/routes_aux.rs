@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use crate::state::ConversationRouterState;
 use aionui_api_types::{
     AgentModeResponse, ApiResponse, GetModelInfoResponse, SetModeRequest, SetModelRequest, SideQuestionRequest,

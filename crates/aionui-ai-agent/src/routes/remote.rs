@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 //! Remote agent management API routes.
 //!
 //! Endpoints:
@@ -23,6 +25,7 @@ use aionui_api_types::{
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
+use super::error_mapping::agent_error_to_api_error;
 use super::state::RemoteAgentRouterState;
 
 /// Build the remote agent router.
@@ -41,7 +44,7 @@ async fn list(
     State(state): State<RemoteAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<RemoteAgentListItem>>>, ApiError> {
-    let items = state.service.list().await?;
+    let items = state.service.list().await.map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(items)))
 }
 
@@ -50,7 +53,7 @@ async fn get_one(
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<RemoteAgentResponse>>, ApiError> {
-    let agent = state.service.get(&id).await?;
+    let agent = state.service.get(&id).await.map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(agent)))
 }
 
@@ -60,7 +63,7 @@ async fn create(
     body: Result<Json<CreateRemoteAgentRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<RemoteAgentResponse>>), ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let agent = state.service.create(req).await?;
+    let agent = state.service.create(req).await.map_err(agent_error_to_api_error)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(agent))))
 }
 
@@ -71,7 +74,7 @@ async fn update(
     body: Result<Json<UpdateRemoteAgentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RemoteAgentResponse>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let agent = state.service.update(&id, req).await?;
+    let agent = state.service.update(&id, req).await.map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(agent)))
 }
 
@@ -80,7 +83,7 @@ async fn delete_one(
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.service.delete(&id).await?;
+    state.service.delete(&id).await.map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -90,7 +93,11 @@ async fn test_connection(
     body: Result<Json<TestRemoteAgentConnectionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    state.service.test_connection(req).await?;
+    state
+        .service
+        .test_connection(req)
+        .await
+        .map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -99,6 +106,6 @@ async fn handshake(
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<HandshakeResponse>>, ApiError> {
-    let resp = state.service.handshake(&id).await?;
+    let resp = state.service.handshake(&id).await.map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(resp)))
 }

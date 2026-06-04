@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_types)]
+
 //! External channel integration: plugin system, pairing handshake, and per-session messaging.
 pub mod action;
 pub mod channel_settings;

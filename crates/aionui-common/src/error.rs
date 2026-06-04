@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use std::path::{Component, Path};
 
 use axum::http::StatusCode;
@@ -57,12 +59,6 @@ pub enum ApiError {
     )]
     WorkspacePathContainsWhitespaceRuntimeUnsupported(String),
 }
-
-/// Backward-compatible alias for pre-Phase3 call sites.
-///
-/// New HTTP boundary code should use `ApiError`. Domain and service layers
-/// should use their crate-owned error types instead.
-pub type AppError = ApiError;
 
 /// Internal error response body matching the `ErrorResponse` format from `aionui-api-types`.
 #[derive(Serialize)]

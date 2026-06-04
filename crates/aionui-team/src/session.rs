@@ -840,13 +840,14 @@ mod tests {
     use super::*;
     use crate::test_utils::MockTeamRepo;
     use crate::types::{Team, TeamAgent, TeammateRole};
+    use aionui_ai_agent::AgentError;
     use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
     use aionui_ai_agent::protocol::events::AgentStreamEvent;
     use aionui_ai_agent::shared_kernel::approval_key;
     use aionui_ai_agent::types::BuildTaskOptions;
     use aionui_ai_agent::types::SendMessageData;
     use aionui_api_types::{AgentModeResponse, WebSocketMessage};
-    use aionui_common::{AgentKillReason, AgentType, ApiError, Confirmation, ConversationStatus, TimestampMs, now_ms};
+    use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
     use std::sync::{Arc, Mutex};
     use tokio::sync::broadcast;
 
@@ -926,16 +927,16 @@ mod tests {
         async fn send_message(&self, data: SendMessageData) -> Result<(), aionui_ai_agent::AgentSendError> {
             self.sent.lock().unwrap().push(data);
             match &self.fail_with {
-                Some(msg) => Err(aionui_ai_agent::AgentSendError::from_api_error(ApiError::Internal(
+                Some(msg) => Err(aionui_ai_agent::AgentSendError::from_agent_error(AgentError::internal(
                     msg.clone(),
                 ))),
                 None => Ok(()),
             }
         }
-        async fn cancel(&self) -> Result<(), ApiError> {
+        async fn cancel(&self) -> Result<(), AgentError> {
             Ok(())
         }
-        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), ApiError> {
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
             Ok(())
         }
     }
@@ -949,7 +950,7 @@ mod tests {
             let _ = approval_key(Some(action), command_type);
             false
         }
-        async fn mode(&self) -> Result<AgentModeResponse, ApiError> {
+        async fn mode(&self) -> Result<AgentModeResponse, AgentError> {
             Ok(AgentModeResponse {
                 mode: "default".into(),
                 initialized: false,
@@ -975,7 +976,7 @@ mod tests {
             }
         }
 
-        /// Build a stub whose `kill` always fails with `ApiError::NotFound` so
+        /// Build a stub whose `kill` always fails with `AgentError::NotFound` so
         /// tests can exercise the non-fatal kill branch in `remove_agent`.
         fn with_kill_error(msg: &str) -> Self {
             Self {
@@ -1003,16 +1004,16 @@ mod tests {
             &self,
             _conversation_id: &str,
             _options: BuildTaskOptions,
-        ) -> Result<AgentInstance, ApiError> {
+        ) -> Result<AgentInstance, AgentError> {
             panic!("get_or_build_task should not be called in D7b tests")
         }
-        fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), ApiError> {
+        fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
             self.kill_calls
                 .lock()
                 .unwrap()
                 .push((conversation_id.to_owned(), reason));
             if let Some(msg) = &self.kill_error {
-                return Err(ApiError::NotFound(msg.clone()));
+                return Err(AgentError::not_found(msg.clone()));
             }
             Ok(())
         }
@@ -1276,7 +1277,7 @@ mod tests {
         .await
         .unwrap();
 
-        // kill returns Err(ApiError::NotFound) but remove_agent must still
+        // kill returns Err(AgentError::NotFound) but remove_agent must still
         // succeed — NotFound means the worker already died, which is OK.
         session.remove_agent("worker-1").await.unwrap();
 

@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -12,7 +14,7 @@ use aionui_api_types::{
     RevokeUserRequest, SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
 };
 use aionui_common::ApiError;
-use aionui_db::IChannelRepository;
+use aionui_db::{DbError, IChannelRepository};
 use aionui_extension::{ExtensionRegistry, ResolvedChannelPlugin};
 use serde::Serialize;
 
@@ -41,6 +43,16 @@ pub struct ChannelRouterState {
     pub extension_registry: ExtensionRegistry,
 }
 
+fn db_error_to_api_error(err: DbError) -> ApiError {
+    match err {
+        DbError::NotFound(msg) => ApiError::NotFound(msg),
+        DbError::Conflict(msg) => ApiError::Conflict(msg),
+        DbError::Query(e) => ApiError::Internal(format!("Database error: {e}")),
+        DbError::Migration(e) => ApiError::Internal(format!("Migration error: {e}")),
+        DbError::Init(msg) => ApiError::Internal(format!("Database init error: {msg}")),
+    }
+}
+
 impl From<ChannelError> for ApiError {
     fn from(err: ChannelError) -> Self {
         match err {
@@ -59,7 +71,7 @@ impl From<ChannelError> for ApiError {
             ChannelError::DecryptionFailed(msg) => ApiError::Internal(msg),
             ChannelError::PlatformApi(msg) => ApiError::BadGateway(msg),
             ChannelError::MessageSendFailed(msg) => ApiError::Internal(msg),
-            ChannelError::Database(db_err) => ApiError::from(db_err),
+            ChannelError::Database(db_err) => db_error_to_api_error(db_err),
             ChannelError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
         }
     }
@@ -343,7 +355,12 @@ async fn disable_plugin(
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     if resolve_extension_channel_plugin(&state, &req.plugin_id).await.is_some()
-        && state.repo.get_plugin(&req.plugin_id).await?.is_none()
+        && state
+            .repo
+            .get_plugin(&req.plugin_id)
+            .await
+            .map_err(db_error_to_api_error)?
+            .is_none()
     {
         return Ok(Json(ApiResponse::ok(BridgeResponse {
             success: true,
@@ -468,7 +485,7 @@ async fn reject_pairing(
 async fn get_authorized_users(
     State(state): State<ChannelRouterState>,
 ) -> Result<Json<ApiResponse<Vec<ChannelUserResponse>>>, ApiError> {
-    let rows = state.repo.get_all_users().await?;
+    let rows = state.repo.get_all_users().await.map_err(db_error_to_api_error)?;
     let responses: Vec<ChannelUserResponse> = rows
         .into_iter()
         .map(|r| ChannelUserResponse {
@@ -496,7 +513,11 @@ async fn revoke_user(
     state.session_manager.cleanup_user_sessions(&req.user_id).await?;
 
     // Delete user record
-    state.repo.delete_user(&req.user_id).await?;
+    state
+        .repo
+        .delete_user(&req.user_id)
+        .await
+        .map_err(db_error_to_api_error)?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,

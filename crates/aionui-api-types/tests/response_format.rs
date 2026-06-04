@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 //! Black-box tests for API response formats (test-plan T3.1, T3.2, T3.3).
 
 use aionui_api_types::{ApiResponse, ErrorResponse};

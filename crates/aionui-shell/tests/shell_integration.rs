@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use std::sync::Arc;
 
 use aionui_api_types::ToolType;

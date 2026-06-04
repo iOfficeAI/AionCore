@@ -10,6 +10,7 @@
 //! they dispatch through `AgentInstance` via `ConversationService`.
 
 pub mod agent;
+pub(crate) mod error_mapping;
 pub mod remote;
 pub mod state;
 

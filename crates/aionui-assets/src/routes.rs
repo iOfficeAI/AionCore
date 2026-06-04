@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -7,6 +9,7 @@ use axum::routing::get;
 
 use aionui_common::ApiError;
 
+use crate::error::AssetError;
 use crate::state::AssetRouterState;
 
 const CACHE_CONTROL_VALUE: &str = "public, max-age=31536000, immutable";
@@ -16,6 +19,16 @@ pub fn asset_routes(state: AssetRouterState) -> Router {
     Router::new()
         .route("/api/assets/logos/{*asset_path}", get(get_logo_asset))
         .with_state(state)
+}
+
+impl From<AssetError> for ApiError {
+    fn from(error: AssetError) -> Self {
+        match error {
+            AssetError::NotFound(message) => Self::NotFound(message),
+            AssetError::Forbidden(message) => Self::Forbidden(message),
+            AssetError::Internal(message) => Self::Internal(message),
+        }
+    }
 }
 
 async fn get_logo_asset(

@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, State};
@@ -38,7 +40,11 @@ async fn test_bedrock(
     body: Result<Json<TestBedrockConnectionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    state.service.test_bedrock_connection(req.bedrock_config).await?;
+    state
+        .service
+        .test_bedrock_connection(req.bedrock_config)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::message("Connection successful")))
 }
 

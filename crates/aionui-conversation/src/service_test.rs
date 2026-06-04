@@ -9,7 +9,7 @@ use std::time::Duration;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::{AgentError, AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{AgentErrorCode, ConversationArtifactKind};
@@ -18,8 +18,7 @@ use aionui_api_types::{
     SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
-    AgentKillReason, AgentType, ApiError, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
-    TimestampMs,
+    AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult, TimestampMs,
 };
 use aionui_db::models::{
     AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams,
@@ -1306,11 +1305,11 @@ impl IAgentTask for MockAgent {
         ));
         Ok(())
     }
-    async fn cancel(&self) -> Result<(), ApiError> {
+    async fn cancel(&self) -> Result<(), AgentError> {
         *self.stopped.lock().unwrap() = true;
         Ok(())
     }
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), ApiError> {
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 }
@@ -1333,11 +1332,11 @@ impl IMockAgent for MockAgent {
         call_id: &str,
         _data: serde_json::Value,
         always_allow: bool,
-    ) -> Result<(), ApiError> {
+    ) -> Result<(), AgentError> {
         let mut confs = self.confirmations.lock().unwrap();
         let existed = confs.iter().any(|c| c.call_id == call_id);
         if !existed && !self.allow_direct_confirm {
-            return Err(ApiError::NotFound(format!("Confirmation {call_id} not found")));
+            return Err(AgentError::not_found(format!("Confirmation {call_id} not found")));
         }
         if always_allow && let Some(conf) = confs.iter().find(|c| c.call_id == call_id) {
             let key = match (conf.action.as_deref(), conf.command_type.as_deref()) {
@@ -1402,11 +1401,11 @@ impl IWorkerTaskManager for FailingBuildTaskManager {
         &self,
         _conversation_id: &str,
         _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, ApiError> {
-        Err(ApiError::BadGateway(self.error.clone()))
+    ) -> Result<AgentInstance, AgentError> {
+        Err(AgentError::bad_gateway(self.error.clone()))
     }
 
-    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), ApiError> {
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 
@@ -1439,7 +1438,7 @@ impl IWorkerTaskManager for MockTaskManager {
         &self,
         conversation_id: &str,
         _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, ApiError> {
+    ) -> Result<AgentInstance, AgentError> {
         let mut agents = self.agents.lock().unwrap();
         if let Some(existing) = agents.get(conversation_id) {
             return Ok(existing.clone());
@@ -1449,7 +1448,7 @@ impl IWorkerTaskManager for MockTaskManager {
         Ok(instance)
     }
 
-    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), ApiError> {
+    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         self.kill_count.fetch_add(1, Ordering::SeqCst);
         self.kill_records
             .lock()
@@ -1509,13 +1508,13 @@ impl IWorkerTaskManager for SlowBuildTaskManager {
         &self,
         conversation_id: &str,
         _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, ApiError> {
+    ) -> Result<AgentInstance, AgentError> {
         tokio::time::sleep(self.delay).await;
         self.built.store(true, Ordering::SeqCst);
         Ok(AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id))))
     }
 
-    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), ApiError> {
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 
@@ -1563,7 +1562,7 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
         &self,
         conversation_id: &str,
         _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, ApiError> {
+    ) -> Result<AgentInstance, AgentError> {
         let workspace = self.workspace.clone();
         let mut agents = self.agents.lock().unwrap();
         if let Some(existing) = agents.get(conversation_id) {
@@ -1576,7 +1575,7 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
         Ok(instance)
     }
 
-    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), ApiError> {
+    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         self.agents.lock().unwrap().remove(conversation_id);
         Ok(())
     }
@@ -1690,11 +1689,11 @@ impl IAgentTask for ScriptedAgent {
         Ok(())
     }
 
-    async fn cancel(&self) -> Result<(), ApiError> {
+    async fn cancel(&self) -> Result<(), AgentError> {
         Ok(())
     }
 
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), ApiError> {
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 }
@@ -2244,8 +2243,8 @@ async fn send_message_does_not_inject_send_error_when_runtime_terminal_exists() 
                 Some(AgentErrorCode::UnknownUpstreamError),
             ))]],
         )
-        .with_send_error(AgentSendError::from_api_error(ApiError::BadGateway(
-            "fallback should not render".into(),
+        .with_send_error(AgentSendError::from_agent_error(AgentError::bad_gateway(
+            "fallback should not render",
         ))),
     );
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
@@ -2272,8 +2271,8 @@ async fn send_message_injects_send_error_when_runtime_terminal_missing() {
     let scripted_agent = Arc::new(
         ScriptedAgent::new(&conv.id, vec![vec![]])
             .with_status(None)
-            .with_send_error(AgentSendError::from_api_error(ApiError::BadGateway(
-                "provider returned 401 invalid api key".into(),
+            .with_send_error(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "provider returned 401 invalid api key",
             ))),
     );
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));

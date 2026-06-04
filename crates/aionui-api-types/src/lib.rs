@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_types)]
+
 //! All HTTP request/response DTOs shared across the API surface.
 mod acp;
 mod acp_prompt_hook;

@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
@@ -401,9 +403,9 @@ mod error_mapping_tests {
 
     #[test]
     fn conversation_api_error_compat_preserves_special_codes() {
-        let app = ApiError::from(ConversationError::from(
-            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/my project".into()),
-        ));
+        let app = ApiError::from(ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported {
+            path: "/tmp/my project".into(),
+        });
         assert!(matches!(
             app,
             ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message) if message == "/tmp/my project"

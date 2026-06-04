@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -12,6 +14,7 @@ use aionui_api_types::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
+use aionui_db::DbError;
 
 use crate::error::TeamError;
 use crate::service::TeamSessionService;
@@ -19,6 +22,16 @@ use crate::service::TeamSessionService;
 #[derive(Clone)]
 pub struct TeamRouterState {
     pub service: Arc<TeamSessionService>,
+}
+
+fn db_error_to_api_error(err: DbError) -> ApiError {
+    match err {
+        DbError::NotFound(msg) => ApiError::NotFound(msg),
+        DbError::Conflict(msg) => ApiError::Conflict(msg),
+        DbError::Query(e) => ApiError::Internal(format!("Database error: {e}")),
+        DbError::Migration(e) => ApiError::Internal(format!("Migration error: {e}")),
+        DbError::Init(msg) => ApiError::Internal(format!("Database init error: {msg}")),
+    }
 }
 
 impl From<TeamError> for ApiError {
@@ -38,7 +51,7 @@ impl From<TeamError> for ApiError {
                 ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
             }
             TeamError::Conversation(conversation_err) => ApiError::from(conversation_err),
-            TeamError::Database(db_err) => ApiError::from(db_err),
+            TeamError::Database(db_err) => db_error_to_api_error(db_err),
             TeamError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
         }
     }
