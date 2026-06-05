@@ -980,6 +980,10 @@ mod tests {
 
     #[tokio::test]
     async fn session_snapshot_overrides_repo_backed_mcp_config() {
+        let snapshot_command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
         let mut servers = HashMap::from([(
             "demo-mcp".to_owned(),
             McpServerConfig {
@@ -997,7 +1001,7 @@ mod tests {
             id: "mcp_1".into(),
             name: "demo-mcp".into(),
             transport: SessionMcpTransport::Stdio {
-                command: "uvx".into(),
+                command: snapshot_command.clone(),
                 args: vec!["new-server".into()],
                 env: HashMap::from([("TOKEN".into(), "abc".into())]),
             },
@@ -1008,10 +1012,7 @@ mod tests {
         let server = servers.get("demo-mcp").expect("snapshot should remain");
         assert_eq!(server.transport, TransportType::Stdio);
         let command = server.command.as_deref().expect("stdio command should exist");
-        assert!(
-            command == "uvx" || command.ends_with("/uvx"),
-            "unexpected stdio command path: {command}",
-        );
+        assert_eq!(command, snapshot_command);
         assert_eq!(server.args.as_deref(), Some(&["new-server".to_owned()][..]));
         assert_eq!(
             server.env.as_ref().and_then(|env| env.get("TOKEN")),
