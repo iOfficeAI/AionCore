@@ -49,7 +49,7 @@ pub async fn csrf_middleware(
                 // Valid: cookie and header match
             }
             _ => {
-                return Err(ApiError::Forbidden("CSRF token validation failed".into()));
+                return Err(ApiError::CsrfInvalid("CSRF token validation failed".into()));
             }
         }
     }

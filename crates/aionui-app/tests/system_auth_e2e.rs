@@ -1,4 +1,4 @@
-//! Auth protection tests — all system endpoints return 403 without auth.
+//! Auth protection tests for system endpoints.
 
 mod common;
 
@@ -6,13 +6,15 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use common::{build_app, get_request};
+use common::{body_json, build_app, get_request};
 
 #[tokio::test]
 async fn auth_required_get_settings() {
     let (app, _) = build_app().await;
     let resp = app.oneshot(get_request("/api/settings")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -32,7 +34,9 @@ async fn auth_required_patch_settings() {
 async fn auth_required_get_client_prefs() {
     let (app, _) = build_app().await;
     let resp = app.oneshot(get_request("/api/settings/client")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -52,7 +56,9 @@ async fn auth_required_put_client_prefs() {
 async fn auth_required_get_providers() {
     let (app, _) = build_app().await;
     let resp = app.oneshot(get_request("/api/providers")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -86,7 +92,9 @@ async fn auth_required_delete_provider() {
 async fn auth_required_system_info() {
     let (app, _) = build_app().await;
     let resp = app.oneshot(get_request("/api/system/info")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]

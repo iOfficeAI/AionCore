@@ -245,6 +245,15 @@ fn file_error_to_api_error(error: FileError) -> ApiError {
     match error {
         FileError::BadRequest(message) => ApiError::BadRequest(message),
         FileError::Forbidden(message) => ApiError::Forbidden(message),
+        FileError::PathOutsideSandbox {
+            message,
+            field,
+            operation,
+        } => ApiError::PathOutsideSandbox {
+            message,
+            field,
+            operation,
+        },
         FileError::NotFound(message) => ApiError::NotFound(message),
         FileError::Internal(message) => ApiError::Internal(message),
     }
@@ -336,6 +345,8 @@ async fn proxy_forward(
 mod tests {
     use std::sync::Arc;
 
+    use aionui_file::FileError;
+
     use crate::conversion::ConversionService;
     use crate::error::OfficeError;
     use crate::proxy::{ProxyError, ProxyService};
@@ -345,7 +356,7 @@ mod tests {
     use crate::types::DocType;
     use crate::watch_manager::{OfficecliWatchManager, ProcessHandle, ProcessSpawner};
 
-    use super::{ApiError, office_proxy_routes, office_routes};
+    use super::{ApiError, file_error_to_api_error, office_proxy_routes, office_routes};
 
     #[test]
     fn office_routes_builds_without_panic() {
@@ -394,6 +405,24 @@ mod tests {
     fn conversion_error_maps_to_internal() {
         let err = ApiError::from(OfficeError::Conversion("bad format".into()));
         assert!(matches!(err, ApiError::Internal(msg) if msg.contains("bad format")));
+    }
+
+    #[test]
+    fn file_path_outside_sandbox_maps_to_explicit_api_code() {
+        let err = file_error_to_api_error(FileError::PathOutsideSandbox {
+            message: "path is outside allowed roots".into(),
+            field: Some("file_path"),
+            operation: Some("preview"),
+        });
+
+        assert!(matches!(
+            err,
+            ApiError::PathOutsideSandbox {
+                message,
+                field: Some("file_path"),
+                operation: Some("preview"),
+            } if message == "path is outside allowed roots"
+        ));
     }
 
     #[test]

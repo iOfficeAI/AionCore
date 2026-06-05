@@ -11,7 +11,8 @@ use crate::error::FileError;
 /// # Errors
 ///
 /// - `FileError::BadRequest` if `path` does not exist or cannot be
-///   canonicalized, or if it falls outside all allowed roots.
+///   canonicalized.
+/// - `FileError::PathOutsideSandbox` if it falls outside all allowed roots.
 pub fn validate_path(path: &str, allowed_roots: &[&Path]) -> Result<PathBuf, FileError> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|e| FileError::BadRequest(format!("cannot resolve path '{}': {}", path, e)))?;
@@ -28,10 +29,11 @@ pub fn validate_path(path: &str, allowed_roots: &[&Path]) -> Result<PathBuf, Fil
     if is_allowed {
         Ok(canonical)
     } else {
-        Err(FileError::Forbidden(format!(
-            "path '{}' is outside the allowed sandbox",
-            path
-        )))
+        Err(FileError::PathOutsideSandbox {
+            message: format!("path '{}' is outside the allowed sandbox", path),
+            field: Some("path"),
+            operation: Some("access"),
+        })
     }
 }
 
@@ -78,10 +80,11 @@ pub fn validate_path_for_write(path: &str, allowed_roots: &[&Path]) -> Result<Pa
     });
 
     if !is_allowed {
-        return Err(FileError::Forbidden(format!(
-            "path '{}' is outside the allowed sandbox",
-            path
-        )));
+        return Err(FileError::PathOutsideSandbox {
+            message: format!("path '{}' is outside the allowed sandbox", path),
+            field: Some("path"),
+            operation: Some("write"),
+        });
     }
 
     Ok(canonical_parent.join(file_name))
@@ -126,7 +129,10 @@ mod tests {
         let result = validate_path(file.to_str().unwrap(), &[sandbox.path()]);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, FileError::Forbidden(_)), "unexpected error: {err}");
+        assert!(
+            matches!(err, FileError::PathOutsideSandbox { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -196,7 +202,18 @@ mod tests {
         let target = outside.path().join("evil.txt");
 
         let result = validate_path_for_write(target.to_str().unwrap(), &[sandbox.path()]);
-        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FileError::PathOutsideSandbox {
+                    field: Some("path"),
+                    operation: Some("write"),
+                    ..
+                }
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

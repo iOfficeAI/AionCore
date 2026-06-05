@@ -195,6 +195,22 @@ fn send_json(text: &str) -> tungstenite::Message {
     tungstenite::Message::Text(text.into())
 }
 
+fn assert_realtime_error(msg: &Value, code: &str, recoverable: bool) {
+    assert_eq!(msg["name"], "realtime.error");
+    assert_eq!(msg["data"]["code"], code);
+    assert!(msg["data"]["message"].as_str().is_some());
+    assert_eq!(msg["data"]["recoverable"], recoverable);
+    assert!(msg["data"]["details"].is_object());
+}
+
+fn assert_invalid_message_error(msg: &Value) {
+    assert_realtime_error(msg, "REALTIME_INVALID_MESSAGE", true);
+    assert_eq!(
+        msg["data"]["details"]["expected"],
+        r#"{ "name": "event-name", "data": {...} }"#
+    );
+}
+
 fn ws_manager(app: &TestApp) -> &Arc<WebSocketManager> {
     &app.services.ws_manager
 }
@@ -219,6 +235,9 @@ async fn t1_2_no_token_closes_1008() {
     let app = start_app().await;
     let mut ws = connect_no_auth(app.addr).await;
 
+    let msg = read_text(&mut ws).await;
+    assert_realtime_error(&msg, "REALTIME_AUTH_MISSING", false);
+
     let code = read_close(&mut ws).await;
     assert_eq!(code, Some(1008));
 }
@@ -230,8 +249,7 @@ async fn t1_3_invalid_token_sends_auth_expired_then_closes() {
     let (_, mut rx) = connect_bearer(app.addr, "invalid-token").await;
 
     let msg = read_text(&mut rx).await;
-    assert_eq!(msg["name"], "auth-expired");
-    assert!(msg["data"]["message"].as_str().is_some());
+    assert_realtime_error(&msg, "REALTIME_AUTH_EXPIRED", false);
 
     let code = read_close(&mut rx).await;
     assert_eq!(code, Some(1008));
@@ -291,8 +309,7 @@ async fn t3_2_invalid_json_returns_error() {
     tx.send(send_json("not valid json")).await.unwrap();
 
     let msg = read_text(&mut rx).await;
-    assert_eq!(msg["error"], "Invalid message format");
-    assert!(msg["expected"].is_string());
+    assert_invalid_message_error(&msg);
 }
 
 #[tokio::test]
@@ -306,7 +323,7 @@ async fn t3_3_missing_fields_returns_error() {
     tx.send(send_json(r#"{"foo": "bar"}"#)).await.unwrap();
 
     let msg = read_text(&mut rx).await;
-    assert_eq!(msg["error"], "Invalid message format");
+    assert_invalid_message_error(&msg);
 }
 
 // ===========================================================================
@@ -522,7 +539,7 @@ async fn t7_2_blacklisted_token_rejected() {
     let (_, mut rx) = connect_bearer(app.addr, &token).await;
 
     let msg = read_text(&mut rx).await;
-    assert_eq!(msg["name"], "auth-expired");
+    assert_realtime_error(&msg, "REALTIME_AUTH_EXPIRED", false);
 
     let code = read_close(&mut rx).await;
     assert_eq!(code, Some(1008));

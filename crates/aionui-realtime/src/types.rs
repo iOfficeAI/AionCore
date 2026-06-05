@@ -23,6 +23,8 @@ pub enum WsOutbound {
     Text(String),
     /// Close frame with status code and reason.
     Close(WebSocketCloseCode, String),
+    /// UTF-8 text frame followed immediately by a close frame.
+    TextThenClose(String, WebSocketCloseCode, String),
 }
 
 /// WebSocket close codes per RFC 6455.
@@ -39,6 +41,68 @@ impl WebSocketCloseCode {
     /// Return the numeric close code.
     pub fn as_u16(self) -> u16 {
         self as u16
+    }
+}
+
+/// Realtime transport/envelope boundary errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealtimeError {
+    /// Authentication token is missing.
+    AuthMissing,
+    /// Authentication token is expired or no longer valid.
+    AuthExpired,
+    /// Incoming message did not match the standard WebSocket envelope.
+    InvalidMessage,
+}
+
+impl RealtimeError {
+    /// Stable machine-readable realtime error code.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::AuthMissing => "REALTIME_AUTH_MISSING",
+            Self::AuthExpired => "REALTIME_AUTH_EXPIRED",
+            Self::InvalidMessage => "REALTIME_INVALID_MESSAGE",
+        }
+    }
+
+    /// Safe public message that avoids sensitive request details.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::AuthMissing => "Authentication is required.",
+            Self::AuthExpired => "Authentication has expired.",
+            Self::InvalidMessage => "Message must use the standard realtime envelope.",
+        }
+    }
+
+    /// Whether retrying without re-authentication may succeed.
+    pub fn recoverable(self) -> bool {
+        match self {
+            Self::AuthMissing | Self::AuthExpired => false,
+            Self::InvalidMessage => true,
+        }
+    }
+
+    /// Structured public details for the error.
+    pub fn details(self) -> serde_json::Value {
+        match self {
+            Self::InvalidMessage => serde_json::json!({
+                "expected": r#"{ "name": "event-name", "data": {...} }"#,
+            }),
+            Self::AuthMissing | Self::AuthExpired => serde_json::json!({}),
+        }
+    }
+
+    /// Convert this error into a realtime error WebSocket event.
+    pub fn into_event(self) -> aionui_api_types::WebSocketMessage<serde_json::Value> {
+        aionui_api_types::WebSocketMessage::new(
+            "realtime.error",
+            serde_json::json!({
+                "code": self.code(),
+                "message": self.message(),
+                "recoverable": self.recoverable(),
+                "details": self.details(),
+            }),
+        )
     }
 }
 
@@ -113,5 +177,29 @@ mod tests {
         assert_eq!(HEARTBEAT_INTERVAL, Duration::from_secs(30));
         assert_eq!(HEARTBEAT_TIMEOUT, Duration::from_secs(60));
         assert_eq!(PER_CONNECTION_BUFFER, 64);
+    }
+
+    #[test]
+    fn realtime_invalid_message_event_uses_standard_envelope() {
+        let msg = RealtimeError::InvalidMessage.into_event();
+        assert_eq!(msg.name, "realtime.error");
+        assert_eq!(msg.data["code"], "REALTIME_INVALID_MESSAGE");
+        assert_eq!(msg.data["recoverable"], true);
+        assert!(msg.data["details"]["expected"].is_string());
+    }
+
+    #[test]
+    fn realtime_auth_expired_is_not_recoverable() {
+        let msg = RealtimeError::AuthExpired.into_event();
+        assert_eq!(msg.name, "realtime.error");
+        assert_eq!(msg.data["code"], "REALTIME_AUTH_EXPIRED");
+        assert_eq!(msg.data["recoverable"], false);
+    }
+
+    #[test]
+    fn realtime_auth_missing_is_not_recoverable() {
+        let msg = RealtimeError::AuthMissing.into_event();
+        assert_eq!(msg.data["code"], "REALTIME_AUTH_MISSING");
+        assert_eq!(msg.data["recoverable"], false);
     }
 }

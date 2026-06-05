@@ -180,9 +180,9 @@ async fn tc6c_create_team_rejects_missing_workspace_path() {
     );
 }
 
-// TC-7: Unauthenticated returns 403
+// TC-7: Unauthenticated returns 401
 #[tokio::test]
-async fn tc7_unauthenticated_returns_403() {
+async fn tc7_unauthenticated_returns_401() {
     let (app, _services) = build_app().await;
 
     let req = axum::http::Request::builder()
@@ -191,7 +191,9 @@ async fn tc7_unauthenticated_returns_403() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // TL-1: Empty team list

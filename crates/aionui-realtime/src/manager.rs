@@ -10,7 +10,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::broadcaster::EventBroadcaster;
-use crate::types::{ClientInfo, ConnectionId, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, WebSocketCloseCode, WsOutbound};
+use crate::types::{
+    ClientInfo, ConnectionId, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, RealtimeError, WebSocketCloseCode, WsOutbound,
+};
 
 /// Validates whether a JWT token is still valid.
 /// Returns `true` if the token is valid, `false` if expired or revoked.
@@ -133,7 +135,7 @@ impl WebSocketManager {
     ///
     /// Every `HEARTBEAT_INTERVAL` (30s), iterates all connections:
     /// 1. Timeout check — closes connections with no pong for `HEARTBEAT_TIMEOUT`
-    /// 2. Token expiry — validates token and sends `auth-expired` if invalid
+    /// 2. Token expiry — validates token and sends `realtime.error` if invalid
     /// 3. Sends a `ping` message with current timestamp
     ///
     /// Returns a `JoinHandle` — abort it to stop the heartbeat loop.
@@ -184,15 +186,24 @@ fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validat
         // 2. Token expiry
         if !token_validator(&client.token) {
             info!(%conn_id, "token expired, closing connection");
-            let auth_expired = WebSocketMessage::new("auth-expired", json!({"message": "Token expired"}));
-            if let Ok(text) = serde_json::to_string(&auth_expired) {
-                let _ = client.tx.try_send(WsOutbound::Text(text));
+            let outbound = match serde_json::to_string(&RealtimeError::AuthExpired.into_event()) {
+                Ok(text) => {
+                    WsOutbound::TextThenClose(text, WebSocketCloseCode::PolicyViolation, "token expired".into())
+                }
+                Err(e) => {
+                    warn!(%conn_id, error = %e, "failed to serialize realtime auth error");
+                    WsOutbound::Close(WebSocketCloseCode::PolicyViolation, "token expired".into())
+                }
+            };
+
+            match client.tx.try_send(outbound) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                    to_remove.push(conn_id);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(%conn_id, "outbound channel full, terminal auth close deferred");
+                }
             }
-            let _ = client.tx.try_send(WsOutbound::Close(
-                WebSocketCloseCode::PolicyViolation,
-                "token expired".into(),
-            ));
-            to_remove.push(conn_id);
             continue;
         }
 
@@ -235,6 +246,15 @@ mod tests {
 
     fn new_client_tx() -> (mpsc::Sender<WsOutbound>, mpsc::Receiver<WsOutbound>) {
         mpsc::channel(PER_CONNECTION_BUFFER)
+    }
+
+    fn assert_realtime_auth_expired(text: &str) {
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["name"], "realtime.error");
+        assert_eq!(parsed["data"]["code"], "REALTIME_AUTH_EXPIRED");
+        assert!(parsed["data"]["message"].is_string());
+        assert_eq!(parsed["data"]["recoverable"], false);
+        assert!(parsed["data"]["details"].is_object());
     }
 
     #[test]
@@ -465,21 +485,39 @@ mod tests {
         // Connection should be removed
         assert_eq!(connections.len(), 0);
 
-        // Should have received auth-expired event then close
+        // Should have received realtime auth-expired event and close as one terminal outbound.
         let msg1 = rx.try_recv().unwrap();
         match msg1 {
-            WsOutbound::Text(text) => {
-                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["name"], "auth-expired");
+            WsOutbound::TextThenClose(text, code, reason) => {
+                assert_realtime_auth_expired(&text);
+                assert_eq!(code, WebSocketCloseCode::PolicyViolation);
+                assert_eq!(reason, "token expired");
             }
-            _ => panic!("expected auth-expired Text"),
+            _ => panic!("expected realtime auth-expired terminal message"),
         }
+        assert!(rx.try_recv().is_err());
+    }
 
-        let msg2 = rx.try_recv().unwrap();
-        assert_eq!(
-            msg2,
-            WsOutbound::Close(WebSocketCloseCode::PolicyViolation, "token expired".into())
+    #[test]
+    fn heartbeat_tick_keeps_expired_token_connection_when_terminal_queue_is_full() {
+        let connections = Arc::new(DashMap::new());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        tx.try_send(WsOutbound::Text("queued".into())).unwrap();
+        connections.insert(
+            ConnectionId(1),
+            ClientInfo {
+                token: "expired-token".into(),
+                last_ping: Instant::now(),
+                tx,
+            },
         );
+
+        heartbeat_tick(&connections, &always_expired());
+
+        assert_eq!(connections.len(), 1);
+        assert_eq!(rx.try_recv().unwrap(), WsOutbound::Text("queued".into()));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -502,7 +540,7 @@ mod tests {
 
         assert_eq!(connections.len(), 0);
 
-        // Only close frame from timeout (no auth-expired text)
+        // Only close frame from timeout (no auth error text)
         let msg = rx.try_recv().unwrap();
         assert_eq!(
             msg,

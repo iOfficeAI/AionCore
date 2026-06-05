@@ -32,6 +32,15 @@ impl From<FileError> for ApiError {
         match error {
             FileError::BadRequest(message) => ApiError::BadRequest(message),
             FileError::Forbidden(message) => ApiError::Forbidden(message),
+            FileError::PathOutsideSandbox {
+                message,
+                field,
+                operation,
+            } => ApiError::PathOutsideSandbox {
+                message,
+                field,
+                operation,
+            },
             FileError::NotFound(message) => ApiError::NotFound(message),
             FileError::Internal(message) => ApiError::Internal(message),
         }
@@ -708,6 +717,18 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn file_path_outside_sandbox_maps_to_explicit_api_code() {
+        let api_err = ApiError::from(FileError::PathOutsideSandbox {
+            message: "path '/tmp/x' is outside the allowed sandbox".into(),
+            field: Some("path"),
+            operation: Some("access"),
+        });
+        assert_eq!(api_err.error_code(), "PATH_OUTSIDE_SANDBOX");
+        assert_eq!(api_err.error_details().unwrap()["field"], "path");
+        assert_eq!(api_err.error_details().unwrap()["operation"], "access");
+    }
 
     #[test]
     fn browse_roots_are_resolved_lazily() {

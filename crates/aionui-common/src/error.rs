@@ -23,6 +23,16 @@ pub enum ApiError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    #[error("Forbidden: {message}")]
+    PathOutsideSandbox {
+        message: String,
+        field: Option<&'static str>,
+        operation: Option<&'static str>,
+    },
+
+    #[error("CSRF invalid: {0}")]
+    CsrfInvalid(String),
+
     #[error("Conflict: {0}")]
     Conflict(String),
 
@@ -75,6 +85,8 @@ impl ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::PathOutsideSandbox { .. } => StatusCode::FORBIDDEN,
+            Self::CsrfInvalid(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -93,13 +105,9 @@ impl ApiError {
             Self::NotFound(_) => "NOT_FOUND",
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Unauthorized(_) => "UNAUTHORIZED",
-            Self::Forbidden(message) => {
-                if message.contains("outside the allowed sandbox") {
-                    "PATH_OUTSIDE_SANDBOX"
-                } else {
-                    "FORBIDDEN"
-                }
-            }
+            Self::Forbidden(_) => "FORBIDDEN",
+            Self::PathOutsideSandbox { .. } => "PATH_OUTSIDE_SANDBOX",
+            Self::CsrfInvalid(_) => "CSRF_INVALID",
             Self::Conflict(_) => "CONFLICT",
             Self::RateLimited => "RATE_LIMITED",
             Self::Internal(_) => "INTERNAL_ERROR",
@@ -116,6 +124,7 @@ impl ApiError {
     /// context in addition to the top-level error code.
     pub fn error_details(&self) -> Option<Value> {
         match self {
+            Self::PathOutsideSandbox { field, operation, .. } => Some(path_outside_sandbox_details(*field, *operation)),
             Self::WorkspacePathUnavailable(path) => Some(workspace_path_details(path, "create")),
             Self::WorkspacePathRuntimeUnavailable(path) => Some(workspace_path_details(path, "runtime")),
             _ => None,
@@ -129,6 +138,17 @@ fn workspace_path_details(path: &str, operation: &str) -> Value {
         "workspace_path": path,
         "operation": operation,
     })
+}
+
+fn path_outside_sandbox_details(field: Option<&'static str>, operation: Option<&'static str>) -> Value {
+    let mut details = serde_json::Map::new();
+    if let Some(field) = field {
+        details.insert("field".to_owned(), Value::String(field.to_owned()));
+    }
+    if let Some(operation) = operation {
+        details.insert("operation".to_owned(), Value::String(operation.to_owned()));
+    }
+    Value::Object(details)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,7 +250,20 @@ mod tests {
         assert_eq!(ApiError::Forbidden("x".into()).error_code(), "FORBIDDEN");
         assert_eq!(
             ApiError::Forbidden("path '/tmp/x' is outside the allowed sandbox".into()).error_code(),
+            "FORBIDDEN"
+        );
+        assert_eq!(
+            ApiError::PathOutsideSandbox {
+                message: "path '/tmp/x' is outside the allowed sandbox".into(),
+                field: Some("workspace"),
+                operation: Some("create"),
+            }
+            .error_code(),
             "PATH_OUTSIDE_SANDBOX"
+        );
+        assert_eq!(
+            ApiError::CsrfInvalid("CSRF token validation failed".into()).error_code(),
+            "CSRF_INVALID"
         );
         assert_eq!(ApiError::Conflict("x".into()).error_code(), "CONFLICT");
         assert_eq!(ApiError::RateLimited.error_code(), "RATE_LIMITED");
@@ -288,6 +321,40 @@ mod tests {
         assert_eq!(json["error"], "Rate limited");
         assert_eq!(json["code"], "RATE_LIMITED");
         assert!(json.get("details").is_none());
+    }
+
+    #[test]
+    fn forbidden_code_does_not_depend_on_message_substrings() {
+        assert_eq!(
+            ApiError::Forbidden("path '/tmp/x' is outside the allowed sandbox".into()).error_code(),
+            "FORBIDDEN"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_outside_sandbox_has_explicit_code_and_details() {
+        let resp = ApiError::PathOutsideSandbox {
+            message: "path '/tmp/x' is outside the allowed sandbox".into(),
+            field: Some("workspace"),
+            operation: Some("create"),
+        }
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
+        assert_eq!(json["details"]["field"], "workspace");
+        assert_eq!(json["details"]["operation"], "create");
+    }
+
+    #[test]
+    fn csrf_invalid_has_explicit_code() {
+        let err = ApiError::CsrfInvalid("CSRF token validation failed".into());
+
+        assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(err.error_code(), "CSRF_INVALID");
     }
 
     #[tokio::test]
