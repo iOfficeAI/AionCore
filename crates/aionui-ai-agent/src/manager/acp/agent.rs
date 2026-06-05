@@ -17,7 +17,8 @@ use crate::registry::CatalogSender;
 use crate::shared_kernel::{ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::{
-    CancelNotification, SessionId, SessionModelState, SessionNotification, UsageUpdate,
+    CancelNotification, SessionId, SessionModelState, SessionNotification, SetSessionModeRequest,
+    SetSessionModelRequest, UsageUpdate,
 };
 use aionui_api_types::{AgentHandshake, SlashCommandItem};
 use aionui_common::{
@@ -387,77 +388,158 @@ impl AcpAgentManager {
     pub(crate) async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
         let normalized_mode = normalize_requested_mode(&self.params.metadata, mode);
         if normalized_mode.is_empty() {
-            return Ok(());
-        }
-        codex_sandbox::sync_for_agent(&self.params.metadata, Some(&normalized_mode)).await;
-        let session_id = self.session.read().await.session_id().map(ToOwned::to_owned);
-
-        // Write desired — the aggregate root's legitimate intent write-point.
-        {
-            let mut session = self.session.write().await;
-            session.set_desired_mode(ModeId::new(&normalized_mode));
-            self.commit_session_changes(&mut session).await;
+            return Err(AgentError::bad_request("mode must not be empty"));
         }
 
-        // If a session is open, reconcile to the CLI. `reconcile_session`
-        // is the sole call-site of `protocol.set_mode` and the sole
-        // observed/advertised write-point — on success it calls
-        // `apply_observed_mode`, which syncs both layers and emits
-        // `ObservedModeSynced`. `get_mode()` reflects the change as soon
-        // as the SDK call returns.
-        if let Some(sid) = session_id {
-            // PUT /mode is best-effort by design: the desired layer is
-            // already updated, and any SDK failure (including
-            // SessionNotFound) is handled on the next ensure_session
-            // pass when the user retries or sends a message.
-            if let Err(e) = self.reconcile_session(&sid).await {
-                debug!(
+        let session_id = {
+            let session = self.session.read().await;
+            if !session.can_select_mode(&normalized_mode) {
+                warn!(
                     conversation_id = %self.params.conversation_id,
-                    error = %e,
-                    "set_mode: reconcile failed; desired layer kept for next ensure_session"
+                    agent_backend = ?self.params.metadata.backend,
+                    requested_mode_id = %normalized_mode,
+                    "acp_set_mode_rejected_unavailable"
                 );
+                return Err(AgentError::bad_request(format!(
+                    "Mode '{normalized_mode}' is not available for this ACP session"
+                )));
             }
+            session.session_id().map(ToOwned::to_owned)
         }
+        .ok_or_else(|| {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_mode_id = %normalized_mode,
+                "acp_set_command_missing_session"
+            );
+            AgentError::bad_request("No active session")
+        })?;
+
+        info!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            requested_mode_id = %normalized_mode,
+            "acp_set_mode_requested"
+        );
+        codex_sandbox::sync_for_agent(&self.params.metadata, Some(&normalized_mode)).await;
+
+        if let Err(e) = self
+            .protocol
+            .set_mode(SetSessionModeRequest::new(
+                SessionId::new(session_id.clone()),
+                normalized_mode.clone(),
+            ))
+            .await
+        {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_mode_id = %normalized_mode,
+                error = %e,
+                "acp_set_mode_failed"
+            );
+            return Err(AgentError::from(e));
+        }
+
+        let mut session = self.session.write().await;
+        if session.session_id() != Some(session_id.as_str()) {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_mode_id = %normalized_mode,
+                confirmed_session_id = %session_id,
+                active_session_id = ?session.session_id(),
+                "acp_set_mode_session_changed"
+            );
+            return Err(AgentError::conflict("Active ACP session changed while applying mode"));
+        }
+        session.confirm_mode(ModeId::new(&normalized_mode));
+        self.commit_session_changes(&mut session).await;
+        info!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            confirmed_mode_id = %normalized_mode,
+            "acp_set_mode_confirmed"
+        );
         Ok(())
     }
 
     /// Set the model for the current session.
-    ///
-    /// Mirrors `set_mode`: writes user intent into the aggregate's Desired
-    /// layer, then delegates to `reconcile_session` for the SDK call.
-    /// `reconcile_session` is the sole call-site of `protocol.set_model` —
-    /// it also handles the observed sync since the CLI does not emit a
-    /// CurrentModelUpdate notification after `session/set_model`.
     pub(crate) async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
-        let session_id = self.session.read().await.session_id().map(ToOwned::to_owned);
-
-        {
-            let mut session = self.session.write().await;
+        let session_id = {
+            let session = self.session.read().await;
             if !session.can_select_model(model_id) {
                 warn!(
                     conversation_id = %self.params.conversation_id,
-                    model_id = %model_id,
-                    "set_model rejected unavailable ACP model"
+                    agent_backend = ?self.params.metadata.backend,
+                    requested_model_id = %model_id,
+                    "acp_set_model_rejected_unavailable"
                 );
                 return Err(AgentError::bad_request(format!(
                     "Model '{model_id}' is not available for this ACP session"
                 )));
             }
-            session.set_desired_model(ModelId::new(model_id));
-            self.commit_session_changes(&mut session).await;
+            session.session_id().map(ToOwned::to_owned)
+        }
+        .ok_or_else(|| {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_model_id = %model_id,
+                "acp_set_command_missing_session"
+            );
+            AgentError::bad_request("No active session")
+        })?;
+
+        info!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            requested_model_id = %model_id,
+            "acp_set_model_requested"
+        );
+        if let Err(e) = self
+            .protocol
+            .set_model(SetSessionModelRequest::new(
+                SessionId::new(session_id.clone()),
+                model_id.to_owned(),
+            ))
+            .await
+        {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_model_id = %model_id,
+                error = %e,
+                "acp_set_model_failed"
+            );
+            return Err(AgentError::from(e));
         }
 
-        if let Some(sid) = session_id {
-            if let Err(e) = self.reconcile_session(&sid).await {
-                debug!(
-                    conversation_id = %self.params.conversation_id,
-                    error = %e,
-                    "set_model: reconcile failed; desired layer kept for next ensure_session"
-                );
-            }
-        } else {
-            return Err(AgentError::bad_request("No active session"));
+        let mut session = self.session.write().await;
+        if session.session_id() != Some(session_id.as_str()) {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_model_id = %model_id,
+                confirmed_session_id = %session_id,
+                active_session_id = ?session.session_id(),
+                "acp_set_model_session_changed"
+            );
+            return Err(AgentError::conflict("Active ACP session changed while applying model"));
         }
+        let model = ModelId::new(model_id);
+        session.confirm_model(model.clone());
+        if self.params.metadata.behavior_policy.self_identity_sticky {
+            session.set_pending_model_notice(model);
+        }
+        self.commit_session_changes(&mut session).await;
+        info!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            confirmed_model_id = %model_id,
+            "acp_set_model_confirmed"
+        );
         Ok(())
     }
 

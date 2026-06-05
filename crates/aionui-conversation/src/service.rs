@@ -698,6 +698,8 @@ impl ConversationService {
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
+        let existing_type: AgentType = string_to_enum(&existing.r#type)?;
+
         // Snapshot invariant: once written at create time, `extra.skills`
         // must not be re-shaped by PATCH. The frontend must clone the
         // conversation to produce a new snapshot.
@@ -713,10 +715,23 @@ impl ConversationService {
             });
         }
 
+        if existing_type == AgentType::Acp
+            && let Some(incoming) = &req.extra
+            && (incoming.get("current_model_id").is_some() || incoming.get("current_mode_id").is_some())
+        {
+            warn!(
+                conversation_id = %id,
+                "Rejected ACP runtime current-state write through conversation.extra"
+            );
+            return Err(ConversationError::BadRequest {
+                reason: "ACP runtime current mode/model must be changed via /mode or /model, not conversation.extra"
+                    .into(),
+            });
+        }
+
         // Type-aware rule: top-level `model` is aionrs-only. For non-aionrs
         // conversations, model/mode must be updated via `extra` (see spec
         // 2026-05-12).
-        let existing_type: AgentType = string_to_enum(&existing.r#type)?;
         if existing_type != AgentType::Aionrs && req.model.is_some() {
             return Err(ConversationError::BadRequest {
                 reason: format!(

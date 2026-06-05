@@ -30,16 +30,19 @@ impl ConversationService {
             .map_err(ConversationError::from)
     }
 
-    pub async fn set_mode(&self, conversation_id: &str, req: SetModeRequest) -> Result<(), ConversationError> {
+    pub async fn set_mode(
+        &self,
+        conversation_id: &str,
+        req: SetModeRequest,
+    ) -> Result<AgentModeResponse, ConversationError> {
         if req.mode.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "mode must not be empty".into(),
             });
         }
-        self.task(conversation_id)?
-            .set_mode(&req.mode)
-            .await
-            .map_err(ConversationError::from)
+        let task = self.task(conversation_id)?;
+        task.set_mode(&req.mode).await.map_err(ConversationError::from)?;
+        task.get_mode().await.map_err(ConversationError::from)
     }
 
     // ── Model ───────────────────────────────────────────────────────
@@ -51,7 +54,11 @@ impl ConversationService {
             .map_err(ConversationError::from)
     }
 
-    pub async fn set_model(&self, conversation_id: &str, req: SetModelRequest) -> Result<(), ConversationError> {
+    pub async fn set_model(
+        &self,
+        conversation_id: &str,
+        req: SetModelRequest,
+    ) -> Result<GetModelInfoResponse, ConversationError> {
         if req.model_id.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "model_id must not be empty".into(),
@@ -69,7 +76,8 @@ impl ConversationService {
                 return Err(err);
             }
         };
-        task.set_model(&req.model_id).await.map_err(ConversationError::from)
+        task.set_model(&req.model_id).await.map_err(ConversationError::from)?;
+        task.get_model().await.map_err(ConversationError::from)
     }
 
     // ── Usage / Slash commands ──────────────────────────────────────

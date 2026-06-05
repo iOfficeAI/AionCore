@@ -43,10 +43,11 @@ async fn set_mode(
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetModeRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
+) -> Result<Json<ApiResponse<AgentModeResponse>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    state.service.set_mode(&id, req).await.map_err(ApiError::from)?;
-    Ok(Json(ApiResponse::success()))
+    Ok(Json(ApiResponse::ok(
+        state.service.set_mode(&id, req).await.map_err(ApiError::from)?,
+    )))
 }
 
 async fn get_model(
@@ -64,10 +65,11 @@ async fn set_model(
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetModelRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
+) -> Result<Json<ApiResponse<GetModelInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    state.service.set_model(&id, req).await.map_err(ApiError::from)?;
-    Ok(Json(ApiResponse::success()))
+    Ok(Json(ApiResponse::ok(
+        state.service.set_model(&id, req).await.map_err(ApiError::from)?,
+    )))
 }
 
 async fn get_usage(
