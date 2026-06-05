@@ -1792,7 +1792,17 @@ impl ConversationService {
         // Extract workspace from extra (common across agent types)
         let workspace = match extra.get("workspace").and_then(|v| v.as_str()) {
             Some(workspace) if !workspace.is_empty() => {
-                let normalized = validate_runtime_workspace_path(workspace)?;
+                let expected_auto_workspace =
+                    expected_auto_workspace_path(&self.workspace_root, &row.id, &agent_type, extra.get("backend"));
+                let normalized = match validate_workspace_path_availability(workspace) {
+                    Ok(normalized) => normalized,
+                    Err(WorkspacePathValidationError::DoesNotExist(path))
+                        if PathBuf::from(workspace) == expected_auto_workspace =>
+                    {
+                        path
+                    }
+                    Err(error) => return Err(map_runtime_workspace_validation_error(error)),
+                };
                 if normalized != workspace {
                     extra["workspace"] = serde_json::Value::String(normalized.clone());
                 }
@@ -1811,11 +1821,12 @@ impl ConversationService {
     }
 
     async fn ensure_auto_workspace_skill_links(&self, row: &ConversationRow, build_opts: &BuildTaskOptions) {
-        let expected_workspace = self.workspace_root.join("conversations").join(format!(
-            "{}-temp-{}",
-            conversation_label(&build_opts.agent_type, build_opts.extra.get("backend")),
-            row.id
-        ));
+        let expected_workspace = expected_auto_workspace_path(
+            &self.workspace_root,
+            &row.id,
+            &build_opts.agent_type,
+            build_opts.extra.get("backend"),
+        );
 
         let stored_workspace = build_opts.workspace.trim();
         let workspace = if stored_workspace.is_empty() {
@@ -2026,10 +2037,6 @@ fn normalize_workspace_path(workspace: &str) -> Result<String, ConversationError
     validate_workspace_path_availability(workspace).map_err(map_create_workspace_validation_error)
 }
 
-fn validate_runtime_workspace_path(workspace: &str) -> Result<String, ConversationError> {
-    validate_workspace_path_availability(workspace).map_err(map_runtime_workspace_validation_error)
-}
-
 fn map_create_workspace_validation_error(error: WorkspacePathValidationError) -> ConversationError {
     match error {
         WorkspacePathValidationError::Empty => ConversationError::BadRequest {
@@ -2072,6 +2079,18 @@ fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value
         return s.clone();
     }
     agent_type.serde_name().to_owned()
+}
+
+fn expected_auto_workspace_path(
+    workspace_root: &std::path::Path,
+    conversation_id: &str,
+    agent_type: &AgentType,
+    backend: Option<&serde_json::Value>,
+) -> PathBuf {
+    workspace_root.join("conversations").join(format!(
+        "{}-temp-{conversation_id}",
+        conversation_label(agent_type, backend)
+    ))
 }
 
 /// Resolve the native skills directory list for an agent by looking it
