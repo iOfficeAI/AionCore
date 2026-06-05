@@ -37,6 +37,12 @@ use aionui_cron::types::JobStatus;
 
 // ── Test infrastructure ────────────────────────────────────────────
 
+fn ensure_named_workspace_path(name: &str) -> String {
+    let workspace = std::env::temp_dir().join(name);
+    std::fs::create_dir_all(&workspace).unwrap();
+    workspace.to_string_lossy().to_string()
+}
+
 struct MockBroadcaster {
     events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
 }
@@ -159,7 +165,7 @@ impl IConversationRepository for StubConvRepo {
                 extra: serde_json::json!({
                     "backend": "gemini",
                     "agent_name": "Gemini",
-                    "workspace": "/tmp/gemini-workspace",
+                    "workspace": ensure_named_workspace_path("aionui-cron-service-gemini-workspace"),
                     "session_mode": "yolo",
                     "current_model_id": "gemini-2.5-pro"
                 })
@@ -189,7 +195,7 @@ impl IConversationRepository for StubConvRepo {
                 extra: serde_json::json!({
                     "backend": "gemini",
                     "agent_name": "Gemini",
-                    "workspace": "/tmp/gemini-default-workspace",
+                    "workspace": ensure_named_workspace_path("aionui-cron-service-gemini-default-workspace"),
                     "session_mode": "default",
                     "current_model_id": "gemini-2.5-pro"
                 })
@@ -219,7 +225,7 @@ impl IConversationRepository for StubConvRepo {
                 extra: serde_json::json!({
                     "backend": "codex",
                     "agent_name": "Codex",
-                    "workspace": "/tmp/codex-workspace",
+                    "workspace": ensure_named_workspace_path("aionui-cron-service-codex-workspace"),
                     "session_mode": "default",
                     "current_model_id": "gpt-5-codex"
                 })
@@ -249,7 +255,7 @@ impl IConversationRepository for StubConvRepo {
                 extra: serde_json::json!({
                     "backend": "claude",
                     "agent_name": "Claude",
-                    "workspace": "/tmp/claude-workspace",
+                    "workspace": ensure_named_workspace_path("aionui-cron-service-claude-workspace"),
                     "session_mode": "default",
                     "current_model_id": "claude-sonnet-4-20250514"
                 })
@@ -279,7 +285,7 @@ impl IConversationRepository for StubConvRepo {
                 extra: serde_json::json!({
                     "backend": "anthropic",
                     "agent_name": "Aion CLI",
-                    "workspace": "/tmp/aionrs-workspace",
+                    "workspace": ensure_named_workspace_path("aionui-cron-service-aionrs-workspace"),
                     "session_mode": "default",
                     "current_model_id": "claude-sonnet-4-20250514"
                 })
@@ -1266,7 +1272,10 @@ async fn icron_service_create_job_inherits_conversation_mode_and_backend() {
     assert_eq!(config.name, "Gemini");
     assert_eq!(config.mode.as_deref(), Some("yolo"));
     assert_eq!(config.model_id.as_deref(), Some("gemini-2.5-pro"));
-    assert_eq!(config.workspace.as_deref(), Some("/tmp/gemini-workspace"));
+    assert_eq!(
+        config.workspace.as_deref(),
+        Some(ensure_named_workspace_path("aionui-cron-service-gemini-workspace").as_str())
+    );
 }
 
 #[tokio::test]
