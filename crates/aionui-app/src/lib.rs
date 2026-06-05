@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_types)]
+
 //! Application crate: assembles all domain crates into an Axum server with DI and middleware.
 //!
 //! This file is a public façade — it only re-exports symbols defined in

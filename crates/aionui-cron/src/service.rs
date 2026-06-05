@@ -6,7 +6,7 @@ use aionui_api_types::{
     CreateCronJobRequest, CronJobResponse, CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse,
     SaveCronSkillRequest, UpdateCronJobRequest,
 };
-use aionui_common::{AgentType, AppError, generate_prefixed_id, now_ms, workspace_path_has_whitespace_segment};
+use aionui_common::{AgentType, generate_prefixed_id, now_ms, workspace_path_has_whitespace_segment};
 use aionui_db::{ICronRepository, UpdateCronJobParams};
 use tracing::{error, info, warn};
 
@@ -488,7 +488,7 @@ impl CronService {
         }
 
         if workspace_path_has_whitespace_segment(Path::new(&workspace)) {
-            return Err(CronError::App(AppError::WorkspacePathContainsWhitespace(workspace)));
+            return Err(CronError::WorkspacePathContainsWhitespace(workspace));
         }
 
         Ok(())

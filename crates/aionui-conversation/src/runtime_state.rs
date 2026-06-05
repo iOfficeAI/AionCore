@@ -4,8 +4,10 @@ use std::{
 };
 
 use aionui_api_types::{ConversationRuntimeStateKind, ConversationRuntimeSummary};
-use aionui_common::{AppError, ConversationStatus};
+use aionui_common::ConversationStatus;
 use tracing::{info, warn};
+
+use crate::ConversationError;
 
 #[derive(Debug, Default)]
 pub struct ConversationRuntimeStateService {
@@ -26,13 +28,13 @@ pub struct TurnClaim {
 }
 
 impl ConversationRuntimeStateService {
-    pub fn try_claim_turn(self: &Arc<Self>, conversation_id: &str) -> Result<TurnClaim, AppError> {
+    pub fn try_claim_turn(self: &Arc<Self>, conversation_id: &str) -> Result<TurnClaim, ConversationError> {
         let mut state = self.state.lock().map_err(|_| {
             warn!(
                 conversation_id,
                 "conversation runtime state lock poisoned while claiming turn"
             );
-            AppError::Internal("conversation runtime state lock poisoned".into())
+            ConversationError::internal("conversation runtime state lock poisoned")
         })?;
 
         if state.deleting_conversations.contains(conversation_id) {
@@ -40,16 +42,16 @@ impl ConversationRuntimeStateService {
                 conversation_id,
                 "conversation runtime turn claim rejected because conversation is deleting"
             );
-            return Err(AppError::Conflict(format!(
-                "conversation {conversation_id} is being deleted"
-            )));
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} is being deleted"),
+            });
         }
 
         if !state.active_turns.insert(conversation_id.to_owned()) {
             info!(conversation_id, "conversation runtime turn claim rejected");
-            return Err(AppError::Conflict(format!(
-                "conversation {conversation_id} is already running"
-            )));
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} is already running"),
+            });
         }
 
         info!(conversation_id, "conversation runtime turn claimed");

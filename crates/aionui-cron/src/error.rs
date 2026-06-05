@@ -1,4 +1,3 @@
-use aionui_common::AppError;
 use aionui_conversation::ConversationError;
 
 #[derive(Debug, thiserror::Error)]
@@ -33,8 +32,11 @@ pub enum CronError {
     #[error("Scheduler error: {0}")]
     Scheduler(String),
 
-    #[error(transparent)]
-    App(#[from] AppError),
+    #[error("Workspace path contains whitespace: {0}")]
+    WorkspacePathContainsWhitespace(String),
+
+    #[error("Workspace path contains whitespace and is unsupported at runtime: {0}")]
+    WorkspacePathContainsWhitespaceRuntimeUnsupported(String),
 
     #[error(transparent)]
     Conversation(#[from] ConversationError),
@@ -49,9 +51,9 @@ pub enum CronError {
 impl CronError {
     pub(crate) fn from_conversation_create(error: ConversationError) -> Self {
         match error {
-            ConversationError::App(error @ AppError::WorkspacePathContainsWhitespace(_)) => Self::App(error),
-            ConversationError::App(error @ AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(_)) => {
-                Self::App(error)
+            ConversationError::WorkspacePathContainsWhitespace { path } => Self::WorkspacePathContainsWhitespace(path),
+            ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported { path } => {
+                Self::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
             }
             other => Self::Scheduler(format!("create conversation: {other}")),
         }
@@ -64,10 +66,10 @@ mod tests {
 
     #[test]
     fn conversation_create_preserves_workspace_error_code() {
-        let err = CronError::from_conversation_create(ConversationError::App(
-            AppError::WorkspacePathContainsWhitespace("/tmp/a b".into()),
-        ));
-        assert!(matches!(err, CronError::App(AppError::WorkspacePathContainsWhitespace(msg)) if msg == "/tmp/a b"));
+        let err = CronError::from_conversation_create(ConversationError::WorkspacePathContainsWhitespace {
+            path: "/tmp/a b".into(),
+        });
+        assert!(matches!(err, CronError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
     }
 
     #[test]

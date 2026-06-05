@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::{AgentEnvEntry, AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};
-use aionui_common::{AgentType, AppError};
+use aionui_common::AgentType;
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
 use aionui_runtime::{
     ManagedAcpToolId, RuntimeCommandProbe, probe_managed_acp_tool_supported, probe_node_runtime_supported,
@@ -27,6 +27,8 @@ use aionui_runtime::{
 use serde_json::Value;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
+
+use crate::error::AgentError;
 
 /// Capacity of the catalog-sync MPSC channel. A single writer thread
 /// drains it serially, so the bound just sizes the burst we can absorb
@@ -88,7 +90,7 @@ impl AgentRegistry {
     /// tests and the consumer itself.
     ///
     /// `None` fields are left untouched (partial update).
-    async fn apply_handshake_inner(&self, id: &str, snapshot: &AgentHandshake) -> Result<(), AppError> {
+    async fn apply_handshake_inner(&self, id: &str, snapshot: &AgentHandshake) -> Result<(), AgentError> {
         let agent_capabilities = encode_optional(&snapshot.agent_capabilities, "agent_capabilities")?;
         let auth_methods = encode_optional(&snapshot.auth_methods, "auth_methods")?;
         let config_options = encode_optional(&snapshot.config_options, "config_options")?;
@@ -109,7 +111,7 @@ impl AgentRegistry {
             .repo
             .apply_handshake(id, &params)
             .await
-            .map_err(|e| AppError::Internal(format!("apply_handshake: {e}")))?
+            .map_err(|e| AgentError::internal(format!("apply_handshake: {e}")))?
         else {
             return Ok(());
         };
@@ -131,12 +133,12 @@ impl AgentRegistry {
     }
     /// Reload every enabled row from the database and re-probe their
     /// spawn commands on `$PATH`.
-    pub async fn hydrate(&self) -> Result<(), AppError> {
+    pub async fn hydrate(&self) -> Result<(), AgentError> {
         let rows = self
             .repo
             .list_all()
             .await
-            .map_err(|e| AppError::Internal(format!("load agent_metadata: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("load agent_metadata: {e}")))?;
 
         let mut map = HashMap::with_capacity(rows.len());
         for row in rows {
@@ -175,7 +177,7 @@ impl AgentRegistry {
     /// (update). Pure refresh with no DB writes — just rebuilds the
     /// in-memory snapshot so `list_all()` and `get()` return the latest
     /// catalog state without waiting for the next process restart.
-    pub async fn invalidate_and_rehydrate(&self) -> Result<(), AppError> {
+    pub async fn invalidate_and_rehydrate(&self) -> Result<(), AgentError> {
         self.hydrate().await?;
         self.refresh_availability().await;
         Ok(())
@@ -468,11 +470,11 @@ fn parse_json(raw: Option<&str>, field: &str) -> Option<Value> {
     })
 }
 
-fn encode_optional(value: &Option<Value>, field: &str) -> Result<Option<String>, AppError> {
+fn encode_optional(value: &Option<Value>, field: &str) -> Result<Option<String>, AgentError> {
     match value {
         Some(v) => serde_json::to_string(v)
             .map(Some)
-            .map_err(|e| AppError::Internal(format!("encode {field}: {e}"))),
+            .map_err(|e| AgentError::internal(format!("encode {field}: {e}"))),
         None => Ok(None),
     }
 }

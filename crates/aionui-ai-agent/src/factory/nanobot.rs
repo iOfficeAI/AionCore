@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use aionui_common::{AgentType, AppError};
+use aionui_common::AgentType;
 
 use crate::agent_task::AgentInstance;
+use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
 use crate::manager::nanobot::NanobotAgentManager;
@@ -12,7 +13,7 @@ pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     _options: BuildTaskOptions,
     ctx: FactoryContext,
-) -> Result<AgentInstance, AppError> {
+) -> Result<AgentInstance, AgentError> {
     // Nanobot lives in the catalog as an internal row; reuse the
     // registry-resolved path instead of re-running `which()`.
     let cli_path = deps
@@ -21,7 +22,7 @@ pub(super) async fn build(
         .await
         .into_iter()
         .find_map(|m| m.resolved_command)
-        .ok_or_else(|| AppError::BadRequest("Nanobot CLI not found in PATH".into()))?;
+        .ok_or_else(|| AgentError::bad_request("Nanobot CLI not found in PATH"))?;
     let agent = NanobotAgentManager::new(ctx.conversation_id, ctx.workspace, cli_path, deps.data_dir.clone()).await?;
     Ok(AgentInstance::Nanobot(Arc::new(agent)))
 }

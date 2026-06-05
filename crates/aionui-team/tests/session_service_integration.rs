@@ -6,9 +6,9 @@ use std::sync::Mutex;
 
 use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_ai_agent::{IWorkerTaskManager, WorkerTaskManagerImpl};
+use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
-use aionui_common::{AgentKillReason, AgentType, AppError, PaginatedResult, ProviderWithModel};
+use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
     AcpSessionRow, AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
@@ -464,11 +464,11 @@ impl IWorkerTaskManager for CountingTaskManager {
         &self,
         conversation_id: &str,
         options: BuildTaskOptions,
-    ) -> Result<aionui_ai_agent::AgentInstance, AppError> {
+    ) -> Result<aionui_ai_agent::AgentInstance, AgentError> {
         self.calls.lock().unwrap().build.push(conversation_id.to_owned());
         self.inner.get_or_build_task(conversation_id, options).await
     }
-    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         self.calls
             .lock()
             .unwrap()
@@ -499,10 +499,11 @@ impl IWorkerTaskManager for CountingTaskManager {
 // asks the task manager to kill + rebuild; the returned handle never has
 // `send_message` called on it.
 mod mock_agent {
+    use aionui_ai_agent::AgentError;
     use aionui_ai_agent::agent_task::{IAgentTask, IMockAgent};
     use aionui_ai_agent::protocol::events::AgentStreamEvent;
     use aionui_ai_agent::types::SendMessageData;
-    use aionui_common::{AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs};
+    use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs};
     use tokio::sync::broadcast;
 
     pub struct MockAgent {
@@ -555,10 +556,10 @@ mod mock_agent {
         async fn send_message(&self, _data: SendMessageData) -> Result<(), aionui_ai_agent::AgentSendError> {
             Ok(())
         }
-        async fn cancel(&self) -> Result<(), AppError> {
+        async fn cancel(&self) -> Result<(), AgentError> {
             Ok(())
         }
-        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
             Ok(())
         }
     }
@@ -1665,9 +1666,8 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
     // Factory always fails → ensure_session must propagate error and not
     // insert into sessions, so send_message afterwards still errors.
     use futures_util::FutureExt;
-    let failing_factory: AgentFactory = Arc::new(|_opts: BuildTaskOptions| {
-        async move { Err(AppError::Internal("simulated build failure".into())) }.boxed()
-    });
+    let failing_factory: AgentFactory =
+        Arc::new(|_opts: BuildTaskOptions| async move { Err(AgentError::internal("simulated build failure")) }.boxed());
     let (svc, tm) = setup_with_factory(failing_factory);
     let created = svc
         .create_team(

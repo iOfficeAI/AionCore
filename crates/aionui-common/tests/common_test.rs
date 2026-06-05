@@ -93,33 +93,33 @@ fn test_encrypt_large_text() {
     assert_eq!(decrypted, large);
 }
 
-// --- AppError ---
+// --- ApiError ---
 
 #[test]
-fn test_app_error_status_codes() {
+fn test_api_error_status_codes() {
     use axum::http::StatusCode;
 
-    assert_eq!(AppError::NotFound("x".into()).status_code(), StatusCode::NOT_FOUND);
-    assert_eq!(AppError::BadRequest("x".into()).status_code(), StatusCode::BAD_REQUEST);
+    assert_eq!(ApiError::NotFound("x".into()).status_code(), StatusCode::NOT_FOUND);
+    assert_eq!(ApiError::BadRequest("x".into()).status_code(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        AppError::Unauthorized("x".into()).status_code(),
+        ApiError::Unauthorized("x".into()).status_code(),
         StatusCode::UNAUTHORIZED
     );
-    assert_eq!(AppError::Forbidden("x".into()).status_code(), StatusCode::FORBIDDEN);
-    assert_eq!(AppError::Conflict("x".into()).status_code(), StatusCode::CONFLICT);
-    assert_eq!(AppError::RateLimited.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(ApiError::Forbidden("x".into()).status_code(), StatusCode::FORBIDDEN);
+    assert_eq!(ApiError::Conflict("x".into()).status_code(), StatusCode::CONFLICT);
+    assert_eq!(ApiError::RateLimited.status_code(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
-        AppError::Internal("x".into()).status_code(),
+        ApiError::Internal("x".into()).status_code(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
-    assert_eq!(AppError::BadGateway("x".into()).status_code(), StatusCode::BAD_GATEWAY);
-    assert_eq!(AppError::Timeout("x".into()).status_code(), StatusCode::BAD_GATEWAY);
+    assert_eq!(ApiError::BadGateway("x".into()).status_code(), StatusCode::BAD_GATEWAY);
+    assert_eq!(ApiError::Timeout("x".into()).status_code(), StatusCode::BAD_GATEWAY);
 }
 
 #[test]
-fn test_app_error_json_format() {
+fn test_api_error_json_format() {
     use axum::response::IntoResponse;
-    let resp = AppError::NotFound("user 123".into()).into_response();
+    let resp = ApiError::NotFound("user 123".into()).into_response();
     assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
 }
 

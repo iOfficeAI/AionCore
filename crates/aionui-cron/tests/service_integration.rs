@@ -67,10 +67,14 @@ impl aionui_ai_agent::task_manager::IWorkerTaskManager for StubTaskManager {
     fn get_task(&self, _: &str) -> Option<AgentInstance> {
         None
     }
-    async fn get_or_build_task(&self, _: &str, _: BuildTaskOptions) -> Result<AgentInstance, aionui_common::AppError> {
-        Err(aionui_common::AppError::Internal("stub".into()))
+    async fn get_or_build_task(
+        &self,
+        _: &str,
+        _: BuildTaskOptions,
+    ) -> Result<AgentInstance, aionui_ai_agent::AgentError> {
+        Err(aionui_ai_agent::AgentError::internal("stub"))
     }
-    fn kill(&self, _: &str, _: Option<aionui_common::AgentKillReason>) -> Result<(), aionui_common::AppError> {
+    fn kill(&self, _: &str, _: Option<aionui_common::AgentKillReason>) -> Result<(), aionui_ai_agent::AgentError> {
         Ok(())
     }
     fn kill_and_wait(

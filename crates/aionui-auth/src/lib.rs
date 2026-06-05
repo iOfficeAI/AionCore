@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_types)]
+
 //! JWT authentication, password hashing, CSRF protection, rate limiting, and auth middleware.
 mod cookie;
 mod csrf;

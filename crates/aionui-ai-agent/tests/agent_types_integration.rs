@@ -74,10 +74,10 @@ impl IAgentTask for TypedMockAgent {
     async fn send_message(&self, _data: SendMessageData) -> Result<(), aionui_ai_agent::AgentSendError> {
         Ok(())
     }
-    async fn cancel(&self) -> Result<(), aionui_common::AppError> {
+    async fn cancel(&self) -> Result<(), aionui_ai_agent::AgentError> {
         Ok(())
     }
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), aionui_common::AppError> {
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), aionui_ai_agent::AgentError> {
         Ok(())
     }
 }

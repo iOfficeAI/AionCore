@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,7 +15,7 @@ use aionui_api_types::{
     ReadSkillInfoResponse, RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse,
     ScannedSkillResponse, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
 };
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
 use crate::classifier::AssistantRuleDispatcher;
 use crate::external_paths::ExternalPathsManager;
@@ -99,7 +101,7 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
 /// `GET /api/skills` — list all available skills.
 async fn list_skills(
     State(state): State<SkillRouterState>,
-) -> Result<Json<ApiResponse<Vec<SkillListItemResponse>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<SkillListItemResponse>>>, ApiError> {
     let items = skill_service::list_available_skills(&state.skill_paths).await?;
     let resp: Vec<SkillListItemResponse> = items
         .into_iter()
@@ -118,7 +120,7 @@ async fn list_skills(
 /// `GET /api/skills/builtin-auto` — list auto-injected built-in skills.
 async fn list_builtin_auto_skills(
     State(state): State<SkillRouterState>,
-) -> Result<Json<ApiResponse<Vec<BuiltinAutoSkillResponse>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<BuiltinAutoSkillResponse>>>, ApiError> {
     let items = skill_service::list_builtin_auto_skills(&state.skill_paths).await?;
     let resp: Vec<BuiltinAutoSkillResponse> = items
         .into_iter()
@@ -134,8 +136,8 @@ async fn list_builtin_auto_skills(
 /// `POST /api/skills/info` — read skill info without importing.
 async fn read_skill_info(
     body: Result<Json<ReadSkillInfoRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<ReadSkillInfoResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<ReadSkillInfoResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let (name, description) = skill_service::read_skill_info(Path::new(&req.skill_path)).await?;
     Ok(Json(ApiResponse::ok(ReadSkillInfoResponse { name, description })))
 }
@@ -143,7 +145,7 @@ async fn read_skill_info(
 /// `GET /api/skills/paths` — get user and built-in skill directories.
 async fn get_skill_paths(
     State(state): State<SkillRouterState>,
-) -> Result<Json<ApiResponse<SkillPathsResponse>>, AppError> {
+) -> Result<Json<ApiResponse<SkillPathsResponse>>, ApiError> {
     let (user_dir, builtin_dir) = skill_service::get_skill_paths(&state.skill_paths);
     Ok(Json(ApiResponse::ok(SkillPathsResponse {
         user_skills_dir: user_dir,
@@ -159,8 +161,8 @@ async fn get_skill_paths(
 async fn import_skill(
     State(state): State<SkillRouterState>,
     body: Result<Json<ImportSkillRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<ImportSkillResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let name = skill_service::import_skill(&state.skill_paths, Path::new(&req.skill_path)).await?;
     Ok(Json(ApiResponse::ok(ImportSkillResponse {
         skill_name: name.clone(),
@@ -172,8 +174,8 @@ async fn import_skill(
 async fn import_skill_symlink(
     State(state): State<SkillRouterState>,
     body: Result<Json<ImportSkillRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<ImportSkillResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let names = skill_service::import_skills_with_symlink(&state.skill_paths, Path::new(&req.skill_path)).await?;
     let first_name = names.first().cloned().unwrap_or_default();
     Ok(Json(ApiResponse::ok(ImportSkillResponse {
@@ -185,8 +187,8 @@ async fn import_skill_symlink(
 /// `POST /api/skills/export-symlink` — export a skill symlink.
 async fn export_skill_symlink(
     body: Result<Json<ExportSkillRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     skill_service::export_skill_with_symlink(Path::new(&req.skill_path), Path::new(&req.target_dir)).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -195,7 +197,7 @@ async fn export_skill_symlink(
 async fn delete_skill(
     State(state): State<SkillRouterState>,
     AxumPath(name): AxumPath<String>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
+) -> Result<Json<ApiResponse<()>>, ApiError> {
     skill_service::delete_skill(&state.skill_paths, &name).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -207,8 +209,8 @@ async fn delete_skill(
 /// `POST /api/skills/scan` — scan a directory for skills.
 async fn scan_for_skills(
     body: Result<Json<ScanForSkillsRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<ScanForSkillsResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<ScanForSkillsResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let skills = skill_service::scan_for_skills(Path::new(&req.folder_path)).await?;
     let resp = ScanForSkillsResponse {
         skills: skills
@@ -224,7 +226,7 @@ async fn scan_for_skills(
 }
 
 /// `GET /api/skills/detect-paths` — detect common skill paths.
-async fn detect_paths() -> Result<Json<ApiResponse<Vec<NamedPathResponse>>>, AppError> {
+async fn detect_paths() -> Result<Json<ApiResponse<Vec<NamedPathResponse>>>, ApiError> {
     let paths = skill_service::detect_common_skill_paths().await;
     let resp: Vec<NamedPathResponse> = paths
         .into_iter()
@@ -239,7 +241,7 @@ async fn detect_paths() -> Result<Json<ApiResponse<Vec<NamedPathResponse>>>, App
 /// `GET /api/skills/detect-external` — discover external skills from all sources.
 async fn detect_external(
     State(state): State<SkillRouterState>,
-) -> Result<Json<ApiResponse<Vec<ExternalSkillSourceResponse>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<ExternalSkillSourceResponse>>>, ApiError> {
     let custom = state.external_paths_manager.get_custom_external_paths().await;
     let sources = skill_service::detect_and_count_external_skills(&custom).await;
     let resp: Vec<ExternalSkillSourceResponse> = sources
@@ -271,8 +273,8 @@ async fn detect_external(
 async fn read_builtin_rule(
     State(state): State<SkillRouterState>,
     body: Result<Json<ReadBuiltinResourceRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<String>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<String>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let content = skill_service::read_builtin_rule(&state.skill_paths, &req.file_name).await?;
     Ok(Json(ApiResponse::ok(content)))
 }
@@ -281,8 +283,8 @@ async fn read_builtin_rule(
 async fn read_builtin_skill(
     State(state): State<SkillRouterState>,
     body: Result<Json<ReadBuiltinResourceRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<String>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<String>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let content = skill_service::read_builtin_skill(&state.skill_paths, &req.file_name).await?;
     Ok(Json(ApiResponse::ok(content)))
 }
@@ -294,10 +296,10 @@ async fn read_builtin_skill(
 async fn materialize_for_agent(
     State(state): State<SkillRouterState>,
     body: Result<Json<MaterializeSkillsRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<MaterializeSkillsResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<MaterializeSkillsResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     if req.conversation_id.trim().is_empty() {
-        return Err(AppError::BadRequest("conversationId must not be empty".into()));
+        return Err(ApiError::BadRequest("conversationId must not be empty".into()));
     }
     let resolved =
         skill_service::materialize_skills_for_agent(&state.skill_paths, &req.conversation_id, &req.skills).await?;
@@ -322,8 +324,8 @@ async fn materialize_for_agent(
 async fn read_assistant_rule(
     State(state): State<SkillRouterState>,
     body: Result<Json<ReadAssistantRuleRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<String>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<String>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         let content = dispatcher.read_rule(&req.assistant_id, req.locale.as_deref()).await?;
         return Ok(Json(ApiResponse::ok(content)));
@@ -339,8 +341,8 @@ async fn read_assistant_rule(
 async fn write_assistant_rule(
     State(state): State<SkillRouterState>,
     body: Result<Json<WriteAssistantRuleRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<bool>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<bool>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         dispatcher
             .write_rule(&req.assistant_id, req.locale.as_deref(), &req.content)
@@ -361,7 +363,7 @@ async fn write_assistant_rule(
 async fn delete_assistant_rule(
     State(state): State<SkillRouterState>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<ApiResponse<bool>>, AppError> {
+) -> Result<Json<ApiResponse<bool>>, ApiError> {
     if let Some(dispatcher) = &state.assistant_dispatcher {
         let ok = dispatcher.delete_rule(&id).await?;
         return Ok(Json(ApiResponse::ok(ok)));
@@ -380,8 +382,8 @@ async fn delete_assistant_rule(
 async fn read_assistant_skill(
     State(state): State<SkillRouterState>,
     body: Result<Json<ReadAssistantRuleRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<String>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<String>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         let content = dispatcher.read_skill(&req.assistant_id, req.locale.as_deref()).await?;
         return Ok(Json(ApiResponse::ok(content)));
@@ -397,8 +399,8 @@ async fn read_assistant_skill(
 async fn write_assistant_skill(
     State(state): State<SkillRouterState>,
     body: Result<Json<WriteAssistantRuleRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<bool>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<bool>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         dispatcher
             .write_skill(&req.assistant_id, req.locale.as_deref(), &req.content)
@@ -419,7 +421,7 @@ async fn write_assistant_skill(
 async fn delete_assistant_skill(
     State(state): State<SkillRouterState>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<ApiResponse<bool>>, AppError> {
+) -> Result<Json<ApiResponse<bool>>, ApiError> {
     if let Some(dispatcher) = &state.assistant_dispatcher {
         let ok = dispatcher.delete_skill(&id).await?;
         return Ok(Json(ApiResponse::ok(ok)));
@@ -435,7 +437,7 @@ async fn delete_assistant_skill(
 /// `GET /api/skills/external-paths` — list custom external paths.
 async fn get_external_paths(
     State(state): State<SkillRouterState>,
-) -> Result<Json<ApiResponse<Vec<NamedPathResponse>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<NamedPathResponse>>>, ApiError> {
     let paths = state.external_paths_manager.get_custom_external_paths().await;
     let resp: Vec<NamedPathResponse> = paths
         .into_iter()
@@ -451,8 +453,8 @@ async fn get_external_paths(
 async fn add_external_path(
     State(state): State<SkillRouterState>,
     body: Result<Json<AddExternalPathRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state
         .external_paths_manager
         .add_custom_external_path(&req.name, &req.path)
@@ -464,8 +466,8 @@ async fn add_external_path(
 async fn remove_external_path(
     State(state): State<SkillRouterState>,
     body: Result<Json<RemoveExternalPathRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state
         .external_paths_manager
         .remove_custom_external_path(&req.path)
@@ -478,13 +480,13 @@ async fn remove_external_path(
 // ---------------------------------------------------------------------------
 
 /// `POST /api/skills/market/enable` — enable the aionui skills market.
-async fn enable_skills_market(State(state): State<SkillRouterState>) -> Result<Json<ApiResponse<()>>, AppError> {
+async fn enable_skills_market(State(state): State<SkillRouterState>) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.external_paths_manager.enable_skills_market().await?;
     Ok(Json(ApiResponse::success()))
 }
 
 /// `POST /api/skills/market/disable` — disable the aionui skills market.
-async fn disable_skills_market(State(state): State<SkillRouterState>) -> Result<Json<ApiResponse<()>>, AppError> {
+async fn disable_skills_market(State(state): State<SkillRouterState>) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.external_paths_manager.disable_skills_market().await?;
     Ok(Json(ApiResponse::success()))
 }

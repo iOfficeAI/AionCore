@@ -1,9 +1,4 @@
-use aionui_common::AppError;
-
 /// Channel crate-level errors.
-///
-/// Uses `thiserror` (library crate convention).
-/// Converts to `AppError` for HTTP response mapping.
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
     #[error("Plugin not found: {0}")]
@@ -58,130 +53,9 @@ pub enum ChannelError {
     Json(#[from] serde_json::Error),
 }
 
-impl From<ChannelError> for AppError {
-    fn from(err: ChannelError) -> Self {
-        match err {
-            ChannelError::PluginNotFound(msg) => AppError::NotFound(msg),
-            ChannelError::InvalidPluginType(msg) => AppError::BadRequest(msg),
-            ChannelError::PluginAlreadyRunning(msg) => AppError::Conflict(msg),
-            ChannelError::InvalidConfig(msg) => AppError::BadRequest(msg),
-            ChannelError::ConnectionFailed(msg) => AppError::BadGateway(msg),
-            ChannelError::PairingNotFound(msg) => AppError::NotFound(msg),
-            ChannelError::PairingExpired(msg) => AppError::BadRequest(msg),
-            ChannelError::PairingAlreadyProcessed(msg) => AppError::BadRequest(msg),
-            ChannelError::UserNotFound(msg) => AppError::NotFound(msg),
-            ChannelError::UserNotAuthorized(msg) => AppError::Forbidden(msg),
-            ChannelError::SessionNotFound(msg) => AppError::NotFound(msg),
-            ChannelError::EncryptionFailed(msg) => AppError::Internal(msg),
-            ChannelError::DecryptionFailed(msg) => AppError::Internal(msg),
-            ChannelError::PlatformApi(msg) => AppError::BadGateway(msg),
-            ChannelError::MessageSendFailed(msg) => AppError::Internal(msg),
-            ChannelError::Database(db_err) => AppError::from(db_err),
-            ChannelError::Json(e) => AppError::Internal(format!("JSON error: {e}")),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn plugin_not_found_maps_to_app_not_found() {
-        let err: AppError = ChannelError::PluginNotFound("telegram".into()).into();
-        assert!(matches!(err, AppError::NotFound(msg) if msg == "telegram"));
-    }
-
-    #[test]
-    fn invalid_plugin_type_maps_to_bad_request() {
-        let err: AppError = ChannelError::InvalidPluginType("unknown".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn plugin_already_running_maps_to_conflict() {
-        let err: AppError = ChannelError::PluginAlreadyRunning("telegram".into()).into();
-        assert!(matches!(err, AppError::Conflict(_)));
-    }
-
-    #[test]
-    fn invalid_config_maps_to_bad_request() {
-        let err: AppError = ChannelError::InvalidConfig("missing token".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn connection_failed_maps_to_bad_gateway() {
-        let err: AppError = ChannelError::ConnectionFailed("timeout".into()).into();
-        assert!(matches!(err, AppError::BadGateway(_)));
-    }
-
-    #[test]
-    fn pairing_not_found_maps_to_not_found() {
-        let err: AppError = ChannelError::PairingNotFound("123456".into()).into();
-        assert!(matches!(err, AppError::NotFound(_)));
-    }
-
-    #[test]
-    fn pairing_expired_maps_to_bad_request() {
-        let err: AppError = ChannelError::PairingExpired("123456".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn pairing_already_processed_maps_to_bad_request() {
-        let err: AppError = ChannelError::PairingAlreadyProcessed("123456".into()).into();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn user_not_found_maps_to_not_found() {
-        let err: AppError = ChannelError::UserNotFound("user-1".into()).into();
-        assert!(matches!(err, AppError::NotFound(_)));
-    }
-
-    #[test]
-    fn user_not_authorized_maps_to_forbidden() {
-        let err: AppError = ChannelError::UserNotAuthorized("tg_42".into()).into();
-        assert!(matches!(err, AppError::Forbidden(_)));
-    }
-
-    #[test]
-    fn session_not_found_maps_to_not_found() {
-        let err: AppError = ChannelError::SessionNotFound("sess-1".into()).into();
-        assert!(matches!(err, AppError::NotFound(_)));
-    }
-
-    #[test]
-    fn encryption_failed_maps_to_internal() {
-        let err: AppError = ChannelError::EncryptionFailed("bad key".into()).into();
-        assert!(matches!(err, AppError::Internal(_)));
-    }
-
-    #[test]
-    fn decryption_failed_maps_to_internal() {
-        let err: AppError = ChannelError::DecryptionFailed("corrupt".into()).into();
-        assert!(matches!(err, AppError::Internal(_)));
-    }
-
-    #[test]
-    fn platform_api_maps_to_bad_gateway() {
-        let err: AppError = ChannelError::PlatformApi("429 rate limited".into()).into();
-        assert!(matches!(err, AppError::BadGateway(_)));
-    }
-
-    #[test]
-    fn message_send_failed_maps_to_internal() {
-        let err: AppError = ChannelError::MessageSendFailed("chat not found".into()).into();
-        assert!(matches!(err, AppError::Internal(_)));
-    }
-
-    #[test]
-    fn json_error_maps_to_internal() {
-        let json_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
-        let err: AppError = ChannelError::Json(json_err).into();
-        assert!(matches!(err, AppError::Internal(_)));
-    }
 
     #[test]
     fn display_messages() {

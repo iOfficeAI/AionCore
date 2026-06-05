@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::agent_task::AgentInstance;
+use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
 use crate::factory::context::FactoryContext;
@@ -8,7 +9,7 @@ use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::types::BuildTaskOptions;
 use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
 use aionui_api_types::{AcpBuildExtra, SessionMcpServer, SessionMcpTransport};
-use aionui_common::{AppError, CommandSpec};
+use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -24,7 +25,7 @@ pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     options: BuildTaskOptions,
     ctx: FactoryContext,
-) -> Result<AgentInstance, AppError> {
+) -> Result<AgentInstance, AgentError> {
     let belongs_to_team = options
         .extra
         .get("teamId")
@@ -32,7 +33,7 @@ pub(super) async fn build(
         .is_some_and(|s| !s.is_empty());
 
     let mut config: AcpBuildExtra = serde_json::from_value(options.extra)
-        .map_err(|e| AppError::BadRequest(format!("Invalid ACP build options: {e}")))?;
+        .map_err(|e| AgentError::bad_request(format!("Invalid ACP build options: {e}")))?;
 
     // Resolve the catalog row — prefer explicit agent_id, fall
     // back to a vendor-label match for legacy payloads.
@@ -43,7 +44,7 @@ pub(super) async fn build(
     } else {
         None
     }
-    .ok_or_else(|| AppError::BadRequest("ACP agent requires either agent_id or backend in extra".into()))?;
+    .ok_or_else(|| AgentError::bad_request("ACP agent requires either agent_id or backend in extra"))?;
 
     // Trust the catalog row over the client-supplied `backend` when an
     // `agent_id` was provided. The frontend collapses row-scoped rows
@@ -206,7 +207,7 @@ async fn resolve_agent_command_spec(
     workspace: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
-) -> Result<CommandSpec, AppError> {
+) -> Result<CommandSpec, AgentError> {
     if meta.agent_source == aionui_api_types::AgentSource::Builtin
         && let Some(backend) = meta.backend.as_deref()
         && let Some(tool) = ManagedAcpToolId::from_backend(backend)
@@ -218,11 +219,11 @@ async fn resolve_agent_command_spec(
         .command
         .as_deref()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::BadRequest(format!("Agent '{}' has no spawn command configured", meta.name)))?;
+        .ok_or_else(|| AgentError::bad_request(format!("Agent '{}' has no spawn command configured", meta.name)))?;
     let reporter = conversation_runtime_reporter(broadcaster, conversation_id.to_owned());
     let resolved = ensure_runtime_command_with_reporter(command, Some(reporter.as_ref()))
         .await
-        .map_err(|error| AppError::BadRequest(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
+        .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
 
     let mut args: Vec<String> = resolved
         .args_prefix
@@ -258,16 +259,16 @@ async fn resolve_builtin_managed_acp_command_spec(
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
     tool: ManagedAcpToolId,
-) -> Result<CommandSpec, AppError> {
+) -> Result<CommandSpec, AgentError> {
     let node_reporter = conversation_runtime_reporter(broadcaster.clone(), conversation_id.to_owned());
     let node_runtime = ensure_node_runtime_with_reporter(Some(node_reporter.as_ref()))
         .await
-        .map_err(|error| AppError::BadRequest(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
+        .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
 
     let tool_reporter = conversation_acp_tool_runtime_reporter(broadcaster, conversation_id.to_owned(), tool);
     let managed_tool = ensure_managed_acp_tool_with_reporter(tool, Some(tool_reporter.as_ref()))
         .await
-        .map_err(|error| AppError::BadRequest(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
+        .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
 
     let resolved = managed_tool.command(&node_runtime);
 

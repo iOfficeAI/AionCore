@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, State};
@@ -6,7 +8,7 @@ use axum::routing::{get, post};
 use aionui_api_types::{
     ApiResponse, HubExtensionListItem, HubOperationResponse, HubUpdateInfo as ApiHubUpdateInfo, InstallExtensionRequest,
 };
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
 use crate::hub::index_manager::HubIndexManager;
 use crate::hub::installer::HubInstaller;
@@ -47,7 +49,7 @@ pub fn hub_routes(state: HubRouterState) -> Router {
 /// `GET /api/hub/extensions` — get Hub extension list with statuses.
 async fn get_hub_extensions(
     State(state): State<HubRouterState>,
-) -> Result<Json<ApiResponse<Vec<HubExtensionListItem>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<HubExtensionListItem>>>, ApiError> {
     let entries = state.index_manager.load_index().await;
     let items: Vec<HubExtensionListItem> = entries
         .into_iter()
@@ -76,8 +78,8 @@ async fn get_hub_extensions(
 async fn install_extension(
     State(state): State<HubRouterState>,
     body: Result<Json<InstallExtensionRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<HubOperationResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let result = state.installer.install(&req.name).await;
     Ok(Json(ApiResponse::ok(HubOperationResponse {
         success: result.success,
@@ -89,8 +91,8 @@ async fn install_extension(
 async fn retry_install(
     State(state): State<HubRouterState>,
     body: Result<Json<InstallExtensionRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<HubOperationResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let result = state.installer.retry_install(&req.name).await;
     Ok(Json(ApiResponse::ok(HubOperationResponse {
         success: result.success,
@@ -101,7 +103,7 @@ async fn retry_install(
 /// `POST /api/hub/check-updates` — check for available updates.
 async fn check_updates(
     State(state): State<HubRouterState>,
-) -> Result<Json<ApiResponse<Vec<ApiHubUpdateInfo>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<ApiHubUpdateInfo>>>, ApiError> {
     let updates = state.installer.check_updates().await;
     let resp: Vec<ApiHubUpdateInfo> = updates
         .into_iter()
@@ -118,8 +120,8 @@ async fn check_updates(
 async fn update_extension(
     State(state): State<HubRouterState>,
     body: Result<Json<InstallExtensionRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<HubOperationResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let result = state.installer.update(&req.name).await;
     Ok(Json(ApiResponse::ok(HubOperationResponse {
         success: result.success,
@@ -131,8 +133,8 @@ async fn update_extension(
 async fn uninstall_extension(
     State(state): State<HubRouterState>,
     body: Result<Json<InstallExtensionRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<HubOperationResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let result = state.installer.uninstall(&req.name).await;
     Ok(Json(ApiResponse::ok(HubOperationResponse {
         success: result.success,

@@ -2,8 +2,9 @@
 //! builders. Produced by `FactoryContext::resolve` at the top of
 //! `build_agent`, then passed into the per-agent `build(..)` functions.
 
-use aionui_common::{AgentType, AppError};
+use aionui_common::AgentType;
 
+use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::types::BuildTaskOptions;
 
@@ -14,7 +15,7 @@ pub(super) struct FactoryContext {
 }
 
 impl FactoryContext {
-    pub async fn resolve(deps: &AgentFactoryDeps, options: &BuildTaskOptions) -> Result<Self, AppError> {
+    pub async fn resolve(deps: &AgentFactoryDeps, options: &BuildTaskOptions) -> Result<Self, AgentError> {
         let conversation_id = options.conversation_id.clone();
 
         // `is_custom_workspace` is the authoritative signal for "user
@@ -36,7 +37,7 @@ impl FactoryContext {
                 .join("conversations")
                 .join(format!("{label}-temp-{conversation_id}"));
             std::fs::create_dir_all(&dir)
-                .map_err(|e| AppError::Internal(format!("Failed to create temp workspace: {e}")))?;
+                .map_err(|e| AgentError::internal(format!("Failed to create temp workspace: {e}")))?;
             (dir.to_string_lossy().into_owned(), false)
         } else {
             (options.workspace.clone(), true)

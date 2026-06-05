@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_types)]
+
 //! Scheduled job engine: cron scheduler, executor, and lifecycle event emitter.
 mod artifacts;
 pub mod busy_guard;

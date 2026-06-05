@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 //! HTTP route handlers for `/api/assistants/*`.
 
 use axum::Router;
@@ -12,8 +14,9 @@ use aionui_api_types::{
     ApiResponse, AssistantResponse, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult,
     SetAssistantStateRequest, UpdateAssistantRequest,
 };
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
+use crate::error::AssistantError;
 pub use crate::state::AssistantRouterState;
 
 /// Build the router for `/api/assistants/*`.
@@ -27,9 +30,21 @@ pub fn assistant_routes(state: AssistantRouterState) -> Router {
         .with_state(state)
 }
 
+impl From<AssistantError> for ApiError {
+    fn from(error: AssistantError) -> Self {
+        match error {
+            AssistantError::NotFound(message) => Self::NotFound(message),
+            AssistantError::BadRequest(message) => Self::BadRequest(message),
+            AssistantError::Forbidden(message) => Self::Forbidden(message),
+            AssistantError::Conflict(message) => Self::Conflict(message),
+            AssistantError::Internal(message) => Self::Internal(message),
+        }
+    }
+}
+
 async fn list(
     State(state): State<AssistantRouterState>,
-) -> Result<Json<ApiResponse<Vec<AssistantResponse>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<AssistantResponse>>>, ApiError> {
     let items = state.service.list().await?;
     Ok(Json(ApiResponse::ok(items)))
 }
@@ -37,8 +52,8 @@ async fn list(
 async fn create(
     State(state): State<AssistantRouterState>,
     body: Result<Json<CreateAssistantRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<ApiResponse<AssistantResponse>>), AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<(StatusCode, Json<ApiResponse<AssistantResponse>>), ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let created = state.service.create(req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
 }
@@ -47,8 +62,8 @@ async fn update(
     State(state): State<AssistantRouterState>,
     Path(id): Path<String>,
     body: Result<Json<UpdateAssistantRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<AssistantResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let updated = state.service.update(&id, req).await?;
     Ok(Json(ApiResponse::ok(updated)))
 }
@@ -56,7 +71,7 @@ async fn update(
 async fn delete_one(
     State(state): State<AssistantRouterState>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
+) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.service.delete(&id).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -65,8 +80,8 @@ async fn set_state(
     State(state): State<AssistantRouterState>,
     Path(id): Path<String>,
     body: Result<Json<SetAssistantStateRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<AssistantResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let resp = state.service.set_state(&id, req).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
@@ -74,8 +89,8 @@ async fn set_state(
 async fn import(
     State(state): State<AssistantRouterState>,
     body: Result<Json<ImportAssistantsRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<ImportAssistantsResult>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<ImportAssistantsResult>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let result = state.service.import(req).await?;
     Ok(Json(ApiResponse::ok(result)))
 }
@@ -83,12 +98,12 @@ async fn import(
 /// Serve the raw avatar bytes for an assistant. Content-Type inferred from the
 /// file extension (png/jpg/svg default). Extensions return 404 — the frontend
 /// serves those via `aion-asset://`.
-async fn get_avatar(State(state): State<AssistantRouterState>, Path(id): Path<String>) -> Result<Response, AppError> {
+async fn get_avatar(State(state): State<AssistantRouterState>, Path(id): Path<String>) -> Result<Response, ApiError> {
     let asset = state
         .service
         .avatar_asset(&id)
         .await
-        .ok_or_else(|| AppError::NotFound(format!("avatar '{id}' not found")))?;
+        .ok_or_else(|| ApiError::NotFound(format!("avatar '{id}' not found")))?;
 
     let content_type = content_type_for_extension(asset.extension.as_deref());
 
@@ -96,7 +111,7 @@ async fn get_avatar(State(state): State<AssistantRouterState>, Path(id): Path<St
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .body(Body::from(asset.bytes))
-        .map_err(|e| AppError::Internal(e.to_string()))
+        .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 fn content_type_for_extension(ext: Option<&str>) -> HeaderValue {

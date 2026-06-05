@@ -6,7 +6,7 @@ use aionui_ai_agent::task_manager::IWorkerTaskManager;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentRegistry, AgentStreamEvent};
 use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
-use aionui_common::{AgentType, AppError, ProviderWithModel, now_ms, workspace_path_has_whitespace_segment};
+use aionui_common::{AgentType, ProviderWithModel, now_ms, workspace_path_has_whitespace_segment};
 use aionui_conversation::ConversationService;
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationRowUpdate, IConversationRepository};
@@ -205,9 +205,7 @@ impl JobExecutor {
         }
 
         if workspace_path_has_whitespace_segment(Path::new(&workspace)) {
-            return Err(CronError::App(
-                AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(workspace),
-            ));
+            return Err(CronError::WorkspacePathContainsWhitespaceRuntimeUnsupported(workspace));
         }
 
         Ok(())
@@ -1996,10 +1994,14 @@ mod tests {
                 &self,
                 _: &str,
                 _: BuildTaskOptions,
-            ) -> Result<AgentInstance, aionui_common::AppError> {
-                Err(aionui_common::AppError::Internal("stub".into()))
+            ) -> Result<AgentInstance, aionui_ai_agent::AgentError> {
+                Err(aionui_ai_agent::AgentError::internal("stub"))
             }
-            fn kill(&self, _: &str, _: Option<aionui_common::AgentKillReason>) -> Result<(), aionui_common::AppError> {
+            fn kill(
+                &self,
+                _: &str,
+                _: Option<aionui_common::AgentKillReason>,
+            ) -> Result<(), aionui_ai_agent::AgentError> {
                 Ok(())
             }
             fn kill_and_wait(
@@ -2245,25 +2247,25 @@ mod tests {
             Ok(())
         }
 
-        async fn cancel(&self) -> Result<(), aionui_common::AppError> {
+        async fn cancel(&self) -> Result<(), aionui_ai_agent::AgentError> {
             Ok(())
         }
 
-        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), aionui_common::AppError> {
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), aionui_ai_agent::AgentError> {
             Ok(())
         }
     }
 
     #[async_trait::async_trait]
     impl IMockAgent for RecordingAgent {
-        async fn mode(&self) -> Result<AgentModeResponse, aionui_common::AppError> {
+        async fn mode(&self) -> Result<AgentModeResponse, aionui_ai_agent::AgentError> {
             Ok(AgentModeResponse {
                 mode: self.mode().await,
                 initialized: self.initialized,
             })
         }
 
-        async fn set_mode(&self, mode: &str) -> Result<(), aionui_common::AppError> {
+        async fn set_mode(&self, mode: &str) -> Result<(), aionui_ai_agent::AgentError> {
             self.set_mode_calls.fetch_add(1, Ordering::Relaxed);
             let mut guard = self.mode.write().await;
             *guard = mode.to_owned();
@@ -2285,7 +2287,7 @@ mod tests {
             &self,
             _conversation_id: &str,
             _options: BuildTaskOptions,
-        ) -> Result<AgentInstance, aionui_common::AppError> {
+        ) -> Result<AgentInstance, aionui_ai_agent::AgentError> {
             Ok(self.agent.clone())
         }
 
@@ -2293,7 +2295,7 @@ mod tests {
             &self,
             _conversation_id: &str,
             _reason: Option<AgentKillReason>,
-        ) -> Result<(), aionui_common::AppError> {
+        ) -> Result<(), aionui_ai_agent::AgentError> {
             Ok(())
         }
 
@@ -2348,7 +2350,7 @@ mod tests {
             &self,
             _conversation_id: &str,
             options: BuildTaskOptions,
-        ) -> Result<AgentInstance, aionui_common::AppError> {
+        ) -> Result<AgentInstance, aionui_ai_agent::AgentError> {
             self.options.lock().unwrap().push(options);
             Ok(self.agent.clone())
         }
@@ -2357,7 +2359,7 @@ mod tests {
             &self,
             _conversation_id: &str,
             _reason: Option<AgentKillReason>,
-        ) -> Result<(), aionui_common::AppError> {
+        ) -> Result<(), aionui_ai_agent::AgentError> {
             Ok(())
         }
 

@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_types)]
+
 //! Conversation and message CRUD with streaming relay and event emission.
 mod acp_error_recovery;
 mod convert;

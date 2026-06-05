@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
-use aionui_common::AppError;
+use crate::error::AgentError;
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -31,7 +31,7 @@ const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TICK_INTERVAL_MS: u64 = 30_000;
 
-type PendingSender = oneshot::Sender<Result<Value, AppError>>;
+type PendingSender = oneshot::Sender<Result<Value, AgentError>>;
 
 pub struct AuthConfig {
     pub token: Option<String>,
@@ -54,10 +54,10 @@ impl OpenClawConnection {
         url: &str,
         auth: Option<AuthConfig>,
         identity: &DeviceIdentity,
-    ) -> Result<(Arc<Self>, HelloOk), AppError> {
+    ) -> Result<(Arc<Self>, HelloOk), AgentError> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(url)
             .await
-            .map_err(|e| AppError::Internal(format!("OpenClaw WebSocket connection failed: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("OpenClaw WebSocket connection failed: {e}")))?;
 
         let (sink, stream) = ws_stream.split();
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -137,7 +137,7 @@ impl OpenClawConnection {
         nonce: Option<&str>,
         auth: Option<AuthConfig>,
         identity: &DeviceIdentity,
-    ) -> Result<HelloOk, AppError> {
+    ) -> Result<HelloOk, AgentError> {
         let auth_params = match &auth {
             Some(a) if a.token.is_some() || a.password.is_some() => Some(AuthParams {
                 token: a.token.clone(),
@@ -169,7 +169,7 @@ impl OpenClawConnection {
             .await
     }
 
-    pub async fn request<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, AppError> {
+    pub async fn request<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, AgentError> {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
 
@@ -188,11 +188,11 @@ impl OpenClawConnection {
 
         let result = tokio::time::timeout(REQUEST_TIMEOUT, rx)
             .await
-            .map_err(|_| AppError::Internal(format!("OpenClaw request '{method}' timed out")))?
-            .map_err(|_| AppError::Internal(format!("OpenClaw request '{method}' cancelled")))??;
+            .map_err(|_| AgentError::internal(format!("OpenClaw request '{method}' timed out")))?
+            .map_err(|_| AgentError::internal(format!("OpenClaw request '{method}' cancelled")))??;
 
         serde_json::from_value(result)
-            .map_err(|e| AppError::Internal(format!("Failed to parse OpenClaw response for '{method}': {e}")))
+            .map_err(|e| AgentError::internal(format!("Failed to parse OpenClaw response for '{method}': {e}")))
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<EventFrame> {
@@ -213,7 +213,7 @@ impl OpenClawConnection {
         // Fail all pending requests
         let mut pending = self.pending.lock().await;
         for (_, tx) in pending.drain() {
-            let _ = tx.send(Err(AppError::Internal("Connection closed".into())));
+            let _ = tx.send(Err(AgentError::internal("Connection closed")));
         }
     }
 
@@ -240,7 +240,7 @@ impl OpenClawConnection {
         // Fail all pending requests
         let mut pending = self.pending.lock().await;
         for (_, tx) in pending.drain() {
-            let _ = tx.send(Err(AppError::Internal("OpenClaw connection closed".into())));
+            let _ = tx.send(Err(AgentError::internal("OpenClaw connection closed")));
         }
     }
 
@@ -264,7 +264,7 @@ impl OpenClawConnection {
                             .error
                             .map(|e| format!("{}: {}", e.code, e.message))
                             .unwrap_or_else(|| "Unknown error".into());
-                        let _ = tx.send(Err(AppError::Internal(msg)));
+                        let _ = tx.send(Err(AgentError::internal(msg)));
                     }
                 }
             }
@@ -292,18 +292,18 @@ impl OpenClawConnection {
         }
     }
 
-    async fn ws_send_frame(&self, frame: &RequestFrame) -> Result<(), AppError> {
+    async fn ws_send_frame(&self, frame: &RequestFrame) -> Result<(), AgentError> {
         let text = serde_json::to_string(frame)
-            .map_err(|e| AppError::Internal(format!("Failed to serialize request frame: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("Failed to serialize request frame: {e}")))?;
 
         let mut guard = self.ws_sink.lock().await;
         let sink = guard
             .as_mut()
-            .ok_or_else(|| AppError::Internal("OpenClaw WebSocket not connected".into()))?;
+            .ok_or_else(|| AgentError::internal("OpenClaw WebSocket not connected"))?;
 
         sink.send(Message::Text(text.into())).await.map_err(|e| {
             error!(error = %e, "Failed to send OpenClaw WebSocket message");
-            AppError::Internal(format!("OpenClaw WebSocket send failed: {e}"))
+            AgentError::internal(format!("OpenClaw WebSocket send failed: {e}"))
         })
     }
 }

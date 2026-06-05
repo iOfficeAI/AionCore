@@ -1,7 +1,8 @@
 use aionui_api_types::OpenClawGatewayConfig;
-use aionui_common::{AppError, CommandSpec, EnvVar};
+use aionui_common::{CommandSpec, EnvVar};
 
 use super::{DEFAULT_GATEWAY_PORT, GATEWAY_READY_POLL_INTERVAL, GATEWAY_READY_TIMEOUT};
+use crate::error::AgentError;
 
 pub(super) fn build_spawn_config(cli_path: &str, workspace: &str, gateway: &OpenClawGatewayConfig) -> CommandSpec {
     let host = gateway.host.as_deref().unwrap_or("127.0.0.1");
@@ -43,7 +44,7 @@ pub(super) async fn is_port_listening(host: &str, port: u16) -> bool {
     tokio::net::TcpStream::connect((host, port)).await.is_ok()
 }
 
-pub(super) async fn wait_for_gateway_ready(host: &str, port: u16) -> Result<(), AppError> {
+pub(super) async fn wait_for_gateway_ready(host: &str, port: u16) -> Result<(), AgentError> {
     let start = tokio::time::Instant::now();
     while start.elapsed() < GATEWAY_READY_TIMEOUT {
         if is_port_listening(host, port).await {
@@ -51,7 +52,7 @@ pub(super) async fn wait_for_gateway_ready(host: &str, port: u16) -> Result<(), 
         }
         tokio::time::sleep(GATEWAY_READY_POLL_INTERVAL).await;
     }
-    Err(AppError::Internal(format!(
+    Err(AgentError::internal(format!(
         "OpenClaw gateway did not become ready on {host}:{port} within {}s",
         GATEWAY_READY_TIMEOUT.as_secs()
     )))

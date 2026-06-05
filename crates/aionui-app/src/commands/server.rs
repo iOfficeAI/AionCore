@@ -201,7 +201,7 @@ pub(crate) async fn run_server(
             runtime_prepare_service
                 .ensure_managed_acp_tool(scope, "claude-agent-acp")
                 .await?;
-            Ok::<(), aionui_common::AppError>(())
+            Ok::<(), aionui_system::SystemError>(())
         }
         .await;
 

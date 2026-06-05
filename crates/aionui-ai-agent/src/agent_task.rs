@@ -13,9 +13,10 @@
 //! pattern (deleted in PR #8c).
 use std::sync::Arc;
 
-use aionui_common::{AgentKillReason, AgentType, AppError, ConversationStatus, TimestampMs};
+use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs};
 use tokio::sync::broadcast;
 
+use crate::error::AgentError;
 use crate::manager::acp::AcpAgentManager;
 use crate::manager::aionrs::AionrsAgentManager;
 use crate::manager::nanobot::NanobotAgentManager;
@@ -66,13 +67,13 @@ pub trait IAgentTask: Send + Sync {
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError>;
 
     /// Stop the current streaming response without killing the agent.
-    async fn cancel(&self) -> Result<(), AppError>;
+    async fn cancel(&self) -> Result<(), AgentError>;
 
     /// Terminate the agent process.
     ///
     /// - `reason: Some(IdleTimeout)` — idle cleanup
     /// - `reason: None` — explicit user/system kill
-    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError>;
+    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AgentError>;
 }
 
 /// Extended trait used exclusively by the `AgentInstance::Mock` variant so
@@ -99,44 +100,42 @@ pub trait IMockAgent: IAgentTask {
         _call_id: &str,
         _data: serde_json::Value,
         _always_allow: bool,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), AgentError> {
         Ok(())
     }
     fn get_session_key(&self) -> Option<String> {
         None
     }
-    async fn mode(&self) -> Result<aionui_api_types::AgentModeResponse, AppError> {
+    async fn mode(&self) -> Result<aionui_api_types::AgentModeResponse, AgentError> {
         Ok(aionui_api_types::AgentModeResponse {
             mode: "default".into(),
             initialized: false,
         })
     }
-    async fn set_mode(&self, _mode: &str) -> Result<(), AppError> {
-        Err(AppError::BadRequest(
-            "Mode switching is not supported for this mock".into(),
-        ))
+    async fn set_mode(&self, _mode: &str) -> Result<(), AgentError> {
+        Err(AgentError::bad_request("Mode switching is not supported for this mock"))
     }
-    async fn get_model(&self) -> Result<GetModelInfoResponse, AppError> {
+    async fn get_model(&self) -> Result<GetModelInfoResponse, AgentError> {
         Ok(GetModelInfoResponse { model_info: None })
     }
-    async fn set_model(&self, _model_id: &str) -> Result<(), AppError> {
-        Err(AppError::BadRequest(
-            "Model switching is not supported for this mock".into(),
+    async fn set_model(&self, _model_id: &str) -> Result<(), AgentError> {
+        Err(AgentError::bad_request(
+            "Model switching is not supported for this mock",
         ))
     }
-    async fn get_usage(&self) -> Result<Option<serde_json::Value>, AppError> {
+    async fn get_usage(&self) -> Result<Option<serde_json::Value>, AgentError> {
         Ok(None)
     }
-    async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AppError> {
+    async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AgentError> {
         Ok(Vec::new())
     }
-    async fn handle_side_question(&self, _req: SideQuestionRequest) -> Result<SideQuestionResponse, AppError> {
+    async fn handle_side_question(&self, _req: SideQuestionRequest) -> Result<SideQuestionResponse, AgentError> {
         Ok(SideQuestionResponse {
             status: "unsupported".into(),
             answer: None,
         })
     }
-    async fn get_openclaw_runtime(&self) -> Result<serde_json::Value, AppError> {
+    async fn get_openclaw_runtime(&self) -> Result<serde_json::Value, AgentError> {
         Ok(serde_json::Value::Null)
     }
 }
@@ -226,12 +225,12 @@ impl AgentInstance {
     }
 
     /// Cancel the current streaming response without killing the agent.
-    pub async fn cancel(&self) -> Result<(), AppError> {
+    pub async fn cancel(&self) -> Result<(), AgentError> {
         self.as_task().cancel().await
     }
 
     /// Terminate the agent process.
-    pub fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    pub fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         self.as_task().kill(reason)
     }
 
@@ -283,7 +282,7 @@ impl AgentInstance {
         call_id: &str,
         data: serde_json::Value,
         always_allow: bool,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), AgentError> {
         match self {
             Self::Acp(m) => m.confirm(msg_id, call_id, data, always_allow),
             Self::Aionrs(m) => m.confirm(msg_id, call_id, data, always_allow),
@@ -321,7 +320,7 @@ impl AgentInstance {
     /// Get the current session mode. Only ACP and Aionrs model a mode;
     /// other variants report `mode = "default"`, `initialized = false`
     /// so cron / UI can skip mode reconciliation.
-    pub async fn get_mode(&self) -> Result<aionui_api_types::AgentModeResponse, AppError> {
+    pub async fn get_mode(&self) -> Result<aionui_api_types::AgentModeResponse, AgentError> {
         match self {
             Self::Acp(m) => m.mode().await,
             Self::Aionrs(m) => m.mode().await,
@@ -337,12 +336,12 @@ impl AgentInstance {
     /// Set the session mode. Unsupported for variants other than ACP /
     /// Aionrs — returns a `BadRequest` so the caller can surface an
     /// actionable error rather than silently no-op.
-    pub async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
+    pub async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
         match self {
             Self::Acp(m) => m.set_mode(mode).await,
             Self::Aionrs(m) => m.set_mode(mode).await,
-            Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Err(AppError::BadRequest(
-                "Mode switching is not supported for this agent type".into(),
+            Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Err(AgentError::bad_request(
+                "Mode switching is not supported for this agent type",
             )),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.set_mode(mode).await,
@@ -352,7 +351,7 @@ impl AgentInstance {
     /// Get the current session model info. Only ACP exposes a model
     /// catalog; other variants report `model_info = None` so the UI can
     /// hide the model picker without an error.
-    pub async fn get_model(&self) -> Result<GetModelInfoResponse, AppError> {
+    pub async fn get_model(&self) -> Result<GetModelInfoResponse, AgentError> {
         match self {
             Self::Acp(m) => {
                 let sdk_model = m.model().await;
@@ -376,14 +375,14 @@ impl AgentInstance {
     /// Switch the active model. Unsupported for variants other than ACP —
     /// returns a `BadRequest` so the caller can surface an actionable
     /// error rather than silently no-op.
-    pub async fn set_model(&self, model_id: &str) -> Result<(), AppError> {
+    pub async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
         if model_id.trim().is_empty() {
-            return Err(AppError::BadRequest("model_id must not be empty".into()));
+            return Err(AgentError::bad_request("model_id must not be empty"));
         }
         match self {
             Self::Acp(m) => m.set_model(model_id).await,
-            Self::Aionrs(_) | Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Err(AppError::BadRequest(
-                "Model switching is not supported for this agent type".into(),
+            Self::Aionrs(_) | Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Err(AgentError::bad_request(
+                "Model switching is not supported for this agent type",
             )),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.set_model(model_id).await,
@@ -398,12 +397,12 @@ impl AgentInstance {
     /// `_meta` passes through verbatim.
     ///
     /// Non-ACP agents return `None`.
-    pub async fn get_usage(&self) -> Result<Option<serde_json::Value>, AppError> {
+    pub async fn get_usage(&self) -> Result<Option<serde_json::Value>, AgentError> {
         match self {
             Self::Acp(m) => {
                 let Some(usage) = m.usage().await else { return Ok(None) };
                 let mut value = serde_json::to_value(usage)
-                    .map_err(|e| AppError::Internal(format!("Failed to serialize usage: {e}")))?;
+                    .map_err(|e| AgentError::internal(format!("Failed to serialize usage: {e}")))?;
                 aionui_common::normalize_keys_to_snake_case(&mut value);
                 Ok(Some(value))
             }
@@ -416,7 +415,7 @@ impl AgentInstance {
     /// Slash commands available in the current session. Only ACP exposes
     /// a slash-command catalog; other variants report an empty list
     /// (the UI renders "no commands").
-    pub async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AppError> {
+    pub async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AgentError> {
         match self {
             Self::Acp(m) => m.load_slash_commands().await,
             Self::Aionrs(m) => m.get_slash_commands().await,
@@ -430,9 +429,9 @@ impl AgentInstance {
     /// the current `AgentService::handle_side_question` behaviour: ACP
     /// agents whose behavior_policy enables side-questions return a stub
     /// "ok" response, everyone else returns `unsupported`.
-    pub async fn handle_side_question(&self, req: SideQuestionRequest) -> Result<SideQuestionResponse, AppError> {
+    pub async fn handle_side_question(&self, req: SideQuestionRequest) -> Result<SideQuestionResponse, AgentError> {
         if req.question.trim().is_empty() {
-            return Err(AppError::BadRequest("question must not be empty".into()));
+            return Err(AgentError::bad_request("question must not be empty"));
         }
         match self {
             Self::Acp(m) => {
@@ -459,7 +458,7 @@ impl AgentInstance {
     /// OpenClaw-specific runtime diagnostics. Only OpenClaw reports
     /// diagnostics; other variants report `Value::Null` so diagnostic
     /// UIs degrade gracefully.
-    pub async fn get_openclaw_runtime(&self) -> Result<serde_json::Value, AppError> {
+    pub async fn get_openclaw_runtime(&self) -> Result<serde_json::Value, AgentError> {
         match self {
             Self::OpenClaw(m) => Ok(m.get_diagnostics().await),
             Self::Acp(_) | Self::Aionrs(_) | Self::Nanobot(_) | Self::Remote(_) => Ok(serde_json::Value::Null),

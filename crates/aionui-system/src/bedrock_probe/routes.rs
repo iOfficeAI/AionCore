@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, State};
@@ -5,7 +7,7 @@ use axum::routing::post;
 
 use aionui_api_types::{ApiResponse, TestBedrockConnectionRequest};
 use aionui_auth::CurrentUser;
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
 use super::service::ConnectionTestService;
 
@@ -36,9 +38,13 @@ async fn test_bedrock(
     State(state): State<ConnectionTestRouterState>,
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<TestBedrockConnectionRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state.service.test_bedrock_connection(req.bedrock_config).await?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    state
+        .service
+        .test_bedrock_connection(req.bedrock_config)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::message("Connection successful")))
 }
 

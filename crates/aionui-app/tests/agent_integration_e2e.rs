@@ -16,8 +16,8 @@ use tower::ServiceExt;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::TextEventData;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
-use aionui_common::{AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs, now_ms};
+use aionui_ai_agent::{AgentError, AgentStreamEvent, IWorkerTaskManager};
+use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
 use async_trait::async_trait;
 
 use common::{body_json, get_with_token, json_with_token, setup_and_login};
@@ -85,11 +85,11 @@ impl IAgentTask for MockAgent {
         Ok(())
     }
 
-    async fn cancel(&self) -> Result<(), AppError> {
+    async fn cancel(&self) -> Result<(), AgentError> {
         Ok(())
     }
 
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 }
@@ -104,7 +104,7 @@ impl IMockAgent for MockAgent {
         self.approvals.lock().unwrap().get(action).copied().unwrap_or(false)
     }
 
-    fn confirm(&self, _msg_id: &str, call_id: &str, _data: Value, always_allow: bool) -> Result<(), AppError> {
+    fn confirm(&self, _msg_id: &str, call_id: &str, _data: Value, always_allow: bool) -> Result<(), AgentError> {
         let mut confs = self.confirmations.lock().unwrap();
         confs.retain(|c| c.call_id != call_id);
         if always_allow {
@@ -147,7 +147,7 @@ impl IWorkerTaskManager for MockTaskManager {
         &self,
         conversation_id: &str,
         _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError> {
+    ) -> Result<AgentInstance, AgentError> {
         let mut agents = self.agents.lock().unwrap();
         if let Some(existing) = agents.get(conversation_id) {
             return Ok(existing.clone());
@@ -157,7 +157,7 @@ impl IWorkerTaskManager for MockTaskManager {
         Ok(instance)
     }
 
-    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         self.agents.lock().unwrap().remove(conversation_id);
         Ok(())
     }

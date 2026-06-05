@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -5,8 +7,9 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::get;
 
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
+use crate::error::AssetError;
 use crate::state::AssetRouterState;
 
 const CACHE_CONTROL_VALUE: &str = "public, max-age=31536000, immutable";
@@ -18,11 +21,21 @@ pub fn asset_routes(state: AssetRouterState) -> Router {
         .with_state(state)
 }
 
+impl From<AssetError> for ApiError {
+    fn from(error: AssetError) -> Self {
+        match error {
+            AssetError::NotFound(message) => Self::NotFound(message),
+            AssetError::Forbidden(message) => Self::Forbidden(message),
+            AssetError::Internal(message) => Self::Internal(message),
+        }
+    }
+}
+
 async fn get_logo_asset(
     State(state): State<AssetRouterState>,
     Path(asset_path): Path<String>,
     headers: HeaderMap,
-) -> Result<Response, AppError> {
+) -> Result<Response, ApiError> {
     let asset = state.service.get_logo(&asset_path)?;
 
     if state
@@ -34,7 +47,7 @@ async fn get_logo_asset(
             .header(header::CACHE_CONTROL, CACHE_CONTROL_VALUE)
             .header(header::ETAG, asset.etag)
             .body(Body::empty())
-            .map_err(|error| AppError::Internal(error.to_string()));
+            .map_err(|error| ApiError::Internal(error.to_string()));
     }
 
     Response::builder()
@@ -43,7 +56,7 @@ async fn get_logo_asset(
         .header(header::CACHE_CONTROL, CACHE_CONTROL_VALUE)
         .header(header::ETAG, asset.etag)
         .body(Body::from(asset.bytes))
-        .map_err(|error| AppError::Internal(error.to_string()))
+        .map_err(|error| ApiError::Internal(error.to_string()))
 }
 
 #[cfg(test)]

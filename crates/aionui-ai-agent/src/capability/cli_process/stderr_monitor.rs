@@ -1,4 +1,4 @@
-use aionui_common::AppError;
+use crate::error::AgentError;
 #[cfg(any(unix, windows))]
 use tracing::{debug, error};
 
@@ -10,12 +10,12 @@ use tracing::{debug, error};
 ///   the ACP CLI typically spawns a node/bun child that must die with it)
 ///
 /// If the process has already exited, this is a no-op.
-pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), AppError> {
+pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), AgentError> {
     #[cfg(unix)]
     {
         use std::io;
 
-        fn kill_pid(target_pid: u32) -> Result<(), AppError> {
+        fn kill_pid(target_pid: u32) -> Result<(), AgentError> {
             let rc = unsafe { libc::kill(target_pid as i32, libc::SIGKILL) };
             if rc == 0 {
                 debug!(pid = target_pid, "Direct SIGKILL sent successfully");
@@ -28,7 +28,7 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
                 Ok(())
             } else {
                 error!(pid = target_pid, error = %err, "Direct SIGKILL failed");
-                Err(AppError::Internal(format!(
+                Err(AgentError::internal(format!(
                     "Failed to kill process {target_pid}: {err}"
                 )))
             }
@@ -52,7 +52,7 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
             }
 
             error!(pid, process_group = group_id, error = %err, "Failed to send SIGKILL to process group");
-            return Err(AppError::Internal(format!(
+            return Err(AgentError::internal(format!(
                 "Failed to kill process group {group_id}: {err}"
             )));
         }
@@ -83,19 +83,19 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let code = output.status.code();
                 error!(pid, ?code, %stderr, "taskkill returned unexpected status");
-                Err(AppError::Internal(format!(
+                Err(AgentError::internal(format!(
                     "taskkill failed for pid {pid} (exit {code:?}): {stderr}"
                 )))
             }
             Err(e) => {
                 error!(pid, error = %e, "Failed to execute taskkill");
-                Err(AppError::Internal(format!("Failed to kill process {pid}: {e}")))
+                Err(AgentError::internal(format!("Failed to kill process {pid}: {e}")))
             }
         }
     }
     #[cfg(not(any(unix, windows)))]
     {
-        Err(AppError::Internal(format!(
+        Err(AgentError::internal(format!(
             "Force kill not supported on this platform for pid {pid}"
         )))
     }

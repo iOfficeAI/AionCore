@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_types)]
+
 //! Bundled runtime (bun) resolver for aioncore.
 //!
 //! Embeds the bun runtime at build time (zstd-compressed) and extracts it

@@ -6,7 +6,6 @@ use aion_config::config::{McpServerConfig, TransportType};
 use aionui_api_types::{
     AionrsBuildExtra, GuideMcpConfig, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
-use aionui_common::AppError;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_realtime::EventBroadcaster;
@@ -15,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::agent_task::AgentInstance;
 use crate::capability::team_guide_prompt;
+use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
@@ -27,7 +27,7 @@ pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     options: BuildTaskOptions,
     ctx: FactoryContext,
-) -> Result<AgentInstance, AppError> {
+) -> Result<AgentInstance, AgentError> {
     let belongs_to_team = options
         .extra
         .get("teamId")
@@ -105,10 +105,11 @@ pub(super) async fn build(
         .provider_repo
         .find_by_id(provider_id)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to load provider config: {e}")))?
-        .ok_or_else(|| AppError::BadRequest(format!("Provider '{provider_id}' not found")))?;
+        .map_err(|e| AgentError::internal(format!("Failed to load provider config: {e}")))?
+        .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
 
-    let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &deps.encryption_key)?;
+    let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &deps.encryption_key)
+        .map_err(|e| AgentError::internal(e.to_string()))?;
 
     let model_id = options
         .model

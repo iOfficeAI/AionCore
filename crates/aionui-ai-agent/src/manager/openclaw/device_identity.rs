@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aionui_common::AppError;
+use crate::error::AgentError;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -35,7 +35,7 @@ fn default_identity_path() -> PathBuf {
         .join("device.json")
 }
 
-pub fn load_or_create_identity(custom_path: Option<&Path>) -> Result<DeviceIdentity, AppError> {
+pub fn load_or_create_identity(custom_path: Option<&Path>) -> Result<DeviceIdentity, AgentError> {
     let path = custom_path.map(PathBuf::from).unwrap_or_else(default_identity_path);
 
     if let Ok(identity) = load_identity(&path) {
@@ -49,15 +49,15 @@ pub fn load_or_create_identity(custom_path: Option<&Path>) -> Result<DeviceIdent
     Ok(identity)
 }
 
-fn load_identity(path: &Path) -> Result<DeviceIdentity, AppError> {
+fn load_identity(path: &Path) -> Result<DeviceIdentity, AgentError> {
     let content =
-        fs::read_to_string(path).map_err(|e| AppError::Internal(format!("Failed to read device identity: {e}")))?;
+        fs::read_to_string(path).map_err(|e| AgentError::internal(format!("Failed to read device identity: {e}")))?;
 
     let stored: StoredIdentity = serde_json::from_str(&content)
-        .map_err(|e| AppError::Internal(format!("Failed to parse device identity: {e}")))?;
+        .map_err(|e| AgentError::internal(format!("Failed to parse device identity: {e}")))?;
 
     if stored.version != 1 {
-        return Err(AppError::Internal(format!(
+        return Err(AgentError::internal(format!(
             "Unsupported device identity version: {}",
             stored.version
         )));
@@ -76,10 +76,10 @@ fn load_identity(path: &Path) -> Result<DeviceIdentity, AppError> {
     })
 }
 
-fn save_identity(path: &Path, identity: &DeviceIdentity) -> Result<(), AppError> {
+fn save_identity(path: &Path, identity: &DeviceIdentity) -> Result<(), AgentError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|e| AppError::Internal(format!("Failed to create identity directory: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("Failed to create identity directory: {e}")))?;
     }
 
     let (pub_pem, priv_pem) = signing_key_to_pem(&identity.signing_key);
@@ -93,10 +93,10 @@ fn save_identity(path: &Path, identity: &DeviceIdentity) -> Result<(), AppError>
     };
 
     let json = serde_json::to_string_pretty(&stored)
-        .map_err(|e| AppError::Internal(format!("Failed to serialize device identity: {e}")))?;
+        .map_err(|e| AgentError::internal(format!("Failed to serialize device identity: {e}")))?;
 
     fs::write(path, format!("{json}\n"))
-        .map_err(|e| AppError::Internal(format!("Failed to write device identity: {e}")))?;
+        .map_err(|e| AgentError::internal(format!("Failed to write device identity: {e}")))?;
 
     #[cfg(unix)]
     {
@@ -208,17 +208,17 @@ const ED25519_PKCS8_PREFIX: [u8; 16] = [
 
 const ED25519_SPKI_PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
 
-fn pem_to_signing_key(pem: &str) -> Result<SigningKey, AppError> {
+fn pem_to_signing_key(pem: &str) -> Result<SigningKey, AgentError> {
     let der = pem_decode(pem, "PRIVATE KEY")?;
 
     if der.len() == ED25519_PKCS8_PREFIX.len() + 32 && der[..ED25519_PKCS8_PREFIX.len()] == ED25519_PKCS8_PREFIX {
         let raw: [u8; 32] = der[ED25519_PKCS8_PREFIX.len()..]
             .try_into()
-            .map_err(|_| AppError::Internal("Invalid Ed25519 private key length".into()))?;
+            .map_err(|_| AgentError::internal("Invalid Ed25519 private key length"))?;
         return Ok(SigningKey::from_bytes(&raw));
     }
 
-    Err(AppError::Internal("Unrecognized Ed25519 PKCS8 format".into()))
+    Err(AgentError::internal("Unrecognized Ed25519 PKCS8 format"))
 }
 
 fn signing_key_to_pem(key: &SigningKey) -> (String, String) {
@@ -247,7 +247,7 @@ fn pem_encode(der: &[u8], label: &str) -> String {
     pem
 }
 
-fn pem_decode(pem: &str, label: &str) -> Result<Vec<u8>, AppError> {
+fn pem_decode(pem: &str, label: &str) -> Result<Vec<u8>, AgentError> {
     use base64::engine::general_purpose::STANDARD;
     let begin = format!("-----BEGIN {label}-----");
     let end = format!("-----END {label}-----");
@@ -255,12 +255,12 @@ fn pem_decode(pem: &str, label: &str) -> Result<Vec<u8>, AppError> {
     let b64: String = pem.lines().filter(|line| !line.starts_with("-----")).collect();
 
     if !pem.contains(&begin) || !pem.contains(&end) {
-        return Err(AppError::Internal(format!("Invalid PEM: missing {label} markers")));
+        return Err(AgentError::internal(format!("Invalid PEM: missing {label} markers")));
     }
 
     STANDARD
         .decode(b64)
-        .map_err(|e| AppError::Internal(format!("Failed to decode PEM base64: {e}")))
+        .map_err(|e| AgentError::internal(format!("Failed to decode PEM base64: {e}")))
 }
 
 #[cfg(test)]

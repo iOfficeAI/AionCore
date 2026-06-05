@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::extract::{Multipart, State};
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -7,32 +9,32 @@ use aionui_api_types::{
     ApiResponse, CheckToolInstalledRequest, CheckToolInstalledResponse, OpenExternalRequest, OpenFileRequest,
     OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig,
 };
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
 use crate::error::{ShellError, SttError};
 use crate::state::ShellRouterState;
 
-impl From<ShellError> for AppError {
+impl From<ShellError> for ApiError {
     fn from(err: ShellError) -> Self {
         match err {
-            ShellError::FileNotFound(path) => AppError::BadRequest(format!("file not found: {path}")),
-            ShellError::DirectoryNotFound(path) => AppError::BadRequest(format!("directory not found: {path}")),
-            ShellError::InvalidUrl(msg) => AppError::BadRequest(format!("invalid URL: {msg}")),
-            ShellError::ToolNotInstalled(tool) => AppError::BadRequest(format!("tool not installed: {tool}")),
-            ShellError::CommandFailed(msg) => AppError::Internal(format!("command failed: {msg}")),
-            ShellError::Io(e) => AppError::Internal(format!("IO error: {e}")),
+            ShellError::FileNotFound(path) => ApiError::BadRequest(format!("file not found: {path}")),
+            ShellError::DirectoryNotFound(path) => ApiError::BadRequest(format!("directory not found: {path}")),
+            ShellError::InvalidUrl(msg) => ApiError::BadRequest(format!("invalid URL: {msg}")),
+            ShellError::ToolNotInstalled(tool) => ApiError::BadRequest(format!("tool not installed: {tool}")),
+            ShellError::CommandFailed(msg) => ApiError::Internal(format!("command failed: {msg}")),
+            ShellError::Io(e) => ApiError::Internal(format!("IO error: {e}")),
         }
     }
 }
 
-impl From<SttError> for AppError {
+impl From<SttError> for ApiError {
     fn from(err: SttError) -> Self {
         match &err {
             SttError::Disabled | SttError::OpenaiNotConfigured | SttError::DeepgramNotConfigured => {
-                AppError::BadRequest(err.to_string())
+                ApiError::BadRequest(err.to_string())
             }
-            SttError::RequestFailed(_) => AppError::BadGateway(err.to_string()),
-            SttError::Unknown(_) => AppError::Internal(err.to_string()),
+            SttError::RequestFailed(_) => ApiError::BadGateway(err.to_string()),
+            SttError::Unknown(_) => ApiError::Internal(err.to_string()),
         }
     }
 }
@@ -51,8 +53,8 @@ pub fn shell_routes(state: ShellRouterState) -> Router {
 async fn open_file(
     State(state): State<ShellRouterState>,
     body: Result<Json<OpenFileRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state.shell_service.open_file(&req.file_path).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -60,8 +62,8 @@ async fn open_file(
 async fn show_item_in_folder(
     State(state): State<ShellRouterState>,
     body: Result<Json<ShowItemInFolderRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state.shell_service.show_item_in_folder(&req.file_path).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -69,8 +71,8 @@ async fn show_item_in_folder(
 async fn open_external(
     State(state): State<ShellRouterState>,
     body: Result<Json<OpenExternalRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state.shell_service.open_external(&req.url).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -78,8 +80,8 @@ async fn open_external(
 async fn check_tool_installed(
     State(state): State<ShellRouterState>,
     body: Result<Json<CheckToolInstalledRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<ApiResponse<CheckToolInstalledResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<CheckToolInstalledResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let installed = state.shell_service.check_tool_installed(req.tool).await;
     Ok(Json(ApiResponse::ok(CheckToolInstalledResponse { installed })))
 }
@@ -87,8 +89,8 @@ async fn check_tool_installed(
 async fn open_folder_with(
     State(state): State<ShellRouterState>,
     body: Result<Json<OpenFolderWithRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state.shell_service.open_folder_with(&req.folder_path, req.tool).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -100,7 +102,7 @@ struct SttMultipartFields {
     language_hint: Option<String>,
 }
 
-async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartFields, AppError> {
+async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartFields, ApiError> {
     let mut file_data: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
     let mut mime_type: Option<String> = None;
@@ -109,7 +111,7 @@ async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartF
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| AppError::BadRequest(format!("multipart error: {e}")))?
+        .map_err(|e| ApiError::BadRequest(format!("multipart error: {e}")))?
     {
         let name = field.name().unwrap_or("").to_owned();
         match name.as_str() {
@@ -118,7 +120,7 @@ async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartF
                     field
                         .bytes()
                         .await
-                        .map_err(|e| AppError::BadRequest(format!("failed to read file: {e}")))?
+                        .map_err(|e| ApiError::BadRequest(format!("failed to read file: {e}")))?
                         .to_vec(),
                 );
             }
@@ -127,7 +129,7 @@ async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartF
                     field
                         .text()
                         .await
-                        .map_err(|e| AppError::BadRequest(format!("failed to read fileName: {e}")))?,
+                        .map_err(|e| ApiError::BadRequest(format!("failed to read fileName: {e}")))?,
                 );
             }
             "mimeType" => {
@@ -135,14 +137,14 @@ async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartF
                     field
                         .text()
                         .await
-                        .map_err(|e| AppError::BadRequest(format!("failed to read mimeType: {e}")))?,
+                        .map_err(|e| ApiError::BadRequest(format!("failed to read mimeType: {e}")))?,
                 );
             }
             "languageHint" => {
                 let text = field
                     .text()
                     .await
-                    .map_err(|e| AppError::BadRequest(format!("failed to read languageHint: {e}")))?;
+                    .map_err(|e| ApiError::BadRequest(format!("failed to read languageHint: {e}")))?;
                 if !text.is_empty() {
                     language_hint = Some(text);
                 }
@@ -151,9 +153,9 @@ async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartF
         }
     }
 
-    let file_data = file_data.ok_or_else(|| AppError::BadRequest("missing 'file' field".to_owned()))?;
-    let file_name = file_name.ok_or_else(|| AppError::BadRequest("missing 'fileName' field".to_owned()))?;
-    let mime_type = mime_type.ok_or_else(|| AppError::BadRequest("missing 'mimeType' field".to_owned()))?;
+    let file_data = file_data.ok_or_else(|| ApiError::BadRequest("missing 'file' field".to_owned()))?;
+    let file_name = file_name.ok_or_else(|| ApiError::BadRequest("missing 'fileName' field".to_owned()))?;
+    let mime_type = mime_type.ok_or_else(|| ApiError::BadRequest("missing 'mimeType' field".to_owned()))?;
 
     Ok(SttMultipartFields {
         file_data,
@@ -182,6 +184,7 @@ async fn speech_to_text(
         .get_preferences(Some(&["speechToText"]))
         .await
         .map_err(|e| {
+            let e = ApiError::from(e);
             let status = e.status_code();
             let body = serde_json::json!({
                 "success": false,
@@ -379,68 +382,68 @@ mod tests {
 
     #[test]
     fn file_not_found_maps_to_bad_request() {
-        let err = AppError::from(ShellError::FileNotFound("/tmp/missing.txt".into()));
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("/tmp/missing.txt")));
+        let err = ApiError::from(ShellError::FileNotFound("/tmp/missing.txt".into()));
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("/tmp/missing.txt")));
     }
 
     #[test]
     fn directory_not_found_maps_to_bad_request() {
-        let err = AppError::from(ShellError::DirectoryNotFound("/tmp/nodir".into()));
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("/tmp/nodir")));
+        let err = ApiError::from(ShellError::DirectoryNotFound("/tmp/nodir".into()));
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("/tmp/nodir")));
     }
 
     #[test]
     fn invalid_url_maps_to_bad_request() {
-        let err = AppError::from(ShellError::InvalidUrl("not a url".into()));
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("not a url")));
+        let err = ApiError::from(ShellError::InvalidUrl("not a url".into()));
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("not a url")));
     }
 
     #[test]
     fn tool_not_installed_maps_to_bad_request() {
-        let err = AppError::from(ShellError::ToolNotInstalled("vscode".into()));
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("vscode")));
+        let err = ApiError::from(ShellError::ToolNotInstalled("vscode".into()));
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("vscode")));
     }
 
     #[test]
     fn command_failed_maps_to_internal() {
-        let err = AppError::from(ShellError::CommandFailed("exit code 1".into()));
-        assert!(matches!(err, AppError::Internal(msg) if msg.contains("exit code 1")));
+        let err = ApiError::from(ShellError::CommandFailed("exit code 1".into()));
+        assert!(matches!(err, ApiError::Internal(msg) if msg.contains("exit code 1")));
     }
 
     #[test]
     fn io_error_maps_to_internal() {
         let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
-        let err = AppError::from(ShellError::Io(io_err));
-        assert!(matches!(err, AppError::Internal(msg) if msg.contains("permission denied")));
+        let err = ApiError::from(ShellError::Io(io_err));
+        assert!(matches!(err, ApiError::Internal(msg) if msg.contains("permission denied")));
     }
 
     #[test]
     fn stt_disabled_maps_to_bad_request() {
-        let err = AppError::from(SttError::Disabled);
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("not enabled")));
+        let err = ApiError::from(SttError::Disabled);
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("not enabled")));
     }
 
     #[test]
     fn stt_openai_not_configured_maps_to_bad_request() {
-        let err = AppError::from(SttError::OpenaiNotConfigured);
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("OpenAI")));
+        let err = ApiError::from(SttError::OpenaiNotConfigured);
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("OpenAI")));
     }
 
     #[test]
     fn stt_deepgram_not_configured_maps_to_bad_request() {
-        let err = AppError::from(SttError::DeepgramNotConfigured);
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("Deepgram")));
+        let err = ApiError::from(SttError::DeepgramNotConfigured);
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("Deepgram")));
     }
 
     #[test]
     fn stt_request_failed_maps_to_bad_gateway() {
-        let err = AppError::from(SttError::RequestFailed("HTTP 401".into()));
-        assert!(matches!(err, AppError::BadGateway(msg) if msg.contains("HTTP 401")));
+        let err = ApiError::from(SttError::RequestFailed("HTTP 401".into()));
+        assert!(matches!(err, ApiError::BadGateway(msg) if msg.contains("HTTP 401")));
     }
 
     #[test]
     fn stt_unknown_maps_to_internal() {
-        let err = AppError::from(SttError::Unknown("unexpected".into()));
-        assert!(matches!(err, AppError::Internal(msg) if msg.contains("unexpected")));
+        let err = ApiError::from(SttError::Unknown("unexpected".into()));
+        assert!(matches!(err, ApiError::Internal(msg) if msg.contains("unexpected")));
     }
 }

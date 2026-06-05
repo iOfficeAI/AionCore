@@ -1,10 +1,12 @@
+#![allow(clippy::disallowed_types)]
+
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 
-use aionui_common::AppError;
+use aionui_common::ApiError;
 use aionui_db::IUserRepository;
 
 use crate::JwtService;
@@ -46,7 +48,7 @@ pub async fn auth_middleware(
     State(state): State<AuthState>,
     mut request: Request,
     next: Next,
-) -> Result<Response, AppError> {
+) -> Result<Response, ApiError> {
     // In local mode, skip JWT verification and inject a fixed default user.
     if state.local {
         request.extensions_mut().insert(CurrentUser {
@@ -57,19 +59,19 @@ pub async fn auth_middleware(
     }
 
     let token = extract_token_from_headers(request.headers())
-        .ok_or_else(|| AppError::Forbidden("Authentication required".into()))?;
+        .ok_or_else(|| ApiError::Forbidden("Authentication required".into()))?;
 
     let payload = state.jwt_service.verify(&token).map_err(|e| {
         tracing::debug!("Token verification failed: {e}");
-        AppError::Forbidden("Invalid or expired token".into())
+        ApiError::Forbidden("Invalid or expired token".into())
     })?;
 
     let user = state
         .user_repo
         .find_by_id(&payload.user_id)
         .await
-        .map_err(|e| AppError::Internal(format!("Database error: {e}")))?
-        .ok_or_else(|| AppError::Forbidden("User not found".into()))?;
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
+        .ok_or_else(|| ApiError::Forbidden("User not found".into()))?;
 
     request.extensions_mut().insert(CurrentUser {
         id: user.id,

@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use std::collections::HashMap;
 use std::path::Path as FsPath;
 
@@ -13,46 +15,46 @@ use aionui_api_types::{
     ApiResponse, DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest,
     GetPermissionsRequest, GetRiskLevelRequest, PermissionDetailResponse, PermissionSummaryResponse,
 };
-use aionui_common::{AppError, now_ms};
+use aionui_common::{ApiError, now_ms};
 
 use crate::asset_paths::normalize_relative_asset_path;
 use crate::error::ExtensionError;
 use crate::permission::{build_permission_summary, calculate_risk_level};
 use crate::registry::ExtensionRegistry;
 
-impl From<ExtensionError> for AppError {
+impl From<ExtensionError> for ApiError {
     fn from(err: ExtensionError) -> Self {
         match err {
-            ExtensionError::ManifestValidation(msg) => AppError::BadRequest(msg),
-            ExtensionError::ReservedNamePrefix { .. } => AppError::BadRequest(err.to_string()),
-            ExtensionError::InvalidVersion { .. } => AppError::BadRequest(err.to_string()),
+            ExtensionError::ManifestValidation(msg) => ApiError::BadRequest(msg),
+            ExtensionError::ReservedNamePrefix { .. } => ApiError::BadRequest(err.to_string()),
+            ExtensionError::InvalidVersion { .. } => ApiError::BadRequest(err.to_string()),
             ExtensionError::UndefinedEnvVariable(var) => {
-                AppError::BadRequest(format!("Undefined environment variable: {var}"))
+                ApiError::BadRequest(format!("Undefined environment variable: {var}"))
             }
             ExtensionError::FileReferenceNotFound(path) => {
-                AppError::NotFound(format!("File reference not found: {path}"))
+                ApiError::NotFound(format!("File reference not found: {path}"))
             }
-            ExtensionError::PathTraversal(path) => AppError::BadRequest(format!("Path traversal detected: {path}")),
-            ExtensionError::EngineIncompatible { .. } => AppError::BadRequest(err.to_string()),
-            ExtensionError::ApiVersionIncompatible { .. } => AppError::BadRequest(err.to_string()),
-            ExtensionError::InvalidWebuiRouteNamespace { .. } => AppError::BadRequest(err.to_string()),
-            ExtensionError::ReservedWebuiRoute { .. } => AppError::BadRequest(err.to_string()),
-            ExtensionError::ThemeCssNotFound(path) => AppError::NotFound(format!("Theme CSS not found: {path}")),
-            ExtensionError::HookTimeout { .. } => AppError::Internal(err.to_string()),
-            ExtensionError::HookFailed { .. } => AppError::Internal(err.to_string()),
-            ExtensionError::HookNotFound(path) => AppError::NotFound(format!("Hook script not found: {path}")),
-            ExtensionError::ResolutionFailed { .. } => AppError::Internal(err.to_string()),
-            ExtensionError::NotFound(name) => AppError::NotFound(format!("Extension not found: {name}")),
-            ExtensionError::StatePersistence(msg) => AppError::Internal(msg),
+            ExtensionError::PathTraversal(path) => ApiError::BadRequest(format!("Path traversal detected: {path}")),
+            ExtensionError::EngineIncompatible { .. } => ApiError::BadRequest(err.to_string()),
+            ExtensionError::ApiVersionIncompatible { .. } => ApiError::BadRequest(err.to_string()),
+            ExtensionError::InvalidWebuiRouteNamespace { .. } => ApiError::BadRequest(err.to_string()),
+            ExtensionError::ReservedWebuiRoute { .. } => ApiError::BadRequest(err.to_string()),
+            ExtensionError::ThemeCssNotFound(path) => ApiError::NotFound(format!("Theme CSS not found: {path}")),
+            ExtensionError::HookTimeout { .. } => ApiError::Internal(err.to_string()),
+            ExtensionError::HookFailed { .. } => ApiError::Internal(err.to_string()),
+            ExtensionError::HookNotFound(path) => ApiError::NotFound(format!("Hook script not found: {path}")),
+            ExtensionError::ResolutionFailed { .. } => ApiError::Internal(err.to_string()),
+            ExtensionError::NotFound(name) => ApiError::NotFound(format!("Extension not found: {name}")),
+            ExtensionError::StatePersistence(msg) => ApiError::Internal(msg),
             ExtensionError::BuiltinSkillDeletion(name) => {
-                AppError::BadRequest(format!("Cannot delete built-in skill: {name}"))
+                ApiError::BadRequest(format!("Cannot delete built-in skill: {name}"))
             }
-            ExtensionError::SkillNotFound(name) => AppError::NotFound(format!("Skill not found: {name}")),
-            ExtensionError::InvalidSkillPath(path) => AppError::BadRequest(format!("Invalid skill path: {path}")),
-            ExtensionError::InvalidRequest(msg) => AppError::BadRequest(msg),
-            ExtensionError::Internal(msg) => AppError::Internal(msg),
-            ExtensionError::Io(e) => AppError::Internal(e.to_string()),
-            ExtensionError::JsonParse(e) => AppError::BadRequest(e.to_string()),
+            ExtensionError::SkillNotFound(name) => ApiError::NotFound(format!("Skill not found: {name}")),
+            ExtensionError::InvalidSkillPath(path) => ApiError::BadRequest(format!("Invalid skill path: {path}")),
+            ExtensionError::InvalidRequest(msg) => ApiError::BadRequest(msg),
+            ExtensionError::Internal(msg) => ApiError::Internal(msg),
+            ExtensionError::Io(e) => ApiError::Internal(e.to_string()),
+            ExtensionError::JsonParse(e) => ApiError::BadRequest(e.to_string()),
         }
     }
 }
@@ -110,7 +112,7 @@ pub fn extension_routes(state: ExtensionRouterState) -> Router {
 /// `GET /api/extensions` — list all loaded extensions.
 async fn get_loaded_extensions(
     State(state): State<ExtensionRouterState>,
-) -> Result<Json<ApiResponse<Vec<ExtensionSummaryResponse>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<ExtensionSummaryResponse>>>, ApiError> {
     let summaries = state.registry.get_loaded_extensions().await;
     let resp: Vec<ExtensionSummaryResponse> = summaries
         .into_iter()
@@ -135,7 +137,7 @@ async fn get_loaded_extensions(
 /// `GET /api/extensions/themes` — get all resolved themes.
 async fn get_themes(
     State(state): State<ExtensionRouterState>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let themes = state.registry.get_themes().await;
     let timestamp = now_ms();
     let value = serde_json::Value::Array(
@@ -160,7 +162,7 @@ async fn get_themes(
 /// `GET /api/extensions/assistants` — get all resolved assistants.
 async fn get_assistants(
     State(state): State<ExtensionRouterState>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let assistants = state.registry.get_assistants().await;
     let value = serde_json::Value::Array(
         assistants
@@ -192,7 +194,7 @@ async fn get_assistants(
 /// `GET /api/extensions/acp-adapters` — get all resolved ACP adapters.
 async fn get_acp_adapters(
     State(state): State<ExtensionRouterState>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let adapters = state.registry.get_acp_adapters().await;
     let value = serde_json::Value::Array(
         adapters
@@ -232,7 +234,7 @@ async fn get_acp_adapters(
 /// `GET /api/extensions/agents` — get all resolved agents.
 async fn get_agents(
     State(state): State<ExtensionRouterState>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let agents = state.registry.get_agents().await;
     let value = serde_json::Value::Array(
         agents
@@ -264,7 +266,7 @@ async fn get_agents(
 /// `GET /api/extensions/mcp-servers` — get all resolved MCP servers.
 async fn get_mcp_servers(
     State(state): State<ExtensionRouterState>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let servers = state.registry.get_mcp_servers().await;
     let timestamp = now_ms();
     let value = serde_json::Value::Array(
@@ -309,7 +311,7 @@ async fn get_mcp_servers(
 /// `GET /api/extensions/skills` — get all resolved skills.
 async fn get_skills(
     State(state): State<ExtensionRouterState>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let skills = state.registry.get_skills().await;
     let value = serde_json::Value::Array(
         skills
@@ -329,7 +331,7 @@ async fn get_skills(
 /// `GET /api/extensions/channel-plugins` — get all resolved channel plugins.
 async fn get_channel_plugins(
     State(state): State<ExtensionRouterState>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let plugins = state.registry.get_channel_plugins().await;
     let value = serde_json::Value::Array(
         plugins
@@ -363,7 +365,7 @@ async fn get_channel_plugins(
 /// `GET /api/extensions/settings-tabs` — get all resolved settings tabs.
 async fn get_settings_tabs(
     State(state): State<ExtensionRouterState>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let tabs = state.registry.get_settings_tabs().await;
     let value = serde_json::to_value(&tabs).unwrap_or_default();
     Ok(Json(ApiResponse::ok(value)))
@@ -374,19 +376,19 @@ async fn get_settings_tabs(
 async fn get_extension_asset(
     State(state): State<ExtensionRouterState>,
     Path((extension_name, asset_path)): Path<(String, String)>,
-) -> Result<Response, AppError> {
+) -> Result<Response, ApiError> {
     let ext = state
         .registry
         .get_extension_by_name(&extension_name)
         .await
-        .ok_or_else(|| AppError::NotFound(format!("Extension not found: {extension_name}")))?;
+        .ok_or_else(|| ApiError::NotFound(format!("Extension not found: {extension_name}")))?;
 
     let canonical_root = tokio::fs::canonicalize(&ext.directory)
         .await
         .map_err(map_asset_lookup_error)?;
 
     let relative_path = normalize_relative_asset_path(&asset_path).ok_or_else(|| {
-        AppError::Forbidden(format!(
+        ApiError::Forbidden(format!(
             "Asset path escapes extension root: {extension_name}/{asset_path}"
         ))
     })?;
@@ -397,7 +399,7 @@ async fn get_extension_asset(
         .map_err(map_asset_lookup_error)?;
 
     if !canonical_asset.starts_with(&canonical_root) {
-        return Err(AppError::Forbidden(format!(
+        return Err(ApiError::Forbidden(format!(
             "Asset path escapes extension root: {}",
             canonical_asset.display()
         )));
@@ -412,13 +414,13 @@ async fn get_extension_asset(
         .header(header::CONTENT_TYPE, content_type_for_path(&canonical_asset))
         .header(header::CACHE_CONTROL, "public, max-age=3600")
         .body(Body::from(bytes))
-        .map_err(|err| AppError::Internal(err.to_string()))
+        .map_err(|err| ApiError::Internal(err.to_string()))
 }
 
 /// `GET /api/extensions/webui` — get all WebUI contributions.
 async fn get_webui(
     State(state): State<ExtensionRouterState>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let webui = state.registry.get_webui_contributions().await;
     let value = serde_json::to_value(&webui).unwrap_or_default();
     Ok(Json(ApiResponse::ok(value)))
@@ -430,7 +432,7 @@ async fn get_webui(
 /// integrate with the agent subsystem's activity tracking.
 async fn get_agent_activity(
     State(_state): State<ExtensionRouterState>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     // Agent activity snapshot is a cross-module concern;
     // return an empty object for now.
     Ok(Json(ApiResponse::ok(serde_json::json!({}))))
@@ -440,8 +442,8 @@ async fn get_agent_activity(
 async fn get_i18n(
     State(state): State<ExtensionRouterState>,
     body: Result<Json<GetI18nRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<HashMap<String, HashMap<String, String>>>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<HashMap<String, HashMap<String, String>>>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let data = state.registry.get_i18n_for_locale(&req.locale).await;
     Ok(Json(ApiResponse::ok(data)))
 }
@@ -450,14 +452,14 @@ async fn get_i18n(
 async fn get_permissions(
     State(state): State<ExtensionRouterState>,
     body: Result<Json<GetPermissionsRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<PermissionSummaryResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<PermissionSummaryResponse>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let ext = state
         .registry
         .get_extension_by_name(&req.name)
         .await
-        .ok_or_else(|| AppError::NotFound(format!("Extension not found: {}", req.name)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("Extension not found: {}", req.name)))?;
 
     let permissions = ext.manifest.permissions.clone().unwrap_or_default();
     let summary = build_permission_summary(&permissions);
@@ -486,14 +488,14 @@ async fn get_permissions(
 async fn get_risk_level(
     State(state): State<ExtensionRouterState>,
     body: Result<Json<GetRiskLevelRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let ext = state
         .registry
         .get_extension_by_name(&req.name)
         .await
-        .ok_or_else(|| AppError::NotFound(format!("Extension not found: {}", req.name)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("Extension not found: {}", req.name)))?;
 
     let permissions = ext.manifest.permissions.clone().unwrap_or_default();
     let risk_level = calculate_risk_level(&permissions);
@@ -511,8 +513,8 @@ async fn get_risk_level(
 async fn enable_extension(
     State(state): State<ExtensionRouterState>,
     body: Result<Json<EnableExtensionRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state.registry.enable_extension(&req.name).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -521,8 +523,8 @@ async fn enable_extension(
 async fn disable_extension(
     State(state): State<ExtensionRouterState>,
     body: Result<Json<DisableExtensionRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     state
         .registry
         .disable_extension(&req.name, req.reason.as_deref())
@@ -547,10 +549,10 @@ fn content_type_for_path(path: &FsPath) -> HeaderValue {
     HeaderValue::from_str(mime.as_ref()).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
 }
 
-fn map_asset_lookup_error(error: std::io::Error) -> AppError {
+fn map_asset_lookup_error(error: std::io::Error) -> ApiError {
     match error.kind() {
-        std::io::ErrorKind::NotFound => AppError::NotFound("Extension asset not found".into()),
-        _ => AppError::Internal(error.to_string()),
+        std::io::ErrorKind::NotFound => ApiError::NotFound("Extension asset not found".into()),
+        _ => ApiError::Internal(error.to_string()),
     }
 }
 
@@ -588,27 +590,27 @@ mod tests {
 
     #[test]
     fn extension_path_traversal_maps_to_bad_request() {
-        let app_err = AppError::from(ExtensionError::PathTraversal("../secret".into()));
-        assert!(matches!(app_err, AppError::BadRequest(_)));
+        let api_err = ApiError::from(ExtensionError::PathTraversal("../secret".into()));
+        assert!(matches!(api_err, ApiError::BadRequest(_)));
     }
 
     #[test]
     fn extension_manifest_validation_maps_to_bad_request() {
-        let app_err = AppError::from(ExtensionError::ManifestValidation("test".into()));
-        assert!(matches!(app_err, AppError::BadRequest(_)));
+        let api_err = ApiError::from(ExtensionError::ManifestValidation("test".into()));
+        assert!(matches!(api_err, ApiError::BadRequest(_)));
     }
 
     #[test]
     fn extension_file_reference_not_found_maps_to_not_found() {
-        let app_err = AppError::from(ExtensionError::FileReferenceNotFound("missing.md".into()));
-        assert!(matches!(app_err, AppError::NotFound(_)));
+        let api_err = ApiError::from(ExtensionError::FileReferenceNotFound("missing.md".into()));
+        assert!(matches!(api_err, ApiError::NotFound(_)));
     }
 
     #[test]
     fn extension_io_error_maps_to_internal() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
-        let app_err = AppError::from(ExtensionError::Io(io_err));
-        assert!(matches!(app_err, AppError::Internal(_)));
+        let api_err = ApiError::from(ExtensionError::Io(io_err));
+        assert!(matches!(api_err, ApiError::Internal(_)));
     }
 
     async fn make_router_with_extension() -> (Router, tempfile::TempDir, PathBuf) {

@@ -5,9 +5,7 @@ use aionui_api_types::{
     CreateRemoteAgentRequest, HandshakeResponse, RemoteAgentListItem, RemoteAgentResponse,
     TestRemoteAgentConnectionRequest, UpdateRemoteAgentRequest,
 };
-use aionui_common::{
-    AppError, RemoteAgentAuthType, RemoteAgentProtocol, RemoteAgentStatus, decrypt_string, encrypt_string,
-};
+use aionui_common::{RemoteAgentAuthType, RemoteAgentProtocol, RemoteAgentStatus, decrypt_string, encrypt_string};
 use aionui_db::models::RemoteAgentRow;
 use aionui_db::{IRemoteAgentRepository, UpdateRemoteAgentParams};
 use base64::Engine;
@@ -15,6 +13,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::SigningKey;
 use tokio_tungstenite::tungstenite;
 use tracing::warn;
+
+use crate::error::AgentError;
 
 /// Service layer for Remote Agent CRUD and connection management.
 #[derive(Clone)]
@@ -29,30 +29,30 @@ impl RemoteAgentService {
     }
 
     /// List all remote agents (auth_token omitted).
-    pub async fn list(&self) -> Result<Vec<RemoteAgentListItem>, AppError> {
+    pub async fn list(&self) -> Result<Vec<RemoteAgentListItem>, AgentError> {
         let rows = self.repo.list().await.map_err(db_err)?;
         rows.into_iter().map(|r| self.row_to_list_item(r)).collect()
     }
 
     /// Get a single remote agent by ID (auth_token masked).
-    pub async fn get(&self, id: &str) -> Result<RemoteAgentResponse, AppError> {
+    pub async fn get(&self, id: &str) -> Result<RemoteAgentResponse, AgentError> {
         let row = self
             .repo
             .find_by_id(id)
             .await
             .map_err(db_err)?
-            .ok_or_else(|| AppError::NotFound(format!("Remote agent '{id}' not found")))?;
+            .ok_or_else(|| AgentError::not_found(format!("Remote agent '{id}' not found")))?;
         self.row_to_response(row)
     }
 
     /// Create a new remote agent. OpenClaw protocol auto-generates Ed25519 keys.
-    pub async fn create(&self, req: CreateRemoteAgentRequest) -> Result<RemoteAgentResponse, AppError> {
+    pub async fn create(&self, req: CreateRemoteAgentRequest) -> Result<RemoteAgentResponse, AgentError> {
         validate_create_request(&req)?;
 
         let encrypted_token = req
             .auth_token
             .as_deref()
-            .map(|t| encrypt_string(t, &self.encryption_key))
+            .map(|t| encrypt_string(t, &self.encryption_key).map_err(|e| AgentError::internal(e.to_string())))
             .transpose()?;
 
         let (device_id, device_public_key, device_private_key) = if req.protocol == RemoteAgentProtocol::OpenClaw {
@@ -85,9 +85,11 @@ impl RemoteAgentService {
     }
 
     /// Update an existing remote agent.
-    pub async fn update(&self, id: &str, req: UpdateRemoteAgentRequest) -> Result<RemoteAgentResponse, AppError> {
+    pub async fn update(&self, id: &str, req: UpdateRemoteAgentRequest) -> Result<RemoteAgentResponse, AgentError> {
         let encrypted_token = match &req.auth_token {
-            Some(Some(t)) => Some(Some(encrypt_string(t, &self.encryption_key)?)),
+            Some(Some(t)) => Some(Some(
+                encrypt_string(t, &self.encryption_key).map_err(|e| AgentError::internal(e.to_string()))?,
+            )),
             Some(None) => Some(None),
             None => None,
         };
@@ -107,23 +109,23 @@ impl RemoteAgentService {
         };
 
         let row = self.repo.update(id, params).await.map_err(|e| match e {
-            aionui_db::DbError::NotFound(msg) => AppError::NotFound(msg),
-            other => AppError::Internal(other.to_string()),
+            aionui_db::DbError::NotFound(msg) => AgentError::not_found(msg),
+            other => AgentError::internal(other.to_string()),
         })?;
 
         self.row_to_response(row)
     }
 
     /// Delete a remote agent.
-    pub async fn delete(&self, id: &str) -> Result<(), AppError> {
+    pub async fn delete(&self, id: &str) -> Result<(), AgentError> {
         self.repo.delete(id).await.map_err(|e| match e {
-            aionui_db::DbError::NotFound(msg) => AppError::NotFound(msg),
-            other => AppError::Internal(other.to_string()),
+            aionui_db::DbError::NotFound(msg) => AgentError::not_found(msg),
+            other => AgentError::internal(other.to_string()),
         })
     }
 
     /// Test a WebSocket connection to a remote agent URL (10s timeout, SSRF protected).
-    pub async fn test_connection(&self, req: TestRemoteAgentConnectionRequest) -> Result<(), AppError> {
+    pub async fn test_connection(&self, req: TestRemoteAgentConnectionRequest) -> Result<(), AgentError> {
         validate_ws_url(&req.url)?;
 
         let url = req.url.clone();
@@ -131,33 +133,33 @@ impl RemoteAgentService {
             tokio::task::spawn_blocking(move || {
                 tungstenite::connect(&url)
                     .map(|_| ())
-                    .map_err(|e| AppError::BadGateway(format!("WebSocket connection failed: {e}")))
+                    .map_err(|e| AgentError::bad_gateway(format!("WebSocket connection failed: {e}")))
             })
             .await
-            .map_err(|e| AppError::Internal(format!("Join error: {e}")))?
+            .map_err(|e| AgentError::internal(format!("Join error: {e}")))?
         })
         .await;
 
         match result {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(AppError::Timeout("Connection timed out after 10 seconds".into())),
+            Err(_) => Err(AgentError::timeout("Connection timed out after 10 seconds")),
         }
     }
 
     /// OpenClaw device handshake (15s timeout).
-    pub async fn handshake(&self, id: &str) -> Result<HandshakeResponse, AppError> {
+    pub async fn handshake(&self, id: &str) -> Result<HandshakeResponse, AgentError> {
         let row = self
             .repo
             .find_by_id(id)
             .await
             .map_err(db_err)?
-            .ok_or_else(|| AppError::NotFound(format!("Remote agent '{id}' not found")))?;
+            .ok_or_else(|| AgentError::not_found(format!("Remote agent '{id}' not found")))?;
 
         let protocol = parse_protocol(&row.protocol);
         if protocol != RemoteAgentProtocol::OpenClaw {
-            return Err(AppError::BadRequest(
-                "Handshake is only supported for OpenClaw protocol".into(),
+            return Err(AgentError::bad_request(
+                "Handshake is only supported for OpenClaw protocol",
             ));
         }
 
@@ -168,10 +170,10 @@ impl RemoteAgentService {
             tokio::task::spawn_blocking(move || {
                 tungstenite::connect(&url)
                     .map(|_| ())
-                    .map_err(|e| AppError::BadGateway(format!("Handshake connection failed: {e}")))
+                    .map_err(|e| AgentError::bad_gateway(format!("Handshake connection failed: {e}")))
             })
             .await
-            .map_err(|e| AppError::Internal(format!("Join error: {e}")))?
+            .map_err(|e| AgentError::internal(format!("Join error: {e}")))?
         })
         .await;
 
@@ -189,14 +191,14 @@ impl RemoteAgentService {
             }
             Err(_) => {
                 let _ = self.repo.update_status(id, "error", None).await;
-                Err(AppError::Timeout("Handshake timed out after 15 seconds".into()))
+                Err(AgentError::timeout("Handshake timed out after 15 seconds"))
             }
         }
     }
 
     // ── Private helpers ──────────────────────────────────────────
 
-    fn row_to_list_item(&self, row: RemoteAgentRow) -> Result<RemoteAgentListItem, AppError> {
+    fn row_to_list_item(&self, row: RemoteAgentRow) -> Result<RemoteAgentListItem, AgentError> {
         Ok(RemoteAgentListItem {
             id: row.id,
             name: row.name,
@@ -213,7 +215,7 @@ impl RemoteAgentService {
         })
     }
 
-    fn row_to_response(&self, row: RemoteAgentRow) -> Result<RemoteAgentResponse, AppError> {
+    fn row_to_response(&self, row: RemoteAgentRow) -> Result<RemoteAgentResponse, AgentError> {
         let masked_token =
             row.auth_token
                 .as_deref()
@@ -252,19 +254,19 @@ impl RemoteAgentService {
 
 // ── Validation ──────────────────────────────────────────────────
 
-fn validate_create_request(req: &CreateRemoteAgentRequest) -> Result<(), AppError> {
+fn validate_create_request(req: &CreateRemoteAgentRequest) -> Result<(), AgentError> {
     if req.name.trim().is_empty() {
-        return Err(AppError::BadRequest("name must not be empty".into()));
+        return Err(AgentError::bad_request("name must not be empty"));
     }
     if req.url.trim().is_empty() {
-        return Err(AppError::BadRequest("url must not be empty".into()));
+        return Err(AgentError::bad_request("url must not be empty"));
     }
     validate_ws_url(&req.url)
 }
 
-fn validate_ws_url(url: &str) -> Result<(), AppError> {
+fn validate_ws_url(url: &str) -> Result<(), AgentError> {
     if !url.starts_with("ws://") && !url.starts_with("wss://") {
-        return Err(AppError::BadRequest("URL must use ws:// or wss:// protocol".into()));
+        return Err(AgentError::bad_request("URL must use ws:// or wss:// protocol"));
     }
     Ok(())
 }
@@ -281,9 +283,9 @@ fn mask_token(token: &str) -> String {
 
 // ── Ed25519 key generation ──────────────────────────────────────
 
-fn generate_device_keypair(encryption_key: &[u8; 32]) -> Result<(String, String, String), AppError> {
+fn generate_device_keypair(encryption_key: &[u8; 32]) -> Result<(String, String, String), AgentError> {
     let mut rng_bytes = [0u8; 32];
-    getrandom::getrandom(&mut rng_bytes).map_err(|e| AppError::Internal(format!("RNG failure: {e}")))?;
+    getrandom::getrandom(&mut rng_bytes).map_err(|e| AgentError::internal(format!("RNG failure: {e}")))?;
 
     let signing_key = SigningKey::from_bytes(&rng_bytes);
     let verifying_key = signing_key.verifying_key();
@@ -294,8 +296,8 @@ fn generate_device_keypair(encryption_key: &[u8; 32]) -> Result<(String, String,
     let pub_b64 = BASE64.encode(verifying_key.as_bytes());
     let priv_b64 = BASE64.encode(signing_key.to_bytes());
 
-    let encrypted_pub = encrypt_string(&pub_b64, encryption_key)?;
-    let encrypted_priv = encrypt_string(&priv_b64, encryption_key)?;
+    let encrypted_pub = encrypt_string(&pub_b64, encryption_key).map_err(|e| AgentError::internal(e.to_string()))?;
+    let encrypted_priv = encrypt_string(&priv_b64, encryption_key).map_err(|e| AgentError::internal(e.to_string()))?;
 
     Ok((device_id, encrypted_pub, encrypted_priv))
 }
@@ -325,8 +327,8 @@ fn parse_status(s: &str) -> RemoteAgentStatus {
     enum_from_str(s).unwrap_or(RemoteAgentStatus::Unknown)
 }
 
-fn db_err(e: aionui_db::DbError) -> AppError {
-    AppError::Internal(e.to_string())
+fn db_err(e: aionui_db::DbError) -> AgentError {
+    AgentError::internal(e.to_string())
 }
 
 #[cfg(test)]

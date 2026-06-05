@@ -105,7 +105,8 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
     let factory: std::sync::Arc<
         dyn Fn(
                 aionui_ai_agent::types::BuildTaskOptions,
-            ) -> futures_util::future::BoxFuture<'static, Result<AgentInstance, aionui_common::AppError>>
+            )
+                -> futures_util::future::BoxFuture<'static, Result<AgentInstance, aionui_ai_agent::AgentError>>
             + Send
             + Sync,
     > = std::sync::Arc::new(|opts| {
@@ -156,10 +157,10 @@ impl IAgentTask for NoopMockAgent {
     ) -> Result<(), aionui_ai_agent::AgentSendError> {
         Ok(())
     }
-    async fn cancel(&self) -> Result<(), aionui_common::AppError> {
+    async fn cancel(&self) -> Result<(), aionui_ai_agent::AgentError> {
         Ok(())
     }
-    fn kill(&self, _reason: Option<aionui_common::AgentKillReason>) -> Result<(), aionui_common::AppError> {
+    fn kill(&self, _reason: Option<aionui_common::AgentKillReason>) -> Result<(), aionui_ai_agent::AgentError> {
         Ok(())
     }
 }

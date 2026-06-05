@@ -1067,6 +1067,7 @@ impl ICronService for SharedCronService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_ai_agent::AgentError;
     use aionui_ai_agent::protocol::events::{ErrorEventData, FinishEventData, TextEventData, ThinkingEventData};
     use aionui_db::DbError;
     use std::sync::Mutex;
@@ -1239,8 +1240,8 @@ mod tests {
         let rx = tx.subscribe();
         let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
         send_error_tx
-            .send(AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
-                "provider returned 401 invalid api key".into(),
+            .send(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "provider returned 401 invalid api key",
             )))
             .unwrap();
 
@@ -1299,9 +1300,8 @@ mod tests {
         );
 
         let rx = tx.subscribe();
-        let send_error = AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
-            "provider returned 401 invalid api key".into(),
-        ));
+        let send_error =
+            AgentSendError::from_agent_error(AgentError::bad_gateway("provider returned 401 invalid api key"));
         tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
             "stream already emitted",
             None,
@@ -1343,8 +1343,8 @@ mod tests {
         let rx = tx.subscribe();
         let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
         send_error_tx
-            .send(AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
-                "provider returned 401 invalid api key".into(),
+            .send(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "provider returned 401 invalid api key",
             )))
             .unwrap();
         let delayed_stream_error = tokio::spawn(async move {

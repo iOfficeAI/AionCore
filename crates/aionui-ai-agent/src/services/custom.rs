@@ -6,7 +6,7 @@
 //! toggle enable).
 //!
 //! Test-on-save: create / update run `try_connect_custom_agent`
-//! before hitting the DB. Failures become `AppError::BadRequest` with
+//! before hitting the DB. Failures become `AgentError::BadRequest` with
 //! a prefixed marker (`cli_not_found:` / `acp_init_failed:`) that the
 //! frontend maps back to the same three Alert states it shows for the
 //! manual "Test connection" button.
@@ -14,10 +14,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::error::AgentError;
 use aionui_api_types::{
     AgentMetadata, CustomAgentUpsertRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
-use aionui_common::{AppError, generate_short_id};
+use aionui_common::generate_short_id;
 use aionui_db::UpsertAgentMetadataParams;
 use tracing::warn;
 
@@ -34,9 +35,9 @@ impl AgentService {
     pub async fn try_connect_custom_agent(
         &self,
         req: TryConnectCustomAgentRequest,
-    ) -> Result<TryConnectCustomAgentResponse, AppError> {
+    ) -> Result<TryConnectCustomAgentResponse, AgentError> {
         if req.command.trim().is_empty() {
-            return Err(AppError::BadRequest("command must not be empty".into()));
+            return Err(AgentError::bad_request("command must not be empty"));
         }
         let reporter = req
             .runtime_scope_id
@@ -52,7 +53,7 @@ impl AgentService {
         .await)
     }
 
-    pub async fn create_custom_agent(&self, req: CustomAgentUpsertRequest) -> Result<AgentMetadata, AppError> {
+    pub async fn create_custom_agent(&self, req: CustomAgentUpsertRequest) -> Result<AgentMetadata, AgentError> {
         validate_upsert(&req)?;
         probe_or_reject(&req, self.data_dir()).await?;
 
@@ -64,18 +65,18 @@ impl AgentService {
         &self,
         id: &str,
         req: CustomAgentUpsertRequest,
-    ) -> Result<AgentMetadata, AppError> {
+    ) -> Result<AgentMetadata, AgentError> {
         validate_upsert(&req)?;
         let existing = self
             .registry()
             .repo_handle()
             .get(id)
             .await
-            .map_err(|e| AppError::Internal(format!("repo.get: {e}")))?
-            .ok_or_else(|| AppError::NotFound(format!("Agent '{id}' not found")))?;
+            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
         if existing.agent_source != "custom" {
-            return Err(AppError::Forbidden(
-                "Only custom agents can be edited via this endpoint".into(),
+            return Err(AgentError::forbidden(
+                "Only custom agents can be edited via this endpoint",
             ));
         }
         probe_or_reject(&req, self.data_dir()).await?;
@@ -84,17 +85,17 @@ impl AgentService {
         self.upsert_custom_row(id, &req, keep_enabled).await
     }
 
-    pub async fn delete_custom_agent(&self, id: &str) -> Result<(), AppError> {
+    pub async fn delete_custom_agent(&self, id: &str) -> Result<(), AgentError> {
         let existing = self
             .registry()
             .repo_handle()
             .get(id)
             .await
-            .map_err(|e| AppError::Internal(format!("repo.get: {e}")))?
-            .ok_or_else(|| AppError::NotFound(format!("Agent '{id}' not found")))?;
+            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
         if existing.agent_source != "custom" {
-            return Err(AppError::Forbidden(
-                "Only custom agents can be deleted via this endpoint".into(),
+            return Err(AgentError::forbidden(
+                "Only custom agents can be deleted via this endpoint",
             ));
         }
         let removed = self
@@ -102,9 +103,9 @@ impl AgentService {
             .repo_handle()
             .delete(id)
             .await
-            .map_err(|e| AppError::Internal(format!("repo.delete: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.delete: {e}")))?;
         if !removed {
-            return Err(AppError::NotFound(format!("Agent '{id}' not found")));
+            return Err(AgentError::not_found(format!("Agent '{id}' not found")));
         }
         if let Err(err) = self.registry().invalidate_and_rehydrate().await {
             warn!(agent_id = %id, error = %err, "registry rehydrate failed after delete_custom_agent");
@@ -112,15 +113,15 @@ impl AgentService {
         Ok(())
     }
 
-    pub async fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<AgentMetadata, AppError> {
+    pub async fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<AgentMetadata, AgentError> {
         let updated = self
             .registry()
             .repo_handle()
             .set_enabled(id, enabled)
             .await
-            .map_err(|e| AppError::Internal(format!("repo.set_enabled: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.set_enabled: {e}")))?;
         if !updated {
-            return Err(AppError::NotFound(format!("Agent '{id}' not found")));
+            return Err(AgentError::not_found(format!("Agent '{id}' not found")));
         }
         if let Err(err) = self.registry().invalidate_and_rehydrate().await {
             warn!(agent_id = %id, error = %err, "registry rehydrate failed after set_agent_enabled");
@@ -128,7 +129,7 @@ impl AgentService {
         self.registry()
             .get(id)
             .await
-            .ok_or_else(|| AppError::Internal(format!("Agent '{id}' not visible after enable toggle")))
+            .ok_or_else(|| AgentError::internal(format!("Agent '{id}' not visible after enable toggle")))
     }
 
     async fn upsert_custom_row(
@@ -136,23 +137,23 @@ impl AgentService {
         id: &str,
         req: &CustomAgentUpsertRequest,
         enabled: bool,
-    ) -> Result<AgentMetadata, AppError> {
+    ) -> Result<AgentMetadata, AgentError> {
         let advanced = req.advanced.clone().unwrap_or_default();
 
         let args_json =
-            serde_json::to_string(&req.args).map_err(|e| AppError::Internal(format!("encode args: {e}")))?;
-        let env_json = serde_json::to_string(&req.env).map_err(|e| AppError::Internal(format!("encode env: {e}")))?;
+            serde_json::to_string(&req.args).map_err(|e| AgentError::internal(format!("encode args: {e}")))?;
+        let env_json = serde_json::to_string(&req.env).map_err(|e| AgentError::internal(format!("encode env: {e}")))?;
         let native_skills_dirs_json = advanced
             .native_skills_dirs
             .as_ref()
             .map(|v| {
-                serde_json::to_string(v).map_err(|e| AppError::Internal(format!("encode native_skills_dirs: {e}")))
+                serde_json::to_string(v).map_err(|e| AgentError::internal(format!("encode native_skills_dirs: {e}")))
             })
             .transpose()?;
         let behavior_policy_json = advanced
             .behavior_policy
             .as_ref()
-            .map(|v| serde_json::to_string(v).map_err(|e| AppError::Internal(format!("encode behavior_policy: {e}"))))
+            .map(|v| serde_json::to_string(v).map_err(|e| AgentError::internal(format!("encode behavior_policy: {e}"))))
             .transpose()?;
 
         let source_info = serde_json::json!({
@@ -191,31 +192,31 @@ impl AgentService {
             .repo_handle()
             .upsert(&params)
             .await
-            .map_err(|e| AppError::Internal(format!("repo.upsert: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.upsert: {e}")))?;
 
         self.registry()
             .invalidate_and_rehydrate()
             .await
-            .map_err(|e| AppError::Internal(format!("registry rehydrate: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("registry rehydrate: {e}")))?;
 
         self.registry()
             .get(id)
             .await
-            .ok_or_else(|| AppError::Internal(format!("Agent '{id}' not visible after upsert")))
+            .ok_or_else(|| AgentError::internal(format!("Agent '{id}' not visible after upsert")))
     }
 }
 
-fn validate_upsert(req: &CustomAgentUpsertRequest) -> Result<(), AppError> {
+fn validate_upsert(req: &CustomAgentUpsertRequest) -> Result<(), AgentError> {
     if req.name.trim().is_empty() {
-        return Err(AppError::BadRequest("name must not be empty".into()));
+        return Err(AgentError::bad_request("name must not be empty"));
     }
     if req.command.trim().is_empty() {
-        return Err(AppError::BadRequest("command must not be empty".into()));
+        return Err(AgentError::bad_request("command must not be empty"));
     }
     Ok(())
 }
 
-async fn probe_or_reject(req: &CustomAgentUpsertRequest, data_dir: &Path) -> Result<(), AppError> {
+async fn probe_or_reject(req: &CustomAgentUpsertRequest, data_dir: &Path) -> Result<(), AgentError> {
     // Test-only bypass — real probe spawns a child process and relies
     // on a working ACP CLI on PATH, which is not present in CI.
     // Gated behind cfg(test) / the `test-support` feature so production
@@ -230,10 +231,10 @@ async fn probe_or_reject(req: &CustomAgentUpsertRequest, data_dir: &Path) -> Res
     match probe(&req.command, &req.args, &env_map, data_dir, None).await {
         TryConnectCustomAgentResponse::Success => Ok(()),
         TryConnectCustomAgentResponse::FailCli { error } => {
-            Err(AppError::BadRequest(format!("cli_not_found: {error}")))
+            Err(AgentError::bad_request(format!("cli_not_found: {error}")))
         }
         TryConnectCustomAgentResponse::FailAcp { error } => {
-            Err(AppError::BadRequest(format!("acp_init_failed: {error}")))
+            Err(AgentError::bad_request(format!("acp_init_failed: {error}")))
         }
     }
 }

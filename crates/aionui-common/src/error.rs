@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use std::path::{Component, Path};
 
 use axum::http::StatusCode;
@@ -5,9 +7,9 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-/// Application-level error with HTTP status code mapping.
+/// API boundary error with HTTP status code mapping.
 #[derive(Debug, thiserror::Error)]
-pub enum AppError {
+pub enum ApiError {
     #[error("Not found: {0}")]
     NotFound(String),
 
@@ -68,7 +70,7 @@ struct ErrorBody {
     details: Option<Value>,
 }
 
-impl AppError {
+impl ApiError {
     /// HTTP status code for this error variant.
     pub fn status_code(&self) -> StatusCode {
         match self {
@@ -162,7 +164,7 @@ fn workspace_path_whitespace_segments(path: &Path) -> Vec<String> {
         .collect()
 }
 
-impl IntoResponse for AppError {
+impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let body = ErrorBody {
@@ -197,79 +199,79 @@ mod tests {
 
     #[test]
     fn test_status_codes() {
-        assert_eq!(AppError::NotFound("x".into()).status_code(), StatusCode::NOT_FOUND);
-        assert_eq!(AppError::BadRequest("x".into()).status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(ApiError::NotFound("x".into()).status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(ApiError::BadRequest("x".into()).status_code(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            AppError::Unauthorized("x".into()).status_code(),
+            ApiError::Unauthorized("x".into()).status_code(),
             StatusCode::UNAUTHORIZED
         );
-        assert_eq!(AppError::Forbidden("x".into()).status_code(), StatusCode::FORBIDDEN);
-        assert_eq!(AppError::Conflict("x".into()).status_code(), StatusCode::CONFLICT);
-        assert_eq!(AppError::RateLimited.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(ApiError::Forbidden("x".into()).status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(ApiError::Conflict("x".into()).status_code(), StatusCode::CONFLICT);
+        assert_eq!(ApiError::RateLimited.status_code(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            AppError::Internal("x".into()).status_code(),
+            ApiError::Internal("x".into()).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
-        assert_eq!(AppError::BadGateway("x".into()).status_code(), StatusCode::BAD_GATEWAY);
-        assert_eq!(AppError::Timeout("x".into()).status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(ApiError::BadGateway("x".into()).status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(ApiError::Timeout("x".into()).status_code(), StatusCode::BAD_GATEWAY);
         assert_eq!(
-            AppError::UnprocessableEntity("x".into()).status_code(),
+            ApiError::UnprocessableEntity("x".into()).status_code(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
         assert_eq!(
-            AppError::WorkspacePathContainsWhitespace("x".into()).status_code(),
+            ApiError::WorkspacePathContainsWhitespace("x".into()).status_code(),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported("x".into()).status_code(),
+            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported("x".into()).status_code(),
             StatusCode::BAD_REQUEST
         );
     }
 
     #[test]
     fn test_error_codes() {
-        assert_eq!(AppError::NotFound("x".into()).error_code(), "NOT_FOUND");
-        assert_eq!(AppError::BadRequest("x".into()).error_code(), "BAD_REQUEST");
-        assert_eq!(AppError::Unauthorized("x".into()).error_code(), "UNAUTHORIZED");
-        assert_eq!(AppError::Forbidden("x".into()).error_code(), "FORBIDDEN");
+        assert_eq!(ApiError::NotFound("x".into()).error_code(), "NOT_FOUND");
+        assert_eq!(ApiError::BadRequest("x".into()).error_code(), "BAD_REQUEST");
+        assert_eq!(ApiError::Unauthorized("x".into()).error_code(), "UNAUTHORIZED");
+        assert_eq!(ApiError::Forbidden("x".into()).error_code(), "FORBIDDEN");
         assert_eq!(
-            AppError::Forbidden("path '/tmp/x' is outside the allowed sandbox".into()).error_code(),
+            ApiError::Forbidden("path '/tmp/x' is outside the allowed sandbox".into()).error_code(),
             "PATH_OUTSIDE_SANDBOX"
         );
-        assert_eq!(AppError::Conflict("x".into()).error_code(), "CONFLICT");
-        assert_eq!(AppError::RateLimited.error_code(), "RATE_LIMITED");
-        assert_eq!(AppError::Internal("x".into()).error_code(), "INTERNAL_ERROR");
-        assert_eq!(AppError::BadGateway("x".into()).error_code(), "BAD_GATEWAY");
-        assert_eq!(AppError::Timeout("x".into()).error_code(), "TIMEOUT");
+        assert_eq!(ApiError::Conflict("x".into()).error_code(), "CONFLICT");
+        assert_eq!(ApiError::RateLimited.error_code(), "RATE_LIMITED");
+        assert_eq!(ApiError::Internal("x".into()).error_code(), "INTERNAL_ERROR");
+        assert_eq!(ApiError::BadGateway("x".into()).error_code(), "BAD_GATEWAY");
+        assert_eq!(ApiError::Timeout("x".into()).error_code(), "TIMEOUT");
         assert_eq!(
-            AppError::UnprocessableEntity("x".into()).error_code(),
+            ApiError::UnprocessableEntity("x".into()).error_code(),
             "UNPROCESSABLE_ENTITY"
         );
         assert_eq!(
-            AppError::WorkspacePathContainsWhitespace("x".into()).error_code(),
+            ApiError::WorkspacePathContainsWhitespace("x".into()).error_code(),
             "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED"
         );
         assert_eq!(
-            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported("x".into()).error_code(),
+            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported("x".into()).error_code(),
             "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
         );
     }
 
     #[test]
     fn test_error_display() {
-        assert_eq!(AppError::NotFound("user 123".into()).to_string(), "Not found: user 123");
-        assert_eq!(AppError::RateLimited.to_string(), "Rate limited");
+        assert_eq!(ApiError::NotFound("user 123".into()).to_string(), "Not found: user 123");
+        assert_eq!(ApiError::RateLimited.to_string(), "Rate limited");
     }
 
     #[test]
     fn test_into_response_status() {
-        let resp = AppError::NotFound("test".into()).into_response();
+        let resp = ApiError::NotFound("test".into()).into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn test_into_response_body_format() {
-        let resp = AppError::NotFound("user 42".into()).into_response();
+        let resp = ApiError::NotFound("user 42".into()).into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -282,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limited_response_body() {
-        let resp = AppError::RateLimited.into_response();
+        let resp = ApiError::RateLimited.into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -296,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_workspace_whitespace_response_contains_details() {
-        let resp = AppError::WorkspacePathContainsWhitespace("/tmp/Archive ".into()).into_response();
+        let resp = ApiError::WorkspacePathContainsWhitespace("/tmp/Archive ".into()).into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -311,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_workspace_runtime_whitespace_response_contains_details() {
-        let resp = AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/Archive ".into()).into_response();
+        let resp = ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/Archive ".into()).into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -353,7 +355,7 @@ mod tests {
 
     #[test]
     fn test_error_chain_single_error() {
-        let err = AppError::NotFound("x".into());
+        let err = ApiError::NotFound("x".into());
         assert_eq!(format!("{}", ErrorChain(&err)), err.to_string());
     }
 

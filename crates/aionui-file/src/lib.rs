@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_types)]
+
 //! File system operations: read/write, path safety, file watching, snapshots, and zip.
 pub mod browse;
 pub mod error;

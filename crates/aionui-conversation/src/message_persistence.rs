@@ -1,13 +1,31 @@
 use aionui_ai_agent::AgentSendError;
-use aionui_common::{AppError, ErrorChain, now_ms};
+use aionui_common::{ErrorChain, now_ms};
 use aionui_db::models::MessageRow;
 use tracing::warn;
 
 use crate::service::ConversationService;
 
 impl ConversationService {
-    pub(crate) async fn persist_send_failure_tip(&self, conversation_id: &str, err: &AppError) -> Option<MessageRow> {
-        let stream_error = AgentSendError::from_app_error_ref(err).into_stream_error();
+    pub(crate) async fn persist_send_failure_tip(
+        &self,
+        conversation_id: &str,
+        err: &AgentSendError,
+        top_level_code: Option<&'static str>,
+    ) -> Option<MessageRow> {
+        let stream_error = err.stream_error();
+        let code = top_level_code.map(str::to_owned).or_else(|| {
+            stream_error
+                .code
+                .and_then(|code| serde_json::to_value(code).ok())
+                .and_then(|value| value.as_str().map(str::to_owned))
+        });
+        let details = match stream_error.workspace_path.as_deref() {
+            Some(workspace_path) => serde_json::json!({
+                "detail": stream_error.detail,
+                "workspace_path": workspace_path,
+            }),
+            None => serde_json::to_value(&stream_error.detail).unwrap_or(serde_json::Value::Null),
+        };
         let row = MessageRow {
             id: Self::mint_msg_id(),
             conversation_id: conversation_id.to_owned(),
@@ -17,8 +35,8 @@ impl ConversationService {
                 "content": &stream_error.message,
                 "type": "error",
                 "source": "send_failed",
-                "code": err.error_code(),
-                "details": err.error_details(),
+                "code": code,
+                "details": details,
                 "error": stream_error,
             })
             .to_string(),

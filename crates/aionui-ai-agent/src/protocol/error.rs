@@ -41,7 +41,7 @@ pub enum CloseReason {
 
     /// Generic upstream / protocol failure that closed the turn but where
     /// the process is still alive. `display` is the
-    /// `user_facing_message`-stripped form of the originating `AppError`,
+    /// `user_facing_message`-stripped form of the originating agent error,
     /// so it never starts with "Bad gateway: ".
     Failed { display: String },
 }
