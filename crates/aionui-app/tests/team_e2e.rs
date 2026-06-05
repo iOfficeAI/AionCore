@@ -126,26 +126,57 @@ async fn tc6_missing_name_returns_error() {
 }
 
 #[tokio::test]
-async fn tc6b_workspace_with_whitespace_segment_returns_specific_code() {
+async fn tc6b_workspace_with_whitespace_segment_is_accepted() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("Archive ");
+    std::fs::create_dir_all(&workspace).unwrap();
 
     let body = json!({
         "name": "Alpha",
-        "workspace": "/Users/zhoukai/Documents/Archive ",
+        "workspace": workspace.to_string_lossy(),
         "agents": [{ "name": "Lead", "role": "lead", "backend": "acp", "model": "claude" }]
     });
     let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+}
+
+#[tokio::test]
+async fn tc6c_create_team_rejects_missing_workspace_path() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let missing_workspace =
+        std::env::temp_dir().join(format!("aionui-team-missing-{}", aionui_common::generate_short_id()));
+
+    let body = json!({
+        "name": "Alpha",
+        "workspace": missing_workspace.to_string_lossy(),
+        "agents": [{ "name": "Lead", "role": "lead", "backend": "acp", "model": "claude" }]
+    });
+    let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
+    assert_eq!(json["code"], "WORKSPACE_PATH_UNAVAILABLE");
+    assert_eq!(json["details"]["operation"], "create");
+    assert_eq!(
+        json["details"]["workspace_path"],
+        missing_workspace.to_string_lossy().to_string()
+    );
+
+    let req = get_with_token("/api/teams", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
     assert!(
-        json["error"]
-            .as_str()
-            .unwrap()
-            .contains("Workspace path contains whitespace")
+        json["data"].as_array().unwrap().is_empty(),
+        "invalid team should not be persisted"
     );
 }
 

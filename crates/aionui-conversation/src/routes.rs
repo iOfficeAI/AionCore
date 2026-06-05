@@ -39,11 +39,9 @@ impl From<ConversationError> for ApiError {
             ConversationError::Timeout { reason } => ApiError::Timeout(reason),
             ConversationError::Unprocessable { reason } => ApiError::UnprocessableEntity(reason),
             ConversationError::Internal { reason } => ApiError::Internal(reason),
-            ConversationError::WorkspacePathContainsWhitespace { path } => {
-                ApiError::WorkspacePathContainsWhitespace(path)
-            }
-            ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported { path } => {
-                ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
+            ConversationError::WorkspacePathUnavailable { path } => ApiError::WorkspacePathUnavailable(path),
+            ConversationError::WorkspacePathRuntimeUnavailable { path } => {
+                ApiError::WorkspacePathRuntimeUnavailable(path)
             }
             ConversationError::Acp(_) => ApiError::BadGateway("Agent protocol error".into()),
         }
@@ -403,12 +401,12 @@ mod error_mapping_tests {
 
     #[test]
     fn conversation_api_error_compat_preserves_special_codes() {
-        let app = ApiError::from(ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported {
+        let app = ApiError::from(ConversationError::WorkspacePathRuntimeUnavailable {
             path: "/tmp/my project".into(),
         });
         assert!(matches!(
             app,
-            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message) if message == "/tmp/my project"
+            ApiError::WorkspacePathRuntimeUnavailable(message) if message == "/tmp/my project"
         ));
     }
 }

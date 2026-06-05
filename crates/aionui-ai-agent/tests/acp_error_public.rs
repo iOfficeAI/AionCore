@@ -17,15 +17,12 @@ fn agent_send_error_classifies_owned_unauthorized_error() {
 }
 
 #[test]
-fn agent_send_error_classifies_owned_workspace_whitespace_error() {
-    let err = AgentSendError::from_agent_error_ref(
-        &AgentError::workspace_path_contains_whitespace_runtime_unsupported("/tmp/Project With Space"),
-    );
+fn agent_send_error_classifies_owned_workspace_runtime_unavailable_error() {
+    let err = AgentSendError::from_agent_error_ref(&AgentError::workspace_path_runtime_unavailable(
+        "/tmp/Project With Space",
+    ));
     let stream = err.stream_error();
 
-    assert_eq!(
-        stream.code,
-        Some(AgentErrorCode::WorkspacePathContainsWhitespaceRuntimeUnsupported)
-    );
+    assert_eq!(stream.code, Some(AgentErrorCode::WorkspacePathRuntimeUnavailable));
     assert_eq!(stream.workspace_path.as_deref(), Some("/tmp/Project With Space"));
 }

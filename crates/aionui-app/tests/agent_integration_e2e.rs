@@ -203,7 +203,7 @@ async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str, na
     let body = json!({
         "type": "acp",
         "name": name,
-        "extra": { "workspace": "/project" }
+        "extra": {}
     });
     let req = common::json_with_token("POST", "/api/conversations", body, token, csrf);
     let resp = app.clone().oneshot(req).await.unwrap();

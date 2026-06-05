@@ -46,10 +46,8 @@ impl From<TeamError> for ApiError {
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
             TeamError::DuplicateAgentName(msg) => ApiError::BadRequest(format!("Agent name already taken: {msg}")),
-            TeamError::WorkspacePathContainsWhitespace(path) => ApiError::WorkspacePathContainsWhitespace(path),
-            TeamError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => {
-                ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
-            }
+            TeamError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
+            TeamError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
             TeamError::Conversation(conversation_err) => ApiError::from(conversation_err),
             TeamError::Database(db_err) => db_error_to_api_error(db_err),
             TeamError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
@@ -274,8 +272,8 @@ mod tests {
 
     #[test]
     fn workspace_error_preserves_code() {
-        let err: ApiError = TeamError::WorkspacePathContainsWhitespace("/tmp/a b".into()).into();
-        assert!(matches!(err, ApiError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
+        let err: ApiError = TeamError::WorkspacePathUnavailable("/tmp/a b".into()).into();
+        assert!(matches!(err, ApiError::WorkspacePathUnavailable(msg) if msg == "/tmp/a b"));
     }
 
     #[test]
@@ -287,10 +285,10 @@ mod tests {
 
     #[test]
     fn runtime_workspace_error_preserves_code() {
-        let err: ApiError = TeamError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/a b".into()).into();
+        let err: ApiError = TeamError::WorkspacePathRuntimeUnavailable("/tmp/a b".into()).into();
         assert!(matches!(
             err,
-            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(msg) if msg == "/tmp/a b"
+            ApiError::WorkspacePathRuntimeUnavailable(msg) if msg == "/tmp/a b"
         ));
     }
 

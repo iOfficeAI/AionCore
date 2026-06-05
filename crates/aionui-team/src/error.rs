@@ -29,11 +29,11 @@ pub enum TeamError {
     #[error("Agent name already taken: {0}")]
     DuplicateAgentName(String),
 
-    #[error("Workspace path contains whitespace: {0}")]
-    WorkspacePathContainsWhitespace(String),
+    #[error("Workspace path is unavailable: {0}")]
+    WorkspacePathUnavailable(String),
 
-    #[error("Workspace path contains whitespace and is unsupported at runtime: {0}")]
-    WorkspacePathContainsWhitespaceRuntimeUnsupported(String),
+    #[error("Workspace path is unavailable during execution: {0}")]
+    WorkspacePathRuntimeUnavailable(String),
 
     #[error(transparent)]
     Conversation(#[from] ConversationError),
@@ -48,10 +48,8 @@ pub enum TeamError {
 impl TeamError {
     pub(crate) fn from_conversation_create(error: ConversationError) -> Self {
         match error {
-            ConversationError::WorkspacePathContainsWhitespace { path } => Self::WorkspacePathContainsWhitespace(path),
-            ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported { path } => {
-                Self::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
-            }
+            ConversationError::WorkspacePathUnavailable { path } => Self::WorkspacePathUnavailable(path),
+            ConversationError::WorkspacePathRuntimeUnavailable { path } => Self::WorkspacePathRuntimeUnavailable(path),
             other => Self::InvalidRequest(format!("failed to create conversation: {other}")),
         }
     }
@@ -63,10 +61,10 @@ mod tests {
 
     #[test]
     fn conversation_create_preserves_workspace_error_code() {
-        let err = TeamError::from_conversation_create(ConversationError::WorkspacePathContainsWhitespace {
+        let err = TeamError::from_conversation_create(ConversationError::WorkspacePathUnavailable {
             path: "/tmp/a b".into(),
         });
-        assert!(matches!(err, TeamError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
+        assert!(matches!(err, TeamError::WorkspacePathUnavailable(msg) if msg == "/tmp/a b"));
     }
 
     #[test]

@@ -4,7 +4,6 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_common::workspace_path_has_whitespace_segment;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, broadcast, watch};
@@ -34,27 +33,11 @@ pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AgentError> {
     }
 
     let workspace_path = PathBuf::from(cwd);
-    if workspace_path_has_whitespace_segment(&workspace_path) {
-        return Err(AgentError::workspace_path_contains_whitespace_runtime_unsupported(
-            workspace_path.display().to_string(),
-        ));
-    }
-
     match fs::metadata(&workspace_path) {
         Ok(metadata) if metadata.is_dir() => Ok(workspace_path),
-        Ok(_) => Err(AgentError::bad_request(format!(
-            "Workspace path is not a directory: {}",
-            workspace_path.display()
-        ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AgentError::bad_request(format!(
-            "Workspace directory does not exist: {}",
-            workspace_path.display()
-        ))),
-        Err(e) => Err(AgentError::bad_request(format!(
-            "Workspace directory is not accessible: {}: {}",
-            workspace_path.display(),
-            e
-        ))),
+        Ok(_) | Err(_) => Err(AgentError::workspace_path_runtime_unavailable(
+            workspace_path.display().to_string(),
+        )),
     }
 }
 
@@ -383,7 +366,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_rejects_cwd_with_trailing_whitespace_in_request() {
+    async fn spawn_rejects_unavailable_cwd_with_trailing_whitespace_in_request() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("workspace");
         fs::create_dir(&cwd).unwrap();
@@ -398,13 +381,12 @@ pub(super) mod tests {
         let result = CliAgentProcess::spawn(config).await;
         assert!(matches!(
             result,
-            Err(AgentError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
-                if message == cwd_with_trailing_space
+            Err(AgentError::WorkspacePathRuntimeUnavailable(message)) if message == cwd_with_trailing_space
         ));
     }
 
     #[tokio::test]
-    async fn spawn_rejects_cwd_with_whitespace_in_any_segment() {
+    async fn spawn_allows_cwd_with_whitespace_in_any_segment() {
         let dir = tempfile::tempdir().unwrap();
         let workspace_parent = dir.path().join("my workspace");
         fs::create_dir(&workspace_parent).unwrap();
@@ -418,16 +400,20 @@ pub(super) mod tests {
             cwd: Some(cwd.to_string_lossy().into_owned()),
         };
 
-        let result = CliAgentProcess::spawn(config).await;
-        assert!(matches!(
-            result,
-            Err(AgentError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
-                if message == cwd.to_string_lossy()
-        ));
+        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let mut rx = proc.subscribe();
+        let event = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("Timed out")
+            .expect("Channel closed");
+        assert_eq!(
+            event["cwd"],
+            std::fs::canonicalize(&cwd).unwrap().to_string_lossy().to_string()
+        );
     }
 
     #[tokio::test]
-    async fn spawn_for_sdk_rejects_cwd_with_whitespace_in_any_segment() {
+    async fn spawn_for_sdk_allows_cwd_with_whitespace_in_any_segment() {
         let dir = tempfile::tempdir().unwrap();
         let workspace_parent = dir.path().join("my workspace");
         fs::create_dir(&workspace_parent).unwrap();
@@ -442,12 +428,8 @@ pub(super) mod tests {
             cwd: Some(cwd.to_string_lossy().into_owned()),
         };
 
-        let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
-        assert!(matches!(
-            result,
-            Err(AgentError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
-                if message == cwd.to_string_lossy()
-        ));
+        let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
+        proc.kill(Duration::from_millis(100)).await.unwrap();
     }
 
     #[tokio::test]
@@ -466,7 +448,8 @@ pub(super) mod tests {
         let result = CliAgentProcess::spawn(config).await;
         assert!(matches!(
             result,
-            Err(AgentError::BadRequest(message)) if message.contains("Workspace directory does not exist")
+            Err(AgentError::WorkspacePathRuntimeUnavailable(message))
+                if message == missing_cwd.to_string_lossy()
         ));
         assert!(!missing_cwd.exists());
     }
@@ -488,7 +471,8 @@ pub(super) mod tests {
         let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(matches!(
             result,
-            Err(AgentError::BadRequest(message)) if message.contains("Workspace directory does not exist")
+            Err(AgentError::WorkspacePathRuntimeUnavailable(message))
+                if message == missing_cwd.to_string_lossy()
         ));
         assert!(!missing_cwd.exists());
     }

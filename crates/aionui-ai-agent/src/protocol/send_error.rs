@@ -68,10 +68,10 @@ impl AgentSendError {
     pub fn from_agent_error_ref(err: &AgentError) -> Self {
         let detail = err.public_message();
         match err {
-            AgentError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => Self {
+            AgentError::WorkspacePathRuntimeUnavailable(path) => Self {
                 stream_error: AgentStreamErrorData {
-                    message: "This workspace path is no longer supported for execution".into(),
-                    code: Some(AgentErrorCode::WorkspacePathContainsWhitespaceRuntimeUnsupported),
+                    message: "Current Agent failed to run in this workspace path".into(),
+                    code: Some(AgentErrorCode::WorkspacePathRuntimeUnavailable),
                     ownership: Some(AgentErrorOwnership::Aionui),
                     detail: Some(sanitize_error_detail(&detail)),
                     workspace_path: Some(path.clone()),
@@ -999,14 +999,10 @@ mod tests {
 
     #[test]
     fn preserves_runtime_workspace_validation_as_structured_aionui_error() {
-        let err = AgentSendError::from_agent_error(AgentError::workspace_path_contains_whitespace_runtime_unsupported(
-            "/Users/test/Archive ",
-        ));
+        let err =
+            AgentSendError::from_agent_error(AgentError::workspace_path_runtime_unavailable("/Users/test/Archive "));
 
-        assert_eq!(
-            err.code(),
-            Some(AgentErrorCode::WorkspacePathContainsWhitespaceRuntimeUnsupported)
-        );
+        assert_eq!(err.code(), Some(AgentErrorCode::WorkspacePathRuntimeUnavailable));
         assert_eq!(err.ownership(), Some(AgentErrorOwnership::Aionui));
         assert_eq!(
             err.stream_error().workspace_path.as_deref(),

@@ -16,7 +16,7 @@ fn create_conv_body(name: &str) -> serde_json::Value {
     json!({
         "type": "acp",
         "name": name,
-        "extra": { "workspace": "/project", "backend": "gemini" }
+        "extra": { "backend": "gemini" }
     })
 }
 
@@ -763,11 +763,14 @@ async fn t2_1_send_message_conversation_not_found() {
 }
 
 #[tokio::test]
-async fn t2_1b_send_message_legacy_workspace_returns_runtime_whitespace_code() {
+async fn t2_1b_send_message_legacy_workspace_with_whitespace_succeeds() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let conv_id = create_conversation(&mut app, &token, &csrf, "Legacy Workspace").await;
-    update_conversation_workspace(&services, &conv_id, "/tmp/my project").await;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("my project");
+    std::fs::create_dir(&workspace).unwrap();
+    update_conversation_workspace(&services, &conv_id, &workspace.to_string_lossy()).await;
 
     let body = json!({ "content": "Hello" });
     let req = common::json_with_token(
@@ -778,12 +781,43 @@ async fn t2_1b_send_message_legacy_workspace_returns_runtime_whitespace_code() {
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn t2_1c_send_message_missing_workspace_persists_message_and_failure_tip() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Missing Workspace").await;
+    update_conversation_workspace(&services, &conv_id, "/tmp/does-not-exist-for-message-e2e").await;
+
+    let body = json!({ "content": "Hello" });
+    let req = common::json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        body,
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
-    assert_eq!(json["details"]["workspace_path"], "/tmp/my project");
-    assert_eq!(json["details"]["operation"], "runtime");
+    assert!(json["data"]["msg_id"].as_str().is_some());
+
+    let messages_resp = app
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conv_id}/messages"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(messages_resp.status(), StatusCode::OK);
+    let messages_json = body_json(messages_resp).await;
+    assert_eq!(messages_json["data"]["total"], 2);
+    let items = messages_json["data"]["items"].as_array().unwrap();
+    assert!(items.iter().any(|item| item["position"] == "right"));
+    assert!(items.iter().any(|item| item["type"] == "tips"));
 }
 
 #[tokio::test]
@@ -852,11 +886,14 @@ async fn t2_3_warmup_conversation_not_found() {
 }
 
 #[tokio::test]
-async fn t2_3b_warmup_legacy_workspace_returns_runtime_whitespace_code() {
+async fn t2_3b_warmup_legacy_workspace_with_whitespace_succeeds() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let conv_id = create_conversation(&mut app, &token, &csrf, "Legacy Warmup").await;
-    update_conversation_workspace(&services, &conv_id, "/tmp/my project").await;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("my project");
+    std::fs::create_dir(&workspace).unwrap();
+    update_conversation_workspace(&services, &conv_id, &workspace.to_string_lossy()).await;
 
     let req = common::json_with_token(
         "POST",
@@ -866,12 +903,7 @@ async fn t2_3b_warmup_legacy_workspace_returns_runtime_whitespace_code() {
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-    let json = body_json(resp).await;
-    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
-    assert_eq!(json["details"]["workspace_path"], "/tmp/my project");
-    assert_eq!(json["details"]["operation"], "runtime");
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]

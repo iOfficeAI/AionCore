@@ -166,20 +166,14 @@ fn t3_3_api_error_timeout_to_error_response() {
 
 #[test]
 fn t3_3_workspace_error_exposes_structured_details() {
-    let err = ApiError::WorkspacePathContainsWhitespace("/tmp/Archive ".into());
+    let err = ApiError::WorkspacePathUnavailable("/tmp/Archive ".into());
     let resp = ErrorResponse::from(err);
 
     assert!(!resp.success);
-    assert_eq!(resp.code, "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
+    assert_eq!(resp.code, "WORKSPACE_PATH_UNAVAILABLE");
     assert_eq!(
         resp.details.as_ref().and_then(|details| details.get("workspace_path")),
         Some(&serde_json::json!("/tmp/Archive "))
-    );
-    assert_eq!(
-        resp.details
-            .as_ref()
-            .and_then(|details| details.get("offending_segments")),
-        Some(&serde_json::json!(["Archive "]))
     );
     assert_eq!(
         resp.details.as_ref().and_then(|details| details.get("operation")),
@@ -189,20 +183,14 @@ fn t3_3_workspace_error_exposes_structured_details() {
 
 #[test]
 fn t3_3_runtime_workspace_error_exposes_structured_details() {
-    let err = ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/Archive ".into());
+    let err = ApiError::WorkspacePathRuntimeUnavailable("/tmp/Archive ".into());
     let resp = ErrorResponse::from(err);
 
     assert!(!resp.success);
-    assert_eq!(resp.code, "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
+    assert_eq!(resp.code, "WORKSPACE_PATH_RUNTIME_UNAVAILABLE");
     assert_eq!(
         resp.details.as_ref().and_then(|details| details.get("workspace_path")),
         Some(&serde_json::json!("/tmp/Archive "))
-    );
-    assert_eq!(
-        resp.details
-            .as_ref()
-            .and_then(|details| details.get("offending_segments")),
-        Some(&serde_json::json!(["Archive "]))
     );
     assert_eq!(
         resp.details.as_ref().and_then(|details| details.get("operation")),

@@ -6,7 +6,9 @@ use aionui_ai_agent::task_manager::IWorkerTaskManager;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentRegistry, AgentStreamEvent};
 use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
-use aionui_common::{AgentType, ProviderWithModel, now_ms, workspace_path_has_whitespace_segment};
+use aionui_common::{
+    AgentType, ProviderWithModel, WorkspacePathValidationError, now_ms, validate_workspace_path_availability,
+};
 use aionui_conversation::ConversationService;
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationRowUpdate, IConversationRepository};
@@ -200,15 +202,15 @@ impl JobExecutor {
 
     pub(crate) async fn validate_runtime_job_workspace(&self, job: &CronJob) -> Result<(), CronError> {
         let workspace = self.resolve_job_workspace_raw(job).await?;
-        if workspace.trim().is_empty() {
-            return Ok(());
+        match validate_workspace_path_availability(&workspace) {
+            Ok(_) => Ok(()),
+            Err(WorkspacePathValidationError::Empty) => Ok(()),
+            Err(WorkspacePathValidationError::DoesNotExist(path))
+            | Err(WorkspacePathValidationError::NotDirectory(path))
+            | Err(WorkspacePathValidationError::NotAccessible { path, .. }) => {
+                Err(CronError::WorkspacePathRuntimeUnavailable(path))
+            }
         }
-
-        if workspace_path_has_whitespace_segment(Path::new(&workspace)) {
-            return Err(CronError::WorkspacePathContainsWhitespaceRuntimeUnsupported(workspace));
-        }
-
-        Ok(())
     }
 
     pub async fn insert_tips_message(

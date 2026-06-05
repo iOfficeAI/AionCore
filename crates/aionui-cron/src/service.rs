@@ -6,7 +6,9 @@ use aionui_api_types::{
     CreateCronJobRequest, CronJobResponse, CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse,
     SaveCronSkillRequest, UpdateCronJobRequest,
 };
-use aionui_common::{AgentType, generate_prefixed_id, now_ms, workspace_path_has_whitespace_segment};
+use aionui_common::{
+    AgentType, WorkspacePathValidationError, generate_prefixed_id, now_ms, validate_workspace_path_availability,
+};
 use aionui_db::{ICronRepository, UpdateCronJobParams};
 use tracing::{error, info, warn};
 
@@ -483,15 +485,15 @@ impl CronService {
 
     async fn validate_job_workspace(&self, job: &CronJob) -> Result<(), CronError> {
         let workspace = self.executor.resolve_job_workspace_raw(job).await?;
-        if workspace.trim().is_empty() {
-            return Ok(());
+        match validate_workspace_path_availability(&workspace) {
+            Ok(_) => Ok(()),
+            Err(WorkspacePathValidationError::Empty) => Ok(()),
+            Err(WorkspacePathValidationError::DoesNotExist(path))
+            | Err(WorkspacePathValidationError::NotDirectory(path))
+            | Err(WorkspacePathValidationError::NotAccessible { path, .. }) => {
+                Err(CronError::WorkspacePathUnavailable(path))
+            }
         }
-
-        if workspace_path_has_whitespace_segment(Path::new(&workspace)) {
-            return Err(CronError::WorkspacePathContainsWhitespace(workspace));
-        }
-
-        Ok(())
     }
 
     async fn handle_execution_result(&self, job: CronJob, result: ExecutionResult) {

@@ -13,7 +13,10 @@ use tower::ServiceExt;
 
 use aionui_db::{ICronRepository, SqliteCronRepository};
 
-use common::{body_json, build_app, delete_with_token, get_request, get_with_token, json_with_token, setup_and_login};
+use common::{
+    body_json, build_app, build_app_with_mock_agents, delete_with_token, get_request, get_with_token, json_with_token,
+    setup_and_login,
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -66,7 +69,7 @@ async fn create_job(app: &mut axum::Router, token: &str, csrf: &str, body: serde
 async fn au1_unauthenticated_list_returns_403() {
     let (app, _services) = build_app().await;
     let req = get_request("/api/cron/jobs");
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert!(
         resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
         "expected 401 or 403, got {}",
@@ -176,9 +179,13 @@ async fn cj3_create_missing_required_fields() {
 }
 
 #[tokio::test]
-async fn cj3b_create_rejects_workspace_with_whitespace_segment() {
+async fn cj3b_create_accepts_workspace_with_whitespace_segment() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", aionui_common::generate_short_id()));
+    std::fs::create_dir(&dir).unwrap();
+    let workspace = dir.join("Archive ");
+    std::fs::create_dir(&workspace).unwrap();
 
     let body = json!({
         "name": "Whitespace Workspace",
@@ -191,22 +198,61 @@ async fn cj3b_create_rejects_workspace_with_whitespace_segment() {
         "agent_config": {
             "backend": "acp",
             "name": "Cron Agent",
-            "workspace": "/Users/zhoukai/Documents/Archive "
+            "workspace": workspace.to_string_lossy()
         }
     });
 
     let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cj3c_create_rejects_missing_workspace_path() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let body = json!({
+        "name": "Missing Workspace",
+        "schedule": { "kind": "every", "every_ms": 60000, "description": "every minute" },
+        "message": "test message",
+        "conversation_id": "",
+        "agent_type": "acp",
+        "created_by": "user",
+        "execution_mode": "new_conversation",
+        "agent_config": {
+            "backend": "claude",
+            "name": "Claude Code",
+            "workspace": "/tmp/cron-job-workspace-missing-path"
+        }
+    });
+
+    let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
-    assert!(
-        json["error"]
-            .as_str()
-            .unwrap()
-            .contains("Workspace path contains whitespace")
+    assert_eq!(json["code"], "WORKSPACE_PATH_UNAVAILABLE");
+    assert_eq!(json["details"]["operation"], "create");
+    assert_eq!(
+        json["details"]["workspace_path"],
+        "/tmp/cron-job-workspace-missing-path"
     );
+
+    let list_req = get_with_token("/api/cron/jobs", &token);
+    let list_resp = app.oneshot(list_req).await.unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_json = body_json(list_resp).await;
+    let has_job = list_json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|job| job["name"] == "Missing Workspace");
+    assert!(!has_job, "invalid cron job should not be persisted");
 }
 
 // ── CJ-4: Get single job ────────────────────────────────────────────
@@ -241,11 +287,15 @@ async fn cj5_get_nonexistent() {
 }
 
 #[tokio::test]
-async fn cj5b_run_now_legacy_workspace_uses_runtime_whitespace_code() {
-    let (mut app, services) = build_app().await;
+async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
+    let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let cron_repo = SqliteCronRepository::new(services.database.pool().clone());
     let now = aionui_common::now_ms();
+    let dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", aionui_common::generate_short_id()));
+    std::fs::create_dir(&dir).unwrap();
+    let workspace = dir.join("Archive ");
+    std::fs::create_dir(&workspace).unwrap();
 
     cron_repo
         .insert(&aionui_db::models::CronJobRow {
@@ -262,7 +312,7 @@ async fn cj5b_run_now_legacy_workspace_uses_runtime_whitespace_code() {
                 json!({
                     "backend": "acp",
                     "name": "Cron Agent",
-                    "workspace": "/Users/zhoukai/Documents/Archive "
+                    "workspace": workspace.to_string_lossy()
                 })
                 .to_string(),
             ),
@@ -293,17 +343,11 @@ async fn cj5b_run_now_legacy_workspace_uses_runtime_whitespace_code() {
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
-    assert!(
-        json["error"]
-            .as_str()
-            .unwrap()
-            .contains("Workspace path contains whitespace")
-    );
-    assert_eq!(json["details"]["operation"], "runtime");
+    assert_eq!(json["success"], true);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── CJ-6: List all jobs ─────────────────────────────────────────────
@@ -486,7 +530,7 @@ async fn rn1_run_now_returns_conversation_id_for_new_conversation_job() {
         json!({
             "type": "acp",
             "name": "Run Now Source",
-            "extra": { "workspace": "/project" }
+            "extra": {}
         }),
         &token,
         &csrf,

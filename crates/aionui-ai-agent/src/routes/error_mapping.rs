@@ -16,9 +16,7 @@ pub(crate) fn agent_error_to_api_error(err: AgentError) -> ApiError {
         AgentError::Timeout(message) => ApiError::Timeout(message),
         AgentError::RateLimited => ApiError::RateLimited,
         AgentError::ConversationArchived(message) => ApiError::ConversationArchived(message),
-        AgentError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => {
-            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
-        }
+        AgentError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
         AgentError::Internal(message) => ApiError::Internal(message),
         AgentError::Acp(err) => acp_error_to_api_error(err),
     }

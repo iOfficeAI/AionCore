@@ -23,8 +23,8 @@ pub enum AgentError {
     RateLimited,
     #[error("Conversation archived: {0}")]
     ConversationArchived(String),
-    #[error("Workspace path contains whitespace: {0}")]
-    WorkspacePathContainsWhitespaceRuntimeUnsupported(String),
+    #[error("Workspace path is unavailable during execution: {0}")]
+    WorkspacePathRuntimeUnavailable(String),
     #[error("Internal error: {0}")]
     Internal(String),
     #[error(transparent)]
@@ -64,8 +64,8 @@ impl AgentError {
         Self::ConversationArchived(message.into())
     }
 
-    pub fn workspace_path_contains_whitespace_runtime_unsupported(path: impl Into<String>) -> Self {
-        Self::WorkspacePathContainsWhitespaceRuntimeUnsupported(path.into())
+    pub fn workspace_path_runtime_unavailable(path: impl Into<String>) -> Self {
+        Self::WorkspacePathRuntimeUnavailable(path.into())
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
@@ -82,7 +82,7 @@ impl AgentError {
             | Self::BadGateway(message)
             | Self::Timeout(message)
             | Self::ConversationArchived(message)
-            | Self::WorkspacePathContainsWhitespaceRuntimeUnsupported(message)
+            | Self::WorkspacePathRuntimeUnavailable(message)
             | Self::Internal(message) => message.clone(),
             Self::RateLimited => "Rate limited".to_owned(),
             Self::Acp(err) => err.to_string(),

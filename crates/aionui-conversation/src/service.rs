@@ -17,7 +17,7 @@ use aionui_api_types::{
 };
 use aionui_common::{
     AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete, PaginatedResult,
-    generate_short_id, now_ms, workspace_path_has_whitespace_segment,
+    WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
@@ -1408,10 +1408,12 @@ impl ConversationService {
                 );
                 let top_level_code = err.error_code();
                 let send_error = AgentSendError::from_agent_error(err.to_agent_error());
-                let _ = self
-                    .persist_send_failure_tip(conversation_id, &send_error, Some(top_level_code))
+                self.persist_and_broadcast_send_failure_tip(conversation_id, &send_error, Some(top_level_code))
                     .await;
-                return Err(err);
+                let mut turn_claim = turn_claim;
+                let was_deleting = turn_claim.release();
+                self.complete_released_turn(conversation_id, was_deleting).await;
+                return Ok(user_msg_id);
             }
         };
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
@@ -1755,9 +1757,7 @@ fn agent_error_top_level_code(error: &AgentError) -> &'static str {
         AgentError::Timeout(_) => "TIMEOUT",
         AgentError::RateLimited => "RATE_LIMITED",
         AgentError::ConversationArchived(_) => "CONVERSATION_ARCHIVED",
-        AgentError::WorkspacePathContainsWhitespaceRuntimeUnsupported(_) => {
-            "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
-        }
+        AgentError::WorkspacePathRuntimeUnavailable(_) => "WORKSPACE_PATH_RUNTIME_UNAVAILABLE",
         AgentError::Internal(_) => "INTERNAL_ERROR",
         _ => "INTERNAL_ERROR",
     }
@@ -2023,37 +2023,37 @@ fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), Conver
 }
 
 fn normalize_workspace_path(workspace: &str) -> Result<String, ConversationError> {
-    if workspace.trim().is_empty() {
-        return Err(ConversationError::BadRequest {
-            reason: "Workspace directory is empty".into(),
-        });
-    }
-
-    let workspace_path = PathBuf::from(workspace);
-    if workspace_path_has_whitespace_segment(&workspace_path) {
-        return Err(ConversationError::WorkspacePathContainsWhitespace {
-            path: workspace_path.display().to_string(),
-        });
-    }
-
-    Ok(workspace.to_owned())
+    validate_workspace_path_availability(workspace).map_err(map_create_workspace_validation_error)
 }
 
 fn validate_runtime_workspace_path(workspace: &str) -> Result<String, ConversationError> {
-    if workspace.trim().is_empty() {
-        return Err(ConversationError::BadRequest {
+    validate_workspace_path_availability(workspace).map_err(map_runtime_workspace_validation_error)
+}
+
+fn map_create_workspace_validation_error(error: WorkspacePathValidationError) -> ConversationError {
+    match error {
+        WorkspacePathValidationError::Empty => ConversationError::BadRequest {
             reason: "Workspace directory is empty".into(),
-        });
+        },
+        WorkspacePathValidationError::DoesNotExist(path)
+        | WorkspacePathValidationError::NotDirectory(path)
+        | WorkspacePathValidationError::NotAccessible { path, .. } => {
+            ConversationError::WorkspacePathUnavailable { path }
+        }
     }
+}
 
-    let workspace_path = PathBuf::from(workspace);
-    if workspace_path_has_whitespace_segment(&workspace_path) {
-        return Err(ConversationError::WorkspacePathContainsWhitespaceRuntimeUnsupported {
-            path: workspace_path.display().to_string(),
-        });
+fn map_runtime_workspace_validation_error(error: WorkspacePathValidationError) -> ConversationError {
+    match error {
+        WorkspacePathValidationError::Empty => ConversationError::BadRequest {
+            reason: "Workspace directory is empty".into(),
+        },
+        WorkspacePathValidationError::DoesNotExist(path)
+        | WorkspacePathValidationError::NotDirectory(path)
+        | WorkspacePathValidationError::NotAccessible { path, .. } => {
+            ConversationError::WorkspacePathRuntimeUnavailable { path }
+        }
     }
-
-    Ok(workspace.to_owned())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

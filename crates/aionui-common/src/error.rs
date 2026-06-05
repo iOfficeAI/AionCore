@@ -1,6 +1,7 @@
 #![allow(clippy::disallowed_types)]
 
-use std::path::{Component, Path};
+use std::fs;
+use std::path::Path;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -49,15 +50,11 @@ pub enum ApiError {
     #[error("Conversation archived: {0}")]
     ConversationArchived(String),
 
-    #[error(
-        "Workspace path contains whitespace in one or more directory names: {0}. Rename the affected directory or choose a path without whitespace in any directory name."
-    )]
-    WorkspacePathContainsWhitespace(String),
+    #[error("Workspace path is unavailable: {0}")]
+    WorkspacePathUnavailable(String),
 
-    #[error(
-        "Workspace path contains whitespace in one or more directory names and is no longer supported for send or warmup: {0}. Rename the affected directory, then update this conversation or task to use a path without whitespace in any directory name."
-    )]
-    WorkspacePathContainsWhitespaceRuntimeUnsupported(String),
+    #[error("Workspace path is unavailable during execution: {0}")]
+    WorkspacePathRuntimeUnavailable(String),
 }
 
 /// Internal error response body matching the `ErrorResponse` format from `aionui-api-types`.
@@ -85,8 +82,8 @@ impl ApiError {
             Self::Timeout(_) => StatusCode::BAD_GATEWAY,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::ConversationArchived(_) => StatusCode::GONE,
-            Self::WorkspacePathContainsWhitespace(_) => StatusCode::BAD_REQUEST,
-            Self::WorkspacePathContainsWhitespaceRuntimeUnsupported(_) => StatusCode::BAD_REQUEST,
+            Self::WorkspacePathUnavailable(_) => StatusCode::BAD_REQUEST,
+            Self::WorkspacePathRuntimeUnavailable(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -110,10 +107,8 @@ impl ApiError {
             Self::Timeout(_) => "TIMEOUT",
             Self::UnprocessableEntity(_) => "UNPROCESSABLE_ENTITY",
             Self::ConversationArchived(_) => "CONVERSATION_ARCHIVED",
-            Self::WorkspacePathContainsWhitespace(_) => "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED",
-            Self::WorkspacePathContainsWhitespaceRuntimeUnsupported(_) => {
-                "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
-            }
+            Self::WorkspacePathUnavailable(_) => "WORKSPACE_PATH_UNAVAILABLE",
+            Self::WorkspacePathRuntimeUnavailable(_) => "WORKSPACE_PATH_RUNTIME_UNAVAILABLE",
         }
     }
 
@@ -121,47 +116,46 @@ impl ApiError {
     /// context in addition to the top-level error code.
     pub fn error_details(&self) -> Option<Value> {
         match self {
-            Self::WorkspacePathContainsWhitespace(path) => Some(workspace_path_whitespace_details(path, "create")),
-            Self::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => {
-                Some(workspace_path_whitespace_details(path, "runtime"))
-            }
+            Self::WorkspacePathUnavailable(path) => Some(workspace_path_details(path, "create")),
+            Self::WorkspacePathRuntimeUnavailable(path) => Some(workspace_path_details(path, "runtime")),
             _ => None,
         }
     }
 }
 
-fn workspace_path_whitespace_details(path: &str, operation: &str) -> Value {
+fn workspace_path_details(path: &str, operation: &str) -> Value {
     json!({
         "field": "workspace",
         "workspace_path": path,
-        "offending_segments": workspace_path_whitespace_segments(Path::new(path)),
         "operation": operation,
     })
 }
 
-/// Return true when any normal directory/file name component in `path`
-/// contains a Unicode whitespace character.
-pub fn workspace_path_has_whitespace_segment(path: &Path) -> bool {
-    path.components().any(|component| match component {
-        Component::Normal(segment) => segment.to_string_lossy().chars().any(char::is_whitespace),
-        _ => false,
-    })
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspacePathValidationError {
+    Empty,
+    DoesNotExist(String),
+    NotDirectory(String),
+    NotAccessible { path: String, reason: String },
 }
 
-fn workspace_path_whitespace_segments(path: &Path) -> Vec<String> {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(segment) => {
-                let value = segment.to_string_lossy().to_string();
-                if value.chars().any(char::is_whitespace) {
-                    Some(value)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
-        .collect()
+pub fn validate_workspace_path_availability(workspace: &str) -> Result<String, WorkspacePathValidationError> {
+    if workspace.trim().is_empty() {
+        return Err(WorkspacePathValidationError::Empty);
+    }
+
+    let path = Path::new(workspace);
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(workspace.to_owned()),
+        Ok(_) => Err(WorkspacePathValidationError::NotDirectory(workspace.to_owned())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(WorkspacePathValidationError::DoesNotExist(workspace.to_owned()))
+        }
+        Err(err) => Err(WorkspacePathValidationError::NotAccessible {
+            path: workspace.to_owned(),
+            reason: err.to_string(),
+        }),
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -219,11 +213,11 @@ mod tests {
             StatusCode::UNPROCESSABLE_ENTITY
         );
         assert_eq!(
-            ApiError::WorkspacePathContainsWhitespace("x".into()).status_code(),
+            ApiError::WorkspacePathUnavailable("x".into()).status_code(),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported("x".into()).status_code(),
+            ApiError::WorkspacePathRuntimeUnavailable("x".into()).status_code(),
             StatusCode::BAD_REQUEST
         );
     }
@@ -248,12 +242,12 @@ mod tests {
             "UNPROCESSABLE_ENTITY"
         );
         assert_eq!(
-            ApiError::WorkspacePathContainsWhitespace("x".into()).error_code(),
-            "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED"
+            ApiError::WorkspacePathUnavailable("x".into()).error_code(),
+            "WORKSPACE_PATH_UNAVAILABLE"
         );
         assert_eq!(
-            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported("x".into()).error_code(),
-            "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
+            ApiError::WorkspacePathRuntimeUnavailable("x".into()).error_code(),
+            "WORKSPACE_PATH_RUNTIME_UNAVAILABLE"
         );
     }
 
@@ -297,48 +291,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_workspace_whitespace_response_contains_details() {
-        let resp = ApiError::WorkspacePathContainsWhitespace("/tmp/Archive ".into()).into_response();
+    async fn test_workspace_unavailable_response_contains_details() {
+        let resp = ApiError::WorkspacePathUnavailable("/tmp/Archive ".into()).into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
+        assert_eq!(json["code"], "WORKSPACE_PATH_UNAVAILABLE");
         assert_eq!(json["details"]["field"], "workspace");
         assert_eq!(json["details"]["workspace_path"], "/tmp/Archive ");
-        assert_eq!(json["details"]["offending_segments"], serde_json::json!(["Archive "]));
         assert_eq!(json["details"]["operation"], "create");
     }
 
     #[tokio::test]
-    async fn test_workspace_runtime_whitespace_response_contains_details() {
-        let resp = ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/Archive ".into()).into_response();
+    async fn test_workspace_runtime_unavailable_response_contains_details() {
+        let resp = ApiError::WorkspacePathRuntimeUnavailable("/tmp/Archive ".into()).into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
+        assert_eq!(json["code"], "WORKSPACE_PATH_RUNTIME_UNAVAILABLE");
         assert_eq!(json["details"]["field"], "workspace");
         assert_eq!(json["details"]["workspace_path"], "/tmp/Archive ");
-        assert_eq!(json["details"]["offending_segments"], serde_json::json!(["Archive "]));
         assert_eq!(json["details"]["operation"], "runtime");
     }
 
     #[test]
-    fn test_workspace_path_has_whitespace_segment() {
-        assert!(workspace_path_has_whitespace_segment(Path::new("/tmp/my project")));
-        assert!(workspace_path_has_whitespace_segment(Path::new("/tmp/project ")));
-        assert!(!workspace_path_has_whitespace_segment(Path::new("/tmp/my-project")));
-    }
+    fn test_validate_workspace_path_availability() {
+        let dir = std::env::temp_dir().join(format!("aionui-common-{}", crate::generate_short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let workspace = dir.join("my project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = dir.join("file.txt");
+        std::fs::write(&file, "x").unwrap();
 
-    #[test]
-    fn test_workspace_path_whitespace_segments() {
         assert_eq!(
-            workspace_path_whitespace_segments(Path::new("/tmp/my project/Archive ")),
-            vec!["my project".to_owned(), "Archive ".to_owned()]
+            validate_workspace_path_availability(&workspace.to_string_lossy()),
+            Ok(workspace.to_string_lossy().to_string())
         );
+        assert_eq!(
+            validate_workspace_path_availability("   "),
+            Err(WorkspacePathValidationError::Empty)
+        );
+        assert!(matches!(
+            validate_workspace_path_availability(&dir.join("missing").to_string_lossy()),
+            Err(WorkspacePathValidationError::DoesNotExist(_))
+        ));
+        assert!(matches!(
+            validate_workspace_path_availability(&file.to_string_lossy()),
+            Err(WorkspacePathValidationError::NotDirectory(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[derive(Debug, thiserror::Error)]

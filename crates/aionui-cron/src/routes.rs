@@ -41,10 +41,8 @@ impl From<CronError> for ApiError {
             CronError::InvalidSkillContent(msg) => ApiError::BadRequest(msg),
             CronError::InvalidAgentConfig(msg) => ApiError::BadRequest(msg),
             CronError::Scheduler(msg) => ApiError::Internal(msg),
-            CronError::WorkspacePathContainsWhitespace(path) => ApiError::WorkspacePathContainsWhitespace(path),
-            CronError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => {
-                ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path)
-            }
+            CronError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
+            CronError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
             CronError::Conversation(conversation_err) => ApiError::from(conversation_err),
             CronError::Database(db_err) => db_error_to_api_error(db_err),
             CronError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
@@ -242,8 +240,8 @@ mod tests {
 
     #[test]
     fn workspace_error_preserves_code() {
-        let err: ApiError = CronError::WorkspacePathContainsWhitespace("/tmp/a b".into()).into();
-        assert!(matches!(err, ApiError::WorkspacePathContainsWhitespace(msg) if msg == "/tmp/a b"));
+        let err: ApiError = CronError::WorkspacePathUnavailable("/tmp/a b".into()).into();
+        assert!(matches!(err, ApiError::WorkspacePathUnavailable(msg) if msg == "/tmp/a b"));
     }
 
     #[test]
@@ -255,10 +253,10 @@ mod tests {
 
     #[test]
     fn runtime_workspace_error_preserves_code() {
-        let err: ApiError = CronError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/a b".into()).into();
+        let err: ApiError = CronError::WorkspacePathRuntimeUnavailable("/tmp/a b".into()).into();
         assert!(matches!(
             err,
-            ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(msg) if msg == "/tmp/a b"
+            ApiError::WorkspacePathRuntimeUnavailable(msg) if msg == "/tmp/a b"
         ));
     }
 

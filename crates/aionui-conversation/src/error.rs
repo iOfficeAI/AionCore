@@ -53,11 +53,11 @@ pub enum ConversationError {
     #[error("Internal error: {reason}")]
     Internal { reason: String },
 
-    #[error("Workspace path contains whitespace: {path}")]
-    WorkspacePathContainsWhitespace { path: String },
+    #[error("Workspace path is unavailable: {path}")]
+    WorkspacePathUnavailable { path: String },
 
-    #[error("Workspace path contains whitespace and is unsupported at runtime: {path}")]
-    WorkspacePathContainsWhitespaceRuntimeUnsupported { path: String },
+    #[error("Workspace path is unavailable during execution: {path}")]
+    WorkspacePathRuntimeUnavailable { path: String },
 
     #[error("ACP error")]
     Acp(#[from] AcpError),
@@ -89,11 +89,11 @@ impl ConversationError {
             Self::Timeout { reason } => AgentError::timeout(reason.clone()),
             Self::Unprocessable { reason } => AgentError::bad_request(reason.clone()),
             Self::Internal { reason } => AgentError::internal(reason.clone()),
-            Self::WorkspacePathContainsWhitespace { path } => AgentError::bad_request(format!(
-                "Workspace path contains whitespace in one or more directory names: {path}"
-            )),
-            Self::WorkspacePathContainsWhitespaceRuntimeUnsupported { path } => {
-                AgentError::workspace_path_contains_whitespace_runtime_unsupported(path.clone())
+            Self::WorkspacePathUnavailable { path } => {
+                AgentError::bad_request(format!("Workspace path is unavailable: {path}"))
+            }
+            Self::WorkspacePathRuntimeUnavailable { path } => {
+                AgentError::workspace_path_runtime_unavailable(path.clone())
             }
             Self::Acp(err) => AgentError::bad_gateway(err.to_string()),
         }
@@ -116,10 +116,8 @@ impl ConversationError {
             Self::Timeout { .. } => "TIMEOUT",
             Self::Unprocessable { .. } => "UNPROCESSABLE_ENTITY",
             Self::Archived { .. } => "CONVERSATION_ARCHIVED",
-            Self::WorkspacePathContainsWhitespace { .. } => "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED",
-            Self::WorkspacePathContainsWhitespaceRuntimeUnsupported { .. } => {
-                "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
-            }
+            Self::WorkspacePathUnavailable { .. } => "WORKSPACE_PATH_UNAVAILABLE",
+            Self::WorkspacePathRuntimeUnavailable { .. } => "WORKSPACE_PATH_RUNTIME_UNAVAILABLE",
         }
     }
 }
@@ -140,9 +138,7 @@ impl From<AgentError> for ConversationError {
                 id: String::new(),
                 reason,
             },
-            AgentError::WorkspacePathContainsWhitespaceRuntimeUnsupported(path) => {
-                Self::WorkspacePathContainsWhitespaceRuntimeUnsupported { path }
-            }
+            AgentError::WorkspacePathRuntimeUnavailable(path) => Self::WorkspacePathRuntimeUnavailable { path },
             AgentError::Acp(err) => Self::Acp(err),
             _ => Self::Internal {
                 reason: error.to_string(),

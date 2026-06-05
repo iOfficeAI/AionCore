@@ -204,7 +204,7 @@ mod tests {
     fn test_error_response_new_with_details() {
         let resp = ErrorResponse::new_with_details(
             "Bad request: invalid workspace",
-            "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED",
+            "WORKSPACE_PATH_UNAVAILABLE",
             serde_json::json!({ "workspace_path": "/tmp/Archive " }),
         );
         assert_eq!(
@@ -215,8 +215,8 @@ mod tests {
 
     #[test]
     fn test_error_response_from_workspace_error_includes_details() {
-        let resp = ErrorResponse::from(ApiError::WorkspacePathContainsWhitespace("/tmp/Archive ".into()));
-        assert_eq!(resp.code, "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
+        let resp = ErrorResponse::from(ApiError::WorkspacePathUnavailable("/tmp/Archive ".into()));
+        assert_eq!(resp.code, "WORKSPACE_PATH_UNAVAILABLE");
         assert_eq!(
             resp.details.as_ref().and_then(|details| details.get("workspace_path")),
             Some(&serde_json::json!("/tmp/Archive "))
@@ -229,10 +229,8 @@ mod tests {
 
     #[test]
     fn test_error_response_from_runtime_workspace_error_includes_details() {
-        let resp = ErrorResponse::from(ApiError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
-            "/tmp/Archive ".into(),
-        ));
-        assert_eq!(resp.code, "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
+        let resp = ErrorResponse::from(ApiError::WorkspacePathRuntimeUnavailable("/tmp/Archive ".into()));
+        assert_eq!(resp.code, "WORKSPACE_PATH_RUNTIME_UNAVAILABLE");
         assert_eq!(
             resp.details.as_ref().and_then(|details| details.get("workspace_path")),
             Some(&serde_json::json!("/tmp/Archive "))
