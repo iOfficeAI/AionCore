@@ -761,22 +761,23 @@ async fn complete_turn_skips_status_update_when_conversation_is_deleting() {
 }
 
 #[tokio::test]
-async fn update_non_aionrs_extra_model_does_not_kill_task() {
-    // Verifies the explicit rule that `extra.model` changes for non-aionrs
-    // do NOT trigger task_manager.kill. Since our `NoopTaskManager::kill` is
-    // a no-op we can't assert the negative directly; we assert the update
-    // succeeds and the merged extra carries the new field, and that top-level
-    // model remains None.
+async fn update_rejects_acp_runtime_current_extra_fields() {
     let (svc, _, task_mgr) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({
-        "extra": { "current_model_id": "claude-opus-4" }
+        "extra": {
+            "current_model_id": "claude-opus-4",
+            "current_mode_id": "bypassPermissions"
+        }
     }))
     .unwrap();
-    let updated = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap();
-    assert_eq!(updated.extra["current_model_id"], "claude-opus-4");
-    assert!(updated.model.is_none());
+
+    let err = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap_err();
+    assert!(
+        matches!(err, ConversationError::BadRequest { .. }),
+        "expected BadRequest, got {err:?}"
+    );
 }
 
 #[tokio::test]

@@ -12,7 +12,10 @@ use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
-use aionui_api_types::{AgentErrorCode, ConversationArtifactKind};
+use aionui_api_types::{
+    AgentErrorCode, AgentModeResponse, ConversationArtifactKind, GetModelInfoResponse, ModelInfoEntry,
+    ModelInfoPayload, SetModeRequest, SetModelRequest,
+};
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
     SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
@@ -587,6 +590,25 @@ fn make_service_with_resolver_and_acp_session_repo(
         acp_session_repo,
     );
     (svc, broadcaster, repo, task_mgr)
+}
+
+fn make_service_with_mock_task_manager(
+    task_mgr: Arc<MockTaskManager>,
+) -> (ConversationService, Arc<MockBroadcaster>, Arc<MockRepo>) {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster.clone(),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr_dyn,
+        repo.clone(),
+        agent_metadata_repo,
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    (svc, broadcaster, repo)
 }
 
 fn make_create_req() -> CreateConversationRequest {
@@ -1231,6 +1253,8 @@ struct MockAgent {
     conversation_id: String,
     event_tx: broadcast::Sender<AgentStreamEvent>,
     stopped: Mutex<bool>,
+    mode: Mutex<String>,
+    model_id: Mutex<String>,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
     allow_direct_confirm: bool,
@@ -1245,6 +1269,8 @@ impl MockAgent {
             conversation_id: conversation_id.to_owned(),
             event_tx,
             stopped: Mutex::new(false),
+            mode: Mutex::new("default".to_owned()),
+            model_id: Mutex::new("model-a".to_owned()),
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -1258,6 +1284,8 @@ impl MockAgent {
             conversation_id: conversation_id.to_owned(),
             event_tx,
             stopped: Mutex::new(false),
+            mode: Mutex::new("default".to_owned()),
+            model_id: Mutex::new("model-a".to_owned()),
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -1271,6 +1299,8 @@ impl MockAgent {
             conversation_id: conversation_id.to_owned(),
             event_tx,
             stopped: Mutex::new(false),
+            mode: Mutex::new("default".to_owned()),
+            model_id: Mutex::new("model-a".to_owned()),
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: true,
@@ -1348,6 +1378,43 @@ impl IMockAgent for MockAgent {
             self.approval_memory.lock().unwrap().insert(key, true);
         }
         confs.retain(|c| c.call_id != call_id);
+        Ok(())
+    }
+
+    async fn mode(&self) -> Result<AgentModeResponse, AppError> {
+        Ok(AgentModeResponse {
+            mode: self.mode.lock().unwrap().clone(),
+            initialized: true,
+        })
+    }
+
+    async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
+        *self.mode.lock().unwrap() = mode.to_owned();
+        Ok(())
+    }
+
+    async fn get_model(&self) -> Result<GetModelInfoResponse, AppError> {
+        let current = self.model_id.lock().unwrap().clone();
+        Ok(GetModelInfoResponse {
+            model_info: Some(ModelInfoPayload {
+                current_model_id: Some(current.clone()),
+                current_model_label: Some(current.clone()),
+                available_models: vec![
+                    ModelInfoEntry {
+                        id: "model-a".to_owned(),
+                        label: "Model A".to_owned(),
+                    },
+                    ModelInfoEntry {
+                        id: "model-b".to_owned(),
+                        label: "Model B".to_owned(),
+                    },
+                ],
+            }),
+        })
+    }
+
+    async fn set_model(&self, model_id: &str) -> Result<(), AppError> {
+        *self.model_id.lock().unwrap() = model_id.to_owned();
         Ok(())
     }
 }
@@ -1774,6 +1841,49 @@ async fn send_message_returns_accepted() {
 
     assert!(!msg_id.is_empty(), "msg_id must be non-empty");
     assert_eq!(msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
+}
+
+#[tokio::test]
+async fn set_mode_returns_confirmed_mode_from_active_agent() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let response = svc
+        .set_mode(
+            &conv.id,
+            SetModeRequest {
+                mode: "plan".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.mode, "plan");
+    assert!(response.initialized);
+}
+
+#[tokio::test]
+async fn set_model_returns_confirmed_model_from_active_agent() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let response = svc
+        .set_model(
+            &conv.id,
+            SetModelRequest {
+                model_id: "model-b".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let model_info = response.model_info.expect("model info should be returned");
+    assert_eq!(model_info.current_model_id.as_deref(), Some("model-b"));
+    assert!(model_info.available_models.iter().any(|m| m.id == "model-b"));
 }
 
 #[tokio::test]
@@ -2817,6 +2927,31 @@ async fn update_rejects_extra_skills() {
 }
 
 #[tokio::test]
+async fn update_rejects_acp_runtime_current_extra_fields() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": "/project", "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("u", req).await.unwrap();
+
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "current_model_id": "claude-3-5-sonnet", "current_mode_id": "default" },
+    }))
+    .unwrap();
+    let err = svc.update("u", &resp.id, update_req, &task_mgr).await.unwrap_err();
+
+    match err {
+        ConversationError::BadRequest { reason: msg } => {
+            assert!(msg.contains("/mode or /model"), "msg = {msg:?}")
+        }
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn update_allows_other_extra_fields() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
 
@@ -2828,12 +2963,12 @@ async fn update_allows_other_extra_fields() {
     let resp = svc.create("u", req).await.unwrap();
 
     let update_req: UpdateConversationRequest = serde_json::from_value(json!({
-        "extra": { "current_model_id": "claude-3-5-sonnet" },
+        "extra": { "display_density": "compact" },
     }))
     .unwrap();
     let updated = svc.update("u", &resp.id, update_req, &task_mgr).await.unwrap();
 
-    assert_eq!(updated.extra["current_model_id"], "claude-3-5-sonnet");
+    assert_eq!(updated.extra["display_density"], "compact");
 }
 
 #[tokio::test]

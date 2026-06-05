@@ -94,6 +94,19 @@ fn set_desired_mode_allows_any_when_advertised_empty() {
 }
 
 #[test]
+fn can_select_mode_reports_unavailable_advertised_mode() {
+    let mut session = make_session();
+    session.apply_advertised_modes(SessionModeState::new(
+        "code",
+        vec![SessionMode::new("code", "Code"), SessionMode::new("plan", "Plan")],
+    ));
+
+    assert!(session.can_select_mode("plan"));
+    assert!(!session.can_select_mode("nonexistent"));
+    assert!(!session.can_select_mode(""));
+}
+
+#[test]
 fn apply_observed_mode_does_not_change_desired() {
     let mut session = make_session();
     session.set_desired_mode(ModeId::new("plan"));
@@ -154,6 +167,56 @@ fn apply_observed_model_creates_advertised_when_empty() {
     let mut session = make_session();
     session.apply_observed_model(ModelId::new("claude-opus-4"));
     assert_eq!(session.current_model_id().as_deref(), Some("claude-opus-4"));
+}
+
+#[test]
+fn confirm_mode_aligns_desired_and_current() {
+    let mut session = make_session();
+    session.apply_advertised_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Default"), SessionMode::new("plan", "Plan")],
+    ));
+    session.drain_events();
+
+    session.confirm_mode(ModeId::new("plan"));
+
+    assert_eq!(session.desired_mode(), Some("plan"));
+    assert_eq!(session.observed_mode(), Some("plan"));
+    assert_eq!(session.current_mode_id().as_deref(), Some("plan"));
+    assert!(session.plan_reconcile().is_empty());
+    assert_eq!(
+        session.drain_events(),
+        vec![AcpSessionEvent::ObservedModeSynced {
+            mode: ModeId::new("plan"),
+        }]
+    );
+}
+
+#[test]
+fn confirm_model_aligns_desired_and_current() {
+    use agent_client_protocol::schema::ModelInfo;
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.apply_advertised_models(SessionModelState::new(
+        "claude-sonnet-4",
+        vec![
+            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
+            ModelInfo::new("claude-opus-4", "Opus 4"),
+        ],
+    ));
+    session.drain_events();
+
+    session.confirm_model(ModelId::new("claude-opus-4"));
+
+    assert_eq!(session.desired_model(), Some("claude-opus-4"));
+    assert_eq!(session.observed_model(), Some("claude-opus-4"));
+    assert_eq!(session.current_model_id().as_deref(), Some("claude-opus-4"));
+    assert!(session.plan_reconcile().is_empty());
+    assert_eq!(
+        session.drain_events(),
+        vec![AcpSessionEvent::ObservedModelSynced {
+            model: ModelId::new("claude-opus-4"),
+        }]
+    );
 }
 
 #[test]
@@ -406,6 +469,25 @@ fn clear_invalid_desired_model_drops_stale_initial_model() {
 }
 
 #[test]
+fn clear_invalid_desired_mode_drops_stale_initial_mode_without_changing_current() {
+    let mut session = AcpSession::new(Some(ModeId::new("legacy-plan")), None, HashMap::new());
+    session.apply_advertised_modes(SessionModeState::new(
+        "code",
+        vec![SessionMode::new("default", "Default"), SessionMode::new("code", "Code")],
+    ));
+    session.drain_events();
+
+    assert_eq!(session.clear_invalid_desired_mode(), Some(ModeId::new("legacy-plan")));
+    assert_eq!(session.desired_mode(), None);
+    assert_eq!(session.observed_mode(), Some("code"));
+    assert_eq!(session.current_mode_id().as_deref(), Some("code"));
+    assert!(
+        session.plan_reconcile().is_empty(),
+        "invalid desired mode must not produce session/set_mode"
+    );
+}
+
+#[test]
 fn apply_advertised_config_options_emits_observed_config_synced_on_change() {
     let mut session = AcpSession::new(None, None, HashMap::new());
     session.apply_advertised_config_options(vec![SessionConfigOption::select(
@@ -470,9 +552,7 @@ fn pending_model_notice_roundtrip_and_take_once() {
 
 #[test]
 fn set_desired_mode_plus_plan_reconcile_produces_set_mode_action() {
-    // This test documents the Stage 4 invariant: the manager's set_mode
-    // should only (a) call set_desired_mode on the aggregate and (b) delegate
-    // to plan_reconcile for the SDK call. Plan_reconcile should emit
+    // Startup/recovery reconcile still turns pending intent into a
     // ReconcileAction::SetMode when desired and observed diverge.
     let mut session = AcpSession::new(None, None, Default::default());
     session.apply_advertised_modes(SessionModeState::new(
@@ -482,7 +562,7 @@ fn set_desired_mode_plus_plan_reconcile_produces_set_mode_action() {
     session.apply_observed_mode(ModeId::new("default"));
     assert_eq!(session.plan_reconcile(), vec![]);
 
-    // User chooses "plan" via set_desired_mode (what set_mode will do).
+    // Startup seed asks for "plan".
     assert!(session.set_desired_mode(ModeId::new("plan")));
 
     // Now reconcile should want to set CLI mode to "plan".
