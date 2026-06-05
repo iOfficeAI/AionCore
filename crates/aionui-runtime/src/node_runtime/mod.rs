@@ -106,7 +106,6 @@ pub async fn ensure_runtime_command_with_reporter(
 fn runtime_source_label(source: ResolvedNodeSource) -> &'static str {
     match source {
         ResolvedNodeSource::Bundled => "bundled",
-        ResolvedNodeSource::DevLocal => "dev-local",
         ResolvedNodeSource::Managed => "managed",
     }
 }

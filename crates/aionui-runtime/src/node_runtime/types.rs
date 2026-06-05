@@ -14,7 +14,6 @@ pub enum NodeTool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedNodeSource {
     Bundled,
-    DevLocal,
     Managed,
 }
 

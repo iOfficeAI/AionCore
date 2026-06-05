@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "aioncore", about = "AionUi Backend Server", version)]
@@ -44,8 +44,27 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub log_level: Option<String>,
 
+    /// Managed runtime resource source selection.
+    #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
+    pub managed_resources_mode: ManagedResourcesModeArg,
+
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedResourcesModeArg {
+    Bundled,
+    Download,
+}
+
+impl From<ManagedResourcesModeArg> for aionui_runtime::ManagedResourcesMode {
+    fn from(value: ManagedResourcesModeArg) -> Self {
+        match value {
+            ManagedResourcesModeArg::Bundled => Self::Bundled,
+            ManagedResourcesModeArg::Download => Self::Download,
+        }
+    }
 }
 
 // `Mcp` prefix is load-bearing on Mcp* variants — clap derives kebab-case
@@ -66,17 +85,16 @@ pub(crate) enum Command {
     /// app launched from confirms whether each backend is detectable
     /// before involving server logs.
     Doctor,
-    /// Prepare current-platform managed runtime resources under the dev-local
-    /// resource root so local development can run without network fetches.
+    /// Prepare current-platform managed runtime resources under a bundle output root.
     PrepareManagedResources(PrepareManagedResourcesArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
 pub(crate) struct PrepareManagedResourcesArgs {
-    /// Optional bundle output root. When set, aioncore writes the managed
-    /// resources under `<bundle-out>/{node,acp}/...` for packaging.
+    /// Bundle output root. Aioncore writes the managed resources under
+    /// `<bundle-out>/{node,acp}/...` for packaging.
     #[arg(long)]
-    pub bundle_out: Option<PathBuf>,
+    pub bundle_out: PathBuf,
 }
 
 #[cfg(test)]
@@ -84,7 +102,7 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, ManagedResourcesModeArg};
 
     #[test]
     fn long_version_flag_uses_workspace_package_version() {
@@ -139,12 +157,30 @@ mod tests {
 
         match cli.command {
             Some(Command::PrepareManagedResources(args)) => {
-                assert_eq!(
-                    args.bundle_out.as_deref(),
-                    Some(std::path::Path::new("/tmp/aioncore-bundle"))
-                );
+                assert_eq!(args.bundle_out, std::path::Path::new("/tmp/aioncore-bundle"));
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
+    }
+
+    #[test]
+    fn managed_resources_mode_defaults_to_download() {
+        let cli = Cli::parse_from(["aioncore"]);
+        assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
+    }
+
+    #[test]
+    fn managed_resources_mode_accepts_download() {
+        let cli = Cli::parse_from(["aioncore", "--managed-resources-mode", "download"]);
+        assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
+    }
+
+    #[test]
+    fn prepare_managed_resources_requires_bundle_out() {
+        let err = match Cli::try_parse_from(["aioncore", "prepare-managed-resources"]) {
+            Ok(_) => panic!("prepare-managed-resources should require --bundle-out"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 }

@@ -1,12 +1,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedResourcesMode {
+    Bundled,
+    Download,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedResourceSourceKind {
     Bundled,
-    DevLocal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,10 +22,25 @@ pub struct ManagedResourceSource {
 }
 
 const BUNDLED_RESOURCES_ENV: &str = "AIONUI_BUNDLED_MANAGED_RESOURCES";
-const DEV_LOCAL_RESOURCES_ENV: &str = "AIONUI_DEV_MANAGED_RESOURCES";
+
+pub fn set_managed_resources_mode(mode: ManagedResourcesMode) {
+    *mode_lock().write().expect("managed resources mode lock poisoned") = mode;
+}
+
+pub fn managed_resources_mode() -> ManagedResourcesMode {
+    *mode_lock().read().expect("managed resources mode lock poisoned")
+}
 
 pub fn bundled_root_path() -> Option<PathBuf> {
     bundled_root().filter(|root| root.is_dir())
+}
+
+pub fn bundled_root_candidate() -> Option<PathBuf> {
+    bundled_root()
+}
+
+pub fn requires_bundled_resources() -> bool {
+    matches!(managed_resources_mode(), ManagedResourcesMode::Bundled)
 }
 
 pub fn node_sources(directory_name: &str) -> Vec<ManagedResourceSource> {
@@ -42,19 +63,6 @@ pub fn acp_tool_sources(tool_slug: &str, version: &str, platform_key: &str) -> V
         })
         .filter(|source| source.root.is_dir())
         .collect()
-}
-
-pub fn export_node_runtime_to_dev_local(source_root: &Path, directory_name: &str) -> std::io::Result<PathBuf> {
-    export_node_runtime_to_root(&ensure_dev_local_root()?, source_root, directory_name)
-}
-
-pub fn export_acp_tool_to_dev_local(
-    source_root: &Path,
-    tool_slug: &str,
-    version: &str,
-    platform_key: &str,
-) -> std::io::Result<PathBuf> {
-    export_acp_tool_to_root(&ensure_dev_local_root()?, source_root, tool_slug, version, platform_key)
 }
 
 pub fn export_node_runtime_to_root(root: &Path, source_root: &Path, directory_name: &str) -> std::io::Result<PathBuf> {
@@ -133,65 +141,37 @@ pub fn materialize_directory(source_root: &Path, target_root: &Path) -> std::io:
     Ok(())
 }
 
-pub fn ensure_dev_local_root() -> std::io::Result<PathBuf> {
-    let root = configured_root(DEV_LOCAL_RESOURCES_ENV).unwrap_or_else(default_dev_local_root);
-    fs::create_dir_all(&root)?;
-    Ok(root)
-}
-
-pub fn should_auto_prepare_dev_local() -> bool {
-    if configured_root(DEV_LOCAL_RESOURCES_ENV).is_some() {
-        return true;
-    }
-
-    let workspace_root = workspace_root();
-    if !workspace_root.join(".git").exists() {
-        return false;
-    }
-
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    let Ok(exe) = fs::canonicalize(exe) else {
-        return false;
-    };
-
-    exe.starts_with(workspace_root.join("target"))
-}
-
 fn resource_roots() -> Vec<ManagedResourceSource> {
     let mut roots = Vec::new();
 
-    if let Some(root) = bundled_root()
-        && root.is_dir()
-    {
-        roots.push(ManagedResourceSource {
-            kind: ManagedResourceSourceKind::Bundled,
-            root,
-        });
-    }
-
-    if let Some(root) = dev_local_root()
-        && root.is_dir()
-    {
-        roots.push(ManagedResourceSource {
-            kind: ManagedResourceSourceKind::DevLocal,
-            root,
-        });
+    match managed_resources_mode() {
+        ManagedResourcesMode::Bundled => {
+            if let Some(root) = bundled_root()
+                && root.is_dir()
+            {
+                roots.push(ManagedResourceSource {
+                    kind: ManagedResourceSourceKind::Bundled,
+                    root,
+                });
+            }
+        }
+        ManagedResourcesMode::Download => {}
     }
 
     roots
 }
 
-fn bundled_root() -> Option<PathBuf> {
-    configured_root(BUNDLED_RESOURCES_ENV).or_else(default_bundled_root)
+fn mode_lock() -> &'static RwLock<ManagedResourcesMode> {
+    static MODE: OnceLock<RwLock<ManagedResourcesMode>> = OnceLock::new();
+    MODE.get_or_init(|| RwLock::new(default_managed_resources_mode()))
 }
 
-fn dev_local_root() -> Option<PathBuf> {
-    configured_root(DEV_LOCAL_RESOURCES_ENV).or_else(|| {
-        let root = default_dev_local_root();
-        root.is_dir().then_some(root)
-    })
+fn default_managed_resources_mode() -> ManagedResourcesMode {
+    ManagedResourcesMode::Download
+}
+
+fn bundled_root() -> Option<PathBuf> {
+    configured_root(BUNDLED_RESOURCES_ENV).or_else(default_bundled_root)
 }
 
 fn configured_root(env_key: &str) -> Option<PathBuf> {
@@ -204,18 +184,6 @@ fn default_bundled_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe_dir = fs::canonicalize(exe).ok()?.parent()?.to_path_buf();
     Some(exe_dir.join("managed-resources"))
-}
-
-fn default_dev_local_root() -> PathBuf {
-    workspace_root().join(".tmp").join("managed-resources")
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("aionui-runtime lives under crates/<name>")
-        .to_path_buf()
 }
 
 fn copy_permissions(source: &Path, target: &Path) -> std::io::Result<()> {
@@ -257,60 +225,54 @@ mod tests {
     }
 
     #[test]
-    fn node_sources_prefer_existing_dev_local_root() {
+    fn default_mode_is_download() {
+        let _guard = env_lock().lock().expect("lock env");
+        assert_eq!(default_managed_resources_mode(), ManagedResourcesMode::Download);
+    }
+
+    #[test]
+    fn bundled_mode_uses_configured_bundled_root() {
         let _guard = env_lock().lock().expect("lock env");
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("managed");
         fs::create_dir_all(root.join("node").join("node-v24.11.0-darwin-arm64")).expect("create node dir");
 
         unsafe {
-            std::env::set_var(DEV_LOCAL_RESOURCES_ENV, &root);
+            std::env::set_var(BUNDLED_RESOURCES_ENV, &root);
         }
+        set_managed_resources_mode(ManagedResourcesMode::Bundled);
 
         let sources = node_sources("node-v24.11.0-darwin-arm64");
         assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].kind, ManagedResourceSourceKind::DevLocal);
+        assert_eq!(sources[0].kind, ManagedResourceSourceKind::Bundled);
         assert_eq!(sources[0].root, root.join("node").join("node-v24.11.0-darwin-arm64"));
 
         unsafe {
-            std::env::remove_var(DEV_LOCAL_RESOURCES_ENV);
+            std::env::remove_var(BUNDLED_RESOURCES_ENV);
         }
+        set_managed_resources_mode(ManagedResourcesMode::Download);
     }
 
     #[test]
-    fn export_node_runtime_copies_files_into_dev_local_root() {
+    fn download_mode_ignores_configured_bundled_root() {
         let _guard = env_lock().lock().expect("lock env");
         let temp = tempfile::tempdir().expect("tempdir");
-        let source = temp.path().join("source-node");
-        fs::create_dir_all(source.join("bin")).expect("create source");
-        fs::write(source.join("bin").join("node"), b"node").expect("write node");
-
-        let dev_root = temp.path().join("dev-root");
-        unsafe {
-            std::env::set_var(DEV_LOCAL_RESOURCES_ENV, &dev_root);
-        }
-
-        let exported = export_node_runtime_to_dev_local(&source, "node-v24.11.0-darwin-arm64").expect("export");
-        assert!(exported.join("bin").join("node").is_file());
+        let root = temp.path().join("managed");
+        fs::create_dir_all(root.join("node").join("node-v24.11.0-darwin-arm64")).expect("create node dir");
 
         unsafe {
-            std::env::remove_var(DEV_LOCAL_RESOURCES_ENV);
+            std::env::set_var(BUNDLED_RESOURCES_ENV, &root);
         }
-    }
+        set_managed_resources_mode(ManagedResourcesMode::Download);
 
-    #[test]
-    fn auto_prepare_is_enabled_when_dev_root_is_explicitly_configured() {
-        let _guard = env_lock().lock().expect("lock env");
-        let temp = tempfile::tempdir().expect("tempdir");
-        unsafe {
-            std::env::set_var(DEV_LOCAL_RESOURCES_ENV, temp.path());
-        }
-
-        assert!(should_auto_prepare_dev_local());
+        let sources = node_sources("node-v24.11.0-darwin-arm64");
+        assert!(sources.is_empty());
+        assert!(!requires_bundled_resources());
 
         unsafe {
-            std::env::remove_var(DEV_LOCAL_RESOURCES_ENV);
+            std::env::remove_var(BUNDLED_RESOURCES_ENV);
         }
+        set_managed_resources_mode(ManagedResourcesMode::Download);
     }
 
     #[cfg(unix)]

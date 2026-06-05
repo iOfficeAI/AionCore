@@ -27,6 +27,7 @@ fn main() -> Result<ExitCode> {
         None | Some(Command::Doctor) | Some(Command::PrepareManagedResources(_))
     );
     if needs_runtime {
+        aionui_runtime::set_managed_resources_mode(cli.managed_resources_mode.into());
         aionui_runtime::init(&cli.data_dir);
     }
 

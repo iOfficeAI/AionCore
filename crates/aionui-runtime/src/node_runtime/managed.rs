@@ -336,7 +336,9 @@ async fn activate_local_runtime_source(
     reporter: Option<&dyn NodeRuntimeProgressReporter>,
 ) -> Result<Option<ResolvedNodeRuntime>, NodeRuntimeError> {
     let version_dir = runtime_root.join(spec.directory_name());
-    if let Some(bundled_root) = managed_resources::bundled_root_path() {
+    if managed_resources::requires_bundled_resources() {
+        let bundled_root = managed_resources::bundled_root_candidate()
+            .ok_or_else(|| NodeRuntimeError::managed_invalid("bundled managed resources root unavailable"))?;
         let bundled_runtime = bundled_root.join("node").join(spec.directory_name());
         if !bundled_runtime.is_dir() {
             return Err(NodeRuntimeError::managed_invalid(format!(
@@ -405,7 +407,6 @@ async fn activate_local_runtime_source(
 fn source_label(source: ResolvedNodeSource) -> &'static str {
     match source {
         ResolvedNodeSource::Bundled => "bundled",
-        ResolvedNodeSource::DevLocal => "dev-local",
         ResolvedNodeSource::Managed => "managed",
     }
 }
@@ -413,14 +414,12 @@ fn source_label(source: ResolvedNodeSource) -> &'static str {
 fn source_kind_label(kind: ManagedResourceSourceKind) -> &'static str {
     match kind {
         ManagedResourceSourceKind::Bundled => "bundled",
-        ManagedResourceSourceKind::DevLocal => "dev-local",
     }
 }
 
 fn map_source_kind(kind: ManagedResourceSourceKind) -> ResolvedNodeSource {
     match kind {
         ManagedResourceSourceKind::Bundled => ResolvedNodeSource::Bundled,
-        ManagedResourceSourceKind::DevLocal => ResolvedNodeSource::DevLocal,
     }
 }
 
@@ -1007,6 +1006,7 @@ mod tests {
         unsafe {
             std::env::set_var("AIONUI_BUNDLED_MANAGED_RESOURCES", &bundled_root);
         }
+        managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Bundled);
         let runtime_root = tmp.path().join("runtime").join("node");
         std::fs::create_dir_all(&runtime_root).unwrap();
         let result = activate_local_runtime_source(
@@ -1021,6 +1021,7 @@ mod tests {
         unsafe {
             std::env::remove_var("AIONUI_BUNDLED_MANAGED_RESOURCES");
         }
+        managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Download);
 
         let error = result.expect_err("bundled validation failure should abort");
         assert!(error.to_string().contains("bundled Node runtime failed validation"));

@@ -22,6 +22,7 @@ pub use acp_tool_runtime::{
     ensure_managed_acp_tool_with_reporter, probe_managed_acp_tool_supported,
 };
 pub use cache::init;
+pub use managed_resources::{ManagedResourcesMode, managed_resources_mode, set_managed_resources_mode};
 pub use node_runtime::{
     DoctorRow, NodeRuntimeError, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressPhase,
     NodeRuntimeProgressReporter, NodeRuntimeSupport, NodeTool, ResolvedCommand, ResolvedNodeRuntime,
