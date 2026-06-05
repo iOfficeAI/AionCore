@@ -10,6 +10,7 @@ pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;
 pub mod routes;
+pub(crate) mod runtime_status;
 pub(crate) mod services;
 pub mod shared_kernel;
 pub mod task_manager;

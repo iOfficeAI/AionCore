@@ -2,10 +2,19 @@ mod protocol;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_api_types::{McpConnectionTestErrorCode, McpConnectionTestResult};
-use aionui_runtime::{Builder as CmdBuilder, kill_process_tree, resolve_command_path};
+use aionui_api_types::{
+    McpConnectionTestErrorCode, McpConnectionTestResult, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
+    RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind, WebSocketMessage,
+};
+use aionui_realtime::EventBroadcaster;
+use aionui_runtime::{
+    Builder as CmdBuilder, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressReporter,
+    RuntimeCommandProbe, ensure_runtime_command_with_reporter, kill_process_tree, probe_runtime_command,
+    resolve_command_path,
+};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -37,13 +46,15 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct McpConnectionTestService {
     http_client: reqwest::Client,
     timeout: Duration,
+    broadcaster: Arc<dyn EventBroadcaster>,
 }
 
 impl McpConnectionTestService {
-    pub fn new(http_client: reqwest::Client) -> Self {
+    pub fn new(http_client: reqwest::Client, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
         Self {
             http_client,
             timeout: CONNECTION_TIMEOUT,
+            broadcaster,
         }
     }
 
@@ -57,9 +68,20 @@ impl McpConnectionTestService {
     /// Dispatches to the appropriate transport handler.  Always returns
     /// a result (never errors) -- failures are encoded in the struct.
     pub async fn test_connection(&self, name: &str, transport: &McpServerTransport) -> McpConnectionTestResult {
+        self.test_connection_with_runtime_scope(name, transport, None).await
+    }
+
+    pub async fn test_connection_with_runtime_scope(
+        &self,
+        name: &str,
+        transport: &McpServerTransport,
+        runtime_scope_id: Option<&str>,
+    ) -> McpConnectionTestResult {
         debug!(name, ?transport, "starting MCP connection test");
         match transport {
-            McpServerTransport::Stdio { command, args, env } => self.test_stdio(command, args, env).await,
+            McpServerTransport::Stdio { command, args, env } => {
+                self.test_stdio(command, args, env, runtime_scope_id).await
+            }
             McpServerTransport::Http { url, headers } => self.test_http(url, headers).await,
             McpServerTransport::Sse { url, headers } => self.test_sse(url, headers).await,
         }
@@ -72,8 +94,9 @@ impl McpConnectionTestService {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
+        runtime_scope_id: Option<&str>,
     ) -> McpConnectionTestResult {
-        self.test_stdio_inner(command, args, env).await
+        self.test_stdio_inner(command, args, env, runtime_scope_id).await
     }
 
     async fn test_stdio_inner(
@@ -81,9 +104,22 @@ impl McpConnectionTestService {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
+        runtime_scope_id: Option<&str>,
     ) -> McpConnectionTestResult {
-        let program = resolve_stdio_command(command);
-        let mut cmd = CmdBuilder::new(&program);
+        let reporter = runtime_scope_id.map(|scope_id| self.runtime_reporter(scope_id.to_owned()));
+        let mut cmd = match probe_runtime_command(command) {
+            RuntimeCommandProbe::NodeTool { .. } => {
+                let resolved = match ensure_runtime_command_with_reporter(command, reporter.as_deref()).await {
+                    Ok(resolved) => resolved,
+                    Err(error) => return spawn_error_result(command, &runtime_resolution_error(&error.to_string())),
+                };
+                CmdBuilder::from_resolved(&resolved)
+            }
+            _ => {
+                let program = resolve_stdio_command(command);
+                CmdBuilder::new(&program)
+            }
+        };
         cmd.args(args)
             .envs(env.iter())
             .stdin(std::process::Stdio::piped())
@@ -365,6 +401,50 @@ impl McpConnectionTestService {
     }
 }
 
+impl McpConnectionTestService {
+    fn runtime_reporter(&self, scope_id: String) -> Arc<dyn NodeRuntimeProgressReporter> {
+        let broadcaster = self.broadcaster.clone();
+        Arc::new(move |update: NodeRuntimeProgress| {
+            let payload = RuntimeStatusPayload {
+                resource: RuntimeResourceKind::Node,
+                resource_id: None,
+                scope: RuntimeStatusScope {
+                    kind: RuntimeStatusScopeKind::Mcp,
+                    id: scope_id.clone(),
+                },
+                phase: map_phase(update.phase),
+                failure_kind: update.failure_kind.map(map_failure_kind),
+                message: update.message,
+                status_code: update.status_code,
+            };
+            let payload = serde_json::to_value(payload).expect("runtime status payload should serialize");
+            broadcaster.broadcast(WebSocketMessage::new("runtime.statusChanged", payload));
+        })
+    }
+}
+
+fn map_phase(phase: aionui_runtime::NodeRuntimeProgressPhase) -> RuntimeStatusPhase {
+    match phase {
+        aionui_runtime::NodeRuntimeProgressPhase::WaitingForLock => RuntimeStatusPhase::WaitingForLock,
+        aionui_runtime::NodeRuntimeProgressPhase::Downloading => RuntimeStatusPhase::Downloading,
+        aionui_runtime::NodeRuntimeProgressPhase::Extracting => RuntimeStatusPhase::Extracting,
+        aionui_runtime::NodeRuntimeProgressPhase::Validating => RuntimeStatusPhase::Validating,
+        aionui_runtime::NodeRuntimeProgressPhase::Ready => RuntimeStatusPhase::Ready,
+        aionui_runtime::NodeRuntimeProgressPhase::Failed => RuntimeStatusPhase::Failed,
+    }
+}
+
+fn map_failure_kind(kind: NodeRuntimeFailureKind) -> RuntimeFailureKind {
+    match kind {
+        NodeRuntimeFailureKind::Timeout => RuntimeFailureKind::Timeout,
+        NodeRuntimeFailureKind::DownloadFailed => RuntimeFailureKind::DownloadFailed,
+        NodeRuntimeFailureKind::HttpStatus => RuntimeFailureKind::HttpStatus,
+        NodeRuntimeFailureKind::ValidationFailed => RuntimeFailureKind::ValidationFailed,
+        NodeRuntimeFailureKind::UnsupportedPlatform => RuntimeFailureKind::UnsupportedPlatform,
+        NodeRuntimeFailureKind::Unknown => RuntimeFailureKind::Unknown,
+    }
+}
+
 fn resolve_stdio_command(command: &str) -> OsString {
     if !command.is_empty()
         && !command.contains('/')
@@ -377,6 +457,19 @@ fn resolve_stdio_command(command: &str) -> OsString {
     OsString::from(command)
 }
 
+fn runtime_resolution_error(message: &str) -> std::io::Error {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("not found")
+        || lower.contains("unsupported")
+        || lower.contains("unavailable")
+        || lower.contains("system node")
+    {
+        std::io::Error::new(std::io::ErrorKind::NotFound, message.to_owned())
+    } else {
+        std::io::Error::other(message.to_owned())
+    }
+}
+
 /// Intermediate struct for HTTP transport response parsing.
 struct HttpMcpResponse {
     rpc: JsonRpcResponse,
@@ -386,16 +479,18 @@ struct HttpMcpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_realtime::BroadcastEventBus;
 
     #[test]
     fn service_clone() {
-        let svc = McpConnectionTestService::new(reqwest::Client::new());
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)));
         let _cloned = svc.clone();
     }
 
     #[test]
     fn service_with_timeout() {
-        let svc = McpConnectionTestService::new(reqwest::Client::new()).with_timeout(Duration::from_secs(5));
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)))
+            .with_timeout(Duration::from_secs(5));
         assert_eq!(svc.timeout, Duration::from_secs(5));
     }
 
@@ -420,7 +515,8 @@ mod tests {
             ],
             env: HashMap::new(),
         };
-        let svc = McpConnectionTestService::new(reqwest::Client::new()).with_timeout(Duration::from_millis(100));
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)))
+            .with_timeout(Duration::from_millis(100));
 
         let result = svc.test_connection("timeout-cleanup", &transport).await;
         assert!(!result.success);

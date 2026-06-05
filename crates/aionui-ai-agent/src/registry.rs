@@ -20,7 +20,10 @@ use std::sync::Arc;
 use aionui_api_types::{AgentEnvEntry, AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};
 use aionui_common::{AgentType, AppError};
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
-use aionui_runtime::resolve_command_path;
+use aionui_runtime::{
+    ManagedAcpToolId, RuntimeCommandProbe, probe_managed_acp_tool_supported, probe_node_runtime_supported,
+    probe_runtime_command, resolve_command_path,
+};
 use serde_json::Value;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
@@ -530,6 +533,9 @@ pub enum UnavailableReason {
     /// direct-CLI rows this is the same binary as `binary_name`; for
     /// bridge rows it's the bridge.
     CommandMissing { command: String },
+    /// Managed runtime/tool support is unavailable even though the row
+    /// itself is builtin and no ambient PATH lookup should be required.
+    ManagedRuntimeUnavailable { resource: String, detail: String },
 }
 
 impl std::fmt::Display for UnavailableReason {
@@ -540,6 +546,9 @@ impl std::fmt::Display for UnavailableReason {
             Self::BridgeMissing { bridge } => write!(f, "bridge binary `{bridge}` not on $PATH"),
             Self::PrimaryMissing { binary } => write!(f, "primary binary `{binary}` not on $PATH"),
             Self::CommandMissing { command } => write!(f, "spawn command `{command}` not on $PATH"),
+            Self::ManagedRuntimeUnavailable { resource, detail } => {
+                write!(f, "managed `{resource}` unavailable: {detail}")
+            }
         }
     }
 }
@@ -559,13 +568,35 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
     if !meta.enabled {
         return Err(UnavailableReason::Disabled);
     }
+
+    if meta.agent_source == AgentSource::Builtin
+        && let Some(backend) = meta.backend.as_deref()
+        && let Some(tool) = ManagedAcpToolId::from_backend(backend)
+    {
+        let node_support = probe_node_runtime_supported();
+        if !node_support.is_supported() {
+            return Err(UnavailableReason::ManagedRuntimeUnavailable {
+                resource: "node".to_owned(),
+                detail: node_support.detail,
+            });
+        }
+        let tool_support = probe_managed_acp_tool_supported(tool);
+        if !tool_support.is_supported() {
+            return Err(UnavailableReason::ManagedRuntimeUnavailable {
+                resource: tool.slug().to_owned(),
+                detail: tool_support.detail,
+            });
+        }
+        return Ok(PathBuf::from(tool.slug()));
+    }
+
     let Some(cmd) = meta.command.as_deref().filter(|s| !s.is_empty()) else {
         return Err(UnavailableReason::NoCommand);
     };
 
     if let Some(bridge) = meta.agent_source_info.bridge_binary.as_deref()
         && bridge != cmd
-        && resolve_command_path(bridge).is_none()
+        && probe_command_candidate(bridge).is_none()
     {
         return Err(UnavailableReason::BridgeMissing {
             bridge: bridge.to_owned(),
@@ -574,16 +605,26 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
     if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
         && primary != cmd
         && meta.agent_source_info.bridge_binary.as_deref() != Some(primary)
-        && resolve_command_path(primary).is_none()
+        && probe_command_candidate(primary).is_none()
     {
         return Err(UnavailableReason::PrimaryMissing {
             binary: primary.to_owned(),
         });
     }
 
-    resolve_command_path(cmd).ok_or_else(|| UnavailableReason::CommandMissing {
+    probe_command_candidate(cmd).ok_or_else(|| UnavailableReason::CommandMissing {
         command: cmd.to_owned(),
     })
+}
+
+fn probe_command_candidate(command: &str) -> Option<PathBuf> {
+    match probe_runtime_command(command) {
+        RuntimeCommandProbe::ExplicitPath { path } => path.exists().then_some(path),
+        RuntimeCommandProbe::PathLookup { command } => resolve_command_path(&command),
+        RuntimeCommandProbe::NodeTool { command, .. } => probe_node_runtime_supported()
+            .is_supported()
+            .then(|| PathBuf::from(command)),
+    }
 }
 
 #[cfg(test)]
@@ -599,6 +640,41 @@ mod tests {
         reg
     }
 
+    #[test]
+    fn probe_resolved_command_accepts_bare_npx_when_managed_runtime_is_supported() {
+        if !probe_node_runtime_supported().is_supported() {
+            return;
+        }
+
+        let meta = AgentMetadata {
+            id: "agent-1".into(),
+            icon: None,
+            name: "Test ACP".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("custom".into()),
+            agent_type: AgentType::Acp,
+            agent_source: AgentSource::Custom,
+            agent_source_info: AgentSourceInfo::default(),
+            enabled: true,
+            available: false,
+            command: Some("npx".into()),
+            resolved_command: None,
+            args: vec![],
+            env: vec![],
+            native_skills_dirs: None,
+            behavior_policy: BehaviorPolicy::default(),
+            yolo_id: None,
+            sort_order: 0,
+            team_capable: false,
+            handshake: AgentHandshake::default(),
+        };
+
+        let resolved = probe_resolved_command(&meta).expect("probe");
+        assert_eq!(resolved, PathBuf::from("npx"));
+    }
+
     #[tokio::test]
     async fn hydrate_loads_seed_rows() {
         // `list_all_including_hidden` bypasses the available/enabled
@@ -610,10 +686,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_builtin_claude_has_bridge_command() {
+    async fn find_builtin_claude_uses_managed_acp_runtime_metadata() {
         let reg = registry().await;
         let m = reg.find_builtin_by_backend("claude").await.unwrap();
-        assert_eq!(m.command.as_deref(), Some("bun"));
+        assert!(m.command.is_none());
+        assert!(m.args.is_empty());
+        assert!(m.agent_source_info.bridge_binary.is_none());
         assert!(m.behavior_policy.supports_side_question);
         assert_eq!(
             m.native_skills_dirs.as_deref(),

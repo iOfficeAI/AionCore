@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-ai-agent"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "agent-client-protocol",
  "aion-agent",
@@ -328,6 +328,7 @@ dependencies = [
  "aionui-db",
  "aionui-extension",
  "aionui-mcp",
+ "aionui-realtime",
  "aionui-runtime",
  "aionui-system",
  "async-trait",
@@ -358,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-api-types"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-common",
  "serde",
@@ -367,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-app"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aion-config",
  "aionui-ai-agent",
@@ -417,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assets"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-common",
  "axum",
@@ -432,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assistant"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -458,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-auth"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -482,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-channel"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -513,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-common"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -530,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-conversation"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -553,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-cron"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -579,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-db"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-common",
  "async-trait",
@@ -595,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-extension"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -624,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-file"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -652,11 +653,12 @@ dependencies = [
 
 [[package]]
 name = "aionui-mcp"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
  "aionui-db",
+ "aionui-realtime",
  "aionui-runtime",
  "aionui-system",
  "async-trait",
@@ -677,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-office"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -703,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-realtime"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-api-types",
  "axum",
@@ -718,22 +720,26 @@ dependencies = [
 
 [[package]]
 name = "aionui-runtime"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dirs",
+ "flate2",
  "fs2",
  "hex",
  "libc",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "toml 0.8.23",
  "tracing",
+ "tracing-subscriber",
  "wait-timeout",
+ "walkdir",
  "which",
  "zip",
  "zstd",
@@ -741,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-shell"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -767,12 +773,14 @@ dependencies = [
 
 [[package]]
 name = "aionui-system"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
  "aionui-common",
  "aionui-db",
+ "aionui-realtime",
+ "aionui-runtime",
  "async-trait",
  "aws-config",
  "aws-sdk-bedrock",
@@ -792,7 +800,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-team"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "agent-client-protocol",
  "aionui-ai-agent",
@@ -2321,6 +2329,16 @@ name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+
+[[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -4177,7 +4195,6 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
- "futures-channel",
  "futures-core",
  "futures-util",
  "http 1.4.0",
@@ -4193,6 +4210,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -5134,6 +5152,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
 ]
 
 [[package]]
@@ -6433,6 +6462,16 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
+]
 
 [[package]]
 name = "xmlparser"

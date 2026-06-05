@@ -26,7 +26,7 @@ use aionui_db::{
 };
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_realtime::EventBroadcaster;
-use aionui_runtime::resolve_command_path;
+use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
@@ -2212,23 +2212,28 @@ fn validate_stdio_command(command: &str) -> Result<(), String> {
         return Err("stdio transport is missing command".to_owned());
     }
 
-    let path = std::path::Path::new(trimmed);
-    let looks_like_path = path.is_absolute()
-        || trimmed.contains(std::path::MAIN_SEPARATOR)
-        || trimmed.contains('/')
-        || trimmed.contains('\\');
-
-    if looks_like_path {
-        if path.exists() {
-            return Ok(());
+    match probe_runtime_command(trimmed) {
+        RuntimeCommandProbe::ExplicitPath { path } => {
+            if path.exists() {
+                return Ok(());
+            }
+            Err(format!("command '{trimmed}' does not exist"))
         }
-        return Err(format!("command '{trimmed}' does not exist"));
-    }
-
-    if resolve_command_path(trimmed).is_some() {
-        Ok(())
-    } else {
-        Err(format!("command '{trimmed}' was not found in PATH"))
+        RuntimeCommandProbe::NodeTool { .. } => {
+            let support = probe_node_runtime_supported();
+            if support.is_supported() {
+                Ok(())
+            } else {
+                Err(format!("command '{trimmed}' is unavailable: {}", support.detail))
+            }
+        }
+        RuntimeCommandProbe::PathLookup { command } => {
+            if resolve_command_path(&command).is_some() {
+                Ok(())
+            } else {
+                Err(format!("command '{command}' was not found in PATH"))
+            }
+        }
     }
 }
 
@@ -2520,6 +2525,15 @@ mod tests {
         let lineage = AssistantLineage::from_response_and_extra(&response, &extra);
         assert_eq!(lineage.agent_type, "acp");
         assert!(!lineage.has_any_identity());
+    }
+
+    #[test]
+    fn validate_stdio_command_accepts_bare_npx_when_runtime_supports_it() {
+        let result = validate_stdio_command("npx");
+        assert!(
+            result.is_ok(),
+            "bare npx should be accepted when managed runtime is supported"
+        );
     }
 
     #[test]

@@ -574,3 +574,5 @@ data/
 .graphify_detect.json
 graphify-out/
 .graphify_*
+
+.tmp/

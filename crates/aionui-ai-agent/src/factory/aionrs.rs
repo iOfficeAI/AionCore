@@ -9,7 +9,8 @@ use aionui_api_types::{
 use aionui_common::AppError;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
-use aionui_runtime::resolve_command_path;
+use aionui_realtime::EventBroadcaster;
+use aionui_runtime::ensure_runtime_command_with_reporter;
 use tracing::{debug, info, warn};
 
 use crate::agent_task::AgentInstance;
@@ -17,6 +18,7 @@ use crate::capability::team_guide_prompt;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
+use crate::runtime_status::conversation_runtime_reporter;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig, BuildTaskOptions};
 
 const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionrs", "codebuddy"];
@@ -57,8 +59,13 @@ pub(super) async fn build(
 
     let mut extra_mcp_servers = resolve_mcp_servers(&overrides, &ctx.conversation_id);
     if let Some(repo) = deps.mcp_server_repo.as_ref() {
-        for (name, config) in
-            load_user_mcp_servers(repo.as_ref(), overrides.mcp_server_ids.as_deref(), &ctx.conversation_id).await
+        for (name, config) in load_user_mcp_servers(
+            repo.as_ref(),
+            overrides.mcp_server_ids.as_deref(),
+            &ctx.conversation_id,
+            deps.broadcaster.clone(),
+        )
+        .await
         {
             extra_mcp_servers.entry(name).or_insert(config);
         }
@@ -67,7 +74,9 @@ pub(super) async fn build(
         &mut extra_mcp_servers,
         &overrides.session_mcp_servers,
         &ctx.conversation_id,
-    );
+        deps.broadcaster.clone(),
+    )
+    .await;
 
     // Inject team guide system prompt for solo sessions with guide MCP
     if overrides.team_mcp_stdio_config.is_none()
@@ -281,6 +290,7 @@ async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
     selected_ids: Option<&[String]>,
     conversation_id: &str,
+    broadcaster: Arc<dyn EventBroadcaster>,
 ) -> HashMap<String, McpServerConfig> {
     let rows_result = match selected_ids {
         Some(ids) => repo.list_by_ids_any(ids).await,
@@ -307,7 +317,7 @@ async fn load_user_mcp_servers(
             continue;
         }
 
-        match row_to_mcp_server_config(&row) {
+        match row_to_mcp_server_config(&row, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
                 servers.insert(row.name.clone(), config);
             }
@@ -326,7 +336,11 @@ async fn load_user_mcp_servers(
     servers
 }
 
-fn row_to_mcp_server_config(row: &McpServerRow) -> Result<McpServerConfig, String> {
+async fn row_to_mcp_server_config(
+    row: &McpServerRow,
+    conversation_id: &str,
+    broadcaster: Arc<dyn EventBroadcaster>,
+) -> Result<McpServerConfig, String> {
     let value: serde_json::Value =
         serde_json::from_str(&row.transport_config).map_err(|e| format!("invalid transport_config JSON: {e}"))?;
 
@@ -336,21 +350,22 @@ fn row_to_mcp_server_config(row: &McpServerRow) -> Result<McpServerConfig, Strin
                 .get("command")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "stdio: missing command".to_owned())?;
-            let resolved_command = resolve_stdio_command(command);
-            let args = value
+            let args: Vec<String> = value
                 .get("args")
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect())
                 .unwrap_or_default();
-            let env = value
+            let env_entries: Vec<(String, String)> = value
                 .get("env")
                 .and_then(|v| v.as_object())
                 .map(|obj| {
                     obj.iter()
                         .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
-                        .collect::<HashMap<_, _>>()
+                        .collect()
                 })
                 .unwrap_or_default();
+            let (resolved_command, args, env) =
+                ensure_stdio_launch(command, &args, &env_entries, conversation_id, broadcaster).await?;
 
             Ok(McpServerConfig {
                 transport: TransportType::Stdio,
@@ -416,17 +431,24 @@ fn row_to_mcp_server_config(row: &McpServerRow) -> Result<McpServerConfig, Strin
     }
 }
 
-fn session_server_to_mcp_server_config(server: &SessionMcpServer) -> Result<McpServerConfig, String> {
+async fn session_server_to_mcp_server_config(
+    server: &SessionMcpServer,
+    conversation_id: &str,
+    broadcaster: Arc<dyn EventBroadcaster>,
+) -> Result<McpServerConfig, String> {
     match &server.transport {
         SessionMcpTransport::Stdio { command, args, env } => {
             if command.is_empty() {
                 return Err("stdio: missing command".to_owned());
             }
+            let entries: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let (command, args, env) =
+                ensure_stdio_launch(command, args, &entries, conversation_id, broadcaster).await?;
             Ok(McpServerConfig {
                 transport: TransportType::Stdio,
-                command: Some(resolve_stdio_command(command)),
-                args: Some(args.clone()),
-                env: Some(env.clone()),
+                command: Some(command),
+                args: Some(args),
+                env: Some(env),
                 url: None,
                 headers: None,
                 deferred: Some(false),
@@ -477,13 +499,14 @@ fn session_server_to_mcp_server_config(server: &SessionMcpServer) -> Result<McpS
     }
 }
 
-fn merge_session_snapshot_mcp_servers(
+async fn merge_session_snapshot_mcp_servers(
     extra_mcp_servers: &mut HashMap<String, McpServerConfig>,
     session_mcp_servers: &[SessionMcpServer],
     conversation_id: &str,
+    broadcaster: Arc<dyn EventBroadcaster>,
 ) {
     for server in session_mcp_servers {
-        match session_server_to_mcp_server_config(server) {
+        match session_server_to_mcp_server_config(server, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
                 if extra_mcp_servers.insert(server.name.clone(), config).is_some() {
                     debug!(
@@ -506,24 +529,34 @@ fn merge_session_snapshot_mcp_servers(
     }
 }
 
-fn resolve_stdio_command(command: &str) -> String {
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        return command.to_owned();
-    }
+async fn ensure_stdio_launch(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    conversation_id: &str,
+    broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
+) -> Result<(String, Vec<String>, HashMap<String, String>), String> {
+    let reporter = conversation_runtime_reporter(broadcaster, conversation_id.to_owned());
+    let resolved = ensure_runtime_command_with_reporter(command, Some(reporter.as_ref()))
+        .await
+        .map_err(|error| error.to_string())?;
 
-    let path = std::path::Path::new(trimmed);
-    if path.is_absolute()
-        || trimmed.contains(std::path::MAIN_SEPARATOR)
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-    {
-        return trimmed.to_owned();
-    }
+    let mut final_args: Vec<String> = resolved
+        .args_prefix
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    final_args.extend(args.iter().cloned());
 
-    resolve_command_path(trimmed)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| trimmed.to_owned())
+    let mut final_env: HashMap<String, String> = env.iter().cloned().collect();
+    final_env.extend(resolved.env.iter().map(|(name, value)| {
+        (
+            name.to_string_lossy().into_owned(),
+            value.to_string_lossy().into_owned(),
+        )
+    }));
+
+    Ok((resolved.program.to_string_lossy().into_owned(), final_args, final_env))
 }
 
 fn resolve_mcp_servers(overrides: &AionrsBuildExtra, conversation_id: &str) -> HashMap<String, McpServerConfig> {
@@ -588,6 +621,105 @@ fn guide_mcp_to_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_realtime::BroadcastEventBus;
+    use aionui_runtime::init as init_runtime;
+    use std::sync::{Mutex, OnceLock};
+    use std::{mem, path::PathBuf};
+
+    fn path_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    fn test_runtime_data_dir() -> &'static PathBuf {
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        DIR.get_or_init(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().to_path_buf();
+            mem::forget(temp);
+            init_runtime(&path);
+            path
+        })
+    }
+
+    #[cfg(unix)]
+    fn install_fake_bundled_runtime() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = tmp.path().join("node").join("node-v24.11.0-darwin-arm64");
+        let bin = runtime_root.join("bin");
+        std::fs::create_dir_all(&bin).expect("create bin");
+
+        for tool in ["node", "npm", "npx"] {
+            let path = bin.join(tool);
+            std::fs::write(&path, "#!/bin/sh\necho v24.11.0\n").expect("write tool");
+            let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod");
+        }
+
+        tmp
+    }
+
+    fn make_row(
+        name: &str,
+        transport_type: &str,
+        transport_config: &str,
+        enabled: bool,
+        builtin: bool,
+    ) -> McpServerRow {
+        McpServerRow {
+            id: format!("mcp_{name}"),
+            name: name.to_owned(),
+            description: None,
+            enabled,
+            transport_type: transport_type.into(),
+            transport_config: transport_config.into(),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn test_broadcaster() -> Arc<dyn EventBroadcaster> {
+        Arc::new(BroadcastEventBus::new(16))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn row_to_mcp_server_config_flattens_resolved_npx_command() {
+        let _lock = path_test_lock().lock().expect("lock");
+        let runtime = install_fake_bundled_runtime();
+        let _runtime_data_dir = test_runtime_data_dir();
+        unsafe { std::env::set_var("AIONUI_BUNDLED_MANAGED_RESOURCES", runtime.path()) };
+
+        let row = make_row(
+            "ctx7",
+            "stdio",
+            r#"{"command":"npx","args":["-y","@upstash/context7-mcp"],"env":{"K":"V"}}"#,
+            true,
+            false,
+        );
+
+        let config = row_to_mcp_server_config(&row, "conv-row", test_broadcaster())
+            .await
+            .expect("convert");
+        unsafe { std::env::remove_var("AIONUI_BUNDLED_MANAGED_RESOURCES") };
+        let command = config.command.as_deref().expect("resolved command");
+        assert_ne!(command, "npx");
+        assert!(command.ends_with("/npx"), "unexpected stdio command path: {command}");
+        assert_eq!(
+            config.args.as_ref(),
+            Some(&vec!["-y".to_owned(), "@upstash/context7-mcp".to_owned()])
+        );
+    }
 
     #[test]
     fn normalize_aionrs_base_url_strips_v1() {
@@ -846,8 +978,12 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn session_snapshot_overrides_repo_backed_mcp_config() {
+    #[tokio::test]
+    async fn session_snapshot_overrides_repo_backed_mcp_config() {
+        let snapshot_command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
         let mut servers = HashMap::from([(
             "demo-mcp".to_owned(),
             McpServerConfig {
@@ -865,21 +1001,18 @@ mod tests {
             id: "mcp_1".into(),
             name: "demo-mcp".into(),
             transport: SessionMcpTransport::Stdio {
-                command: "uvx".into(),
+                command: snapshot_command.clone(),
                 args: vec!["new-server".into()],
                 env: HashMap::from([("TOKEN".into(), "abc".into())]),
             },
         }];
 
-        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, "conv-override");
+        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, "conv-override", test_broadcaster()).await;
 
         let server = servers.get("demo-mcp").expect("snapshot should remain");
         assert_eq!(server.transport, TransportType::Stdio);
         let command = server.command.as_deref().expect("stdio command should exist");
-        assert!(
-            command == "uvx" || command.ends_with("/uvx"),
-            "unexpected stdio command path: {command}",
-        );
+        assert_eq!(command, snapshot_command);
         assert_eq!(server.args.as_deref(), Some(&["new-server".to_owned()][..]));
         assert_eq!(
             server.env.as_ref().and_then(|env| env.get("TOKEN")),

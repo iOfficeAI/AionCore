@@ -26,6 +26,8 @@ const STARTUP_FILE_RETRY_DELAYS: [Duration; 5] = [
 ];
 
 static DB_MIGRATOR: Migrator = sqlx::migrate!();
+// Historical special-case for the MCP schema reconciliation fallback.
+// Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
 
 /// Wraps a SQLite connection pool with lifecycle management.

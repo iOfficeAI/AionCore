@@ -297,6 +297,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builtin_managed_acp_rows_drop_runtime_bridge_command() {
+        let (repo, _db) = setup().await;
+
+        let claude = repo.get("2d23ff1c").await.unwrap().expect("seeded claude row");
+        assert!(claude.command.is_none());
+        assert_eq!(claude.args.as_deref(), Some(r#"[]"#));
+        assert_eq!(claude.agent_source_info.as_deref(), Some(r#"{"binary_name":"claude"}"#));
+
+        let codex = repo.get("8e1acf31").await.unwrap().expect("seeded codex row");
+        assert!(codex.command.is_none());
+        assert_eq!(codex.args.as_deref(), Some(r#"[]"#));
+        assert_eq!(codex.agent_source_info.as_deref(), Some(r#"{"binary_name":"codex"}"#));
+
+        let codebuddy = repo.get("8b20fd41").await.unwrap().expect("seeded codebuddy row");
+        assert_eq!(codebuddy.command.as_deref(), Some("npx"));
+        assert_eq!(
+            codebuddy.args.as_deref(),
+            Some(r#"["-y","--package","@tencent-ai/codebuddy-code@2.97.0","codebuddy","--acp"]"#)
+        );
+        assert_eq!(
+            codebuddy.agent_source_info.as_deref(),
+            Some(r#"{"binary_name":"codebuddy","bridge_binary":"npx"}"#)
+        );
+    }
+
+    #[tokio::test]
     async fn upsert_inserts_then_updates() {
         let (repo, _db) = setup().await;
         let mut p = custom_params("custom-0001", "my-claude");

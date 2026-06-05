@@ -1,13 +1,17 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use aionui_api_types::{PreviewState, PreviewStatusEvent, WebSocketMessage};
 use aionui_realtime::EventBroadcaster;
-use aionui_runtime::Builder as CmdBuilder;
+use aionui_runtime::{Builder as CmdBuilder, ensure_runtime_command};
 use dashmap::DashMap;
 use tokio::sync::Mutex;
 
 use crate::error::OfficeError;
+#[cfg(test)]
+use crate::officecli_runtime::resolve_officecli_path;
+use crate::officecli_runtime::{officecli_prefix, resolve_officecli_command};
 use crate::port::{allocate_port, is_port_listening};
 use crate::types::DocType;
 
@@ -244,7 +248,15 @@ impl Drop for OfficecliWatchManager {
 // DefaultProcessSpawner — real implementation using tokio::process
 // ---------------------------------------------------------------------------
 
-pub struct DefaultProcessSpawner;
+pub struct DefaultProcessSpawner {
+    data_dir: PathBuf,
+}
+
+impl DefaultProcessSpawner {
+    pub fn new(data_dir: PathBuf) -> Self {
+        Self { data_dir }
+    }
+}
 
 struct TokioProcessHandle {
     child: Mutex<Option<tokio::process::Child>>,
@@ -278,7 +290,8 @@ impl ProcessSpawner for DefaultProcessSpawner {
         port: u16,
         _doc_type: DocType,
     ) -> Result<Box<dyn ProcessHandle>, OfficeError> {
-        let mut builder = CmdBuilder::new("officecli");
+        let resolved = resolve_officecli_command(&self.data_dir).await?;
+        let mut builder = CmdBuilder::from_resolved(&resolved);
         builder
             .arg("watch")
             .arg(file_path)
@@ -301,8 +314,14 @@ impl ProcessSpawner for DefaultProcessSpawner {
     }
 
     async fn install_officecli(&self) -> Result<(), OfficeError> {
-        let mut builder = CmdBuilder::clean_cli("npm");
-        builder.args(["install", "-g", "officecli"]);
+        let resolved = ensure_runtime_command("npm")
+            .await
+            .map_err(|e| OfficeError::InstallFailed(e.to_string()))?;
+        let prefix = officecli_prefix(&self.data_dir);
+        std::fs::create_dir_all(&prefix).map_err(OfficeError::Io)?;
+        let prefix_arg = prefix.to_string_lossy().into_owned();
+        let mut builder = CmdBuilder::from_resolved(&resolved);
+        builder.args(["install", "--prefix", prefix_arg.as_str(), "officecli"]);
         let output = builder
             .output()
             .await
@@ -316,14 +335,23 @@ impl ProcessSpawner for DefaultProcessSpawner {
     }
 
     async fn is_officecli_installed(&self) -> bool {
-        let mut builder = CmdBuilder::clean_cli("officecli");
+        let Ok(resolved) = resolve_officecli_command(&self.data_dir).await else {
+            return false;
+        };
+        let mut builder = CmdBuilder::from_resolved(&resolved);
         builder.arg("--version");
         builder.output().await.is_ok_and(|o| o.status.success())
     }
 
     async fn check_update(&self, _doc_type: DocType) -> Result<(), OfficeError> {
-        let mut builder = CmdBuilder::clean_cli("npm");
-        builder.args(["outdated", "-g", "officecli"]);
+        let resolved = ensure_runtime_command("npm")
+            .await
+            .map_err(|e| OfficeError::StartFailed(e.to_string()))?;
+        let prefix = officecli_prefix(&self.data_dir);
+        std::fs::create_dir_all(&prefix).map_err(OfficeError::Io)?;
+        let prefix_arg = prefix.to_string_lossy().into_owned();
+        let mut builder = CmdBuilder::from_resolved(&resolved);
+        builder.args(["outdated", "--prefix", prefix_arg.as_str(), "officecli"]);
         let output = builder
             .output()
             .await
@@ -331,8 +359,8 @@ impl ProcessSpawner for DefaultProcessSpawner {
 
         if !output.status.success() {
             tracing::info!("officecli update available, installing...");
-            let mut install_builder = CmdBuilder::clean_cli("npm");
-            install_builder.args(["install", "-g", "officecli@latest"]);
+            let mut install_builder = CmdBuilder::from_resolved(&resolved);
+            install_builder.args(["install", "--prefix", prefix_arg.as_str(), "officecli@latest"]);
             let install = install_builder
                 .output()
                 .await
@@ -352,7 +380,7 @@ impl ProcessSpawner for DefaultProcessSpawner {
 // ---------------------------------------------------------------------------
 
 fn resolve_path(file_path: &str) -> Result<String, OfficeError> {
-    let path = std::path::Path::new(file_path);
+    let path = Path::new(file_path);
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     Ok(resolved.to_string_lossy().into_owned())
 }
@@ -497,6 +525,17 @@ mod tests {
         let k1 = session_key("/a.docx", DocType::Word);
         let k2 = session_key("/a.docx", DocType::Excel);
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn officecli_spawn_prefers_managed_prefix_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed_bin = tmp.path().join("runtime/node/tools/officecli/bin/officecli");
+        std::fs::create_dir_all(managed_bin.parent().unwrap()).unwrap();
+        std::fs::write(&managed_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let path = resolve_officecli_path(tmp.path()).expect("managed officecli");
+        assert_eq!(path, managed_bin);
     }
 
     #[tokio::test]

@@ -30,6 +30,7 @@ use std::process::Stdio;
 
 use tokio::process::{Child, Command};
 
+use crate::ResolvedCommand;
 use crate::resolver::resolve_command_path;
 
 /// Construction mode — determines default stdio + env extras.
@@ -121,6 +122,23 @@ impl Builder {
         Self {
             inner,
             mode: Mode::CleanCli,
+        }
+    }
+
+    /// Builder from a fully resolved command plan.
+    ///
+    /// This bypasses `resolve_command_path` and uses the provided
+    /// `program + args_prefix + env` directly.
+    pub fn from_resolved(resolved: &ResolvedCommand) -> Self {
+        let mut inner = Command::new(&resolved.program);
+        inner.kill_on_drop(true);
+        configure_platform_spawn(&mut inner);
+        strip_pollution(&mut inner);
+        inner.args(&resolved.args_prefix);
+        inner.envs(resolved.env.iter().cloned());
+        Self {
+            inner,
+            mode: Mode::Default,
         }
     }
 
@@ -283,6 +301,7 @@ fn resolve_program(program: &OsStr) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ResolvedCommand;
     use std::time::{Duration, Instant};
 
     #[tokio::test]
@@ -369,6 +388,23 @@ mod tests {
         assert!(child.id().is_some());
         let status = child.wait().await.unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn resolved_command_builder_applies_prefix_and_env() {
+        let resolved = ResolvedCommand {
+            program: "/bin/echo".into(),
+            args_prefix: vec!["hello".into()],
+            env: vec![("NO_COLOR".into(), "1".into())],
+        };
+
+        let builder = Builder::from_resolved(&resolved);
+        let preview = builder.to_string();
+        assert!(
+            preview.contains("hello"),
+            "preview should include args prefix: {preview}"
+        );
+        assert!(preview.contains("NO_COLOR=\"1\"") || preview.contains("NO_COLOR=1"));
     }
 
     #[test]

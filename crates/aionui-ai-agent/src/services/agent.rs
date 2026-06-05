@@ -21,12 +21,14 @@ use aionui_api_types::{
 };
 use aionui_common::AppError;
 use aionui_db::IProviderRepository;
+use aionui_realtime::EventBroadcaster;
 
 use super::provider_health::ProviderHealthCheckService;
 use crate::registry::AgentRegistry;
 
 pub struct AgentService {
     registry: Arc<AgentRegistry>,
+    broadcaster: Arc<dyn EventBroadcaster>,
     data_dir: PathBuf,
     provider_health: ProviderHealthCheckService,
 }
@@ -34,6 +36,7 @@ pub struct AgentService {
 impl AgentService {
     pub fn new(
         registry: Arc<AgentRegistry>,
+        broadcaster: Arc<dyn EventBroadcaster>,
         provider_repo: Arc<dyn IProviderRepository>,
         encryption_key: [u8; 32],
         data_dir: PathBuf,
@@ -41,6 +44,7 @@ impl AgentService {
         let provider_health = ProviderHealthCheckService::new(provider_repo, encryption_key, data_dir.clone());
         Arc::new(Self {
             registry,
+            broadcaster,
             data_dir,
             provider_health,
         })
@@ -56,6 +60,10 @@ impl AgentService {
     /// for direct repository access (upsert / delete / enable toggle).
     pub(crate) fn registry(&self) -> &Arc<AgentRegistry> {
         &self.registry
+    }
+
+    pub(crate) fn broadcaster(&self) -> &Arc<dyn EventBroadcaster> {
+        &self.broadcaster
     }
 }
 

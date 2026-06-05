@@ -5,7 +5,8 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
-    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, FetchModelsAnonymousRequest,
+    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, EnsureManagedAcpToolRequest,
+    EnsureManagedAcpToolResponse, EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, FetchModelsAnonymousRequest,
     FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse,
     SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
     UpdateProviderRequest, UpdateSettingsRequest,
@@ -16,6 +17,7 @@ use crate::client_pref::ClientPrefService;
 use crate::model_fetcher::ModelFetchService;
 use crate::protocol::ProtocolDetectionService;
 use crate::provider::ProviderService;
+use crate::runtime_prepare::RuntimePrepareService;
 use crate::settings::SettingsService;
 use crate::version::VersionCheckService;
 
@@ -28,6 +30,7 @@ pub struct SystemRouterState {
     pub model_fetch_service: ModelFetchService,
     pub protocol_detection_service: ProtocolDetectionService,
     pub version_check_service: VersionCheckService,
+    pub runtime_prepare_service: RuntimePrepareService,
 }
 
 /// Build the system router (settings + client prefs + providers + system).
@@ -48,6 +51,8 @@ pub struct SystemRouterState {
 /// - `POST /api/providers/detect-protocol`   — detect API protocol
 /// - `GET  /api/system/info`                 — system directory & platform info
 /// - `POST /api/system/check-update`         — check GitHub for new versions
+/// - `POST /api/system/ensure-node-runtime`  — prepare managed Node runtime
+/// - `POST /api/system/ensure-managed-acp-tool` — prepare managed ACP tool artifact
 pub fn system_routes(state: SystemRouterState) -> Router {
     Router::new()
         .route("/api/settings", get(get_settings).patch(update_settings))
@@ -65,6 +70,8 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         .route("/api/providers/{id}/models", post(fetch_models))
         .route("/api/system/info", get(get_system_info))
         .route("/api/system/check-update", post(check_update))
+        .route("/api/system/ensure-node-runtime", post(ensure_node_runtime))
+        .route("/api/system/ensure-managed-acp-tool", post(ensure_managed_acp_tool))
         .with_state(state)
 }
 
@@ -209,5 +216,26 @@ async fn check_update(
 ) -> Result<Json<ApiResponse<UpdateCheckResult>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let result = state.version_check_service.check_update(&req).await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn ensure_node_runtime(
+    State(state): State<SystemRouterState>,
+    body: Result<Json<EnsureNodeRuntimeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<EnsureNodeRuntimeResponse>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let result = state.runtime_prepare_service.ensure_node_runtime(req.scope).await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn ensure_managed_acp_tool(
+    State(state): State<SystemRouterState>,
+    body: Result<Json<EnsureManagedAcpToolRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<EnsureManagedAcpToolResponse>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let result = state
+        .runtime_prepare_service
+        .ensure_managed_acp_tool(req.scope, &req.tool_id)
+        .await?;
     Ok(Json(ApiResponse::ok(result)))
 }

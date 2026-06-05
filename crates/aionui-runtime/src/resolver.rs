@@ -51,14 +51,22 @@ pub fn resolve_bun() -> Result<PathBuf, ResolveError> {
     Ok(resolved)
 }
 
-/// Returns the directory that holds `bun` and `bunx`, if a bundled
-/// runtime was extracted. `None` when no embed + no override was used.
+/// Returns the directory that should be injected for `bun` / `bunx`.
+///
+/// This only reports an explicit `AIONUI_BUN_PATH` override or an extracted
+/// embedded runtime. It must not mirror the ambient system bun directory back
+/// into `PATH`, otherwise bun/bunx regain implicit priority.
 pub fn bun_bin_dir() -> Option<PathBuf> {
     BUN_DIR
         .get_or_init(|| {
-            resolve_with(&ProductionEmbed)
-                .ok()
-                .and_then(|p| p.parent().map(PathBuf::from))
+            env_override().and_then(|p| p.parent().map(PathBuf::from)).or_else(|| {
+                if !ProductionEmbed.has() {
+                    return None;
+                }
+                resolve_with(&ProductionEmbed)
+                    .ok()
+                    .and_then(|p| p.parent().map(PathBuf::from))
+            })
         })
         .clone()
 }

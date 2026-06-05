@@ -8,17 +8,19 @@
 //! - SSE auth probe (M-33 coverage)
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aionui_mcp::McpConnectionTestService;
 use aionui_mcp::McpServerTransport;
+use aionui_realtime::BroadcastEventBus;
 
 fn make_service() -> McpConnectionTestService {
-    McpConnectionTestService::new(reqwest::Client::new())
+    McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)))
 }
 
 fn make_service_with_timeout(timeout: Duration) -> McpConnectionTestService {
-    McpConnectionTestService::new(reqwest::Client::new()).with_timeout(timeout)
+    McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16))).with_timeout(timeout)
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use aionui_api_types::GuideMcpConfig;
 use aionui_common::{AgentType, AppError};
 use aionui_db::{IMcpServerRepository, IProviderRepository, IRemoteAgentRepository};
+use aionui_realtime::EventBroadcaster;
 use futures_util::FutureExt;
 
 use crate::agent_task::AgentInstance;
@@ -32,6 +33,7 @@ pub struct AgentFactoryDeps {
     pub agent_registry: Arc<AgentRegistry>,
     pub acp_agent_service: Arc<AcpSessionSyncService>,
     pub data_dir: PathBuf,
+    pub broadcaster: Arc<dyn EventBroadcaster>,
     /// Absolute path to the backend binary, reused as the `command` of the
     /// stdio MCP bridge injected into ACP `session/new` for team sessions.
     /// Captured once at app startup (`std::env::current_exe()`).

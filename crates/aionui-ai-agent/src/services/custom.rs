@@ -23,6 +23,7 @@ use tracing::warn;
 
 use super::AgentService;
 use crate::protocol::custom_agent_probe::try_connect_custom_agent as probe;
+use crate::runtime_status::custom_agent_runtime_reporter;
 
 const CUSTOM_SORT_ORDER_DEFAULT: i64 = 1500;
 
@@ -37,7 +38,18 @@ impl AgentService {
         if req.command.trim().is_empty() {
             return Err(AppError::BadRequest("command must not be empty".into()));
         }
-        Ok(probe(&req.command, &req.acp_args, &req.env, self.data_dir()).await)
+        let reporter = req
+            .runtime_scope_id
+            .as_ref()
+            .map(|scope_id| custom_agent_runtime_reporter(self.broadcaster().clone(), scope_id.clone()));
+        Ok(probe(
+            &req.command,
+            &req.acp_args,
+            &req.env,
+            self.data_dir(),
+            reporter.as_deref(),
+        )
+        .await)
     }
 
     pub async fn create_custom_agent(&self, req: CustomAgentUpsertRequest) -> Result<AgentMetadata, AppError> {
@@ -215,7 +227,7 @@ async fn probe_or_reject(req: &CustomAgentUpsertRequest, data_dir: &Path) -> Res
     }
 
     let env_map: HashMap<String, String> = req.env.iter().map(|e| (e.name.clone(), e.value.clone())).collect();
-    match probe(&req.command, &req.args, &env_map, data_dir).await {
+    match probe(&req.command, &req.args, &env_map, data_dir, None).await {
         TryConnectCustomAgentResponse::Success => Ok(()),
         TryConnectCustomAgentResponse::FailCli { error } => {
             Err(AppError::BadRequest(format!("cli_not_found: {error}")))

@@ -4,7 +4,7 @@
 //! is spawned** (including the tokio runtime). It rewrites
 //! `std::env::var("PATH")` to include:
 //!
-//! 1. The bundled bun directory (highest priority).
+//! 1. An explicit bun override directory, if configured.
 //! 2. Platform extra bins (`~/.bun/bin`, `~/.cargo/bin`, etc.).
 //! 3. The current `PATH` (inherited from the launching process).
 //! 4. The login-shell `PATH` (Unix only, 3s timeout) — fixes
@@ -38,7 +38,7 @@ pub unsafe fn enhance_process_path() -> String {
         tracing::info!(
             login = login.is_some(),
             extra_bin_count = extras.len(),
-            bun_bundled = bun_dir.is_some(),
+            bun_injected = bun_dir.is_some(),
             original_len = current.len(),
             merged_len = merged.len(),
             "PATH enhanced at startup"

@@ -9,7 +9,9 @@ use anyhow::Result;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use aionui_api_types::{RuntimeStatusScope, RuntimeStatusScopeKind};
 use aionui_app::{AppConfig, AppServices, create_router};
+use aionui_system::RuntimePrepareService;
 
 use crate::bootstrap::ServerEnvironment;
 
@@ -182,6 +184,39 @@ pub(crate) async fn run_server(
     let listener = bound.listener;
     let addr = bound.addr;
     info!(elapsed_ms = boot.elapsed().as_millis(), "Server listening on {addr}");
+
+    let runtime_prepare_service = RuntimePrepareService::new(services.event_bus.clone());
+    tokio::spawn(async move {
+        let scope = RuntimeStatusScope {
+            kind: RuntimeStatusScopeKind::CustomAgent,
+            id: "startup".into(),
+        };
+        let prepare_started = Instant::now();
+        info!("startup: managed runtime background preparation started");
+        let result = async {
+            runtime_prepare_service.ensure_node_runtime(scope.clone()).await?;
+            runtime_prepare_service
+                .ensure_managed_acp_tool(scope.clone(), "codex-acp")
+                .await?;
+            runtime_prepare_service
+                .ensure_managed_acp_tool(scope, "claude-agent-acp")
+                .await?;
+            Ok::<(), aionui_common::AppError>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => info!(
+                prepare_elapsed_ms = prepare_started.elapsed().as_millis(),
+                "startup: managed runtime background preparation completed"
+            ),
+            Err(error) => warn!(
+                prepare_elapsed_ms = prepare_started.elapsed().as_millis(),
+                error = %error,
+                "startup: managed runtime background preparation failed"
+            ),
+        }
+    });
 
     // Kick off the idle-ACP-agent reaper. `start_idle_scanner` returns
     // immediately with a `JoinHandle`; the scanner task polls every 60 s

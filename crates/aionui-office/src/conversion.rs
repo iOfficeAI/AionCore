@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aionui_api_types::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionResponse, ExcelSheetData,
@@ -10,14 +10,26 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::error::OfficeError;
+use crate::officecli_runtime::resolve_officecli_path;
 
 pub struct ConversionService {
     officecli_path: Option<String>,
+    data_dir: Option<PathBuf>,
 }
 
 impl ConversionService {
     pub fn new(officecli_path: Option<String>) -> Self {
-        Self { officecli_path }
+        Self {
+            officecli_path,
+            data_dir: None,
+        }
+    }
+
+    pub fn with_data_dir(officecli_path: Option<String>, data_dir: PathBuf) -> Self {
+        Self {
+            officecli_path,
+            data_dir: Some(data_dir),
+        }
     }
 
     pub async fn convert(
@@ -116,7 +128,7 @@ impl ConversionService {
     async fn ppt_to_json(&self, file_path: &str) -> Result<Value, OfficeError> {
         validate_file_exists(file_path)?;
 
-        let officecli = resolve_officecli(&self.officecli_path).await?;
+        let officecli = resolve_officecli(&self.officecli_path, self.data_dir.as_deref()).await?;
 
         let mut builder = CmdBuilder::clean_cli(&officecli);
         builder.args(["ppt2json", file_path]);
@@ -226,11 +238,17 @@ fn find_executable(name: &str) -> Option<String> {
     which::which(name).ok().map(|p| p.to_string_lossy().into_owned())
 }
 
-async fn resolve_officecli(configured_path: &Option<String>) -> Result<String, OfficeError> {
+async fn resolve_officecli(configured_path: &Option<String>, data_dir: Option<&Path>) -> Result<String, OfficeError> {
     if let Some(path) = configured_path
         && Path::new(path).exists()
     {
         return Ok(path.clone());
+    }
+
+    if let Some(data_dir) = data_dir
+        && let Some(path) = resolve_officecli_path(data_dir)
+    {
+        return Ok(path.to_string_lossy().into_owned());
     }
 
     if let Some(found) = find_executable("officecli") {
@@ -308,9 +326,29 @@ mod tests {
     fn conversion_service_new() {
         let svc = ConversionService::new(None);
         assert!(svc.officecli_path.is_none());
+        assert!(svc.data_dir.is_none());
 
         let svc = ConversionService::new(Some("/usr/local/bin/officecli".into()));
         assert_eq!(svc.officecli_path.as_deref(), Some("/usr/local/bin/officecli"));
+        assert!(svc.data_dir.is_none());
+
+        let svc = ConversionService::with_data_dir(None, PathBuf::from("/tmp/aionui"));
+        assert_eq!(svc.data_dir.as_deref(), Some(Path::new("/tmp/aionui")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_officecli_prefers_managed_prefix_when_available() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed_bin = tmp.path().join("runtime/node/tools/officecli/bin/officecli");
+        std::fs::create_dir_all(managed_bin.parent().unwrap()).unwrap();
+        std::fs::write(&managed_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let resolved = resolve_officecli(&Some("/nonexistent/officecli".into()), Some(tmp.path()))
+            .await
+            .expect("managed officecli");
+
+        assert_eq!(resolved, managed_bin.to_string_lossy());
     }
 
     #[tokio::test]

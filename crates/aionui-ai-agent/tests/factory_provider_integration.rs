@@ -11,6 +11,7 @@ use aionui_db::{
     CreateProviderParams, IAcpSessionRepository, IProviderRepository, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, init_database_memory,
 };
+use aionui_realtime::BroadcastEventBus;
 
 fn test_encryption_key() -> [u8; 32] {
     [0xABu8; 32]
@@ -73,6 +74,7 @@ fn make_factory(
         agent_registry,
         acp_agent_service,
         data_dir: PathBuf::from("/tmp/aionrs-test"),
+        broadcaster: Arc::new(BroadcastEventBus::new(16)),
         backend_binary_path: Arc::new(PathBuf::from("/tmp/aionrs-test/aioncore")),
         guide_mcp_config: None,
         mcp_server_repo: None,

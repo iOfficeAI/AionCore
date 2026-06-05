@@ -472,7 +472,7 @@ fn missing_command_runtime(command: &str) -> &'static str {
 fn command_not_found_message(command: &str) -> String {
     match missing_command_runtime(command) {
         "node" => format!(
-            "Command not found: {command}. Install Node.js (which includes npm/npx), then restart AionUI or configure this MCP server to use an absolute command path."
+            "Command not found: {command}. AionCore usually provisions its managed Node runtime automatically. Retry the connection test, check backend logs if it still fails, or configure this MCP server to use an absolute command path."
         ),
         "bun" => format!(
             "Command not found: {command}. Install Bun (which includes bun/bunx), then restart AionUI or configure this MCP server to use an absolute command path."
@@ -719,7 +719,7 @@ mod tests {
         let result = spawn_error_result("npx", &err);
         let error = result.error.as_deref().unwrap();
         assert!(error.contains("Command not found: npx"));
-        assert!(error.contains("Install Node.js"));
+        assert!(error.contains("managed Node runtime"));
         assert!(error.contains("absolute command path"));
         assert_eq!(result.code, Some(McpConnectionTestErrorCode::CommandNotFound));
         assert_eq!(result.details.as_ref().unwrap()["runtime"], "node");
