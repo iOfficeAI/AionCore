@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.22](https://github.com/iOfficeAI/AionCore/compare/v0.1.21...v0.1.22) (2026-06-05)
+
+
+### Bug Fixes
+
+* **acp:** stabilize mode and model source of truth ([#409](https://github.com/iOfficeAI/AionCore/issues/409)) ([300bb1e](https://github.com/iOfficeAI/AionCore/commit/300bb1eba0c30207918dc9b23a2934f3542d2fe4))
+* **conversation:** align workspace path availability handling ([#410](https://github.com/iOfficeAI/AionCore/issues/410)) ([30bc96b](https://github.com/iOfficeAI/AionCore/commit/30bc96b01632b2107279e81d641dfe020a3af873))
+* **file:** lazy load browse roots ([#406](https://github.com/iOfficeAI/AionCore/issues/406)) ([668c562](https://github.com/iOfficeAI/AionCore/commit/668c5623ffd30243cb0ed72e670eecb578fb22cc))
+* prepare managed acp tools locally without cdn ([#408](https://github.com/iOfficeAI/AionCore/issues/408)) ([2a48ae3](https://github.com/iOfficeAI/AionCore/commit/2a48ae34a498ff0e5bd37d0eedee81d2ea7d0154))
+
+
+### Code Refactoring
+
+* **error:** finish ApiError phase3 ([#398](https://github.com/iOfficeAI/AionCore/issues/398)) ([37523ab](https://github.com/iOfficeAI/AionCore/commit/37523ab628abdfaa29eaf5b0b713cb2251062146))
+
 ## [0.1.21](https://github.com/iOfficeAI/AionCore/compare/v0.1.20...v0.1.21) (2026-06-05)
 
 
