@@ -259,7 +259,7 @@ impl TeamSessionService {
         };
         // Top-level `model` is aionrs-only per spec 2026-05-12; for other
         // agent types the model/provider ride along in `extra`.
-        let (top_level_model, extra) = if agent_type == AgentType::Aionrs {
+        let (top_level_model, mut extra) = if agent_type == AgentType::Aionrs {
             (
                 Some(ProviderWithModel {
                     provider_id,
@@ -282,6 +282,7 @@ impl TeamSessionService {
                 }),
             )
         };
+        inherit_team_workspace(&mut extra, &row.workspace);
         let conv_req = CreateConversationRequest {
             r#type: agent_type,
             name: Some(name.clone()),
