@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.21](https://github.com/iOfficeAI/AionCore/compare/v0.1.20...v0.1.21) (2026-06-05)
+
+
+### Features
+
+* bundle managed node and ACP runtime resources ([#403](https://github.com/iOfficeAI/AionCore/issues/403)) ([6aafd57](https://github.com/iOfficeAI/AionCore/commit/6aafd572178ff4197b7a356db48fea8250d50318))
+
 ## [0.1.20](https://github.com/iOfficeAI/AionCore/compare/v0.1.19...v0.1.20) (2026-06-04)
 
 
