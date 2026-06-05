@@ -114,10 +114,17 @@ async fn setup() -> (ConversationService, Arc<TestBroadcaster>, Arc<dyn IWorkerT
 
 const USER_ID: &str = "system_default_user";
 
+fn ensure_test_workspace_path() -> String {
+    let workspace = std::env::temp_dir().join("aionui-conversation-crud-test-project");
+    std::fs::create_dir_all(&workspace).unwrap();
+    workspace.to_string_lossy().to_string()
+}
+
 fn make_create_req() -> CreateConversationRequest {
+    let workspace = ensure_test_workspace_path();
     serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/home/user/project" }
+        "extra": { "workspace": workspace }
     }))
     .unwrap()
 }
@@ -127,6 +134,7 @@ fn make_create_req() -> CreateConversationRequest {
 #[tokio::test]
 async fn t1_1_create_with_defaults() {
     let (svc, broadcaster, _task_mgr) = setup().await;
+    let workspace = ensure_test_workspace_path();
 
     let resp = svc.create(USER_ID, make_create_req()).await.unwrap();
 
@@ -136,7 +144,7 @@ async fn t1_1_create_with_defaults() {
     assert_eq!(resp.source, Some(ConversationSource::Aionui));
     assert!(!resp.pinned);
     assert!(resp.pinned_at.is_none());
-    assert_eq!(resp.extra["workspace"], "/home/user/project");
+    assert_eq!(resp.extra["workspace"], workspace);
     assert!(resp.created_at > 0);
     assert_eq!(resp.created_at, resp.modified_at);
 
@@ -191,13 +199,14 @@ async fn t1_2_create_each_agent_type() {
 #[tokio::test]
 async fn t1_3_create_with_optional_fields() {
     let (svc, _, _task_mgr) = setup().await;
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "Custom Name",
         "source": "telegram",
         "channel_chat_id": "user:123",
-        "extra": { "workspace": "/path" }
+        "extra": { "workspace": workspace }
     }))
     .unwrap();
     let resp = svc.create(USER_ID, req).await.unwrap();
@@ -398,20 +407,25 @@ async fn t4_3_unpin_clears_pinned_at() {
 #[tokio::test]
 async fn t4_4_extra_merge_preserves_existing_keys() {
     let (svc, _, task_mgr) = setup().await;
+    let dir = std::env::temp_dir().join("aionui-conversation-crud-extra-merge");
+    let old_workspace = dir.join("old-workspace");
+    let new_workspace = dir.join("new-workspace");
+    std::fs::create_dir_all(&old_workspace).unwrap();
+    std::fs::create_dir_all(&new_workspace).unwrap();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/old", "contextFileName": "ctx.md" }
+        "extra": { "workspace": old_workspace.to_string_lossy(), "contextFileName": "ctx.md" }
     }))
     .unwrap();
     let conv = svc.create(USER_ID, req).await.unwrap();
 
     // Update only workspace
     let update_req: UpdateConversationRequest =
-        serde_json::from_value(json!({ "extra": { "workspace": "/new" } })).unwrap();
+        serde_json::from_value(json!({ "extra": { "workspace": new_workspace.to_string_lossy() } })).unwrap();
     let updated = svc.update(USER_ID, &conv.id, update_req, &task_mgr).await.unwrap();
 
-    assert_eq!(updated.extra["workspace"], "/new");
+    assert_eq!(updated.extra["workspace"], new_workspace.to_string_lossy().to_string());
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
 }
 
@@ -545,9 +559,10 @@ async fn t12_1_long_name() {
 #[tokio::test]
 async fn t12_2_large_extra_json() {
     let (svc, _, _task_mgr) = setup().await;
+    let workspace = ensure_test_workspace_path();
 
     let large_extra = json!({
-        "workspace": "/project",
+        "workspace": workspace,
         "nested": {
             "deep": {
                 "array": [1, 2, 3, 4, 5],
@@ -564,7 +579,7 @@ async fn t12_2_large_extra_json() {
     .unwrap();
     let resp = svc.create(USER_ID, req).await.unwrap();
 
-    assert_eq!(resp.extra["workspace"], "/project");
+    assert_eq!(resp.extra["workspace"], workspace);
     assert_eq!(resp.extra["nested"]["deep"]["array"][2], 3);
 }
 
@@ -596,6 +611,8 @@ async fn t12_3_concurrent_creates() {
 #[tokio::test]
 async fn full_lifecycle_create_get_update_delete() {
     let (svc, broadcaster, task_mgr) = setup().await;
+    let updated_workspace = std::env::temp_dir().join("aionui-conversation-crud-updated-workspace");
+    std::fs::create_dir_all(&updated_workspace).unwrap();
 
     // Create
     let created = svc.create(USER_ID, make_create_req()).await.unwrap();
@@ -609,13 +626,16 @@ async fn full_lifecycle_create_get_update_delete() {
     let update_req: UpdateConversationRequest = serde_json::from_value(json!({
         "name": "Updated",
         "pinned": true,
-        "extra": { "workspace": "/updated" }
+        "extra": { "workspace": updated_workspace.to_string_lossy() }
     }))
     .unwrap();
     let updated = svc.update(USER_ID, &created.id, update_req, &task_mgr).await.unwrap();
     assert_eq!(updated.name, "Updated");
     assert!(updated.pinned);
-    assert_eq!(updated.extra["workspace"], "/updated");
+    assert_eq!(
+        updated.extra["workspace"],
+        updated_workspace.to_string_lossy().to_string()
+    );
 
     // Delete
     svc.delete(USER_ID, &created.id).await.unwrap();
@@ -690,12 +710,13 @@ async fn create_accepts_top_level_model_for_aionrs() {
 #[tokio::test]
 async fn create_aionrs_strips_extra_model_field() {
     let (svc, _, _task_mgr) = setup().await;
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "aionrs",
         "model": { "provider_id": "p1", "model": "gpt-4o" },
         "extra": {
-            "workspace": "/home/user/project",
+            "workspace": workspace,
             "model": "bogus-from-legacy-client"
         }
     }))

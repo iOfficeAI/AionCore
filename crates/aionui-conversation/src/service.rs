@@ -1797,7 +1797,7 @@ impl ConversationService {
                 let normalized = match validate_workspace_path_availability(workspace) {
                     Ok(normalized) => normalized,
                     Err(WorkspacePathValidationError::DoesNotExist(path))
-                        if PathBuf::from(workspace) == expected_auto_workspace =>
+                        if expected_auto_workspace.as_path() == std::path::Path::new(workspace) =>
                     {
                         path
                     }
