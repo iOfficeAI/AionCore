@@ -560,6 +560,19 @@ mod tests {
         }
     }
 
+    fn stdio_config_for_existing_command() -> String {
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        serde_json::json!({
+            "command": command,
+            "args": [],
+            "env": {},
+        })
+        .to_string()
+    }
+
     fn path_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -820,6 +833,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_user_mcp_servers_skips_disabled_and_builtin() {
+        let stdio_config = stdio_config_for_existing_command();
         let caps = AcpMcpCapabilities {
             stdio: true,
             http: true,
@@ -827,20 +841,8 @@ mod tests {
         };
         let repo: Arc<dyn IMcpServerRepository> = Arc::new(MockRepo {
             rows: vec![
-                make_row(
-                    "user-enabled",
-                    "stdio",
-                    r#"{"command":"npx","args":[],"env":{}}"#,
-                    true,
-                    false,
-                ),
-                make_row(
-                    "user-disabled",
-                    "stdio",
-                    r#"{"command":"npx","args":[],"env":{}}"#,
-                    false,
-                    false,
-                ),
+                make_row("user-enabled", "stdio", &stdio_config, true, false),
+                make_row("user-disabled", "stdio", &stdio_config, false, false),
                 make_row(
                     "builtin",
                     "stdio",
@@ -876,6 +878,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_user_mcp_servers_skips_malformed_rows_but_keeps_others() {
+        let stdio_config = stdio_config_for_existing_command();
         let caps = AcpMcpCapabilities {
             stdio: true,
             http: true,
@@ -883,7 +886,7 @@ mod tests {
         };
         let repo: Arc<dyn IMcpServerRepository> = Arc::new(MockRepo {
             rows: vec![
-                make_row("good", "stdio", r#"{"command":"npx","args":[],"env":{}}"#, true, false),
+                make_row("good", "stdio", &stdio_config, true, false),
                 make_row("bad", "stdio", "not-json", true, false),
             ],
             fail: false,
@@ -898,6 +901,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_user_mcp_servers_uses_selected_snapshot_over_enabled_state() {
+        let stdio_config = stdio_config_for_existing_command();
         let caps = AcpMcpCapabilities {
             stdio: true,
             http: true,
@@ -905,20 +909,8 @@ mod tests {
         };
         let repo: Arc<dyn IMcpServerRepository> = Arc::new(MockRepo {
             rows: vec![
-                make_row(
-                    "enabled",
-                    "stdio",
-                    r#"{"command":"npx","args":[],"env":{}}"#,
-                    true,
-                    false,
-                ),
-                make_row(
-                    "disabled-picked",
-                    "stdio",
-                    r#"{"command":"uvx","args":[],"env":{}}"#,
-                    false,
-                    false,
-                ),
+                make_row("enabled", "stdio", &stdio_config, true, false),
+                make_row("disabled-picked", "stdio", &stdio_config, false, false),
             ],
             fail: false,
         });
