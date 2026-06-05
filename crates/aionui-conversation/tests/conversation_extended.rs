@@ -115,10 +115,21 @@ async fn setup() -> (
 
 const USER_ID: &str = "system_default_user";
 
+fn ensure_test_workspace_path() -> String {
+    ensure_named_workspace_path("aionui-conversation-extended-test-project")
+}
+
+fn ensure_named_workspace_path(name: &str) -> String {
+    let workspace = std::env::temp_dir().join(name);
+    std::fs::create_dir_all(&workspace).unwrap();
+    workspace.to_string_lossy().to_string()
+}
+
 fn make_create_req() -> CreateConversationRequest {
+    let workspace = ensure_test_workspace_path();
     serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/home/user/project" }
+        "extra": { "workspace": workspace }
     }))
     .unwrap()
 }
@@ -402,6 +413,7 @@ async fn t8_8_get_message_not_found() {
 #[tokio::test]
 async fn t9_1_keyword_match() {
     let (svc, repo, _b) = setup().await;
+    let workspace = ensure_test_workspace_path();
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     repo.insert_message(&make_message(&conv.id, "Rust review report", 0))
@@ -427,7 +439,7 @@ async fn t9_1_keyword_match() {
 
     assert_eq!(item.conversation.id, conv.id);
     assert_eq!(item.conversation.name, conv.name);
-    assert_eq!(item.conversation.extra["workspace"], "/home/user/project");
+    assert_eq!(item.conversation.extra["workspace"], workspace);
 }
 
 #[tokio::test]
@@ -519,13 +531,14 @@ async fn t9_5_preview_text_extracts_from_json_content() {
 #[tokio::test]
 async fn t9_6_search_result_includes_conversation_model() {
     let (svc, repo, _b) = setup().await;
+    let workspace = ensure_test_workspace_path();
 
     // Search surfaces conversation.model only for aionrs (the only type that
     // carries a top-level model under the aionrs-only rule).
     let aionrs_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "aionrs",
         "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" },
-        "extra": { "workspace": "/home/user/project" }
+        "extra": { "workspace": workspace }
     }))
     .unwrap();
     let conv = svc.create(USER_ID, aionrs_req).await.unwrap();
@@ -572,11 +585,13 @@ async fn t9_7_search_does_not_leak_other_users_messages() {
 #[tokio::test]
 async fn t10_1_same_workspace() {
     let (svc, _repo, _b) = setup().await;
+    let shared_workspace = ensure_named_workspace_path("aionui-conversation-extended-shared-workspace");
+    let other_workspace = ensure_named_workspace_path("aionui-conversation-extended-other-workspace");
 
     let req1: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "Conv A",
-        "extra": { "workspace": "/shared/path" }
+        "extra": { "workspace": shared_workspace }
     }))
     .unwrap();
     let conv1 = svc.create(USER_ID, req1).await.unwrap();
@@ -584,7 +599,7 @@ async fn t10_1_same_workspace() {
     let req2: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "Conv B",
-        "extra": { "workspace": "/shared/path" }
+        "extra": { "workspace": shared_workspace }
     }))
     .unwrap();
     let conv2 = svc.create(USER_ID, req2).await.unwrap();
@@ -593,7 +608,7 @@ async fn t10_1_same_workspace() {
     let req3: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "Conv C",
-        "extra": { "workspace": "/other/path" }
+        "extra": { "workspace": other_workspace }
     }))
     .unwrap();
     svc.create(USER_ID, req3).await.unwrap();
@@ -606,10 +621,11 @@ async fn t10_1_same_workspace() {
 #[tokio::test]
 async fn t10_2_no_associated() {
     let (svc, _repo, _b) = setup().await;
+    let workspace = ensure_named_workspace_path("aionui-conversation-extended-unique-workspace");
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/unique/path" }
+        "extra": { "workspace": workspace }
     }))
     .unwrap();
     let conv = svc.create(USER_ID, req).await.unwrap();
