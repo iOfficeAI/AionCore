@@ -1116,19 +1116,20 @@ async fn delete_wrong_user_returns_not_found() {
 #[tokio::test]
 async fn clone_without_source_creates_new() {
     let (svc, broadcaster, _repo, _task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     let req: CloneConversationRequest = serde_json::from_value(json!({
         "conversation": {
             "type": "acp",
             "name": "Cloned",
-            "extra": { "workspace": "/new" }
+            "extra": { "workspace": workspace }
         }
     }))
     .unwrap();
 
     let resp = svc.clone_create("user_1", req).await.unwrap();
     assert_eq!(resp.name, "Cloned");
-    assert_eq!(resp.extra["workspace"], "/new");
+    assert_eq!(resp.extra["workspace"], workspace);
 
     let events = broadcaster.take_events();
     assert_eq!(events.len(), 1);

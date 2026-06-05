@@ -48,12 +48,13 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     );
     let task_mgr = Arc::new(MockTaskManager::new());
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let workspace = ensure_test_workspace_path();
     repo.update(
         &conv.id,
         &ConversationRowUpdate {
             extra: Some(
                 serde_json::to_string(&json!({
-                    "workspace": "/project",
+                    "workspace": workspace,
                     "current_model_id": "deepseek-v4-pro",
                 }))
                 .unwrap(),
