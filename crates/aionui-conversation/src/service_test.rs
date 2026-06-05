@@ -898,20 +898,28 @@ async fn update_unpin_clears_pinned_at() {
 #[tokio::test]
 async fn update_extra_merge() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let dir = std::env::temp_dir().join(format!(
+        "aionui-conversation-update-extra-merge-{}",
+        aionui_common::generate_short_id()
+    ));
+    let old_workspace = dir.join("old-workspace");
+    let new_workspace = dir.join("new-workspace");
+    std::fs::create_dir_all(&old_workspace).unwrap();
+    std::fs::create_dir_all(&new_workspace).unwrap();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/old", "contextFileName": "ctx.md" }
+        "extra": { "workspace": old_workspace.to_string_lossy(), "contextFileName": "ctx.md" }
     }))
     .unwrap();
     let conv = svc.create("user_1", req).await.unwrap();
 
     // Update only workspace — contextFileName should be preserved
     let update_req: UpdateConversationRequest =
-        serde_json::from_value(json!({ "extra": { "workspace": "/new" } })).unwrap();
+        serde_json::from_value(json!({ "extra": { "workspace": new_workspace.to_string_lossy() } })).unwrap();
     let updated = svc.update("user_1", &conv.id, update_req, &task_mgr).await.unwrap();
 
-    assert_eq!(updated.extra["workspace"], "/new");
+    assert_eq!(updated.extra["workspace"], new_workspace.to_string_lossy().to_string());
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
 }
 
