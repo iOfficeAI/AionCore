@@ -2982,10 +2982,11 @@ async fn update_rejects_extra_skills() {
 #[tokio::test]
 async fn update_rejects_acp_runtime_current_extra_fields() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/project", "backend": "claude" },
+        "extra": { "workspace": workspace, "backend": "claude" },
     }))
     .unwrap();
     let resp = svc.create("u", req).await.unwrap();
