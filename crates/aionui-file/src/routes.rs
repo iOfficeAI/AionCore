@@ -2,7 +2,8 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Json, Multipart, Query, State};
 use axum::routing::{get, post};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use aionui_api_types::{
@@ -39,6 +40,42 @@ impl From<FileError> for AppError {
 // Router state
 // ---------------------------------------------------------------------------
 
+type BrowseRootsResolver = dyn Fn() -> Vec<PathBuf> + Send + Sync;
+
+/// Lazily resolves roots for the shallow `/api/fs/browse` endpoint.
+#[derive(Clone)]
+pub struct BrowseRoots {
+    roots: Arc<OnceLock<Vec<PathBuf>>>,
+    resolver: Arc<BrowseRootsResolver>,
+}
+
+impl BrowseRoots {
+    pub fn new() -> Self {
+        Self {
+            roots: Arc::new(OnceLock::new()),
+            resolver: Arc::new(browse::default_browse_roots),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_resolver(resolver: impl Fn() -> Vec<PathBuf> + Send + Sync + 'static) -> Self {
+        Self {
+            roots: Arc::new(OnceLock::new()),
+            resolver: Arc::new(resolver),
+        }
+    }
+
+    fn get(&self) -> Vec<PathBuf> {
+        self.roots.get_or_init(|| (self.resolver)()).clone()
+    }
+}
+
+impl Default for BrowseRoots {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared state for all file-related route handlers.
 #[derive(Clone)]
 pub struct FileRouterState {
@@ -50,7 +87,7 @@ pub struct FileRouterState {
     /// typically wider than `allowed_roots` (it includes `cwd`, Windows
     /// drive letters, and `/` on Unix) because the WebUI host-file picker
     /// legitimately needs to reach outside any single workspace.
-    pub browse_roots: Vec<std::path::PathBuf>,
+    pub browse_roots: BrowseRoots,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,11 +162,14 @@ async fn browse_directory(
 ) -> Result<Json<ApiResponse<BrowseDirectoryResponse>>, AppError> {
     let show_files = matches!(query.show_files.as_deref(), Some("true") | Some("1"));
     let raw_path = query.path.clone();
-    let roots = state.browse_roots.clone();
+    let browse_roots = state.browse_roots.clone();
 
-    let response = tokio::task::spawn_blocking(move || browse::browse(raw_path.as_deref(), show_files, &roots))
-        .await
-        .map_err(|e| AppError::Internal(format!("browse task failed: {}", e)))??;
+    let response = tokio::task::spawn_blocking(move || {
+        let roots = browse_roots.get();
+        browse::browse(raw_path.as_deref(), show_files, &roots)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("browse task failed: {}", e)))??;
 
     Ok(Json(ApiResponse::ok(response)))
 }
@@ -664,6 +704,29 @@ fn to_compare_response(r: CompareResult) -> SnapshotCompareResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn browse_roots_are_resolved_lazily() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let roots = BrowseRoots::with_resolver({
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                vec![std::env::current_dir().unwrap()]
+            }
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let first = roots.get();
+        let second = roots.get();
+
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn dir_or_file_response_conversion_file() {

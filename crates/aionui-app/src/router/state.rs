@@ -23,7 +23,7 @@ use aionui_extension::{
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
-use aionui_file::{FileRouterState, FileService, FileWatchService, SnapshotService};
+use aionui_file::{BrowseRoots, FileRouterState, FileService, FileWatchService, SnapshotService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -88,6 +88,22 @@ fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::P
     }
     roots
 }
+
+fn build_module_state_phase<T>(boot: &Instant, phase: &'static str, build: impl FnOnce() -> T) -> T {
+    tracing::info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        phase,
+        "startup: module state phase started"
+    );
+    let value = build();
+    tracing::info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        phase,
+        "startup: module state phase completed"
+    );
+    value
+}
+
 /// Components needed to start the channel orchestrator.
 ///
 /// Returned alongside `ChannelRouterState` by `build_channel_state`.
@@ -165,29 +181,33 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
         "startup: module states bundle started"
     );
     let states = ModuleStates {
-        system: build_system_state(services),
-        conversation: build_conversation_state(services, Some(cron.cron_service.clone())),
-        remote_agent: build_remote_agent_state(services),
-        agent: AgentRouterState {
+        system: build_module_state_phase(&boot, "system", || build_system_state(services)),
+        conversation: build_module_state_phase(&boot, "conversation", || {
+            build_conversation_state(services, Some(cron.cron_service.clone()))
+        }),
+        remote_agent: build_module_state_phase(&boot, "remote_agent", || build_remote_agent_state(services)),
+        agent: build_module_state_phase(&boot, "agent", || AgentRouterState {
             agent_registry: services.agent_registry.clone(),
             service: agent_service,
-        },
-        connection_test: build_connection_test_state(),
-        file: build_file_state(services),
-        mcp: build_mcp_state(services),
+        }),
+        connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
+        file: build_module_state_phase(&boot, "file", || build_file_state(services)),
+        mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
         skill: skill_state,
         channel: channel_state,
-        team: build_team_state(
-            services,
-            Some(cron.cron_service.clone()),
-            backend_binary_path.clone(),
-            services.guide_mcp_config.clone(),
-        ),
+        team: build_module_state_phase(&boot, "team", || {
+            build_team_state(
+                services,
+                Some(cron.cron_service.clone()),
+                backend_binary_path.clone(),
+                services.guide_mcp_config.clone(),
+            )
+        }),
         cron,
-        office: build_office_state(services),
-        shell: build_shell_state(services),
+        office: build_module_state_phase(&boot, "office", || build_office_state(services)),
+        shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
     };
     tracing::info!(
@@ -302,7 +322,7 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 pub fn build_file_state(services: &AppServices) -> FileRouterState {
     let broadcaster = services.event_bus.clone();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
-    let browse_roots = aionui_file::browse::default_browse_roots();
+    let browse_roots = BrowseRoots::new();
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
     let watch_service = Arc::new(FileWatchService::new(broadcaster).expect("file watch service initialization"));
     let snapshot_service = Arc::new(SnapshotService::new());
