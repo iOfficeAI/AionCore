@@ -106,7 +106,10 @@ pub async fn install_and_validate_with_reporter(
         }
     }
 
-    if let Some(runtime) = activate_local_runtime_source(&runtime_root, spec, reporter).await? {
+    if let Some(runtime) = activate_local_runtime_source(&runtime_root, spec, reporter)
+        .await
+        .map_err(|error| install_error(error, reporter))?
+    {
         emit_progress(
             reporter,
             NodeRuntimeProgress::ready(format!(
@@ -901,6 +904,40 @@ mod tests {
 
         assert_eq!(kind, NodeRuntimeFailureKind::BundledResourceMissing);
         assert_eq!(status, None);
+    }
+
+    #[tokio::test]
+    async fn bundled_runtime_missing_reports_bundled_resource_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundled_root = tmp.path().join("bundled");
+        if !crate::test_support::run_in_env_child(
+            "node_runtime::managed::tests::bundled_runtime_missing_reports_bundled_resource_missing",
+            |command| {
+                command.env("AIONUI_BUNDLED_MANAGED_RESOURCES", &bundled_root);
+            },
+        ) {
+            return;
+        }
+
+        crate::cache::init(tmp.path().join("data"));
+        managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Bundled);
+
+        let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reporter_updates = updates.clone();
+        let reporter = move |update: NodeRuntimeProgress| {
+            reporter_updates.lock().unwrap().push(update);
+        };
+
+        let result = install_and_validate_with_reporter(Some(&reporter)).await;
+        managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Download);
+
+        let error = result.expect_err("missing bundled runtime should fail");
+        assert!(error.to_string().contains("bundled Node runtime missing"));
+        let updates = updates.lock().unwrap();
+        assert!(updates.iter().any(|update| {
+            update.phase == crate::NodeRuntimeProgressPhase::Failed
+                && update.failure_kind == Some(NodeRuntimeFailureKind::BundledResourceMissing)
+        }));
     }
 
     #[test]
