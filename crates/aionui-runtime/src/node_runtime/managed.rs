@@ -794,6 +794,18 @@ fn classify_error(error: &NodeRuntimeError) -> (NodeRuntimeFailureKind, Option<u
     if message.contains("unsupported") {
         return (NodeRuntimeFailureKind::UnsupportedPlatform, None);
     }
+    if message.contains("bundled node runtime missing")
+        || message.contains("bundled managed resources root unavailable")
+    {
+        return (NodeRuntimeFailureKind::BundledResourceMissing, None);
+    }
+    if message.contains("bundled node runtime is invalid") || message.contains("bundled node runtime failed validation")
+    {
+        return (NodeRuntimeFailureKind::BundledResourceInvalid, None);
+    }
+    if message.contains("checksum mismatch") {
+        return (NodeRuntimeFailureKind::ChecksumMismatch, None);
+    }
     if message.contains("validate") || message.contains("executable missing") || message.contains("entrypoint missing")
     {
         return (NodeRuntimeFailureKind::ValidationFailed, None);
@@ -878,6 +890,17 @@ mod tests {
         let support = probe_support();
         let expected = cfg!(target_os = "macos") || cfg!(target_os = "linux") || cfg!(windows);
         assert_eq!(support.supported, expected);
+    }
+
+    #[test]
+    fn classify_error_detects_bundled_node_runtime_missing() {
+        let err = NodeRuntimeError::managed_invalid(
+            "bundled Node runtime missing under C:\\Program Files\\AionUi\\resources\\bundled-aioncore\\win32-x64\\managed-resources\\node\\node-v24.11.0-win-x64",
+        );
+        let (kind, status) = classify_error(&err);
+
+        assert_eq!(kind, NodeRuntimeFailureKind::BundledResourceMissing);
+        assert_eq!(status, None);
     }
 
     #[test]

@@ -113,6 +113,8 @@ pub enum ManagedAcpToolFailureKind {
     ChecksumMismatch,
     ValidationFailed,
     UnsupportedPlatform,
+    BundledResourceMissing,
+    BundledResourceInvalid,
     Unknown,
 }
 

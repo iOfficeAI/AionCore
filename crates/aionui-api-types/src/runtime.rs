@@ -41,6 +41,8 @@ pub enum RuntimeFailureKind {
     ChecksumMismatch,
     ValidationFailed,
     UnsupportedPlatform,
+    BundledResourceMissing,
+    BundledResourceInvalid,
     Unknown,
 }
 
@@ -104,6 +106,15 @@ mod tests {
         assert_eq!(json["scope"]["kind"], "conversation");
         assert_eq!(json["phase"], "downloading");
         assert_eq!(json["message"], "downloading");
+    }
+
+    #[test]
+    fn bundled_runtime_failure_kind_serializes_as_snake_case() {
+        let missing = serde_json::to_value(RuntimeFailureKind::BundledResourceMissing).unwrap();
+        let invalid = serde_json::to_value(RuntimeFailureKind::BundledResourceInvalid).unwrap();
+
+        assert_eq!(missing, "bundled_resource_missing");
+        assert_eq!(invalid, "bundled_resource_invalid");
     }
 
     #[test]

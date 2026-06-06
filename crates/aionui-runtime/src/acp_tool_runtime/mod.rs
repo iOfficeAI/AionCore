@@ -718,6 +718,15 @@ fn classify_error(error: &ManagedAcpToolError) -> (ManagedAcpToolFailureKind, Op
     if message.contains("unsupported") {
         return (ManagedAcpToolFailureKind::UnsupportedPlatform, None);
     }
+    if message.contains("bundled managed") && message.contains("artifact missing") {
+        return (ManagedAcpToolFailureKind::BundledResourceMissing, None);
+    }
+    if message.contains("bundled managed") && message.contains("artifact failed validation") {
+        return (ManagedAcpToolFailureKind::BundledResourceInvalid, None);
+    }
+    if message.contains("bundled managed") && message.contains("artifact is invalid") {
+        return (ManagedAcpToolFailureKind::BundledResourceInvalid, None);
+    }
     if message.contains("checksum mismatch") {
         return (ManagedAcpToolFailureKind::ChecksumMismatch, None);
     }
@@ -786,6 +795,17 @@ mod tests {
         let error = ManagedAcpToolError::invalid("managed ACP archive checksum mismatch");
         let (kind, status_code) = classify_error(&error);
         assert_eq!(kind, ManagedAcpToolFailureKind::ChecksumMismatch);
+        assert_eq!(status_code, None);
+    }
+
+    #[test]
+    fn classify_error_detects_bundled_acp_validation_failure() {
+        let error = ManagedAcpToolError::invalid(
+            "bundled managed Codex ACP artifact failed validation under /app/resources/managed-resources/acp/codex-acp/0.14.0/linux-x64: managed ACP entrypoint missing",
+        );
+        let (kind, status_code) = classify_error(&error);
+
+        assert_eq!(kind, ManagedAcpToolFailureKind::BundledResourceInvalid);
         assert_eq!(status_code, None);
     }
 

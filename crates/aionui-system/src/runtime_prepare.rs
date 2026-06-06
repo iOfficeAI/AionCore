@@ -108,8 +108,11 @@ fn map_failure_kind(kind: NodeRuntimeFailureKind) -> RuntimeFailureKind {
         NodeRuntimeFailureKind::Timeout => RuntimeFailureKind::Timeout,
         NodeRuntimeFailureKind::DownloadFailed => RuntimeFailureKind::DownloadFailed,
         NodeRuntimeFailureKind::HttpStatus => RuntimeFailureKind::HttpStatus,
+        NodeRuntimeFailureKind::ChecksumMismatch => RuntimeFailureKind::ChecksumMismatch,
         NodeRuntimeFailureKind::ValidationFailed => RuntimeFailureKind::ValidationFailed,
         NodeRuntimeFailureKind::UnsupportedPlatform => RuntimeFailureKind::UnsupportedPlatform,
+        NodeRuntimeFailureKind::BundledResourceMissing => RuntimeFailureKind::BundledResourceMissing,
+        NodeRuntimeFailureKind::BundledResourceInvalid => RuntimeFailureKind::BundledResourceInvalid,
         NodeRuntimeFailureKind::Unknown => RuntimeFailureKind::Unknown,
     }
 }
@@ -133,6 +136,8 @@ fn map_acp_failure_kind(kind: ManagedAcpToolFailureKind) -> RuntimeFailureKind {
         ManagedAcpToolFailureKind::ChecksumMismatch => RuntimeFailureKind::ChecksumMismatch,
         ManagedAcpToolFailureKind::ValidationFailed => RuntimeFailureKind::ValidationFailed,
         ManagedAcpToolFailureKind::UnsupportedPlatform => RuntimeFailureKind::UnsupportedPlatform,
+        ManagedAcpToolFailureKind::BundledResourceMissing => RuntimeFailureKind::BundledResourceMissing,
+        ManagedAcpToolFailureKind::BundledResourceInvalid => RuntimeFailureKind::BundledResourceInvalid,
         ManagedAcpToolFailureKind::Unknown => RuntimeFailureKind::Unknown,
     }
 }
