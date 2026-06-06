@@ -179,8 +179,10 @@ async fn unauthenticated_get_servers_rejected() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    // CSRF middleware rejects before auth can run
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // GET bypasses CSRF; auth middleware returns the canonical auth boundary.
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -217,12 +219,12 @@ async fn authenticated_access_succeeds() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-// AU-2: Invalid Bearer token is rejected by auth middleware (403 per API spec)
+// AU-2: Invalid Bearer token is rejected by auth middleware.
 #[tokio::test]
 async fn invalid_token_rejected() {
     let (app, _services) = build_app().await;
 
-    // GET bypasses CSRF → auth middleware sees invalid Bearer → 403
+    // GET bypasses CSRF; auth middleware sees invalid Bearer.
     let req = axum::http::Request::builder()
         .method("GET")
         .uri("/api/mcp/servers")
@@ -230,5 +232,7 @@ async fn invalid_token_rejected() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }

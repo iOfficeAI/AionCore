@@ -62,6 +62,35 @@ async fn unknown_route_returns_not_found() {
         .expect("request failed");
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let json = response_json(response.into_body()).await;
+    assert_eq!(json["success"], false);
+    assert_eq!(json["code"], "NOT_FOUND");
+    assert!(json["error"].is_string());
+}
+
+#[tokio::test]
+async fn default_body_limit_returns_error_response() {
+    let app = build_app().await;
+
+    let body = format!(
+        r#"{{"username":"admin","password":"{}"}}"#,
+        "x".repeat(11 * 1024 * 1024)
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/login")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .expect("failed to build request");
+
+    let response = app.oneshot(request).await.expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let json = response_json(response.into_body()).await;
+    assert_eq!(json["success"], false);
+    assert_eq!(json["code"], "PAYLOAD_TOO_LARGE");
+    assert!(json["error"].is_string());
 }
 
 #[tokio::test]

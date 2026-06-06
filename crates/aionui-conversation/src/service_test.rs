@@ -1057,8 +1057,10 @@ async fn delete_invokes_registered_hook_before_row_delete() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     svc.delete("user_1", &conv.id).await.unwrap();
 
-    let observations = hook.observations.lock().unwrap();
-    assert_eq!(observations.as_slice(), &[true]);
+    {
+        let observations = hook.observations.lock().unwrap();
+        assert_eq!(observations.as_slice(), &[true]);
+    }
     assert!(repo.get(&conv.id).await.unwrap().is_none());
 }
 

@@ -1,5 +1,6 @@
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use serde_json::Value;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -44,7 +45,10 @@ async fn test_non_local_mode_requires_auth() {
         .oneshot(Request::builder().uri("/api/settings").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "UNAUTHORIZED");
 
     services.database.close().await;
 }

@@ -16,6 +16,15 @@ fn new_client_tx() -> (mpsc::Sender<WsOutbound>, mpsc::Receiver<WsOutbound>) {
     mpsc::channel(PER_CONNECTION_BUFFER)
 }
 
+fn assert_realtime_auth_expired(text: &str) {
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["name"], "realtime.error");
+    assert_eq!(parsed["data"]["code"], "REALTIME_AUTH_EXPIRED");
+    assert!(parsed["data"]["message"].is_string());
+    assert_eq!(parsed["data"]["recoverable"], false);
+    assert!(parsed["data"]["details"].is_object());
+}
+
 // --- Connection lifecycle ---
 
 #[test]
@@ -192,31 +201,20 @@ async fn heartbeat_closes_expired_token_with_auth_expired_event() {
     let expired_validator: TokenValidator = Arc::new(|_| false);
     let handle = mgr.start_heartbeat(expired_validator);
 
-    // Expect auth-expired event
+    // Expect realtime auth-expired event and close as one terminal outbound.
     let msg1 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("timeout")
         .expect("closed");
 
     match msg1 {
-        WsOutbound::Text(text) => {
-            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(parsed["name"], "auth-expired");
-            assert!(parsed["data"]["message"].is_string());
+        WsOutbound::TextThenClose(text, code, reason) => {
+            assert_realtime_auth_expired(&text);
+            assert_eq!(code, WebSocketCloseCode::PolicyViolation);
+            assert_eq!(reason, "token expired");
         }
-        other => panic!("expected auth-expired, got {other:?}"),
+        other => panic!("expected realtime auth-expired terminal message, got {other:?}"),
     }
-
-    // Expect close frame
-    let msg2 = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-        .await
-        .expect("timeout")
-        .expect("closed");
-
-    assert_eq!(
-        msg2,
-        WsOutbound::Close(WebSocketCloseCode::PolicyViolation, "token expired".into())
-    );
 
     // Connection should be removed
     assert_eq!(mgr.client_count(), 0);

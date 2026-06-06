@@ -28,7 +28,9 @@ impl From<OfficeError> for ApiError {
             OfficeError::OfficecliNotFound => ApiError::BadRequest("officecli not found".into()),
             OfficeError::InstallFailed(msg) => ApiError::Internal(format!("officecli install failed: {msg}")),
             OfficeError::StartFailed(msg) => ApiError::Internal(format!("preview start failed: {msg}")),
-            OfficeError::PortTimeout(path) => ApiError::Timeout(format!("port readiness timeout for {path}")),
+            OfficeError::PortTimeout(path) => {
+                ApiError::Internal(format!("preview service readiness timeout for {path}"))
+            }
             OfficeError::Io(e) => ApiError::Internal(format!("IO error: {e}")),
             OfficeError::Snapshot(msg) => ApiError::Internal(format!("snapshot error: {msg}")),
             OfficeError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
@@ -135,7 +137,7 @@ async fn start_preview(
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
     let validated_path = validated_path.to_string_lossy().into_owned();
 
@@ -160,7 +162,7 @@ async fn stop_preview(
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.watch_manager.stop(&req.file_path, doc_type).await;
     Ok(Json(ApiResponse::success()))
 }
@@ -172,7 +174,7 @@ async fn list_snapshots(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<ListSnapshotsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<PreviewSnapshotInfoDto>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let snapshots = state.snapshot_service.list(&req.target).await?;
     Ok(Json(ApiResponse::ok(snapshots)))
 }
@@ -182,7 +184,7 @@ async fn save_snapshot(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<SaveSnapshotRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewSnapshotInfoDto>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let info = state.snapshot_service.save(&req.target, &req.content).await?;
     Ok(Json(ApiResponse::ok(info)))
 }
@@ -192,7 +194,7 @@ async fn get_snapshot_content(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<GetSnapshotContentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<SnapshotContentResponse>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .snapshot_service
         .get_content(&req.target, &req.snapshot_id)
@@ -207,7 +209,7 @@ async fn detect_star_office(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<DetectStarOfficeRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<StarOfficeDetectResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let url = state
         .star_office_detector
         .detect(req.preferred_url.as_deref(), req.force.unwrap_or(false), req.timeout_ms)
@@ -222,7 +224,7 @@ async fn convert_document(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<DocumentConversionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<aionui_api_types::DocumentConversionResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
     let resp = state
         .conversion_service
@@ -245,6 +247,15 @@ fn file_error_to_api_error(error: FileError) -> ApiError {
     match error {
         FileError::BadRequest(message) => ApiError::BadRequest(message),
         FileError::Forbidden(message) => ApiError::Forbidden(message),
+        FileError::PathOutsideSandbox {
+            message,
+            field,
+            operation,
+        } => ApiError::PathOutsideSandbox {
+            message,
+            field,
+            operation,
+        },
         FileError::NotFound(message) => ApiError::NotFound(message),
         FileError::Internal(message) => ApiError::Internal(message),
     }
@@ -336,6 +347,8 @@ async fn proxy_forward(
 mod tests {
     use std::sync::Arc;
 
+    use aionui_file::FileError;
+
     use crate::conversion::ConversionService;
     use crate::error::OfficeError;
     use crate::proxy::{ProxyError, ProxyService};
@@ -345,7 +358,7 @@ mod tests {
     use crate::types::DocType;
     use crate::watch_manager::{OfficecliWatchManager, ProcessHandle, ProcessSpawner};
 
-    use super::{ApiError, office_proxy_routes, office_routes};
+    use super::{ApiError, file_error_to_api_error, office_proxy_routes, office_routes};
 
     #[test]
     fn office_routes_builds_without_panic() {
@@ -378,9 +391,9 @@ mod tests {
     }
 
     #[test]
-    fn port_timeout_maps_to_timeout() {
+    fn port_timeout_maps_to_internal() {
         let err = ApiError::from(OfficeError::PortTimeout("/a.docx".into()));
-        assert!(matches!(err, ApiError::Timeout(msg) if msg.contains("/a.docx")));
+        assert!(matches!(err, ApiError::Internal(msg) if msg.contains("/a.docx")));
     }
 
     #[test]
@@ -394,6 +407,24 @@ mod tests {
     fn conversion_error_maps_to_internal() {
         let err = ApiError::from(OfficeError::Conversion("bad format".into()));
         assert!(matches!(err, ApiError::Internal(msg) if msg.contains("bad format")));
+    }
+
+    #[test]
+    fn file_path_outside_sandbox_maps_to_explicit_api_code() {
+        let err = file_error_to_api_error(FileError::PathOutsideSandbox {
+            message: "path is outside allowed roots".into(),
+            field: Some("file_path"),
+            operation: Some("preview"),
+        });
+
+        assert!(matches!(
+            err,
+            ApiError::PathOutsideSandbox {
+                message,
+                field: Some("file_path"),
+                operation: Some("preview"),
+            } if message == "path is outside allowed roots"
+        ));
     }
 
     #[test]

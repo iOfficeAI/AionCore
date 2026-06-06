@@ -294,7 +294,9 @@ async fn t13_3_no_token_fails() {
     let req = get_request("/api/auth/user");
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ===========================================================================
@@ -406,7 +408,9 @@ async fn full_auth_flow_e2e() {
     // 6. Old token invalidated after password change
     let req = get_with_token("/api/auth/user", &token);
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 
     // 7. Login with new password
     let req = post_json_login("/login", r#"{"username":"admin","password":"Updated@Pass2"}"#);
@@ -423,7 +427,9 @@ async fn full_auth_flow_e2e() {
     // 9. Token invalid after logout
     let req = get_with_token("/api/auth/user", &new_token);
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ===========================================================================

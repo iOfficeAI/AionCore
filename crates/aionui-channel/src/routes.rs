@@ -299,7 +299,7 @@ async fn enable_plugin(
     State(state): State<ChannelRouterState>,
     body: Result<Json<EnablePluginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &req.plugin_id).await {
         let config = build_extension_config(&extension_plugin, &req.config)?;
@@ -352,7 +352,7 @@ async fn disable_plugin(
     State(state): State<ChannelRouterState>,
     body: Result<Json<DisablePluginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     if resolve_extension_channel_plugin(&state, &req.plugin_id).await.is_some()
         && state
@@ -391,7 +391,7 @@ async fn test_plugin(
     State(state): State<ChannelRouterState>,
     body: Result<Json<TestPluginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TestPluginResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &req.plugin_id).await {
         let _config = build_extension_test_config(&extension_plugin, &req)?;
@@ -450,7 +450,7 @@ async fn approve_pairing(
     State(state): State<ChannelRouterState>,
     body: Result<Json<ApprovePairingRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     state.pairing_service.approve_pairing(&req.code).await?;
 
@@ -466,7 +466,7 @@ async fn reject_pairing(
     State(state): State<ChannelRouterState>,
     body: Result<Json<RejectPairingRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     state.pairing_service.reject_pairing(&req.code).await?;
 
@@ -507,7 +507,7 @@ async fn revoke_user(
     State(state): State<ChannelRouterState>,
     body: Result<Json<RevokeUserRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     // Clean up sessions first
     state.session_manager.cleanup_user_sessions(&req.user_id).await?;
@@ -564,7 +564,7 @@ async fn sync_channel_settings(
     State(state): State<ChannelRouterState>,
     body: Result<Json<SyncChannelSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     let _platform = PluginType::from_str_opt(&req.platform)
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", req.platform)))?;

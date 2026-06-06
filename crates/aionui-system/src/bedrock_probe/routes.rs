@@ -39,7 +39,7 @@ async fn test_bedrock(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<TestBedrockConnectionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .service
         .test_bedrock_connection(req.bedrock_config)

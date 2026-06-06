@@ -137,7 +137,7 @@ async fn list_builtin_auto_skills(
 async fn read_skill_info(
     body: Result<Json<ReadSkillInfoRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ReadSkillInfoResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let (name, description) = skill_service::read_skill_info(Path::new(&req.skill_path)).await?;
     Ok(Json(ApiResponse::ok(ReadSkillInfoResponse { name, description })))
 }
@@ -162,7 +162,7 @@ async fn import_skill(
     State(state): State<SkillRouterState>,
     body: Result<Json<ImportSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let name = skill_service::import_skill(&state.skill_paths, Path::new(&req.skill_path)).await?;
     Ok(Json(ApiResponse::ok(ImportSkillResponse {
         skill_name: name.clone(),
@@ -175,7 +175,7 @@ async fn import_skill_symlink(
     State(state): State<SkillRouterState>,
     body: Result<Json<ImportSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let names = skill_service::import_skills_with_symlink(&state.skill_paths, Path::new(&req.skill_path)).await?;
     let first_name = names.first().cloned().unwrap_or_default();
     Ok(Json(ApiResponse::ok(ImportSkillResponse {
@@ -188,7 +188,7 @@ async fn import_skill_symlink(
 async fn export_skill_symlink(
     body: Result<Json<ExportSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     skill_service::export_skill_with_symlink(Path::new(&req.skill_path), Path::new(&req.target_dir)).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -210,7 +210,7 @@ async fn delete_skill(
 async fn scan_for_skills(
     body: Result<Json<ScanForSkillsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ScanForSkillsResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let skills = skill_service::scan_for_skills(Path::new(&req.folder_path)).await?;
     let resp = ScanForSkillsResponse {
         skills: skills
@@ -274,7 +274,7 @@ async fn read_builtin_rule(
     State(state): State<SkillRouterState>,
     body: Result<Json<ReadBuiltinResourceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let content = skill_service::read_builtin_rule(&state.skill_paths, &req.file_name).await?;
     Ok(Json(ApiResponse::ok(content)))
 }
@@ -284,7 +284,7 @@ async fn read_builtin_skill(
     State(state): State<SkillRouterState>,
     body: Result<Json<ReadBuiltinResourceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let content = skill_service::read_builtin_skill(&state.skill_paths, &req.file_name).await?;
     Ok(Json(ApiResponse::ok(content)))
 }
@@ -297,7 +297,7 @@ async fn materialize_for_agent(
     State(state): State<SkillRouterState>,
     body: Result<Json<MaterializeSkillsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<MaterializeSkillsResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     if req.conversation_id.trim().is_empty() {
         return Err(ApiError::BadRequest("conversationId must not be empty".into()));
     }
@@ -325,7 +325,7 @@ async fn read_assistant_rule(
     State(state): State<SkillRouterState>,
     body: Result<Json<ReadAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         let content = dispatcher.read_rule(&req.assistant_id, req.locale.as_deref()).await?;
         return Ok(Json(ApiResponse::ok(content)));
@@ -342,7 +342,7 @@ async fn write_assistant_rule(
     State(state): State<SkillRouterState>,
     body: Result<Json<WriteAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         dispatcher
             .write_rule(&req.assistant_id, req.locale.as_deref(), &req.content)
@@ -383,7 +383,7 @@ async fn read_assistant_skill(
     State(state): State<SkillRouterState>,
     body: Result<Json<ReadAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         let content = dispatcher.read_skill(&req.assistant_id, req.locale.as_deref()).await?;
         return Ok(Json(ApiResponse::ok(content)));
@@ -400,7 +400,7 @@ async fn write_assistant_skill(
     State(state): State<SkillRouterState>,
     body: Result<Json<WriteAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         dispatcher
             .write_skill(&req.assistant_id, req.locale.as_deref(), &req.content)
@@ -454,7 +454,7 @@ async fn add_external_path(
     State(state): State<SkillRouterState>,
     body: Result<Json<AddExternalPathRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .external_paths_manager
         .add_custom_external_path(&req.name, &req.path)
@@ -467,7 +467,7 @@ async fn remove_external_path(
     State(state): State<SkillRouterState>,
     body: Result<Json<RemoveExternalPathRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .external_paths_manager
         .remove_custom_external_path(&req.path)

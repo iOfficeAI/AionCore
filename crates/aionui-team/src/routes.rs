@@ -78,7 +78,7 @@ async fn create_team(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateTeamRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<TeamResponse>>), ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let team = state.service.create_team(&user.id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(team))))
 }
@@ -110,7 +110,7 @@ async fn rename_team(
     Path(id): Path<String>,
     body: Result<Json<RenameTeamRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.service.rename_team(&id, &req.name).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -127,7 +127,7 @@ async fn add_agent(
     Path(id): Path<String>,
     body: Result<Json<AddAgentRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<TeamAgentResponse>>), ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let agent = state.service.add_agent(&user.id, &id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(agent))))
 }
@@ -149,7 +149,7 @@ async fn rename_agent(
     Path(params): Path<AgentPathParams>,
     body: Result<Json<RenameAgentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .service
         .rename_agent(&params.id, &params.slot_id, &req.name)
@@ -162,7 +162,7 @@ async fn send_message(
     Path(id): Path<String>,
     body: Result<Json<SendTeamMessageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.service.send_message(&id, &req.content, req.files).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -172,7 +172,7 @@ async fn send_message_to_agent(
     Path(params): Path<AgentPathParams>,
     body: Result<Json<SendAgentMessageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .service
         .send_message_to_agent(&params.id, &params.slot_id, &req.content, req.files)
@@ -185,7 +185,7 @@ async fn set_session_mode(
     Path(id): Path<String>,
     body: Result<Json<SetModeRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.service.set_session_mode(&id, &req.mode).await?;
     Ok(Json(ApiResponse::success()))
 }

@@ -60,7 +60,7 @@ async fn health_check(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<AcpHealthCheckRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AcpHealthCheckResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
             .service
@@ -75,7 +75,7 @@ async fn provider_health_check(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<ProviderHealthCheckRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderHealthCheckResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
             .service
@@ -90,7 +90,7 @@ async fn try_connect_custom(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<TryConnectCustomAgentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TryConnectCustomAgentResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
             .service
@@ -105,7 +105,7 @@ async fn create_custom(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<CustomAgentUpsertRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentMetadata>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
             .service
@@ -121,7 +121,7 @@ async fn update_custom(
     Path(id): Path<String>,
     body: Result<Json<CustomAgentUpsertRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentMetadata>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
             .service
@@ -150,7 +150,7 @@ async fn set_agent_enabled(
     Path(id): Path<String>,
     body: Result<Json<SetEnabledRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentMetadata>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
             .service

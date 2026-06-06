@@ -3,14 +3,18 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::Json;
 use axum::extract::DefaultBodyLimit;
-use axum::http::Method;
-use axum::middleware::from_fn_with_state;
+use axum::extract::Request;
+use axum::http::{Method, StatusCode, header};
+use axum::middleware::{Next, from_fn_with_state};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, middleware};
 use tower_http::cors::{Any, CorsLayer};
 
 use aionui_ai_agent::{agent_routes, remote_agent_routes};
+use aionui_api_types::ErrorResponse;
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
@@ -264,6 +268,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // `BODY_LIMIT` (10MB). Routes that need a larger cap (e.g. `/api/fs/upload`)
     // disable this default and install their own `RequestBodyLimitLayer`.
     let router = router.layer(DefaultBodyLimit::max(aionui_common::constants::BODY_LIMIT));
+    let router = router.layer(middleware::from_fn(normalize_boundary_error_response));
 
     let router = with_access_log(router);
     tracing::info!(
@@ -286,5 +291,86 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         router.layer(cors)
     } else {
         router
+    }
+}
+
+async fn normalize_boundary_error_response(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    if response.status().is_success() || response_has_json_content_type(&response) {
+        return response;
+    }
+
+    let status = response.status();
+    let Some((error, code)) = boundary_error_for_status(status) else {
+        return response;
+    };
+
+    let original_headers = response.headers().clone();
+    let mut normalized = (status, Json(ErrorResponse::new(error, code))).into_response();
+    for (name, value) in original_headers.iter() {
+        if *name != header::CONTENT_TYPE && *name != header::CONTENT_LENGTH {
+            normalized.headers_mut().insert(name, value.clone());
+        }
+    }
+    normalized
+}
+
+fn response_has_json_content_type(response: &Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| content_type.starts_with("application/json"))
+}
+
+fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'static str)> {
+    match status {
+        StatusCode::BAD_REQUEST => Some(("Bad request.", "BAD_REQUEST")),
+        StatusCode::UNAUTHORIZED => Some(("Unauthorized.", "UNAUTHORIZED")),
+        StatusCode::FORBIDDEN => Some(("Forbidden.", "FORBIDDEN")),
+        StatusCode::NOT_FOUND => Some(("Route not found.", "NOT_FOUND")),
+        StatusCode::METHOD_NOT_ALLOWED => Some(("Method not allowed.", "METHOD_NOT_ALLOWED")),
+        StatusCode::CONFLICT => Some(("Conflict.", "CONFLICT")),
+        StatusCode::GONE => Some(("Gone.", "GONE")),
+        StatusCode::PAYLOAD_TOO_LARGE => Some(("Request body is too large.", "PAYLOAD_TOO_LARGE")),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => Some(("Unsupported media type.", "UNSUPPORTED_MEDIA_TYPE")),
+        StatusCode::UNPROCESSABLE_ENTITY => Some(("Unprocessable entity.", "UNPROCESSABLE_ENTITY")),
+        StatusCode::TOO_MANY_REQUESTS => Some(("Rate limited", "RATE_LIMITED")),
+        StatusCode::INTERNAL_SERVER_ERROR => Some(("Internal server error.", "INTERNAL_ERROR")),
+        StatusCode::BAD_GATEWAY => Some(("Upstream service unavailable.", "BAD_GATEWAY")),
+        StatusCode::GATEWAY_TIMEOUT => Some(("Request timed out.", "GATEWAY_TIMEOUT")),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::boundary_error_for_status;
+
+    #[test]
+    fn boundary_error_for_status_covers_common_fallback_statuses() {
+        let cases = [
+            (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+            (StatusCode::UNAUTHORIZED, "UNAUTHORIZED"),
+            (StatusCode::FORBIDDEN, "FORBIDDEN"),
+            (StatusCode::NOT_FOUND, "NOT_FOUND"),
+            (StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED"),
+            (StatusCode::CONFLICT, "CONFLICT"),
+            (StatusCode::GONE, "GONE"),
+            (StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE"),
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, "UNSUPPORTED_MEDIA_TYPE"),
+            (StatusCode::UNPROCESSABLE_ENTITY, "UNPROCESSABLE_ENTITY"),
+            (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
+            (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            (StatusCode::GATEWAY_TIMEOUT, "GATEWAY_TIMEOUT"),
+        ];
+
+        for (status, code) in cases {
+            let (_, actual_code) = boundary_error_for_status(status).expect("status should be normalized");
+            assert_eq!(actual_code, code);
+        }
     }
 }

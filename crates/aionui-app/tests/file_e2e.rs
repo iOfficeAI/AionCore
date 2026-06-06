@@ -950,4 +950,8 @@ async fn upload_body_exceeding_30mb_returns_413() {
     let req = upload_request(&content_type, body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], false);
+    assert_eq!(json["code"], "PAYLOAD_TOO_LARGE");
+    assert!(json["error"].is_string());
 }

@@ -180,7 +180,9 @@ async fn build_app_with_extension_root(ext_root: &std::path::Path) -> (axum::Rou
 async fn eq_unauthenticated_access_rejected() {
     let (app, _) = build_app().await;
     let resp = app.oneshot(common::get_request("/api/extensions")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ---------------------------------------------------------------------------
@@ -935,14 +937,18 @@ async fn cp1_get_external_paths_empty() {
 async fn auth_hub_unauthenticated() {
     let (app, _) = build_app().await;
     let resp = app.oneshot(common::get_request("/api/hub/extensions")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
 async fn auth_skills_unauthenticated() {
     let (app, _) = build_app().await;
     let resp = app.oneshot(common::get_request("/api/skills")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,7 +1348,9 @@ async fn ba3_auto_skills_unauthenticated_rejected() {
         .oneshot(common::get_request("/api/skills/builtin-auto"))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ---------------------------------------------------------------------------

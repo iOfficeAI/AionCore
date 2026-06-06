@@ -278,9 +278,9 @@ async fn list_requires_auth() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = fx.app.clone().oneshot(req).await.unwrap();
-    // auth_middleware returns 403 Forbidden for any authentication failure
-    // (see `aionui_auth::middleware::auth_middleware`).
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ===========================================================================

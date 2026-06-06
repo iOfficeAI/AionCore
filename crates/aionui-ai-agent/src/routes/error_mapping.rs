@@ -22,25 +22,33 @@ pub(crate) fn agent_error_to_api_error(err: AgentError) -> ApiError {
     }
 }
 
-pub(crate) fn acp_error_to_api_error(err: AcpError) -> ApiError {
+fn acp_error_to_api_error(err: AcpError) -> ApiError {
     match &err {
         AcpError::SpawnFailed { .. } | AcpError::StartupCrash { .. } | AcpError::Disconnected { .. } => {
-            ApiError::BadGateway(err.to_string())
+            ApiError::BadGateway(acp_error_public_message(&err))
         }
         AcpError::AuthRequired => ApiError::Unauthorized("Agent requires authentication".into()),
-        AcpError::SessionNotFound { .. } => ApiError::NotFound(err.to_string()),
-        AcpError::MethodNotFound { .. } => ApiError::BadRequest(err.to_string()),
-        AcpError::InvalidParams { .. } => ApiError::BadRequest(err.to_string()),
+        AcpError::SessionNotFound { .. } => ApiError::NotFound(acp_error_public_message(&err)),
+        AcpError::MethodNotFound { .. } => ApiError::BadRequest(acp_error_public_message(&err)),
+        AcpError::InvalidParams { .. } => ApiError::BadRequest(acp_error_public_message(&err)),
         AcpError::AgentInternal { .. } => ApiError::BadGateway(acp_error_public_message(&err)),
         AcpError::NotConnected => ApiError::Internal("ACP protocol not connected".into()),
-        AcpError::InitTimeout { .. } => ApiError::BadGateway(err.to_string()),
+        AcpError::InitTimeout { .. } => ApiError::BadGateway(acp_error_public_message(&err)),
     }
 }
 
 fn acp_error_public_message(err: &AcpError) -> String {
     match err {
+        AcpError::SpawnFailed { .. } | AcpError::StartupCrash { .. } | AcpError::Disconnected { .. } => {
+            "Agent process is unavailable.".to_owned()
+        }
+        AcpError::AuthRequired => "Agent requires authentication.".to_owned(),
+        AcpError::SessionNotFound { .. } => "Agent session was not found.".to_owned(),
+        AcpError::MethodNotFound { .. } => "Agent method is not supported.".to_owned(),
+        AcpError::InvalidParams { .. } => "Invalid ACP request parameters.".to_owned(),
         AcpError::AgentInternal { code, .. } => format!("Agent internal error (code {code})"),
-        _ => err.to_string(),
+        AcpError::NotConnected => "ACP protocol is not connected.".to_owned(),
+        AcpError::InitTimeout { .. } => "Agent initialization timed out.".to_owned(),
     }
 }
 
@@ -101,5 +109,32 @@ mod tests {
         assert!(!rendered.contains("Failed to connect MCP servers"));
         assert!(!rendered.contains("sk-secret"));
         assert!(!rendered.contains("api_key"));
+    }
+
+    #[test]
+    fn acp_error_to_api_error_uses_fixed_public_messages() {
+        let cases = vec![
+            acp_error_to_api_error(AcpError::SpawnFailed {
+                message: "spawn failed at /tmp/agent with token sk-secret".into(),
+            }),
+            acp_error_to_api_error(AcpError::SessionNotFound {
+                session_id: "/tmp/session-123".into(),
+            }),
+            acp_error_to_api_error(AcpError::MethodNotFound {
+                method: "debug.dumpSecrets".into(),
+            }),
+            acp_error_to_api_error(AcpError::InvalidParams {
+                message: "invalid path /tmp/private and token sk-secret".into(),
+            }),
+            acp_error_to_api_error(AcpError::InitTimeout { timeout_secs: 42 }),
+        ];
+
+        for api_err in cases {
+            let rendered = api_err.public_message();
+            assert!(!rendered.contains("/tmp"), "leaked path in {rendered}");
+            assert!(!rendered.contains("sk-secret"), "leaked token in {rendered}");
+            assert!(!rendered.contains("debug.dumpSecrets"), "leaked method in {rendered}");
+            assert!(!rendered.contains("42"), "leaked internal timeout in {rendered}");
+        }
     }
 }

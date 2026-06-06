@@ -195,6 +195,22 @@ fn send_json(text: &str) -> tungstenite::Message {
     tungstenite::Message::Text(text.into())
 }
 
+fn assert_realtime_error(msg: &Value, code: &str, recoverable: bool) {
+    assert_eq!(msg["name"], "realtime.error");
+    assert_eq!(msg["data"]["code"], code);
+    assert!(msg["data"]["message"].as_str().is_some());
+    assert_eq!(msg["data"]["recoverable"], recoverable);
+    assert!(msg["data"]["details"].is_object());
+}
+
+fn assert_invalid_message_error(msg: &Value) {
+    assert_realtime_error(msg, "REALTIME_INVALID_MESSAGE", true);
+    assert_eq!(
+        msg["data"]["details"]["expected"],
+        r#"{ "name": "event-name", "data": {...} }"#
+    );
+}
+
 fn ws_manager(app: &TestApp) -> &Arc<WebSocketManager> {
     &app.services.ws_manager
 }
@@ -219,6 +235,9 @@ async fn t1_2_no_token_closes_1008() {
     let app = start_app().await;
     let mut ws = connect_no_auth(app.addr).await;
 
+    let msg = read_text(&mut ws).await;
+    assert_realtime_error(&msg, "REALTIME_AUTH_MISSING", false);
+
     let code = read_close(&mut ws).await;
     assert_eq!(code, Some(1008));
 }
@@ -230,8 +249,7 @@ async fn t1_3_invalid_token_sends_auth_expired_then_closes() {
     let (_, mut rx) = connect_bearer(app.addr, "invalid-token").await;
 
     let msg = read_text(&mut rx).await;
-    assert_eq!(msg["name"], "auth-expired");
-    assert!(msg["data"]["message"].as_str().is_some());
+    assert_realtime_error(&msg, "REALTIME_AUTH_EXPIRED", false);
 
     let code = read_close(&mut rx).await;
     assert_eq!(code, Some(1008));
@@ -264,20 +282,18 @@ async fn t1_5_token_from_sec_websocket_protocol() {
 // ===========================================================================
 
 #[tokio::test]
-async fn t3_1_valid_json_message_accepted() {
+async fn t3_1_valid_json_with_no_registered_route_returns_unsupported_error() {
     let app = start_app().await;
     let token = sign_token(&app, "user1");
 
-    let (mut tx, _rx) = connect_bearer(app.addr, &token).await;
+    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let msg = json!({"name": "some-event", "data": {"key": "value"}});
     tx.send(send_json(&msg.to_string())).await.unwrap();
 
-    // No error response expected — verify with a short timeout
-    let timeout_result = tokio::time::timeout(Duration::from_millis(200), _rx.into_future()).await;
-    // Timeout (no response) is expected for valid messages routed to NoopMessageRouter
-    assert!(timeout_result.is_err(), "valid message should not generate a response");
+    let msg = read_text(&mut rx).await;
+    assert_realtime_error(&msg, "REALTIME_UNSUPPORTED_MESSAGE", true);
 }
 
 #[tokio::test]
@@ -291,8 +307,7 @@ async fn t3_2_invalid_json_returns_error() {
     tx.send(send_json("not valid json")).await.unwrap();
 
     let msg = read_text(&mut rx).await;
-    assert_eq!(msg["error"], "Invalid message format");
-    assert!(msg["expected"].is_string());
+    assert_invalid_message_error(&msg);
 }
 
 #[tokio::test]
@@ -306,7 +321,7 @@ async fn t3_3_missing_fields_returns_error() {
     tx.send(send_json(r#"{"foo": "bar"}"#)).await.unwrap();
 
     let msg = read_text(&mut rx).await;
-    assert_eq!(msg["error"], "Invalid message format");
+    assert_invalid_message_error(&msg);
 }
 
 // ===========================================================================
@@ -522,7 +537,7 @@ async fn t7_2_blacklisted_token_rejected() {
     let (_, mut rx) = connect_bearer(app.addr, &token).await;
 
     let msg = read_text(&mut rx).await;
-    assert_eq!(msg["name"], "auth-expired");
+    assert_realtime_error(&msg, "REALTIME_AUTH_EXPIRED", false);
 
     let code = read_close(&mut rx).await;
     assert_eq!(code, Some(1008));

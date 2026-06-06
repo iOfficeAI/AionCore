@@ -113,7 +113,7 @@ fn test_api_error_status_codes() {
         StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(ApiError::BadGateway("x".into()).status_code(), StatusCode::BAD_GATEWAY);
-    assert_eq!(ApiError::Timeout("x".into()).status_code(), StatusCode::BAD_GATEWAY);
+    assert_eq!(ApiError::Timeout("x".into()).status_code(), StatusCode::GATEWAY_TIMEOUT);
 }
 
 #[test]

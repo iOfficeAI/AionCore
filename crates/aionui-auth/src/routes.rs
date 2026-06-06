@@ -228,7 +228,7 @@ async fn login_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     // Input length validation (per API spec)
     if req.username.len() > 32 {
@@ -387,7 +387,7 @@ async fn create_internal_user_handler(
     body: Result<Json<CreateInternalUserRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<User>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let user = state
         .user_repo
         .create_user(&req.username, &req.password_hash)
@@ -401,7 +401,7 @@ async fn set_system_user_credentials_handler(
     body: Result<Json<SetSystemUserCredentialsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .user_repo
         .set_system_user_credentials(&req.username, &req.password_hash)
@@ -416,7 +416,7 @@ async fn update_user_password_hash_handler(
     body: Result<Json<UpdatePasswordHashRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .user_repo
         .update_password(&id, &req.password_hash)
@@ -431,7 +431,7 @@ async fn update_user_username_handler(
     body: Result<Json<UpdateUsernameRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .user_repo
         .update_username(&id, &req.username)
@@ -446,7 +446,7 @@ async fn update_user_jwt_secret_handler(
     body: Result<Json<UpdateJwtSecretRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .user_repo
         .update_jwt_secret(&id, &req.jwt_secret)
@@ -491,7 +491,7 @@ async fn change_password_handler(
     Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ChangePasswordRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     // Validate new password strength
     validate_password(&req.new_password)?;
@@ -547,7 +547,7 @@ async fn refresh_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<RefreshTokenRequest>, JsonRejection>,
 ) -> Result<Json<RefreshResponse>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     let payload = state
         .jwt_service
@@ -603,7 +603,7 @@ async fn qr_login_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<QrLoginRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     // Validate and consume QR token (one-time use)
     state.qr_token_store.validate_and_consume(&req.qr_token)?;
@@ -727,7 +727,7 @@ async fn webui_change_password_handler(
     body: Result<Json<WebuiChangePasswordRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     validate_password(&req.new_password)?;
 
@@ -756,7 +756,7 @@ async fn webui_change_username_handler(
     body: Result<Json<WebuiChangeUsernameRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<WebuiChangeUsernameResponse>>, ApiError> {
     ensure_local_mode(state.local)?;
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     let trimmed = req.new_username.trim().to_owned();
     validate_username(&trimmed)?;

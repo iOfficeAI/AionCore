@@ -155,7 +155,17 @@ async fn read_file_rejects_outside_sandbox_without_workspace() {
     let svc = make_service(sandbox.path());
     let err = svc.read_file(file.to_str().unwrap(), None).await.unwrap_err();
 
-    assert!(matches!(err, FileError::Forbidden(_)));
+    assert!(
+        matches!(
+            err,
+            FileError::PathOutsideSandbox {
+                field: Some("path"),
+                operation: Some("access"),
+                ..
+            }
+        ),
+        "expected path outside sandbox, got {err}"
+    );
     assert!(err.to_string().contains("outside the allowed sandbox"));
 }
 
@@ -318,7 +328,18 @@ async fn write_file_outside_sandbox_rejected() {
     let ws = sandbox.path().to_str().unwrap();
     let result = svc.write_file(target.to_str().unwrap(), b"bad", ws).await;
 
-    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FileError::PathOutsideSandbox {
+                field: Some("path"),
+                operation: Some("write"),
+                ..
+            }
+        ),
+        "expected path outside sandbox, got {err}"
+    );
 }
 
 // -----------------------------------------------------------------------

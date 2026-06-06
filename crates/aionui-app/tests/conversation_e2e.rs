@@ -375,7 +375,9 @@ async fn t2_5_list_pinned_filter() {
 async fn t2_6_list_requires_auth() {
     let (app, _services) = build_app().await;
     let resp = app.oneshot(get_request("/api/conversations")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ── T3: Get ───────────────────────────────────────────────────────────
@@ -416,7 +418,9 @@ async fn t3_2_get_not_found() {
 async fn t3_3_get_requires_auth() {
     let (app, _services) = build_app().await;
     let resp = app.oneshot(get_request("/api/conversations/some-id")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ── T4: Update ────────────────────────────────────────────────────────
@@ -570,7 +574,9 @@ async fn t4_5_update_not_found() {
 async fn t4_6_update_requires_auth() {
     let (app, _services) = build_app().await;
     let resp = app.oneshot(get_request("/api/conversations/some-id")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ── T5: Delete ────────────────────────────────────────────────────────
@@ -830,7 +836,9 @@ async fn t10_4_associated_requires_auth() {
         .oneshot(get_request("/api/conversations/some-id/associated"))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ── T12: Boundary scenarios ───────────────────────────────────────────
