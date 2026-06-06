@@ -5,19 +5,19 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use anyhow::Result;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use aionui_api_types::{RuntimeStatusScope, RuntimeStatusScopeKind};
-use aionui_app::{AppConfig, AppServices, create_router};
+use aionui_app::{AppConfig, AppServices, RouterBuildError, create_router};
 use aionui_system::RuntimePrepareService;
 
-use crate::bootstrap::ServerEnvironment;
+use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ServerEnvironment};
 
 const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
 
+#[derive(Debug)]
 pub(crate) struct BoundHttpListener {
     listener: TcpListener,
     addr: SocketAddr,
@@ -26,9 +26,14 @@ pub(crate) struct BoundHttpListener {
 /// Bind the main HTTP listener before constructing services that may start
 /// their own local listeners. When `config.port == 0`, the OS-selected port is
 /// written back to the config before downstream services are built.
-pub(crate) async fn bind_http_listener(config: &mut AppConfig) -> Result<BoundHttpListener> {
+pub(crate) async fn bind_http_listener(config: &mut AppConfig) -> Result<BoundHttpListener, BootstrapError> {
     if config.port != 0 && is_fetch_forbidden_backend_port(config.port) {
-        anyhow::bail!("backend port {} is blocked by Fetch clients", config.port);
+        return Err(BootstrapError::new(
+            BootstrapErrorCode::ConfigInvalid,
+            "config.port",
+            "invalid startup configuration",
+        )
+        .with_field("port", config.port.to_string()));
     }
 
     let dynamic_port = config.port == 0;
@@ -41,8 +46,23 @@ pub(crate) async fn bind_http_listener(config: &mut AppConfig) -> Result<BoundHt
     for attempt in 1..=max_attempts {
         let addr = config.socket_addr();
         info!(address = %addr, attempt, "startup: socket bind started");
-        let listener = TcpListener::bind(&addr).await?;
-        let local_addr = listener.local_addr()?;
+        let listener = TcpListener::bind(&addr).await.map_err(|error| {
+            BootstrapError::new(
+                BootstrapErrorCode::BindFailed,
+                "bind.listener",
+                "failed to bind HTTP listener",
+            )
+            .with_source(error)
+            .with_field("address", addr.to_string())
+        })?;
+        let local_addr = listener.local_addr().map_err(|error| {
+            BootstrapError::new(
+                BootstrapErrorCode::BindFailed,
+                "bind.listener",
+                "failed to bind HTTP listener",
+            )
+            .with_source(error)
+        })?;
 
         if dynamic_port && is_fetch_forbidden_backend_port(local_addr.port()) {
             warn!(
@@ -62,7 +82,11 @@ pub(crate) async fn bind_http_listener(config: &mut AppConfig) -> Result<BoundHt
         });
     }
 
-    anyhow::bail!("failed to bind a Fetch-compatible dynamic backend port");
+    Err(BootstrapError::new(
+        BootstrapErrorCode::BindFailed,
+        "bind.dynamic_port",
+        "failed to bind HTTP listener",
+    ))
 }
 
 fn is_fetch_forbidden_backend_port(port: u16) -> bool {
@@ -168,15 +192,24 @@ pub(crate) async fn run_server(
     env: ServerEnvironment,
     services: AppServices,
     bound: BoundHttpListener,
-) -> Result<ExitCode> {
+) -> Result<ExitCode, BootstrapError> {
     let boot = Instant::now();
 
-    let has_users = services.user_repo.has_users().await?;
+    let has_users = services.user_repo.has_users().await.map_err(|error| {
+        BootstrapError::new(
+            BootstrapErrorCode::ServerFailed,
+            "server.preflight",
+            "server startup preflight failed",
+        )
+        .with_source(error)
+    })?;
     if !has_users {
         info!("No configured users detected — initial setup required via /api/auth/status");
     }
 
-    let router = create_router(&services).await;
+    let router = create_router(&services)
+        .await
+        .map_err(router_build_error_to_bootstrap)?;
     info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: router ready for bound socket"
@@ -211,6 +244,8 @@ pub(crate) async fn run_server(
                 "startup: managed runtime background preparation completed"
             ),
             Err(error) => warn!(
+                code = "BOOTSTRAP_DEGRADED_MANAGED_RUNTIME_PREPARE",
+                stage = "runtime.prepare",
                 prepare_elapsed_ms = prepare_started.elapsed().as_millis(),
                 error = %error,
                 "startup: managed runtime background preparation failed"
@@ -224,20 +259,40 @@ pub(crate) async fn run_server(
     // exceeds the default 5-minute idle threshold. The watch channel
     // propagates graceful-shutdown so the scanner exits on SIGINT/SIGTERM.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_error_tx, shutdown_error_rx) = tokio::sync::oneshot::channel::<BootstrapError>();
     let idle_scanner_handle =
         aionui_ai_agent::start_idle_scanner(services.worker_task_manager.clone(), shutdown_rx, None, None);
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
+            if let Err(error) = shutdown_signal().await {
+                error.log_source();
+                tracing::error!(error = %error.stderr_line(), "shutdown signal handler failed");
+                let _ = shutdown_error_tx.send(error);
+            }
             let _ = shutdown_tx.send(true);
         })
-        .await?;
+        .await
+        .map_err(|error| {
+            BootstrapError::new(
+                BootstrapErrorCode::ServerFailed,
+                "server.serve",
+                "server runtime failed",
+            )
+            .with_source(error)
+        })?;
+
+    let shutdown_error = shutdown_error_rx.await.ok();
 
     // Wait for the scanner to observe the shutdown watch value and
     // return; at worst this blocks for the current 60 s tick.
     if let Err(e) = idle_scanner_handle.await {
-        warn!(error = %e, "idle scanner join failed");
+        warn!(
+            code = "BOOTSTRAP_DEGRADED_IDLE_SCANNER",
+            stage = "idle_scanner.join",
+            error = %e,
+            "idle scanner join failed"
+        );
     }
 
     services.database.close().await;
@@ -246,33 +301,65 @@ pub(crate) async fn run_server(
     // Prevent the log guard from being dropped before final log flush.
     drop(env);
 
+    finish_server_shutdown(shutdown_error)
+}
+
+fn router_build_error_to_bootstrap(error: RouterBuildError) -> BootstrapError {
+    let stage = error.stage();
+    let message = error.message();
+    BootstrapError::new(BootstrapErrorCode::ServerFailed, stage, message).with_source(error)
+}
+
+fn finish_server_shutdown(shutdown_error: Option<BootstrapError>) -> Result<ExitCode, BootstrapError> {
+    if let Some(error) = shutdown_error {
+        return Err(error);
+    }
+
     Ok(ExitCode::SUCCESS)
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal() -> Result<(), BootstrapError> {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+        tokio::signal::ctrl_c().await.map_err(|error| {
+            BootstrapError::new(
+                BootstrapErrorCode::ShutdownFailed,
+                "shutdown.signal_handler",
+                "failed to install shutdown signal handler",
+            )
+            .with_source(error)
+        })
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|error| {
+                BootstrapError::new(
+                    BootstrapErrorCode::ShutdownFailed,
+                    "shutdown.signal_handler",
+                    "failed to install shutdown signal handler",
+                )
+                .with_source(error)
+            })?;
+        terminate.recv().await;
+        Ok::<(), BootstrapError>(())
     };
 
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let terminate = std::future::pending::<Result<(), BootstrapError>>();
 
     tokio::select! {
-        () = ctrl_c => {
+        result = ctrl_c => {
+            result?;
             info!("Received SIGINT, shutting down...");
         }
-        () = terminate => {
+        result = terminate => {
+            result?;
             info!("Received SIGTERM, shutting down...");
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -315,5 +402,58 @@ mod tests {
 
         assert!(config.port > 0);
         assert_eq!(config.port, bound.addr.port());
+    }
+
+    #[tokio::test]
+    async fn forbidden_backend_port_maps_to_bootstrap_config_invalid() {
+        let mut config = AppConfig {
+            port: 1720,
+            ..AppConfig::default()
+        };
+
+        let err = bind_http_listener(&mut config).await.unwrap_err();
+        assert_eq!(err.code(), crate::bootstrap::BootstrapErrorCode::ConfigInvalid);
+        assert_eq!(err.stage(), "config.port");
+        assert_eq!(err.exit_code(), std::process::ExitCode::from(2));
+        assert!(
+            err.stderr_line()
+                .starts_with("BOOTSTRAP_CONFIG_INVALID stage=config.port")
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_returns_signal_error_when_serve_succeeds() {
+        let error = BootstrapError::new(
+            BootstrapErrorCode::ShutdownFailed,
+            "shutdown.signal_handler",
+            "failed to install shutdown signal handler",
+        )
+        .with_source(anyhow::anyhow!("raw shutdown source"));
+
+        let err = finish_server_shutdown(Some(error)).unwrap_err();
+
+        assert_eq!(err.code(), BootstrapErrorCode::ShutdownFailed);
+        assert_eq!(err.stage(), "shutdown.signal_handler");
+        assert!(
+            err.stderr_line()
+                .starts_with("BOOTSTRAP_SHUTDOWN_FAILED stage=shutdown.signal_handler")
+        );
+        assert!(!err.stderr_line().contains("raw shutdown source"));
+    }
+
+    #[test]
+    fn router_build_error_maps_to_bootstrap_server_failed() {
+        let err = router_build_error_to_bootstrap(
+            RouterBuildError::new("router.file_watch", "failed to initialize file watch service")
+                .with_source(anyhow::anyhow!("raw watch backend unavailable")),
+        );
+
+        assert_eq!(err.code(), BootstrapErrorCode::ServerFailed);
+        assert_eq!(err.stage(), "router.file_watch");
+        assert!(
+            err.stderr_line()
+                .starts_with("BOOTSTRAP_SERVER_FAILED stage=router.file_watch")
+        );
+        assert!(!err.stderr_line().contains("raw watch backend unavailable"));
     }
 }

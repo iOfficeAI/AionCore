@@ -43,6 +43,50 @@ use aionui_team::{TeamRouterState, TeamSessionService};
 use crate::config::derive_encryption_key;
 use crate::services::AppServices;
 
+#[derive(Debug)]
+pub struct RouterBuildError {
+    stage: &'static str,
+    message: &'static str,
+    source: Option<anyhow::Error>,
+}
+
+impl RouterBuildError {
+    pub fn new(stage: &'static str, message: &'static str) -> Self {
+        Self {
+            stage,
+            message,
+            source: None,
+        }
+    }
+
+    pub fn with_source(mut self, source: impl Into<anyhow::Error>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    pub fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+}
+
+impl std::fmt::Display for RouterBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.stage, self.message)
+    }
+}
+
+impl std::error::Error for RouterBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
 /// All module-level router states bundled into a single struct.
 ///
 /// Reduces parameter bloat on router constructors and makes it easy for
@@ -117,7 +161,9 @@ pub struct ChannelOrchestratorComponents {
 }
 
 /// Build all default `ModuleStates` from application services.
-pub async fn build_module_states(services: &AppServices) -> (ModuleStates, ChannelOrchestratorComponents) {
+pub async fn build_module_states(
+    services: &AppServices,
+) -> Result<(ModuleStates, ChannelOrchestratorComponents), RouterBuildError> {
     let boot = Instant::now();
     tracing::info!("startup: module state build started");
 
@@ -129,7 +175,12 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
 
     let scan_paths = resolve_scan_paths_for_data_dir(&services.data_dir);
     if let Err(error) = ext_state.registry.initialize_with_scan_paths(scan_paths).await {
-        tracing::warn!(error = %error, "extension registry initialize failed");
+        tracing::warn!(
+            code = "BOOTSTRAP_DEGRADED_EXTENSION_REGISTRY",
+            stage = "extension.registry.initialize",
+            error = %error,
+            "extension registry initialize failed"
+        );
     }
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -192,7 +243,7 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
             service: agent_service,
         }),
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
-        file: build_module_state_phase(&boot, "file", || build_file_state(services)),
+        file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -216,7 +267,7 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
         "startup: module state build completed"
     );
 
-    (states, channel_components)
+    Ok((states, channel_components))
 }
 
 /// Build the default `AssistantRouterState` from application services.
@@ -321,20 +372,24 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 }
 
 /// Build the default `FileRouterState` from application services.
-pub fn build_file_state(services: &AppServices) -> FileRouterState {
+pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, RouterBuildError> {
     let broadcaster = services.event_bus.clone();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
     let browse_roots = BrowseRoots::new();
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
-    let watch_service = Arc::new(FileWatchService::new(broadcaster).expect("file watch service initialization"));
+    let watch_service = Arc::new(FileWatchService::new(broadcaster).map_err(file_watch_init_error)?);
     let snapshot_service = Arc::new(SnapshotService::new());
-    FileRouterState {
+    Ok(FileRouterState {
         file_service,
         watch_service,
         snapshot_service,
         allowed_roots,
         browse_roots,
-    }
+    })
+}
+
+fn file_watch_init_error(error: aionui_file::FileError) -> RouterBuildError {
+    RouterBuildError::new("router.file_watch", "failed to initialize file watch service").with_source(error)
 }
 
 /// Build the default `McpRouterState` from application services.
@@ -769,5 +824,14 @@ mod tests {
         assert_eq!(loaded[0].name, "demo-ext");
 
         services.database.close().await;
+    }
+
+    #[test]
+    fn file_watch_init_error_maps_to_bootstrap_server_failed() {
+        let err = file_watch_init_error(aionui_file::FileError::Internal("watch backend unavailable".into()));
+
+        assert_eq!(err.stage(), "router.file_watch");
+        assert_eq!(err.message(), "failed to initialize file watch service");
+        assert!(!err.to_string().contains("watch backend unavailable"));
     }
 }

@@ -62,6 +62,7 @@ base64.workspace = true
 git2.workspace = true
 http-body-util.workspace = true
 rust_xlsxwriter.workspace = true
+sqlx = { workspace = true, features = ["migrate"] }
 tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 tokio-tungstenite.workspace = true

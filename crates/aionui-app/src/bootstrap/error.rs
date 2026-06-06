@@ -99,6 +99,12 @@ impl BootstrapError {
     }
 
     pub(crate) fn log_source(&self) {
+        if self.code == BootstrapErrorCode::LoggingInitFailed {
+            // Logging setup failed before a tracing subscriber was available.
+            // Keep raw source private on the error object; public stderr remains
+            // the stable boundary line only.
+            return;
+        }
         if let Some(source) = &self.source {
             tracing::error!(
                 code = self.code.as_str(),
@@ -173,5 +179,28 @@ mod tests {
 
         let source = std::error::Error::source(&err).expect("source should be preserved");
         assert!(source.to_string().contains("secret disk path /tmp/secret.db"));
+    }
+
+    #[test]
+    fn logging_init_source_remains_private_when_tracing_is_unavailable() {
+        let err = BootstrapError::new(
+            BootstrapErrorCode::LoggingInitFailed,
+            "logging.init",
+            "failed to initialize logging",
+        )
+        .with_source(anyhow::anyhow!("secret log path /tmp/aion.log"));
+
+        err.log_source();
+
+        let stderr = err.stderr_line();
+        assert!(stderr.contains("BOOTSTRAP_LOGGING_INIT_FAILED"));
+        assert!(!stderr.contains("secret log path"));
+        assert!(!stderr.contains("/tmp/aion.log"));
+        assert!(
+            std::error::Error::source(&err)
+                .expect("source should be preserved")
+                .to_string()
+                .contains("secret log path")
+        );
     }
 }

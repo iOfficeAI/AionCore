@@ -67,7 +67,7 @@ async fn build_app() -> (axum::Router, aionui_app::AppServices) {
     let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
         .await
         .unwrap();
-    let router = aionui_app::create_router(&services).await;
+    let router = aionui_app::create_router(&services).await.expect("build router");
     (router, services)
 }
 

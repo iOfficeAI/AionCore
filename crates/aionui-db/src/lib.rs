@@ -6,7 +6,9 @@ mod error;
 pub mod models;
 mod repository;
 
-pub use database::{Database, init_database, init_database_memory, maybe_copy_legacy_database};
+pub use database::{
+    Database, DatabaseInitError, init_database, init_database_memory, init_database_staged, maybe_copy_legacy_database,
+};
 pub use error::DbError;
 pub use models::{
     AgentMetadataRow, AssistantOverrideRow, AssistantRow, ConversationArtifactRow, CreateAssistantParams,
