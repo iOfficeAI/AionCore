@@ -143,11 +143,13 @@ impl CliAgentProcess {
     }
 
     fn sdk_spawn_preview(config: &CommandSpec) -> String {
+        let explicit_env_key_names: Vec<&str> = config.env.iter().map(|entry| entry.name.as_str()).collect();
         format!(
-            "program={} args={} explicit_env_keys={} cwd={}",
+            "program={} args={} explicit_env_keys={} explicit_env_key_names={:?} cwd={}",
             config.command.display(),
             config.args.len(),
             config.env.len(),
+            explicit_env_key_names,
             config.cwd.as_deref().unwrap_or("<inherit>")
         )
     }
@@ -306,21 +308,28 @@ printf '%s\n' \
         let config = CommandSpec {
             command: "node".into(),
             args: vec!["--api-key=secret-arg-value".into()],
-            env: vec![EnvVar {
-                name: "SECRET_TOKEN".into(),
-                value: "secret-env-value".into(),
-            }],
+            env: vec![
+                EnvVar {
+                    name: "SECRET_TOKEN".into(),
+                    value: "secret-env-value".into(),
+                },
+                EnvVar {
+                    name: "PATH".into(),
+                    value: "/secret/path".into(),
+                },
+            ],
             cwd: Some("/workspace".into()),
         };
 
         let preview = CliAgentProcess::sdk_spawn_preview(&config);
         assert!(preview.contains("program=node"));
         assert!(preview.contains("args=1"));
-        assert!(preview.contains("explicit_env_keys=1"));
+        assert!(preview.contains("explicit_env_keys=2"));
+        assert!(preview.contains("explicit_env_key_names=[\"SECRET_TOKEN\", \"PATH\"]"));
         assert!(preview.contains("cwd=/workspace"));
         assert!(!preview.contains("secret-arg-value"));
-        assert!(!preview.contains("SECRET_TOKEN"));
         assert!(!preview.contains("secret-env-value"));
+        assert!(!preview.contains("/secret/path"));
     }
 
     #[tokio::test]
