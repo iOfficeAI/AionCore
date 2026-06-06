@@ -30,9 +30,12 @@ impl CliAgentProcess {
     /// - Process exit monitoring
     pub async fn spawn_for_sdk(config: CommandSpec, data_dir: &Path) -> Result<Self, AgentError> {
         let mut cmd = CmdBuilder::new(&config.command);
+        let agent_env = aionui_runtime::agent_process_env().await;
         cmd.args(&config.args)
-            .envs(config.env.iter().map(|e| (&e.name, &e.value)))
+            .env_clear()
+            .envs(agent_env)
             .envs(Self::agent_spawn_env(data_dir))
+            .envs(config.env.iter().map(|e| (&e.name, &e.value)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -40,7 +43,7 @@ impl CliAgentProcess {
         if let Some(ref cwd) = config.cwd {
             cmd.current_dir(prepare_command_cwd(cwd)?);
         }
-        let preview = cmd.to_string();
+        let preview = Self::sdk_spawn_preview(&config);
         info!(command = %preview, "Spawning CLI process (SDK mode)");
         let mut child: Child = cmd.spawn().map_err(|e| {
             error!(command = %preview, error = %ErrorChain(&e), "Failed to spawn CLI process");
@@ -138,13 +141,26 @@ impl CliAgentProcess {
             ("BUN_TMPDIR".into(), bun_tmp.to_string_lossy().into_owned()),
         ]
     }
+
+    fn sdk_spawn_preview(config: &CommandSpec) -> String {
+        format!(
+            "program={} args={} explicit_env_keys={} cwd={}",
+            config.command.display(),
+            config.args.len(),
+            config.env.len(),
+            config.cwd.as_deref().unwrap_or("<inherit>")
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::tests::simple_script_config;
     use super::*;
+    use aionui_common::EnvVar;
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::time::timeout;
 
     // ── SDK mode tests ───────────────────────────────────────────────
 
@@ -199,6 +215,112 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_for_sdk_uses_clean_agent_env_and_explicit_overrides() {
+        const CHILD_ENV: &str = "AIONUI_TEST_SDK_AGENT_ENV_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let shell = temp.path().join("fake-shell");
+            write_fake_shell(
+                &shell,
+                r#"#!/bin/sh
+printf '%s\n' \
+  'AIONUI_SHELL_ONLY=from-shell' \
+  'AIONUI_OVERLAY=from-shell' \
+  'PATH=/shell/bin:/bin:/usr/bin' \
+  'NODE_OPTIONS=--inspect' \
+  'npm_lifecycle_event=start'
+"#,
+            );
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(
+                    "capability::cli_process::spawn_sdk::tests::spawn_for_sdk_uses_clean_agent_env_and_explicit_overrides",
+                )
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .env("SHELL", &shell)
+                .env("PATH", "/bin:/usr/bin")
+                .env("NODE_OPTIONS", "--require parent")
+                .env("npm_config_cache", "/tmp/parent-cache")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = simple_script_config(
+            "printf 'shell=%s\nconfig=%s\noverlay=%s\nnpm=%s\nnode=%s\nbun=%s\n' \
+             \"${AIONUI_SHELL_ONLY:-unset}\" \
+             \"${AIONUI_CONFIG_ONLY:-unset}\" \
+             \"${AIONUI_OVERLAY:-unset}\" \
+             \"${npm_lifecycle_event:-unset}\" \
+             \"${NODE_OPTIONS:-unset}\" \
+             \"${BUN_INSTALL_CACHE_DIR:-unset}\"",
+        );
+        config.env.push(EnvVar {
+            name: "AIONUI_CONFIG_ONLY".into(),
+            value: "from-config".into(),
+        });
+        config.env.push(EnvVar {
+            name: "AIONUI_OVERLAY".into(),
+            value: "from-config".into(),
+        });
+
+        let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
+        let (_stdin, mut stdout) = proc.take_stdio().await.unwrap();
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).await.unwrap();
+        timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
+
+        assert!(output.contains("shell=from-shell"), "{output}");
+        assert!(output.contains("config=from-config"), "{output}");
+        assert!(output.contains("overlay=from-config"), "{output}");
+        assert!(output.contains("npm=unset"), "{output}");
+        assert!(output.contains("node=unset"), "{output}");
+        assert!(output.contains("bun="), "{output}");
+        assert!(output.contains("bun-cache"), "{output}");
+    }
+
+    #[cfg(unix)]
+    fn write_fake_shell(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn sdk_spawn_preview_omits_env_values_and_arg_bodies() {
+        let config = CommandSpec {
+            command: "node".into(),
+            args: vec!["--api-key=secret-arg-value".into()],
+            env: vec![EnvVar {
+                name: "SECRET_TOKEN".into(),
+                value: "secret-env-value".into(),
+            }],
+            cwd: Some("/workspace".into()),
+        };
+
+        let preview = CliAgentProcess::sdk_spawn_preview(&config);
+        assert!(preview.contains("program=node"));
+        assert!(preview.contains("args=1"));
+        assert!(preview.contains("explicit_env_keys=1"));
+        assert!(preview.contains("cwd=/workspace"));
+        assert!(!preview.contains("secret-arg-value"));
+        assert!(!preview.contains("SECRET_TOKEN"));
+        assert!(!preview.contains("secret-env-value"));
     }
 
     #[tokio::test]

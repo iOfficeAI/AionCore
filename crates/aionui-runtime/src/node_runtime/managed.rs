@@ -851,12 +851,6 @@ fn combined_retry_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[tokio::test]
     async fn managed_runtime_validation_uses_real_commands() {
@@ -979,9 +973,17 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_runtime_validation_failure_does_not_fallback_to_remote_download() {
-        let _guard = env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let bundled_root = tmp.path().join("bundled");
+        if !crate::test_support::run_in_env_child(
+            "node_runtime::managed::tests::bundled_runtime_validation_failure_does_not_fallback_to_remote_download",
+            |command| {
+                command.env("AIONUI_BUNDLED_MANAGED_RESOURCES", &bundled_root);
+            },
+        ) {
+            return;
+        }
+        let bundled_root = std::path::PathBuf::from(std::env::var_os("AIONUI_BUNDLED_MANAGED_RESOURCES").unwrap());
         let runtime_root = bundled_root.join("node").join("node-v24.11.0-darwin-arm64");
         let bin = runtime_root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -1003,9 +1005,6 @@ mod tests {
             }
         }
 
-        unsafe {
-            std::env::set_var("AIONUI_BUNDLED_MANAGED_RESOURCES", &bundled_root);
-        }
         managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Bundled);
         let runtime_root = tmp.path().join("runtime").join("node");
         std::fs::create_dir_all(&runtime_root).unwrap();
@@ -1018,9 +1017,6 @@ mod tests {
             None,
         )
         .await;
-        unsafe {
-            std::env::remove_var("AIONUI_BUNDLED_MANAGED_RESOURCES");
-        }
         managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Download);
 
         let error = result.expect_err("bundled validation failure should abort");

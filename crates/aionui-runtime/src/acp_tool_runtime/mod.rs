@@ -856,6 +856,15 @@ mod tests {
     fn bundled_validation_failure_does_not_fallback_to_remote_download() {
         let tmp = tempfile::tempdir().unwrap();
         let bundled_root = tmp.path().join("bundled");
+        if !crate::test_support::run_in_env_child(
+            "acp_tool_runtime::tests::bundled_validation_failure_does_not_fallback_to_remote_download",
+            |command| {
+                command.env("AIONUI_BUNDLED_MANAGED_RESOURCES", &bundled_root);
+            },
+        ) {
+            return;
+        }
+        let bundled_root = std::path::PathBuf::from(std::env::var_os("AIONUI_BUNDLED_MANAGED_RESOURCES").unwrap());
         let spec = platform_spec().unwrap();
         let source_root = bundled_root
             .join("acp")
@@ -872,14 +881,8 @@ mod tests {
         let runtime_root = tmp.path().join("runtime");
         let tool_root = runtime_root.join("codex-acp").join("0.14.0").join(spec.manifest_key);
 
-        unsafe {
-            std::env::set_var("AIONUI_BUNDLED_MANAGED_RESOURCES", &bundled_root);
-        }
         managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Bundled);
         let result = activate_local_tool_source(ManagedAcpToolId::CodexAcp, spec, &tool_root, None);
-        unsafe {
-            std::env::remove_var("AIONUI_BUNDLED_MANAGED_RESOURCES");
-        }
         managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Download);
 
         let error = result.expect_err("bundled validation failure should abort");
