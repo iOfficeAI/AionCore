@@ -4,6 +4,7 @@
 //! All logic lives in the submodules.
 
 mod bridge;
+pub(crate) mod cli_error;
 mod doctor;
 mod prepare_managed_resources;
 mod server;
