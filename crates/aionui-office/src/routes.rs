@@ -135,7 +135,7 @@ async fn start_preview(
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
     let validated_path = validated_path.to_string_lossy().into_owned();
 
@@ -160,7 +160,7 @@ async fn stop_preview(
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.watch_manager.stop(&req.file_path, doc_type).await;
     Ok(Json(ApiResponse::success()))
 }
@@ -172,7 +172,7 @@ async fn list_snapshots(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<ListSnapshotsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<PreviewSnapshotInfoDto>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let snapshots = state.snapshot_service.list(&req.target).await?;
     Ok(Json(ApiResponse::ok(snapshots)))
 }
@@ -182,7 +182,7 @@ async fn save_snapshot(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<SaveSnapshotRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewSnapshotInfoDto>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let info = state.snapshot_service.save(&req.target, &req.content).await?;
     Ok(Json(ApiResponse::ok(info)))
 }
@@ -192,7 +192,7 @@ async fn get_snapshot_content(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<GetSnapshotContentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<SnapshotContentResponse>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .snapshot_service
         .get_content(&req.target, &req.snapshot_id)
@@ -207,7 +207,7 @@ async fn detect_star_office(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<DetectStarOfficeRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<StarOfficeDetectResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let url = state
         .star_office_detector
         .detect(req.preferred_url.as_deref(), req.force.unwrap_or(false), req.timeout_ms)
@@ -222,7 +222,7 @@ async fn convert_document(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<DocumentConversionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<aionui_api_types::DocumentConversionResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
     let resp = state
         .conversion_service

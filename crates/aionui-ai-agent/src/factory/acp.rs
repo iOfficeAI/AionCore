@@ -533,7 +533,7 @@ mod tests {
     use super::*;
     use aionui_realtime::BroadcastEventBus;
     use aionui_runtime::init as init_runtime;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
     use std::{mem, path::PathBuf};
 
     fn make_row(
@@ -574,9 +574,9 @@ mod tests {
         .to_string()
     }
 
-    fn path_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn path_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[cfg(unix)]
@@ -614,7 +614,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn row_to_sdk_stdio_flattens_resolved_npx_command() {
-        let _lock = path_test_lock().lock().expect("lock");
+        let _lock = path_test_lock().lock().await;
         let runtime = install_fake_bundled_runtime();
         let _runtime_data_dir = test_runtime_data_dir();
         unsafe { std::env::set_var("AIONUI_BUNDLED_MANAGED_RESOURCES", runtime.path()) };
@@ -643,7 +643,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn resolve_agent_command_spec_flattens_bare_npx_command() {
-        let _lock = path_test_lock().lock().expect("lock");
+        let _lock = path_test_lock().lock().await;
         let runtime = install_fake_bundled_runtime();
         let _runtime_data_dir = test_runtime_data_dir();
         unsafe { std::env::set_var("AIONUI_BUNDLED_MANAGED_RESOURCES", runtime.path()) };

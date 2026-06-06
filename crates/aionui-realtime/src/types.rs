@@ -53,6 +53,16 @@ pub enum RealtimeError {
     AuthExpired,
     /// Incoming message did not match the standard WebSocket envelope.
     InvalidMessage,
+    /// Incoming message used a valid envelope but no realtime route supports it.
+    UnsupportedMessage,
+    /// Connection missed the heartbeat deadline and will be closed.
+    HeartbeatTimeout,
+    /// Outbound queue is saturated.
+    Backpressure,
+    /// WebSocket transport write failed.
+    SendFailed,
+    /// Realtime boundary hit an unexpected internal failure.
+    Internal,
 }
 
 impl RealtimeError {
@@ -62,6 +72,11 @@ impl RealtimeError {
             Self::AuthMissing => "REALTIME_AUTH_MISSING",
             Self::AuthExpired => "REALTIME_AUTH_EXPIRED",
             Self::InvalidMessage => "REALTIME_INVALID_MESSAGE",
+            Self::UnsupportedMessage => "REALTIME_UNSUPPORTED_MESSAGE",
+            Self::HeartbeatTimeout => "REALTIME_HEARTBEAT_TIMEOUT",
+            Self::Backpressure => "REALTIME_BACKPRESSURE",
+            Self::SendFailed => "REALTIME_SEND_FAILED",
+            Self::Internal => "REALTIME_INTERNAL_ERROR",
         }
     }
 
@@ -71,6 +86,11 @@ impl RealtimeError {
             Self::AuthMissing => "Authentication is required.",
             Self::AuthExpired => "Authentication has expired.",
             Self::InvalidMessage => "Message must use the standard realtime envelope.",
+            Self::UnsupportedMessage => "Realtime message is not supported.",
+            Self::HeartbeatTimeout => "Realtime connection heartbeat timed out.",
+            Self::Backpressure => "Realtime connection is temporarily overloaded.",
+            Self::SendFailed => "Realtime message could not be delivered.",
+            Self::Internal => "Realtime service encountered an internal error.",
         }
     }
 
@@ -79,6 +99,10 @@ impl RealtimeError {
         match self {
             Self::AuthMissing | Self::AuthExpired => false,
             Self::InvalidMessage => true,
+            Self::UnsupportedMessage => true,
+            Self::HeartbeatTimeout => false,
+            Self::Backpressure => true,
+            Self::SendFailed | Self::Internal => false,
         }
     }
 
@@ -88,7 +112,13 @@ impl RealtimeError {
             Self::InvalidMessage => serde_json::json!({
                 "expected": r#"{ "name": "event-name", "data": {...} }"#,
             }),
-            Self::AuthMissing | Self::AuthExpired => serde_json::json!({}),
+            Self::AuthMissing
+            | Self::AuthExpired
+            | Self::UnsupportedMessage
+            | Self::HeartbeatTimeout
+            | Self::Backpressure
+            | Self::SendFailed
+            | Self::Internal => serde_json::json!({}),
         }
     }
 
@@ -201,5 +231,25 @@ mod tests {
         let msg = RealtimeError::AuthMissing.into_event();
         assert_eq!(msg.data["code"], "REALTIME_AUTH_MISSING");
         assert_eq!(msg.data["recoverable"], false);
+    }
+
+    #[test]
+    fn realtime_boundary_error_matrix_uses_canonical_codes() {
+        let cases = [
+            (RealtimeError::UnsupportedMessage, "REALTIME_UNSUPPORTED_MESSAGE", true),
+            (RealtimeError::HeartbeatTimeout, "REALTIME_HEARTBEAT_TIMEOUT", false),
+            (RealtimeError::Backpressure, "REALTIME_BACKPRESSURE", true),
+            (RealtimeError::SendFailed, "REALTIME_SEND_FAILED", false),
+            (RealtimeError::Internal, "REALTIME_INTERNAL_ERROR", false),
+        ];
+
+        for (error, code, recoverable) in cases {
+            let msg = error.into_event();
+            assert_eq!(msg.name, "realtime.error");
+            assert_eq!(msg.data["code"], code);
+            assert_eq!(msg.data["recoverable"], recoverable);
+            assert!(msg.data["message"].is_string());
+            assert!(msg.data["details"].is_object());
+        }
     }
 }

@@ -79,7 +79,7 @@ async fn install_extension(
     State(state): State<HubRouterState>,
     body: Result<Json<InstallExtensionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state.installer.install(&req.name).await;
     Ok(Json(ApiResponse::ok(HubOperationResponse {
         success: result.success,
@@ -92,7 +92,7 @@ async fn retry_install(
     State(state): State<HubRouterState>,
     body: Result<Json<InstallExtensionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state.installer.retry_install(&req.name).await;
     Ok(Json(ApiResponse::ok(HubOperationResponse {
         success: result.success,
@@ -121,7 +121,7 @@ async fn update_extension(
     State(state): State<HubRouterState>,
     body: Result<Json<InstallExtensionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state.installer.update(&req.name).await;
     Ok(Json(ApiResponse::ok(HubOperationResponse {
         success: result.success,
@@ -134,7 +134,7 @@ async fn uninstall_extension(
     State(state): State<HubRouterState>,
     body: Result<Json<InstallExtensionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state.installer.uninstall(&req.name).await;
     Ok(Json(ApiResponse::ok(HubOperationResponse {
         success: result.success,

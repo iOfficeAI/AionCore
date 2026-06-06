@@ -198,16 +198,20 @@ fn handle_text_message(conn_id: ConnectionId, text: &str, state: &WsHandlerState
             handle_subscribe_show_open(state, conn_id, msg.data);
         }
         name => {
-            state.router.route(conn_id, name, msg.data);
+            if !state.router.route(conn_id, name, msg.data) {
+                send_realtime_error(state, conn_id, RealtimeError::UnsupportedMessage);
+            }
         }
     }
 }
 
 /// Send an error response for invalid message format.
 fn send_error_response(state: &WsHandlerState, conn_id: ConnectionId) {
-    state
-        .manager
-        .send_to(conn_id, RealtimeError::InvalidMessage.into_event());
+    send_realtime_error(state, conn_id, RealtimeError::InvalidMessage);
+}
+
+fn send_realtime_error(state: &WsHandlerState, conn_id: ConnectionId, error: RealtimeError) {
+    state.manager.send_to(conn_id, error.into_event());
 }
 
 /// Handle `subscribe-show-open`: reply with `show-open-request`.
@@ -270,6 +274,15 @@ mod tests {
             parsed["data"]["details"]["expected"],
             r#"{ "name": "event-name", "data": {...} }"#
         );
+    }
+
+    fn assert_unsupported_message_error(text: &str) {
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["name"], "realtime.error");
+        assert_eq!(parsed["data"]["code"], "REALTIME_UNSUPPORTED_MESSAGE");
+        assert_eq!(parsed["data"]["recoverable"], true);
+        assert!(parsed["data"]["message"].is_string());
+        assert!(parsed["data"]["details"].is_object());
     }
 
     #[test]
@@ -475,8 +488,9 @@ mod tests {
             called: AtomicBool,
         }
         impl MessageRouter for TestRouter {
-            fn route(&self, _conn_id: ConnectionId, _name: &str, _data: Value) {
+            fn route(&self, _conn_id: ConnectionId, _name: &str, _data: Value) -> bool {
                 self.called.store(true, Ordering::Relaxed);
+                true
             }
         }
 
@@ -501,6 +515,28 @@ mod tests {
         );
 
         assert!(router.called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn text_message_unhandled_by_router_sends_unsupported_error() {
+        let manager = Arc::new(WebSocketManager::new());
+        let (tx, mut rx) = mpsc::channel(PER_CONNECTION_BUFFER);
+        let conn_id = manager.add_client("tok".into(), tx);
+        let state = test_state(manager);
+
+        handle_text_message(
+            conn_id,
+            r#"{"name":"conversation.send-message","data":{"text":"hi"}}"#,
+            &state,
+        );
+
+        let msg = rx.try_recv().unwrap();
+        match msg {
+            WsOutbound::Text(text) => {
+                assert_unsupported_message_error(&text);
+            }
+            _ => panic!("expected unsupported message error"),
+        }
     }
 
     #[test]

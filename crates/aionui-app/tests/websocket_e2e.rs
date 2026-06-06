@@ -282,20 +282,18 @@ async fn t1_5_token_from_sec_websocket_protocol() {
 // ===========================================================================
 
 #[tokio::test]
-async fn t3_1_valid_json_message_accepted() {
+async fn t3_1_valid_json_with_no_registered_route_returns_unsupported_error() {
     let app = start_app().await;
     let token = sign_token(&app, "user1");
 
-    let (mut tx, _rx) = connect_bearer(app.addr, &token).await;
+    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let msg = json!({"name": "some-event", "data": {"key": "value"}});
     tx.send(send_json(&msg.to_string())).await.unwrap();
 
-    // No error response expected — verify with a short timeout
-    let timeout_result = tokio::time::timeout(Duration::from_millis(200), _rx.into_future()).await;
-    // Timeout (no response) is expected for valid messages routed to NoopMessageRouter
-    assert!(timeout_result.is_err(), "valid message should not generate a response");
+    let msg = read_text(&mut rx).await;
+    assert_realtime_error(&msg, "REALTIME_UNSUPPORTED_MESSAGE", true);
 }
 
 #[tokio::test]

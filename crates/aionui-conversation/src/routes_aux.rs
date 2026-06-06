@@ -44,7 +44,7 @@ async fn set_mode(
     Path(id): Path<String>,
     body: Result<Json<SetModeRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentModeResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state.service.set_mode(&id, req).await.map_err(ApiError::from)?,
     )))
@@ -66,7 +66,7 @@ async fn set_model(
     Path(id): Path<String>,
     body: Result<Json<SetModelRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<GetModelInfoResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state.service.set_model(&id, req).await.map_err(ApiError::from)?,
     )))

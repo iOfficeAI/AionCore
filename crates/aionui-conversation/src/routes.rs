@@ -80,7 +80,7 @@ async fn create(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateConversationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let conversation = state.service.create(&user.id, req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }
@@ -99,7 +99,7 @@ async fn clone(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CloneConversationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let conversation = state
         .service
         .clone_create(&user.id, req)
@@ -123,7 +123,7 @@ async fn update(
     Path(id): Path<String>,
     body: Result<Json<UpdateConversationRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ConversationResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let conversation = state
         .service
         .update(&user.id, &id, req, &state.task_manager)
@@ -203,7 +203,7 @@ async fn send_msg(
     Path(id): Path<String>,
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let msg_id = state
         .service
         .send_message(&user.id, &id, req, &state.task_manager)
@@ -241,7 +241,7 @@ async fn update_artifact(
     Path(params): Path<ArtifactPathParams>,
     body: Result<Json<UpdateConversationArtifactRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ConversationArtifactResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let artifact = state
         .service
         .update_artifact(&user.id, &params.id, &params.artifact_id, req)
@@ -317,7 +317,7 @@ async fn confirm(
     Path(params): Path<ConfirmPathParams>,
     body: Result<Json<ConfirmRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .service
         .confirm(&user.id, &params.id, &params.call_id, req, &state.task_manager)

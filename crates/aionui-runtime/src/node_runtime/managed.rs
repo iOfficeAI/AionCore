@@ -851,11 +851,11 @@ fn combined_retry_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[tokio::test]
@@ -979,7 +979,7 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_runtime_validation_failure_does_not_fallback_to_remote_download() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let bundled_root = tmp.path().join("bundled");
         let runtime_root = bundled_root.join("node").join("node-v24.11.0-darwin-arm64");

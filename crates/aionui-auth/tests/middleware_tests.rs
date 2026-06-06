@@ -261,9 +261,10 @@ async fn auth_middleware_database_error_returns_internal_error_code() {
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let json = json_body(resp).await;
     assert_eq!(json["code"], "INTERNAL_ERROR");
-    assert_eq!(json["error"], "Internal error: Authentication service unavailable");
+    assert_eq!(json["error"], "Internal server error.");
     let error = json["error"].as_str().unwrap();
     assert!(!error.contains("Database error"));
+    assert!(!error.contains("Authentication service unavailable"));
     assert!(!error.to_ascii_lowercase().contains("closed"));
     assert!(!error.to_ascii_lowercase().contains("sqlx"));
 }

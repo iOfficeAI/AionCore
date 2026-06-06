@@ -54,7 +54,7 @@ async fn open_file(
     State(state): State<ShellRouterState>,
     body: Result<Json<OpenFileRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.shell_service.open_file(&req.file_path).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -63,7 +63,7 @@ async fn show_item_in_folder(
     State(state): State<ShellRouterState>,
     body: Result<Json<ShowItemInFolderRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.shell_service.show_item_in_folder(&req.file_path).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -72,7 +72,7 @@ async fn open_external(
     State(state): State<ShellRouterState>,
     body: Result<Json<OpenExternalRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.shell_service.open_external(&req.url).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -81,7 +81,7 @@ async fn check_tool_installed(
     State(state): State<ShellRouterState>,
     body: Result<Json<CheckToolInstalledRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ApiResponse<CheckToolInstalledResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let installed = state.shell_service.check_tool_installed(req.tool).await;
     Ok(Json(ApiResponse::ok(CheckToolInstalledResponse { installed })))
 }
@@ -90,7 +90,7 @@ async fn open_folder_with(
     State(state): State<ShellRouterState>,
     body: Result<Json<OpenFolderWithRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.shell_service.open_folder_with(&req.folder_path, req.tool).await?;
     Ok(Json(ApiResponse::success()))
 }
