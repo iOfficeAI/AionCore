@@ -326,13 +326,51 @@ fn response_has_json_content_type(response: &Response) -> bool {
 fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'static str)> {
     match status {
         StatusCode::BAD_REQUEST => Some(("Bad request.", "BAD_REQUEST")),
+        StatusCode::UNAUTHORIZED => Some(("Unauthorized.", "UNAUTHORIZED")),
+        StatusCode::FORBIDDEN => Some(("Forbidden.", "FORBIDDEN")),
         StatusCode::NOT_FOUND => Some(("Route not found.", "NOT_FOUND")),
         StatusCode::METHOD_NOT_ALLOWED => Some(("Method not allowed.", "METHOD_NOT_ALLOWED")),
+        StatusCode::CONFLICT => Some(("Conflict.", "CONFLICT")),
+        StatusCode::GONE => Some(("Gone.", "GONE")),
         StatusCode::PAYLOAD_TOO_LARGE => Some(("Request body is too large.", "PAYLOAD_TOO_LARGE")),
         StatusCode::UNSUPPORTED_MEDIA_TYPE => Some(("Unsupported media type.", "UNSUPPORTED_MEDIA_TYPE")),
+        StatusCode::UNPROCESSABLE_ENTITY => Some(("Unprocessable entity.", "UNPROCESSABLE_ENTITY")),
+        StatusCode::TOO_MANY_REQUESTS => Some(("Rate limited", "RATE_LIMITED")),
         StatusCode::INTERNAL_SERVER_ERROR => Some(("Internal server error.", "INTERNAL_ERROR")),
         StatusCode::BAD_GATEWAY => Some(("Upstream service unavailable.", "BAD_GATEWAY")),
         StatusCode::GATEWAY_TIMEOUT => Some(("Request timed out.", "GATEWAY_TIMEOUT")),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::boundary_error_for_status;
+
+    #[test]
+    fn boundary_error_for_status_covers_common_fallback_statuses() {
+        let cases = [
+            (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+            (StatusCode::UNAUTHORIZED, "UNAUTHORIZED"),
+            (StatusCode::FORBIDDEN, "FORBIDDEN"),
+            (StatusCode::NOT_FOUND, "NOT_FOUND"),
+            (StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED"),
+            (StatusCode::CONFLICT, "CONFLICT"),
+            (StatusCode::GONE, "GONE"),
+            (StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE"),
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, "UNSUPPORTED_MEDIA_TYPE"),
+            (StatusCode::UNPROCESSABLE_ENTITY, "UNPROCESSABLE_ENTITY"),
+            (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
+            (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            (StatusCode::GATEWAY_TIMEOUT, "GATEWAY_TIMEOUT"),
+        ];
+
+        for (status, code) in cases {
+            let (_, actual_code) = boundary_error_for_status(status).expect("status should be normalized");
+            assert_eq!(actual_code, code);
+        }
     }
 }

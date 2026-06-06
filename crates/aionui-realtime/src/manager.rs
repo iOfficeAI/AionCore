@@ -67,8 +67,10 @@ impl WebSocketManager {
 
     /// Send a message to all connected clients.
     ///
-    /// Uses `try_send` for backpressure — full channels drop the message
-    /// with a warning; closed channels trigger client removal.
+    /// Uses `try_send` for backpressure. A saturated channel cannot reliably
+    /// receive an additional `REALTIME_BACKPRESSURE` event on the same path, so
+    /// broadcast backpressure is logged and the connection is left alive.
+    /// Closed channels trigger client removal.
     pub fn broadcast_all(&self, msg: WebSocketMessage<serde_json::Value>) {
         let text = match serde_json::to_string(&msg) {
             Ok(t) => t,
@@ -84,7 +86,11 @@ impl WebSocketManager {
             match entry.value().tx.try_send(WsOutbound::Text(text.clone())) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(%conn_id, "outbound channel full, message dropped");
+                    warn!(
+                        %conn_id,
+                        code = RealtimeError::Backpressure.code(),
+                        "outbound channel full, broadcast message dropped"
+                    );
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     disconnected.push(conn_id);
@@ -115,13 +121,19 @@ impl WebSocketManager {
 
     /// Send a raw outbound message to a specific connection.
     ///
-    /// Used for non-`WebSocketMessage` payloads (e.g. error responses).
+    /// Used for non-`WebSocketMessage` payloads (e.g. error responses). A full
+    /// channel cannot receive a send-failure event through the same queue, so
+    /// backpressure is logged as the downgrade path.
     pub fn send_raw_to(&self, conn_id: ConnectionId, outbound: WsOutbound) {
         if let Some(client) = self.connections.get(&conn_id) {
             match client.tx.try_send(outbound) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(%conn_id, "outbound channel full, message dropped");
+                    warn!(
+                        %conn_id,
+                        code = RealtimeError::SendFailed.code(),
+                        "outbound channel full, raw message dropped"
+                    );
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     drop(client);
@@ -194,7 +206,12 @@ fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validat
                     to_remove.push(conn_id);
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(%conn_id, "outbound channel full, terminal auth close deferred");
+                    warn!(
+                        %conn_id,
+                        code = RealtimeError::Backpressure.code(),
+                        "outbound channel full, terminal auth close dropped"
+                    );
+                    to_remove.push(conn_id);
                 }
             }
             continue;
@@ -515,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_tick_keeps_expired_token_connection_when_terminal_queue_is_full() {
+    fn heartbeat_tick_removes_expired_token_connection_when_terminal_queue_is_full() {
         let connections = Arc::new(DashMap::new());
         let (tx, mut rx) = mpsc::channel(1);
 
@@ -531,7 +548,7 @@ mod tests {
 
         heartbeat_tick(&connections, &always_expired());
 
-        assert_eq!(connections.len(), 1);
+        assert_eq!(connections.len(), 0);
         assert_eq!(rx.try_recv().unwrap(), WsOutbound::Text("queued".into()));
         assert!(rx.try_recv().is_err());
     }

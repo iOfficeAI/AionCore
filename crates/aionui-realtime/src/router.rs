@@ -13,9 +13,11 @@ pub trait MessageRouter: Send + Sync {
     fn route(&self, conn_id: ConnectionId, name: &str, data: serde_json::Value) -> bool;
 }
 
-/// A no-op message router that silently discards all messages.
+/// A no-op message router that reports every message as unhandled.
 ///
-/// Used as a placeholder until business modules provide real routing.
+/// Used as a placeholder until business modules provide real routing. The
+/// WebSocket handler turns the `false` return value into
+/// `REALTIME_UNSUPPORTED_MESSAGE`.
 pub struct NoopMessageRouter;
 
 impl MessageRouter for NoopMessageRouter {

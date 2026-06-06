@@ -28,7 +28,9 @@ impl From<OfficeError> for ApiError {
             OfficeError::OfficecliNotFound => ApiError::BadRequest("officecli not found".into()),
             OfficeError::InstallFailed(msg) => ApiError::Internal(format!("officecli install failed: {msg}")),
             OfficeError::StartFailed(msg) => ApiError::Internal(format!("preview start failed: {msg}")),
-            OfficeError::PortTimeout(path) => ApiError::Timeout(format!("port readiness timeout for {path}")),
+            OfficeError::PortTimeout(path) => {
+                ApiError::Internal(format!("preview service readiness timeout for {path}"))
+            }
             OfficeError::Io(e) => ApiError::Internal(format!("IO error: {e}")),
             OfficeError::Snapshot(msg) => ApiError::Internal(format!("snapshot error: {msg}")),
             OfficeError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
@@ -389,9 +391,9 @@ mod tests {
     }
 
     #[test]
-    fn port_timeout_maps_to_timeout() {
+    fn port_timeout_maps_to_internal() {
         let err = ApiError::from(OfficeError::PortTimeout("/a.docx".into()));
-        assert!(matches!(err, ApiError::Timeout(msg) if msg.contains("/a.docx")));
+        assert!(matches!(err, ApiError::Internal(msg) if msg.contains("/a.docx")));
     }
 
     #[test]

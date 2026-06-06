@@ -148,13 +148,23 @@ impl ApiError {
     /// internals such as SQL errors, local paths, subprocess stderr, or tokens.
     pub fn public_message(&self) -> String {
         match self {
+            Self::BadRequest(message) => message.clone(),
+            Self::Unauthorized(message) => message.clone(),
+            Self::Forbidden(_) => "Forbidden.".to_owned(),
+            Self::NotFound(message) => message.clone(),
             Self::PathOutsideSandbox { .. } => "Path is outside the allowed sandbox.".to_owned(),
             Self::PayloadTooLarge(_) => "Request body is too large.".to_owned(),
             Self::UnsupportedMediaType(_) => "Unsupported media type.".to_owned(),
+            Self::CsrfInvalid(message) => message.clone(),
+            Self::Conflict(message) => message.clone(),
+            Self::RateLimited => "Rate limited".to_owned(),
             Self::Internal(_) => "Internal server error.".to_owned(),
             Self::BadGateway(_) => "Upstream service unavailable.".to_owned(),
             Self::Timeout(_) => "Request timed out.".to_owned(),
-            _ => self.to_string(),
+            Self::UnprocessableEntity(message) => message.clone(),
+            Self::ConversationArchived(message) => message.clone(),
+            Self::WorkspacePathUnavailable(_) => "Workspace path is unavailable.".to_owned(),
+            Self::WorkspacePathRuntimeUnavailable(_) => "Workspace path is unavailable at runtime.".to_owned(),
         }
     }
 }
@@ -355,22 +365,42 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["success"], false);
-        assert_eq!(json["error"], "Not found: user 42");
+        assert_eq!(json["error"], "user 42");
         assert_eq!(json["code"], "NOT_FOUND");
     }
 
     #[tokio::test]
-    async fn internal_response_uses_safe_public_message() {
-        let resp = ApiError::Internal("database password leaked in detail".into()).into_response();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    async fn public_message_does_not_expose_internal_details() {
+        let cases = [
+            (
+                ApiError::Forbidden("Asset path escapes extension root: /tmp/aionui/private/icon.png".into()),
+                StatusCode::FORBIDDEN,
+                "Forbidden.",
+                "FORBIDDEN",
+            ),
+            (
+                ApiError::Internal("database password leaked in detail".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error.",
+                "INTERNAL_ERROR",
+            ),
+        ];
 
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for (error, status, message, code) in cases {
+            let resp = error.into_response();
+            assert_eq!(resp.status(), status);
 
-        assert_eq!(json["success"], false);
-        assert_eq!(json["error"], "Internal server error.");
-        assert_eq!(json["code"], "INTERNAL_ERROR");
-        assert!(!json["error"].as_str().unwrap().contains("password"));
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            assert_eq!(json["success"], false);
+            assert_eq!(json["error"], message);
+            assert_eq!(json["code"], code);
+            let public_error = json["error"].as_str().unwrap();
+            assert!(!public_error.contains("/tmp"));
+            assert!(!public_error.contains("password"));
+            assert!(!public_error.contains("Asset path"));
+        }
     }
 
     #[tokio::test]
