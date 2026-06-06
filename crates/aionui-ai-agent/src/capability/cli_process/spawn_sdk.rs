@@ -126,45 +126,17 @@ impl CliAgentProcess {
     /// Mirrors the frontend `acpConnectors.ts::getCleanAgentEnv` logic:
     /// - Set BUN_INSTALL_CACHE_DIR / BUN_TMPDIR to stable paths under
     ///   the backend's `AppConfig.data_dir`
-    /// - Set CLAUDE_CODE_EXECUTABLE so claude-agent-sdk finds the CLI
+    ///
+    /// Claude SDK resolves its packaged native binary by default. Callers may
+    /// still provide `CLAUDE_CODE_EXECUTABLE` explicitly via `CommandSpec.env`.
     fn agent_spawn_env(data_dir: &Path) -> Vec<(String, String)> {
         let bun_cache = data_dir.join("bun-cache");
         let bun_tmp = data_dir.join("bun-tmp");
 
-        let mut env = vec![
+        vec![
             ("BUN_INSTALL_CACHE_DIR".into(), bun_cache.to_string_lossy().into_owned()),
             ("BUN_TMPDIR".into(), bun_tmp.to_string_lossy().into_owned()),
-        ];
-
-        // PATH enrichment (including bundled bun dir) is handled globally by
-        // `aionui_runtime::enhance_process_path` during startup; children
-        // inherit it automatically. No per-spawn injection needed.
-
-        if let Some(claude_path) = Self::find_native_claude() {
-            env.push(("CLAUDE_CODE_EXECUTABLE".into(), claude_path));
-        }
-
-        env
-    }
-
-    /// Find the native Claude Code binary so `claude-agent-sdk` can spawn it
-    /// directly via `CLAUDE_CODE_EXECUTABLE`.
-    ///
-    /// Walks `PATH` in declared order. The actual binary check is delegated
-    /// to `aionui_runtime::resolve_command_in`, which honours `PATHEXT` on
-    /// Windows and adds the `.cmd / .ps1 / .bat` shim fallback for
-    /// npm-installed CLIs.
-    fn find_native_claude() -> Option<String> {
-        let path_var = std::env::var_os("PATH")?;
-        for dir in std::env::split_paths(&path_var) {
-            if dir.as_os_str().is_empty() {
-                continue;
-            }
-            if let Some(found) = aionui_runtime::resolve_command_in("claude", &dir) {
-                return Some(found.to_string_lossy().into_owned());
-            }
-        }
-        None
+        ]
     }
 }
 
@@ -175,6 +147,59 @@ mod tests {
     use std::time::Duration;
 
     // ── SDK mode tests ───────────────────────────────────────────────
+
+    #[test]
+    fn agent_spawn_env_does_not_override_claude_code_executable_from_path() {
+        const CHILD_ENV: &str = "AIONUI_TEST_AGENT_SPAWN_ENV_CHILD";
+
+        if let Some(data_dir) = std::env::var_os(CHILD_ENV) {
+            let env = CliAgentProcess::agent_spawn_env(Path::new(&data_dir));
+
+            assert!(
+                !env.iter().any(|(name, _)| name == "CLAUDE_CODE_EXECUTABLE"),
+                "managed claude-agent-acp should use its packaged Claude SDK binary by default"
+            );
+            assert!(
+                env.iter()
+                    .any(|(name, value)| name == "BUN_INSTALL_CACHE_DIR" && value.contains("bun-cache")),
+                "non-Claude SDK spawn env entries should still be present"
+            );
+            assert!(
+                env.iter()
+                    .any(|(name, value)| name == "BUN_TMPDIR" && value.contains("bun-tmp")),
+                "non-Claude SDK spawn env entries should still be present"
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake_claude = temp.path().join(if cfg!(windows) { "claude.cmd" } else { "claude" });
+        std::fs::write(
+            &fake_claude,
+            if cfg!(windows) { "@echo off\r\n" } else { "#!/bin/sh\n" },
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("capability::cli_process::spawn_sdk::tests::agent_spawn_env_does_not_override_claude_code_executable_from_path")
+            .arg("--nocapture")
+            .env(CHILD_ENV, temp.path())
+            .env("PATH", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[tokio::test]
     async fn spawn_for_sdk_take_stdio() {
