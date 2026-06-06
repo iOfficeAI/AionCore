@@ -11,6 +11,7 @@ pub mod routes_aux;
 pub mod runtime_state;
 pub mod service;
 mod service_ops;
+pub(crate) mod session_context;
 pub mod skill_resolver;
 pub mod skill_snapshot;
 pub mod state;

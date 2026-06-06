@@ -4,11 +4,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use aionui_ai_agent::session_context::{
+    AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
+};
 use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
-use aionui_api_types::{AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
-use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
+use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
+use aionui_common::{AgentKillReason, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
     AcpSessionRow, AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
@@ -576,7 +579,7 @@ fn success_factory() -> AgentFactory {
     Arc::new(|opts: BuildTaskOptions| {
         async move {
             Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
-                mock_agent::MockAgent::new(opts.conversation_id, opts.workspace),
+                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
             )))
         }
         .boxed()
@@ -600,10 +603,42 @@ fn confirmations_factory(count: usize) -> AgentFactory {
             .collect::<Vec<_>>();
         async move {
             Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
-                mock_agent::MockAgent::with_confirmations(opts.conversation_id, opts.workspace, confirmations),
+                mock_agent::MockAgent::with_confirmations(
+                    opts.context.conversation.conversation_id,
+                    opts.context.workspace.path,
+                    confirmations,
+                ),
             )))
         }
         .boxed()
+    })
+}
+
+fn test_acp_build_options(conversation_id: String, workspace: String) -> BuildTaskOptions {
+    BuildTaskOptions::new(AgentSessionContext {
+        conversation: ConversationContext {
+            conversation_id,
+            user_id: "user1".into(),
+            agent_type: aionui_common::AgentType::Acp,
+            source: None,
+        },
+        workspace: WorkspaceContext {
+            path: workspace.clone(),
+            stored_path: workspace,
+            is_custom: true,
+        },
+        model: ProviderWithModel {
+            provider_id: "test".into(),
+            model: "claude".into(),
+            use_model: None,
+        },
+        skills: Vec::new(),
+        kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
+            config: AcpBuildExtra::default(),
+            belongs_to_team: false,
+            session_id: None,
+            session_snapshot: None,
+        })),
     })
 }
 
@@ -1037,17 +1072,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
     task_manager
         .get_or_build_task(
             &conversation_id,
-            BuildTaskOptions {
-                agent_type: AgentType::Acp,
-                workspace: "/tmp/ws".into(),
-                model: ProviderWithModel {
-                    provider_id: "test".into(),
-                    model: "claude".into(),
-                    use_model: None,
-                },
-                conversation_id: conversation_id.clone(),
-                extra: serde_json::json!({}),
-            },
+            test_acp_build_options(conversation_id.clone(), "/tmp/ws".into()),
         )
         .await
         .unwrap();
@@ -1604,18 +1629,22 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
     use futures_util::FutureExt;
     let (svc, _tm) = setup_with_factory(Arc::new(|opts: BuildTaskOptions| {
         async move {
-            let extra_has_cfg = opts
-                .extra
-                .get("team_mcp_stdio_config")
-                .and_then(|v| v.as_object())
-                .is_some_and(|o| o.contains_key("port") && o.contains_key("slot_id"));
+            let context = opts.context;
+            let extra_has_cfg = match &context.kind {
+                AgentSessionKind::Acp(acp) => acp
+                    .config
+                    .team_mcp_stdio_config
+                    .as_ref()
+                    .is_some_and(|cfg| cfg.port > 0 && !cfg.slot_id.is_empty()),
+                _ => false,
+            };
             assert!(
                 extra_has_cfg,
-                "factory called without team_mcp_stdio_config in extra: {:?}",
-                opts.extra
+                "factory called without team_mcp_stdio_config in typed context: {:?}",
+                context.kind
             );
             Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
-                mock_agent::MockAgent::new(opts.conversation_id, opts.workspace),
+                mock_agent::MockAgent::new(context.conversation.conversation_id, context.workspace.path),
             )))
         }
         .boxed()

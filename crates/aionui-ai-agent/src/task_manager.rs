@@ -202,6 +202,9 @@ mod tests {
     use super::*;
     use crate::agent_task::{IAgentTask, IMockAgent};
     use crate::protocol::events::AgentStreamEvent;
+    use crate::session_context::{
+        AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
+    };
     use crate::types::SendMessageData;
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, ProviderWithModel};
     use futures_util::FutureExt;
@@ -282,17 +285,31 @@ mod tests {
     impl IMockAgent for MockAgent {}
 
     fn make_options(conversation_id: &str) -> BuildTaskOptions {
-        BuildTaskOptions {
-            agent_type: AgentType::Acp,
-            workspace: "/tmp/test".into(),
+        BuildTaskOptions::new(AgentSessionContext {
+            conversation: ConversationContext {
+                conversation_id: conversation_id.into(),
+                user_id: "user-1".into(),
+                agent_type: AgentType::Acp,
+                source: None,
+            },
+            workspace: WorkspaceContext {
+                path: "/tmp/test".into(),
+                stored_path: "/tmp/test".into(),
+                is_custom: true,
+            },
             model: ProviderWithModel {
                 provider_id: "p1".into(),
                 model: "test".into(),
                 use_model: None,
             },
-            conversation_id: conversation_id.into(),
-            extra: serde_json::Value::Null,
-        }
+            skills: vec![],
+            kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
+                config: Default::default(),
+                belongs_to_team: false,
+                session_id: None,
+                session_snapshot: None,
+            })),
+        })
     }
 
     fn mock_instance(agent: MockAgent) -> AgentInstance {
@@ -301,7 +318,7 @@ mod tests {
 
     fn make_manager() -> WorkerTaskManagerImpl {
         let factory: AgentFactory = Arc::new(|opts: BuildTaskOptions| {
-            async move { Ok(mock_instance(MockAgent::new(&opts.conversation_id, None))) }.boxed()
+            async move { Ok(mock_instance(MockAgent::new(opts.conversation_id(), None))) }.boxed()
         });
         WorkerTaskManagerImpl::new(factory)
     }
@@ -350,7 +367,7 @@ mod tests {
                 // Simulate a slow build (CLI spawn + initialize handshake).
                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(mock_instance(MockAgent::new(&opts.conversation_id, None)))
+                Ok(mock_instance(MockAgent::new(opts.conversation_id(), None)))
             }
             .boxed()
         });
@@ -389,7 +406,7 @@ mod tests {
                 if flag.swap(false, Ordering::SeqCst) {
                     Err(AgentError::internal("first call fails"))
                 } else {
-                    Ok(mock_instance(MockAgent::new(&opts.conversation_id, None)))
+                    Ok(mock_instance(MockAgent::new(opts.conversation_id(), None)))
                 }
             }
             .boxed()

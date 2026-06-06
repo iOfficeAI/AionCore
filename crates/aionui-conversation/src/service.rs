@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
 
@@ -36,6 +37,7 @@ use crate::convert::{
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
+use crate::session_context::SessionContextBuilder;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::stream_relay::StreamRelay;
@@ -1413,7 +1415,7 @@ impl ConversationService {
         ));
 
         // Build task options from conversation row
-        let build_opts = match self.build_task_options(&row) {
+        let build_opts = match self.build_task_options(&row).await {
             Ok(opts) => opts,
             Err(err) => {
                 error!(
@@ -1432,7 +1434,7 @@ impl ConversationService {
             }
         };
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
-        let stored_workspace = build_opts.workspace.clone();
+        let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
         let conv_id = conversation_id.to_owned();
         let repo = Arc::clone(&self.conversation_repo);
@@ -1745,9 +1747,9 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
-        let build_opts = self.build_task_options(&row)?;
+        let build_opts = self.build_task_options(&row).await?;
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
-        let stored_workspace = build_opts.workspace.clone();
+        let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let agent = task_manager.get_or_build_task(conversation_id, build_opts).await?;
 
         // Persist auto-resolved workspace if factory picked a different path.
@@ -1779,95 +1781,57 @@ fn agent_error_top_level_code(error: &AgentError) -> &'static str {
 }
 
 impl ConversationService {
-    /// Build [`BuildTaskOptions`] from a conversation database row.
+    /// Build typed agent runtime context from a conversation database row.
     ///
-    /// Provider/model resolution lives in [`crate::task_options::provider_model_from_conversation_row`]
-    /// so the cron executor can derive identical values for the same row.
-    /// Diverging the lookup here historically produced
-    /// `Provider '<vendor>' not found` failures under cron when the
-    /// interactive path worked fine (Sentry ELECTRON-1HM).
-    fn build_task_options(
+    /// Raw `conversation.extra` parsing lives in [`SessionContextBuilder`]
+    /// so the task manager and concrete agent factories consume typed
+    /// session context instead of the DB envelope.
+    async fn build_task_options(
         &self,
         row: &aionui_db::models::ConversationRow,
     ) -> Result<BuildTaskOptions, ConversationError> {
-        let agent_type = string_to_enum(&row.r#type)?;
+        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+            .build_options(row)
+            .await
+    }
 
-        let model = crate::task_options::provider_model_from_conversation_row(row);
-
-        let mut extra: serde_json::Value = serde_json::from_str(&row.extra)
-            .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
-
-        // Inject user_id into extra so the Guide MCP bridge can pass it to
-        // aion_create_team without a separate lookup. Harmless for non-ACP types.
-        if let Some(obj) = extra.as_object_mut() {
-            obj.entry("user_id")
-                .or_insert_with(|| serde_json::Value::String(row.user_id.clone()));
-        }
-
-        // Extract workspace from extra (common across agent types)
-        let workspace = match extra.get("workspace").and_then(|v| v.as_str()) {
-            Some(workspace) if !workspace.is_empty() => {
-                let expected_auto_workspace =
-                    expected_auto_workspace_path(&self.workspace_root, &row.id, &agent_type, extra.get("backend"));
-                let normalized = match validate_workspace_path_availability(workspace) {
-                    Ok(normalized) => normalized,
-                    Err(WorkspacePathValidationError::DoesNotExist(path))
-                        if expected_auto_workspace.as_path() == std::path::Path::new(workspace) =>
-                    {
-                        path
-                    }
-                    Err(error) => return Err(map_runtime_workspace_validation_error(error)),
-                };
-                if normalized != workspace {
-                    extra["workspace"] = serde_json::Value::String(normalized.clone());
-                }
-                normalized
-            }
-            _ => String::new(),
-        };
-
-        Ok(BuildTaskOptions {
-            agent_type,
-            workspace,
-            model,
-            conversation_id: row.id.clone(),
-            extra,
-        })
+    pub async fn build_task_options_for_runtime(
+        &self,
+        row: &aionui_db::models::ConversationRow,
+        workspace_override: Option<&str>,
+    ) -> Result<BuildTaskOptions, ConversationError> {
+        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+            .build_options_with_workspace_override(row, workspace_override)
+            .await
     }
 
     async fn ensure_auto_workspace_skill_links(&self, row: &ConversationRow, build_opts: &BuildTaskOptions) {
+        let context = &build_opts.context;
+        if context.workspace.is_custom {
+            return;
+        }
+        let backend = context_backend_value(context);
         let expected_workspace = expected_auto_workspace_path(
             &self.workspace_root,
             &row.id,
-            &build_opts.agent_type,
-            build_opts.extra.get("backend"),
+            &context.conversation.agent_type,
+            backend.as_ref(),
         );
 
-        let stored_workspace = build_opts.workspace.trim();
-        let workspace = if stored_workspace.is_empty() {
-            expected_workspace
-        } else {
-            let workspace = PathBuf::from(stored_workspace);
-            if workspace != expected_workspace {
-                return;
-            }
-            workspace
-        };
+        let workspace = PathBuf::from(context.workspace.path.trim());
+        if workspace != expected_workspace {
+            return;
+        }
 
-        let skill_names = build_opts
-            .extra
-            .get("skills")
-            .cloned()
-            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
-            .unwrap_or_default();
+        let skill_names = context_skill_names(context);
         if skill_names.is_empty() {
             return;
         }
 
         let Some(rel_dirs) = native_skills_dirs(
             &self.agent_metadata_repo,
-            &build_opts.agent_type,
-            build_opts.extra.get("backend"),
+            &context.conversation.agent_type,
+            backend.as_ref(),
         )
         .await
         else {
@@ -2065,19 +2029,6 @@ fn map_create_workspace_validation_error(error: WorkspacePathValidationError) ->
     }
 }
 
-fn map_runtime_workspace_validation_error(error: WorkspacePathValidationError) -> ConversationError {
-    match error {
-        WorkspacePathValidationError::Empty => ConversationError::BadRequest {
-            reason: "Workspace directory is empty".into(),
-        },
-        WorkspacePathValidationError::DoesNotExist(path)
-        | WorkspacePathValidationError::NotDirectory(path)
-        | WorkspacePathValidationError::NotAccessible { path, .. } => {
-            ConversationError::WorkspacePathRuntimeUnavailable { path }
-        }
-    }
-}
-
 // ── Helpers ────────────────────────────────────────────────────────
 
 /// Compute the label used in auto-provisioned workspace directory names.
@@ -2106,6 +2057,22 @@ fn expected_auto_workspace_path(
         "{}-temp-{conversation_id}",
         conversation_label(agent_type, backend)
     ))
+}
+
+fn context_backend_value(context: &AgentSessionContext) -> Option<serde_json::Value> {
+    match &context.kind {
+        AgentSessionKind::Acp(acp) => acp
+            .config
+            .backend
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .map(|value| serde_json::Value::String(value.clone())),
+        _ => None,
+    }
+}
+
+fn context_skill_names(context: &AgentSessionContext) -> Vec<String> {
+    context.skills.clone()
 }
 
 /// Resolve the native skills directory list for an agent by looking it

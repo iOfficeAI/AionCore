@@ -6,6 +6,7 @@ use aion_config::config::{McpServerConfig, TransportType};
 use aionui_api_types::{
     AionrsBuildExtra, GuideMcpConfig, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
+use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_realtime::EventBroadcaster;
@@ -19,22 +20,19 @@ use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
-use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig, BuildTaskOptions};
+use crate::session_context::AionrsSessionBuildContext;
+use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
 
 const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionrs", "codebuddy"];
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
-    options: BuildTaskOptions,
+    build_context: AionrsSessionBuildContext,
+    model: ProviderWithModel,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
-    let belongs_to_team = options
-        .extra
-        .get("teamId")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|s| !s.is_empty());
-
-    let mut overrides: AionrsBuildExtra = serde_json::from_value(options.extra).unwrap_or_default();
+    let belongs_to_team = build_context.belongs_to_team;
+    let mut overrides = build_context.config;
 
     // Merge preset assistant rules into system_prompt (used as custom_prompt
     // in aionrs's build_system_prompt). Mirrors the old architecture's
@@ -100,7 +98,7 @@ pub(super) async fn build(
         );
     }
 
-    let provider_id = &options.model.provider_id;
+    let provider_id = &model.provider_id;
     let row = deps
         .provider_repo
         .find_by_id(provider_id)
@@ -111,12 +109,11 @@ pub(super) async fn build(
     let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &deps.encryption_key)
         .map_err(|e| AgentError::internal(e.to_string()))?;
 
-    let model_id = options
-        .model
+    let model_id = model
         .use_model
         .as_deref()
         .filter(|s| !s.is_empty())
-        .unwrap_or(&options.model.model)
+        .unwrap_or(&model.model)
         .to_owned();
 
     let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref());

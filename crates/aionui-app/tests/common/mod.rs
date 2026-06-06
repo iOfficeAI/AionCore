@@ -112,7 +112,7 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
     > = std::sync::Arc::new(|opts| {
         Box::pin(async move {
             Ok(AgentInstance::Mock(std::sync::Arc::new(NoopMockAgent {
-                conversation_id: opts.conversation_id,
+                conversation_id: opts.conversation_id().to_owned(),
             })))
         })
     });

@@ -6,9 +6,9 @@ use crate::factory::AgentFactoryDeps;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
 use crate::factory::context::FactoryContext;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
-use crate::types::BuildTaskOptions;
+use crate::session_context::AcpSessionBuildContext;
 use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
-use aionui_api_types::{AcpBuildExtra, SessionMcpServer, SessionMcpTransport};
+use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
@@ -23,17 +23,11 @@ use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
-    options: BuildTaskOptions,
+    build_context: AcpSessionBuildContext,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
-    let belongs_to_team = options
-        .extra
-        .get("teamId")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|s| !s.is_empty());
-
-    let mut config: AcpBuildExtra = serde_json::from_value(options.extra)
-        .map_err(|e| AgentError::bad_request(format!("Invalid ACP build options: {e}")))?;
+    let belongs_to_team = build_context.belongs_to_team;
+    let mut config = build_context.config;
 
     // Resolve the catalog row — prefer explicit agent_id, fall
     // back to a vendor-label match for legacy payloads.
@@ -97,7 +91,7 @@ pub(super) async fn build(
             tracing::info!(?keys, "cc-switch: env vars injected");
         }
     }
-    let session_snapshot = deps.acp_agent_service.load_snapshot_state(&ctx.conversation_id).await;
+    let session_snapshot = build_context.session_snapshot;
 
     // Load user-configured MCP servers from the DB so they reach
     // ACP `session/new` mcpServers payload. Without this the agent
@@ -182,7 +176,7 @@ pub(super) async fn build(
     // inside `AcpAgentManager::new`. The CLI-assigned session id is still
     // loaded here so the first turn after a task rebuild takes the resume
     // path.
-    if let Some(sid) = deps.acp_agent_service.load_session_id(&ctx.conversation_id).await {
+    if let Some(sid) = build_context.session_id {
         arc.set_session_id(sid).await;
     }
 

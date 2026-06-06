@@ -15,6 +15,7 @@ pub mod registry;
 pub mod routes;
 pub(crate) mod runtime_status;
 pub(crate) mod services;
+pub mod session_context;
 pub mod shared_kernel;
 pub mod task_manager;
 pub mod types;
@@ -43,4 +44,8 @@ pub use registry::{AgentRegistry, UnavailableReason};
 pub use routes::{AgentRouterState, RemoteAgentRouterState, agent_routes, remote_agent_routes};
 pub use services::AgentService;
 pub use services::RemoteAgentService;
+pub use session_context::{
+    AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext,
+    NanobotSessionBuildContext, OpenClawSessionBuildContext, RemoteSessionBuildContext, WorkspaceContext,
+};
 pub use task_manager::{IWorkerTaskManager, WorkerTaskManagerImpl};

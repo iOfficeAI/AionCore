@@ -151,28 +151,65 @@ async fn collect_idle_ignores_non_acp_agent_types() {
     // Build a factory that creates typed mocks (all finished + old)
     let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
         async move {
-            let mock = TypedMockAgent::new(
-                opts.agent_type,
-                &opts.conversation_id,
-                Some(ConversationStatus::Finished),
-            )
-            .with_last_activity(old_ts);
+            let agent_type = opts.context.conversation.agent_type;
+            let conversation_id = opts.context.conversation.conversation_id.clone();
+            let mock = TypedMockAgent::new(agent_type, &conversation_id, Some(ConversationStatus::Finished))
+                .with_last_activity(old_ts);
             Ok(AgentInstance::Mock(Arc::new(mock)))
         }
         .boxed()
     });
     let mgr = WorkerTaskManagerImpl::new(factory);
 
-    let make_opts = |agent_type: AgentType, id: &str| BuildTaskOptions {
-        agent_type,
-        workspace: "/tmp".into(),
-        model: ProviderWithModel {
-            provider_id: "p".into(),
-            model: "m".into(),
-            use_model: None,
-        },
-        conversation_id: id.into(),
-        extra: json!(null),
+    let make_opts = |agent_type: AgentType, id: &str| {
+        let kind = match agent_type {
+            AgentType::Acp => AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
+                config: Default::default(),
+                belongs_to_team: false,
+                session_id: None,
+                session_snapshot: None,
+            })),
+            AgentType::Aionrs => AgentSessionKind::Aionrs(Box::new(AionrsSessionBuildContext {
+                config: Default::default(),
+                belongs_to_team: false,
+            })),
+            AgentType::OpenclawGateway => AgentSessionKind::OpenClaw(Box::new(OpenClawSessionBuildContext {
+                config: aionui_api_types::OpenClawBuildExtra {
+                    backend: None,
+                    agent_name: None,
+                    gateway: Default::default(),
+                    skills: vec![],
+                    preset_assistant_id: None,
+                    cron_job_id: None,
+                    session_key: None,
+                },
+            })),
+            AgentType::Remote => AgentSessionKind::Remote(RemoteSessionBuildContext {
+                remote_agent_id: "remote-1".into(),
+            }),
+            AgentType::Nanobot => AgentSessionKind::Nanobot(NanobotSessionBuildContext),
+            AgentType::Gemini => AgentSessionKind::Gemini,
+        };
+        BuildTaskOptions::new(AgentSessionContext {
+            conversation: ConversationContext {
+                conversation_id: id.into(),
+                user_id: "user-1".into(),
+                agent_type,
+                source: None,
+            },
+            workspace: WorkspaceContext {
+                path: "/tmp".into(),
+                stored_path: "/tmp".into(),
+                is_custom: true,
+            },
+            model: ProviderWithModel {
+                provider_id: "p".into(),
+                model: "m".into(),
+                use_model: None,
+            },
+            skills: vec![],
+            kind,
+        })
     };
 
     mgr.get_or_build_task("nanobot-1", make_opts(AgentType::Nanobot, "nanobot-1"))
