@@ -19,6 +19,7 @@ pub mod skill_resolver;
 pub mod skill_snapshot;
 mod startup_recovery;
 pub mod state;
+mod stream_persistence;
 pub mod stream_relay;
 pub mod task_options;
 mod turn_continuation_policy;
