@@ -3,6 +3,7 @@ use aionui_common::{ErrorChain, now_ms};
 use aionui_db::models::MessageRow;
 use tracing::warn;
 
+use crate::runtime_persistence::RuntimeWriteKind;
 use crate::service::ConversationService;
 
 impl ConversationService {
@@ -12,6 +13,13 @@ impl ConversationService {
         err: &AgentSendError,
         top_level_code: Option<&'static str>,
     ) -> Option<MessageRow> {
+        if !self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::SendFailureTip)
+        {
+            return None;
+        }
+
         let stream_error = err.stream_error();
         let code = top_level_code.map(str::to_owned).or_else(|| {
             stream_error

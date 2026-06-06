@@ -226,10 +226,18 @@ pub(crate) async fn run_server(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let idle_scanner_handle =
         aionui_ai_agent::start_idle_scanner(services.worker_task_manager.clone(), shutdown_rx, None, None);
+    let conversation_runtime_state = services.conversation_runtime_state.clone();
+    let worker_task_manager = services.worker_task_manager.clone();
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
+            let active_turn_count = conversation_runtime_state.mark_shutting_down();
+            info!(
+                reason = "graceful_shutdown",
+                active_turn_count, "conversation runtime shutdown prepared"
+            );
+            worker_task_manager.clear();
             let _ = shutdown_tx.send(true);
         })
         .await?;

@@ -215,6 +215,11 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
     );
+    states
+        .conversation
+        .service
+        .recover_stale_runtime_state_on_startup()
+        .await;
 
     (states, channel_components)
 }

@@ -2,10 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
-use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::ICronService;
+use crate::runtime_completion::RuntimeCompletionPublisher;
+use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::{
     ApprovalCheckResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
@@ -29,7 +31,6 @@ use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::convert::{
@@ -40,10 +41,10 @@ use crate::error::ConversationError;
 use crate::session_context::SessionContextBuilder;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
-use crate::stream_relay::StreamRelay;
+use crate::turn_orchestrator::{ConversationTurnOrchestrator, TurnStartInput};
 use std::sync::RwLock;
 
-const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
+pub(crate) const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 struct McpSupportPolicy {
@@ -187,12 +188,28 @@ impl ConversationService {
         &self.conversation_repo
     }
 
+    pub(crate) fn broadcaster(&self) -> &Arc<dyn EventBroadcaster> {
+        &self.broadcaster
+    }
+
     pub(crate) fn acp_session_repo(&self) -> &Arc<dyn IAcpSessionRepository> {
         &self.acp_session_repo
     }
 
     pub fn runtime_state(&self) -> Arc<ConversationRuntimeStateService> {
         self.runtime_state.clone()
+    }
+
+    pub(crate) fn runtime_persistence(&self) -> RuntimePersistenceCoordinator {
+        RuntimePersistenceCoordinator::new(self.runtime_state())
+    }
+
+    pub(crate) fn completion_publisher(&self) -> RuntimeCompletionPublisher {
+        RuntimeCompletionPublisher::new(
+            self.conversation_repo.clone(),
+            self.broadcaster.clone(),
+            self.runtime_persistence(),
+        )
     }
 
     pub(crate) fn task(&self, conversation_id: &str) -> Result<AgentInstance, ConversationError> {
@@ -214,25 +231,13 @@ impl ConversationService {
     }
 
     pub async fn complete_turn(&self, conversation_id: &str) {
-        if self.runtime_state.is_deleting(conversation_id) {
-            debug!(
-                conversation_id,
-                "Skipping turn completion because conversation is deleting"
-            );
-            return;
-        }
-
         let runtime = self.runtime_summary_for(conversation_id).await;
-        StreamRelay::complete_conversation_with_runtime(
-            &self.conversation_repo,
-            &self.broadcaster,
-            conversation_id,
-            Some(runtime),
-        )
-        .await;
+        self.completion_publisher()
+            .publish(conversation_id, Some(runtime))
+            .await;
     }
 
-    async fn complete_released_turn(&self, conversation_id: &str, was_deleting: bool) {
+    pub(crate) async fn complete_released_turn(&self, conversation_id: &str, was_deleting: bool) {
         if was_deleting {
             debug!(
                 conversation_id,
@@ -1394,6 +1399,15 @@ impl ConversationService {
             hidden: req.hidden,
             created_at: now_ms(),
         };
+        if !self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::UserMessage)
+        {
+            let mut turn_claim = turn_claim;
+            let was_deleting = turn_claim.release();
+            self.complete_released_turn(conversation_id, was_deleting).await;
+            return Ok(user_msg_id);
+        }
         if let Err(e) = self.conversation_repo.insert_message(&user_msg).await {
             warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
             return Err(e.into());
@@ -1436,197 +1450,14 @@ impl ConversationService {
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
-        let conv_id = conversation_id.to_owned();
-        let repo = Arc::clone(&self.conversation_repo);
-        let broadcaster = Arc::clone(&self.broadcaster);
-        let cron_service = self.current_cron_service();
-        let runtime_state = self.runtime_state();
-        let user_id_owned = user_id.to_owned();
-        let service = self.clone();
-        let task_manager = Arc::clone(task_manager);
-
-        // Send message to the agent in a background task.
-        // prompt() blocks until the PromptResponse arrives (turn completed),
-        // but the HTTP handler should return 202 immediately.
-        //
-        // Every turn mints a fresh msg_id and passes it as the agent
-        // correlation id so DB row, WebSocket stream events, and
-        // agent-internal tracing all share one identifier per turn.
         let user_msg_id_ret = user_msg_id.clone();
-        tokio::spawn(async move {
-            let mut turn_claim = turn_claim;
-            let build_started_at = now_ms();
-            info!(conversation_id = %conv_id, "Agent task build started");
-            let agent = match task_manager.get_or_build_task(&conv_id, build_opts).await {
-                Ok(agent) => agent,
-                Err(err) => {
-                    let top_level_code = agent_error_top_level_code(&err);
-                    let send_error = AgentSendError::from_agent_error_ref(&err);
-                    error!(
-                        conversation_id = %conv_id,
-                        error_code = ?send_error.code(),
-                        error = %ErrorChain(&err),
-                        "Agent task build failed"
-                    );
-                    if service.runtime_state.is_deleting(&conv_id) {
-                        debug!(
-                            conversation_id = %conv_id,
-                            "Skipping send failure persistence because conversation is deleting"
-                        );
-                    } else {
-                        service
-                            .persist_and_broadcast_send_failure_tip(&conv_id, &send_error, Some(top_level_code))
-                            .await;
-                    }
-                    let was_deleting = turn_claim.release();
-                    service.complete_released_turn(&conv_id, was_deleting).await;
-                    return;
-                }
-            };
-
-            // If the factory resolved a different workspace (e.g. auto-created temp
-            // dir for a legacy conversation with empty workspace), persist it back.
-            if let Err(err) = service
-                .maybe_persist_workspace(&conv_id, &stored_workspace, agent.workspace())
-                .await
-            {
-                let top_level_code = err.error_code();
-                let send_error = AgentSendError::from_agent_error(err.to_agent_error());
-                error!(
-                    conversation_id = %conv_id,
-                    error_code = err.error_code(),
-                    error = %ErrorChain(&err),
-                    "Failed to persist resolved workspace"
-                );
-                if service.runtime_state.is_deleting(&conv_id) {
-                    debug!(
-                        conversation_id = %conv_id,
-                        "Skipping workspace failure persistence because conversation is deleting"
-                    );
-                } else {
-                    service
-                        .persist_and_broadcast_send_failure_tip(&conv_id, &send_error, Some(top_level_code))
-                        .await;
-                }
-                let was_deleting = turn_claim.release();
-                service.complete_released_turn(&conv_id, was_deleting).await;
-                return;
-            }
-
-            info!(
-                conversation_id = %conv_id,
-                agent_type = ?agent.agent_type(),
-                elapsed_ms = now_ms().saturating_sub(build_started_at),
-                "Agent task ready"
-            );
-
-            let first_turn_msg_id = Self::mint_msg_id();
-            let mut pending_send = Some((
-                SendMessageData {
-                    content: req.content,
-                    msg_id: first_turn_msg_id.clone(),
-                    files: req.files,
-                    inject_skills: req.inject_skills,
-                },
-                first_turn_msg_id,
-            ));
-            let mut continuation_count = 0usize;
-
-            while let Some((current_send, msg_id)) = pending_send.take() {
-                if continuation_count >= MAX_CRON_CONTINUATIONS_PER_TURN {
-                    warn!(
-                        conversation_id = %conv_id,
-                        max = MAX_CRON_CONTINUATIONS_PER_TURN,
-                        "Reached cron continuation limit; ending turn early"
-                    );
-                    break;
-                }
-
-                let relay = StreamRelay::new(
-                    conv_id.clone(),
-                    msg_id,
-                    user_id_owned.clone(),
-                    Arc::clone(&repo),
-                    Arc::clone(&broadcaster),
-                    cron_service.clone(),
-                )
-                .with_runtime_state(Arc::clone(&runtime_state))
-                .with_turn_completion(false);
-
-                let rx = agent.subscribe();
-                let send_agent = agent.clone();
-                let conv_id_send = conv_id.clone();
-                let (send_error_tx, send_error_rx) = oneshot::channel();
-                // 1. Send the message to the agent and concurrently run the relay to stream events.
-                tokio::spawn(async move {
-                    if let Err(e) = send_agent.send_message(current_send).await {
-                        let task_status = send_agent.status();
-                        let agent_type = send_agent.agent_type();
-                        error!(
-                            conversation_id = %conv_id_send,
-                            ?agent_type,
-                            ?task_status,
-                            error = %ErrorChain(&e),
-                            "Agent send_message failed"
-                        );
-                        if task_status == Some(ConversationStatus::Finished) {
-                            debug!(
-                                conversation_id = %conv_id_send,
-                                ?agent_type,
-                                "Agent send_message failure already published runtime terminal; skipping fallback stream error"
-                            );
-                        } else {
-                            warn!(
-                                conversation_id = %conv_id_send,
-                                ?agent_type,
-                                code = ?e.code(),
-                                ownership = ?e.ownership(),
-                                "Agent send_message returned error without runtime terminal; injecting fallback stream error"
-                            );
-                            let _ = send_error_tx.send(e);
-                        }
-                    }
-                });
-                // 2. Wait for the agent to process the message and complete the turn, while the relay streams events in real time.
-                let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
-
-                if runtime_state.is_deleting(&conv_id) {
-                    debug!(
-                        conversation_id = %conv_id,
-                        "Skipping post-terminal persistence because conversation is deleting"
-                    );
-                    break;
-                }
-
-                if let Some(session_key) = agent.get_session_key() {
-                    persist_session_key(&repo, &conv_id, &session_key).await;
-                }
-
-                if service
-                    .evict_acp_task_after_terminal_error(&conv_id, agent.agent_type(), &outcome, &task_manager)
-                    .await
-                {
-                    break;
-                }
-
-                if outcome.system_responses.is_empty() {
-                    break;
-                }
-                continuation_count += 1;
-                let next_turn_msg_id = Self::mint_msg_id();
-                pending_send = Some((
-                    SendMessageData {
-                        content: outcome.system_responses.join("\n"),
-                        msg_id: next_turn_msg_id.clone(),
-                        files: vec![],
-                        inject_skills: vec![],
-                    },
-                    next_turn_msg_id,
-                ));
-            }
-
-            let was_deleting = turn_claim.release();
-            service.complete_released_turn(&conv_id, was_deleting).await;
+        ConversationTurnOrchestrator::new(self.clone(), Arc::clone(task_manager)).spawn_user_turn(TurnStartInput {
+            user_id: user_id.to_owned(),
+            conversation: row,
+            request: req,
+            build_options: build_opts,
+            stored_workspace,
+            turn_claim,
         });
 
         info!(
@@ -1637,7 +1468,7 @@ impl ConversationService {
         Ok(user_msg_id_ret)
     }
 
-    async fn persist_and_broadcast_send_failure_tip(
+    pub(crate) async fn persist_and_broadcast_send_failure_tip(
         &self,
         conversation_id: &str,
         err: &AgentSendError,
@@ -1763,7 +1594,7 @@ impl ConversationService {
 
 // ── Internal Helpers ────────────────────────────────────────────────
 
-fn agent_error_top_level_code(error: &AgentError) -> &'static str {
+pub(crate) fn agent_error_top_level_code(error: &AgentError) -> &'static str {
     match error {
         AgentError::BadRequest(_) => "BAD_REQUEST",
         AgentError::Unauthorized(_) => "UNAUTHORIZED",
@@ -1786,7 +1617,7 @@ impl ConversationService {
     /// Raw `conversation.extra` parsing lives in [`SessionContextBuilder`]
     /// so the task manager and concrete agent factories consume typed
     /// session context instead of the DB envelope.
-    async fn build_task_options(
+    pub(crate) async fn build_task_options(
         &self,
         row: &aionui_db::models::ConversationRow,
     ) -> Result<BuildTaskOptions, ConversationError> {
@@ -1805,7 +1636,7 @@ impl ConversationService {
             .await
     }
 
-    async fn ensure_auto_workspace_skill_links(&self, row: &ConversationRow, build_opts: &BuildTaskOptions) {
+    pub(crate) async fn ensure_auto_workspace_skill_links(&self, row: &ConversationRow, build_opts: &BuildTaskOptions) {
         let context = &build_opts.context;
         if context.workspace.is_custom {
             return;
@@ -1865,13 +1696,19 @@ impl ConversationService {
     /// This handles legacy conversations whose `extra.workspace` was empty:
     /// the factory creates a temp dir at task-build time, and we persist that
     /// path here so the frontend can display the workspace panel correctly.
-    async fn maybe_persist_workspace(
+    pub(crate) async fn maybe_persist_workspace(
         &self,
         conversation_id: &str,
         stored_workspace: &str,
         resolved_workspace: &str,
     ) -> Result<(), ConversationError> {
         if resolved_workspace.is_empty() || resolved_workspace == stored_workspace {
+            return Ok(());
+        }
+        if !self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::ResolvedWorkspace)
+        {
             return Ok(());
         }
 
@@ -1919,7 +1756,7 @@ impl ConversationService {
         self.broadcaster.broadcast(event);
     }
 
-    fn current_cron_service(&self) -> Option<Arc<dyn ICronService>> {
+    pub(crate) fn current_cron_service(&self) -> Option<Arc<dyn ICronService>> {
         match self.cron_service.read() {
             Ok(guard) => guard.as_ref().map(Arc::clone),
             Err(_) => None,
@@ -2311,7 +2148,16 @@ fn enum_to_db<T: serde::Serialize>(val: &T) -> Result<String, ConversationError>
 ///
 /// Called after send_message completes so the session can be resumed
 /// when the user re-enters this conversation later.
-async fn persist_session_key(repo: &Arc<dyn IConversationRepository>, conversation_id: &str, session_key: &str) {
+pub(crate) async fn persist_session_key(
+    repo: &Arc<dyn IConversationRepository>,
+    persistence: &RuntimePersistenceCoordinator,
+    conversation_id: &str,
+    session_key: &str,
+) {
+    if !persistence.allows(conversation_id, RuntimeWriteKind::SessionKey) {
+        return;
+    }
+
     let row = match repo.get(conversation_id).await {
         Ok(Some(r)) => r,
         _ => return,

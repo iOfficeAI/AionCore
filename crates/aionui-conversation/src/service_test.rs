@@ -330,6 +330,19 @@ impl IConversationRepository for MockRepo {
             .cloned())
     }
 
+    async fn list_stale_runtime_messages(&self) -> Result<Vec<MessageRow>, aionui_db::DbError> {
+        let messages = self.messages.lock().unwrap();
+        Ok(messages
+            .iter()
+            .filter(|message| {
+                message.position.as_deref() == Some("left")
+                    && matches!(message.status.as_deref(), Some("work" | "pending"))
+                    && matches!(message.r#type.as_str(), "text" | "thinking")
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn search_messages(
         &self,
         _user_id: &str,
@@ -1491,6 +1504,58 @@ impl FailingBuildTaskManager {
     }
 }
 
+struct DelayedFailingBuildTaskManager {
+    delay: Duration,
+    error: String,
+}
+
+impl DelayedFailingBuildTaskManager {
+    fn new(delay: Duration, error: impl Into<String>) -> Self {
+        Self {
+            delay,
+            error: error.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for DelayedFailingBuildTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        None
+    }
+
+    async fn get_or_build_task(
+        &self,
+        _conversation_id: &str,
+        _options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        tokio::time::sleep(self.delay).await;
+        Err(AgentError::bad_gateway(self.error.clone()))
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        _conversation_id: &str,
+        _reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    fn clear(&self) {}
+
+    fn active_count(&self) -> usize {
+        0
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        vec![]
+    }
+}
+
 #[async_trait::async_trait]
 impl IWorkerTaskManager for FailingBuildTaskManager {
     fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
@@ -2232,6 +2297,60 @@ async fn send_message_rejects_active_runtime_claim() {
 }
 
 #[tokio::test]
+async fn send_message_rejects_when_runtime_is_shutting_down() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    svc.runtime_state().mark_shutting_down();
+
+    let err = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::Busy { .. }));
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    assert!(
+        messages.is_empty(),
+        "shutdown rejection must not persist a user message"
+    );
+}
+
+#[tokio::test]
+async fn send_message_build_failure_while_deleting_skips_failure_tip_and_completion() {
+    let (svc, broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(DelayedFailingBuildTaskManager::new(
+        Duration::from_millis(100),
+        "delayed build failure",
+    ));
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    let msg_id = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+    assert!(!msg_id.is_empty());
+
+    svc.runtime_state().mark_deleting(&conv.id);
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    assert!(
+        messages.iter().all(|message| message.r#type != "tips"),
+        "deleting conversation must skip build-failure tips"
+    );
+
+    let events = broadcaster.take_events();
+    assert!(
+        events.iter().all(|event| event.name != "turn.completed"),
+        "deleting conversation must not publish turn.completed"
+    );
+}
+
+#[tokio::test]
 async fn send_message_persists_factory_resolved_workspace() {
     // Conversation created with no workspace → create() auto-assigns one.
     // Factory resolves a *different* temp dir (simulating legacy-conv fallback).
@@ -2273,6 +2392,55 @@ async fn send_message_persists_factory_resolved_workspace() {
     .await
     .expect("factory-resolved workspace should be persisted in the background");
     assert_eq!(updated.extra["workspace"], auto_workspace);
+}
+
+#[tokio::test]
+async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    repo.insert_message(&MessageRow {
+        id: "visible-stale".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: Some("visible-stale".into()),
+        r#type: "text".into(),
+        content: json!({ "content": "partial output" }).to_string(),
+        position: Some("left".into()),
+        status: Some("work".into()),
+        hidden: false,
+        created_at: 1,
+    })
+    .await
+    .unwrap();
+    repo.insert_message(&MessageRow {
+        id: "empty-stale".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: Some("empty-stale".into()),
+        r#type: "thinking".into(),
+        content: json!({ "content": "" }).to_string(),
+        position: Some("left".into()),
+        status: Some("pending".into()),
+        hidden: false,
+        created_at: 2,
+    })
+    .await
+    .unwrap();
+
+    svc.recover_stale_runtime_state_on_startup().await;
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let visible = messages.iter().find(|message| message.id == "visible-stale").unwrap();
+    assert_eq!(visible.status.as_deref(), Some("finish"));
+    assert!(!visible.hidden);
+
+    let empty = messages.iter().find(|message| message.id == "empty-stale").unwrap();
+    assert_eq!(empty.status.as_deref(), Some("finish"));
+    assert!(empty.hidden);
+
+    assert!(
+        messages.iter().all(|message| message.r#type != "tips"),
+        "startup recovery must not write failure tips"
+    );
 }
 
 #[tokio::test]

@@ -18,6 +18,8 @@ pub struct ConversationRuntimeStateService {
 struct ConversationRuntimeState {
     active_turns: HashSet<String>,
     deleting_conversations: HashSet<String>,
+    cancelling_conversations: HashSet<String>,
+    shutting_down: bool,
 }
 
 #[derive(Debug)]
@@ -25,6 +27,14 @@ pub struct TurnClaim {
     conversation_id: String,
     state: Weak<ConversationRuntimeStateService>,
     released: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeLifecycleState {
+    Active,
+    Deleting,
+    Cancelling,
+    ShuttingDown,
 }
 
 impl ConversationRuntimeStateService {
@@ -36,6 +46,16 @@ impl ConversationRuntimeStateService {
             );
             ConversationError::internal("conversation runtime state lock poisoned")
         })?;
+
+        if state.shutting_down {
+            info!(
+                conversation_id,
+                "conversation runtime turn claim rejected because runtime is shutting down"
+            );
+            return Err(ConversationError::Busy {
+                reason: "conversation runtime is shutting down".into(),
+            });
+        }
 
         if state.deleting_conversations.contains(conversation_id) {
             info!(
@@ -109,6 +129,84 @@ impl ConversationRuntimeStateService {
             .unwrap_or(false)
     }
 
+    pub fn mark_cancelling(&self, conversation_id: &str) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.cancelling_conversations.insert(conversation_id.to_owned());
+                info!(conversation_id, "conversation marked cancelling");
+            }
+            Err(_) => {
+                warn!(
+                    conversation_id,
+                    "conversation runtime state lock poisoned while marking cancel"
+                );
+            }
+        }
+    }
+
+    pub fn clear_cancelling(&self, conversation_id: &str) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.cancelling_conversations.remove(conversation_id);
+            }
+            Err(_) => {
+                warn!(
+                    conversation_id,
+                    "conversation runtime state lock poisoned while clearing cancel"
+                );
+            }
+        }
+    }
+
+    pub fn is_cancelling(&self, conversation_id: &str) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.cancelling_conversations.contains(conversation_id))
+            .unwrap_or(false)
+    }
+
+    pub fn mark_shutting_down(&self) -> usize {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.shutting_down = true;
+                let active_turn_count = state.active_turns.len();
+                info!(active_turn_count, "conversation runtime marked shutting down");
+                active_turn_count
+            }
+            Err(_) => {
+                warn!("conversation runtime state lock poisoned while marking shutdown");
+                0
+            }
+        }
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.state.lock().map(|state| state.shutting_down).unwrap_or(true)
+    }
+
+    pub fn lifecycle_for(&self, conversation_id: &str) -> RuntimeLifecycleState {
+        match self.state.lock() {
+            Ok(state) => {
+                if state.shutting_down {
+                    RuntimeLifecycleState::ShuttingDown
+                } else if state.deleting_conversations.contains(conversation_id) {
+                    RuntimeLifecycleState::Deleting
+                } else if state.cancelling_conversations.contains(conversation_id) {
+                    RuntimeLifecycleState::Cancelling
+                } else {
+                    RuntimeLifecycleState::Active
+                }
+            }
+            Err(_) => {
+                warn!(
+                    conversation_id,
+                    "conversation runtime state lock poisoned while reading lifecycle"
+                );
+                RuntimeLifecycleState::ShuttingDown
+            }
+        }
+    }
+
     pub fn summary_from_parts(
         &self,
         conversation_id: &str,
@@ -145,6 +243,7 @@ impl ConversationRuntimeStateService {
             Ok(mut state) => {
                 state.active_turns.remove(conversation_id);
                 let was_deleting = state.deleting_conversations.remove(conversation_id);
+                state.cancelling_conversations.remove(conversation_id);
                 info!(
                     conversation_id,
                     deleting = was_deleting,
@@ -239,6 +338,43 @@ mod tests {
         assert!(claim.release());
 
         assert!(!state.is_deleting("conv-1"));
+    }
+
+    #[test]
+    fn claim_rejects_when_shutting_down() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+
+        state.mark_shutting_down();
+
+        let err = state
+            .try_claim_turn("conv-1")
+            .expect_err("shutting down runtime should reject new turns");
+        assert!(err.to_string().contains("shutting down"));
+    }
+
+    #[test]
+    fn lifecycle_prioritizes_shutdown_over_conversation_flags() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+
+        state.mark_deleting("conv-1");
+        state.mark_cancelling("conv-1");
+        assert_eq!(state.lifecycle_for("conv-1"), RuntimeLifecycleState::Deleting);
+
+        state.mark_shutting_down();
+        assert_eq!(state.lifecycle_for("conv-1"), RuntimeLifecycleState::ShuttingDown);
+    }
+
+    #[test]
+    fn release_clears_cancelling_flag_for_active_turn() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let mut claim = state.try_claim_turn("conv-1").expect("claim should be created");
+
+        state.mark_cancelling("conv-1");
+        assert!(state.is_cancelling("conv-1"));
+
+        assert!(!claim.release());
+
+        assert!(!state.is_cancelling("conv-1"));
     }
 
     #[test]

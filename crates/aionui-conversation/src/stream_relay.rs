@@ -12,6 +12,7 @@ use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResu
 use aionui_api_types::{AgentErrorCode, ConversationRuntimeSummary, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
+use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
 use aionui_db::models::MessageRow;
@@ -115,6 +116,7 @@ pub struct StreamRelay {
     broadcaster: Arc<dyn EventBroadcaster>,
     cron_service: Option<Arc<dyn ICronService>>,
     runtime_state: Option<Arc<ConversationRuntimeStateService>>,
+    persistence: Option<RuntimePersistenceCoordinator>,
     complete_turn: bool,
 }
 
@@ -135,12 +137,18 @@ impl StreamRelay {
             broadcaster,
             cron_service,
             runtime_state: None,
+            persistence: None,
             complete_turn: true,
         }
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = Some(runtime_state);
+        self
+    }
+
+    pub fn with_persistence(mut self, persistence: RuntimePersistenceCoordinator) -> Self {
+        self.persistence = Some(persistence);
         self
     }
 
@@ -424,6 +432,12 @@ impl StreamRelay {
             .is_some_and(|state| state.is_deleting(&self.conversation_id))
     }
 
+    fn allows_write(&self, kind: RuntimeWriteKind) -> bool {
+        self.persistence
+            .as_ref()
+            .is_none_or(|persistence| persistence.allows(&self.conversation_id, kind))
+    }
+
     fn event_kind(event: &AgentStreamEvent) -> &'static str {
         match event {
             AgentStreamEvent::Start(_) => "Start",
@@ -509,6 +523,9 @@ impl StreamRelay {
     /// Flush an active text segment to the database (create or update).
     #[tracing::instrument(skip_all)]
     async fn flush_text_segment(&self, segment: &mut TextSegmentState) {
+        if !self.allows_write(RuntimeWriteKind::AssistantTextFlush) {
+            return;
+        }
         if segment.buffer.is_empty() {
             return;
         }
@@ -545,6 +562,9 @@ impl StreamRelay {
 
     #[tracing::instrument(skip_all)]
     async fn finalize_text_segment(&self, segment: TextSegmentState, status: &str) -> Option<PersistedTextSegment> {
+        if !self.allows_write(RuntimeWriteKind::AssistantTextFinalize) {
+            return None;
+        }
         if segment.buffer.is_empty() {
             return None;
         }
@@ -606,6 +626,9 @@ impl StreamRelay {
 
             if let Some(primary_segment) = text_segments.first() {
                 if processed.message != text || hidden {
+                    if !self.allows_write(RuntimeWriteKind::TerminalFinalize) {
+                        return outcome;
+                    }
                     let content = json!({ "content": final_text }).to_string();
                     let update = aionui_db::MessageRowUpdate {
                         content: Some(content),
@@ -629,6 +652,9 @@ impl StreamRelay {
                         self.send_final_text_override(&segment.id, "", true);
                     }
                 } else {
+                    if !self.allows_write(RuntimeWriteKind::TerminalFinalize) {
+                        return outcome;
+                    }
                     for segment in text_segments {
                         let status_update = aionui_db::MessageRowUpdate {
                             content: None,
@@ -641,6 +667,9 @@ impl StreamRelay {
                     }
                 }
             } else if !hidden {
+                if !self.allows_write(RuntimeWriteKind::TerminalFinalize) {
+                    return outcome;
+                }
                 let row = MessageRow {
                     id: self.msg_id.clone(),
                     conversation_id: self.conversation_id.clone(),
@@ -660,6 +689,9 @@ impl StreamRelay {
             self.send_system_responses(&processed.system_responses);
             outcome.system_responses = processed.system_responses;
         } else if let AgentStreamEvent::Error(data) = event {
+            if !self.allows_write(RuntimeWriteKind::TerminalFinalize) {
+                return outcome;
+            }
             // No text accumulated but got an error — store error as tips message
             let content = json!({ "content": &data.message, "type": "error", "error": &data }).to_string();
             let row = MessageRow {
@@ -689,6 +721,9 @@ impl StreamRelay {
         let duration_ms = (now_ms() - segment.started_at).max(0);
         self.send_thinking_done(&segment.id, duration_ms as u64);
         if segment.buffer.is_empty() {
+            return;
+        }
+        if !self.allows_write(RuntimeWriteKind::AssistantThinkingFinalize) {
             return;
         }
         let content = json!({
@@ -731,6 +766,9 @@ impl StreamRelay {
     /// Persist a Gemini-style tool_call event.
     #[tracing::instrument(skip_all)]
     async fn persist_tool_call(&self, data: &aionui_ai_agent::protocol::events::tool_call::ToolCallEventData) {
+        if !self.allows_write(RuntimeWriteKind::ToolCallPersist) {
+            return;
+        }
         if data.call_id.trim().is_empty() {
             warn!(
                 tool = %data.name,
@@ -811,6 +849,9 @@ impl StreamRelay {
     /// First event (ToolCall) inserts; subsequent events (ToolCallUpdate) update.
     #[tracing::instrument(skip_all)]
     async fn persist_acp_tool_call(&self, data: &aionui_ai_agent::protocol::events::tool_call::AcpToolCallEventData) {
+        if !self.allows_write(RuntimeWriteKind::AcpToolCallPersist) {
+            return;
+        }
         let tool_call_id = &data.update.tool_call_id;
         let status = match data.update.status {
             Some(AcpToolCallStatus::Pending) | None => "work",
@@ -901,6 +942,9 @@ impl StreamRelay {
     /// Persist a tool_group event (array of tool summaries).
     #[tracing::instrument(skip_all)]
     async fn persist_tool_group(&self, entries: &[aionui_ai_agent::protocol::events::tool_call::ToolGroupEntry]) {
+        if !self.allows_write(RuntimeWriteKind::ToolGroupPersist) {
+            return;
+        }
         let all_done = entries
             .iter()
             .all(|e| matches!(e.status, ToolCallStatus::Completed | ToolCallStatus::Error));
