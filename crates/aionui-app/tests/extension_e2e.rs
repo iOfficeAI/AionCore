@@ -158,7 +158,7 @@ async fn build_app_with_extension_root(ext_root: &std::path::Path) -> (axum::Rou
         ..Default::default()
     };
     let services = AppServices::from_config(db, &config).await.unwrap();
-    let (states, _) = build_module_states(&services).await;
+    let (states, _) = build_module_states(&services).await.expect("build module states");
     states
         .extension
         .registry

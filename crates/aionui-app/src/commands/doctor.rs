@@ -20,29 +20,27 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use anyhow::Result;
-
 use aionui_ai_agent::{AgentRegistry, UnavailableReason};
 use aionui_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository, init_database, maybe_copy_legacy_database};
 use aionui_runtime::{acp_tool_doctor_snapshot, doctor_snapshot};
 
 use crate::cli::Cli;
+use crate::commands::cli_error::{CliBoundaryCode, CliBoundaryError};
 
-pub async fn run_doctor(cli: &Cli, merged_path: &str) -> Result<ExitCode> {
+const SUBCOMMAND: &str = "doctor";
+
+pub async fn run_doctor(cli: &Cli, merged_path: &str) -> Result<ExitCode, CliBoundaryError> {
     print_environment(merged_path, &cli.data_dir);
 
     // Use the real on-disk DB so the report reflects the user's actual
     // catalog (including custom agents they've added via the UI).
     let db_path = cli.data_dir.join("aionui-backend.db");
-    maybe_copy_legacy_database(&db_path)?;
-    let database = init_database(&db_path).await?;
+    maybe_copy_legacy_database(&db_path).map_err(|_| doctor_database_error())?;
+    let database = init_database(&db_path).await.map_err(|_| doctor_database_error())?;
 
     let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(database.pool().clone()));
     let registry = AgentRegistry::new(repo);
-    registry
-        .hydrate()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to hydrate agent registry: {e}"))?;
+    registry.hydrate().await.map_err(|_| doctor_registry_hydrate_error())?;
 
     let snapshot = registry.diagnostic_snapshot().await;
     print_snapshot(&snapshot);
@@ -50,6 +48,22 @@ pub async fn run_doctor(cli: &Cli, merged_path: &str) -> Result<ExitCode> {
     database.close().await;
 
     Ok(ExitCode::SUCCESS)
+}
+
+fn doctor_database_error() -> CliBoundaryError {
+    CliBoundaryError::new(
+        CliBoundaryCode::CliDoctorDatabaseFailed,
+        SUBCOMMAND,
+        "doctor failed to open the application database",
+    )
+}
+
+fn doctor_registry_hydrate_error() -> CliBoundaryError {
+    CliBoundaryError::new(
+        CliBoundaryCode::CliDoctorRegistryHydrateFailed,
+        SUBCOMMAND,
+        "doctor failed to hydrate the agent registry",
+    )
 }
 
 fn print_environment(merged_path: &str, data_dir: &Path) {
@@ -158,5 +172,28 @@ mod tests {
         assert_eq!(lines[0], "  node runtime   :");
         assert!(lines.iter().skip(1).any(|line| line.contains("node")));
         assert!(lines.iter().any(|line| line == "  managed acp    :"));
+    }
+
+    #[test]
+    fn doctor_database_error_uses_stable_code_without_raw_path() {
+        let err = doctor_database_error();
+
+        assert_eq!(err.code(), CliBoundaryCode::CliDoctorDatabaseFailed);
+        assert!(
+            err.stderr_line()
+                .starts_with("CLI_DOCTOR_DATABASE_FAILED subcommand=doctor")
+        );
+        assert!(!err.stderr_line().contains("/Users/secret/aionui-backend.db"));
+    }
+
+    #[test]
+    fn doctor_registry_error_uses_stable_code() {
+        let err = doctor_registry_hydrate_error();
+
+        assert_eq!(err.code(), CliBoundaryCode::CliDoctorRegistryHydrateFailed);
+        assert!(
+            err.stderr_line()
+                .starts_with("CLI_DOCTOR_REGISTRY_HYDRATE_FAILED subcommand=doctor")
+        );
     }
 }

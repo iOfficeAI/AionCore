@@ -71,19 +71,82 @@ pub async fn ensure_managed_acp_tool_with_reporter(
         return Ok(installed);
     }
 
-    if let Some(installed) = activate_local_tool_source(tool, spec, &root, reporter)? {
+    if let Some(installed) =
+        activate_local_tool_source(tool, spec, &root, reporter).map_err(|error| report_failure(error, reporter))?
+    {
         return Ok(installed);
     }
 
-    if maybe_prepare_local_runtime_tool_source(tool, spec, reporter).await? {
-        return validate_tool_root(tool, &root, reporter);
+    if maybe_prepare_local_runtime_tool_source(tool, spec, reporter)
+        .await
+        .map_err(|error| report_failure(error, reporter))?
+    {
+        return validate_tool_root(tool, &root, reporter).map_err(|error| report_failure(error, reporter));
     }
 
-    Err(ManagedAcpToolError::invalid(format!(
+    Err(report_failure(unavailable_error(tool, &root), reporter))
+}
+
+fn report_failure(
+    error: ManagedAcpToolError,
+    reporter: Option<&dyn ManagedAcpToolProgressReporter>,
+) -> ManagedAcpToolError {
+    let (kind, status_code) = classify_error(&error);
+    emit_progress(
+        reporter,
+        match status_code {
+            Some(status) => ManagedAcpToolProgress::failed_with_status(kind, status, error.to_string()),
+            None => ManagedAcpToolProgress::failed(kind, error.to_string()),
+        },
+    );
+    error
+}
+
+fn classify_error(error: &ManagedAcpToolError) -> (ManagedAcpToolFailureKind, Option<u16>) {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("timed out") {
+        return (ManagedAcpToolFailureKind::Timeout, None);
+    }
+    if let Some(status) = parse_http_status(&message) {
+        return (ManagedAcpToolFailureKind::HttpStatus, Some(status));
+    }
+    if message.contains("unsupported") {
+        return (ManagedAcpToolFailureKind::UnsupportedPlatform, None);
+    }
+    if message.contains("bundled managed") && message.contains("artifact missing") {
+        return (ManagedAcpToolFailureKind::BundledResourceMissing, None);
+    }
+    if message.contains("bundled managed") && message.contains("artifact failed validation") {
+        return (ManagedAcpToolFailureKind::BundledResourceInvalid, None);
+    }
+    if message.contains("bundled managed") && message.contains("artifact is invalid") {
+        return (ManagedAcpToolFailureKind::BundledResourceInvalid, None);
+    }
+    if message.contains("checksum mismatch") {
+        return (ManagedAcpToolFailureKind::ChecksumMismatch, None);
+    }
+    if message.contains("validate") || message.contains("entrypoint missing") {
+        return (ManagedAcpToolFailureKind::ValidationFailed, None);
+    }
+    if message.contains("download") || message.contains("extract") || message.contains("connect failed") {
+        return (ManagedAcpToolFailureKind::DownloadFailed, None);
+    }
+    (ManagedAcpToolFailureKind::Unknown, None)
+}
+
+fn parse_http_status(message: &str) -> Option<u16> {
+    let marker = "http ";
+    let start = message.find(marker)? + marker.len();
+    let digits: String = message[start..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    digits.parse::<u16>().ok()
+}
+
+fn unavailable_error(tool: ManagedAcpToolId, root: &Path) -> ManagedAcpToolError {
+    ManagedAcpToolError::invalid(format!(
         "managed {} artifact unavailable under {} and could not be prepared locally",
         tool.display_name(),
         root.display()
-    )))
+    ))
 }
 
 pub fn probe_managed_acp_tool_supported(tool: ManagedAcpToolId) -> ManagedAcpToolSupport {
@@ -707,38 +770,6 @@ fn format_error_with_causes(error: &(dyn StdError + 'static)) -> String {
 }
 
 #[cfg(test)]
-fn classify_error(error: &ManagedAcpToolError) -> (ManagedAcpToolFailureKind, Option<u16>) {
-    let message = error.to_string().to_ascii_lowercase();
-    if message.contains("timed out") {
-        return (ManagedAcpToolFailureKind::Timeout, None);
-    }
-    if let Some(status) = parse_http_status(&message) {
-        return (ManagedAcpToolFailureKind::HttpStatus, Some(status));
-    }
-    if message.contains("unsupported") {
-        return (ManagedAcpToolFailureKind::UnsupportedPlatform, None);
-    }
-    if message.contains("checksum mismatch") {
-        return (ManagedAcpToolFailureKind::ChecksumMismatch, None);
-    }
-    if message.contains("validate") || message.contains("entrypoint missing") {
-        return (ManagedAcpToolFailureKind::ValidationFailed, None);
-    }
-    if message.contains("download") || message.contains("extract") || message.contains("connect failed") {
-        return (ManagedAcpToolFailureKind::DownloadFailed, None);
-    }
-    (ManagedAcpToolFailureKind::Unknown, None)
-}
-
-#[cfg(test)]
-fn parse_http_status(message: &str) -> Option<u16> {
-    let marker = "http ";
-    let start = message.find(marker)? + marker.len();
-    let digits: String = message[start..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
-    digits.parse::<u16>().ok()
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::fmt;
@@ -787,6 +818,51 @@ mod tests {
         let (kind, status_code) = classify_error(&error);
         assert_eq!(kind, ManagedAcpToolFailureKind::ChecksumMismatch);
         assert_eq!(status_code, None);
+    }
+
+    #[test]
+    fn classify_error_detects_bundled_acp_validation_failure() {
+        let error = ManagedAcpToolError::invalid(
+            "bundled managed Codex ACP artifact failed validation under /app/resources/managed-resources/acp/codex-acp/0.14.0/linux-x64: managed ACP entrypoint missing",
+        );
+        let (kind, status_code) = classify_error(&error);
+
+        assert_eq!(kind, ManagedAcpToolFailureKind::BundledResourceInvalid);
+        assert_eq!(status_code, None);
+    }
+
+    #[tokio::test]
+    async fn bundled_acp_tool_missing_reports_bundled_resource_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundled_root = tmp.path().join("bundled");
+        if !crate::test_support::run_in_env_child(
+            "acp_tool_runtime::tests::bundled_acp_tool_missing_reports_bundled_resource_missing",
+            |command| {
+                command.env("AIONUI_BUNDLED_MANAGED_RESOURCES", &bundled_root);
+            },
+        ) {
+            return;
+        }
+
+        crate::cache::init(tmp.path().join("data"));
+        managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Bundled);
+
+        let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reporter_updates = updates.clone();
+        let reporter = move |update: ManagedAcpToolProgress| {
+            reporter_updates.lock().unwrap().push(update);
+        };
+
+        let result = ensure_managed_acp_tool_with_reporter(ManagedAcpToolId::CodexAcp, Some(&reporter)).await;
+        managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Download);
+
+        let error = result.expect_err("missing bundled ACP tool should fail");
+        assert!(error.to_string().contains("bundled managed Codex ACP artifact missing"));
+        let updates = updates.lock().unwrap();
+        assert!(updates.iter().any(|update| {
+            update.phase == ManagedAcpToolProgressPhase::Failed
+                && update.failure_kind == Some(ManagedAcpToolFailureKind::BundledResourceMissing)
+        }));
     }
 
     #[test]

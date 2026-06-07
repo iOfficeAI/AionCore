@@ -1,7 +1,7 @@
 //! `aioncore mcp-bridge` subcommand: stdio ↔ TCP bridge for the team MCP server.
 //!
 //! Spawned by the ACP agent CLI as an MCP server with command `aioncore mcp-bridge`.
-//! stdio side speaks newline-delimited JSON-RPC 2.0 (the MCP stdio transport);
+//! stdio side speaks MCP Content-Length framed JSON-RPC 2.0;
 //! TCP side speaks 4-byte big-endian length-prefixed JSON frames against
 //! `127.0.0.1:<TEAM_MCP_PORT>` (reusing `aionui_team::mcp::protocol`).
 //!
@@ -20,7 +20,14 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+use crate::commands::cli_error::{CliBoundaryCode, CliBoundaryError, missing_env, parse_required_port};
+
+const SUBCOMMAND: &str = "mcp-bridge";
 const CONNECT_ADDR_HOST: &str = "127.0.0.1";
+const MCP_STDIO_FRAME_MAX_BYTES: usize = 10 * 1024 * 1024;
+const MCP_STDIO_HEADER_LINE_MAX_BYTES: usize = 8 * 1024;
+const MCP_STDIO_HEADER_SECTION_MAX_BYTES: usize = 16 * 1024;
+const MCP_STDIO_HEADER_MAX_COUNT: usize = 64;
 
 /// Entry point for `aioncore mcp-bridge`. Returns an [`ExitCode`] so the
 /// binary surfaces non-zero on any failure (ACP CLI uses that to mark the MCP
@@ -31,23 +38,33 @@ pub async fn run_mcp_bridge() -> ExitCode {
         Err(err) => {
             // stderr, not tracing: the parent agent CLI captures stderr and
             // shows it to the user when the bridge dies on startup.
-            eprintln!("mcp-bridge: {err}");
-            ExitCode::from(1)
+            eprintln!("{}", err.stderr_line());
+            err.exit_code()
         }
     }
 }
 
-async fn run() -> Result<(), String> {
+async fn run() -> Result<(), CliBoundaryError> {
     let env = BridgeEnv::from_env()?;
 
-    let tcp = TcpStream::connect((CONNECT_ADDR_HOST, env.port))
-        .await
-        .map_err(|e| format!("failed to connect 127.0.0.1:{}: {e}", env.port))?;
+    let tcp = TcpStream::connect((CONNECT_ADDR_HOST, env.port)).await.map_err(|_| {
+        CliBoundaryError::new(
+            CliBoundaryCode::McpTcpConnectFailed,
+            SUBCOMMAND,
+            "failed to connect to local MCP TCP listener",
+        )
+        .with_field("host", CONNECT_ADDR_HOST)
+        .with_field("port", env.port.to_string())
+    })?;
     tcp.set_nodelay(true).ok();
     let (tcp_reader, tcp_writer) = tcp.into_split();
 
     if std::io::stdin().is_terminal() {
-        return Err("stdin is a TTY; mcp-bridge must be spawned by an MCP-capable agent CLI".into());
+        return Err(CliBoundaryError::new(
+            CliBoundaryCode::McpStdinTty,
+            SUBCOMMAND,
+            "stdin must be provided by an MCP-capable agent CLI",
+        ));
     }
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -60,13 +77,21 @@ async fn run() -> Result<(), String> {
     // either side as "other side closed, we're done".
     tokio::select! {
         res = stdin_task => {
-            res.map_err(|e| format!("stdin task panicked: {e}"))??;
+            res.map_err(|_| task_join_error())??;
         }
         res = tcp_task => {
-            res.map_err(|e| format!("tcp task panicked: {e}"))??;
+            res.map_err(|_| task_join_error())??;
         }
     }
     Ok(())
+}
+
+fn task_join_error() -> CliBoundaryError {
+    CliBoundaryError::new(
+        CliBoundaryCode::McpTaskJoinPanic,
+        SUBCOMMAND,
+        "MCP bridge worker task failed",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -81,93 +106,168 @@ struct BridgeEnv {
 }
 
 impl BridgeEnv {
-    fn from_env() -> Result<Self, String> {
+    fn from_env() -> Result<Self, CliBoundaryError> {
         let port_raw = std::env::var(TeamMcpStdioConfig::ENV_PORT)
-            .map_err(|_| format!("missing env var {}", TeamMcpStdioConfig::ENV_PORT))?;
-        let port: u16 = port_raw
-            .parse()
-            .map_err(|e| format!("invalid {} value {port_raw:?}: {e}", TeamMcpStdioConfig::ENV_PORT))?;
+            .map_err(|_| missing_env(SUBCOMMAND, TeamMcpStdioConfig::ENV_PORT))?;
         let token = std::env::var(TeamMcpStdioConfig::ENV_TOKEN)
-            .map_err(|_| format!("missing env var {}", TeamMcpStdioConfig::ENV_TOKEN))?;
+            .map_err(|_| missing_env(SUBCOMMAND, TeamMcpStdioConfig::ENV_TOKEN))?;
         let slot_id = std::env::var(TeamMcpStdioConfig::ENV_SLOT_ID)
-            .map_err(|_| format!("missing env var {}", TeamMcpStdioConfig::ENV_SLOT_ID))?;
-        Ok(Self { port, token, slot_id })
+            .map_err(|_| missing_env(SUBCOMMAND, TeamMcpStdioConfig::ENV_SLOT_ID))?;
+        Self::from_values(&port_raw, &token, &slot_id)
+    }
+
+    fn from_values(port_raw: &str, token: &str, slot_id: &str) -> Result<Self, CliBoundaryError> {
+        let port = parse_required_port(SUBCOMMAND, TeamMcpStdioConfig::ENV_PORT, port_raw)?;
+        Ok(Self {
+            port,
+            token: token.to_owned(),
+            slot_id: slot_id.to_owned(),
+        })
     }
 }
 
 // ---------------------------------------------------------------------------
-// stdin → TCP: read newline-delimited JSON, inject auth on `initialize`, frame to TCP
+// stdin → TCP: read MCP Content-Length frames, inject auth on `initialize`, frame to TCP
 // ---------------------------------------------------------------------------
 
-async fn forward_stdin_to_tcp<R, W>(stdin: R, mut tcp_writer: W, env: BridgeEnv) -> Result<(), String>
+async fn forward_stdin_to_tcp<R, W>(stdin: R, mut tcp_writer: W, env: BridgeEnv) -> Result<(), CliBoundaryError>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut reader = BufReader::new(stdin);
-    eprintln!("[mcp-bridge] stdin loop started (Content-Length framing)");
     loop {
         let body = match read_mcp_stdio_message(&mut reader).await {
             Ok(Some(b)) => b,
             Ok(None) => {
-                eprintln!("[mcp-bridge] stdin EOF");
                 return Ok(());
             }
             Err(e) => return Err(e),
         };
 
-        eprintln!("[mcp-bridge] stdin received: {} bytes", body.len());
-        let mut value: Value =
-            serde_json::from_slice(&body).map_err(|e| format!("stdin payload is not valid JSON: {e}"))?;
+        let mut value: Value = serde_json::from_slice(&body).map_err(|_| {
+            CliBoundaryError::new(
+                CliBoundaryCode::McpStdinJsonInvalid,
+                SUBCOMMAND,
+                "stdin MCP frame body is not valid JSON",
+            )
+        })?;
 
         if value.get("method").and_then(Value::as_str) == Some("initialize") {
             inject_auth(&mut value, &env);
         }
 
-        let bytes = serde_json::to_vec(&value).map_err(|e| format!("serialize outgoing frame: {e}"))?;
-        write_frame(&mut tcp_writer, &bytes)
-            .await
-            .map_err(|e| format!("tcp write error: {e}"))?;
-        eprintln!("[mcp-bridge] forwarded to TCP ({} bytes)", bytes.len());
+        let bytes = serde_json::to_vec(&value).map_err(|_| {
+            CliBoundaryError::new(
+                CliBoundaryCode::McpJsonSerializeFailed,
+                SUBCOMMAND,
+                "failed to serialize MCP JSON frame",
+            )
+        })?;
+        write_frame(&mut tcp_writer, &bytes).await.map_err(|_| {
+            CliBoundaryError::new(
+                CliBoundaryCode::McpTcpWriteFailed,
+                SUBCOMMAND,
+                "failed to write MCP frame to TCP listener",
+            )
+        })?;
     }
 }
 
 /// Read one MCP stdio message (Content-Length framing).
 /// Returns None on clean EOF.
-async fn read_mcp_stdio_message<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {
+async fn read_mcp_stdio_message<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<Vec<u8>>, CliBoundaryError> {
     let mut content_length: Option<usize> = None;
-    let mut header_line = String::new();
+    let mut header_line = Vec::new();
+    let mut header_bytes = 0usize;
+    let mut header_count = 0usize;
     loop {
-        header_line.clear();
-        let n = reader
-            .read_line(&mut header_line)
-            .await
-            .map_err(|e| format!("stdin header read error: {e}"))?;
+        let n = read_bounded_header_line(reader, &mut header_line).await?;
         if n == 0 {
-            return Ok(None); // EOF
+            return if header_bytes == 0 {
+                Ok(None) // Clean EOF before the next frame starts.
+            } else {
+                Err(stdin_frame_invalid())
+            };
         }
-        let trimmed = header_line.trim();
+        header_bytes = header_bytes.checked_add(n).ok_or_else(stdin_frame_invalid)?;
+        if header_bytes > MCP_STDIO_HEADER_SECTION_MAX_BYTES {
+            return Err(stdin_frame_invalid());
+        }
+        let trimmed = std::str::from_utf8(&header_line)
+            .map_err(|_| stdin_frame_invalid())?
+            .trim();
         if trimmed.is_empty() {
             // Empty line = end of headers
             break;
         }
+        header_count += 1;
+        if header_count > MCP_STDIO_HEADER_MAX_COUNT {
+            return Err(stdin_frame_invalid());
+        }
         if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
-            content_length = Some(
-                len_str
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|e| format!("invalid Content-Length: {e}"))?,
-            );
+            content_length = Some(len_str.trim().parse::<usize>().map_err(|_| stdin_frame_invalid())?);
         }
         // Ignore other headers
     }
-    let len = content_length.ok_or("missing Content-Length header")?;
+    let len = content_length.ok_or_else(stdin_frame_invalid)?;
+    if len > MCP_STDIO_FRAME_MAX_BYTES {
+        return Err(CliBoundaryError::new(
+            CliBoundaryCode::McpFrameTooLarge,
+            SUBCOMMAND,
+            "MCP stdio frame exceeds configured size limit",
+        )
+        .with_field("limitBytes", MCP_STDIO_FRAME_MAX_BYTES.to_string()));
+    }
     let mut body = vec![0u8; len];
-    reader
-        .read_exact(&mut body)
-        .await
-        .map_err(|e| format!("stdin body read error: {e}"))?;
+    reader.read_exact(&mut body).await.map_err(|_| stdin_read_error())?;
     Ok(Some(body))
+}
+
+async fn read_bounded_header_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> Result<usize, CliBoundaryError> {
+    line.clear();
+    loop {
+        let (n, end_of_line) = {
+            let available = reader.fill_buf().await.map_err(|_| stdin_read_error())?;
+            if available.is_empty() {
+                return Ok(line.len());
+            }
+            let n = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |pos| pos + 1);
+            if line.len() + n > MCP_STDIO_HEADER_LINE_MAX_BYTES {
+                return Err(stdin_frame_invalid());
+            }
+            line.extend_from_slice(&available[..n]);
+            (n, available[n - 1] == b'\n')
+        };
+        reader.consume(n);
+        if end_of_line {
+            return Ok(line.len());
+        }
+    }
+}
+
+fn stdin_frame_invalid() -> CliBoundaryError {
+    CliBoundaryError::new(
+        CliBoundaryCode::McpStdinFrameInvalid,
+        SUBCOMMAND,
+        "invalid MCP stdio frame",
+    )
+}
+
+fn stdin_read_error() -> CliBoundaryError {
+    CliBoundaryError::new(
+        CliBoundaryCode::McpStdinReadFailed,
+        SUBCOMMAND,
+        "failed to read MCP stdio frame from stdin",
+    )
 }
 
 fn inject_auth(value: &mut Value, env: &BridgeEnv) {
@@ -183,10 +283,10 @@ fn inject_auth(value: &mut Value, env: &BridgeEnv) {
 }
 
 // ---------------------------------------------------------------------------
-// TCP → stdout: read length-prefixed frames, write as newline-delimited JSON
+// TCP → stdout: read length-prefixed frames, write MCP Content-Length frames
 // ---------------------------------------------------------------------------
 
-async fn forward_tcp_to_stdout<R, W>(mut tcp_reader: R, mut stdout: W) -> Result<(), String>
+async fn forward_tcp_to_stdout<R, W>(mut tcp_reader: R, mut stdout: W) -> Result<(), CliBoundaryError>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -195,24 +295,33 @@ where
         let frame = match read_frame(&mut tcp_reader).await {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                eprintln!("[mcp-bridge] TCP EOF");
                 return Ok(());
             }
-            Err(e) => return Err(format!("tcp read error: {e}")),
+            Err(_) => {
+                return Err(CliBoundaryError::new(
+                    CliBoundaryCode::McpTcpReadFailed,
+                    SUBCOMMAND,
+                    "failed to read MCP frame from TCP listener",
+                ));
+            }
         };
-        eprintln!("[mcp-bridge] TCP→stdout: {} bytes", frame.len());
         // Content-Length framing for stdout (MCP stdio transport)
         let header = format!("Content-Length: {}\r\n\r\n", frame.len());
         stdout
             .write_all(header.as_bytes())
             .await
-            .map_err(|e| format!("stdout write error: {e}"))?;
-        stdout
-            .write_all(&frame)
-            .await
-            .map_err(|e| format!("stdout write error: {e}"))?;
-        stdout.flush().await.map_err(|e| format!("stdout flush error: {e}"))?;
+            .map_err(|_| stdout_write_error())?;
+        stdout.write_all(&frame).await.map_err(|_| stdout_write_error())?;
+        stdout.flush().await.map_err(|_| stdout_write_error())?;
     }
+}
+
+fn stdout_write_error() -> CliBoundaryError {
+    CliBoundaryError::new(
+        CliBoundaryCode::McpStdoutWriteFailed,
+        SUBCOMMAND,
+        "failed to write MCP stdio frame to stdout",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +339,91 @@ mod tests {
             token: "tok".into(),
             slot_id: "slot-a".into(),
         }
+    }
+
+    #[test]
+    fn bridge_env_rejects_invalid_port_with_stable_code() {
+        let err = BridgeEnv::from_values("not-a-port", "tok", "slot-a").unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::commands::cli_error::CliBoundaryCode::McpEnvInvalidPort
+        );
+        assert_eq!(err.exit_code(), std::process::ExitCode::from(2));
+    }
+
+    #[tokio::test]
+    async fn read_mcp_stdio_message_rejects_oversized_content_length() {
+        let input = format!("Content-Length: {}\r\n\r\n", MCP_STDIO_FRAME_MAX_BYTES + 1);
+        let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::commands::cli_error::CliBoundaryCode::McpFrameTooLarge
+        );
+    }
+
+    #[tokio::test]
+    async fn read_mcp_stdio_message_rejects_invalid_content_length() {
+        let input = "Content-Length: nope\r\n\r\n";
+        let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::commands::cli_error::CliBoundaryCode::McpStdinFrameInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn read_mcp_stdio_message_rejects_partial_header_eof() {
+        for input in ["Content-Length: 2", "X-Header: value"] {
+            let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
+            assert_eq!(
+                err.code(),
+                crate::commands::cli_error::CliBoundaryCode::McpStdinFrameInvalid
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_mcp_stdio_message_rejects_overlong_header_line() {
+        let input = format!("X-Header: {}\r\nContent-Length: 2\r\n\r\n{{}}", "a".repeat(16 * 1024));
+        let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::commands::cli_error::CliBoundaryCode::McpStdinFrameInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn read_mcp_stdio_message_rejects_oversized_header_section() {
+        let line_a = format!(
+            "X-A: {}\r\n",
+            "a".repeat(MCP_STDIO_HEADER_LINE_MAX_BYTES - "X-A: \r\n".len())
+        );
+        let line_b = format!(
+            "X-B: {}\r\n",
+            "b".repeat(MCP_STDIO_HEADER_LINE_MAX_BYTES - "X-B: \r\n".len())
+        );
+        let input = format!("{line_a}{line_b}X-C: v\r\nContent-Length: 0\r\n\r\n");
+
+        let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::commands::cli_error::CliBoundaryCode::McpStdinFrameInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn read_mcp_stdio_message_rejects_too_many_headers() {
+        let mut input = String::new();
+        for index in 0..=MCP_STDIO_HEADER_MAX_COUNT {
+            input.push_str(&format!("X-{index}: v\r\n"));
+        }
+        input.push_str("Content-Length: 0\r\n\r\n");
+
+        let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::commands::cli_error::CliBoundaryCode::McpStdinFrameInvalid
+        );
     }
 
     #[test]

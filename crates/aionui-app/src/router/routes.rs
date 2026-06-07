@@ -37,7 +37,7 @@ use aionui_team::team_routes;
 use crate::services::AppServices;
 
 use super::health::{guide_mcp_status, health_check};
-use super::state::{ModuleStates, build_module_states, build_ws_state};
+use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
 use super::trace::with_access_log;
 
 /// Create the application router with all routes and global middleware.
@@ -46,7 +46,7 @@ use super::trace::with_access_log;
 /// 1. Security response headers (X-Frame-Options, etc.)
 /// 2. CSRF protection (Double Submit Cookie)
 /// 3. Route handlers (auth routes + system routes + conversation routes + file routes + health check)
-pub async fn create_router(services: &AppServices) -> Router {
+pub async fn create_router(services: &AppServices) -> Result<Router, RouterBuildError> {
     let boot = Instant::now();
     tracing::info!("startup: router assembly started");
 
@@ -60,7 +60,7 @@ pub async fn create_router(services: &AppServices) -> Router {
         }
     });
 
-    let (states, channel_components) = build_module_states(services).await;
+    let (states, channel_components) = build_module_states(services).await?;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
 
     // Wire TeamSessionService into Guide MCP server now that both are available.
@@ -88,7 +88,12 @@ pub async fn create_router(services: &AppServices) -> Router {
     let chan_factory = channel_components.plugin_factory;
     tokio::spawn(async move {
         if let Err(e) = chan_mgr.restore_plugins(&chan_factory).await {
-            tracing::warn!(error = %e, "failed to restore channel plugins");
+            tracing::warn!(
+                code = "BOOTSTRAP_DEGRADED_CHANNEL_RESTORE",
+                stage = "channel.restore",
+                error = %e,
+                "failed to restore channel plugins"
+            );
         }
     });
     tracing::info!(
@@ -105,7 +110,7 @@ pub async fn create_router(services: &AppServices) -> Router {
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: router assembly completed"
     );
-    router
+    Ok(router)
 }
 
 /// Create the application router with custom module states.

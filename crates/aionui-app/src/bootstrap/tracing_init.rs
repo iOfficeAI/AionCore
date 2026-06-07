@@ -8,6 +8,8 @@ use std::path::Path;
 
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+use super::{BootstrapError, BootstrapErrorCode};
+
 const NOISE_SUPPRESSIONS: &[&str] = &[
     "sqlx::query=warn",
     "hyper_util=warn",
@@ -77,8 +79,18 @@ pub struct LogGuards {
     _aionrs: tracing_appender::non_blocking::WorkerGuard,
 }
 
-pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> LogGuards {
-    std::fs::create_dir_all(log_dir).expect("failed to create log directory");
+const LOGGING_INIT_MESSAGE: &str = "failed to initialize logging";
+
+pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards, BootstrapError> {
+    std::fs::create_dir_all(log_dir).map_err(|e| {
+        BootstrapError::new(
+            BootstrapErrorCode::LoggingInitFailed,
+            "logging.dir",
+            LOGGING_INIT_MESSAGE,
+        )
+        .with_source(e)
+        .with_field("logDir", log_dir.display().to_string())
+    })?;
 
     let console_layer = fmt::layer().with_target(true).with_filter(build_env_filter(log_level));
 
@@ -87,7 +99,15 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> LogGuards {
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_suffix("aioncore.log")
         .build(log_dir)
-        .expect("failed to create backend log file appender");
+        .map_err(|e| {
+            BootstrapError::new(
+                BootstrapErrorCode::LoggingInitFailed,
+                "logging.appender",
+                LOGGING_INIT_MESSAGE,
+            )
+            .with_source(e)
+            .with_field("logDir", log_dir.display().to_string())
+        })?;
     let (non_blocking, backend_guard) = tracing_appender::non_blocking(file_appender);
 
     let backend_file_layer = fmt::layer()
@@ -104,19 +124,35 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> LogGuards {
         level: aionrs_level,
         dir: log_dir.to_path_buf(),
     };
-    let (aionrs_layer, aionrs_guard) =
-        aion_config::logging::create_file_layer(&aionrs_resolved).expect("failed to create aionrs log layer");
+    let (aionrs_layer, aionrs_guard) = aion_config::logging::create_file_layer(&aionrs_resolved).map_err(|e| {
+        BootstrapError::new(
+            BootstrapErrorCode::LoggingInitFailed,
+            "logging.appender",
+            LOGGING_INIT_MESSAGE,
+        )
+        .with_source(e)
+        .with_field("logDir", log_dir.display().to_string())
+    })?;
 
     tracing_subscriber::registry()
         .with(console_layer)
         .with(backend_file_layer)
         .with(aionrs_layer)
-        .init();
+        .try_init()
+        .map_err(|e| {
+            BootstrapError::new(
+                BootstrapErrorCode::LoggingInitFailed,
+                "logging.subscriber",
+                LOGGING_INIT_MESSAGE,
+            )
+            .with_source(e)
+            .with_field("logDir", log_dir.display().to_string())
+        })?;
 
-    LogGuards {
+    Ok(LogGuards {
         _backend: backend_guard,
         _aionrs: aionrs_guard,
-    }
+    })
 }
 
 #[cfg(test)]

@@ -27,7 +27,7 @@ struct TestApp {
 async fn start_app() -> TestApp {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
-    let router = create_router(&services).await;
+    let router = create_router(&services).await.expect("build router");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
