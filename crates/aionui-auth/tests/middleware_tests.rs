@@ -6,12 +6,20 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::middleware;
 use axum::routing::{get, post};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use tower::ServiceExt;
 
 use aionui_auth::{
-    CookieConfig, CurrentUser, RateLimiter, api_rate_limit_middleware, auth_rate_limit_middleware,
-    authenticated_action_rate_limit_middleware, csrf_middleware, security_headers_middleware,
+    AuthState, CookieConfig, CurrentUser, JwtService, RateLimiter, TokenPayload, api_rate_limit_middleware,
+    auth_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware, csrf_middleware,
+    security_headers_middleware,
 };
+use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
+
+async fn json_body(resp: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
 
 // ============================================================
 // T12.1 — Security response headers
@@ -73,6 +81,8 @@ async fn t12_2_post_without_csrf_token_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "CSRF_INVALID");
 }
 
 #[tokio::test]
@@ -106,6 +116,157 @@ async fn t12_2_post_with_mismatched_csrf_tokens_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "CSRF_INVALID");
+}
+
+// ============================================================
+// Auth middleware
+// ============================================================
+
+async fn auth_app(jwt_service: Arc<JwtService>) -> Router {
+    let db = init_database_memory().await.unwrap();
+    let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    protected_auth_app(jwt_service, user_repo)
+}
+
+fn protected_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepository>) -> Router {
+    let state = AuthState {
+        jwt_service,
+        user_repo,
+        local: false,
+    };
+
+    Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .route_layer(middleware::from_fn_with_state(state, auth_middleware))
+}
+
+fn expired_token(jwt_service: &JwtService, secret: &str, user_id: &str, username: &str) -> String {
+    let token = jwt_service.sign(user_id, username).unwrap();
+    let mut validation = Validation::default();
+    validation.validate_exp = false;
+    validation.validate_aud = false;
+
+    let mut claims = decode::<TokenPayload>(&token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
+        .unwrap()
+        .claims;
+
+    claims.iat = 1000;
+    claims.exp = 1001;
+
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn auth_middleware_missing_token_returns_unauthorized_code() {
+    let app = auth_app(Arc::new(JwtService::new("middleware_test_secret".into()))).await;
+
+    let resp = app
+        .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn auth_middleware_invalid_token_returns_unauthorized_code() {
+    let app = auth_app(Arc::new(JwtService::new("middleware_test_secret".into()))).await;
+
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, "Bearer not-a-valid-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn auth_middleware_expired_token_returns_unauthorized_code() {
+    let secret = "middleware_test_secret";
+    let jwt_service = Arc::new(JwtService::new(secret.into()));
+    let token = expired_token(&jwt_service, secret, "system_default_user", "system_default_user");
+    let app = auth_app(jwt_service).await;
+
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn auth_middleware_missing_user_returns_unauthorized_code() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let token = jwt_service.sign("missing_user", "ghost").unwrap();
+    let app = auth_app(jwt_service).await;
+
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn auth_middleware_database_error_returns_internal_error_code() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let token = jwt_service.sign("system_default_user", "system_default_user").unwrap();
+    let db = init_database_memory().await.unwrap();
+    let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    db.close().await;
+    let app = protected_auth_app(jwt_service, user_repo);
+
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "INTERNAL_ERROR");
+    assert_eq!(json["error"], "Internal server error.");
+    let error = json["error"].as_str().unwrap();
+    assert!(!error.contains("Database error"));
+    assert!(!error.contains("Authentication service unavailable"));
+    assert!(!error.to_ascii_lowercase().contains("closed"));
+    assert!(!error.to_ascii_lowercase().contains("sqlx"));
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@ use tracing::{debug, info};
 
 use crate::manager::{TokenValidator, WebSocketManager};
 use crate::router::MessageRouter;
-use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, WebSocketCloseCode, WsOutbound};
+use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocketCloseCode, WsOutbound};
 
 /// Extracts a JWT token from WebSocket upgrade request headers.
 ///
@@ -33,7 +33,7 @@ pub struct WsHandlerState {
 ///
 /// Extracts a JWT token from the request headers, validates it,
 /// and upgrades the connection to WebSocket on success.
-/// On authentication failure, sends `auth-expired` and closes with 1008.
+/// On authentication failure, sends `realtime.error` and closes with 1008.
 ///
 /// When the token is carried via `Sec-WebSocket-Protocol`, the server
 /// echoes the protocol header back so the client handshake succeeds.
@@ -66,12 +66,12 @@ pub async fn ws_upgrade_handler(
 /// Validates the token, registers the client, spawns send/recv loops.
 async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandlerState) {
     let Some(token) = token else {
-        send_close_no_token(socket).await;
+        send_realtime_error_and_close(socket, RealtimeError::AuthMissing, "authentication required").await;
         return;
     };
 
     if !(state.token_validator)(&token) {
-        send_auth_expired_and_close(socket).await;
+        send_realtime_error_and_close(socket, RealtimeError::AuthExpired, "authentication failed").await;
         return;
     }
 
@@ -91,24 +91,14 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
     info!(%conn_id, "websocket connection closed");
 }
 
-/// Send a close frame with 1008 when no token is provided.
-async fn send_close_no_token(mut socket: WebSocket) {
-    let close = Message::Close(Some(CloseFrame {
-        code: WebSocketCloseCode::PolicyViolation.as_u16(),
-        reason: "no token provided".into(),
-    }));
-    let _ = socket.send(close).await;
-}
-
-/// Send `auth-expired` event then close with 1008.
-async fn send_auth_expired_and_close(mut socket: WebSocket) {
-    let auth_expired = WebSocketMessage::new("auth-expired", json!({"message": "Token expired or invalid"}));
-    if let Ok(text) = serde_json::to_string(&auth_expired) {
+/// Send a realtime boundary error event, then close with 1008.
+async fn send_realtime_error_and_close(mut socket: WebSocket, error: RealtimeError, reason: &str) {
+    if let Ok(text) = serde_json::to_string(&error.into_event()) {
         let _ = socket.send(Message::Text(text.into())).await;
     }
     let close = Message::Close(Some(CloseFrame {
         code: WebSocketCloseCode::PolicyViolation.as_u16(),
-        reason: "authentication failed".into(),
+        reason: reason.into(),
     }));
     let _ = socket.send(close).await;
 }
@@ -131,6 +121,16 @@ async fn send_loop(
                 code: code.as_u16(),
                 reason: reason.into(),
             })),
+            WsOutbound::TextThenClose(text, code, reason) => {
+                if sender.send(Message::Text(text.into())).await.is_err() {
+                    debug!(%conn_id, "send loop: socket write failed, exiting");
+                    break;
+                }
+                Message::Close(Some(CloseFrame {
+                    code: code.as_u16(),
+                    reason: reason.into(),
+                }))
+            }
         };
         if sender.send(msg).await.is_err() {
             debug!(%conn_id, "send loop: socket write failed, exiting");
@@ -185,6 +185,11 @@ fn handle_text_message(conn_id: ConnectionId, text: &str, state: &WsHandlerState
         }
     };
 
+    if msg.name.trim().is_empty() {
+        send_error_response(state, conn_id);
+        return;
+    }
+
     match msg.name.as_str() {
         "pong" => {
             state.manager.update_last_ping(conn_id);
@@ -193,21 +198,20 @@ fn handle_text_message(conn_id: ConnectionId, text: &str, state: &WsHandlerState
             handle_subscribe_show_open(state, conn_id, msg.data);
         }
         name => {
-            state.router.route(conn_id, name, msg.data);
+            if !state.router.route(conn_id, name, msg.data) {
+                send_realtime_error(state, conn_id, RealtimeError::UnsupportedMessage);
+            }
         }
     }
 }
 
 /// Send an error response for invalid message format.
 fn send_error_response(state: &WsHandlerState, conn_id: ConnectionId) {
-    let error = json!({
-        "error": "Invalid message format",
-        "expected": r#"{ "name": "event-name", "data": {...} }"#
-    });
+    send_realtime_error(state, conn_id, RealtimeError::InvalidMessage);
+}
 
-    if let Ok(text) = serde_json::to_string(&error) {
-        state.manager.send_raw_to(conn_id, WsOutbound::Text(text));
-    }
+fn send_realtime_error(state: &WsHandlerState, conn_id: ConnectionId, error: RealtimeError) {
+    state.manager.send_to(conn_id, error.into_event());
 }
 
 /// Handle `subscribe-show-open`: reply with `show-open-request`.
@@ -258,6 +262,27 @@ mod tests {
             token_validator: Arc::new(|_| true),
             token_extractor: Arc::new(|_| None),
         }
+    }
+
+    fn assert_invalid_message_error(text: &str) {
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["name"], "realtime.error");
+        assert_eq!(parsed["data"]["code"], "REALTIME_INVALID_MESSAGE");
+        assert!(parsed["data"]["message"].is_string());
+        assert_eq!(parsed["data"]["recoverable"], true);
+        assert_eq!(
+            parsed["data"]["details"]["expected"],
+            r#"{ "name": "event-name", "data": {...} }"#
+        );
+    }
+
+    fn assert_unsupported_message_error(text: &str) {
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["name"], "realtime.error");
+        assert_eq!(parsed["data"]["code"], "REALTIME_UNSUPPORTED_MESSAGE");
+        assert_eq!(parsed["data"]["recoverable"], true);
+        assert!(parsed["data"]["message"].is_string());
+        assert!(parsed["data"]["details"].is_object());
     }
 
     #[test]
@@ -413,9 +438,7 @@ mod tests {
         let msg = rx.try_recv().unwrap();
         match msg {
             WsOutbound::Text(text) => {
-                let parsed: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["error"], "Invalid message format");
-                assert!(parsed["expected"].is_string());
+                assert_invalid_message_error(&text);
             }
             _ => panic!("expected error text"),
         }
@@ -433,8 +456,25 @@ mod tests {
         let msg = rx.try_recv().unwrap();
         match msg {
             WsOutbound::Text(text) => {
-                let parsed: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["error"], "Invalid message format");
+                assert_invalid_message_error(&text);
+            }
+            _ => panic!("expected error text"),
+        }
+    }
+
+    #[test]
+    fn text_message_empty_name_sends_error() {
+        let manager = Arc::new(WebSocketManager::new());
+        let (tx, mut rx) = mpsc::channel(PER_CONNECTION_BUFFER);
+        let conn_id = manager.add_client("tok".into(), tx);
+        let state = test_state(manager);
+
+        handle_text_message(conn_id, r#"{"name":"","data":{}}"#, &state);
+
+        let msg = rx.try_recv().unwrap();
+        match msg {
+            WsOutbound::Text(text) => {
+                assert_invalid_message_error(&text);
             }
             _ => panic!("expected error text"),
         }
@@ -448,8 +488,9 @@ mod tests {
             called: AtomicBool,
         }
         impl MessageRouter for TestRouter {
-            fn route(&self, _conn_id: ConnectionId, _name: &str, _data: Value) {
+            fn route(&self, _conn_id: ConnectionId, _name: &str, _data: Value) -> bool {
                 self.called.store(true, Ordering::Relaxed);
+                true
             }
         }
 
@@ -474,6 +515,28 @@ mod tests {
         );
 
         assert!(router.called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn text_message_unhandled_by_router_sends_unsupported_error() {
+        let manager = Arc::new(WebSocketManager::new());
+        let (tx, mut rx) = mpsc::channel(PER_CONNECTION_BUFFER);
+        let conn_id = manager.add_client("tok".into(), tx);
+        let state = test_state(manager);
+
+        handle_text_message(
+            conn_id,
+            r#"{"name":"conversation.send-message","data":{"text":"hi"}}"#,
+            &state,
+        );
+
+        let msg = rx.try_recv().unwrap();
+        match msg {
+            WsOutbound::Text(text) => {
+                assert_unsupported_message_error(&text);
+            }
+            _ => panic!("expected unsupported message error"),
+        }
     }
 
     #[test]

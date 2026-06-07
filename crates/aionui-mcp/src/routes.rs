@@ -106,7 +106,7 @@ async fn add_server(
     State(state): State<McpRouterState>,
     body: Result<Json<CreateMcpServerRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<McpServerResponse>>), ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let server = state.config_service.add_server(req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(server))))
 }
@@ -117,7 +117,7 @@ async fn edit_server(
     Path(id): Path<String>,
     body: Result<Json<UpdateMcpServerRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let server = state
         .config_service
         .edit_server(&id, req)
@@ -149,7 +149,7 @@ async fn batch_import(
     State(state): State<McpRouterState>,
     body: Result<Json<BatchImportMcpServersRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<McpServerResponse>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let servers = state.config_service.batch_import(req).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(servers)))
 }
@@ -165,7 +165,7 @@ async fn test_connection(
     State(state): State<McpRouterState>,
     body: Result<Json<TestMcpConnectionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let transport = McpServerTransport::from(req.transport);
     let result = state
         .connection_test_service
@@ -241,7 +241,7 @@ async fn oauth_check_status(
     State(state): State<McpRouterState>,
     body: Result<Json<OAuthCheckStatusRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<OAuthStatusResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let status = state
         .oauth_service
         .check_oauth_status(&req.server_url)
@@ -258,7 +258,7 @@ async fn oauth_login(
     State(state): State<McpRouterState>,
     body: Result<Json<OAuthLoginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<OAuthLoginResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .oauth_service
         .login(&req.server_url)
@@ -272,7 +272,7 @@ async fn oauth_logout(
     State(state): State<McpRouterState>,
     body: Result<Json<OAuthLogoutRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .oauth_service
         .logout(&req.server_url)

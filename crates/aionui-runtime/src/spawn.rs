@@ -175,6 +175,11 @@ impl Builder {
         self
     }
 
+    pub fn env_clear(&mut self) -> &mut Self {
+        self.inner.env_clear();
+        self
+    }
+
     pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
         self.inner.env_remove(key);
         self
@@ -306,11 +311,13 @@ mod tests {
 
     #[tokio::test]
     async fn clean_cli_captures_stdout_and_strips_env_pollution() {
-        // Set pollution on parent — it must not leak into child.
-        // SAFETY: single-threaded test. Rust 2024 requires unsafe.
-        unsafe {
-            std::env::set_var("NODE_OPTIONS", "--inspect=9229");
-            std::env::set_var("CLAUDECODE", "1");
+        if !crate::test_support::run_in_env_child(
+            "spawn::tests::clean_cli_captures_stdout_and_strips_env_pollution",
+            |command| {
+                command.env("NODE_OPTIONS", "--inspect=9229").env("CLAUDECODE", "1");
+            },
+        ) {
+            return;
         }
 
         // Ask the child to print NODE_OPTIONS + CLAUDECODE; Builder must
@@ -324,12 +331,6 @@ mod tests {
         assert!(stdout.contains("NO:unset"), "got: {stdout}");
         assert!(stdout.contains("CC:unset"), "got: {stdout}");
         assert!(output.status.success());
-
-        // SAFETY: single-threaded test cleanup.
-        unsafe {
-            std::env::remove_var("NODE_OPTIONS");
-            std::env::remove_var("CLAUDECODE");
-        }
     }
 
     #[tokio::test]
@@ -357,10 +358,10 @@ mod tests {
 
     #[tokio::test]
     async fn agent_strips_env_pollution() {
-        // SAFETY: single-threaded test.
-        unsafe {
-            std::env::set_var("NODE_INSPECT", "9229");
-            std::env::set_var("NODE_DEBUG", "*");
+        if !crate::test_support::run_in_env_child("spawn::tests::agent_strips_env_pollution", |command| {
+            command.env("NODE_INSPECT", "9229").env("NODE_DEBUG", "*");
+        }) {
+            return;
         }
 
         let mut b = Builder::new("sh");
@@ -372,12 +373,6 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("NI:unset"), "got: {stdout}");
         assert!(stdout.contains("ND:unset"), "got: {stdout}");
-
-        // SAFETY: single-threaded cleanup.
-        unsafe {
-            std::env::remove_var("NODE_INSPECT");
-            std::env::remove_var("NODE_DEBUG");
-        }
     }
 
     #[tokio::test]

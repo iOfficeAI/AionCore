@@ -62,7 +62,7 @@ async fn create(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<CreateRemoteAgentRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<RemoteAgentResponse>>), ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let agent = state.service.create(req).await.map_err(agent_error_to_api_error)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(agent))))
 }
@@ -73,7 +73,7 @@ async fn update(
     Path(id): Path<String>,
     body: Result<Json<UpdateRemoteAgentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RemoteAgentResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let agent = state.service.update(&id, req).await.map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(agent)))
 }
@@ -92,7 +92,7 @@ async fn test_connection(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<TestRemoteAgentConnectionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .service
         .test_connection(req)

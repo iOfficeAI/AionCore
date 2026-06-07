@@ -36,6 +36,42 @@ pub struct Database {
     pool: SqlitePool,
 }
 
+#[derive(Debug)]
+pub struct DatabaseInitError {
+    stage: &'static str,
+    source: DbError,
+}
+
+impl DatabaseInitError {
+    pub fn new(stage: &'static str, source: DbError) -> Self {
+        Self { stage, source }
+    }
+
+    pub fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    pub fn into_source(self) -> DbError {
+        self.source
+    }
+
+    fn source(&self) -> &DbError {
+        &self.source
+    }
+}
+
+impl std::fmt::Display for DatabaseInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.stage, self.source)
+    }
+}
+
+impl std::error::Error for DatabaseInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl Database {
     /// Returns a reference to the underlying connection pool.
     pub fn pool(&self) -> &SqlitePool {
@@ -58,18 +94,26 @@ impl Database {
 /// failures attempt recovery by backing up the corrupted file and creating a
 /// fresh database. Migration mismatches and lock contention fail fast.
 pub async fn init_database(path: &Path) -> Result<Database, DbError> {
+    init_database_staged(path).await.map_err(DatabaseInitError::into_source)
+}
+
+pub async fn init_database_staged(path: &Path) -> Result<Database, DatabaseInitError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| DbError::Init(format!("Failed to create database directory: {e}")))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            DatabaseInitError::new(
+                "database.open",
+                DbError::Init(format!("Failed to create database directory: {e}")),
+            )
+        })?;
     }
 
-    match try_init_file(path).await {
+    match try_init_file_staged(path).await {
         Ok(db) => Ok(db),
-        Err(e) if path.exists() && should_attempt_recovery(&e) => {
+        Err(e) if path.exists() && should_attempt_recovery(e.source()) => {
             warn!("Database initialization failed, attempting recovery: {e}");
-            recover_and_retry(path, e).await
+            recover_and_retry(path, e.into_source()).await
         }
         Err(e) => Err(e),
     }
@@ -159,7 +203,7 @@ pub fn maybe_copy_legacy_database(target: &Path) -> Result<(), DbError> {
     Ok(())
 }
 
-async fn try_init_file(path: &Path) -> Result<Database, DbError> {
+async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError> {
     // Serialize the whole file-backed startup path, not only the sqlx
     // migrator. Opening a fresh SQLite file also runs connection-level PRAGMAs
     // such as WAL setup, which can race before migrations start.
@@ -186,10 +230,12 @@ async fn try_init_file(path: &Path) -> Result<Database, DbError> {
         .max_connections(MAX_CONNECTIONS)
         .connect_with(opts)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(|e| DatabaseInitError::new("database.open", DbError::Query(e)))?;
 
-    run_migrations(&pool).await?;
-    ensure_system_user(&pool).await?;
+    run_migrations_staged(&pool).await?;
+    ensure_system_user(&pool)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.seed", e))?;
 
     info!("Database initialized at {}", path.display());
     Ok(Database { pool })
@@ -247,6 +293,12 @@ fn is_retryable_startup_file_error(error: &std::io::Error) -> bool {
 }
 
 async fn run_migrations(pool: &SqlitePool) -> Result<(), DbError> {
+    run_migrations_staged(pool)
+        .await
+        .map_err(DatabaseInitError::into_source)
+}
+
+async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitError> {
     // File-backed callers hold a cross-process startup lock before opening the
     // SQLite pool. sqlx-sqlite's Migrate impl has no-op
     // lock()/unlock() and the migrator does list_applied → apply without an
@@ -257,24 +309,31 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), DbError> {
     // `_sqlx_migrations` blows up with `UNIQUE constraint failed:
     // _sqlx_migrations.version`. The outer startup lock also covers
     // schema-repair and connection PRAGMAs before migration execution.
-    ensure_schema_columns(pool).await?;
+    ensure_schema_columns(pool)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.schema_repair", e))?;
     // Migration 002 rebuilds tables via RENAME+DROP. Two pragmas are needed:
     // - foreign_keys=OFF: prevents DROP TABLE from triggering ON DELETE CASCADE
     // - legacy_alter_table=ON: prevents ALTER TABLE RENAME from rewriting FK
     //   references in other tables (SQLite 3.26+ rewrites them by default)
     // Both must be set outside a transaction (sqlx wraps each migration in one).
-    let mut conn = pool.acquire().await.map_err(DbError::Query)?;
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| DatabaseInitError::new("database.migration", DbError::Query(e)))?;
     sqlx::query("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON")
         .execute(&mut *conn)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(|e| DatabaseInitError::new("database.migration", DbError::Query(e)))?;
 
-    let result = run_migrations_with_retry(&mut conn).await;
+    let result = run_migrations_with_retry(&mut conn)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.migration", e));
 
     sqlx::query("PRAGMA foreign_keys = ON; PRAGMA legacy_alter_table = OFF")
         .execute(&mut *conn)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(|e| DatabaseInitError::new("database.migration", DbError::Query(e)))?;
     result
 }
 
@@ -577,25 +636,36 @@ async fn ensure_system_user(pool: &SqlitePool) -> Result<(), DbError> {
     Ok(())
 }
 
-async fn recover_and_retry(path: &Path, original_error: DbError) -> Result<Database, DbError> {
+async fn recover_and_retry(path: &Path, original_error: DbError) -> Result<Database, DatabaseInitError> {
     let backup_path = format!("{}.backup.{}", path.display(), aionui_common::now_ms());
     warn!("Backing up corrupted database to: {backup_path}");
 
     std::fs::rename(path, &backup_path).map_err(|e| {
-        DbError::Init(format!(
-            "Recovery failed: could not backup corrupted database: {e}. \
-             Original error: {original_error}"
-        ))
+        DatabaseInitError::new(
+            "database.recovery",
+            DbError::Init(format!(
+                "Recovery failed: could not backup corrupted database: {e}. \
+                 Original error: {original_error}"
+            )),
+        )
     })?;
 
-    match try_init_file(path).await {
+    match try_init_file_staged(path).await {
         Ok(db) => {
-            warn!("Database recovered. Backup at: {backup_path}");
+            warn!(
+                code = "BOOTSTRAP_RECOVERED_DATABASE_CORRUPTION",
+                stage = "database.recovery",
+                backup_path = %backup_path,
+                "Database recovered after corruption-like startup failure"
+            );
             Ok(db)
         }
-        Err(retry_err) => Err(DbError::Init(format!(
-            "Recovery failed after backup: {retry_err}. Original error: {original_error}"
-        ))),
+        Err(retry_err) => Err(DatabaseInitError::new(
+            "database.recovery",
+            DbError::Init(format!(
+                "Recovery failed after backup: {retry_err}. Original error: {original_error}"
+            )),
+        )),
     }
 }
 

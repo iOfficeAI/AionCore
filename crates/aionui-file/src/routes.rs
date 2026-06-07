@@ -32,6 +32,15 @@ impl From<FileError> for ApiError {
         match error {
             FileError::BadRequest(message) => ApiError::BadRequest(message),
             FileError::Forbidden(message) => ApiError::Forbidden(message),
+            FileError::PathOutsideSandbox {
+                message,
+                field,
+                operation,
+            } => ApiError::PathOutsideSandbox {
+                message,
+                field,
+                operation,
+            },
             FileError::NotFound(message) => ApiError::NotFound(message),
             FileError::Internal(message) => ApiError::Internal(message),
         }
@@ -180,7 +189,7 @@ async fn get_files_by_dir(
     State(state): State<FileRouterState>,
     body: Result<Json<GetFilesByDirRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<DirOrFileResponse>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let items = state.file_service.get_files_by_dir(&req.dir, &req.root).await?;
     let response: Vec<DirOrFileResponse> = items.into_iter().map(to_dir_or_file_response).collect();
     Ok(Json(ApiResponse::ok(response)))
@@ -190,7 +199,7 @@ async fn list_workspace_files(
     State(state): State<FileRouterState>,
     body: Result<Json<ListWorkspaceFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<WorkspaceFlatFileResponse>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let items = state.file_service.list_workspace_files(&req.root).await?;
     let response: Vec<WorkspaceFlatFileResponse> = items.into_iter().map(to_flat_file_response).collect();
     Ok(Json(ApiResponse::ok(response)))
@@ -200,7 +209,7 @@ async fn get_file_metadata(
     State(state): State<FileRouterState>,
     body: Result<Json<GetFileMetadataRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FileMetadataResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let meta = state
         .file_service
         .get_file_metadata(&req.path, req.workspace.as_deref().map(Path::new))
@@ -212,7 +221,7 @@ async fn read_file(
     State(state): State<FileRouterState>,
     body: Result<Json<ReadFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let content = state
         .file_service
         .read_file(&req.path, req.workspace.as_deref().map(Path::new))
@@ -224,7 +233,7 @@ async fn read_file_buffer(
     State(state): State<FileRouterState>,
     body: Result<Json<ReadFileBufferRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let data = state
         .file_service
         .read_file_buffer(&req.path, req.workspace.as_deref().map(Path::new))
@@ -241,7 +250,7 @@ async fn write_file(
     State(state): State<FileRouterState>,
     body: Result<Json<WriteFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let workspace = req.workspace.unwrap_or_else(|| {
         std::path::Path::new(&req.path)
             .parent()
@@ -259,7 +268,7 @@ async fn copy_files(
     State(state): State<FileRouterState>,
     body: Result<Json<CopyFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CopyFilesResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .file_service
         .copy_files_to_workspace(&req.file_paths, &req.workspace, req.source_root.as_deref())
@@ -271,7 +280,7 @@ async fn remove_entry(
     State(state): State<FileRouterState>,
     body: Result<Json<RemoveEntryRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let workspace = req.workspace.unwrap_or_else(|| {
         std::path::Path::new(&req.path)
             .parent()
@@ -286,7 +295,7 @@ async fn rename_entry(
     State(state): State<FileRouterState>,
     body: Result<Json<RenameRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RenameResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let new_path = state.file_service.rename_entry(&req.path, &req.new_name).await?;
     Ok(Json(ApiResponse::ok(RenameResponse { new_path })))
 }
@@ -295,7 +304,7 @@ async fn create_temp_file(
     State(state): State<FileRouterState>,
     body: Result<Json<CreateTempFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let path = state.file_service.create_temp_file(&req.file_name).await?;
     Ok(Json(ApiResponse::ok(path)))
 }
@@ -401,7 +410,7 @@ async fn get_image_base64(
     State(state): State<FileRouterState>,
     body: Result<Json<GetImageBase64Request>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let data_url = state
         .file_service
         .get_image_base64(&req.path, req.workspace.as_deref().map(Path::new))
@@ -413,7 +422,7 @@ async fn fetch_remote_image(
     State(state): State<FileRouterState>,
     body: Result<Json<FetchRemoteImageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let data_url = state.file_service.fetch_remote_image(&req.url).await;
     Ok(Json(ApiResponse::ok(data_url)))
 }
@@ -422,7 +431,7 @@ async fn create_zip(
     State(state): State<FileRouterState>,
     body: Result<Json<ZipRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let entries: Vec<ZipEntry> = req.files.into_iter().map(to_zip_entry).collect();
     let ok = state
         .file_service
@@ -435,7 +444,7 @@ async fn cancel_zip(
     State(state): State<FileRouterState>,
     body: Result<Json<CancelZipRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let ok = state.file_service.cancel_zip(&req.request_id).await;
     Ok(Json(ApiResponse::ok(ok)))
 }
@@ -448,7 +457,7 @@ async fn start_watch(
     State(state): State<FileRouterState>,
     body: Result<Json<FileWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.watch_service.start_watch(&req.file_path).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -457,7 +466,7 @@ async fn stop_watch(
     State(state): State<FileRouterState>,
     body: Result<Json<FileWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.watch_service.stop_watch(&req.file_path).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -471,7 +480,7 @@ async fn start_office_watch(
     State(state): State<FileRouterState>,
     body: Result<Json<WorkspaceOfficeWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let allowed_roots: Vec<&Path> = state.allowed_roots.iter().map(std::path::PathBuf::as_path).collect();
     crate::path_safety::validate_path_with_extra_root(&req.workspace, &allowed_roots, Some(Path::new(&req.workspace)))?;
     state.watch_service.start_office_watch(&req.workspace).await?;
@@ -482,7 +491,7 @@ async fn stop_office_watch(
     State(state): State<FileRouterState>,
     body: Result<Json<WorkspaceOfficeWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.watch_service.stop_office_watch(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -495,7 +504,7 @@ async fn snapshot_init(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let info = state.snapshot_service.init(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
@@ -504,7 +513,7 @@ async fn snapshot_info(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let info = state.snapshot_service.get_info(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
@@ -513,7 +522,7 @@ async fn snapshot_compare(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotCompareResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state.snapshot_service.compare(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_compare_response(result))))
 }
@@ -522,7 +531,7 @@ async fn snapshot_baseline(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotBaselineRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let content = state
         .snapshot_service
         .get_baseline_content(&req.workspace, &req.file_path)
@@ -534,7 +543,7 @@ async fn snapshot_stage_file(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .snapshot_service
         .stage_file(&req.workspace, &req.file_path)
@@ -546,7 +555,7 @@ async fn snapshot_stage_all(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.snapshot_service.stage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -555,7 +564,7 @@ async fn snapshot_unstage_file(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .snapshot_service
         .unstage_file(&req.workspace, &req.file_path)
@@ -567,7 +576,7 @@ async fn snapshot_unstage_all(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.snapshot_service.unstage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -576,7 +585,7 @@ async fn snapshot_discard(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .snapshot_service
         .discard_file(&req.workspace, &req.file_path, req.operation)
@@ -588,7 +597,7 @@ async fn snapshot_reset(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .snapshot_service
         .reset_file(&req.workspace, &req.file_path, req.operation)
@@ -600,7 +609,7 @@ async fn snapshot_branches(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let branches = state.snapshot_service.get_branches(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(branches)))
 }
@@ -609,7 +618,7 @@ async fn snapshot_dispose(
     State(state): State<FileRouterState>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.snapshot_service.dispose(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -708,6 +717,18 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn file_path_outside_sandbox_maps_to_explicit_api_code() {
+        let api_err = ApiError::from(FileError::PathOutsideSandbox {
+            message: "path '/tmp/x' is outside the allowed sandbox".into(),
+            field: Some("path"),
+            operation: Some("access"),
+        });
+        assert_eq!(api_err.error_code(), "PATH_OUTSIDE_SANDBOX");
+        assert_eq!(api_err.error_details().unwrap()["field"], "path");
+        assert_eq!(api_err.error_details().unwrap()["operation"], "access");
+    }
 
     #[test]
     fn browse_roots_are_resolved_lazily() {

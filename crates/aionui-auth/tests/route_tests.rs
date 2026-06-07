@@ -179,6 +179,7 @@ async fn t4_2_login_nonexistent_user() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = body_json(resp).await;
     assert_eq!(json["success"], false);
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -190,6 +191,8 @@ async fn t4_3_login_wrong_password() {
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -289,7 +292,9 @@ async fn t5_2_logout_token_becomes_invalid() {
     // Try to use the token
     let req = get_with_token("/api/auth/user", &token);
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -303,7 +308,9 @@ async fn t5_3_logout_unauthenticated() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ===========================================================================
@@ -388,7 +395,9 @@ async fn t7_2_get_user_invalid_token() {
     let req = get_with_token("/api/auth/user", "invalid.jwt.token");
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -398,7 +407,9 @@ async fn t7_3_get_user_no_token() {
     let req = get_anonymous("/api/auth/user");
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ===========================================================================
@@ -442,7 +453,9 @@ async fn t8_2_change_password_old_token_invalidated() {
     // Old token should be invalid (JWT secret rotated)
     let req = get_with_token("/api/auth/user", &token);
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -459,6 +472,8 @@ async fn t8_3_change_password_wrong_current() {
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -550,6 +565,8 @@ async fn t9_2_refresh_invalid_token() {
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -593,7 +610,9 @@ async fn t10_2_ws_token_unauthenticated() {
     let req = get_anonymous("/api/ws-token");
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ===========================================================================
@@ -638,6 +657,8 @@ async fn t11_2_qr_login_invalid_token() {
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -662,6 +683,8 @@ async fn t11_4_qr_login_already_used() {
     let req = json_post("/api/auth/qr-login", &body);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]

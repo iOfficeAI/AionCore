@@ -67,7 +67,7 @@ async fn build_app() -> (axum::Router, aionui_app::AppServices) {
     let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
         .await
         .unwrap();
-    let router = aionui_app::create_router(&services).await;
+    let router = aionui_app::create_router(&services).await.expect("build router");
     (router, services)
 }
 
@@ -82,7 +82,9 @@ async fn workspace_browse_requires_auth() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -194,6 +196,8 @@ async fn side_question_requires_auth() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "CSRF_INVALID");
 }
 
 #[tokio::test]
@@ -244,7 +248,9 @@ async fn slash_commands_requires_auth() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -269,7 +275,9 @@ async fn openclaw_runtime_requires_auth() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]

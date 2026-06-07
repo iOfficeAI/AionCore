@@ -87,8 +87,11 @@ pub enum NodeRuntimeFailureKind {
     Timeout,
     DownloadFailed,
     HttpStatus,
+    ChecksumMismatch,
     ValidationFailed,
     UnsupportedPlatform,
+    BundledResourceMissing,
+    BundledResourceInvalid,
     Unknown,
 }
 

@@ -53,7 +53,7 @@ async fn create(
     State(state): State<AssistantRouterState>,
     body: Result<Json<CreateAssistantRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AssistantResponse>>), ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let created = state.service.create(req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
 }
@@ -63,7 +63,7 @@ async fn update(
     Path(id): Path<String>,
     body: Result<Json<UpdateAssistantRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let updated = state.service.update(&id, req).await?;
     Ok(Json(ApiResponse::ok(updated)))
 }
@@ -81,7 +81,7 @@ async fn set_state(
     Path(id): Path<String>,
     body: Result<Json<SetAssistantStateRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let resp = state.service.set_state(&id, req).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
@@ -90,7 +90,7 @@ async fn import(
     State(state): State<AssistantRouterState>,
     body: Result<Json<ImportAssistantsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportAssistantsResult>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state.service.import(req).await?;
     Ok(Json(ApiResponse::ok(result)))
 }

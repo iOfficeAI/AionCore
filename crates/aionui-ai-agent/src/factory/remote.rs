@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use aionui_api_types::RemoteBuildExtra;
 use tracing::warn;
 
 use crate::agent_task::AgentInstance;
@@ -8,21 +7,19 @@ use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
 use crate::manager::remote::{RemoteAgentConfig, RemoteAgentManager};
-use crate::types::BuildTaskOptions;
+use crate::session_context::RemoteSessionBuildContext;
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
-    options: BuildTaskOptions,
+    build_context: RemoteSessionBuildContext,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
-    let extra: RemoteBuildExtra = serde_json::from_value(options.extra)
-        .map_err(|e| AgentError::bad_request(format!("Invalid Remote build options: {e}")))?;
     let row = deps
         .remote_agent_repo
-        .find_by_id(&extra.remote_agent_id)
+        .find_by_id(&build_context.remote_agent_id)
         .await
         .map_err(|e| AgentError::internal(format!("Failed to load remote agent config: {e}")))?
-        .ok_or_else(|| AgentError::not_found(format!("Remote agent '{}' not found", extra.remote_agent_id)))?;
+        .ok_or_else(|| AgentError::not_found(format!("Remote agent '{}' not found", build_context.remote_agent_id)))?;
     let auth_token = row
         .auth_token
         .as_deref()

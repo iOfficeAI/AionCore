@@ -5,7 +5,11 @@ use aionui_ai_agent::AcpSessionSyncService;
 use aionui_ai_agent::AcpSkillManager;
 use aionui_ai_agent::factory::{AgentFactoryDeps, build_agent_factory};
 use aionui_ai_agent::registry::AgentRegistry;
+use aionui_ai_agent::session_context::{
+    AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext, WorkspaceContext,
+};
 use aionui_ai_agent::types::BuildTaskOptions;
+use aionui_api_types::AionrsBuildExtra;
 use aionui_common::{AgentType, ProviderWithModel, encrypt_string};
 use aionui_db::{
     CreateProviderParams, IAcpSessionRepository, IProviderRepository, SqliteAcpSessionRepository,
@@ -81,22 +85,48 @@ fn make_factory(
     })
 }
 
+fn make_aionrs_options(
+    conversation_id: &str,
+    workspace: &str,
+    model: ProviderWithModel,
+    config: AionrsBuildExtra,
+) -> BuildTaskOptions {
+    BuildTaskOptions::new(AgentSessionContext {
+        conversation: ConversationContext {
+            conversation_id: conversation_id.to_owned(),
+            user_id: "user-1".to_owned(),
+            agent_type: AgentType::Aionrs,
+            source: None,
+        },
+        workspace: WorkspaceContext {
+            path: workspace.to_owned(),
+            stored_path: workspace.to_owned(),
+            is_custom: !workspace.is_empty(),
+        },
+        model,
+        skills: vec![],
+        kind: AgentSessionKind::Aionrs(Box::new(AionrsSessionBuildContext {
+            config,
+            belongs_to_team: false,
+        })),
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aionrs_factory_returns_error_for_missing_provider() {
     let (provider_repo, remote_agent_repo, agent_registry, acp_agent_service) = setup().await;
     let factory = make_factory(provider_repo, remote_agent_repo, agent_registry, acp_agent_service);
 
-    let options = BuildTaskOptions {
-        agent_type: AgentType::Aionrs,
-        workspace: String::new(),
-        model: ProviderWithModel {
+    let options = make_aionrs_options(
+        "conv-test-1",
+        "",
+        ProviderWithModel {
             provider_id: "nonexistent-provider".into(),
             model: "gpt-4o".into(),
             use_model: None,
         },
-        conversation_id: "conv-test-1".into(),
-        extra: serde_json::json!({}),
-    };
+        AionrsBuildExtra::default(),
+    );
 
     let result = factory(options).await;
     match result {
@@ -117,17 +147,19 @@ async fn aionrs_factory_resolves_provider_from_db() {
     insert_test_provider(&*provider_repo, "prov-001", "openai").await;
     let factory = make_factory(provider_repo, remote_agent_repo, agent_registry, acp_agent_service);
 
-    let options = BuildTaskOptions {
-        agent_type: AgentType::Aionrs,
-        workspace: "/tmp/test-workspace".into(),
-        model: ProviderWithModel {
+    let options = make_aionrs_options(
+        "conv-test-2",
+        "/tmp/test-workspace",
+        ProviderWithModel {
             provider_id: "prov-001".into(),
             model: "gpt-4o".into(),
             use_model: None,
         },
-        conversation_id: "conv-test-2".into(),
-        extra: serde_json::json!({ "max_tokens": 2048 }),
-    };
+        AionrsBuildExtra {
+            max_tokens: 2048,
+            ..Default::default()
+        },
+    );
 
     let result = factory(options).await;
     assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
@@ -139,17 +171,16 @@ async fn aionrs_factory_respects_use_model_override() {
     insert_test_provider(&*provider_repo, "prov-002", "openai").await;
     let factory = make_factory(provider_repo, remote_agent_repo, agent_registry, acp_agent_service);
 
-    let options = BuildTaskOptions {
-        agent_type: AgentType::Aionrs,
-        workspace: "/tmp/test-workspace".into(),
-        model: ProviderWithModel {
+    let options = make_aionrs_options(
+        "conv-test-3",
+        "/tmp/test-workspace",
+        ProviderWithModel {
             provider_id: "prov-002".into(),
             model: "gpt-4o".into(),
             use_model: Some("gpt-5.4".into()),
         },
-        conversation_id: "conv-test-3".into(),
-        extra: serde_json::json!({}),
-    };
+        AionrsBuildExtra::default(),
+    );
 
     let result = factory(options).await;
     assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());

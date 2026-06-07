@@ -69,7 +69,7 @@ async fn create_job(
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<CreateCronJobRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<CronJobResponse>>), ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let job = state.cron_service.add_job(req).await?;
     let resp = CronService::to_response(&job);
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(resp))))
@@ -100,7 +100,7 @@ async fn update_job(
     Path(id): Path<String>,
     body: Result<Json<UpdateCronJobRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CronJobResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let job = state.cron_service.update_job(&id, req).await?;
     Ok(Json(ApiResponse::ok(CronService::to_response(&job))))
 }
@@ -142,7 +142,7 @@ async fn save_skill(
     Path(id): Path<String>,
     body: Result<Json<SaveCronSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.cron_service.save_skill(&id, req).await?;
     Ok(Json(ApiResponse::success()))
 }

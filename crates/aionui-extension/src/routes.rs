@@ -443,7 +443,7 @@ async fn get_i18n(
     State(state): State<ExtensionRouterState>,
     body: Result<Json<GetI18nRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<HashMap<String, HashMap<String, String>>>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let data = state.registry.get_i18n_for_locale(&req.locale).await;
     Ok(Json(ApiResponse::ok(data)))
 }
@@ -453,7 +453,7 @@ async fn get_permissions(
     State(state): State<ExtensionRouterState>,
     body: Result<Json<GetPermissionsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PermissionSummaryResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     let ext = state
         .registry
@@ -489,7 +489,7 @@ async fn get_risk_level(
     State(state): State<ExtensionRouterState>,
     body: Result<Json<GetRiskLevelRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
 
     let ext = state
         .registry
@@ -514,7 +514,7 @@ async fn enable_extension(
     State(state): State<ExtensionRouterState>,
     body: Result<Json<EnableExtensionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state.registry.enable_extension(&req.name).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -524,7 +524,7 @@ async fn disable_extension(
     State(state): State<ExtensionRouterState>,
     body: Result<Json<DisableExtensionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .registry
         .disable_extension(&req.name, req.reason.as_deref())

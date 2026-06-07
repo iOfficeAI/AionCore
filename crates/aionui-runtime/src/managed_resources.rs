@@ -217,29 +217,32 @@ fn create_symlink(link_target: &Path, target: &Path, source: &Path) -> std::io::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[test]
     fn default_mode_is_download() {
-        let _guard = env_lock().lock().expect("lock env");
+        if !crate::test_support::run_in_env_child("managed_resources::tests::default_mode_is_download", |command| {
+            command.env_remove(BUNDLED_RESOURCES_ENV);
+        }) {
+            return;
+        }
         assert_eq!(default_managed_resources_mode(), ManagedResourcesMode::Download);
     }
 
     #[test]
     fn bundled_mode_uses_configured_bundled_root() {
-        let _guard = env_lock().lock().expect("lock env");
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("managed");
+        if !crate::test_support::run_in_env_child(
+            "managed_resources::tests::bundled_mode_uses_configured_bundled_root",
+            |command| {
+                command.env(BUNDLED_RESOURCES_ENV, &root);
+            },
+        ) {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(BUNDLED_RESOURCES_ENV).expect("bundled root env"));
         fs::create_dir_all(root.join("node").join("node-v24.11.0-darwin-arm64")).expect("create node dir");
 
-        unsafe {
-            std::env::set_var(BUNDLED_RESOURCES_ENV, &root);
-        }
         set_managed_resources_mode(ManagedResourcesMode::Bundled);
 
         let sources = node_sources("node-v24.11.0-darwin-arm64");
@@ -247,31 +250,30 @@ mod tests {
         assert_eq!(sources[0].kind, ManagedResourceSourceKind::Bundled);
         assert_eq!(sources[0].root, root.join("node").join("node-v24.11.0-darwin-arm64"));
 
-        unsafe {
-            std::env::remove_var(BUNDLED_RESOURCES_ENV);
-        }
         set_managed_resources_mode(ManagedResourcesMode::Download);
     }
 
     #[test]
     fn download_mode_ignores_configured_bundled_root() {
-        let _guard = env_lock().lock().expect("lock env");
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("managed");
+        if !crate::test_support::run_in_env_child(
+            "managed_resources::tests::download_mode_ignores_configured_bundled_root",
+            |command| {
+                command.env(BUNDLED_RESOURCES_ENV, &root);
+            },
+        ) {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(BUNDLED_RESOURCES_ENV).expect("bundled root env"));
         fs::create_dir_all(root.join("node").join("node-v24.11.0-darwin-arm64")).expect("create node dir");
 
-        unsafe {
-            std::env::set_var(BUNDLED_RESOURCES_ENV, &root);
-        }
         set_managed_resources_mode(ManagedResourcesMode::Download);
 
         let sources = node_sources("node-v24.11.0-darwin-arm64");
         assert!(sources.is_empty());
         assert!(!requires_bundled_resources());
 
-        unsafe {
-            std::env::remove_var(BUNDLED_RESOURCES_ENV);
-        }
         set_managed_resources_mode(ManagedResourcesMode::Download);
     }
 

@@ -1,0 +1,672 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use aionui_ai_agent::session_context::{
+    AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext,
+    NanobotSessionBuildContext, OpenClawSessionBuildContext, RemoteSessionBuildContext, WorkspaceContext,
+};
+use aionui_ai_agent::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState};
+use aionui_ai_agent::types::BuildTaskOptions;
+use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, OpenClawBuildExtra, RemoteBuildExtra};
+use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
+use aionui_db::models::ConversationRow;
+use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
+use tracing::{debug, warn};
+
+use crate::convert::string_to_enum;
+use crate::error::ConversationError;
+use crate::task_options::provider_model_from_conversation_row;
+
+pub(crate) struct SessionContextBuilder<'a> {
+    workspace_root: &'a Path,
+    agent_metadata_repo: &'a Arc<dyn IAgentMetadataRepository>,
+    acp_session_repo: &'a Arc<dyn IAcpSessionRepository>,
+}
+
+impl<'a> SessionContextBuilder<'a> {
+    pub(crate) fn new(
+        workspace_root: &'a Path,
+        agent_metadata_repo: &'a Arc<dyn IAgentMetadataRepository>,
+        acp_session_repo: &'a Arc<dyn IAcpSessionRepository>,
+    ) -> Self {
+        Self {
+            workspace_root,
+            agent_metadata_repo,
+            acp_session_repo,
+        }
+    }
+
+    pub(crate) async fn build_options(&self, row: &ConversationRow) -> Result<BuildTaskOptions, ConversationError> {
+        Ok(BuildTaskOptions::new(self.build(row).await?))
+    }
+
+    pub(crate) async fn build_options_with_workspace_override(
+        &self,
+        row: &ConversationRow,
+        workspace_override: Option<&str>,
+    ) -> Result<BuildTaskOptions, ConversationError> {
+        Ok(BuildTaskOptions::new(
+            self.build_with_workspace_override(row, workspace_override).await?,
+        ))
+    }
+
+    async fn build(&self, row: &ConversationRow) -> Result<AgentSessionContext, ConversationError> {
+        self.build_with_workspace_override(row, None).await
+    }
+
+    async fn build_with_workspace_override(
+        &self,
+        row: &ConversationRow,
+        workspace_override: Option<&str>,
+    ) -> Result<AgentSessionContext, ConversationError> {
+        let agent_type: AgentType = string_to_enum(&row.r#type)?;
+        let extra = parse_extra(row)?;
+        let workspace = self.resolve_workspace(row, &agent_type, &extra, workspace_override)?;
+        let model = provider_model_from_conversation_row(row);
+        let skills = parse_string_array(extra.get("skills").cloned()).unwrap_or_default();
+        let kind = self.build_kind(row, &agent_type, extra).await?;
+
+        Ok(AgentSessionContext {
+            conversation: ConversationContext {
+                conversation_id: row.id.clone(),
+                user_id: row.user_id.clone(),
+                agent_type,
+                source: row.source.clone(),
+            },
+            workspace,
+            model,
+            skills,
+            kind,
+        })
+    }
+
+    fn resolve_workspace(
+        &self,
+        row: &ConversationRow,
+        agent_type: &AgentType,
+        extra: &serde_json::Value,
+        workspace_override: Option<&str>,
+    ) -> Result<WorkspaceContext, ConversationError> {
+        let expected_auto_workspace =
+            expected_auto_workspace_path(self.workspace_root, &row.id, agent_type, extra.get("backend"));
+        let existing_stored_path = extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+
+        if let Some(override_path) = workspace_override.map(str::trim).filter(|value| !value.is_empty()) {
+            let normalized = match validate_workspace_path_availability(override_path) {
+                Ok(normalized) => normalized,
+                Err(error) => return Err(map_runtime_workspace_validation_error(error)),
+            };
+            return Ok(WorkspaceContext {
+                path: normalized,
+                stored_path: existing_stored_path,
+                is_custom: true,
+            });
+        }
+
+        let stored = extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+
+        let Some(stored_path) = stored else {
+            std::fs::create_dir_all(&expected_auto_workspace)
+                .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
+            return Ok(WorkspaceContext {
+                path: expected_auto_workspace.to_string_lossy().into_owned(),
+                stored_path: String::new(),
+                is_custom: false,
+            });
+        };
+
+        let normalized = match validate_workspace_path_availability(stored_path) {
+            Ok(normalized) => normalized,
+            Err(WorkspacePathValidationError::DoesNotExist(path))
+                if expected_auto_workspace.as_path() == Path::new(stored_path) =>
+            {
+                path
+            }
+            Err(error) => return Err(map_runtime_workspace_validation_error(error)),
+        };
+
+        Ok(WorkspaceContext {
+            is_custom: Path::new(&normalized) != expected_auto_workspace.as_path(),
+            stored_path: stored_path.to_owned(),
+            path: normalized,
+        })
+    }
+
+    async fn build_kind(
+        &self,
+        row: &ConversationRow,
+        agent_type: &AgentType,
+        extra: serde_json::Value,
+    ) -> Result<AgentSessionKind, ConversationError> {
+        match agent_type {
+            AgentType::Gemini => Ok(AgentSessionKind::Gemini),
+            AgentType::Acp => self
+                .build_acp_context(row, extra)
+                .await
+                .map(|context| AgentSessionKind::Acp(Box::new(context))),
+            AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(row, extra)))),
+            AgentType::OpenclawGateway => {
+                build_openclaw_context(extra).map(|context| AgentSessionKind::OpenClaw(Box::new(context)))
+            }
+            AgentType::Remote => build_remote_context(extra).map(AgentSessionKind::Remote),
+            AgentType::Nanobot => Ok(AgentSessionKind::Nanobot(NanobotSessionBuildContext)),
+        }
+    }
+
+    async fn build_acp_context(
+        &self,
+        row: &ConversationRow,
+        extra: serde_json::Value,
+    ) -> Result<AcpSessionBuildContext, ConversationError> {
+        let mut config: AcpBuildExtra =
+            serde_json::from_value(extra.clone()).map_err(|e| ConversationError::BadRequest {
+                reason: format!("Invalid ACP build options: {e}"),
+            })?;
+        config.user_id.get_or_insert_with(|| row.user_id.clone());
+        normalize_cron_alias(row, &extra, &mut config.cron_job_id);
+
+        if config.session_mode.is_none()
+            && let Some(mode) = extra
+                .get("current_mode_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+        {
+            debug!(
+                conversation_id = %row.id,
+                "session_context: using legacy ACP extra.current_mode_id as startup seed"
+            );
+            config.session_mode = Some(mode.to_owned());
+        }
+
+        self.resolve_acp_identity(row, &mut config, &extra).await?;
+
+        let belongs_to_team = extra
+            .get("teamId")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+
+        let session_row = self
+            .acp_session_repo
+            .get(&row.id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load acp_session row: {e}")))?;
+        let session_id = session_row.and_then(|row| row.session_id);
+        let session_snapshot = self.load_acp_session_snapshot(row, &config).await?;
+
+        Ok(AcpSessionBuildContext {
+            config,
+            belongs_to_team,
+            session_id,
+            session_snapshot,
+        })
+    }
+
+    async fn resolve_acp_identity(
+        &self,
+        row: &ConversationRow,
+        config: &mut AcpBuildExtra,
+        extra: &serde_json::Value,
+    ) -> Result<(), ConversationError> {
+        let agent_id = config.agent_id.as_deref().filter(|value| !value.is_empty());
+        if agent_id.is_some() {
+            return Ok(());
+        }
+
+        let backend = config.backend.as_deref().filter(|value| !value.is_empty());
+        let agent_source = extra
+            .get("agent_source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("builtin");
+
+        if agent_source != "builtin" {
+            return Err(ConversationError::BadRequest {
+                reason: "ACP non-builtin agent requires agent_id in extra".to_owned(),
+            });
+        }
+
+        let Some(backend) = backend else {
+            return Ok(());
+        };
+
+        let Some(row_meta) = self
+            .agent_metadata_repo
+            .find_builtin_by_backend(backend)
+            .await
+            .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?
+        else {
+            debug!(
+                conversation_id = %row.id,
+                backend,
+                "session_context: legacy ACP backend fallback left for factory resolution"
+            );
+            return Ok(());
+        };
+
+        debug!(
+            conversation_id = %row.id,
+            backend,
+            "session_context: resolved legacy ACP backend fallback"
+        );
+        config.agent_id = Some(row_meta.id);
+        Ok(())
+    }
+
+    async fn load_acp_session_snapshot(
+        &self,
+        row: &ConversationRow,
+        config: &AcpBuildExtra,
+    ) -> Result<Option<PersistedSessionState>, ConversationError> {
+        let db_state = self
+            .acp_session_repo
+            .load_runtime_state(&row.id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load acp_session runtime state: {e}")))?;
+        let snapshot = db_state.map(decode_persisted_session_state);
+        if snapshot
+            .as_ref()
+            .and_then(|state| state.current_model_id.as_ref())
+            .is_none()
+            && config
+                .current_model_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+        {
+            debug!(
+                conversation_id = %row.id,
+                "session_context: using legacy ACP extra.current_model_id as startup seed"
+            );
+        }
+        Ok(snapshot)
+    }
+}
+
+fn build_aionrs_context(row: &ConversationRow, extra: serde_json::Value) -> AionrsSessionBuildContext {
+    let mut config: AionrsBuildExtra = match serde_json::from_value(extra.clone()) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(
+                conversation_id = %row.id,
+                error = %err,
+                "session_context: invalid aionrs extra; using defaults"
+            );
+            AionrsBuildExtra::default()
+        }
+    };
+    config.user_id.get_or_insert_with(|| row.user_id.clone());
+    let belongs_to_team = extra
+        .get("teamId")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    AionrsSessionBuildContext {
+        config,
+        belongs_to_team,
+    }
+}
+
+fn build_openclaw_context(extra: serde_json::Value) -> Result<OpenClawSessionBuildContext, ConversationError> {
+    let config: OpenClawBuildExtra = serde_json::from_value(extra).map_err(|e| ConversationError::BadRequest {
+        reason: format!("Invalid OpenClaw build options: {e}"),
+    })?;
+    Ok(OpenClawSessionBuildContext { config })
+}
+
+fn build_remote_context(extra: serde_json::Value) -> Result<RemoteSessionBuildContext, ConversationError> {
+    let config: RemoteBuildExtra = serde_json::from_value(extra).map_err(|e| ConversationError::BadRequest {
+        reason: format!("Invalid Remote build options: {e}"),
+    })?;
+    if config.remote_agent_id.trim().is_empty() {
+        return Err(ConversationError::BadRequest {
+            reason: "Remote agent requires remote_agent_id in extra".to_owned(),
+        });
+    }
+    Ok(RemoteSessionBuildContext {
+        remote_agent_id: config.remote_agent_id,
+    })
+}
+
+fn parse_extra(row: &ConversationRow) -> Result<serde_json::Value, ConversationError> {
+    serde_json::from_str(&row.extra).map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))
+}
+
+fn parse_string_array(value: Option<serde_json::Value>) -> Option<Vec<String>> {
+    serde_json::from_value(value?).ok()
+}
+
+fn normalize_cron_alias(row: &ConversationRow, extra: &serde_json::Value, cron_job_id: &mut Option<String>) {
+    if cron_job_id.is_none()
+        && let Some(legacy) = extra
+            .get("cronJobId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+    {
+        debug!(
+            conversation_id = %row.id,
+            "session_context: normalized legacy cronJobId alias"
+        );
+        *cron_job_id = Some(legacy.to_owned());
+    }
+}
+
+fn decode_persisted_session_state(state: aionui_db::PersistedSessionState) -> PersistedSessionState {
+    let mut decoded = PersistedSessionState {
+        current_mode_id: state.current_mode_id.map(ModeId::new),
+        current_model_id: state.current_model_id.map(ModelId::new),
+        ..Default::default()
+    };
+    if let Some(raw) = state.config_selections_json
+        && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&raw)
+    {
+        decoded.config_selections = map
+            .into_iter()
+            .map(|(key, value)| (ConfigKey::new(key), ConfigValue::new(value)))
+            .collect();
+    }
+    if let Some(raw) = state.context_usage_json
+        && let Ok(usage) = serde_json::from_str(&raw)
+    {
+        decoded.context_usage = Some(usage);
+    }
+    decoded
+}
+
+fn expected_auto_workspace_path(
+    workspace_root: &Path,
+    conversation_id: &str,
+    agent_type: &AgentType,
+    backend: Option<&serde_json::Value>,
+) -> PathBuf {
+    workspace_root.join("conversations").join(format!(
+        "{}-temp-{conversation_id}",
+        conversation_label(agent_type, backend)
+    ))
+}
+
+fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
+    if *agent_type == AgentType::Acp
+        && let Some(serde_json::Value::String(s)) = backend
+        && !s.is_empty()
+    {
+        return s.clone();
+    }
+    agent_type.serde_name().to_owned()
+}
+
+fn map_runtime_workspace_validation_error(error: WorkspacePathValidationError) -> ConversationError {
+    match error {
+        WorkspacePathValidationError::Empty => ConversationError::BadRequest {
+            reason: "Workspace directory is empty".into(),
+        },
+        WorkspacePathValidationError::DoesNotExist(path)
+        | WorkspacePathValidationError::NotDirectory(path)
+        | WorkspacePathValidationError::NotAccessible { path, .. } => {
+            ConversationError::WorkspacePathRuntimeUnavailable { path }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aionui_db::{
+        CreateAcpSessionParams, SaveRuntimeStateParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+        UpsertAgentMetadataParams, init_database_memory,
+    };
+
+    struct TestRepos {
+        workspace_root: PathBuf,
+        metadata_repo: Arc<dyn IAgentMetadataRepository>,
+        acp_session_repo: Arc<dyn IAcpSessionRepository>,
+    }
+
+    impl TestRepos {
+        fn builder(&self) -> SessionContextBuilder<'_> {
+            SessionContextBuilder::new(&self.workspace_root, &self.metadata_repo, &self.acp_session_repo)
+        }
+    }
+
+    async fn setup() -> TestRepos {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
+        let metadata_repo: Arc<dyn IAgentMetadataRepository> =
+            Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
+        let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
+        let workspace_root = std::env::temp_dir().join(format!(
+            "aion-session-context-test-{}",
+            aionui_common::generate_short_id()
+        ));
+        TestRepos {
+            workspace_root,
+            metadata_repo,
+            acp_session_repo,
+        }
+    }
+
+    fn row(agent_type: &str, extra: serde_json::Value, model: Option<serde_json::Value>) -> ConversationRow {
+        ConversationRow {
+            id: "conv-1".into(),
+            user_id: "user-1".into(),
+            name: "test".into(),
+            r#type: agent_type.into(),
+            model: model.map(|value| serde_json::to_string(&value).unwrap()),
+            extra: serde_json::to_string(&extra).unwrap(),
+            status: None,
+            source: Some("chat".into()),
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    async fn upsert_builtin(repos: &TestRepos, id: &str, backend: &str) {
+        repos
+            .metadata_repo
+            .upsert(&UpsertAgentMetadataParams {
+                id,
+                icon: None,
+                name: id,
+                name_i18n: None,
+                description: None,
+                description_i18n: None,
+                backend: Some(backend),
+                agent_type: "acp",
+                agent_source: "builtin",
+                agent_source_info: None,
+                enabled: true,
+                command: Some("/bin/echo"),
+                args: None,
+                env: None,
+                native_skills_dirs: None,
+                behavior_policy: None,
+                yolo_id: None,
+                agent_capabilities: None,
+                auth_methods: None,
+                config_options: None,
+                available_modes: None,
+                available_models: None,
+                available_commands: None,
+                sort_order: 0,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn acp_context(context: AgentSessionContext) -> AcpSessionBuildContext {
+        match context.kind {
+            AgentSessionKind::Acp(acp) => *acp,
+            other => panic!("expected ACP context, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_agent_id_takes_priority_over_backend() {
+        let repos = setup().await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "agent_id": "custom-agent-1",
+                "backend": "claude",
+                "agent_source": "custom"
+            }),
+            None,
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.agent_id.as_deref(), Some("custom-agent-1"));
+        assert_eq!(acp.config.backend.as_deref(), Some("claude"));
+    }
+
+    #[tokio::test]
+    async fn acp_builtin_backend_fallback_resolves_agent_id() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.agent_id.as_deref(), Some("builtin-claude-test"));
+        assert_eq!(acp.config.backend.as_deref(), Some("claude"));
+    }
+
+    #[tokio::test]
+    async fn acp_non_builtin_without_agent_id_is_rejected() {
+        let repos = setup().await;
+        let row = row(
+            "acp",
+            serde_json::json!({ "backend": "custom", "agent_source": "custom" }),
+            None,
+        );
+
+        let err = repos.builder().build(&row).await.unwrap_err();
+        assert!(err.to_string().contains("requires agent_id"));
+    }
+
+    #[tokio::test]
+    async fn acp_persisted_runtime_is_loaded_before_legacy_seed() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        repos
+            .acp_session_repo
+            .create(&CreateAcpSessionParams {
+                conversation_id: "conv-1",
+                agent_backend: "claude",
+                agent_source: "builtin",
+                agent_id: "builtin-claude-test",
+            })
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .save_runtime_state(
+                "conv-1",
+                &SaveRuntimeStateParams {
+                    current_mode_id: Some(Some("persisted-mode")),
+                    current_model_id: Some(Some("persisted-model")),
+                    config_selections_json: None,
+                    context_usage_json: None,
+                },
+            )
+            .await
+            .unwrap();
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "claude",
+                "current_mode_id": "legacy-mode",
+                "current_model_id": "legacy-model"
+            }),
+            None,
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        let snapshot = acp.session_snapshot.expect("snapshot loaded");
+        assert_eq!(snapshot.current_mode_id.unwrap().as_str(), "persisted-mode");
+        assert_eq!(snapshot.current_model_id.unwrap().as_str(), "persisted-model");
+        assert_eq!(acp.config.session_mode.as_deref(), Some("legacy-mode"));
+        assert_eq!(acp.config.current_model_id.as_deref(), Some("legacy-model"));
+    }
+
+    #[tokio::test]
+    async fn acp_legacy_current_mode_becomes_startup_seed_without_runtime() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        let row = row(
+            "acp",
+            serde_json::json!({ "backend": "claude", "current_mode_id": "legacy-mode" }),
+            None,
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.session_mode.as_deref(), Some("legacy-mode"));
+        assert!(acp.session_snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn aionrs_uses_conversation_model_and_ignores_legacy_extra_model() {
+        let repos = setup().await;
+        let row = row(
+            "aionrs",
+            serde_json::json!({
+                "model": { "provider_id": "wrong", "model": "wrong-model" }
+            }),
+            Some(serde_json::json!({
+                "provider_id": "provider-1",
+                "model": "gpt-5",
+                "use_model": "gpt-5.1"
+            })),
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        assert_eq!(context.model.provider_id, "provider-1");
+        assert_eq!(context.model.model, "gpt-5");
+        assert_eq!(context.model.use_model.as_deref(), Some("gpt-5.1"));
+    }
+
+    #[tokio::test]
+    async fn workspace_empty_uses_auto_path_and_is_not_custom() {
+        let repos = setup().await;
+        let row = row("aionrs", serde_json::json!({}), None);
+
+        let context = repos.builder().build(&row).await.unwrap();
+        assert!(!context.workspace.is_custom);
+        assert!(context.workspace.stored_path.is_empty());
+        assert!(context.workspace.path.ends_with("aionrs-temp-conv-1"));
+    }
+
+    #[tokio::test]
+    async fn workspace_existing_path_is_custom() {
+        let repos = setup().await;
+        let custom = repos.workspace_root.join("custom-workspace");
+        std::fs::create_dir_all(&custom).unwrap();
+        let row = row(
+            "aionrs",
+            serde_json::json!({ "workspace": custom.to_string_lossy().to_string() }),
+            None,
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        assert!(context.workspace.is_custom);
+        assert_eq!(context.workspace.path, custom.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn remote_missing_remote_agent_id_is_rejected() {
+        let repos = setup().await;
+        let row = row("remote", serde_json::json!({}), None);
+
+        let err = repos.builder().build(&row).await.unwrap_err();
+        assert!(err.to_string().contains("remote_agent_id"));
+    }
+}

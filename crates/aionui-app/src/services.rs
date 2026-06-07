@@ -158,7 +158,12 @@ impl AppServices {
                 (Some(srv), Some(config))
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Guide MCP server failed to start; solo create-team disabled");
+                tracing::warn!(
+                    code = "BOOTSTRAP_DEGRADED_GUIDE_MCP",
+                    stage = "guide_mcp.start",
+                    error = %e,
+                    "Guide MCP server failed to start; solo create-team disabled"
+                );
                 (None, None)
             }
         };

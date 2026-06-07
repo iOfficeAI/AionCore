@@ -86,6 +86,12 @@ pub trait IConversationRepository: Send + Sync {
         msg_type: &str,
     ) -> Result<Option<MessageRow>, DbError>;
 
+    /// Lists stale assistant-side runtime messages that were left in a
+    /// non-terminal state by a previous process.
+    async fn list_stale_runtime_messages(&self) -> Result<Vec<MessageRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Full-text search across messages, joining conversation name.
     async fn search_messages(
         &self,

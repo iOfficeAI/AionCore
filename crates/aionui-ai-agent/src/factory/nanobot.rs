@@ -7,11 +7,11 @@ use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
 use crate::manager::nanobot::NanobotAgentManager;
-use crate::types::BuildTaskOptions;
+use crate::session_context::NanobotSessionBuildContext;
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
-    _options: BuildTaskOptions,
+    _build_context: NanobotSessionBuildContext,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
     // Nanobot lives in the catalog as an internal row; reuse the

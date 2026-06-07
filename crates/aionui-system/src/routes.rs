@@ -112,7 +112,7 @@ async fn update_settings(
     State(state): State<SystemRouterState>,
     body: Result<Json<UpdateSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let settings = state
         .settings_service
         .update_settings(req)
@@ -155,7 +155,7 @@ async fn update_client_preferences(
     State(state): State<SystemRouterState>,
     body: Result<Json<UpdateClientPreferencesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .client_pref_service
         .update_preferences(req)
@@ -179,7 +179,7 @@ async fn create_provider(
     State(state): State<SystemRouterState>,
     body: Result<Json<CreateProviderRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ProviderResponse>>), ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let provider = state.provider_service.create(req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(provider))))
 }
@@ -189,7 +189,7 @@ async fn update_provider(
     Path(id): Path<String>,
     body: Result<Json<UpdateProviderRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let provider = state.provider_service.update(&id, req).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(provider)))
 }
@@ -207,7 +207,7 @@ async fn fetch_models(
     Path(id): Path<String>,
     body: Result<Json<FetchModelsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FetchModelsResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .model_fetch_service
         .fetch_models(&id, &req)
@@ -220,7 +220,7 @@ async fn fetch_models_anonymous(
     State(state): State<SystemRouterState>,
     body: Result<Json<FetchModelsAnonymousRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FetchModelsResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .model_fetch_service
         .fetch_models_anonymous(&req)
@@ -233,7 +233,7 @@ async fn detect_protocol(
     State(state): State<SystemRouterState>,
     body: Result<Json<DetectProtocolRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProtocolDetectionResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .protocol_detection_service
         .detect_protocol(&req)
@@ -255,7 +255,7 @@ async fn check_update(
     State(state): State<SystemRouterState>,
     body: Result<Json<UpdateCheckRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<UpdateCheckResult>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .version_check_service
         .check_update(&req)
@@ -268,7 +268,7 @@ async fn ensure_node_runtime(
     State(state): State<SystemRouterState>,
     body: Result<Json<EnsureNodeRuntimeRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<EnsureNodeRuntimeResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state.runtime_prepare_service.ensure_node_runtime(req.scope).await?;
     Ok(Json(ApiResponse::ok(result)))
 }
@@ -277,7 +277,7 @@ async fn ensure_managed_acp_tool(
     State(state): State<SystemRouterState>,
     body: Result<Json<EnsureManagedAcpToolRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<EnsureManagedAcpToolResponse>>, ApiError> {
-    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .runtime_prepare_service
         .ensure_managed_acp_tool(req.scope, &req.tool_id)
