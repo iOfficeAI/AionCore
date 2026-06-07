@@ -11,7 +11,7 @@
 
 use std::process::ExitCode;
 
-use crate::commands::cli_error::{CliBoundaryCode, CliBoundaryError, missing_env, parse_required_port};
+use crate::commands::error::{CliBoundaryCode, CliBoundaryError, missing_env, parse_required_port};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content};
 use rmcp::{schemars, service::ServiceExt, tool, tool_router, transport};
@@ -426,10 +426,7 @@ mod tests {
     #[test]
     fn guide_env_rejects_invalid_port_with_stable_code() {
         let err = GuideEnv::from_values("bad", "tok", "", "", "").unwrap_err();
-        assert_eq!(
-            err.code(),
-            crate::commands::cli_error::CliBoundaryCode::McpEnvInvalidPort
-        );
+        assert_eq!(err.code(), crate::commands::error::CliBoundaryCode::McpEnvInvalidPort);
         assert_eq!(err.exit_code(), std::process::ExitCode::from(2));
     }
 

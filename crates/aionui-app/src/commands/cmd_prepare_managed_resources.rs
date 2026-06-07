@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use crate::cli::PrepareManagedResourcesArgs;
-use crate::commands::cli_error::{CliBoundaryCode, CliBoundaryError};
+use crate::commands::error::{CliBoundaryCode, CliBoundaryError};
 use aionui_runtime::acp_tool_runtime::ManagedAcpToolId;
 use aionui_runtime::managed_resources::{export_acp_tool_to_root, export_node_runtime_to_root};
 use aionui_runtime::{ensure_managed_acp_tool, ensure_node_runtime};

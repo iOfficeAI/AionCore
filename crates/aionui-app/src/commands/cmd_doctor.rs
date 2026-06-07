@@ -25,7 +25,7 @@ use aionui_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository, init_da
 use aionui_runtime::{acp_tool_doctor_snapshot, doctor_snapshot};
 
 use crate::cli::Cli;
-use crate::commands::cli_error::{CliBoundaryCode, CliBoundaryError};
+use crate::commands::error::{CliBoundaryCode, CliBoundaryError};
 
 const SUBCOMMAND: &str = "doctor";
 

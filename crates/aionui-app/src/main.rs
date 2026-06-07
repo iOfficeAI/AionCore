@@ -1,6 +1,7 @@
 mod bootstrap;
 mod cli;
 mod commands;
+mod error;
 mod process_report;
 
 use std::process::ExitCode;
@@ -10,55 +11,9 @@ use clap::Parser;
 use aionui_app::AppServices;
 use cli::{Cli, Command};
 
-#[derive(Debug)]
-enum MainError {
-    Bootstrap(bootstrap::BootstrapError),
-    Cli(commands::cli_error::CliBoundaryError),
-    Other(anyhow::Error),
-}
+use crate::error::MainError;
 
-impl MainError {
-    fn report(&self) {
-        match self {
-            Self::Bootstrap(err) => {
-                err.log_source();
-                eprintln!("{}", err.stderr_line());
-            }
-            Self::Cli(err) => {
-                eprintln!("{}", err.stderr_line());
-            }
-            Self::Other(err) => {
-                eprintln!("CLI_INTERNAL_ERROR: {err}");
-            }
-        }
-    }
-
-    fn exit_code(&self) -> ExitCode {
-        match self {
-            Self::Bootstrap(err) => err.exit_code(),
-            Self::Cli(err) => err.exit_code(),
-            Self::Other(_) => ExitCode::from(1),
-        }
-    }
-}
-
-impl From<bootstrap::BootstrapError> for MainError {
-    fn from(error: bootstrap::BootstrapError) -> Self {
-        Self::Bootstrap(error)
-    }
-}
-
-impl From<commands::cli_error::CliBoundaryError> for MainError {
-    fn from(error: commands::cli_error::CliBoundaryError) -> Self {
-        Self::Cli(error)
-    }
-}
-
-impl From<anyhow::Error> for MainError {
-    fn from(error: anyhow::Error) -> Self {
-        Self::Other(error)
-    }
-}
+// MainError has been moved to src/error.rs
 
 fn main() -> ExitCode {
     match run_main() {
@@ -82,10 +37,7 @@ fn run_main() -> Result<ExitCode, MainError> {
     // detection path exactly. It must hit the same `aionui_runtime::init`
     // (so the bundled `bun` resolves through the same cache the server
     // uses) before falling through to PATH probing.
-    let needs_runtime = matches!(
-        cli.command,
-        None | Some(Command::Doctor) | Some(Command::PrepareManagedResources(_))
-    );
+    let needs_runtime = cli.command.as_ref().is_none_or(Command::need_runtime);
     if needs_runtime {
         aionui_runtime::set_managed_resources_mode(cli.managed_resources_mode.into());
         aionui_runtime::init(&cli.data_dir);
@@ -104,7 +56,7 @@ fn run_main() -> Result<ExitCode, MainError> {
 }
 
 fn runtime_init_error_for_command(command: &Option<Command>, error: std::io::Error) -> MainError {
-    if command_uses_bootstrap_runtime_boundary(command) {
+    if command.is_none() {
         return MainError::Bootstrap(
             bootstrap::BootstrapError::new(
                 bootstrap::BootstrapErrorCode::RuntimeInitFailed,
@@ -115,26 +67,11 @@ fn runtime_init_error_for_command(command: &Option<Command>, error: std::io::Err
         );
     }
 
-    MainError::Cli(commands::cli_error::CliBoundaryError::new(
-        commands::cli_error::CliBoundaryCode::CliRuntimeInitFailed,
-        command_subcommand(command),
+    MainError::Cli(commands::CliBoundaryError::new(
+        commands::CliBoundaryCode::CliRuntimeInitFailed,
+        command.as_ref().map_or("server", Command::as_str),
         "failed to initialize async runtime",
     ))
-}
-
-fn command_uses_bootstrap_runtime_boundary(command: &Option<Command>) -> bool {
-    command.is_none()
-}
-
-fn command_subcommand(command: &Option<Command>) -> &'static str {
-    match command {
-        None => "server",
-        Some(Command::McpBridge) => "mcp-bridge",
-        Some(Command::McpGuideStdio) => "mcp-guide-stdio",
-        Some(Command::McpTeamStdio) => "mcp-team-stdio",
-        Some(Command::Doctor) => "doctor",
-        Some(Command::PrepareManagedResources(_)) => "prepare-managed-resources",
-    }
 }
 
 async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError> {
@@ -188,7 +125,7 @@ mod tests {
             panic!("expected CLI error");
         };
 
-        assert_eq!(err.code(), commands::cli_error::CliBoundaryCode::CliRuntimeInitFailed);
+        assert_eq!(err.code(), commands::CliBoundaryCode::CliRuntimeInitFailed);
         assert!(
             err.stderr_line()
                 .starts_with("CLI_RUNTIME_INIT_FAILED subcommand=mcp-team-stdio")
@@ -202,7 +139,7 @@ mod tests {
             panic!("expected CLI error");
         };
 
-        assert_eq!(err.code(), commands::cli_error::CliBoundaryCode::CliRuntimeInitFailed);
+        assert_eq!(err.code(), commands::CliBoundaryCode::CliRuntimeInitFailed);
         assert!(
             err.stderr_line()
                 .starts_with("CLI_RUNTIME_INIT_FAILED subcommand=doctor")

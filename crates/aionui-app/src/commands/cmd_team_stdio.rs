@@ -11,7 +11,7 @@
 
 use std::process::ExitCode;
 
-use crate::commands::cli_error::{CliBoundaryCode, CliBoundaryError, missing_env, parse_required_port};
+use crate::commands::error::{CliBoundaryCode, CliBoundaryError, missing_env, parse_required_port};
 use aionui_api_types::TeamMcpStdioConfig;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use rmcp::handler::server::wrapper::Parameters;
@@ -556,7 +556,7 @@ fn tool_error_message(code: CliBoundaryCode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::cli_error::CliBoundaryCode;
+    use crate::commands::error::CliBoundaryCode;
     use serde_json::json;
     use tokio::net::TcpListener;
 

@@ -20,7 +20,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-use crate::commands::cli_error::{CliBoundaryCode, CliBoundaryError, missing_env, parse_required_port};
+use crate::commands::error::{CliBoundaryCode, CliBoundaryError, missing_env, parse_required_port};
 
 const SUBCOMMAND: &str = "mcp-bridge";
 const CONNECT_ADDR_HOST: &str = "127.0.0.1";
@@ -344,10 +344,7 @@ mod tests {
     #[test]
     fn bridge_env_rejects_invalid_port_with_stable_code() {
         let err = BridgeEnv::from_values("not-a-port", "tok", "slot-a").unwrap_err();
-        assert_eq!(
-            err.code(),
-            crate::commands::cli_error::CliBoundaryCode::McpEnvInvalidPort
-        );
+        assert_eq!(err.code(), crate::commands::error::CliBoundaryCode::McpEnvInvalidPort);
         assert_eq!(err.exit_code(), std::process::ExitCode::from(2));
     }
 
@@ -355,10 +352,7 @@ mod tests {
     async fn read_mcp_stdio_message_rejects_oversized_content_length() {
         let input = format!("Content-Length: {}\r\n\r\n", MCP_STDIO_FRAME_MAX_BYTES + 1);
         let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
-        assert_eq!(
-            err.code(),
-            crate::commands::cli_error::CliBoundaryCode::McpFrameTooLarge
-        );
+        assert_eq!(err.code(), crate::commands::error::CliBoundaryCode::McpFrameTooLarge);
     }
 
     #[tokio::test]
@@ -367,7 +361,7 @@ mod tests {
         let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
         assert_eq!(
             err.code(),
-            crate::commands::cli_error::CliBoundaryCode::McpStdinFrameInvalid
+            crate::commands::error::CliBoundaryCode::McpStdinFrameInvalid
         );
     }
 
@@ -377,7 +371,7 @@ mod tests {
             let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
             assert_eq!(
                 err.code(),
-                crate::commands::cli_error::CliBoundaryCode::McpStdinFrameInvalid
+                crate::commands::error::CliBoundaryCode::McpStdinFrameInvalid
             );
         }
     }
@@ -388,7 +382,7 @@ mod tests {
         let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
         assert_eq!(
             err.code(),
-            crate::commands::cli_error::CliBoundaryCode::McpStdinFrameInvalid
+            crate::commands::error::CliBoundaryCode::McpStdinFrameInvalid
         );
     }
 
@@ -407,7 +401,7 @@ mod tests {
         let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
         assert_eq!(
             err.code(),
-            crate::commands::cli_error::CliBoundaryCode::McpStdinFrameInvalid
+            crate::commands::error::CliBoundaryCode::McpStdinFrameInvalid
         );
     }
 
@@ -422,7 +416,7 @@ mod tests {
         let err = read_mcp_stdio_message(&mut input.as_bytes()).await.unwrap_err();
         assert_eq!(
             err.code(),
-            crate::commands::cli_error::CliBoundaryCode::McpStdinFrameInvalid
+            crate::commands::error::CliBoundaryCode::McpStdinFrameInvalid
         );
     }
 
