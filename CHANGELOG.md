@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.23](https://github.com/iOfficeAI/AionCore/compare/v0.1.22...v0.1.23) (2026-06-07)
+
+
+### Features
+
+* **cli:** canonicalize CLI and bootstrap boundary errors ([#417](https://github.com/iOfficeAI/AionCore/issues/417)) ([9ddf82e](https://github.com/iOfficeAI/AionCore/commit/9ddf82e374f9f40fa5f7321fea54dca3a611f3c5))
+
+
+### Bug Fixes
+
+* **error:** canonicalize boundary errors ([#415](https://github.com/iOfficeAI/AionCore/issues/415)) ([84e04e1](https://github.com/iOfficeAI/AionCore/commit/84e04e122dad19eee712af29d3b5bd3f631a6fe1))
+* **runtime:** report bundled resource installation failures ([#420](https://github.com/iOfficeAI/AionCore/issues/420)) ([bc4b7d9](https://github.com/iOfficeAI/AionCore/commit/bc4b7d9315727b1e4fe00cb54c1230828dd37cf1))
+* **team:** inherit workspace for spawned agents ([#413](https://github.com/iOfficeAI/AionCore/issues/413)) ([82b31c5](https://github.com/iOfficeAI/AionCore/commit/82b31c5fbdb1e30a580865b4c441b1ac93ec5181))
+
+
+### Code Refactoring
+
+* centralize agent runtime session context building ([#419](https://github.com/iOfficeAI/AionCore/issues/419)) ([b21f833](https://github.com/iOfficeAI/AionCore/commit/b21f8334e2955c73be4acb2beb76c79133e2120a))
+* centralize runtime turn lifecycle ([#421](https://github.com/iOfficeAI/AionCore/issues/421)) ([282c68c](https://github.com/iOfficeAI/AionCore/commit/282c68cb43a6c06862ee61c7441a9dd52a3008b7))
+
 ## [0.1.22](https://github.com/iOfficeAI/AionCore/compare/v0.1.21...v0.1.22) (2026-06-05)
 
 
