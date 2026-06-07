@@ -146,6 +146,9 @@ async fn read_skill_info(
 async fn get_skill_paths(
     State(state): State<SkillRouterState>,
 ) -> Result<Json<ApiResponse<SkillPathsResponse>>, ApiError> {
+    tokio::fs::create_dir_all(&state.skill_paths.user_skills_dir)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to create user skills directory: {e}")))?;
     let (user_dir, builtin_dir) = skill_service::get_skill_paths(&state.skill_paths);
     Ok(Json(ApiResponse::ok(SkillPathsResponse {
         user_skills_dir: user_dir,
@@ -523,5 +526,19 @@ mod tests {
     async fn skill_routes_builds_router() {
         let state = make_state().await;
         let _router = skill_routes(state);
+    }
+
+    #[tokio::test]
+    async fn get_skill_paths_creates_user_skills_dir() {
+        let state = make_state().await;
+        assert!(!state.skill_paths.user_skills_dir.exists());
+
+        let response = get_skill_paths(State(state.clone())).await.unwrap().0;
+
+        assert!(state.skill_paths.user_skills_dir.is_dir());
+        assert_eq!(
+            response.data.unwrap().user_skills_dir,
+            state.skill_paths.user_skills_dir.to_string_lossy()
+        );
     }
 }
