@@ -39,6 +39,12 @@ pub trait ChannelSender: Send + Sync {
         message_id: &str,
         message: UnifiedOutgoingMessage,
     ) -> Result<(), ChannelError>;
+
+    /// Start typing indicator for a chat. Default no-op.
+    async fn start_typing(&self, _plugin_id: &str, _chat_id: &str) {}
+
+    /// Stop typing indicator for a chat. Default no-op.
+    async fn stop_typing(&self, _plugin_id: &str, _chat_id: &str) {}
 }
 
 /// Relays agent stream events to an IM platform.
@@ -72,6 +78,19 @@ impl ChannelStreamRelay {
         let mut text_buffer = String::new();
         let mut has_content = false;
 
+        // Start continuous typing indicator — refreshes every 2s like Hermes
+        let keep_typing = {
+            let sender = Arc::clone(&self.sender);
+            let plugin_id = self.config.plugin_id.clone();
+            let chat_id = self.config.chat_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    sender.start_typing(&plugin_id, &chat_id).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            })
+        };
+
         loop {
             match rx.recv().await {
                 Ok(event) => match ChannelMessageService::process_stream_event(&event) {
@@ -100,6 +119,14 @@ impl ChannelStreamRelay {
                                 .send_message(&self.config.plugin_id, &self.config.chat_id, final_msg)
                                 .await;
                         }
+
+                        keep_typing.abort();
+
+                        // Stop typing after sending message to avoid gap
+                        self.sender
+                            .stop_typing(&self.config.plugin_id, &self.config.chat_id)
+                            .await;
+
                         info!(
                             plugin_id = %self.config.plugin_id,
                             chat_id = %self.config.chat_id,
@@ -126,6 +153,12 @@ impl ChannelStreamRelay {
                             .sender
                             .send_message(&self.config.plugin_id, &self.config.chat_id, error_msg)
                             .await;
+
+                        keep_typing.abort();
+
+                        self.sender
+                            .stop_typing(&self.config.plugin_id, &self.config.chat_id)
+                            .await;
                         break;
                     }
                     None => {}
@@ -139,6 +172,12 @@ impl ChannelStreamRelay {
                             .send_message(&self.config.plugin_id, &self.config.chat_id, final_msg)
                             .await;
                     }
+
+                    keep_typing.abort();
+
+                    self.sender
+                        .stop_typing(&self.config.plugin_id, &self.config.chat_id)
+                        .await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {

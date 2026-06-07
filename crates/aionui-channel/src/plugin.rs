@@ -77,6 +77,12 @@ pub trait ChannelPlugin: Send + Sync {
 
     /// The most recent error message, if status is `Error`.
     fn last_error(&self) -> Option<&str>;
+
+    /// Start typing indicator for a chat. Default no-op.
+    async fn start_typing(&self, _chat_id: &str) {}
+
+    /// Stop typing indicator for a chat. Default no-op.
+    async fn stop_typing(&self, _chat_id: &str) {}
 }
 
 #[cfg(test)]

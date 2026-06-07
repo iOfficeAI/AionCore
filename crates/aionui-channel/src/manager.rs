@@ -523,6 +523,22 @@ impl crate::stream_relay::ChannelSender for ChannelManager {
     ) -> Result<(), crate::error::ChannelError> {
         self.edit_message(plugin_id, chat_id, message_id, message).await
     }
+
+    async fn start_typing(&self, plugin_id: &str, chat_id: &str) {
+        if let Some(plugin) = self.plugins.get(plugin_id) {
+            plugin.start_typing(chat_id).await;
+        } else {
+            warn!(%plugin_id, %chat_id, "start_typing: plugin not found");
+        }
+    }
+
+    async fn stop_typing(&self, plugin_id: &str, chat_id: &str) {
+        if let Some(plugin) = self.plugins.get(plugin_id) {
+            plugin.stop_typing(chat_id).await;
+        } else {
+            warn!(%plugin_id, %chat_id, "stop_typing: plugin not found");
+        }
+    }
 }
 
 #[cfg(test)]
