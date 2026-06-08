@@ -284,7 +284,7 @@ async fn openclaw_runtime_requires_auth() {
 async fn openclaw_runtime_no_active_task() {
     let (mut app, services) = build_app().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-    let conv_id = create_conversation(&mut app, &token, &_csrf, "OpenClaw Test", "openclaw-gateway").await;
+    let conv_id = create_conversation(&mut app, &token, &_csrf, "OpenClaw Runtime Route Test", "acp").await;
 
     let req = get_with_token(&format!("/api/conversations/{conv_id}/openclaw/runtime"), &token);
     let resp = app.oneshot(req).await.unwrap();

@@ -52,11 +52,11 @@ async fn t1_1_create_conversation_success() {
 }
 
 #[tokio::test]
-async fn t1_2_create_various_agent_types() {
+async fn t1_2_create_supported_agent_types_and_reject_legacy_types() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let types = ["acp", "openclaw-gateway", "nanobot", "remote"];
+    let types = ["acp", "aionrs"];
     for agent_type in types {
         let body = json!({
             "type": agent_type,
@@ -67,6 +67,18 @@ async fn t1_2_create_various_agent_types() {
         assert_eq!(resp.status(), StatusCode::CREATED, "type={agent_type}");
         let json = body_json(resp).await;
         assert_eq!(json["data"]["type"], agent_type);
+    }
+
+    for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini"] {
+        let body = json!({
+            "type": agent_type,
+            "extra": {}
+        });
+        let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "type={agent_type}");
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "BAD_REQUEST");
     }
 }
 

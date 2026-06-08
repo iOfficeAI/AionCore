@@ -673,7 +673,7 @@ async fn create_rejects_top_level_model_for_acp() {
 }
 
 #[tokio::test]
-async fn create_rejects_top_level_model_for_remote() {
+async fn create_rejects_deprecated_remote_runtime() {
     let (svc, _, _task_mgr) = setup().await;
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
@@ -683,10 +683,13 @@ async fn create_rejects_top_level_model_for_remote() {
     }))
     .unwrap();
 
-    assert!(matches!(
-        svc.create(USER_ID, req).await,
-        Err(ConversationError::BadRequest { .. })
-    ));
+    let err = svc.create(USER_ID, req).await.unwrap_err();
+    match err {
+        ConversationError::BadRequest { reason } => {
+            assert!(reason.contains("no longer supported"), "unexpected error: {reason}");
+        }
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
 }
 
 #[tokio::test]
