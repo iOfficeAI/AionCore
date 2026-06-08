@@ -649,6 +649,24 @@ async fn cj1_create_cron_job() {
     assert_eq!(events[0].name, "cron.job-created");
 }
 
+#[tokio::test]
+async fn create_job_rejects_deprecated_agent_types() {
+    let (svc, _, _) = setup().await;
+
+    for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini"] {
+        let mut req = make_create_req(&format!("Deprecated {agent_type}"), every_60s());
+        req.agent_type = agent_type.to_owned();
+
+        let err = svc.add_job(req).await.unwrap_err();
+        assert!(matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)));
+        assert!(
+            err.to_string()
+                .contains("This agent type is no longer supported for new conversations."),
+            "unexpected error for {agent_type}: {err}"
+        );
+    }
+}
+
 // ── CJ-2: Create three schedule types ──────────────────────────────
 
 #[tokio::test]

@@ -31,6 +31,7 @@ use crate::types::{CronJob, ExecutionMode};
 pub const RETRY_INTERVAL_MS: u64 = 30_000;
 pub const MAX_RETRIES_DEFAULT: i64 = 3;
 const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
+const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 const SKILL_SUGGEST_TERMINAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,7 +429,7 @@ impl JobExecutor {
         job: &CronJob,
         saved_skill: Option<&SavedSkillContext>,
     ) -> Result<String, CronError> {
-        let agent_type = parse_agent_type(&self.agent_registry, &job.agent_type).await;
+        let agent_type = parse_agent_type(&self.agent_registry, &job.agent_type).await?;
         let model = resolve_model(job);
         let user_id = self.resolve_conversation_owner_user_id(job).await?;
 
@@ -935,12 +936,21 @@ async fn wait_for_terminal_event(mut rx: broadcast::Receiver<AgentStreamEvent>) 
 ///    than the deprecated standalone adapter.
 /// 2. Exact [`AgentType`] serde match.
 /// 3. Fallback to [`AgentType::Acp`] to preserve the prior default.
-async fn parse_agent_type(registry: &AgentRegistry, agent_type_str: &str) -> AgentType {
-    if registry.find_builtin_by_backend(agent_type_str).await.is_some() {
-        return AgentType::Acp;
+async fn parse_agent_type(registry: &AgentRegistry, agent_type_str: &str) -> Result<AgentType, CronError> {
+    if let Ok(agent_type) =
+        serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type_str.to_owned()))
+    {
+        if agent_type.is_deprecated_runtime() {
+            return Err(CronError::InvalidAgentConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
+        }
+        return Ok(agent_type);
     }
 
-    serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type_str.to_owned())).unwrap_or(AgentType::Acp)
+    if registry.find_builtin_by_backend(agent_type_str).await.is_some() {
+        return Ok(AgentType::Acp);
+    }
+
+    Ok(AgentType::Acp)
 }
 
 /// Only aionrs conversations carry meaningful model info in `conversations.model`;
@@ -1408,23 +1418,42 @@ mod tests {
     #[tokio::test]
     async fn parse_agent_type_known_types() {
         let registry = hydrated_registry().await;
-        assert_eq!(parse_agent_type(&registry, "acp").await, AgentType::Acp);
-        assert_eq!(parse_agent_type(&registry, "nanobot").await, AgentType::Nanobot);
+        assert_eq!(parse_agent_type(&registry, "acp").await.unwrap(), AgentType::Acp);
+        assert_eq!(
+            parse_agent_type(&registry, "aionrs").await.unwrap(),
+            AgentType::Aionrs
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_agent_type_rejects_deprecated_runtime_types() {
+        let registry = hydrated_registry().await;
+        for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini"] {
+            let err = parse_agent_type(&registry, agent_type).await.unwrap_err();
+            assert!(matches!(err, CronError::InvalidAgentConfig(_)));
+            assert!(
+                err.to_string()
+                    .contains("This agent type is no longer supported for new conversations."),
+                "unexpected error for {agent_type}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn parse_agent_type_acp_backend_aliases_to_acp() {
         let registry = hydrated_registry().await;
-        assert_eq!(parse_agent_type(&registry, "claude").await, AgentType::Acp);
-        assert_eq!(parse_agent_type(&registry, "gemini").await, AgentType::Acp);
-        assert_eq!(parse_agent_type(&registry, "qwen").await, AgentType::Acp);
-        assert_eq!(parse_agent_type(&registry, "codex").await, AgentType::Acp);
+        assert_eq!(parse_agent_type(&registry, "claude").await.unwrap(), AgentType::Acp);
+        assert_eq!(parse_agent_type(&registry, "qwen").await.unwrap(), AgentType::Acp);
+        assert_eq!(parse_agent_type(&registry, "codex").await.unwrap(), AgentType::Acp);
     }
 
     #[tokio::test]
     async fn parse_agent_type_unknown_defaults_to_acp() {
         let registry = hydrated_registry().await;
-        assert_eq!(parse_agent_type(&registry, "unknown_type").await, AgentType::Acp);
+        assert_eq!(
+            parse_agent_type(&registry, "unknown_type").await.unwrap(),
+            AgentType::Acp
+        );
     }
 
     // -- resolve_model tests -------------------------------------------------

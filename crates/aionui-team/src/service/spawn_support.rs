@@ -27,6 +27,8 @@ const ACP_VENDOR_LABELS: &[&str] = &[
     "snow",
 ];
 
+const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+
 pub(super) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     // Any registered ACP vendor label collapses to `AgentType::Acp`.
     if ACP_VENDOR_LABELS.contains(&backend) {
@@ -36,6 +38,9 @@ pub(super) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     // "nanobot", "aionrs", "remote", "openclaw-gateway").
     let quoted = format!("\"{backend}\"");
     if let Ok(agent_type) = serde_json::from_str::<AgentType>(&quoted) {
+        if agent_type.is_deprecated_runtime() {
+            return Err(TeamError::InvalidRequest(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
+        }
         return Ok(agent_type);
     }
     Err(TeamError::InvalidRequest(format!("unsupported backend: {backend}")))
@@ -342,22 +347,26 @@ mod tests {
     #[test]
     fn parse_agent_type_known_backends() {
         assert_eq!(parse_agent_type("acp").unwrap(), AgentType::Acp);
-        assert_eq!(parse_agent_type("nanobot").unwrap(), AgentType::Nanobot);
-        assert_eq!(parse_agent_type("remote").unwrap(), AgentType::Remote);
+        assert_eq!(parse_agent_type("gemini").unwrap(), AgentType::Acp);
         assert_eq!(parse_agent_type("aionrs").unwrap(), AgentType::Aionrs);
+    }
+
+    #[test]
+    fn parse_agent_type_rejects_deprecated_runtime_types() {
+        for backend in ["nanobot", "remote", "openclaw-gateway"] {
+            let err = parse_agent_type(backend).unwrap_err();
+            assert!(matches!(err, TeamError::InvalidRequest(_)));
+            assert!(
+                err.to_string()
+                    .contains("This agent type is no longer supported for new conversations."),
+                "unexpected error for {backend}: {err}"
+            );
+        }
     }
 
     #[test]
     fn parse_agent_type_unknown_backend_returns_error() {
         let err = parse_agent_type("unknown").unwrap_err();
         assert!(matches!(err, TeamError::InvalidRequest(_)));
-    }
-
-    #[test]
-    fn parse_agent_type_openclaw_gateway() {
-        assert_eq!(
-            parse_agent_type("openclaw-gateway").unwrap(),
-            AgentType::OpenclawGateway
-        );
     }
 }

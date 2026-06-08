@@ -13,6 +13,8 @@ use crate::constants::{STREAM_THROTTLE_INTERVAL, TOOL_CONFIRM_TIMEOUT};
 use crate::error::ChannelError;
 use crate::types::{ActionButton, OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
 
+const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+
 /// Bridges channel messages to the conversation + AI agent layer.
 ///
 /// Responsibilities:
@@ -123,7 +125,7 @@ impl ChannelMessageService {
         platform: PluginType,
     ) -> Result<String, ChannelError> {
         let source = platform_to_source(platform);
-        let agent_type = parse_agent_type(&session.agent_type);
+        let agent_type = parse_agent_type(&session.agent_type)?;
 
         let agent_config = self.settings.get_agent_config(platform).await?;
         let model_config = self.settings.get_model_config(platform).await?;
@@ -339,12 +341,13 @@ fn platform_to_source(platform: PluginType) -> ConversationSource {
     }
 }
 
-/// Parses an agent_type string to an AgentType enum.
+/// Parses a top-level agent_type string to an AgentType enum.
 ///
 /// Falls back to `AgentType::Acp` for unknown values.
-fn parse_agent_type(s: &str) -> AgentType {
-    match s {
+fn parse_agent_type(s: &str) -> Result<AgentType, ChannelError> {
+    let agent_type = match s {
         "acp" => AgentType::Acp,
+        "gemini" => AgentType::Gemini,
         "openclaw-gateway" => AgentType::OpenclawGateway,
         "nanobot" => AgentType::Nanobot,
         "remote" => AgentType::Remote,
@@ -353,7 +356,13 @@ fn parse_agent_type(s: &str) -> AgentType {
             warn!(agent_type = %s, "unknown agent type, defaulting to Acp");
             AgentType::Acp
         }
+    };
+
+    if agent_type.is_deprecated_runtime() {
+        return Err(ChannelError::InvalidConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
     }
+
+    Ok(agent_type)
 }
 
 fn channel_conversation_name(
@@ -428,17 +437,22 @@ mod tests {
 
     #[test]
     fn parse_known_agent_types() {
-        assert_eq!(parse_agent_type("acp"), AgentType::Acp);
-        assert_eq!(parse_agent_type("openclaw-gateway"), AgentType::OpenclawGateway);
-        assert_eq!(parse_agent_type("nanobot"), AgentType::Nanobot);
-        assert_eq!(parse_agent_type("remote"), AgentType::Remote);
-        assert_eq!(parse_agent_type("aionrs"), AgentType::Aionrs);
+        assert_eq!(parse_agent_type("acp").unwrap(), AgentType::Acp);
+        assert_eq!(parse_agent_type("aionrs").unwrap(), AgentType::Aionrs);
+    }
+
+    #[test]
+    fn parse_agent_type_rejects_deprecated_channel_runtime_types() {
+        for raw in ["openclaw-gateway", "nanobot", "remote", "gemini"] {
+            let err = parse_agent_type(raw).unwrap_err();
+            assert!(matches!(err, ChannelError::InvalidConfig(_)));
+        }
     }
 
     #[test]
     fn parse_unknown_agent_type_defaults_to_acp() {
-        assert_eq!(parse_agent_type("unknown"), AgentType::Acp);
-        assert_eq!(parse_agent_type(""), AgentType::Acp);
+        assert_eq!(parse_agent_type("unknown").unwrap(), AgentType::Acp);
+        assert_eq!(parse_agent_type("").unwrap(), AgentType::Acp);
     }
 
     // ── process_stream_event ───────────────────────────────────────────
