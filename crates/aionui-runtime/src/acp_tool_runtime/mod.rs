@@ -106,13 +106,14 @@ pub async fn prepare_managed_acp_tool_to_root(
     let node_runtime = ensure_node_runtime_with_reporter(None)
         .await
         .map_err(|error| ManagedAcpToolError::invalid(format!("prepare managed Node runtime: {error}")))?;
+    let target_root = bundle_tool_root(root, tool, spec);
     let staging_root = bundle_prepare_staging_root(tool, spec, root);
     if staging_root.exists() {
         let _ = fs::remove_dir_all(&staging_root);
     }
     fs::create_dir_all(&staging_root).map_err(ManagedAcpToolError::io)?;
 
-    let result = prepare_local_tool_source_to_root(tool, spec, &node_runtime, &staging_root, root).await;
+    let result = prepare_local_tool_source_to_root(tool, spec, &node_runtime, &staging_root, &target_root).await;
 
     if let Err(error) = fs::remove_dir_all(&staging_root)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -879,6 +880,14 @@ fn bundle_prepare_staging_root(tool: ManagedAcpToolId, spec: PlatformSpec, bundl
     ))
 }
 
+fn bundle_tool_root(bundle_root: &Path, tool: ManagedAcpToolId, spec: PlatformSpec) -> PathBuf {
+    bundle_root
+        .join("acp")
+        .join(tool.slug())
+        .join(tool.version())
+        .join(spec.manifest_key)
+}
+
 fn platform_spec() -> Result<PlatformSpec, ManagedAcpToolError> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok(PlatformSpec {
@@ -1220,6 +1229,27 @@ mod tests {
             error
                 .to_string()
                 .contains("bundled managed Codex ACP artifact failed validation")
+        );
+    }
+
+    #[test]
+    fn bundle_tool_root_scopes_acp_output_under_tool_directory() {
+        let bundle_root = std::path::Path::new("/tmp/bundle");
+        let spec = PlatformSpec {
+            manifest_key: "win32-x64",
+            npm_os: "win32",
+            npm_cpu: "x64",
+        };
+
+        let path = bundle_tool_root(bundle_root, ManagedAcpToolId::CodexAcp, spec);
+
+        assert_eq!(
+            path,
+            bundle_root
+                .join("acp")
+                .join("codex-acp")
+                .join("0.14.0")
+                .join("win32-x64")
         );
     }
 }
