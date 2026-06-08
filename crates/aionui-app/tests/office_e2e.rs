@@ -50,7 +50,7 @@ async fn build_office_app_with_roots(
         ..Default::default()
     };
     let services = AppServices::from_config(db, &config).await.unwrap();
-    let (mut states, _) = build_module_states(&services).await;
+    let (mut states, _) = build_module_states(&services).await.expect("build module states");
 
     states.office = build_test_office_state(tmp.path(), allowed_roots);
 

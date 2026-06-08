@@ -8,6 +8,7 @@ aionui-runtime.workspace = true
 aionui-common.workspace = true
 aionui-db.workspace = true
 aionui-api-types.workspace = true
+aionui-realtime.workspace = true
 aionui-system.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true

@@ -131,10 +131,11 @@ pub fn resolve_browse_path(raw: &str, allowed_roots: &[PathBuf]) -> Result<PathB
     });
 
     if !allowed {
-        return Err(FileError::Forbidden(format!(
-            "path '{}' is outside the allowed sandbox",
-            raw
-        )));
+        return Err(FileError::PathOutsideSandbox {
+            message: format!("path '{}' is outside the allowed sandbox", raw),
+            field: Some("directory"),
+            operation: Some("browse"),
+        });
     }
 
     Ok(canonical)
@@ -350,7 +351,17 @@ mod tests {
         let roots = roots_from(&[sandbox.path()]);
 
         let err = browse(Some(outside.path().to_str().unwrap()), false, &roots).unwrap_err();
-        assert!(matches!(err, FileError::Forbidden(_)), "expected forbidden, got {err}");
+        assert!(
+            matches!(
+                err,
+                FileError::PathOutsideSandbox {
+                    field: Some("directory"),
+                    operation: Some("browse"),
+                    ..
+                }
+            ),
+            "expected outside-sandbox, got {err}"
+        );
     }
 
     #[test]
@@ -447,7 +458,17 @@ mod tests {
         let roots = roots_from(&[sandbox.path()]);
 
         let err = browse(Some(link.to_str().unwrap()), false, &roots).unwrap_err();
-        assert!(matches!(err, FileError::Forbidden(_)), "expected forbidden, got {err}");
+        assert!(
+            matches!(
+                err,
+                FileError::PathOutsideSandbox {
+                    field: Some("directory"),
+                    operation: Some("browse"),
+                    ..
+                }
+            ),
+            "expected outside-sandbox, got {err}"
+        );
     }
 
     #[test]

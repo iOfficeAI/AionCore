@@ -14,7 +14,6 @@ use aionui_api_types::{
     AgentModeResponse, GetModelInfoResponse, SetModeRequest, SetModelRequest, SideQuestionRequest,
     SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
-use aionui_common::AppError;
 
 use crate::ConversationError;
 use crate::service::ConversationService;
@@ -31,16 +30,19 @@ impl ConversationService {
             .map_err(ConversationError::from)
     }
 
-    pub async fn set_mode(&self, conversation_id: &str, req: SetModeRequest) -> Result<(), ConversationError> {
+    pub async fn set_mode(
+        &self,
+        conversation_id: &str,
+        req: SetModeRequest,
+    ) -> Result<AgentModeResponse, ConversationError> {
         if req.mode.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "mode must not be empty".into(),
             });
         }
-        self.task(conversation_id)?
-            .set_mode(&req.mode)
-            .await
-            .map_err(ConversationError::from)
+        let task = self.task(conversation_id)?;
+        task.set_mode(&req.mode).await.map_err(ConversationError::from)?;
+        task.get_mode().await.map_err(ConversationError::from)
     }
 
     // ── Model ───────────────────────────────────────────────────────
@@ -52,7 +54,11 @@ impl ConversationService {
             .map_err(ConversationError::from)
     }
 
-    pub async fn set_model(&self, conversation_id: &str, req: SetModelRequest) -> Result<(), ConversationError> {
+    pub async fn set_model(
+        &self,
+        conversation_id: &str,
+        req: SetModelRequest,
+    ) -> Result<GetModelInfoResponse, ConversationError> {
         if req.model_id.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "model_id must not be empty".into(),
@@ -70,7 +76,8 @@ impl ConversationService {
                 return Err(err);
             }
         };
-        task.set_model(&req.model_id).await.map_err(ConversationError::from)
+        task.set_model(&req.model_id).await.map_err(ConversationError::from)?;
+        task.get_model().await.map_err(ConversationError::from)
     }
 
     // ── Usage / Slash commands ──────────────────────────────────────
@@ -134,13 +141,13 @@ impl ConversationService {
             .conversation_repo()
             .get(conversation_id)
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to load conversation: {e}")))?
+            .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
 
-        let extra: serde_json::Value =
-            serde_json::from_str(&row.extra).map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra)
+            .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
         let workspace = extra
             .get("workspace")
             .and_then(|v| v.as_str())
@@ -177,10 +184,10 @@ impl ConversationService {
         // dirs that point at the builtin skills corpus under data-dir).
         let canonical_base = base
             .canonicalize()
-            .map_err(|e| AppError::Internal(format!("Failed to resolve workspace path: {e}")))?;
+            .map_err(|e| ConversationError::internal(format!("Failed to resolve workspace path: {e}")))?;
         let canonical_browse = browse_path
             .canonicalize()
-            .map_err(|_| AppError::NotFound("Directory not found".into()))?;
+            .map_err(|_| ConversationError::not_found_reason("Directory not found"))?;
         if !browse_path.starts_with(base) && !canonical_browse.starts_with(&canonical_base) {
             return Err(ConversationError::BadRequest {
                 reason: "Path traversal outside workspace is not allowed".into(),
@@ -198,7 +205,7 @@ impl ConversationService {
         let mut entries = Vec::new();
         let mut dir_reader = tokio::fs::read_dir(&canonical_browse)
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to read directory: {e}")))?;
+            .map_err(|e| ConversationError::internal(format!("Failed to read directory: {e}")))?;
 
         while let Ok(Some(entry)) = dir_reader.next_entry().await {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -214,7 +221,7 @@ impl ConversationService {
             let entry_path = entry.path();
             let metadata = tokio::fs::metadata(&entry_path)
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to read entry metadata: {e}")))?;
+                .map_err(|e| ConversationError::internal(format!("Failed to read entry metadata: {e}")))?;
 
             let entry_type = if metadata.is_dir() { "directory" } else { "file" };
 

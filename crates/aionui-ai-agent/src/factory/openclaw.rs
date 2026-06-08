@@ -1,21 +1,20 @@
 use std::sync::Arc;
 
-use aionui_api_types::OpenClawBuildExtra;
-use aionui_common::{AgentType, AppError};
+use aionui_common::AgentType;
 
 use crate::agent_task::AgentInstance;
+use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
 use crate::manager::openclaw::OpenClawAgentManager;
-use crate::types::BuildTaskOptions;
+use crate::session_context::OpenClawSessionBuildContext;
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
-    options: BuildTaskOptions,
+    build_context: OpenClawSessionBuildContext,
     ctx: FactoryContext,
-) -> Result<AgentInstance, AppError> {
-    let mut config: OpenClawBuildExtra = serde_json::from_value(options.extra)
-        .map_err(|e| AppError::BadRequest(format!("Invalid OpenClaw build options: {e}")))?;
+) -> Result<AgentInstance, AgentError> {
+    let mut config = build_context.config;
 
     // OpenClaw lives in the catalog as an internal row; reuse
     // the registry-resolved path instead of re-running `which()`.

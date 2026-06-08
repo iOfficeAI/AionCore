@@ -58,7 +58,7 @@ async fn fixture_embedded() -> Fixture {
     let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
         .await
         .unwrap();
-    let (mut states, _): (ModuleStates, _) = build_module_states(&services).await;
+    let (mut states, _): (ModuleStates, _) = build_module_states(&services).await.expect("build module states");
 
     // Replace the skill state with a deterministic one rooted at tmp.
     // `build_module_states` builds a state pointing at `~/.aionui/`,

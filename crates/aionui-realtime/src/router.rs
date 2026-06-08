@@ -10,21 +10,24 @@ pub trait MessageRouter: Send + Sync {
     ///
     /// Called for any message whose `name` is not handled internally
     /// by the WebSocket layer (i.e. not `pong` or `subscribe-show-open`).
-    fn route(&self, conn_id: ConnectionId, name: &str, data: serde_json::Value);
+    fn route(&self, conn_id: ConnectionId, name: &str, data: serde_json::Value) -> bool;
 }
 
-/// A no-op message router that silently discards all messages.
+/// A no-op message router that reports every message as unhandled.
 ///
-/// Used as a placeholder until business modules provide real routing.
+/// Used as a placeholder until business modules provide real routing. The
+/// WebSocket handler turns the `false` return value into
+/// `REALTIME_UNSUPPORTED_MESSAGE`.
 pub struct NoopMessageRouter;
 
 impl MessageRouter for NoopMessageRouter {
-    fn route(&self, conn_id: ConnectionId, name: &str, _data: serde_json::Value) {
+    fn route(&self, conn_id: ConnectionId, name: &str, _data: serde_json::Value) -> bool {
         tracing::debug!(
             %conn_id,
             message_name = name,
             "no router registered, message discarded"
         );
+        false
     }
 }
 
@@ -36,12 +39,16 @@ mod tests {
     #[test]
     fn noop_router_does_not_panic() {
         let router = NoopMessageRouter;
-        router.route(ConnectionId(1), "some-event", json!({"key": "val"}));
+        let handled = router.route(ConnectionId(1), "some-event", json!({"key": "val"}));
+
+        assert!(!handled);
     }
 
     #[test]
     fn noop_router_is_trait_object_compatible() {
         let router: Box<dyn MessageRouter> = Box::new(NoopMessageRouter);
-        router.route(ConnectionId(42), "test", json!(null));
+        let handled = router.route(ConnectionId(42), "test", json!(null));
+
+        assert!(!handled);
     }
 }

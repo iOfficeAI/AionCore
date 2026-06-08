@@ -9,17 +9,19 @@ use std::time::Duration;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::{AgentError, AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
-use aionui_api_types::{AgentErrorCode, ConversationArtifactKind};
+use aionui_api_types::{
+    AgentErrorCode, AgentModeResponse, ConversationArtifactKind, GetModelInfoResponse, ModelInfoEntry,
+    ModelInfoPayload, SetModeRequest, SetModelRequest,
+};
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
     SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
-    AgentKillReason, AgentType, AppError, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
-    TimestampMs,
+    AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult, TimestampMs,
 };
 use aionui_db::models::{
     AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams,
@@ -328,6 +330,19 @@ impl IConversationRepository for MockRepo {
             .cloned())
     }
 
+    async fn list_stale_runtime_messages(&self) -> Result<Vec<MessageRow>, aionui_db::DbError> {
+        let messages = self.messages.lock().unwrap();
+        Ok(messages
+            .iter()
+            .filter(|message| {
+                message.position.as_deref() == Some("left")
+                    && matches!(message.status.as_deref(), Some("work" | "pending"))
+                    && matches!(message.r#type.as_str(), "text" | "thinking")
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn search_messages(
         &self,
         _user_id: &str,
@@ -589,12 +604,38 @@ fn make_service_with_resolver_and_acp_session_repo(
     (svc, broadcaster, repo, task_mgr)
 }
 
+fn make_service_with_mock_task_manager(
+    task_mgr: Arc<MockTaskManager>,
+) -> (ConversationService, Arc<MockBroadcaster>, Arc<MockRepo>) {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster.clone(),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr_dyn,
+        repo.clone(),
+        agent_metadata_repo,
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    (svc, broadcaster, repo)
+}
+
 fn make_create_req() -> CreateConversationRequest {
+    let workspace = ensure_test_workspace_path();
     serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/project" }
+        "extra": { "workspace": workspace }
     }))
     .unwrap()
+}
+
+fn ensure_test_workspace_path() -> String {
+    let workspace = std::env::temp_dir().join("aionui-conversation-service-test-project");
+    std::fs::create_dir_all(&workspace).unwrap();
+    workspace.to_string_lossy().to_string()
 }
 
 // ── Create tests ───────────────────────────────────────────────────
@@ -602,6 +643,7 @@ fn make_create_req() -> CreateConversationRequest {
 #[tokio::test]
 async fn create_returns_conversation_with_defaults() {
     let (svc, broadcaster, _repo, _task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     let resp = svc.create("user_1", make_create_req()).await.unwrap();
 
@@ -611,7 +653,7 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(resp.source, Some(ConversationSource::Aionui));
     assert!(!resp.pinned);
     assert!(resp.pinned_at.is_none());
-    assert_eq!(resp.extra["workspace"], "/project");
+    assert_eq!(resp.extra["workspace"], workspace);
     assert!(resp.created_at > 0);
     assert_eq!(resp.created_at, resp.modified_at);
 
@@ -625,7 +667,7 @@ async fn create_returns_conversation_with_defaults() {
 }
 
 #[tokio::test]
-async fn create_rejects_workspace_with_trailing_whitespace_in_request() {
+async fn create_rejects_unavailable_workspace_with_trailing_whitespace_in_request() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
     std::fs::create_dir(&dir).unwrap();
@@ -639,17 +681,34 @@ async fn create_rejects_workspace_with_trailing_whitespace_in_request() {
     }))
     .unwrap();
     let err = svc.create("user_1", req).await.unwrap_err();
-
     assert!(matches!(
         err,
-        ConversationError::App(AppError::WorkspacePathContainsWhitespace(message))
-            if message == workspace_with_trailing_space
+        ConversationError::WorkspacePathUnavailable { path }
+            if path == workspace_with_trailing_space
     ));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
-async fn create_rejects_workspace_with_whitespace_in_any_path_segment() {
+async fn create_accepts_existing_workspace_with_trailing_whitespace_in_name() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
+    std::fs::create_dir(&dir).unwrap();
+    let workspace = dir.join("workspace ");
+    std::fs::create_dir(&workspace).unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace.to_string_lossy() }
+    }))
+    .unwrap();
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.extra["workspace"], workspace.to_string_lossy().to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn create_accepts_workspace_with_whitespace_in_any_path_segment() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
     std::fs::create_dir(&dir).unwrap();
@@ -662,13 +721,8 @@ async fn create_rejects_workspace_with_whitespace_in_any_path_segment() {
         "extra": { "workspace": workspace.to_string_lossy() }
     }))
     .unwrap();
-    let err = svc.create("user_1", req).await.unwrap_err();
-
-    assert!(matches!(
-        err,
-        ConversationError::App(AppError::WorkspacePathContainsWhitespace(message))
-            if message == workspace.to_string_lossy()
-    ));
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.extra["workspace"], workspace.to_string_lossy().to_string());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -696,12 +750,13 @@ async fn create_with_custom_name_and_source() {
 #[tokio::test]
 async fn create_stores_model_as_json() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     // Top-level model is only valid for aionrs conversations.
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "aionrs",
         "model": { "provider_id": "p1", "model": "m1" },
-        "extra": { "workspace": "/project" }
+        "extra": { "workspace": workspace }
     }))
     .unwrap();
     let resp = svc.create("user_1", req).await.unwrap();
@@ -878,33 +933,42 @@ async fn update_unpin_clears_pinned_at() {
 #[tokio::test]
 async fn update_extra_merge() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let dir = std::env::temp_dir().join(format!(
+        "aionui-conversation-update-extra-merge-{}",
+        aionui_common::generate_short_id()
+    ));
+    let old_workspace = dir.join("old-workspace");
+    let new_workspace = dir.join("new-workspace");
+    std::fs::create_dir_all(&old_workspace).unwrap();
+    std::fs::create_dir_all(&new_workspace).unwrap();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/old", "contextFileName": "ctx.md" }
+        "extra": { "workspace": old_workspace.to_string_lossy(), "contextFileName": "ctx.md" }
     }))
     .unwrap();
     let conv = svc.create("user_1", req).await.unwrap();
 
     // Update only workspace — contextFileName should be preserved
     let update_req: UpdateConversationRequest =
-        serde_json::from_value(json!({ "extra": { "workspace": "/new" } })).unwrap();
+        serde_json::from_value(json!({ "extra": { "workspace": new_workspace.to_string_lossy() } })).unwrap();
     let updated = svc.update("user_1", &conv.id, update_req, &task_mgr).await.unwrap();
 
-    assert_eq!(updated.extra["workspace"], "/new");
+    assert_eq!(updated.extra["workspace"], new_workspace.to_string_lossy().to_string());
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
 }
 
 #[tokio::test]
 async fn update_model() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     // Top-level model updates are only valid on aionrs conversations
     // (Task 8 enforces the aionrs-only rule in update).
     let create_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "aionrs",
         "model": { "provider_id": "p1", "model": "m1" },
-        "extra": { "workspace": "/project" }
+        "extra": { "workspace": workspace }
     }))
     .unwrap();
     let conv = svc.create("user_1", create_req).await.unwrap();
@@ -1006,8 +1070,10 @@ async fn delete_invokes_registered_hook_before_row_delete() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     svc.delete("user_1", &conv.id).await.unwrap();
 
-    let observations = hook.observations.lock().unwrap();
-    assert_eq!(observations.as_slice(), &[true]);
+    {
+        let observations = hook.observations.lock().unwrap();
+        assert_eq!(observations.as_slice(), &[true]);
+    }
     assert!(repo.get(&conv.id).await.unwrap().is_none());
 }
 
@@ -1095,19 +1161,20 @@ async fn delete_wrong_user_returns_not_found() {
 #[tokio::test]
 async fn clone_without_source_creates_new() {
     let (svc, broadcaster, _repo, _task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     let req: CloneConversationRequest = serde_json::from_value(json!({
         "conversation": {
             "type": "acp",
             "name": "Cloned",
-            "extra": { "workspace": "/new" }
+            "extra": { "workspace": workspace }
         }
     }))
     .unwrap();
 
     let resp = svc.clone_create("user_1", req).await.unwrap();
     assert_eq!(resp.name, "Cloned");
-    assert_eq!(resp.extra["workspace"], "/new");
+    assert_eq!(resp.extra["workspace"], workspace);
 
     let events = broadcaster.take_events();
     assert_eq!(events.len(), 1);
@@ -1231,6 +1298,8 @@ struct MockAgent {
     conversation_id: String,
     event_tx: broadcast::Sender<AgentStreamEvent>,
     stopped: Mutex<bool>,
+    mode: Mutex<String>,
+    model_id: Mutex<String>,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
     allow_direct_confirm: bool,
@@ -1245,6 +1314,8 @@ impl MockAgent {
             conversation_id: conversation_id.to_owned(),
             event_tx,
             stopped: Mutex::new(false),
+            mode: Mutex::new("default".to_owned()),
+            model_id: Mutex::new("model-a".to_owned()),
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -1258,6 +1329,8 @@ impl MockAgent {
             conversation_id: conversation_id.to_owned(),
             event_tx,
             stopped: Mutex::new(false),
+            mode: Mutex::new("default".to_owned()),
+            model_id: Mutex::new("model-a".to_owned()),
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -1271,6 +1344,8 @@ impl MockAgent {
             conversation_id: conversation_id.to_owned(),
             event_tx,
             stopped: Mutex::new(false),
+            mode: Mutex::new("default".to_owned()),
+            model_id: Mutex::new("model-a".to_owned()),
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: true,
@@ -1306,11 +1381,11 @@ impl IAgentTask for MockAgent {
         ));
         Ok(())
     }
-    async fn cancel(&self) -> Result<(), AppError> {
+    async fn cancel(&self) -> Result<(), AgentError> {
         *self.stopped.lock().unwrap() = true;
         Ok(())
     }
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 }
@@ -1333,11 +1408,11 @@ impl IMockAgent for MockAgent {
         call_id: &str,
         _data: serde_json::Value,
         always_allow: bool,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), AgentError> {
         let mut confs = self.confirmations.lock().unwrap();
         let existed = confs.iter().any(|c| c.call_id == call_id);
         if !existed && !self.allow_direct_confirm {
-            return Err(AppError::NotFound(format!("Confirmation {call_id} not found")));
+            return Err(AgentError::not_found(format!("Confirmation {call_id} not found")));
         }
         if always_allow && let Some(conf) = confs.iter().find(|c| c.call_id == call_id) {
             let key = match (conf.action.as_deref(), conf.command_type.as_deref()) {
@@ -1348,6 +1423,43 @@ impl IMockAgent for MockAgent {
             self.approval_memory.lock().unwrap().insert(key, true);
         }
         confs.retain(|c| c.call_id != call_id);
+        Ok(())
+    }
+
+    async fn mode(&self) -> Result<AgentModeResponse, AgentError> {
+        Ok(AgentModeResponse {
+            mode: self.mode.lock().unwrap().clone(),
+            initialized: true,
+        })
+    }
+
+    async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
+        *self.mode.lock().unwrap() = mode.to_owned();
+        Ok(())
+    }
+
+    async fn get_model(&self) -> Result<GetModelInfoResponse, AgentError> {
+        let current = self.model_id.lock().unwrap().clone();
+        Ok(GetModelInfoResponse {
+            model_info: Some(ModelInfoPayload {
+                current_model_id: Some(current.clone()),
+                current_model_label: Some(current.clone()),
+                available_models: vec![
+                    ModelInfoEntry {
+                        id: "model-a".to_owned(),
+                        label: "Model A".to_owned(),
+                    },
+                    ModelInfoEntry {
+                        id: "model-b".to_owned(),
+                        label: "Model B".to_owned(),
+                    },
+                ],
+            }),
+        })
+    }
+
+    async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
+        *self.model_id.lock().unwrap() = model_id.to_owned();
         Ok(())
     }
 }
@@ -1392,6 +1504,58 @@ impl FailingBuildTaskManager {
     }
 }
 
+struct DelayedFailingBuildTaskManager {
+    delay: Duration,
+    error: String,
+}
+
+impl DelayedFailingBuildTaskManager {
+    fn new(delay: Duration, error: impl Into<String>) -> Self {
+        Self {
+            delay,
+            error: error.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for DelayedFailingBuildTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        None
+    }
+
+    async fn get_or_build_task(
+        &self,
+        _conversation_id: &str,
+        _options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        tokio::time::sleep(self.delay).await;
+        Err(AgentError::bad_gateway(self.error.clone()))
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        _conversation_id: &str,
+        _reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    fn clear(&self) {}
+
+    fn active_count(&self) -> usize {
+        0
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        vec![]
+    }
+}
+
 #[async_trait::async_trait]
 impl IWorkerTaskManager for FailingBuildTaskManager {
     fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
@@ -1402,11 +1566,11 @@ impl IWorkerTaskManager for FailingBuildTaskManager {
         &self,
         _conversation_id: &str,
         _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError> {
-        Err(AppError::BadGateway(self.error.clone()))
+    ) -> Result<AgentInstance, AgentError> {
+        Err(AgentError::bad_gateway(self.error.clone()))
     }
 
-    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 
@@ -1439,7 +1603,7 @@ impl IWorkerTaskManager for MockTaskManager {
         &self,
         conversation_id: &str,
         _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError> {
+    ) -> Result<AgentInstance, AgentError> {
         let mut agents = self.agents.lock().unwrap();
         if let Some(existing) = agents.get(conversation_id) {
             return Ok(existing.clone());
@@ -1449,7 +1613,7 @@ impl IWorkerTaskManager for MockTaskManager {
         Ok(instance)
     }
 
-    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         self.kill_count.fetch_add(1, Ordering::SeqCst);
         self.kill_records
             .lock()
@@ -1509,13 +1673,13 @@ impl IWorkerTaskManager for SlowBuildTaskManager {
         &self,
         conversation_id: &str,
         _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError> {
+    ) -> Result<AgentInstance, AgentError> {
         tokio::time::sleep(self.delay).await;
         self.built.store(true, Ordering::SeqCst);
         Ok(AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id))))
     }
 
-    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 
@@ -1563,7 +1727,7 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
         &self,
         conversation_id: &str,
         _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError> {
+    ) -> Result<AgentInstance, AgentError> {
         let workspace = self.workspace.clone();
         let mut agents = self.agents.lock().unwrap();
         if let Some(existing) = agents.get(conversation_id) {
@@ -1576,7 +1740,7 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
         Ok(instance)
     }
 
-    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         self.agents.lock().unwrap().remove(conversation_id);
         Ok(())
     }
@@ -1690,11 +1854,11 @@ impl IAgentTask for ScriptedAgent {
         Ok(())
     }
 
-    async fn cancel(&self) -> Result<(), AppError> {
+    async fn cancel(&self) -> Result<(), AgentError> {
         Ok(())
     }
 
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 }
@@ -1777,12 +1941,56 @@ async fn send_message_returns_accepted() {
 }
 
 #[tokio::test]
-async fn send_message_rejects_legacy_workspace_with_runtime_error_code() {
-    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+async fn set_mode_returns_confirmed_mode_from_active_agent() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let response = svc
+        .set_mode(
+            &conv.id,
+            SetModeRequest {
+                mode: "plan".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.mode, "plan");
+    assert!(response.initialized);
+}
+
+#[tokio::test]
+async fn set_model_returns_confirmed_model_from_active_agent() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let response = svc
+        .set_model(
+            &conv.id,
+            SetModelRequest {
+                model_id: "model-b".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let model_info = response.model_info.expect("model info should be returned");
+    assert_eq!(model_info.current_model_id.as_deref(), Some("model-b"));
+    assert!(model_info.available_models.iter().any(|m| m.id == "model-b"));
+}
+
+#[tokio::test]
+async fn send_message_missing_workspace_persists_message_and_failure_tip() {
+    let (svc, broadcaster, repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let legacy_workspace = "/tmp/my project".to_owned();
+    broadcaster.take_events();
+    let legacy_workspace = format!("/tmp/does-not-exist-{}", aionui_common::generate_short_id());
     repo.update(
         &conv.id,
         &ConversationRowUpdate {
@@ -1793,43 +2001,62 @@ async fn send_message_rejects_legacy_workspace_with_runtime_error_code() {
     .await
     .unwrap();
 
-    let err = svc
+    let msg_id = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        ConversationError::App(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
-            if message == "/tmp/my project"
-    ));
+        .unwrap();
+    assert!(
+        !msg_id.is_empty(),
+        "msg_id must still be returned when runtime workspace validation fails"
+    );
 
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
-            if messages.iter().any(|message| message.r#type == "tips") {
+            if messages.iter().any(|message| message.r#type == "tips")
+                && messages.iter().any(|message| message.r#type == "text")
+            {
                 return messages;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("legacy workspace failure should persist an error tip");
+    .expect("missing workspace failure should persist a user message and error tip");
+
+    let user_message = messages
+        .iter()
+        .find(|message| message.r#type == "text")
+        .expect("missing workspace failure should persist the user message");
+    assert_eq!(user_message.msg_id.as_deref(), Some(msg_id.as_str()));
 
     let error_tip = messages
         .iter()
         .find(|message| message.r#type == "tips")
-        .expect("legacy workspace failure should persist an error tips message");
+        .expect("missing workspace failure should persist an error tips message");
     let content: serde_json::Value = serde_json::from_str(&error_tip.content).unwrap();
+    assert_eq!(content["code"], "WORKSPACE_PATH_RUNTIME_UNAVAILABLE");
+    assert_eq!(content["details"]["workspace_path"], legacy_workspace);
+    assert_eq!(content["error"]["code"], "WORKSPACE_PATH_RUNTIME_UNAVAILABLE");
+    assert_eq!(content["error"]["workspacePath"], legacy_workspace);
+
+    let events = broadcaster.take_events();
+    let error_tip_event = events
+        .iter()
+        .find(|event| event.name == "message.stream" && event.data["type"] == "tips")
+        .expect("missing workspace failure should broadcast the error tips message");
+    assert_eq!(error_tip_event.data["status"], "error");
     assert_eq!(
-        content["code"],
-        "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
+        error_tip_event.data["data"]["code"],
+        "WORKSPACE_PATH_RUNTIME_UNAVAILABLE"
     );
-    assert_eq!(content["details"]["workspace_path"], "/tmp/my project");
-    assert_eq!(
-        content["error"]["code"],
-        "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED"
-    );
-    assert_eq!(content["error"]["workspacePath"], "/tmp/my project");
+
+    let turn_event = events
+        .iter()
+        .find(|event| event.name == "turn.completed")
+        .expect("missing workspace failure should complete the turn");
+    assert_eq!(turn_event.data["runtime"]["is_processing"], false);
+    assert_eq!(turn_event.data["runtime"]["can_send_message"], true);
 }
 
 #[tokio::test]
@@ -2070,6 +2297,60 @@ async fn send_message_rejects_active_runtime_claim() {
 }
 
 #[tokio::test]
+async fn send_message_rejects_when_runtime_is_shutting_down() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    svc.runtime_state().mark_shutting_down();
+
+    let err = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::Busy { .. }));
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    assert!(
+        messages.is_empty(),
+        "shutdown rejection must not persist a user message"
+    );
+}
+
+#[tokio::test]
+async fn send_message_build_failure_while_deleting_skips_failure_tip_and_completion() {
+    let (svc, broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(DelayedFailingBuildTaskManager::new(
+        Duration::from_millis(100),
+        "delayed build failure",
+    ));
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    let msg_id = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+    assert!(!msg_id.is_empty());
+
+    svc.runtime_state().mark_deleting(&conv.id);
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    assert!(
+        messages.iter().all(|message| message.r#type != "tips"),
+        "deleting conversation must skip build-failure tips"
+    );
+
+    let events = broadcaster.take_events();
+    assert!(
+        events.iter().all(|event| event.name != "turn.completed"),
+        "deleting conversation must not publish turn.completed"
+    );
+}
+
+#[tokio::test]
 async fn send_message_persists_factory_resolved_workspace() {
     // Conversation created with no workspace → create() auto-assigns one.
     // Factory resolves a *different* temp dir (simulating legacy-conv fallback).
@@ -2111,6 +2392,55 @@ async fn send_message_persists_factory_resolved_workspace() {
     .await
     .expect("factory-resolved workspace should be persisted in the background");
     assert_eq!(updated.extra["workspace"], auto_workspace);
+}
+
+#[tokio::test]
+async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    repo.insert_message(&MessageRow {
+        id: "visible-stale".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: Some("visible-stale".into()),
+        r#type: "text".into(),
+        content: json!({ "content": "partial output" }).to_string(),
+        position: Some("left".into()),
+        status: Some("work".into()),
+        hidden: false,
+        created_at: 1,
+    })
+    .await
+    .unwrap();
+    repo.insert_message(&MessageRow {
+        id: "empty-stale".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: Some("empty-stale".into()),
+        r#type: "thinking".into(),
+        content: json!({ "content": "" }).to_string(),
+        position: Some("left".into()),
+        status: Some("pending".into()),
+        hidden: false,
+        created_at: 2,
+    })
+    .await
+    .unwrap();
+
+    svc.recover_stale_runtime_state_on_startup().await;
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let visible = messages.iter().find(|message| message.id == "visible-stale").unwrap();
+    assert_eq!(visible.status.as_deref(), Some("finish"));
+    assert!(!visible.hidden);
+
+    let empty = messages.iter().find(|message| message.id == "empty-stale").unwrap();
+    assert_eq!(empty.status.as_deref(), Some("finish"));
+    assert!(empty.hidden);
+
+    assert!(
+        messages.iter().all(|message| message.r#type != "tips"),
+        "startup recovery must not write failure tips"
+    );
 }
 
 #[tokio::test]
@@ -2244,8 +2574,8 @@ async fn send_message_does_not_inject_send_error_when_runtime_terminal_exists() 
                 Some(AgentErrorCode::UnknownUpstreamError),
             ))]],
         )
-        .with_send_error(AgentSendError::from_app_error(AppError::BadGateway(
-            "fallback should not render".into(),
+        .with_send_error(AgentSendError::from_agent_error(AgentError::bad_gateway(
+            "fallback should not render",
         ))),
     );
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
@@ -2272,8 +2602,8 @@ async fn send_message_injects_send_error_when_runtime_terminal_missing() {
     let scripted_agent = Arc::new(
         ScriptedAgent::new(&conv.id, vec![vec![]])
             .with_status(None)
-            .with_send_error(AgentSendError::from_app_error(AppError::BadGateway(
-                "provider returned 401 invalid api key".into(),
+            .with_send_error(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "provider returned 401 invalid api key",
             ))),
     );
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
@@ -2391,7 +2721,7 @@ async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let legacy_workspace = "/tmp/my project".to_owned();
+    let legacy_workspace = format!("/tmp/does-not-exist-{}", aionui_common::generate_short_id());
     repo.update(
         &conv.id,
         &ConversationRowUpdate {
@@ -2405,8 +2735,8 @@ async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
     let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
     assert!(matches!(
         err,
-        ConversationError::App(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
-            if message == "/tmp/my project"
+        ConversationError::WorkspacePathRuntimeUnavailable { path: message }
+            if message == legacy_workspace
     ));
 }
 
@@ -2588,7 +2918,7 @@ async fn confirm_nonexistent_call_id_returns_not_found() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, ConversationError::App(AppError::NotFound(_))));
+    assert!(matches!(err, ConversationError::NotFoundReason { .. }));
 }
 
 #[tokio::test]
@@ -2728,12 +3058,13 @@ async fn create_writes_extra_skills_from_auto_inject_and_preset() {
         names: vec!["cron".into(), "todo-tracker".into()],
     });
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "t",
         "extra": {
-            "workspace": "/project",
+            "workspace": workspace,
             "backend": "claude",
             "preset_enabled_skills": ["pdf", "cron"],
             "exclude_auto_inject_skills": ["todo-tracker"],
@@ -2751,10 +3082,11 @@ async fn create_writes_extra_skills_from_auto_inject_and_preset() {
 async fn create_writes_empty_skills_when_no_auto_inject_and_no_preset() {
     let resolver = Arc::new(FixedSkillResolver { names: vec![] });
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/project", "backend": "claude" },
+        "extra": { "workspace": workspace, "backend": "claude" },
     }))
     .unwrap();
     let resp = svc.create("user-1", req).await.unwrap();
@@ -2796,10 +3128,11 @@ async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
 #[tokio::test]
 async fn update_rejects_extra_skills() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/project", "backend": "claude" },
+        "extra": { "workspace": workspace, "backend": "claude" },
     }))
     .unwrap();
     let resp = svc.create("u", req).await.unwrap();
@@ -2817,23 +3150,50 @@ async fn update_rejects_extra_skills() {
 }
 
 #[tokio::test]
-async fn update_allows_other_extra_fields() {
+async fn update_rejects_acp_runtime_current_extra_fields() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/project", "backend": "claude" },
+        "extra": { "workspace": workspace, "backend": "claude" },
     }))
     .unwrap();
     let resp = svc.create("u", req).await.unwrap();
 
     let update_req: UpdateConversationRequest = serde_json::from_value(json!({
-        "extra": { "current_model_id": "claude-3-5-sonnet" },
+        "extra": { "current_model_id": "claude-3-5-sonnet", "current_mode_id": "default" },
+    }))
+    .unwrap();
+    let err = svc.update("u", &resp.id, update_req, &task_mgr).await.unwrap_err();
+
+    match err {
+        ConversationError::BadRequest { reason: msg } => {
+            assert!(msg.contains("/mode or /model"), "msg = {msg:?}")
+        }
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn update_allows_other_extra_fields() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("u", req).await.unwrap();
+
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "display_density": "compact" },
     }))
     .unwrap();
     let updated = svc.update("u", &resp.id, update_req, &task_mgr).await.unwrap();
 
-    assert_eq!(updated.extra["current_model_id"], "claude-3-5-sonnet");
+    assert_eq!(updated.extra["display_density"], "compact");
 }
 
 #[tokio::test]
@@ -2951,10 +3311,11 @@ async fn create_honors_legacy_alias_fields_from_clone_merge() {
 
     // Legacy-shaped extra — what clone_create might merge in from an
     // unmigrated source conversation.
+    let workspace = ensure_test_workspace_path();
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "extra": {
-            "workspace": "/project",
+            "workspace": workspace,
             "backend": "claude",
             "enabled_skills": ["pdf"],
             "exclude_builtin_skills": ["cron"],

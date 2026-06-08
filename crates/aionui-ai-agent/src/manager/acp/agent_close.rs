@@ -14,8 +14,7 @@
 //! must NEVER be Display'd into HTTP responses or WebSocket events; it
 //! is logged via `tracing` only.
 
-use aionui_common::AppError;
-
+use crate::error::AgentError;
 use crate::manager::acp::AcpAgentManager;
 use crate::manager::acp::agent::{exit_status_parts, user_facing_message};
 use crate::protocol::error::CloseReason;
@@ -30,14 +29,14 @@ impl AcpAgentManager {
     /// peek the child's recent stderr and try to surface a more informative
     /// message. Returns `None` when augmentation does not apply or finds nothing.
     ///
-    /// Why string-matching: `AppError::BadGateway(String)` has discarded the
+    /// Why string-matching: `AgentError::BadGateway(String)` has discarded the
     /// structured `AcpError` by the time we see it. The default-message
     /// signature is narrow and stable enough that matching on the inner string
     /// is cheaper than threading typed errors through the manager API. Keep
     /// this in sync with `AcpError::Display` in
     /// `crates/aionui-ai-agent/src/protocol/error.rs` if its fallback wording
     /// changes.
-    pub(super) async fn augment_with_stderr(&self, err: &AppError) -> Option<String> {
+    pub(super) async fn augment_with_stderr(&self, err: &AgentError) -> Option<String> {
         const SDK_DEFAULT_BAD_GATEWAY_PREFIX: &str = "Bad gateway: Agent internal error (code ";
         let display = err.to_string();
         // Match the Display produced for `AgentInternal` whenever the SDK gave
@@ -77,8 +76,8 @@ impl AcpAgentManager {
     /// 2. **Process still alive**: fall back to the existing
     ///    `AgentInternal` stderr-augmentation heuristic for the SDK's
     ///    "default Internal error" shape; otherwise the user-facing form
-    ///    of the `AppError` is the best we can do.
-    pub(super) async fn build_close_reason_from_error(&self, err: &AppError) -> CloseReason {
+    ///    of the `AgentError` is the best we can do.
+    pub(super) async fn build_close_reason_from_error(&self, err: &AgentError) -> CloseReason {
         // Branch 1 — process exit detected.
         if let Some(status) = self.process.exit_status() {
             let (exit_code, signal) = exit_status_parts(Some(status));
@@ -117,9 +116,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use aionui_common::{AppError, CommandSpec};
+    use aionui_common::CommandSpec;
 
     use crate::capability::cli_process::CliAgentProcess;
+    use crate::error::AgentError;
     use crate::manager::acp::agent::{exit_status_parts, user_facing_message};
     use crate::protocol::error::CloseReason;
 
@@ -148,7 +148,7 @@ mod tests {
     /// bare `CliAgentProcess` — the same two branches, the same peek size,
     /// the same extractor module path. Keep this aligned with the production
     /// helper or these tests stop reflecting reality.
-    async fn build_close_reason_via_process(proc: &Arc<CliAgentProcess>, err: &AppError) -> CloseReason {
+    async fn build_close_reason_via_process(proc: &Arc<CliAgentProcess>, err: &AgentError) -> CloseReason {
         if let Some(status) = proc.exit_status() {
             let (exit_code, signal) = exit_status_parts(Some(status));
             let tail = proc.peek_stderr_tail(super::STDERR_PEEK_LINES).await;
@@ -187,7 +187,7 @@ mod tests {
             "\u{1b}[2m2026-05-13T20:01:21Z\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m codex_acp::thread: usage limit exceeded";
         let proc = spawn_with_stderr_and_exit(stderr, 1).await;
 
-        let err = AppError::BadGateway("Agent internal error (code -32603)".into());
+        let err = AgentError::bad_gateway("Agent internal error (code -32603)");
         let reason = build_close_reason_via_process(&proc, &err).await;
         match reason {
             CloseReason::ProcessExited {
@@ -217,7 +217,7 @@ mod tests {
         let stderr = "ERROR widget_loader: failed to load module 'foo' due to internal logic bug";
         let proc = spawn_with_stderr_and_exit(stderr, 42).await;
 
-        let err = AppError::BadGateway("Agent internal error (code -32603)".into());
+        let err = AgentError::bad_gateway("Agent internal error (code -32603)");
         let reason = build_close_reason_via_process(&proc, &err).await;
         match reason {
             CloseReason::ProcessExited {
@@ -257,7 +257,7 @@ mod tests {
         let payload = format!("{secret_bearer_line}\n{actionable_line}");
         let proc = spawn_with_stderr_and_exit(&payload, 2).await;
 
-        let err = AppError::BadGateway("Agent internal error (code -32603)".into());
+        let err = AgentError::bad_gateway("Agent internal error (code -32603)");
         let reason = build_close_reason_via_process(&proc, &err).await;
         match reason {
             CloseReason::ProcessExited { redacted_summary, .. } => {

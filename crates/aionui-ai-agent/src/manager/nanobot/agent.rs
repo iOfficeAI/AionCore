@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_common::{AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, ErrorChain, TimestampMs};
+use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tracing::{debug, error, info, warn};
@@ -10,6 +10,7 @@ use aionui_common::CommandSpec;
 
 use crate::agent_runtime::AgentRuntime;
 use crate::capability::cli_process::CliAgentProcess;
+use crate::error::AgentError;
 use crate::manager::process_registry::register_session_process;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
@@ -45,7 +46,7 @@ impl NanobotAgentManager {
         workspace: String,
         cli_path: PathBuf,
         data_dir: PathBuf,
-    ) -> Result<Self, AppError> {
+    ) -> Result<Self, AgentError> {
         let spawn_config = Self::build_spawn_config(cli_path, &workspace);
         let command_preview = spawn_config.command.display().to_string();
         let process = Arc::new(CliAgentProcess::spawn(spawn_config).await?);
@@ -214,19 +215,19 @@ impl crate::agent_task::IAgentTask for NanobotAgentManager {
                     error = %ErrorChain(&err),
                     "Nanobot send_message failed, emitting Error"
                 );
-                let send_error = AgentSendError::from_app_error(err);
+                let send_error = AgentSendError::from_agent_error(err);
                 self.runtime.emit_error_data(send_error.stream_error().clone());
                 Err(send_error)
             }
         }
     }
 
-    async fn cancel(&self) -> Result<(), AppError> {
+    async fn cancel(&self) -> Result<(), AgentError> {
         let payload = json!({ "type": "stop.stream", "data": {} });
         self.process.send(&payload).await
     }
 
-    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         info!(
             conversation_id = %self.runtime.conversation_id(),
             ?reason,
@@ -264,8 +265,8 @@ impl NanobotAgentManager {
 /// are trivial stubs matching the semantics of the removed `IAgentManager`
 /// default impls.
 impl NanobotAgentManager {
-    pub fn confirm(&self, _msg_id: &str, _call_id: &str, _data: Value, _always_allow: bool) -> Result<(), AppError> {
-        Err(AppError::BadRequest("Nanobot does not support confirmations".into()))
+    pub fn confirm(&self, _msg_id: &str, _call_id: &str, _data: Value, _always_allow: bool) -> Result<(), AgentError> {
+        Err(AgentError::bad_request("Nanobot does not support confirmations"))
     }
 
     pub fn get_confirmations(&self) -> Vec<Confirmation> {

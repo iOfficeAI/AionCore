@@ -3,12 +3,12 @@ use std::sync::{Arc, Mutex};
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask};
 use aionui_ai_agent::protocol::events::FinishEventData;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentSendError, AgentStreamEvent, IMockAgent, IWorkerTaskManager};
+use aionui_ai_agent::{AgentError, AgentSendError, AgentStreamEvent, IMockAgent, IWorkerTaskManager};
 use aionui_api_types::WebSocketMessage;
 use aionui_channel::channel_settings::ChannelSettingsService;
 use aionui_channel::message_service::ChannelMessageService;
 use aionui_channel::types::PluginType;
-use aionui_common::{AgentKillReason, AgentType, AppError, ConversationStatus, TimestampMs};
+use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs};
 use aionui_conversation::ConversationService;
 use aionui_conversation::skill_resolver::{ResolvedAgentSkill, SkillResolver};
 use aionui_db::models::AssistantSessionRow;
@@ -106,11 +106,11 @@ impl IAgentTask for ScriptedAgent {
         Ok(())
     }
 
-    async fn cancel(&self) -> Result<(), AppError> {
+    async fn cancel(&self) -> Result<(), AgentError> {
         Ok(())
     }
 
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 }
@@ -139,7 +139,7 @@ impl IWorkerTaskManager for RecordingTaskManager {
         &self,
         conversation_id: &str,
         _options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError> {
+    ) -> Result<AgentInstance, AgentError> {
         let mut agents = self.agents.lock().unwrap();
         if let Some(agent) = agents.get(conversation_id) {
             return Ok(agent.clone());
@@ -150,7 +150,7 @@ impl IWorkerTaskManager for RecordingTaskManager {
         Ok(agent)
     }
 
-    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         self.agents.lock().unwrap().remove(conversation_id);
         Ok(())
     }

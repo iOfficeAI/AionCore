@@ -3,6 +3,7 @@ use crate::capability::PromptCtx;
 use crate::capability::cli_process::CliAgentProcess;
 use crate::capability::prompt_pipeline::PromptPipeline;
 use crate::capability::skill_manager::AcpSkillManager;
+use crate::error::AgentError;
 use crate::factory::acp_assembler::AcpSessionParams;
 use crate::manager::acp::{
     AcpSession, AcpSessionEvent, ModelIdentityReminderHook, PermissionRouter, SessionNewPreludeHook,
@@ -16,11 +17,12 @@ use crate::registry::CatalogSender;
 use crate::shared_kernel::{ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::{
-    CancelNotification, SessionId, SessionModelState, SessionNotification, UsageUpdate,
+    CancelNotification, SessionId, SessionModelState, SessionNotification, SetSessionModeRequest,
+    SetSessionModelRequest, UsageUpdate,
 };
 use aionui_api_types::{AgentHandshake, SlashCommandItem};
 use aionui_common::{
-    AgentKillReason, AgentType, AppError, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case,
+    AgentKillReason, AgentType, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -29,11 +31,11 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use super::agent_session_flow::PromptOutcome;
-use super::error_mapping::{AcpSendFailure, acp_error_to_app_error};
+use super::error_mapping::AcpSendFailure;
 
-/// The user-visible body inside an [`AppError`].
+/// The user-visible body inside an [`AgentError`].
 ///
-/// `AppError`'s `Display` prefixes every variant with its HTTP status name
+/// `AgentError`'s `Display` prefixes every variant with its status name
 /// (`"Bad gateway: ..."`, `"Not found: ..."`, etc.). That's correct for HTTP
 /// response bodies, but the WebSocket `error` event we broadcast goes straight
 /// to the renderer and gets shown verbatim — the prefix only adds noise. Strip
@@ -41,7 +43,7 @@ use super::error_mapping::{AcpSendFailure, acp_error_to_app_error};
 ///
 /// `pub(super)` so the close-path helpers in `agent_close.rs` can reuse the
 /// same prefix-stripping logic when fabricating the `Failed { display }` arm.
-pub(super) fn user_facing_message(err: &AppError) -> String {
+pub(super) fn user_facing_message(err: &AgentError) -> String {
     let full = err.to_string();
     // Each variant's Display starts with `"<Tag>: "`. Find the first ": " and
     // return what follows. Variants without a colon (e.g. `RateLimited` →
@@ -197,7 +199,7 @@ impl AcpAgentManager {
             mpsc::Receiver<AcpSessionEvent>,
             mpsc::Receiver<SessionNotification>,
         ),
-        AppError,
+        AgentError,
     > {
         let (this, domain_event_rx, notification_rx) = AcpAgentManager::new(params, skill_manager).await?;
         this.init(catalog_tx).await;
@@ -213,7 +215,7 @@ impl AcpAgentManager {
             mpsc::Receiver<AcpSessionEvent>,
             mpsc::Receiver<SessionNotification>,
         ),
-        AppError,
+        AgentError,
     > {
         let initial_mode = initial_mode_from_params(&params);
         codex_sandbox::sync_for_agent(&params.metadata, initial_mode.as_ref().map(|m| m.as_str())).await;
@@ -234,7 +236,7 @@ impl AcpAgentManager {
         let (stdin, stdout) = process.take_stdio().await.ok_or_else(|| {
             error!(conversation_id = %params.conversation_id, "Failed to take stdio from CLI process");
             let _ = unregister_agent_process(&params.data_dir, process.pid());
-            AppError::Internal("Failed to take stdio from CLI process".into())
+            AgentError::internal("Failed to take stdio from CLI process")
         })?;
 
         // Dedicated channel for raw SDK SessionNotifications → session tracker.
@@ -265,7 +267,7 @@ impl AcpAgentManager {
                     "Agent process exited before ACP handshake completed"
                 );
                 let _ = unregister_agent_process(&params.data_dir, process.pid());
-                return Err(acp_error_to_app_error(AcpError::StartupCrash { exit_code, signal, stderr }));
+                return Err(AgentError::from(AcpError::StartupCrash { exit_code, signal, stderr }));
             }
             res = &mut connect_fut => res.map_err(|e| {
                 error!(
@@ -274,7 +276,7 @@ impl AcpAgentManager {
                     "Failed to establish ACP protocol connection"
                 );
                 let _ = unregister_agent_process(&params.data_dir, process.pid());
-                acp_error_to_app_error(e)
+                AgentError::from(e)
             })?,
         };
         let permission_router = Arc::new(PermissionRouter::new(permission_rx));
@@ -347,7 +349,7 @@ impl AcpAgentManager {
 }
 
 impl AcpAgentManager {
-    pub(crate) async fn mode(&self) -> Result<aionui_api_types::AgentModeResponse, AppError> {
+    pub(crate) async fn mode(&self) -> Result<aionui_api_types::AgentModeResponse, AgentError> {
         let desired = self
             .session
             .read()
@@ -383,85 +385,166 @@ impl AcpAgentManager {
     }
 
     /// Set the mode for the current session.
-    pub(crate) async fn set_mode(&self, mode: &str) -> Result<(), AppError> {
+    pub(crate) async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
         let normalized_mode = normalize_requested_mode(&self.params.metadata, mode);
         if normalized_mode.is_empty() {
-            return Ok(());
-        }
-        codex_sandbox::sync_for_agent(&self.params.metadata, Some(&normalized_mode)).await;
-        let session_id = self.session.read().await.session_id().map(ToOwned::to_owned);
-
-        // Write desired — the aggregate root's legitimate intent write-point.
-        {
-            let mut session = self.session.write().await;
-            session.set_desired_mode(ModeId::new(&normalized_mode));
-            self.commit_session_changes(&mut session).await;
+            return Err(AgentError::bad_request("mode must not be empty"));
         }
 
-        // If a session is open, reconcile to the CLI. `reconcile_session`
-        // is the sole call-site of `protocol.set_mode` and the sole
-        // observed/advertised write-point — on success it calls
-        // `apply_observed_mode`, which syncs both layers and emits
-        // `ObservedModeSynced`. `get_mode()` reflects the change as soon
-        // as the SDK call returns.
-        if let Some(sid) = session_id {
-            // PUT /mode is best-effort by design: the desired layer is
-            // already updated, and any SDK failure (including
-            // SessionNotFound) is handled on the next ensure_session
-            // pass when the user retries or sends a message.
-            if let Err(e) = self.reconcile_session(&sid).await {
-                debug!(
+        let session_id = {
+            let session = self.session.read().await;
+            if !session.can_select_mode(&normalized_mode) {
+                warn!(
                     conversation_id = %self.params.conversation_id,
-                    error = %e,
-                    "set_mode: reconcile failed; desired layer kept for next ensure_session"
+                    agent_backend = ?self.params.metadata.backend,
+                    requested_mode_id = %normalized_mode,
+                    "acp_set_mode_rejected_unavailable"
                 );
+                return Err(AgentError::bad_request(format!(
+                    "Mode '{normalized_mode}' is not available for this ACP session"
+                )));
             }
+            session.session_id().map(ToOwned::to_owned)
         }
+        .ok_or_else(|| {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_mode_id = %normalized_mode,
+                "acp_set_command_missing_session"
+            );
+            AgentError::bad_request("No active session")
+        })?;
+
+        info!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            requested_mode_id = %normalized_mode,
+            "acp_set_mode_requested"
+        );
+        codex_sandbox::sync_for_agent(&self.params.metadata, Some(&normalized_mode)).await;
+
+        if let Err(e) = self
+            .protocol
+            .set_mode(SetSessionModeRequest::new(
+                SessionId::new(session_id.clone()),
+                normalized_mode.clone(),
+            ))
+            .await
+        {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_mode_id = %normalized_mode,
+                error = %e,
+                "acp_set_mode_failed"
+            );
+            return Err(AgentError::from(e));
+        }
+
+        let mut session = self.session.write().await;
+        if session.session_id() != Some(session_id.as_str()) {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_mode_id = %normalized_mode,
+                confirmed_session_id = %session_id,
+                active_session_id = ?session.session_id(),
+                "acp_set_mode_session_changed"
+            );
+            return Err(AgentError::conflict("Active ACP session changed while applying mode"));
+        }
+        session.confirm_mode(ModeId::new(&normalized_mode));
+        self.commit_session_changes(&mut session).await;
+        info!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            confirmed_mode_id = %normalized_mode,
+            "acp_set_mode_confirmed"
+        );
         Ok(())
     }
 
     /// Set the model for the current session.
-    ///
-    /// Mirrors `set_mode`: writes user intent into the aggregate's Desired
-    /// layer, then delegates to `reconcile_session` for the SDK call.
-    /// `reconcile_session` is the sole call-site of `protocol.set_model` —
-    /// it also handles the observed sync since the CLI does not emit a
-    /// CurrentModelUpdate notification after `session/set_model`.
-    pub(crate) async fn set_model(&self, model_id: &str) -> Result<(), AppError> {
-        let session_id = self.session.read().await.session_id().map(ToOwned::to_owned);
-
-        {
-            let mut session = self.session.write().await;
+    pub(crate) async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
+        let session_id = {
+            let session = self.session.read().await;
             if !session.can_select_model(model_id) {
                 warn!(
                     conversation_id = %self.params.conversation_id,
-                    model_id = %model_id,
-                    "set_model rejected unavailable ACP model"
+                    agent_backend = ?self.params.metadata.backend,
+                    requested_model_id = %model_id,
+                    "acp_set_model_rejected_unavailable"
                 );
-                return Err(AppError::BadRequest(format!(
+                return Err(AgentError::bad_request(format!(
                     "Model '{model_id}' is not available for this ACP session"
                 )));
             }
-            session.set_desired_model(ModelId::new(model_id));
-            self.commit_session_changes(&mut session).await;
+            session.session_id().map(ToOwned::to_owned)
+        }
+        .ok_or_else(|| {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_model_id = %model_id,
+                "acp_set_command_missing_session"
+            );
+            AgentError::bad_request("No active session")
+        })?;
+
+        info!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            requested_model_id = %model_id,
+            "acp_set_model_requested"
+        );
+        if let Err(e) = self
+            .protocol
+            .set_model(SetSessionModelRequest::new(
+                SessionId::new(session_id.clone()),
+                model_id.to_owned(),
+            ))
+            .await
+        {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_model_id = %model_id,
+                error = %e,
+                "acp_set_model_failed"
+            );
+            return Err(AgentError::from(e));
         }
 
-        if let Some(sid) = session_id {
-            if let Err(e) = self.reconcile_session(&sid).await {
-                debug!(
-                    conversation_id = %self.params.conversation_id,
-                    error = %e,
-                    "set_model: reconcile failed; desired layer kept for next ensure_session"
-                );
-            }
-        } else {
-            return Err(AppError::BadRequest("No active session".into()));
+        let mut session = self.session.write().await;
+        if session.session_id() != Some(session_id.as_str()) {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_model_id = %model_id,
+                confirmed_session_id = %session_id,
+                active_session_id = ?session.session_id(),
+                "acp_set_model_session_changed"
+            );
+            return Err(AgentError::conflict("Active ACP session changed while applying model"));
         }
+        let model = ModelId::new(model_id);
+        session.confirm_model(model.clone());
+        if self.params.metadata.behavior_policy.self_identity_sticky {
+            session.set_pending_model_notice(model);
+        }
+        self.commit_session_changes(&mut session).await;
+        info!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            confirmed_model_id = %model_id,
+            "acp_set_model_confirmed"
+        );
         Ok(())
     }
 
     /// Return available slash commands from the session aggregate.
-    pub(crate) async fn load_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AppError> {
+    pub(crate) async fn load_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AgentError> {
         let session = self.session.read().await;
         let items = session
             .available_commands()
@@ -523,7 +606,7 @@ impl AcpAgentManager {
     /// 2. Sid present but CLI has not opened it (fresh task) → `open_session_resume`
     /// 3. Already opened → noop, return the existing sid
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id))]
-    async fn ensure_session_opened(&self) -> Result<String, AppError> {
+    async fn ensure_session_opened(&self) -> Result<String, AgentError> {
         debug!("Ensuring ACP session is opened");
         let _lock = self.session_lock.lock().await;
 
@@ -581,7 +664,7 @@ impl AcpAgentManager {
     /// only after the session is ready to accept `set_mode` / `set_model`
     /// / `prompt`. Idempotent — if already opened, returns immediately.
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id))]
-    pub async fn warmup_session(&self) -> Result<(), AppError> {
+    pub async fn warmup_session(&self) -> Result<(), AgentError> {
         info!("Warming up ACP session");
         let result = self.ensure_session_opened().await.map(|_sid| ());
         match &result {
@@ -656,7 +739,7 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
             }
             Err(err) => {
                 let send_error = err.to_agent_send_error();
-                let app_err = err.into_app_error();
+                let agent_err = err.into_agent_error();
                 // Build a CloseReason that captures whatever context we still
                 // have. Two cases matter:
                 //   1. The CLI process has already exited — we can read the
@@ -666,14 +749,14 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
                 //   2. The process is still alive — fall back to the existing
                 //      stderr-augmentation heuristic for the SDK's "default
                 //      Internal error" shape; otherwise the user-facing form
-                //      of the AppError is the best we can do.
-                let close_reason = self.build_close_reason_from_error(&app_err).await;
+                //      of the AgentError is the best we can do.
+                let close_reason = self.build_close_reason_from_error(&agent_err).await;
 
                 // Operator log: full error chain + the (raw, pre-redaction)
                 // stderr peek so on-call can correlate. The redacted summary
                 // is what reaches the UI.
                 let summary = close_reason.user_facing_message();
-                error!(error = %ErrorChain(&app_err), close_reason_summary = %summary, "ACP send_message failed");
+                error!(error = %ErrorChain(&agent_err), close_reason_summary = %summary, "ACP send_message failed");
 
                 {
                     let mut session = self.session.write().await;
@@ -686,7 +769,7 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
     }
 
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id))]
-    async fn cancel(&self) -> Result<(), AppError> {
+    async fn cancel(&self) -> Result<(), AgentError> {
         info!("Cancelling ACP session");
         let session_id = self.session.read().await.session_id().map(ToOwned::to_owned);
         if let Some(sid) = &session_id {
@@ -717,7 +800,7 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
         Ok(())
     }
 
-    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         info!(
             conversation_id = %self.params.conversation_id,
             ?reason,
@@ -803,9 +886,9 @@ impl AcpAgentManager {
         call_id: &str,
         data: serde_json::Value,
         _always_allow: bool,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), AgentError> {
         let option_id = confirm_option_id(&data)
-            .ok_or_else(|| AppError::BadRequest("ACP confirmation requires an option_id string".into()))?;
+            .ok_or_else(|| AgentError::bad_request("ACP confirmation requires an option_id string"))?;
 
         self.permission_router
             .confirm(call_id, option_id, &self.params.conversation_id)
@@ -818,7 +901,7 @@ impl AcpAgentManager {
 #[cfg(test)]
 mod tests {
     use super::{exit_status_parts, user_facing_message};
-    use aionui_common::AppError;
+    use crate::error::AgentError;
 
     #[test]
     fn exit_status_parts_handles_missing_status() {
@@ -840,26 +923,26 @@ mod tests {
 
     #[test]
     fn strips_bad_gateway_prefix() {
-        let err = AppError::BadGateway("API Error: Internal server error".into());
+        let err = AgentError::bad_gateway("API Error: Internal server error");
         assert_eq!(user_facing_message(&err), "API Error: Internal server error");
     }
 
     #[test]
     fn strips_not_found_prefix() {
-        let err = AppError::NotFound("user 42".into());
+        let err = AgentError::not_found("user 42");
         assert_eq!(user_facing_message(&err), "user 42");
     }
 
     #[test]
     fn rate_limited_has_no_colon_returns_full_string() {
-        let err = AppError::RateLimited;
+        let err = AgentError::RateLimited;
         assert_eq!(user_facing_message(&err), "Rate limited");
     }
 
     #[test]
     fn nested_colons_only_strip_first() {
         // "Bad gateway: Internal error: API Error: ..." → keep everything after the first ": "
-        let err = AppError::BadGateway("Internal error: API Error: Internal server error".into());
+        let err = AgentError::bad_gateway("Internal error: API Error: Internal server error");
         assert_eq!(
             user_facing_message(&err),
             "Internal error: API Error: Internal server error"
@@ -908,7 +991,7 @@ mod tests {
         spawn_with_stderr_and_exit(stderr_payload, 0).await
     }
 
-    async fn augment_via_process(proc: &Arc<CliAgentProcess>, err: &AppError) -> Option<String> {
+    async fn augment_via_process(proc: &Arc<CliAgentProcess>, err: &AgentError) -> Option<String> {
         const SDK_DEFAULT_BAD_GATEWAY_PREFIX: &str = "Bad gateway: Agent internal error (code ";
         let display = err.to_string();
         let is_default_internal = display.starts_with(SDK_DEFAULT_BAD_GATEWAY_PREFIX) && display.ends_with(')');
@@ -924,7 +1007,7 @@ mod tests {
     async fn augments_when_codex_usage_limit_in_stderr() {
         let stderr = "\u{1b}[2m2026-05-13T20:01:21Z\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m codex_acp::thread: Unhandled error during turn: You've hit your usage limit. Try again later. Some(UsageLimitExceeded)";
         let proc = spawn_with_stderr(stderr).await;
-        let err = AppError::BadGateway("Agent internal error (code -32603)".into());
+        let err = AgentError::bad_gateway("Agent internal error (code -32603)");
 
         let augmented = augment_via_process(&proc, &err).await;
         let msg = augmented.expect("must augment when stderr matches allowlist");
@@ -935,7 +1018,7 @@ mod tests {
     async fn does_not_augment_when_message_is_specific() {
         // 1BF case: SDK already gave us a real message → don't second-guess.
         let proc = spawn_with_stderr("ERROR something: usage limit exceeded").await;
-        let err = AppError::BadGateway("Internal error: API Error: Internal server error".into());
+        let err = AgentError::bad_gateway("Internal error: API Error: Internal server error");
 
         assert!(augment_via_process(&proc, &err).await.is_none());
     }
@@ -944,7 +1027,7 @@ mod tests {
     async fn returns_none_when_stderr_has_no_allowlisted_keywords() {
         let stderr = "ERROR widget_loader: failed to load module 'foo'";
         let proc = spawn_with_stderr(stderr).await;
-        let err = AppError::BadGateway("Agent internal error (code -32603)".into());
+        let err = AgentError::bad_gateway("Agent internal error (code -32603)");
 
         assert!(augment_via_process(&proc, &err).await.is_none());
     }

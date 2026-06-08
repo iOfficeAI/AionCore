@@ -30,6 +30,7 @@ use std::process::Stdio;
 
 use tokio::process::{Child, Command};
 
+use crate::ResolvedCommand;
 use crate::resolver::resolve_command_path;
 
 /// Construction mode — determines default stdio + env extras.
@@ -124,6 +125,23 @@ impl Builder {
         }
     }
 
+    /// Builder from a fully resolved command plan.
+    ///
+    /// This bypasses `resolve_command_path` and uses the provided
+    /// `program + args_prefix + env` directly.
+    pub fn from_resolved(resolved: &ResolvedCommand) -> Self {
+        let mut inner = Command::new(&resolved.program);
+        inner.kill_on_drop(true);
+        configure_platform_spawn(&mut inner);
+        strip_pollution(&mut inner);
+        inner.args(&resolved.args_prefix);
+        inner.envs(resolved.env.iter().cloned());
+        Self {
+            inner,
+            mode: Mode::Default,
+        }
+    }
+
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
         self.inner.arg(arg);
         self
@@ -154,6 +172,11 @@ impl Builder {
         V: AsRef<OsStr>,
     {
         self.inner.envs(vars);
+        self
+    }
+
+    pub fn env_clear(&mut self) -> &mut Self {
+        self.inner.env_clear();
         self
     }
 
@@ -283,15 +306,18 @@ fn resolve_program(program: &OsStr) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ResolvedCommand;
     use std::time::{Duration, Instant};
 
     #[tokio::test]
     async fn clean_cli_captures_stdout_and_strips_env_pollution() {
-        // Set pollution on parent — it must not leak into child.
-        // SAFETY: single-threaded test. Rust 2024 requires unsafe.
-        unsafe {
-            std::env::set_var("NODE_OPTIONS", "--inspect=9229");
-            std::env::set_var("CLAUDECODE", "1");
+        if !crate::test_support::run_in_env_child(
+            "spawn::tests::clean_cli_captures_stdout_and_strips_env_pollution",
+            |command| {
+                command.env("NODE_OPTIONS", "--inspect=9229").env("CLAUDECODE", "1");
+            },
+        ) {
+            return;
         }
 
         // Ask the child to print NODE_OPTIONS + CLAUDECODE; Builder must
@@ -305,12 +331,6 @@ mod tests {
         assert!(stdout.contains("NO:unset"), "got: {stdout}");
         assert!(stdout.contains("CC:unset"), "got: {stdout}");
         assert!(output.status.success());
-
-        // SAFETY: single-threaded test cleanup.
-        unsafe {
-            std::env::remove_var("NODE_OPTIONS");
-            std::env::remove_var("CLAUDECODE");
-        }
     }
 
     #[tokio::test]
@@ -338,10 +358,10 @@ mod tests {
 
     #[tokio::test]
     async fn agent_strips_env_pollution() {
-        // SAFETY: single-threaded test.
-        unsafe {
-            std::env::set_var("NODE_INSPECT", "9229");
-            std::env::set_var("NODE_DEBUG", "*");
+        if !crate::test_support::run_in_env_child("spawn::tests::agent_strips_env_pollution", |command| {
+            command.env("NODE_INSPECT", "9229").env("NODE_DEBUG", "*");
+        }) {
+            return;
         }
 
         let mut b = Builder::new("sh");
@@ -353,12 +373,6 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("NI:unset"), "got: {stdout}");
         assert!(stdout.contains("ND:unset"), "got: {stdout}");
-
-        // SAFETY: single-threaded cleanup.
-        unsafe {
-            std::env::remove_var("NODE_INSPECT");
-            std::env::remove_var("NODE_DEBUG");
-        }
     }
 
     #[tokio::test]
@@ -369,6 +383,23 @@ mod tests {
         assert!(child.id().is_some());
         let status = child.wait().await.unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn resolved_command_builder_applies_prefix_and_env() {
+        let resolved = ResolvedCommand {
+            program: "/bin/echo".into(),
+            args_prefix: vec!["hello".into()],
+            env: vec![("NO_COLOR".into(), "1".into())],
+        };
+
+        let builder = Builder::from_resolved(&resolved);
+        let preview = builder.to_string();
+        assert!(
+            preview.contains("hello"),
+            "preview should include args prefix: {preview}"
+        );
+        assert!(preview.contains("NO_COLOR=\"1\"") || preview.contains("NO_COLOR=1"));
     }
 
     #[test]

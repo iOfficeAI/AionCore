@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
 use aionui_api_types::AgentMetadata;
-use aionui_common::{AppError, ErrorChain};
+use aionui_common::ErrorChain;
 use tokio::fs;
 use tracing::{info, warn};
+
+use crate::error::AgentError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CodexSandboxMode {
@@ -86,31 +88,31 @@ async fn sync_for_agent_at_path(
     }
 }
 
-async fn write_codex_sandbox_mode_to_path(mode: CodexSandboxMode, path: &std::path::Path) -> Result<(), AppError> {
+async fn write_codex_sandbox_mode_to_path(mode: CodexSandboxMode, path: &std::path::Path) -> Result<(), AgentError> {
     let content = fs::read_to_string(&path).await.unwrap_or_default();
     let rendered = render_config_with_sandbox_mode(&content, mode.as_str());
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to create Codex config directory: {}", ErrorChain(&e))))?;
+        fs::create_dir_all(parent).await.map_err(|e| {
+            AgentError::internal(format!("Failed to create Codex config directory: {}", ErrorChain(&e)))
+        })?;
     }
 
     fs::write(&path, rendered)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to write Codex sandbox config: {}", ErrorChain(&e))))?;
+        .map_err(|e| AgentError::internal(format!("Failed to write Codex sandbox config: {}", ErrorChain(&e))))?;
     Ok(())
 }
 
-fn codex_config_path() -> Result<PathBuf, AppError> {
+fn codex_config_path() -> Result<PathBuf, AgentError> {
     if let Some(home) = std::env::var_os("CODEX_HOME")
         && !home.is_empty()
     {
         return Ok(PathBuf::from(home).join("config.toml"));
     }
 
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::Internal("Failed to resolve home directory for Codex config".into()))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| AgentError::internal("Failed to resolve home directory for Codex config"))?;
     Ok(home.join(".codex").join("config.toml"))
 }
 

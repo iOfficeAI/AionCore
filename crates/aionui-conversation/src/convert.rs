@@ -2,11 +2,12 @@ use std::path::Path;
 
 use aionui_api_types::{ConversationArtifactResponse, ConversationResponse, MessageResponse, MessageSearchItem};
 use aionui_common::{
-    AgentType, AppError, ConversationSource, ConversationStatus, MessagePosition, MessageStatus, MessageType,
-    ProviderWithModel,
+    AgentType, ConversationSource, ConversationStatus, MessagePosition, MessageStatus, MessageType, ProviderWithModel,
 };
 use aionui_db::MessageSearchRow;
 use aionui_db::models::{ConversationArtifactRow, ConversationRow, MessageRow};
+
+use crate::ConversationError;
 
 pub(crate) const TOOL_CONTENT_COMPACT_THRESHOLD_BYTES: usize = 64 * 1024;
 const TOOL_CONTENT_PREVIEW_CHARS: usize = 4096;
@@ -17,9 +18,9 @@ const TOOL_CONTENT_PREVIEW_CHARS: usize = 4096;
 /// `data_dir` is required so the response can expose a derived
 /// `is_temporary_workspace` flag without storing that attribute on disk —
 /// see [`row_to_response_with_extra`].
-pub fn row_to_response(row: ConversationRow, data_dir: &Path) -> Result<ConversationResponse, AppError> {
-    let extra: serde_json::Value =
-        serde_json::from_str(&row.extra).map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
+pub fn row_to_response(row: ConversationRow, data_dir: &Path) -> Result<ConversationResponse, ConversationError> {
+    let extra: serde_json::Value = serde_json::from_str(&row.extra)
+        .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
     row_to_response_with_extra(row, extra, data_dir)
 }
 
@@ -37,7 +38,7 @@ pub fn row_to_response_with_extra(
     row: ConversationRow,
     mut extra: serde_json::Value,
     data_dir: &Path,
-) -> Result<ConversationResponse, AppError> {
+) -> Result<ConversationResponse, ConversationError> {
     let is_temporary_workspace = {
         let ws = extra.get("workspace").and_then(|v| v.as_str()).unwrap_or("");
         !ws.is_empty() && Path::new(ws).starts_with(data_dir)
@@ -83,9 +84,9 @@ pub fn row_to_response_with_extra(
 /// field that can be an array of model objects. The backend only needs
 /// `provider_id`, `model` (the selected model name), and `use_model`.
 /// Accepts both snake_case and legacy camelCase key names for backward compatibility.
-fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, AppError> {
+fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, ConversationError> {
     let v: serde_json::Value =
-        serde_json::from_str(s).map_err(|e| AppError::Internal(format!("Invalid model JSON: {e}")))?;
+        serde_json::from_str(s).map_err(|e| ConversationError::internal(format!("Invalid model JSON: {e}")))?;
 
     if let Some(provider_id) = v
         .get("provider_id")
@@ -118,7 +119,7 @@ fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, AppError> {
         });
     }
 
-    Err(AppError::Internal(format!(
+    Err(ConversationError::internal(format!(
         "Model JSON missing both 'provider_id'/'providerId' and 'id': {s}"
     )))
 }
@@ -126,13 +127,13 @@ fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, AppError> {
 /// Parse a DB string value into a typed enum via serde.
 ///
 /// e.g. `"acp"` → `AgentType::Acp`
-pub fn string_to_enum<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, AppError> {
+pub fn string_to_enum<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, ConversationError> {
     serde_json::from_value(serde_json::Value::String(s.to_owned()))
-        .map_err(|e| AppError::Internal(format!("Invalid enum value '{s}': {e}")))
+        .map_err(|e| ConversationError::internal(format!("Invalid enum value '{s}': {e}")))
 }
 
 /// Convert a message database row into an API response DTO.
-pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, AppError> {
+pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, ConversationError> {
     let msg_type: MessageType = string_to_enum(&row.r#type)?;
 
     let position: Option<MessagePosition> = row.position.as_deref().map(string_to_enum).transpose()?;
@@ -140,7 +141,7 @@ pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, AppEr
     let status: Option<MessageStatus> = row.status.as_deref().map(string_to_enum).transpose()?;
 
     let content: serde_json::Value = serde_json::from_str(&row.content)
-        .map_err(|e| AppError::Internal(format!("Invalid message content JSON: {e}")))?;
+        .map_err(|e| ConversationError::internal(format!("Invalid message content JSON: {e}")))?;
 
     Ok(MessageResponse {
         id: row.id,
@@ -156,7 +157,7 @@ pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, AppEr
 }
 
 /// Convert a message row for history-list use, compacting oversized tool payloads.
-pub fn row_to_message_response_compact(row: MessageRow) -> Result<MessageResponse, AppError> {
+pub fn row_to_message_response_compact(row: MessageRow) -> Result<MessageResponse, ConversationError> {
     let original_size = row.content.len();
     let mut response = row_to_message_response(row)?;
     if !is_tool_message(response.r#type) || original_size <= TOOL_CONTENT_COMPACT_THRESHOLD_BYTES {
@@ -208,11 +209,13 @@ fn truncate_large_strings(value: &mut serde_json::Value, max_chars: usize, trunc
 }
 
 /// Convert an artifact database row into an API response DTO.
-pub fn row_to_artifact_response(row: ConversationArtifactRow) -> Result<ConversationArtifactResponse, AppError> {
+pub fn row_to_artifact_response(
+    row: ConversationArtifactRow,
+) -> Result<ConversationArtifactResponse, ConversationError> {
     let kind = string_to_enum(&row.kind)?;
     let status = string_to_enum(&row.status)?;
     let payload: serde_json::Value = serde_json::from_str(&row.payload)
-        .map_err(|e| AppError::Internal(format!("Invalid artifact payload JSON: {e}")))?;
+        .map_err(|e| ConversationError::internal(format!("Invalid artifact payload JSON: {e}")))?;
 
     Ok(ConversationArtifactResponse {
         id: row.id,
@@ -271,7 +274,7 @@ fn extract_preview_text(raw_content: &str) -> String {
 }
 
 /// Convert a search result row into an API search item DTO.
-pub fn search_row_to_item(row: MessageSearchRow, data_dir: &Path) -> Result<MessageSearchItem, AppError> {
+pub fn search_row_to_item(row: MessageSearchRow, data_dir: &Path) -> Result<MessageSearchItem, ConversationError> {
     let conversation_row = ConversationRow {
         id: row.conversation_id,
         user_id: String::new(),
@@ -362,7 +365,7 @@ mod tests {
     fn row_to_response_invalid_type() {
         let row = make_row("invalid", "pending", None, None, "{}");
         let err = row_to_response(row, Path::new("/tmp/data")).unwrap_err();
-        assert!(matches!(err, AppError::Internal(_)));
+        assert!(matches!(err, ConversationError::Internal { .. }));
     }
 
     #[test]
@@ -383,7 +386,7 @@ mod tests {
             updated_at: 2000,
         };
         let err = row_to_response(row, Path::new("/tmp/data")).unwrap_err();
-        assert!(matches!(err, AppError::Internal(_)));
+        assert!(matches!(err, ConversationError::Internal { .. }));
     }
 
     #[test]
@@ -401,7 +404,7 @@ mod tests {
     #[test]
     fn string_to_enum_invalid() {
         let err = string_to_enum::<AgentType>("not_valid").unwrap_err();
-        assert!(matches!(err, AppError::Internal(_)));
+        assert!(matches!(err, ConversationError::Internal { .. }));
     }
 
     #[test]
@@ -589,7 +592,7 @@ mod tests {
         };
 
         let err = search_row_to_item(row, Path::new("/tmp/data")).unwrap_err();
-        assert!(matches!(err, AppError::Internal(_)));
+        assert!(matches!(err, ConversationError::Internal { .. }));
     }
 
     #[test]
@@ -614,6 +617,6 @@ mod tests {
         };
 
         let err = search_row_to_item(row, Path::new("/tmp/data")).unwrap_err();
-        assert!(matches!(err, AppError::Internal(_)));
+        assert!(matches!(err, ConversationError::Internal { .. }));
     }
 }

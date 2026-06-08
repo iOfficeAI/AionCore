@@ -10,7 +10,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::broadcaster::EventBroadcaster;
-use crate::types::{ClientInfo, ConnectionId, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, WebSocketCloseCode, WsOutbound};
+use crate::types::{
+    ClientInfo, ConnectionId, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, RealtimeError, WebSocketCloseCode, WsOutbound,
+};
 
 /// Validates whether a JWT token is still valid.
 /// Returns `true` if the token is valid, `false` if expired or revoked.
@@ -65,8 +67,10 @@ impl WebSocketManager {
 
     /// Send a message to all connected clients.
     ///
-    /// Uses `try_send` for backpressure — full channels drop the message
-    /// with a warning; closed channels trigger client removal.
+    /// Uses `try_send` for backpressure. A saturated channel cannot reliably
+    /// receive an additional `REALTIME_BACKPRESSURE` event on the same path, so
+    /// broadcast backpressure is logged and the connection is left alive.
+    /// Closed channels trigger client removal.
     pub fn broadcast_all(&self, msg: WebSocketMessage<serde_json::Value>) {
         let text = match serde_json::to_string(&msg) {
             Ok(t) => t,
@@ -82,7 +86,11 @@ impl WebSocketManager {
             match entry.value().tx.try_send(WsOutbound::Text(text.clone())) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(%conn_id, "outbound channel full, message dropped");
+                    warn!(
+                        %conn_id,
+                        code = RealtimeError::Backpressure.code(),
+                        "outbound channel full, broadcast message dropped"
+                    );
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     disconnected.push(conn_id);
@@ -113,13 +121,19 @@ impl WebSocketManager {
 
     /// Send a raw outbound message to a specific connection.
     ///
-    /// Used for non-`WebSocketMessage` payloads (e.g. error responses).
+    /// Used for non-`WebSocketMessage` payloads (e.g. error responses). A full
+    /// channel cannot receive a send-failure event through the same queue, so
+    /// backpressure is logged as the downgrade path.
     pub fn send_raw_to(&self, conn_id: ConnectionId, outbound: WsOutbound) {
         if let Some(client) = self.connections.get(&conn_id) {
             match client.tx.try_send(outbound) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(%conn_id, "outbound channel full, message dropped");
+                    warn!(
+                        %conn_id,
+                        code = RealtimeError::SendFailed.code(),
+                        "outbound channel full, raw message dropped"
+                    );
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     drop(client);
@@ -133,7 +147,7 @@ impl WebSocketManager {
     ///
     /// Every `HEARTBEAT_INTERVAL` (30s), iterates all connections:
     /// 1. Timeout check — closes connections with no pong for `HEARTBEAT_TIMEOUT`
-    /// 2. Token expiry — validates token and sends `auth-expired` if invalid
+    /// 2. Token expiry — validates token and sends `realtime.error` if invalid
     /// 3. Sends a `ping` message with current timestamp
     ///
     /// Returns a `JoinHandle` — abort it to stop the heartbeat loop.
@@ -173,9 +187,10 @@ fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validat
         // 1. Heartbeat timeout
         if now.duration_since(client.last_ping) > HEARTBEAT_TIMEOUT {
             info!(%conn_id, "heartbeat timeout, closing connection");
-            let _ = client.tx.try_send(WsOutbound::Close(
-                WebSocketCloseCode::PolicyViolation,
-                "heartbeat timeout".into(),
+            let _ = client.tx.try_send(terminal_realtime_error(
+                conn_id,
+                RealtimeError::HeartbeatTimeout,
+                "heartbeat timeout",
             ));
             to_remove.push(conn_id);
             continue;
@@ -184,15 +199,21 @@ fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validat
         // 2. Token expiry
         if !token_validator(&client.token) {
             info!(%conn_id, "token expired, closing connection");
-            let auth_expired = WebSocketMessage::new("auth-expired", json!({"message": "Token expired"}));
-            if let Ok(text) = serde_json::to_string(&auth_expired) {
-                let _ = client.tx.try_send(WsOutbound::Text(text));
+            let outbound = terminal_realtime_error(conn_id, RealtimeError::AuthExpired, "token expired");
+
+            match client.tx.try_send(outbound) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                    to_remove.push(conn_id);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        %conn_id,
+                        code = RealtimeError::Backpressure.code(),
+                        "outbound channel full, terminal auth close dropped"
+                    );
+                    to_remove.push(conn_id);
+                }
             }
-            let _ = client.tx.try_send(WsOutbound::Close(
-                WebSocketCloseCode::PolicyViolation,
-                "token expired".into(),
-            ));
-            to_remove.push(conn_id);
             continue;
         }
 
@@ -220,6 +241,16 @@ fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validat
     }
 }
 
+fn terminal_realtime_error(conn_id: ConnectionId, error: RealtimeError, reason: &str) -> WsOutbound {
+    match serde_json::to_string(&error.into_event()) {
+        Ok(text) => WsOutbound::TextThenClose(text, WebSocketCloseCode::PolicyViolation, reason.into()),
+        Err(e) => {
+            warn!(%conn_id, error = %e, code = error.code(), "failed to serialize terminal realtime error");
+            WsOutbound::Close(WebSocketCloseCode::PolicyViolation, reason.into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +266,24 @@ mod tests {
 
     fn new_client_tx() -> (mpsc::Sender<WsOutbound>, mpsc::Receiver<WsOutbound>) {
         mpsc::channel(PER_CONNECTION_BUFFER)
+    }
+
+    fn assert_realtime_auth_expired(text: &str) {
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["name"], "realtime.error");
+        assert_eq!(parsed["data"]["code"], "REALTIME_AUTH_EXPIRED");
+        assert!(parsed["data"]["message"].is_string());
+        assert_eq!(parsed["data"]["recoverable"], false);
+        assert!(parsed["data"]["details"].is_object());
+    }
+
+    fn assert_realtime_heartbeat_timeout(text: &str) {
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["name"], "realtime.error");
+        assert_eq!(parsed["data"]["code"], "REALTIME_HEARTBEAT_TIMEOUT");
+        assert!(parsed["data"]["message"].is_string());
+        assert_eq!(parsed["data"]["recoverable"], false);
+        assert!(parsed["data"]["details"].is_object());
     }
 
     #[test]
@@ -438,12 +487,16 @@ mod tests {
         // Connection should be removed
         assert_eq!(connections.len(), 0);
 
-        // Should have received a close frame
+        // Should have received realtime heartbeat-timeout event and close as one terminal outbound.
         let msg = rx.try_recv().unwrap();
-        assert_eq!(
-            msg,
-            WsOutbound::Close(WebSocketCloseCode::PolicyViolation, "heartbeat timeout".into())
-        );
+        match msg {
+            WsOutbound::TextThenClose(text, code, reason) => {
+                assert_realtime_heartbeat_timeout(&text);
+                assert_eq!(code, WebSocketCloseCode::PolicyViolation);
+                assert_eq!(reason, "heartbeat timeout");
+            }
+            other => panic!("expected realtime heartbeat-timeout terminal message, got {other:?}"),
+        }
     }
 
     #[test]
@@ -465,21 +518,39 @@ mod tests {
         // Connection should be removed
         assert_eq!(connections.len(), 0);
 
-        // Should have received auth-expired event then close
+        // Should have received realtime auth-expired event and close as one terminal outbound.
         let msg1 = rx.try_recv().unwrap();
         match msg1 {
-            WsOutbound::Text(text) => {
-                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["name"], "auth-expired");
+            WsOutbound::TextThenClose(text, code, reason) => {
+                assert_realtime_auth_expired(&text);
+                assert_eq!(code, WebSocketCloseCode::PolicyViolation);
+                assert_eq!(reason, "token expired");
             }
-            _ => panic!("expected auth-expired Text"),
+            _ => panic!("expected realtime auth-expired terminal message"),
         }
+        assert!(rx.try_recv().is_err());
+    }
 
-        let msg2 = rx.try_recv().unwrap();
-        assert_eq!(
-            msg2,
-            WsOutbound::Close(WebSocketCloseCode::PolicyViolation, "token expired".into())
+    #[test]
+    fn heartbeat_tick_removes_expired_token_connection_when_terminal_queue_is_full() {
+        let connections = Arc::new(DashMap::new());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        tx.try_send(WsOutbound::Text("queued".into())).unwrap();
+        connections.insert(
+            ConnectionId(1),
+            ClientInfo {
+                token: "expired-token".into(),
+                last_ping: Instant::now(),
+                tx,
+            },
         );
+
+        heartbeat_tick(&connections, &always_expired());
+
+        assert_eq!(connections.len(), 0);
+        assert_eq!(rx.try_recv().unwrap(), WsOutbound::Text("queued".into()));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -502,12 +573,16 @@ mod tests {
 
         assert_eq!(connections.len(), 0);
 
-        // Only close frame from timeout (no auth-expired text)
+        // Only heartbeat timeout terminal message (no auth-expired event)
         let msg = rx.try_recv().unwrap();
-        assert_eq!(
-            msg,
-            WsOutbound::Close(WebSocketCloseCode::PolicyViolation, "heartbeat timeout".into())
-        );
+        match msg {
+            WsOutbound::TextThenClose(text, code, reason) => {
+                assert_realtime_heartbeat_timeout(&text);
+                assert_eq!(code, WebSocketCloseCode::PolicyViolation);
+                assert_eq!(reason, "heartbeat timeout");
+            }
+            other => panic!("expected realtime heartbeat-timeout terminal message, got {other:?}"),
+        }
         // No more messages
         assert!(rx.try_recv().is_err());
     }

@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use aionui_common::{AppError, Confirmation};
+use aionui_common::Confirmation;
 use serde_json::{Value, json};
 use tracing::warn;
 
+use crate::error::AgentError;
 use crate::shared_kernel::approval_key;
 
 use super::OpenClawAgentManager;
@@ -12,7 +13,7 @@ use super::OpenClawAgentManager;
 /// matches in the routes + services (e.g. `persist_session_key` uses
 /// `get_session_key`, and `get_openclaw_runtime` calls `get_diagnostics`).
 impl OpenClawAgentManager {
-    pub fn confirm(&self, _msg_id: &str, call_id: &str, _data: Value, always_allow: bool) -> Result<(), AppError> {
+    pub fn confirm(&self, _msg_id: &str, call_id: &str, _data: Value, always_allow: bool) -> Result<(), AgentError> {
         if let Ok(mut state) = self.state.try_write() {
             if always_allow && let Some(conf) = state.confirmations.iter().find(|c| c.call_id == call_id) {
                 let key = approval_key(conf.action.as_deref(), conf.command_type.as_deref());

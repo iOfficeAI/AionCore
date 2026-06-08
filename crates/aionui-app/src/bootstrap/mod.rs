@@ -6,7 +6,9 @@
 
 mod builtin_skills;
 mod environment;
+mod error;
 mod tracing_init;
 mod work_dir;
 
 pub use environment::{ServerEnvironment, init_data_layer, init_environment};
+pub(crate) use error::{BootstrapError, BootstrapErrorCode};

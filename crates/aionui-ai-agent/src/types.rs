@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use aionui_common::{AgentType, ProviderWithModel};
+use crate::session_context::AgentSessionContext;
 
 /// Data payload for sending a user message to an Agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,19 +21,19 @@ pub struct SendMessageData {
 }
 
 /// Options for building (creating or resuming) an Agent task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct BuildTaskOptions {
-    /// Type of agent to create.
-    pub agent_type: AgentType,
-    /// Working directory for the agent.
-    pub workspace: String,
-    /// Model selection config.
-    pub model: ProviderWithModel,
-    /// Conversation ID this task belongs to.
-    pub conversation_id: String,
-    /// Type-specific extra parameters (JSON object).
-    #[serde(default)]
-    pub extra: serde_json::Value,
+    pub context: AgentSessionContext,
+}
+
+impl BuildTaskOptions {
+    pub fn new(context: AgentSessionContext) -> Self {
+        Self { context }
+    }
+
+    pub fn conversation_id(&self) -> &str {
+        self.context.conversation_id()
+    }
 }
 
 /// Provider-specific compat overrides resolved in the factory.
@@ -144,25 +144,6 @@ mod tests {
         let data: SendMessageData = serde_json::from_value(json).unwrap();
         assert!(data.files.is_empty());
         assert!(data.inject_skills.is_empty());
-    }
-
-    #[test]
-    fn build_task_options_serde() {
-        let opts = BuildTaskOptions {
-            agent_type: AgentType::Acp,
-            workspace: "/project".into(),
-            model: ProviderWithModel {
-                provider_id: "p1".into(),
-                model: "claude-sonnet".into(),
-                use_model: None,
-            },
-            conversation_id: "conv-1".into(),
-            extra: json!({ "backend": "claude" }),
-        };
-        let json = serde_json::to_value(&opts).unwrap();
-        assert_eq!(json["agent_type"], "acp");
-        assert_eq!(json["workspace"], "/project");
-        assert_eq!(json["conversation_id"], "conv-1");
     }
 
     #[test]

@@ -4,9 +4,10 @@ mod url_fixer;
 use std::sync::Arc;
 
 use aionui_api_types::{BedrockConfig, FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse};
-use aionui_common::{AppError, decrypt_string};
+use aionui_common::decrypt_string;
 use aionui_db::IProviderRepository;
 
+use crate::error::SystemError;
 use crate::provider::deserialize_opt;
 
 /// Internal configuration extracted from a provider row for model fetching.
@@ -42,7 +43,7 @@ impl ModelFetchService {
         &self,
         provider_id: &str,
         req: &FetchModelsRequest,
-    ) -> Result<FetchModelsResponse, AppError> {
+    ) -> Result<FetchModelsResponse, SystemError> {
         let config = self.load_provider_config(provider_id).await?;
         self.fetch_with_config(&config, req.try_fix).await
     }
@@ -53,7 +54,7 @@ impl ModelFetchService {
     pub async fn fetch_models_anonymous(
         &self,
         req: &FetchModelsAnonymousRequest,
-    ) -> Result<FetchModelsResponse, AppError> {
+    ) -> Result<FetchModelsResponse, SystemError> {
         validate_anonymous_request(req)?;
         let config = FetchConfig {
             platform: req.platform.clone(),
@@ -66,7 +67,7 @@ impl ModelFetchService {
 
     /// Shared fetch+try_fix branch used by both the by-id and anonymous
     /// entry points.
-    async fn fetch_with_config(&self, config: &FetchConfig, try_fix: bool) -> Result<FetchModelsResponse, AppError> {
+    async fn fetch_with_config(&self, config: &FetchConfig, try_fix: bool) -> Result<FetchModelsResponse, SystemError> {
         match fetchers::fetch_for_platform(&self.http_client, config).await {
             Ok(models) => Ok(FetchModelsResponse {
                 models,
@@ -80,16 +81,16 @@ impl ModelFetchService {
     }
 
     /// Extract and decrypt provider configuration from DB.
-    async fn load_provider_config(&self, provider_id: &str) -> Result<FetchConfig, AppError> {
+    async fn load_provider_config(&self, provider_id: &str) -> Result<FetchConfig, SystemError> {
         let row = self
             .repo
             .find_by_id(provider_id)
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("Provider {provider_id} not found")))?;
+            .ok_or_else(|| SystemError::NotFound(format!("Provider {provider_id} not found")))?;
 
         let api_key = decrypt_string(&row.api_key_encrypted, &self.encryption_key)?;
         if api_key.trim().is_empty() {
-            return Err(AppError::BadRequest("API key is empty".into()));
+            return Err(SystemError::BadRequest("API key is empty".into()));
         }
 
         let bedrock_config: Option<BedrockConfig> = deserialize_opt(&row.bedrock_config, "bedrock_config")?;
@@ -105,16 +106,16 @@ impl ModelFetchService {
 
 /// Validate a `FetchModelsAnonymousRequest` — platform / base_url / api_key
 /// must all be non-empty after trim.
-fn validate_anonymous_request(req: &FetchModelsAnonymousRequest) -> Result<(), AppError> {
+fn validate_anonymous_request(req: &FetchModelsAnonymousRequest) -> Result<(), SystemError> {
     if req.platform.trim().is_empty() {
-        return Err(AppError::BadRequest("platform is required".into()));
+        return Err(SystemError::BadRequest("platform is required".into()));
     }
     if req.base_url.trim().is_empty() {
-        return Err(AppError::BadRequest("baseUrl is required".into()));
+        return Err(SystemError::BadRequest("baseUrl is required".into()));
     }
     // Bedrock uses bedrock_config for credentials; empty api_key is allowed there.
     if req.platform != "bedrock" && req.api_key.trim().is_empty() {
-        return Err(AppError::BadRequest("apiKey is required".into()));
+        return Err(SystemError::BadRequest("apiKey is required".into()));
     }
     Ok(())
 }
@@ -189,7 +190,7 @@ mod tests {
     async fn load_config_nonexistent_provider_returns_not_found() {
         let (svc, _db) = setup().await;
         let err = svc.load_provider_config("no_such_id").await.unwrap_err();
-        assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
+        assert!(matches!(err, SystemError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -197,7 +198,7 @@ mod tests {
         let (svc, db) = setup().await;
         let id = create_provider(&db, "openai", "https://api.openai.com", "   ").await;
         let err = svc.load_provider_config(&id).await.unwrap_err();
-        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(matches!(err, SystemError::BadRequest(_)));
     }
 
     #[tokio::test]
@@ -235,7 +236,7 @@ mod tests {
         let (svc, _db) = setup().await;
         let req = FetchModelsRequest { try_fix: false };
         let err = svc.fetch_models("no_such_id", &req).await.unwrap_err();
-        assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
+        assert!(matches!(err, SystemError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -264,7 +265,7 @@ mod tests {
             try_fix: false,
         };
         let err = svc.fetch_models_anonymous(&req).await.unwrap_err();
-        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(matches!(err, SystemError::BadRequest(_)));
     }
 
     #[tokio::test]
@@ -278,7 +279,7 @@ mod tests {
             try_fix: false,
         };
         let err = svc.fetch_models_anonymous(&req).await.unwrap_err();
-        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(matches!(err, SystemError::BadRequest(_)));
     }
 
     #[tokio::test]

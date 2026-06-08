@@ -655,19 +655,21 @@ async fn batch_import_with_invalid_config_returns_400() {
 }
 
 // ===========================================================================
-// AU-1: Auth required (CSRF middleware returns 403 before auth checks)
+// AU-1: Auth required
 // ===========================================================================
 
 #[tokio::test]
 async fn unauthenticated_access_is_rejected() {
     let (app, _services) = build_app().await;
 
-    // GET without token — CSRF middleware rejects before auth can run
+    // GET without token — auth middleware rejects with the canonical auth boundary.
     let req = axum::http::Request::builder()
         .method("GET")
         .uri("/api/mcp/servers")
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }

@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_types)]
+
 //! Extension registry: manifest parsing, hub installer, skill scanning, and lifecycle hooks.
 
 mod asset_paths;

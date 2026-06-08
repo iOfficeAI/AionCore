@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use aionui_api_types::{
     DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig, SpeechToTextConfig, SpeechToTextProvider,
 };
@@ -486,24 +488,24 @@ async fn deepgram_with_all_optional_flags() {
 }
 
 // ---------------------------------------------------------------------------
-// SttError → AppError conversion (black-box integration test)
+// SttError → ApiError conversion (black-box integration test)
 // ---------------------------------------------------------------------------
 #[test]
-fn stt_error_to_app_error_mapping() {
-    use aionui_common::AppError;
+fn stt_error_to_api_error_mapping() {
+    use aionui_common::ApiError;
 
-    let err: AppError = SttError::Disabled.into();
-    assert!(matches!(err, AppError::BadRequest(_)));
+    let err: ApiError = SttError::Disabled.into();
+    assert!(matches!(err, ApiError::BadRequest(_)));
 
-    let err: AppError = SttError::OpenaiNotConfigured.into();
-    assert!(matches!(err, AppError::BadRequest(_)));
+    let err: ApiError = SttError::OpenaiNotConfigured.into();
+    assert!(matches!(err, ApiError::BadRequest(_)));
 
-    let err: AppError = SttError::DeepgramNotConfigured.into();
-    assert!(matches!(err, AppError::BadRequest(_)));
+    let err: ApiError = SttError::DeepgramNotConfigured.into();
+    assert!(matches!(err, ApiError::BadRequest(_)));
 
-    let err: AppError = SttError::RequestFailed("upstream".into()).into();
-    assert!(matches!(err, AppError::BadGateway(_)));
+    let err: ApiError = SttError::RequestFailed("upstream".into()).into();
+    assert!(matches!(err, ApiError::BadGateway(_)));
 
-    let err: AppError = SttError::Unknown("bug".into()).into();
-    assert!(matches!(err, AppError::Internal(_)));
+    let err: ApiError = SttError::Unknown("bug".into()).into();
+    assert!(matches!(err, ApiError::Internal(_)));
 }

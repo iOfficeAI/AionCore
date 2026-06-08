@@ -37,7 +37,7 @@ async fn get_plugins_empty() {
     assert!(data.iter().all(|item| item["enabled"] == false));
 }
 
-// PS-3: Unauthenticated request returns 403
+// PS-3: Unauthenticated request returns 401
 #[tokio::test]
 async fn get_plugins_unauthenticated() {
     let (app, _services) = build_app().await;
@@ -48,7 +48,9 @@ async fn get_plugins_unauthenticated() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // EP-3: Enable missing pluginId fails

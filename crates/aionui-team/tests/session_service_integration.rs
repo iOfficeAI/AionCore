@@ -4,11 +4,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use aionui_ai_agent::session_context::{
+    AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
+};
 use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_ai_agent::{IWorkerTaskManager, WorkerTaskManagerImpl};
-use aionui_api_types::{AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
-use aionui_common::{AgentKillReason, AgentType, AppError, PaginatedResult, ProviderWithModel};
+use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
+use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
+use aionui_common::{AgentKillReason, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
     AcpSessionRow, AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
@@ -36,6 +39,14 @@ impl MockConversationRepo {
         Self {
             conversations: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn get_extra(&self, id: &str) -> Option<serde_json::Value> {
+        let convs = self.conversations.lock().unwrap();
+        convs
+            .iter()
+            .find(|c| c.id == id)
+            .and_then(|c| serde_json::from_str(&c.extra).ok())
     }
 }
 
@@ -464,11 +475,11 @@ impl IWorkerTaskManager for CountingTaskManager {
         &self,
         conversation_id: &str,
         options: BuildTaskOptions,
-    ) -> Result<aionui_ai_agent::AgentInstance, AppError> {
+    ) -> Result<aionui_ai_agent::AgentInstance, AgentError> {
         self.calls.lock().unwrap().build.push(conversation_id.to_owned());
         self.inner.get_or_build_task(conversation_id, options).await
     }
-    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         self.calls
             .lock()
             .unwrap()
@@ -499,10 +510,11 @@ impl IWorkerTaskManager for CountingTaskManager {
 // asks the task manager to kill + rebuild; the returned handle never has
 // `send_message` called on it.
 mod mock_agent {
+    use aionui_ai_agent::AgentError;
     use aionui_ai_agent::agent_task::{IAgentTask, IMockAgent};
     use aionui_ai_agent::protocol::events::AgentStreamEvent;
     use aionui_ai_agent::types::SendMessageData;
-    use aionui_common::{AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs};
+    use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs};
     use tokio::sync::broadcast;
 
     pub struct MockAgent {
@@ -555,10 +567,10 @@ mod mock_agent {
         async fn send_message(&self, _data: SendMessageData) -> Result<(), aionui_ai_agent::AgentSendError> {
             Ok(())
         }
-        async fn cancel(&self) -> Result<(), AppError> {
+        async fn cancel(&self) -> Result<(), AgentError> {
             Ok(())
         }
-        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
             Ok(())
         }
     }
@@ -575,7 +587,7 @@ fn success_factory() -> AgentFactory {
     Arc::new(|opts: BuildTaskOptions| {
         async move {
             Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
-                mock_agent::MockAgent::new(opts.conversation_id, opts.workspace),
+                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
             )))
         }
         .boxed()
@@ -599,10 +611,42 @@ fn confirmations_factory(count: usize) -> AgentFactory {
             .collect::<Vec<_>>();
         async move {
             Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
-                mock_agent::MockAgent::with_confirmations(opts.conversation_id, opts.workspace, confirmations),
+                mock_agent::MockAgent::with_confirmations(
+                    opts.context.conversation.conversation_id,
+                    opts.context.workspace.path,
+                    confirmations,
+                ),
             )))
         }
         .boxed()
+    })
+}
+
+fn test_acp_build_options(conversation_id: String, workspace: String) -> BuildTaskOptions {
+    BuildTaskOptions::new(AgentSessionContext {
+        conversation: ConversationContext {
+            conversation_id,
+            user_id: "user1".into(),
+            agent_type: aionui_common::AgentType::Acp,
+            source: None,
+        },
+        workspace: WorkspaceContext {
+            path: workspace.clone(),
+            stored_path: workspace,
+            is_custom: true,
+        },
+        model: ProviderWithModel {
+            provider_id: "test".into(),
+            model: "claude".into(),
+            use_model: None,
+        },
+        skills: Vec::new(),
+        kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
+            config: AcpBuildExtra::default(),
+            belongs_to_team: false,
+            session_id: None,
+            session_snapshot: None,
+        })),
     })
 }
 
@@ -642,8 +686,21 @@ fn setup_with_factory_and_metadata(
     factory: AgentFactory,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
 ) -> (Arc<TeamSessionService>, Arc<CountingTaskManager>) {
+    let (svc, task_manager, _) = setup_with_factory_and_metadata_and_conversation_repo(factory, agent_metadata_repo);
+    (svc, task_manager)
+}
+
+fn setup_with_factory_and_metadata_and_conversation_repo(
+    factory: AgentFactory,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<CountingTaskManager>,
+    Arc<MockConversationRepo>,
+) {
     let team_repo: Arc<dyn ITeamRepository> = Arc::new(FullMockTeamRepo::new());
-    let conv_repo: Arc<dyn IConversationRepository> = Arc::new(MockConversationRepo::new());
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let conv_repo_dyn: Arc<dyn IConversationRepository> = conv_repo.clone();
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
     let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
     let task_manager = Arc::new(CountingTaskManager::new(factory));
@@ -653,7 +710,7 @@ fn setup_with_factory_and_metadata(
         broadcaster.clone(),
         Arc::new(StubSkillResolver),
         task_manager_dyn.clone(),
-        conv_repo,
+        conv_repo_dyn,
         agent_metadata_repo.clone(),
         acp_session_repo,
     );
@@ -669,7 +726,7 @@ fn setup_with_factory_and_metadata(
         backend_binary_path,
         None,
     );
-    (svc, task_manager)
+    (svc, task_manager, conv_repo)
 }
 
 fn setup() -> Arc<TeamSessionService> {
@@ -1036,17 +1093,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
     task_manager
         .get_or_build_task(
             &conversation_id,
-            BuildTaskOptions {
-                agent_type: AgentType::Acp,
-                workspace: "/tmp/ws".into(),
-                model: ProviderWithModel {
-                    provider_id: "test".into(),
-                    model: "claude".into(),
-                    use_model: None,
-                },
-                conversation_id: conversation_id.clone(),
-                extra: serde_json::json!({}),
-            },
+            test_acp_build_options(conversation_id.clone(), "/tmp/ws".into()),
         )
         .await
         .unwrap();
@@ -1196,6 +1243,55 @@ async fn aa1_add_agent_to_team() {
 
     let got = svc.get_team(&created.id).await.unwrap();
     assert_eq!(got.agents.len(), 2);
+}
+
+#[tokio::test]
+async fn aa_add_agent_inherits_team_workspace() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+    let workspace = std::env::temp_dir().join(format!("aionui-team-workspace-{}", aionui_common::generate_id()));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.to_string_lossy().into_owned();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: "acp".into(),
+                    model: "claude".into(),
+                    custom_agent_id: None,
+                    conversation_id: None,
+                }],
+                workspace: Some(workspace.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let agent = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Worker".into(),
+                role: "teammate".into(),
+                backend: "acp".into(),
+                model: "claude".into(),
+                custom_agent_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let extra = conv_repo.get_extra(&agent.conversation_id).unwrap();
+    assert_eq!(
+        extra.get("workspace").and_then(|v| v.as_str()),
+        Some(workspace.as_str())
+    );
 }
 
 #[tokio::test]
@@ -1603,18 +1699,22 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
     use futures_util::FutureExt;
     let (svc, _tm) = setup_with_factory(Arc::new(|opts: BuildTaskOptions| {
         async move {
-            let extra_has_cfg = opts
-                .extra
-                .get("team_mcp_stdio_config")
-                .and_then(|v| v.as_object())
-                .is_some_and(|o| o.contains_key("port") && o.contains_key("slot_id"));
+            let context = opts.context;
+            let extra_has_cfg = match &context.kind {
+                AgentSessionKind::Acp(acp) => acp
+                    .config
+                    .team_mcp_stdio_config
+                    .as_ref()
+                    .is_some_and(|cfg| cfg.port > 0 && !cfg.slot_id.is_empty()),
+                _ => false,
+            };
             assert!(
                 extra_has_cfg,
-                "factory called without team_mcp_stdio_config in extra: {:?}",
-                opts.extra
+                "factory called without team_mcp_stdio_config in typed context: {:?}",
+                context.kind
             );
             Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
-                mock_agent::MockAgent::new(opts.conversation_id, opts.workspace),
+                mock_agent::MockAgent::new(context.conversation.conversation_id, context.workspace.path),
             )))
         }
         .boxed()
@@ -1665,9 +1765,8 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
     // Factory always fails → ensure_session must propagate error and not
     // insert into sessions, so send_message afterwards still errors.
     use futures_util::FutureExt;
-    let failing_factory: AgentFactory = Arc::new(|_opts: BuildTaskOptions| {
-        async move { Err(AppError::Internal("simulated build failure".into())) }.boxed()
-    });
+    let failing_factory: AgentFactory =
+        Arc::new(|_opts: BuildTaskOptions| async move { Err(AgentError::internal("simulated build failure")) }.boxed());
     let (svc, tm) = setup_with_factory(failing_factory);
     let created = svc
         .create_team(

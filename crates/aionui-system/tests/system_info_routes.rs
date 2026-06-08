@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use aionui_realtime::BroadcastEventBus;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -20,8 +21,8 @@ use aionui_db::{
     SqliteClientPreferenceRepository, SqliteProviderRepository, SqliteSettingsRepository, init_database_memory,
 };
 use aionui_system::{
-    ClientPrefService, ModelFetchService, ProtocolDetectionService, ProviderService, SettingsService,
-    SystemRouterState, VersionCheckService, system_routes,
+    ClientPrefService, ModelFetchService, ProtocolDetectionService, ProviderService, RuntimePrepareService,
+    SettingsService, SystemRouterState, VersionCheckService, system_routes,
 };
 
 // ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ fn build_state(db: &aionui_db::Database, version_check_service: VersionCheckServ
         model_fetch_service: ModelFetchService::new(provider_repo, TEST_KEY, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client),
         version_check_service,
+        runtime_prepare_service: RuntimePrepareService::new(Arc::new(BroadcastEventBus::new(16))),
     }
 }
 

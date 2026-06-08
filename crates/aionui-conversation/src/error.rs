@@ -1,5 +1,4 @@
-use aionui_ai_agent::AcpError;
-use aionui_common::AppError;
+use aionui_ai_agent::{AcpError, AgentError};
 use aionui_db::DbError;
 
 /// Application-level error contract for the conversation domain.
@@ -33,27 +32,136 @@ pub enum ConversationError {
     #[error("Forbidden: {reason}")]
     Forbidden { reason: String },
 
+    #[error("Not found: {reason}")]
+    NotFoundReason { reason: String },
+
+    #[error("Unauthorized: {reason}")]
+    Unauthorized { reason: String },
+
+    #[error("Rate limited")]
+    RateLimited,
+
+    #[error("Bad gateway: {reason}")]
+    BadGateway { reason: String },
+
+    #[error("Request timeout: {reason}")]
+    Timeout { reason: String },
+
+    #[error("Unprocessable entity: {reason}")]
+    Unprocessable { reason: String },
+
+    #[error("Internal error: {reason}")]
+    Internal { reason: String },
+
+    #[error("Workspace path is unavailable: {path}")]
+    WorkspacePathUnavailable { path: String },
+
+    #[error("Workspace path is unavailable during execution: {path}")]
+    WorkspacePathRuntimeUnavailable { path: String },
+
     #[error("ACP error")]
     Acp(#[from] AcpError),
-
-    #[error("{0}")]
-    App(#[source] AppError),
 }
 
-impl From<AppError> for ConversationError {
-    fn from(error: AppError) -> Self {
+impl ConversationError {
+    pub(crate) fn internal(reason: impl Into<String>) -> Self {
+        Self::Internal { reason: reason.into() }
+    }
+
+    pub(crate) fn not_found_reason(reason: impl Into<String>) -> Self {
+        Self::NotFoundReason { reason: reason.into() }
+    }
+
+    pub(crate) fn to_agent_error(&self) -> AgentError {
+        match self {
+            Self::NotFound { id } => AgentError::not_found(format!("Conversation {id} not found")),
+            Self::MessageNotFound { id } => AgentError::not_found(format!("Message {id} not found")),
+            Self::ArtifactNotFound { id } => AgentError::not_found(format!("Artifact {id} not found")),
+            Self::ActiveAgentNotFound { .. } => AgentError::not_found("No active agent for this conversation"),
+            Self::Archived { reason, .. } => AgentError::conversation_archived(reason.clone()),
+            Self::BadRequest { reason } => AgentError::bad_request(reason.clone()),
+            Self::Busy { reason } => AgentError::conflict(reason.clone()),
+            Self::Forbidden { reason } => AgentError::forbidden(reason.clone()),
+            Self::NotFoundReason { reason } => AgentError::not_found(reason.clone()),
+            Self::Unauthorized { reason } => AgentError::unauthorized(reason.clone()),
+            Self::RateLimited => AgentError::RateLimited,
+            Self::BadGateway { reason } => AgentError::bad_gateway(reason.clone()),
+            Self::Timeout { reason } => AgentError::timeout(reason.clone()),
+            Self::Unprocessable { reason } => AgentError::bad_request(reason.clone()),
+            Self::Internal { reason } => AgentError::internal(reason.clone()),
+            Self::WorkspacePathUnavailable { path } => {
+                AgentError::bad_request(format!("Workspace path is unavailable: {path}"))
+            }
+            Self::WorkspacePathRuntimeUnavailable { path } => {
+                AgentError::workspace_path_runtime_unavailable(path.clone())
+            }
+            Self::Acp(err) => AgentError::bad_gateway(err.to_string()),
+        }
+    }
+
+    pub(crate) fn error_code(&self) -> &'static str {
+        match self {
+            Self::NotFound { .. }
+            | Self::MessageNotFound { .. }
+            | Self::ArtifactNotFound { .. }
+            | Self::ActiveAgentNotFound { .. }
+            | Self::NotFoundReason { .. } => "NOT_FOUND",
+            Self::BadRequest { .. } => "BAD_REQUEST",
+            Self::Unauthorized { .. } => "UNAUTHORIZED",
+            Self::Forbidden { .. } => "FORBIDDEN",
+            Self::Busy { .. } => "CONFLICT",
+            Self::RateLimited => "RATE_LIMITED",
+            Self::Internal { .. } | Self::Acp(_) => "INTERNAL_ERROR",
+            Self::BadGateway { .. } => "BAD_GATEWAY",
+            Self::Timeout { .. } => "TIMEOUT",
+            Self::Unprocessable { .. } => "UNPROCESSABLE_ENTITY",
+            Self::Archived { .. } => "CONVERSATION_ARCHIVED",
+            Self::WorkspacePathUnavailable { .. } => "WORKSPACE_PATH_UNAVAILABLE",
+            Self::WorkspacePathRuntimeUnavailable { .. } => "WORKSPACE_PATH_RUNTIME_UNAVAILABLE",
+        }
+    }
+}
+
+impl From<AgentError> for ConversationError {
+    fn from(error: AgentError) -> Self {
         match error {
-            AppError::BadRequest(reason) => Self::BadRequest { reason },
-            AppError::Conflict(reason) => Self::Busy { reason },
-            AppError::Forbidden(reason) => Self::Forbidden { reason },
-            other => Self::App(other),
+            AgentError::NotFound(reason) => Self::NotFoundReason { reason },
+            AgentError::BadRequest(reason) => Self::BadRequest { reason },
+            AgentError::Unauthorized(reason) => Self::Unauthorized { reason },
+            AgentError::Forbidden(reason) => Self::Forbidden { reason },
+            AgentError::Conflict(reason) => Self::Busy { reason },
+            AgentError::RateLimited => Self::RateLimited,
+            AgentError::Internal(reason) => Self::Internal { reason },
+            AgentError::BadGateway(reason) => Self::BadGateway { reason },
+            AgentError::Timeout(reason) => Self::Timeout { reason },
+            AgentError::ConversationArchived(reason) => Self::Archived {
+                id: String::new(),
+                reason,
+            },
+            AgentError::WorkspacePathRuntimeUnavailable(path) => Self::WorkspacePathRuntimeUnavailable { path },
+            AgentError::Acp(err) => Self::Acp(err),
+            _ => Self::Internal {
+                reason: error.to_string(),
+            },
         }
     }
 }
 
 impl From<DbError> for ConversationError {
     fn from(error: DbError) -> Self {
-        AppError::from(error).into()
+        match error {
+            DbError::NotFound(reason) => Self::NotFoundReason { reason },
+            DbError::Conflict(reason) => Self::Busy { reason },
+            DbError::Query(e) => Self::Internal {
+                reason: format!("Database error: {e}"),
+            },
+            DbError::Migration(e) => Self::Internal {
+                reason: format!("Migration error: {e}"),
+            },
+            DbError::Init(reason) => Self::Internal {
+                reason: format!("Database init error: {reason}"),
+            },
+        }
     }
 }
 
@@ -65,6 +173,8 @@ mod tests {
 
     fn assert_from_acp<T: From<AcpError>>() {}
 
+    fn assert_from_agent<T: From<AgentError>>() {}
+
     fn assert_from_db<T: From<DbError>>() {}
 
     #[test]
@@ -75,6 +185,11 @@ mod tests {
     #[test]
     fn conversation_error_has_acp_from_impl() {
         assert_from_acp::<ConversationError>();
+    }
+
+    #[test]
+    fn conversation_error_has_agent_from_impl() {
+        assert_from_agent::<ConversationError>();
     }
 
     #[test]

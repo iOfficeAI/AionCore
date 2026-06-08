@@ -108,6 +108,7 @@ impl AppServices {
 
         let remote_agent_repo = Arc::new(SqliteRemoteAgentRepository::new(database.pool().clone()));
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
+        let event_bus = Arc::new(BroadcastEventBus::new(256));
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
@@ -157,7 +158,12 @@ impl AppServices {
                 (Some(srv), Some(config))
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Guide MCP server failed to start; solo create-team disabled");
+                tracing::warn!(
+                    code = "BOOTSTRAP_DEGRADED_GUIDE_MCP",
+                    stage = "guide_mcp.start",
+                    error = %e,
+                    "Guide MCP server failed to start; solo create-team disabled"
+                );
                 (None, None)
             }
         };
@@ -170,6 +176,7 @@ impl AppServices {
             agent_registry: agent_registry.clone(),
             acp_agent_service: acp_agent_service.clone(),
             data_dir: data_dir.clone(),
+            broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             guide_mcp_config: guide_mcp_config.clone(),
             mcp_server_repo: Some(mcp_server_repo),
@@ -190,7 +197,7 @@ impl AppServices {
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
             ws_manager: Arc::new(WebSocketManager::new()),
-            event_bus: Arc::new(BroadcastEventBus::new(256)),
+            event_bus,
             worker_task_manager,
             conversation_runtime_state,
             task_manager_delete_hook: Some(task_manager_delete_hook),

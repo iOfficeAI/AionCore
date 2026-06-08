@@ -103,6 +103,8 @@ pub struct TryConnectCustomAgentRequest {
     pub acp_args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub runtime_scope_id: Option<String>,
 }
 
 /// Outcome of [`TryConnectCustomAgentRequest`].
@@ -221,12 +223,14 @@ mod tests {
         let json = json!({
             "command": "/path/to/agent",
             "acp_args": ["--flag"],
-            "env": { "KEY": "value" }
+            "env": { "KEY": "value" },
+            "runtime_scope_id": "custom-agent:test"
         });
         let req: TryConnectCustomAgentRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.command, "/path/to/agent");
         assert_eq!(req.acp_args, vec!["--flag"]);
         assert_eq!(req.env.get("KEY"), Some(&"value".into()));
+        assert_eq!(req.runtime_scope_id.as_deref(), Some("custom-agent:test"));
     }
 
     #[test]
@@ -235,6 +239,7 @@ mod tests {
         let req: TryConnectCustomAgentRequest = serde_json::from_value(json).unwrap();
         assert!(req.acp_args.is_empty());
         assert!(req.env.is_empty());
+        assert!(req.runtime_scope_id.is_none());
     }
 
     #[test]

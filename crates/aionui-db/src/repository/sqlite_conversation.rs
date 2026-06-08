@@ -424,6 +424,21 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(row)
     }
 
+    async fn list_stale_runtime_messages(&self) -> Result<Vec<MessageRow>, DbError> {
+        let rows = sqlx::query_as::<_, MessageRow>(
+            "SELECT m.* FROM messages m \
+             INNER JOIN conversations c ON c.id = m.conversation_id \
+             WHERE m.position = 'left' \
+               AND m.status IN ('work', 'pending') \
+               AND m.type IN ('text', 'thinking') \
+             ORDER BY m.created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     async fn search_messages(
         &self,
         user_id: &str,
