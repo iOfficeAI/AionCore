@@ -22,6 +22,7 @@ pub use types::{
 };
 
 static INSTALL_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+const MANAGED_ACP_SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy)]
 struct PlatformSpec {
@@ -85,6 +86,37 @@ pub async fn ensure_managed_acp_tool_with_reporter(
     }
 
     Err(report_failure(unavailable_error(tool, &root), reporter))
+}
+
+pub async fn prepare_managed_acp_tool_to_root(
+    tool: ManagedAcpToolId,
+    root: &Path,
+) -> Result<ResolvedManagedAcpTool, ManagedAcpToolError> {
+    let spec = platform_spec()?;
+    let node_runtime = ensure_node_runtime_with_reporter(None)
+        .await
+        .map_err(|error| ManagedAcpToolError::invalid(format!("prepare managed Node runtime: {error}")))?;
+    let staging_root = bundle_prepare_staging_root(tool, spec, root);
+    if staging_root.exists() {
+        let _ = fs::remove_dir_all(&staging_root);
+    }
+    fs::create_dir_all(&staging_root).map_err(ManagedAcpToolError::io)?;
+
+    let result = prepare_local_tool_source_to_root(tool, spec, &node_runtime, &staging_root, root).await;
+
+    if let Err(error) = fs::remove_dir_all(&staging_root)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            tool = tool.slug(),
+            version = tool.version(),
+            staging_root = %staging_root.display(),
+            error = %error,
+            "failed to clean up managed ACP bundle preparation staging directory"
+        );
+    }
+
+    result
 }
 
 fn report_failure(
@@ -428,6 +460,18 @@ async fn prepare_local_tool_source(
     staging_root: &Path,
     target_root: &Path,
 ) -> Result<(), ManagedAcpToolError> {
+    prepare_local_tool_source_to_root(tool, spec, node_runtime, staging_root, target_root)
+        .await
+        .map(|_| ())
+}
+
+async fn prepare_local_tool_source_to_root(
+    tool: ManagedAcpToolId,
+    spec: PlatformSpec,
+    node_runtime: &crate::ResolvedNodeRuntime,
+    staging_root: &Path,
+    target_root: &Path,
+) -> Result<ResolvedManagedAcpTool, ManagedAcpToolError> {
     let project_dir = staging_root.join("project");
     let npm_cache_dir = staging_root.join("npm-cache");
     fs::create_dir_all(&project_dir).map_err(ManagedAcpToolError::io)?;
@@ -478,6 +522,8 @@ async fn prepare_local_tool_source(
     let manifest = build_local_artifact_manifest(tool, &project_dir)?;
     validate_bridge_entrypoint(&project_dir, &manifest)?;
     validate_platform_binary(tool, &project_dir, spec)?;
+    validate_dependency_tree(node_runtime, &project_dir, &npm_cache_dir, tool).await?;
+    validate_package_import_smoke(node_runtime, &project_dir, tool).await?;
 
     let manifest_path = project_dir.join("manifest.json");
     fs::write(
@@ -488,6 +534,9 @@ async fn prepare_local_tool_source(
     .map_err(ManagedAcpToolError::io)?;
 
     managed_resources::materialize_directory(&project_dir, target_root).map_err(ManagedAcpToolError::io)?;
+    let resolved = validate_tool_root(tool, target_root, None)?;
+    validate_dependency_tree(node_runtime, target_root, &npm_cache_dir, tool).await?;
+    validate_package_import_smoke(node_runtime, target_root, tool).await?;
     info!(
         tool = tool.slug(),
         version = tool.version(),
@@ -495,7 +544,7 @@ async fn prepare_local_tool_source(
         target_root = %target_root.display(),
         "prepared managed ACP tool under local runtime resources"
     );
-    Ok(())
+    Ok(resolved)
 }
 
 async fn run_npm_prepare_step<const N: usize>(
@@ -624,6 +673,64 @@ fn validate_platform_binary(
     }
 }
 
+async fn validate_dependency_tree(
+    node_runtime: &crate::ResolvedNodeRuntime,
+    project_dir: &Path,
+    npm_cache_dir: &Path,
+    tool: ManagedAcpToolId,
+) -> Result<(), ManagedAcpToolError> {
+    run_npm_prepare_step(
+        node_runtime,
+        project_dir,
+        npm_cache_dir,
+        ["ls", "--omit=dev", "--all"],
+        &format!("validate managed {} dependency tree", tool.display_name()),
+    )
+    .await
+}
+
+async fn validate_package_import_smoke(
+    node_runtime: &crate::ResolvedNodeRuntime,
+    project_dir: &Path,
+    tool: ManagedAcpToolId,
+) -> Result<(), ManagedAcpToolError> {
+    let mut builder = Builder::clean_cli(node_runtime.node_path.clone());
+    builder.current_dir(project_dir).args([
+        "--input-type=module",
+        "-e",
+        "await import(process.argv[1]);",
+        tool.package_name(),
+    ]);
+    let output = tokio::time::timeout(MANAGED_ACP_SMOKE_TIMEOUT, builder.output())
+        .await
+        .map_err(|_| {
+            ManagedAcpToolError::invalid(format!(
+                "smoke test for managed {} package import timed out after {}s",
+                tool.display_name(),
+                MANAGED_ACP_SMOKE_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(ManagedAcpToolError::io)?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let detail = if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        stderr
+    } else {
+        format!("{stderr}; stdout: {stdout}")
+    };
+    Err(ManagedAcpToolError::invalid(format!(
+        "smoke test for managed {} package import failed with exit code {:?}: {detail}",
+        tool.display_name(),
+        output.status.code()
+    )))
+}
+
 fn package_json_path(project_dir: &Path, package_name: &str) -> PathBuf {
     let mut path = project_dir.join("node_modules");
     for segment in package_path_segments(package_name) {
@@ -685,6 +792,20 @@ fn prepare_staging_root(tool: ManagedAcpToolId, spec: PlatformSpec) -> Result<Pa
         spec.manifest_key,
         nonce
     )))
+}
+
+fn bundle_prepare_staging_root(tool: ManagedAcpToolId, spec: PlatformSpec, bundle_root: &Path) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    bundle_root.join(".staging").join(format!(
+        "{}-{}-{}-{}",
+        tool.slug(),
+        tool.version(),
+        spec.manifest_key,
+        nonce
+    ))
 }
 
 fn platform_spec() -> Result<PlatformSpec, ManagedAcpToolError> {

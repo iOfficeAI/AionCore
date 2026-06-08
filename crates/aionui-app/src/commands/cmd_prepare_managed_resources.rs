@@ -3,8 +3,8 @@ use std::process::ExitCode;
 use crate::cli::PrepareManagedResourcesArgs;
 use crate::commands::error::{CliBoundaryCode, CliBoundaryError};
 use aionui_runtime::acp_tool_runtime::ManagedAcpToolId;
-use aionui_runtime::managed_resources::{export_acp_tool_to_root, export_node_runtime_to_root};
-use aionui_runtime::{ensure_managed_acp_tool, ensure_node_runtime};
+use aionui_runtime::managed_resources::export_node_runtime_to_root;
+use aionui_runtime::{ensure_node_runtime, prepare_managed_acp_tool_to_root};
 
 const SUBCOMMAND: &str = "prepare-managed-resources";
 
@@ -27,17 +27,10 @@ pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) ->
     println!("  node   -> {}", exported_node.display());
 
     for tool in [ManagedAcpToolId::CodexAcp, ManagedAcpToolId::ClaudeAgentAcp] {
-        let resolved = ensure_managed_acp_tool(tool)
+        let prepared = prepare_managed_acp_tool_to_root(tool, &output_root)
             .await
             .map_err(|_| prepare_managed_resources_error("acp.prepare"))?;
-        let platform = resolved
-            .root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| prepare_managed_resources_error("acp.layout"))?;
-        let exported = export_acp_tool_to_root(&output_root, &resolved.root, tool.slug(), tool.version(), platform)
-            .map_err(|_| prepare_managed_resources_error("acp.export"))?;
-        println!("  {:<6} -> {}", tool.slug(), exported.display());
+        println!("  {:<6} -> {}", tool.slug(), prepared.root.display());
     }
 
     Ok(ExitCode::SUCCESS)
