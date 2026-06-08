@@ -29,6 +29,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::error::AgentError;
+use crate::manager::acp::config_option_catalog::enrich_handshake_with_existing_config_option_catalog;
 
 /// Capacity of the catalog-sync MPSC channel. A single writer thread
 /// drains it serially, so the bound just sizes the burst we can absorb
@@ -41,6 +42,10 @@ struct CatalogSyncMessage {
     agent_metadata_id: String,
     handshake: AgentHandshake,
 }
+
+#[cfg(test)]
+#[path = "registry_config_option_tests.rs"]
+mod registry_config_option_tests;
 
 pub struct AgentRegistry {
     repo: Arc<dyn IAgentMetadataRepository>,
@@ -91,6 +96,8 @@ impl AgentRegistry {
     ///
     /// `None` fields are left untouched (partial update).
     async fn apply_handshake_inner(&self, id: &str, snapshot: &AgentHandshake) -> Result<(), AgentError> {
+        let existing = self.by_id.read().await.get(id).map(|meta| meta.handshake.clone());
+        let snapshot = enrich_handshake_with_existing_config_option_catalog(snapshot, existing.as_ref());
         let agent_capabilities = encode_optional(&snapshot.agent_capabilities, "agent_capabilities")?;
         let auth_methods = encode_optional(&snapshot.auth_methods, "auth_methods")?;
         let config_options = encode_optional(&snapshot.config_options, "config_options")?;

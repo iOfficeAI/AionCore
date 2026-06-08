@@ -1,8 +1,6 @@
 use crate::manager::acp::{AcpAgentManager, AcpSession};
 use crate::protocol::events::AgentStreamEvent;
-use agent_client_protocol::schema::{
-    SessionConfigOption, SessionModeState, SessionModelState, SessionNotification, UsageUpdate,
-};
+use agent_client_protocol::schema::{SessionModeState, SessionModelState, SessionNotification, UsageUpdate};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -10,6 +8,8 @@ use tokio::sync::mpsc;
 use std::collections::HashMap;
 
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId};
+
+use super::config_option_catalog::extract_config_options_from_value;
 
 /// Domain events emitted by the `AcpSession` aggregate.
 ///
@@ -110,7 +110,7 @@ impl AcpAgentManager {
                 }
             }
             AgentStreamEvent::AcpConfigOption(value) => {
-                if let Ok(update) = serde_json::from_value::<Vec<SessionConfigOption>>(value.clone()) {
+                if let Some(update) = extract_config_options_from_value(value) {
                     let mut s = self.session.write().await;
                     s.apply_advertised_config_options(update);
                     self.commit_session_changes(&mut s).await;

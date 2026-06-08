@@ -3,7 +3,7 @@
 //! `#[path = "session_tests.rs"] mod tests;` from `session.rs`, so
 //! `super::*` resolves to the `session` module's private scope.
 
-use agent_client_protocol::schema::{SessionConfigSelectOption, SessionMode};
+use agent_client_protocol::schema::{ModelInfo, SessionConfigSelectOption, SessionMode};
 
 use super::*;
 
@@ -533,6 +533,85 @@ fn apply_advertised_config_options_idempotent_when_unchanged() {
         events.is_empty(),
         "no ObservedConfigSynced when observed unchanged, got {events:?}"
     );
+}
+
+#[test]
+fn apply_advertised_config_options_derives_missing_mode_and_model_catalogs() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "modes",
+            "Mode",
+            "plan",
+            vec![
+                SessionConfigSelectOption::new("build", "Build"),
+                SessionConfigSelectOption::new("plan", "Plan"),
+            ],
+        ),
+        SessionConfigOption::select(
+            "models",
+            "Model",
+            "opus",
+            vec![
+                SessionConfigSelectOption::new("sonnet", "Sonnet"),
+                SessionConfigSelectOption::new("opus", "Opus"),
+            ],
+        ),
+    ]);
+
+    assert_eq!(session.observed_mode(), Some("plan"));
+    assert_eq!(session.current_mode_id().as_deref(), Some("plan"));
+    let modes = session.modes().expect("derived modes");
+    assert_eq!(modes.available_modes.len(), 2);
+    assert_eq!(modes.available_modes[1].id.to_string(), "plan");
+
+    assert_eq!(session.observed_model(), Some("opus"));
+    assert_eq!(session.current_model_id().as_deref(), Some("opus"));
+    let models = session.model_info().expect("derived models");
+    assert_eq!(models.available_models.len(), 2);
+    assert_eq!(models.available_models[1].model_id.to_string(), "opus");
+}
+
+#[test]
+fn apply_advertised_config_options_keeps_explicit_non_empty_mode_and_model_catalogs() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.apply_advertised_modes(SessionModeState::new(
+        "build",
+        vec![SessionMode::new("build", "Build"), SessionMode::new("plan", "Plan")],
+    ));
+    session.apply_advertised_models(SessionModelState::new(
+        "sonnet",
+        vec![ModelInfo::new("sonnet", "Sonnet"), ModelInfo::new("opus", "Opus")],
+    ));
+    session.drain_events();
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "modes",
+            "Mode",
+            "derived-mode",
+            vec![SessionConfigSelectOption::new("derived-mode", "Derived mode")],
+        ),
+        SessionConfigOption::select(
+            "models",
+            "Model",
+            "derived-model",
+            vec![SessionConfigSelectOption::new("derived-model", "Derived model")],
+        ),
+    ]);
+
+    assert_eq!(session.observed_mode(), Some("build"));
+    assert_eq!(session.current_mode_id().as_deref(), Some("build"));
+    let modes = session.modes().expect("explicit modes");
+    assert_eq!(modes.available_modes.len(), 2);
+    assert_eq!(modes.available_modes[0].id.to_string(), "build");
+
+    assert_eq!(session.observed_model(), Some("sonnet"));
+    assert_eq!(session.current_model_id().as_deref(), Some("sonnet"));
+    let models = session.model_info().expect("explicit models");
+    assert_eq!(models.available_models.len(), 2);
+    assert_eq!(models.available_models[0].model_id.to_string(), "sonnet");
 }
 
 #[test]
