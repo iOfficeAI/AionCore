@@ -117,8 +117,8 @@ dependencies = [
 
 [[package]]
 name = "aion-agent"
-version = "0.1.28"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.28#29731e7525ee9163b89f109f0e3f36395f3dfdbc"
+version = "0.1.29"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.29#b2495c7076ae02dfdc7b487a9c85127bc7e9978d"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -147,8 +147,8 @@ dependencies = [
 
 [[package]]
 name = "aion-compact"
-version = "0.1.28"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.28#29731e7525ee9163b89f109f0e3f36395f3dfdbc"
+version = "0.1.29"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.29#b2495c7076ae02dfdc7b487a9c85127bc7e9978d"
 dependencies = [
  "regex",
  "serde",
@@ -158,8 +158,8 @@ dependencies = [
 
 [[package]]
 name = "aion-config"
-version = "0.1.28"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.28#29731e7525ee9163b89f109f0e3f36395f3dfdbc"
+version = "0.1.29"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.29#b2495c7076ae02dfdc7b487a9c85127bc7e9978d"
 dependencies = [
  "aion-compact",
  "aion-types",
@@ -176,13 +176,14 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "which 8.0.3",
  "workspace-hack",
 ]
 
 [[package]]
 name = "aion-mcp"
-version = "0.1.28"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.28#29731e7525ee9163b89f109f0e3f36395f3dfdbc"
+version = "0.1.29"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.29#b2495c7076ae02dfdc7b487a9c85127bc7e9978d"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -202,8 +203,8 @@ dependencies = [
 
 [[package]]
 name = "aion-memory"
-version = "0.1.28"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.28#29731e7525ee9163b89f109f0e3f36395f3dfdbc"
+version = "0.1.29"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.29#b2495c7076ae02dfdc7b487a9c85127bc7e9978d"
 dependencies = [
  "aion-config",
  "chrono",
@@ -216,8 +217,8 @@ dependencies = [
 
 [[package]]
 name = "aion-protocol"
-version = "0.1.28"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.28#29731e7525ee9163b89f109f0e3f36395f3dfdbc"
+version = "0.1.29"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.29#b2495c7076ae02dfdc7b487a9c85127bc7e9978d"
 dependencies = [
  "aion-types",
  "serde",
@@ -229,8 +230,8 @@ dependencies = [
 
 [[package]]
 name = "aion-providers"
-version = "0.1.28"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.28#29731e7525ee9163b89f109f0e3f36395f3dfdbc"
+version = "0.1.29"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.29#b2495c7076ae02dfdc7b487a9c85127bc7e9978d"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -257,8 +258,8 @@ dependencies = [
 
 [[package]]
 name = "aion-skills"
-version = "0.1.28"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.28#29731e7525ee9163b89f109f0e3f36395f3dfdbc"
+version = "0.1.29"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.29#b2495c7076ae02dfdc7b487a9c85127bc7e9978d"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -283,8 +284,8 @@ dependencies = [
 
 [[package]]
 name = "aion-tools"
-version = "0.1.28"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.28#29731e7525ee9163b89f109f0e3f36395f3dfdbc"
+version = "0.1.29"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.29#b2495c7076ae02dfdc7b487a9c85127bc7e9978d"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -303,8 +304,8 @@ dependencies = [
 
 [[package]]
 name = "aion-types"
-version = "0.1.28"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.28#29731e7525ee9163b89f109f0e3f36395f3dfdbc"
+version = "0.1.29"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.29#b2495c7076ae02dfdc7b487a9c85127bc7e9978d"
 dependencies = [
  "async-trait",
  "chrono",
@@ -354,7 +355,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "which",
+ "which 7.0.3",
 ]
 
 [[package]]
@@ -701,7 +702,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "which",
+ "which 7.0.3",
 ]
 
 [[package]]
@@ -741,7 +742,7 @@ dependencies = [
  "tracing-subscriber",
  "wait-timeout",
  "walkdir",
- "which",
+ "which 7.0.3",
  "zip",
  "zstd",
 ]
@@ -768,7 +769,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
- "which",
+ "which 7.0.3",
  "wiremock",
 ]
 
@@ -5985,6 +5986,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "which"
+version = "8.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c789537cf2f7f55be8e6192f92e464174ee55f91af622777f7f1ceb0dbccd03e"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "whoami"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6456,7 +6466,7 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.28#29731e7525ee9163b89f109f0e3f36395f3dfdbc"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.29#b2495c7076ae02dfdc7b487a9c85127bc7e9978d"
 
 [[package]]
 name = "writeable"
