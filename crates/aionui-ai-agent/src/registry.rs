@@ -810,6 +810,13 @@ mod tests {
         assert_eq!(claude.yolo_id.as_deref(), Some("bypassPermissions"));
     }
 
+    #[tokio::test]
+    async fn hermes_builtin_does_not_advertise_a_yolo_id() {
+        let reg = registry().await;
+        let hermes = reg.find_builtin_by_backend("hermes").await.unwrap();
+        assert_eq!(hermes.yolo_id, None);
+    }
+
     /// On a host that has *none* of the seeded CLIs installed, the
     /// public listing collapses to the rows that don't need one
     /// (Aion CLI is `agent_source = internal` with no `command`).

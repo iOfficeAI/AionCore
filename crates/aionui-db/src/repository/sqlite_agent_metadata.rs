@@ -268,6 +268,11 @@ mod tests {
         // Nanobot and OpenClaw are builtin (not internal).
         assert!(rows.iter().any(|r| r.name == "Nanobot" && r.agent_source == "builtin"));
         assert!(rows.iter().any(|r| r.name == "OpenClaw" && r.agent_source == "builtin"));
+        let hermes = rows
+            .iter()
+            .find(|r| r.name == "Hermes" && r.agent_source == "builtin")
+            .expect("seeded hermes row");
+        assert_eq!(hermes.yolo_id, None);
     }
 
     #[tokio::test]

@@ -77,7 +77,9 @@ impl AgentType {
     /// Canonical full-auto session mode id for this agent type.
     ///
     /// ACP agents need backend-specific mode ids, while other agent types
-    /// currently converge on the permissive `yolo` mode.
+    /// currently converge on the permissive `yolo` mode. Hermes is the
+    /// exception: it has no full-auto ACP mode, so callers must stay on its
+    /// native `default`.
     ///
     /// `backend` is the vendor label (e.g. `"claude"`, `"codex"`) used
     /// only by ACP; pass `None` for non-ACP agents. This mapping is
@@ -89,6 +91,7 @@ impl AgentType {
             AgentType::Acp => match backend {
                 Some("claude") | Some("codebuddy") => "bypassPermissions",
                 Some("codex") => "full-access",
+                Some("hermes") => "default",
                 Some("opencode") => "build",
                 Some("cursor") => "agent",
                 _ => "yolo",
@@ -422,6 +425,7 @@ mod tests {
         assert_eq!(AgentType::Acp.full_auto_mode_id(Some("codex")), "full-access");
         assert_eq!(AgentType::Acp.full_auto_mode_id(Some("claude")), "bypassPermissions");
         assert_eq!(AgentType::Acp.full_auto_mode_id(Some("gemini")), "yolo");
+        assert_eq!(AgentType::Acp.full_auto_mode_id(Some("hermes")), "default");
         assert_eq!(AgentType::Acp.full_auto_mode_id(None), "yolo");
         assert_eq!(AgentType::Aionrs.full_auto_mode_id(None), "yolo");
         assert_eq!(AgentType::Remote.full_auto_mode_id(None), "yolo");

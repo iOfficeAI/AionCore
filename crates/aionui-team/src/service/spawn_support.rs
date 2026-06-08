@@ -360,4 +360,9 @@ mod tests {
             AgentType::OpenclawGateway
         );
     }
+
+    #[test]
+    fn resolve_full_auto_mode_keeps_hermes_on_default() {
+        assert_eq!(resolve_full_auto_mode("hermes"), "default");
+    }
 }

@@ -175,6 +175,36 @@ impl IConversationRepository for StubConvRepo {
                 created_at: 1000,
                 updated_at: 1000,
             }
+        } else if id == "conv_mode_hermes" {
+            aionui_db::models::ConversationRow {
+                id: id.into(),
+                user_id: "u1".into(),
+                name: "Hermes Chat".into(),
+                r#type: "acp".into(),
+                model: Some(
+                    serde_json::json!({
+                        "provider_id": "hermes",
+                        "model": "gemini-2.5-pro",
+                        "use_model": "gemini-2.5-pro"
+                    })
+                    .to_string(),
+                ),
+                status: Some("active".into()),
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::json!({
+                    "backend": "hermes",
+                    "agent_name": "Hermes",
+                    "workspace": ensure_named_workspace_path("aionui-cron-service-hermes-workspace"),
+                    "session_mode": "default",
+                    "current_model_id": "gemini-2.5-pro"
+                })
+                .to_string(),
+                pinned: false,
+                pinned_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            }
         } else if id == "conv_mode_default" {
             aionui_db::models::ConversationRow {
                 id: id.into(),
@@ -1300,6 +1330,9 @@ async fn icron_service_create_job_forces_full_auto_mode_for_generated_crons() {
     let claude = ICronService::create_job(&svc, "user_1", "conv_mode_claude", &params).await;
     assert!(claude.success);
 
+    let hermes = ICronService::create_job(&svc, "user_1", "conv_mode_hermes", &params).await;
+    assert!(hermes.success);
+
     let aionrs = ICronService::create_job(&svc, "user_1", "conv_mode_aionrs", &params).await;
     assert!(aionrs.success);
 
@@ -1343,6 +1376,20 @@ async fn icron_service_create_job_forces_full_auto_mode_for_generated_crons() {
             .as_ref()
             .and_then(|config| config.mode.as_deref()),
         Some("bypassPermissions")
+    );
+
+    let hermes_jobs = svc
+        .list_jobs(&ListCronJobsQuery {
+            conversation_id: Some("conv_mode_hermes".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hermes_jobs[0]
+            .agent_config
+            .as_ref()
+            .and_then(|config| config.mode.as_deref()),
+        Some("default")
     );
 
     let aionrs_jobs = svc
