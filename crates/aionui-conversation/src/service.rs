@@ -267,6 +267,17 @@ impl ConversationService {
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
+        if !req.r#type.supports_new_conversation() {
+            info!(
+                agent_type = req.r#type.serde_name(),
+                source = ?source,
+                "Rejected deprecated agent type for new conversation"
+            );
+            return Err(ConversationError::BadRequest {
+                reason: "This agent type is no longer supported for new conversations.".into(),
+            });
+        }
+
         // Type-aware rule: top-level `model` is aionrs-only. Other agent types
         // carry model/mode via `extra` (see spec 2026-05-12). Reject early so
         // clients that still ship the legacy shape get a loud 400 instead of

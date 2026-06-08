@@ -667,6 +667,34 @@ async fn create_returns_conversation_with_defaults() {
 }
 
 #[tokio::test]
+async fn create_rejects_deprecated_agent_types_for_new_conversations() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    for agent_type in [
+        AgentType::Gemini,
+        AgentType::OpenclawGateway,
+        AgentType::Nanobot,
+        AgentType::Remote,
+    ] {
+        let mut req = make_create_req();
+        req.r#type = agent_type;
+        req.model = None;
+        req.extra = json!({
+            "workspace": ensure_test_workspace_path()
+        });
+
+        let err = svc.create("user_1", req).await.unwrap_err();
+        assert_eq!(err.error_code(), "BAD_REQUEST");
+        assert!(
+            err.to_string()
+                .contains("This agent type is no longer supported for new conversations."),
+            "unexpected error for {}: {err}",
+            agent_type.serde_name()
+        );
+    }
+}
+
+#[tokio::test]
 async fn create_rejects_unavailable_workspace_with_trailing_whitespace_in_request() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
