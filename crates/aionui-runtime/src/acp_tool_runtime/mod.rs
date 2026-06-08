@@ -809,17 +809,18 @@ fn resolve_package_smoke_target(
     package_json: &InstalledPackageJson,
 ) -> Result<PackageSmokeTarget, ManagedAcpToolError> {
     if let Some(entry) = resolve_package_import_entry(&package_json.exports, package_json.main.as_deref()) {
-        return Ok(PackageSmokeTarget::Import(package_root(project_dir, &package_json.name).join(entry)));
+        return Ok(PackageSmokeTarget::Import(
+            package_root(project_dir, &package_json.name).join(entry),
+        ));
     }
 
     let bin_entry = resolve_package_bin_entry(package_json.name.as_str(), &package_json.bin)?;
-    Ok(PackageSmokeTarget::SyntaxCheck(package_root(project_dir, &package_json.name).join(bin_entry)))
+    Ok(PackageSmokeTarget::SyntaxCheck(
+        package_root(project_dir, &package_json.name).join(bin_entry),
+    ))
 }
 
-fn resolve_package_import_entry(
-    exports_field: &serde_json::Value,
-    main_field: Option<&str>,
-) -> Option<String> {
+fn resolve_package_import_entry(exports_field: &serde_json::Value, main_field: Option<&str>) -> Option<String> {
     let exports_entry = match exports_field {
         serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
         serde_json::Value::Object(entries) => entries.get(".").and_then(|root| match root {
@@ -841,15 +842,7 @@ fn resolve_package_import_entry(
         _ => None,
     };
 
-    exports_entry.or_else(|| {
-        main_field.and_then(|value| {
-            if value.is_empty() {
-                None
-            } else {
-                Some(value.to_owned())
-            }
-        })
-    })
+    exports_entry.or_else(|| main_field.and_then(|value| if value.is_empty() { None } else { Some(value.to_owned()) }))
 }
 
 fn normalize_slashes(path: &Path) -> String {
