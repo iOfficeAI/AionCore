@@ -238,6 +238,7 @@ async fn resolve_agent_command_spec(
         name: name.to_string_lossy().into_owned(),
         value: value.to_string_lossy().into_owned(),
     }));
+    crate::capability::agent_binary_resolver::append_agent_runtime_path_env(meta, &mut env);
 
     Ok(CommandSpec {
         command: resolved.program,
@@ -284,6 +285,7 @@ async fn resolve_builtin_managed_acp_command_spec(
         name: name.to_string_lossy().into_owned(),
         value: value.to_string_lossy().into_owned(),
     }));
+    crate::capability::agent_binary_resolver::append_agent_runtime_path_env(meta, &mut env);
 
     Ok(CommandSpec {
         command: resolved.program,

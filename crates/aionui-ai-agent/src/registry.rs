@@ -589,6 +589,13 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
                 detail: tool_support.detail,
             });
         }
+        if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
+            && probe_primary_binary_candidate(meta, primary).is_none()
+        {
+            return Err(UnavailableReason::PrimaryMissing {
+                binary: primary.to_owned(),
+            });
+        }
         return Ok(PathBuf::from(tool.slug()));
     }
 
@@ -607,7 +614,7 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
     if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
         && primary != cmd
         && meta.agent_source_info.bridge_binary.as_deref() != Some(primary)
-        && probe_command_candidate(primary).is_none()
+        && probe_primary_binary_candidate(meta, primary).is_none()
     {
         return Err(UnavailableReason::PrimaryMissing {
             binary: primary.to_owned(),
@@ -627,6 +634,11 @@ fn probe_command_candidate(command: &str) -> Option<PathBuf> {
             .is_supported()
             .then(|| PathBuf::from(command)),
     }
+}
+
+fn probe_primary_binary_candidate(meta: &AgentMetadata, binary: &str) -> Option<PathBuf> {
+    probe_command_candidate(binary)
+        .or_else(|| crate::capability::agent_binary_resolver::resolve_primary_binary_candidate(meta, binary))
 }
 
 #[cfg(test)]
