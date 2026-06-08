@@ -10,6 +10,7 @@ use aionui_api_types::{
     SendMessageRequest, SideForkMode,
 };
 use aionui_common::{AgentType, TimestampMs, now_ms};
+use aionui_db::models::{ConversationAssistantSnapshotRow, UpsertConversationAssistantSnapshotParams};
 use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams};
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -66,6 +67,7 @@ impl ConversationService {
             })?;
 
         let parent_extra: Value = serde_json::from_str(&parent.extra).unwrap_or_else(|_| json!({}));
+        let parent_assistant_snapshot = self.conversation_repo().get_assistant_snapshot(parent_id).await?;
         let parent_type: AgentType = crate::convert::string_to_enum(&parent.r#type)?;
 
         if !is_side_supported_parent_type(parent_type) {
@@ -97,6 +99,10 @@ impl ConversationService {
         let child = self.create(user_id, create_req).await?;
         let child_id = child.id.clone();
 
+        if let Some(snapshot) = parent_assistant_snapshot.as_ref() {
+            self.clone_assistant_snapshot(&child_id, snapshot).await?;
+        }
+
         self.insert_hidden_context_message(&child_id, &bootstrap, now_ms())
             .await?;
 
@@ -126,6 +132,7 @@ impl ConversationService {
     /// Prefix agent input with parent snapshot — **only** for legacy rows without `fork_mode`.
     pub(super) async fn enrich_side_agent_content(
         &self,
+        user_id: &str,
         child_extra: &Value,
         user_content: &str,
     ) -> Result<String, ConversationError> {
@@ -145,7 +152,15 @@ impl ConversationService {
             return Ok(user_content.to_owned());
         };
 
-        let transcript = self.build_parent_reference_transcript(parent_id).await?;
+        let parent = self
+            .conversation_repo()
+            .get(parent_id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| ConversationError::NotFound {
+                id: parent_id.to_owned(),
+            })?;
+        let transcript = self.build_parent_reference_transcript(&parent.id).await?;
         let workspace = child_extra
             .get("workspace")
             .and_then(|v| v.as_str())
@@ -168,6 +183,36 @@ impl ConversationService {
         };
 
         Ok(format!("{reference}\n\n---\n\n{user_content}"))
+    }
+
+    async fn clone_assistant_snapshot(
+        &self,
+        child_id: &str,
+        snapshot: &ConversationAssistantSnapshotRow,
+    ) -> Result<(), ConversationError> {
+        self.conversation_repo()
+            .upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {
+                conversation_id: child_id,
+                assistant_definition_id: &snapshot.assistant_definition_id,
+                assistant_id: &snapshot.assistant_id,
+                assistant_source: &snapshot.assistant_source,
+                agent_id: &snapshot.agent_id,
+                rules_content: &snapshot.rules_content,
+                default_model_mode: &snapshot.default_model_mode,
+                resolved_model_id: snapshot.resolved_model_id.as_deref(),
+                default_permission_mode: &snapshot.default_permission_mode,
+                resolved_permission_value: snapshot.resolved_permission_value.as_deref(),
+                default_thought_level_mode: &snapshot.default_thought_level_mode,
+                resolved_thought_level_value: snapshot.resolved_thought_level_value.as_deref(),
+                default_skills_mode: &snapshot.default_skills_mode,
+                resolved_skill_ids: &snapshot.resolved_skill_ids,
+                resolved_disabled_builtin_skill_ids: &snapshot.resolved_disabled_builtin_skill_ids,
+                default_mcps_mode: &snapshot.default_mcps_mode,
+                resolved_mcp_ids: &snapshot.resolved_mcp_ids,
+            })
+            .await?
+            .ok_or_else(|| ConversationError::internal("assistant snapshot clone returned no row"))?;
+        Ok(())
     }
 
     async fn build_parent_reference_transcript(&self, parent_id: &str) -> Result<String, ConversationError> {
@@ -372,6 +417,9 @@ fn build_child_create_request(
         r#type: Some(parent_type),
         name: Some(display_name),
         model,
+        // The parent's frozen assistant snapshot is copied after row creation.
+        // Re-resolving a mutable assistant definition here could change its
+        // identity, rules, or defaults at the fork boundary.
         assistant: None,
         source: parent
             .source

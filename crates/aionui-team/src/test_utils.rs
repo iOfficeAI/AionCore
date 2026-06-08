@@ -336,6 +336,14 @@ pub(crate) mod workspace_harness {
             Ok(vec![])
         }
 
+        async fn list_side_children(
+            &self,
+            _user_id: &str,
+            _parent_conversation_id: &str,
+        ) -> Result<Vec<ConversationRow>, DbError> {
+            Ok(vec![])
+        }
+
         async fn list_messages_page(
             &self,
             _conv_id: &str,

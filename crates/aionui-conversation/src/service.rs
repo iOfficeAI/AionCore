@@ -2640,7 +2640,9 @@ impl ConversationService {
         info!(msg_id = %user_msg_id, "User message persisted");
 
         let child_extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
-        let agent_content = self.enrich_side_agent_content(&child_extra, &req.content).await?;
+        let agent_content = self
+            .enrich_side_agent_content(user_id, &child_extra, &req.content)
+            .await?;
 
         self.broadcaster.broadcast(WebSocketMessage::new(
             "message.userCreated",

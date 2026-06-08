@@ -22,8 +22,8 @@ use aionui_api_types::{
     SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
-    SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
+    CloneConversationRequest, CreateConversationRequest, CreateSideConversationRequest, ListConversationsQuery,
+    SearchMessagesQuery, SendMessageRequest, SideForkMode, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
@@ -7258,6 +7258,95 @@ async fn create_honors_legacy_alias_fields_from_clone_merge() {
     assert!(resp.extra.get("enabled_skills").is_none());
     assert!(resp.extra.get("exclude_builtin_skills").is_none());
     assert!(resp.extra.get("loaded_skills").is_none());
+}
+
+#[tokio::test]
+async fn side_child_preserves_parent_assistant_snapshot() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    let mut parent_req = make_create_req_with_backend("codex");
+    parent_req.extra["preset_context"] = json!("frozen parent rules");
+    parent_req.extra["preset_enabled_skills"] = json!(["pdf"]);
+    let parent = svc.create("user_1", parent_req).await.unwrap();
+
+    repo.upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {
+        conversation_id: &parent.id,
+        assistant_definition_id: "asstdef-side-parent",
+        assistant_id: "assistant-side-parent",
+        assistant_source: "builtin",
+        agent_id: "codex",
+        rules_content: "frozen parent rules",
+        default_model_mode: "fixed",
+        resolved_model_id: Some("gpt-5.3-codex"),
+        default_permission_mode: "fixed",
+        resolved_permission_value: Some("workspace-write"),
+        default_thought_level_mode: "fixed",
+        resolved_thought_level_value: Some("high"),
+        default_skills_mode: "fixed",
+        resolved_skill_ids: r#"["pdf"]"#,
+        resolved_disabled_builtin_skill_ids: r#"["cron"]"#,
+        default_mcps_mode: "fixed",
+        resolved_mcp_ids: r#"["mcp-docs"]"#,
+    })
+    .await
+    .unwrap();
+
+    let side = svc
+        .create_side_conversation(
+            "user_1",
+            &parent.id,
+            CreateSideConversationRequest {
+                guardrail: None,
+                initial_prompt: None,
+                forked_at_msg_id: None,
+            },
+            &task_mgr,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(side.fork_mode, SideForkMode::TextSnapshot);
+    let snapshot = repo
+        .get_assistant_snapshot(&side.conversation_id)
+        .await
+        .unwrap()
+        .expect("side child must retain the frozen assistant snapshot");
+    assert_eq!(snapshot.assistant_definition_id, "asstdef-side-parent");
+    assert_eq!(snapshot.assistant_id, "assistant-side-parent");
+    assert_eq!(snapshot.agent_id, "codex");
+    assert_eq!(snapshot.rules_content, "frozen parent rules");
+    assert_eq!(snapshot.resolved_skill_ids, r#"["pdf"]"#);
+    assert_eq!(snapshot.resolved_disabled_builtin_skill_ids, r#"["cron"]"#);
+    assert_eq!(snapshot.resolved_mcp_ids, r#"["mcp-docs"]"#);
+
+    let child = repo.get(&side.conversation_id).await.unwrap().unwrap();
+    let child_extra: serde_json::Value = serde_json::from_str(&child.extra).unwrap();
+    let preset_context = child_extra["preset_context"].as_str().unwrap();
+    assert!(preset_context.starts_with("frozen parent rules\n\n"));
+    assert!(preset_context.contains("【侧边会话 · 摘要模式】"));
+    assert_eq!(child_extra["skills"], json!(["pdf"]));
+}
+
+#[tokio::test]
+async fn legacy_side_context_rejects_cross_user_parent_reference() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let foreign_parent = svc
+        .create("user_2", make_create_req_with_backend("codex"))
+        .await
+        .unwrap();
+    let child_extra = json!({
+        "side_mode": true,
+        "parent_conversation_id": foreign_parent.id,
+    });
+
+    let err = svc
+        .enrich_side_agent_content("user_1", &child_extra, "show parent context")
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ConversationError::NotFound { id } if id == foreign_parent.id),
+        "cross-user parent references must be indistinguishable from missing parents"
+    );
 }
 
 // ── insert_raw_message ────────────────────────────────────────────
