@@ -937,9 +937,7 @@ async fn wait_for_terminal_event(mut rx: broadcast::Receiver<AgentStreamEvent>) 
 /// 2. Exact [`AgentType`] serde match.
 /// 3. Fallback to [`AgentType::Acp`] to preserve the prior default.
 async fn parse_agent_type(registry: &AgentRegistry, agent_type_str: &str) -> Result<AgentType, CronError> {
-    if let Ok(agent_type) =
-        serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type_str.to_owned()))
-    {
+    if let Ok(agent_type) = serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type_str.to_owned())) {
         if agent_type.is_deprecated_runtime() {
             return Err(CronError::InvalidAgentConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
         }
@@ -1419,10 +1417,7 @@ mod tests {
     async fn parse_agent_type_known_types() {
         let registry = hydrated_registry().await;
         assert_eq!(parse_agent_type(&registry, "acp").await.unwrap(), AgentType::Acp);
-        assert_eq!(
-            parse_agent_type(&registry, "aionrs").await.unwrap(),
-            AgentType::Aionrs
-        );
+        assert_eq!(parse_agent_type(&registry, "aionrs").await.unwrap(), AgentType::Aionrs);
     }
 
     #[tokio::test]

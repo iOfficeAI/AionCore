@@ -639,7 +639,11 @@ fn ensure_test_workspace_path() -> String {
 }
 
 async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agent_type: AgentType) -> ConversationRow {
-    let id = format!("legacy-{}-{}", agent_type.serde_name(), aionui_common::generate_short_id());
+    let id = format!(
+        "legacy-{}-{}",
+        agent_type.serde_name(),
+        aionui_common::generate_short_id()
+    );
     let row = ConversationRow {
         id,
         user_id: user_id.to_owned(),

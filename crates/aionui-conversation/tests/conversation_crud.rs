@@ -164,13 +164,7 @@ async fn t1_1_create_with_defaults() {
 async fn t1_2_create_each_agent_type() {
     let (svc, _, _task_mgr) = setup().await;
 
-    let types = vec![
-        ("acp", AgentType::Acp),
-        ("openclaw-gateway", AgentType::OpenclawGateway),
-        ("nanobot", AgentType::Nanobot),
-        ("remote", AgentType::Remote),
-        ("aionrs", AgentType::Aionrs),
-    ];
+    let types = vec![("acp", AgentType::Acp), ("aionrs", AgentType::Aionrs)];
 
     for (type_str, expected_type) in types {
         let body = if type_str == "aionrs" {
@@ -192,6 +186,24 @@ async fn t1_2_create_each_agent_type() {
             assert!(resp.model.is_some(), "aionrs should keep top-level model");
         } else {
             assert!(resp.model.is_none(), "{type_str} should have no top-level model");
+        }
+    }
+
+    for type_str in ["openclaw-gateway", "nanobot", "remote", "gemini"] {
+        let req: CreateConversationRequest = serde_json::from_value(json!({
+            "type": type_str,
+            "extra": {}
+        }))
+        .unwrap();
+        let err = svc.create(USER_ID, req).await.unwrap_err();
+        match err {
+            ConversationError::BadRequest { reason } => {
+                assert!(
+                    reason.contains("no longer supported"),
+                    "unexpected error for {type_str}: {reason}"
+                );
+            }
+            other => panic!("expected BadRequest for {type_str}, got {other:?}"),
         }
     }
 }

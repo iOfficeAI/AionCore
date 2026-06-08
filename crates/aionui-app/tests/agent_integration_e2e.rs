@@ -271,10 +271,7 @@ async fn agents_endpoint_hides_deprecated_runtime_rows() {
 
     let body = body_json(resp).await;
     let agents = body["data"].as_array().expect("data should be array");
-    let types: Vec<&str> = agents
-        .iter()
-        .filter_map(|agent| agent["agent_type"].as_str())
-        .collect();
+    let types: Vec<&str> = agents.iter().filter_map(|agent| agent["agent_type"].as_str()).collect();
 
     assert!(types.contains(&"acp"));
     assert!(types.contains(&"aionrs"));
