@@ -684,7 +684,6 @@ mod tests {
         assert_eq!(resolved, PathBuf::from("npx"));
     }
 
-
     #[test]
     fn probe_resolved_command_requires_primary_binary_for_builtin_managed_claude() {
         if !probe_node_runtime_supported().is_supported()
