@@ -7,7 +7,9 @@ use agent_client_protocol::schema::{
 
 use super::agent_event_tracker::AcpSessionEvent;
 use super::agent_reconcile::ReconcileAction;
-use super::config_option_catalog::{derive_models_from_config_options, derive_modes_from_config_options};
+use super::config_option_catalog::{
+    derive_models_from_config_options, derive_modes_from_config_options, merge_config_options,
+};
 use crate::protocol::error::CloseReason;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState, SessionId};
 
@@ -468,23 +470,13 @@ impl AcpSession {
     }
 
     pub fn apply_advertised_config_options(&mut self, options: Vec<SessionConfigOption>) {
-        if self
-            .advertised
-            .modes
-            .as_ref()
-            .is_none_or(|modes| modes.available_modes.is_empty())
-            && let Some(modes) = derive_modes_from_config_options(&options)
-        {
+        let options = merge_config_options(self.advertised.config_options.as_deref(), options);
+
+        if let Some(modes) = derive_modes_from_config_options(&options) {
             self.apply_advertised_modes(modes);
         }
 
-        if self
-            .advertised
-            .models
-            .as_ref()
-            .is_none_or(|models| models.available_models.is_empty())
-            && let Some(models) = derive_models_from_config_options(&options)
-        {
+        if let Some(models) = derive_models_from_config_options(&options) {
             self.apply_advertised_models(models);
         }
 

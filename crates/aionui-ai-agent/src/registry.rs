@@ -29,7 +29,9 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::error::AgentError;
-use crate::manager::acp::config_option_catalog::enrich_handshake_with_existing_config_option_catalog;
+use crate::manager::acp::config_option_catalog::{
+    enrich_handshake_with_config_option_catalog, merge_config_option_values,
+};
 
 /// Capacity of the catalog-sync MPSC channel. A single writer thread
 /// drains it serially, so the bound just sizes the burst we can absorb
@@ -46,6 +48,10 @@ struct CatalogSyncMessage {
 #[cfg(test)]
 #[path = "registry_config_option_tests.rs"]
 mod registry_config_option_tests;
+
+#[cfg(test)]
+#[path = "registry_tests.rs"]
+mod registry_tests;
 
 pub struct AgentRegistry {
     repo: Arc<dyn IAgentMetadataRepository>,
@@ -96,8 +102,20 @@ impl AgentRegistry {
     ///
     /// `None` fields are left untouched (partial update).
     async fn apply_handshake_inner(&self, id: &str, snapshot: &AgentHandshake) -> Result<(), AgentError> {
-        let existing = self.by_id.read().await.get(id).map(|meta| meta.handshake.clone());
-        let snapshot = enrich_handshake_with_existing_config_option_catalog(snapshot, existing.as_ref());
+        let mut snapshot = snapshot.clone();
+        if let Some(incoming_config_options) = snapshot.config_options.as_ref() {
+            let existing_config_options = {
+                let guard = self.by_id.read().await;
+                guard.get(id).and_then(|meta| meta.handshake.config_options.clone())
+            };
+            if let Some(merged_config_options) =
+                merge_config_option_values(existing_config_options.as_ref(), incoming_config_options)
+            {
+                snapshot.config_options = Some(merged_config_options);
+            }
+        }
+
+        let snapshot = enrich_handshake_with_config_option_catalog(&snapshot);
         let agent_capabilities = encode_optional(&snapshot.agent_capabilities, "agent_capabilities")?;
         let auth_methods = encode_optional(&snapshot.auth_methods, "auth_methods")?;
         let config_options = encode_optional(&snapshot.config_options, "config_options")?;
@@ -654,127 +672,6 @@ mod tests {
         let reg = AgentRegistry::new(repo);
         reg.hydrate().await.unwrap();
         reg
-    }
-
-    #[test]
-    fn probe_resolved_command_accepts_bare_npx_when_managed_runtime_is_supported() {
-        if !probe_node_runtime_supported().is_supported() {
-            return;
-        }
-
-        let meta = AgentMetadata {
-            id: "agent-1".into(),
-            icon: None,
-            name: "Test ACP".into(),
-            name_i18n: None,
-            description: None,
-            description_i18n: None,
-            backend: Some("custom".into()),
-            agent_type: AgentType::Acp,
-            agent_source: AgentSource::Custom,
-            agent_source_info: AgentSourceInfo::default(),
-            enabled: true,
-            available: false,
-            command: Some("npx".into()),
-            resolved_command: None,
-            args: vec![],
-            env: vec![],
-            native_skills_dirs: None,
-            behavior_policy: BehaviorPolicy::default(),
-            yolo_id: None,
-            sort_order: 0,
-            team_capable: false,
-            handshake: AgentHandshake::default(),
-        };
-
-        let resolved = probe_resolved_command(&meta).expect("probe");
-        assert_eq!(resolved, PathBuf::from("npx"));
-    }
-
-    #[test]
-    fn probe_resolved_command_requires_primary_binary_for_builtin_managed_claude() {
-        if !probe_node_runtime_supported().is_supported()
-            || !probe_managed_acp_tool_supported(ManagedAcpToolId::ClaudeAgentAcp).is_supported()
-        {
-            return;
-        }
-
-        let meta = AgentMetadata {
-            id: "agent-claude".into(),
-            icon: None,
-            name: "Claude Code".into(),
-            name_i18n: None,
-            description: None,
-            description_i18n: None,
-            backend: Some("claude".into()),
-            agent_type: AgentType::Acp,
-            agent_source: AgentSource::Builtin,
-            agent_source_info: AgentSourceInfo {
-                binary_name: Some("definitely-missing-claude-cli".into()),
-                ..Default::default()
-            },
-            enabled: true,
-            available: false,
-            command: None,
-            resolved_command: None,
-            args: vec![],
-            env: vec![],
-            native_skills_dirs: None,
-            behavior_policy: BehaviorPolicy::default(),
-            yolo_id: None,
-            sort_order: 0,
-            team_capable: false,
-            handshake: AgentHandshake::default(),
-        };
-
-        let reason = probe_resolved_command(&meta).expect_err("missing claude CLI must hide builtin row");
-        assert!(matches!(
-            reason,
-            UnavailableReason::PrimaryMissing { binary } if binary == "definitely-missing-claude-cli"
-        ));
-    }
-
-    #[test]
-    fn probe_resolved_command_requires_primary_binary_for_builtin_managed_codex() {
-        if !probe_node_runtime_supported().is_supported()
-            || !probe_managed_acp_tool_supported(ManagedAcpToolId::CodexAcp).is_supported()
-        {
-            return;
-        }
-
-        let meta = AgentMetadata {
-            id: "agent-codex".into(),
-            icon: None,
-            name: "Codex".into(),
-            name_i18n: None,
-            description: None,
-            description_i18n: None,
-            backend: Some("codex".into()),
-            agent_type: AgentType::Acp,
-            agent_source: AgentSource::Builtin,
-            agent_source_info: AgentSourceInfo {
-                binary_name: Some("definitely-missing-codex-cli".into()),
-                ..Default::default()
-            },
-            enabled: true,
-            available: false,
-            command: None,
-            resolved_command: None,
-            args: vec![],
-            env: vec![],
-            native_skills_dirs: None,
-            behavior_policy: BehaviorPolicy::default(),
-            yolo_id: None,
-            sort_order: 0,
-            team_capable: false,
-            handshake: AgentHandshake::default(),
-        };
-
-        let reason = probe_resolved_command(&meta).expect_err("missing codex CLI must hide builtin row");
-        assert!(matches!(
-            reason,
-            UnavailableReason::PrimaryMissing { binary } if binary == "definitely-missing-codex-cli"
-        ));
     }
 
     #[tokio::test]

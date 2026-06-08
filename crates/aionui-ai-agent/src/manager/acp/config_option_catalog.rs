@@ -25,16 +25,52 @@ pub(crate) fn derive_modes_from_config_options(options: &[SessionConfigOption]) 
 
 pub(crate) fn derive_models_from_config_options(options: &[SessionConfigOption]) -> Option<SessionModelState> {
     let select = find_select(options, &["model", "models"], &SessionConfigOptionCategory::Model)?;
-    let available_models: Vec<ModelInfo> = flatten_select_options(&select.options)
+    let model_options = flatten_select_options(&select.options);
+
+    if model_options.is_empty() {
+        return None;
+    }
+
+    if let Some(thought_select) = find_select(
+        options,
+        &["thought_level", "reasoning_effort"],
+        &SessionConfigOptionCategory::ThoughtLevel,
+    ) {
+        let thought_options = flatten_select_options(&thought_select.options);
+        if !thought_options.is_empty() {
+            let current_model =
+                non_empty_or_first(select.current_value.to_string(), &model_options[0].value.to_string());
+            let current_thought = non_empty_or_first(
+                thought_select.current_value.to_string(),
+                &thought_options[0].value.to_string(),
+            );
+            let available_models: Vec<ModelInfo> = model_options
+                .into_iter()
+                .flat_map(|model| {
+                    thought_options.iter().map(move |thought| {
+                        let thought_value = thought.value.to_string();
+                        ModelInfo::new(
+                            format!("{}/{}", model.value, thought.value),
+                            format!("{} ({thought_value})", model.name),
+                        )
+                        .description(model.description.clone())
+                    })
+                })
+                .collect();
+
+            return Some(SessionModelState::new(
+                format!("{current_model}/{current_thought}"),
+                available_models,
+            ));
+        }
+    }
+
+    let available_models: Vec<ModelInfo> = model_options
         .into_iter()
         .map(|option| {
             ModelInfo::new(option.value.to_string(), option.name.clone()).description(option.description.clone())
         })
         .collect();
-
-    if available_models.is_empty() {
-        return None;
-    }
 
     let current_model_id = non_empty_or_first(
         select.current_value.to_string(),
@@ -43,10 +79,58 @@ pub(crate) fn derive_models_from_config_options(options: &[SessionConfigOption])
     Some(SessionModelState::new(current_model_id, available_models))
 }
 
-pub(crate) fn enrich_handshake_with_existing_config_option_catalog(
-    handshake: &AgentHandshake,
-    existing: Option<&AgentHandshake>,
-) -> AgentHandshake {
+pub(crate) fn merge_config_options(
+    existing: Option<&[SessionConfigOption]>,
+    incoming: Vec<SessionConfigOption>,
+) -> Vec<SessionConfigOption> {
+    let Some(existing) = existing else {
+        return incoming;
+    };
+
+    let mut merged = existing.to_vec();
+    for option in incoming {
+        let incoming_id = option.id.to_string();
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| existing.id.to_string() == incoming_id)
+        {
+            *existing = option;
+        } else {
+            merged.push(option);
+        }
+    }
+    merged
+}
+
+pub(crate) fn merge_config_option_values(existing: Option<&Value>, incoming: &Value) -> Option<Value> {
+    let incoming_options = extract_config_options_from_value(incoming)?;
+    let existing_options = existing.and_then(extract_config_options_from_value);
+    let merged_options = merge_config_options(existing_options.as_deref(), incoming_options);
+    Some(config_options_value_like(incoming, merged_options))
+}
+
+fn config_options_value_like(template: &Value, options: Vec<SessionConfigOption>) -> Value {
+    let options_value = serde_json::to_value(options).unwrap_or_else(|_| Value::Array(Vec::new()));
+    let Some(template_map) = template.as_object() else {
+        return options_value;
+    };
+
+    if template_map.contains_key("config_options") {
+        let mut map = template_map.clone();
+        map.insert("config_options".to_owned(), options_value);
+        return Value::Object(map);
+    }
+
+    if template_map.contains_key("configOptions") {
+        let mut map = template_map.clone();
+        map.insert("configOptions".to_owned(), options_value);
+        return Value::Object(map);
+    }
+
+    options_value
+}
+
+pub(crate) fn enrich_handshake_with_config_option_catalog(handshake: &AgentHandshake) -> AgentHandshake {
     let mut enriched = handshake.clone();
     let Some(config_options) = handshake
         .config_options
@@ -56,23 +140,13 @@ pub(crate) fn enrich_handshake_with_existing_config_option_catalog(
         return enriched;
     };
 
-    if should_fill_catalog(
-        &enriched.available_modes,
-        existing.and_then(|handshake| handshake.available_modes.as_ref()),
-        "available_modes",
-        "availableModes",
-    ) && let Some(modes) = derive_modes_from_config_options(&config_options)
+    if let Some(modes) = derive_modes_from_config_options(&config_options)
         && let Some(value) = mode_state_to_snake_value(&modes)
     {
         enriched.available_modes = Some(value);
     }
 
-    if should_fill_catalog(
-        &enriched.available_models,
-        existing.and_then(|handshake| handshake.available_models.as_ref()),
-        "available_models",
-        "availableModels",
-    ) && let Some(models) = derive_models_from_config_options(&config_options)
+    if let Some(models) = derive_models_from_config_options(&config_options)
         && let Some(value) = model_state_to_payload_value(&models)
     {
         enriched.available_models = Some(value);
@@ -163,34 +237,6 @@ fn model_state_to_payload_value(models: &SessionModelState) -> Option<Value> {
         available_models,
     })
     .ok()
-}
-
-fn has_non_empty_catalog(value: &Option<Value>, snake_key: &str, camel_key: &str) -> bool {
-    value
-        .as_ref()
-        .is_some_and(|value| has_non_empty_catalog_value(value, snake_key, camel_key))
-}
-
-fn has_non_empty_catalog_value(value: &Value, snake_key: &str, camel_key: &str) -> bool {
-    match value {
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(map) => map
-            .get(snake_key)
-            .or_else(|| map.get(camel_key))
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty()),
-        _ => false,
-    }
-}
-
-fn should_fill_catalog(incoming: &Option<Value>, existing: Option<&Value>, snake_key: &str, camel_key: &str) -> bool {
-    if has_non_empty_catalog(incoming, snake_key, camel_key) {
-        return false;
-    }
-    if incoming.is_none() && existing.is_some_and(|value| has_non_empty_catalog_value(value, snake_key, camel_key)) {
-        return false;
-    }
-    true
 }
 
 fn keys_to_camel_case(value: Value) -> Value {
@@ -308,6 +354,43 @@ mod tests {
     }
 
     #[test]
+    fn derives_codex_model_variants_from_model_and_thought_level_options() {
+        let options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "gpt-5.5",
+                vec![
+                    SessionConfigSelectOption::new("gpt-5.5", "GPT-5.5"),
+                    SessionConfigSelectOption::new("gpt-5.4", "gpt-5.4"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Model),
+            SessionConfigOption::select(
+                "reasoning_effort",
+                "Reasoning Effort",
+                "medium",
+                vec![
+                    SessionConfigSelectOption::new("low", "Low"),
+                    SessionConfigSelectOption::new("medium", "Medium"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ];
+
+        let models = derive_models_from_config_options(&options).expect("combined model catalog");
+
+        assert_eq!(models.current_model_id.to_string(), "gpt-5.5/medium");
+        assert_eq!(models.available_models.len(), 4);
+        assert_eq!(models.available_models[0].model_id.to_string(), "gpt-5.5/low");
+        assert_eq!(models.available_models[0].name, "GPT-5.5 (low)");
+        assert_eq!(models.available_models[1].model_id.to_string(), "gpt-5.5/medium");
+        assert_eq!(models.available_models[1].name, "GPT-5.5 (medium)");
+        assert_eq!(models.available_models[3].model_id.to_string(), "gpt-5.4/medium");
+        assert_eq!(models.available_models[3].name, "gpt-5.4 (medium)");
+    }
+
+    #[test]
     fn derives_from_semantic_categories_before_id_aliases() {
         let options = vec![
             SessionConfigOption::select(
@@ -415,7 +498,7 @@ mod tests {
             ..Default::default()
         };
 
-        let enriched = enrich_handshake_with_existing_config_option_catalog(&handshake, None);
+        let enriched = enrich_handshake_with_config_option_catalog(&handshake);
 
         assert_eq!(
             enriched.available_modes,
@@ -491,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn enrich_keeps_explicit_non_empty_catalogs() {
+    fn enrich_falls_back_to_available_catalogs_when_config_options_have_no_catalogs() {
         let explicit_modes = json!({
             "current_mode_id": "explicit",
             "available_modes": [{"id": "explicit", "name": "Explicit"}]
@@ -504,11 +587,11 @@ mod tests {
         let handshake = AgentHandshake {
             config_options: Some(json!([
                 {
-                    "id": "models",
-                    "name": "Model",
+                    "id": "reasoning",
+                    "name": "Reasoning",
                     "type": "select",
-                    "currentValue": "derived",
-                    "options": [{"value": "derived", "name": "Derived"}]
+                    "currentValue": "high",
+                    "options": [{"value": "high", "name": "High"}]
                 }
             ])),
             available_modes: Some(explicit_modes.clone()),
@@ -516,22 +599,14 @@ mod tests {
             ..Default::default()
         };
 
-        let enriched = enrich_handshake_with_existing_config_option_catalog(&handshake, None);
+        let enriched = enrich_handshake_with_config_option_catalog(&handshake);
 
         assert_eq!(enriched.available_modes, Some(explicit_modes));
         assert_eq!(enriched.available_models, Some(explicit_models));
     }
 
     #[test]
-    fn enrich_skips_config_only_fallback_when_existing_catalog_is_non_empty() {
-        let existing = AgentHandshake {
-            available_models: Some(json!({
-                "current_model_id": "explicit-model",
-                "current_model_label": "Explicit Model",
-                "available_models": [{"id": "explicit-model", "label": "Explicit Model"}]
-            })),
-            ..Default::default()
-        };
+    fn enrich_prefers_config_options_over_available_catalogs() {
         let incoming = AgentHandshake {
             config_options: Some(json!({
                 "configOptions": [
@@ -544,14 +619,23 @@ mod tests {
                     }
                 ]
             })),
+            available_models: Some(json!({
+                "current_model_id": "available-model",
+                "current_model_label": "Available Model",
+                "available_models": [{"id": "available-model", "label": "Available Model"}]
+            })),
             ..Default::default()
         };
 
-        let enriched = enrich_handshake_with_existing_config_option_catalog(&incoming, Some(&existing));
+        let enriched = enrich_handshake_with_config_option_catalog(&incoming);
 
-        assert!(
-            enriched.available_models.is_none(),
-            "config-only partial must not overwrite an existing explicit catalog"
+        assert_eq!(
+            enriched.available_models,
+            Some(json!({
+                "current_model_id": "derived",
+                "current_model_label": "Derived",
+                "available_models": [{"id": "derived", "label": "Derived"}]
+            }))
         );
     }
 }
