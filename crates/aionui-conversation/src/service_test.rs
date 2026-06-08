@@ -638,6 +638,30 @@ fn ensure_test_workspace_path() -> String {
     workspace.to_string_lossy().to_string()
 }
 
+async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agent_type: AgentType) -> ConversationRow {
+    let id = format!("legacy-{}-{}", agent_type.serde_name(), aionui_common::generate_short_id());
+    let row = ConversationRow {
+        id,
+        user_id: user_id.to_owned(),
+        name: format!("legacy {}", agent_type.serde_name()),
+        r#type: agent_type.serde_name().to_owned(),
+        extra: json!({
+            "workspace": ensure_test_workspace_path()
+        })
+        .to_string(),
+        model: None,
+        status: Some("finished".into()),
+        source: Some("aionui".into()),
+        channel_chat_id: None,
+        pinned: false,
+        pinned_at: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    repo.create(&row).await.unwrap();
+    row
+}
+
 // ── Create tests ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1969,6 +1993,34 @@ async fn send_message_returns_accepted() {
 }
 
 #[tokio::test]
+async fn send_message_rejects_legacy_runtime_conversations_as_archived() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    for agent_type in [
+        AgentType::Gemini,
+        AgentType::OpenclawGateway,
+        AgentType::Nanobot,
+        AgentType::Remote,
+    ] {
+        let conv = insert_conversation_with_type(&repo, "user_1", agent_type).await;
+
+        let err = svc
+            .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "CONVERSATION_ARCHIVED");
+        assert!(
+            err.to_string()
+                .contains("This historical conversation can no longer be continued. Please start a new conversation."),
+            "unexpected archived message for {}: {err}",
+            agent_type.serde_name()
+        );
+    }
+}
+
+#[tokio::test]
 async fn set_mode_returns_confirmed_mode_from_active_agent() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
@@ -2722,6 +2774,31 @@ async fn warmup_creates_agent_task() {
 
     // Agent should now exist
     assert!(task_mgr.get_task(&conv.id).is_some());
+}
+
+#[tokio::test]
+async fn warmup_rejects_legacy_runtime_conversations_as_archived() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    for agent_type in [
+        AgentType::Gemini,
+        AgentType::OpenclawGateway,
+        AgentType::Nanobot,
+        AgentType::Remote,
+    ] {
+        let conv = insert_conversation_with_type(&repo, "user_1", agent_type).await;
+
+        let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+
+        assert_eq!(err.error_code(), "CONVERSATION_ARCHIVED");
+        assert!(
+            err.to_string()
+                .contains("This historical conversation can no longer be continued. Please start a new conversation."),
+            "unexpected archived message for {}: {err}",
+            agent_type.serde_name()
+        );
+    }
 }
 
 #[tokio::test]

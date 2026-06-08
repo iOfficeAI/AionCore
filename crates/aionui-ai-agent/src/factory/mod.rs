@@ -3,8 +3,14 @@ pub mod acp_assembler;
 mod acp;
 pub(crate) mod aionrs;
 mod context;
+// Legacy runtime managers are retained for historical row decoding and
+// diagnostics only. New conversations must use `acp` or `aionrs`; attempts
+// to run legacy rows return CONVERSATION_ARCHIVED.
+#[allow(dead_code)]
 mod nanobot;
+#[allow(dead_code)]
 mod openclaw;
+#[allow(dead_code)]
 mod remote;
 
 use std::path::PathBuf;
@@ -24,6 +30,9 @@ use crate::registry::AgentRegistry;
 use crate::session_context::AgentSessionKind;
 use crate::task_manager::AgentFactory;
 use crate::types::BuildTaskOptions;
+
+const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
+    "This historical conversation can no longer be continued. Please start a new conversation.";
 
 /// Dependencies needed by the agent factory to construct agents.
 pub struct AgentFactoryDeps {
@@ -70,14 +79,11 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
     match context.kind {
-        AgentSessionKind::Gemini => Err(AgentError::conversation_archived(
-            "This conversation was created with the legacy Gemini runtime, which has been \
-             removed. Please start a new conversation with the Gemini ACP backend to continue.",
-        )),
+        AgentSessionKind::Gemini
+        | AgentSessionKind::OpenClaw(_)
+        | AgentSessionKind::Nanobot(_)
+        | AgentSessionKind::Remote(_) => Err(AgentError::conversation_archived(LEGACY_CONVERSATION_ARCHIVED_MESSAGE)),
         AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,
-        AgentSessionKind::OpenClaw(openclaw_context) => openclaw::build(deps, *openclaw_context, ctx).await,
-        AgentSessionKind::Nanobot(nanobot_context) => nanobot::build(deps, nanobot_context, ctx).await,
-        AgentSessionKind::Remote(remote_context) => remote::build(deps, remote_context, ctx).await,
         AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
     }
 }

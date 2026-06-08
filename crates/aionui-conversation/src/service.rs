@@ -45,6 +45,8 @@ use crate::turn_orchestrator::{ConversationTurnOrchestrator, TurnStartInput};
 use std::sync::RwLock;
 
 pub(crate) const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
+const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
+    "This historical conversation can no longer be continued. Please start a new conversation.";
 
 #[derive(Debug, Clone, Copy)]
 struct McpSupportPolicy {
@@ -89,6 +91,30 @@ impl McpSupportPolicy {
             SessionMcpTransport::StreamableHttp { .. } => self.streamable_http,
         }
     }
+}
+
+fn parse_agent_type_from_row(row: &ConversationRow) -> Option<AgentType> {
+    serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok()
+}
+
+fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), ConversationError> {
+    let Some(agent_type) = parse_agent_type_from_row(row) else {
+        return Ok(());
+    };
+
+    if agent_type.is_deprecated_runtime() {
+        debug!(
+            conversation_id = %row.id,
+            agent_type = agent_type.serde_name(),
+            "Rejected deprecated runtime conversation"
+        );
+        return Err(ConversationError::Archived {
+            id: row.id.clone(),
+            reason: LEGACY_CONVERSATION_ARCHIVED_MESSAGE.into(),
+        });
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1377,20 +1403,7 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
-        // Short-circuit for legacy Gemini conversations: the dedicated Gemini
-        // runtime has been removed, so we cannot build an agent for this row.
-        // Emit CONVERSATION_ARCHIVED (HTTP 410 Gone) without touching the
-        // legacy `model` column, which may hold shapes the new parser can't
-        // deserialize. The client identifies this case by `code` and renders
-        // a dedicated archived-conversation UI rather than a generic banner.
-        if row.r#type == "gemini" {
-            return Err(ConversationError::Archived {
-                id: conversation_id.to_owned(),
-                reason: "This conversation was created with the legacy Gemini runtime, which has been \
-                         removed. Please start a new conversation with the Gemini ACP backend to continue."
-                    .into(),
-            });
-        }
+        reject_deprecated_runtime_row(&row)?;
 
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id)?;
 
@@ -1589,6 +1602,8 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
+        reject_deprecated_runtime_row(&row)?;
+
         let build_opts = self.build_task_options(&row).await?;
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
@@ -1632,6 +1647,7 @@ impl ConversationService {
         &self,
         row: &aionui_db::models::ConversationRow,
     ) -> Result<BuildTaskOptions, ConversationError> {
+        reject_deprecated_runtime_row(row)?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
             .build_options(row)
             .await
@@ -1642,6 +1658,7 @@ impl ConversationService {
         row: &aionui_db::models::ConversationRow,
         workspace_override: Option<&str>,
     ) -> Result<BuildTaskOptions, ConversationError> {
+        reject_deprecated_runtime_row(row)?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
             .build_options_with_workspace_override(row, workspace_override)
             .await
