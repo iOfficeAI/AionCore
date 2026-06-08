@@ -539,6 +539,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_openclaw_builtin_backend_fallback_resolves_agent_id() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-openclaw-test", "openclaw").await;
+        let row = row("acp", serde_json::json!({ "backend": "openclaw" }), None);
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.agent_id.as_deref(), Some("builtin-openclaw-test"));
+        assert_eq!(acp.config.backend.as_deref(), Some("openclaw"));
+    }
+
+    #[tokio::test]
     async fn acp_non_builtin_without_agent_id_is_rejected() {
         let repos = setup().await;
         let row = row(
