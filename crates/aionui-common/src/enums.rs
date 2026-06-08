@@ -44,6 +44,14 @@ impl AgentType {
         }
     }
 
+    pub fn supports_new_conversation(&self) -> bool {
+        matches!(self, AgentType::Acp | AgentType::Aionrs)
+    }
+
+    pub fn is_deprecated_runtime(&self) -> bool {
+        !self.supports_new_conversation()
+    }
+
     pub fn id(&self) -> String {
         let hash = fnv1a_hex8(self.serde_name().as_bytes());
         // SAFETY: fnv1a_hex8 only produces ASCII hex digits
@@ -334,6 +342,28 @@ mod tests {
             let parsed: AgentType = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, variant, "deserialize {expected}");
         }
+    }
+
+    #[test]
+    fn agent_type_new_conversation_support_policy_is_explicit() {
+        assert!(AgentType::Acp.supports_new_conversation());
+        assert!(AgentType::Aionrs.supports_new_conversation());
+
+        assert!(!AgentType::Gemini.supports_new_conversation());
+        assert!(!AgentType::OpenclawGateway.supports_new_conversation());
+        assert!(!AgentType::Nanobot.supports_new_conversation());
+        assert!(!AgentType::Remote.supports_new_conversation());
+    }
+
+    #[test]
+    fn agent_type_deprecated_runtime_policy_matches_new_conversation_support() {
+        assert!(!AgentType::Acp.is_deprecated_runtime());
+        assert!(!AgentType::Aionrs.is_deprecated_runtime());
+
+        assert!(AgentType::Gemini.is_deprecated_runtime());
+        assert!(AgentType::OpenclawGateway.is_deprecated_runtime());
+        assert!(AgentType::Nanobot.is_deprecated_runtime());
+        assert!(AgentType::Remote.is_deprecated_runtime());
     }
 
     #[test]
