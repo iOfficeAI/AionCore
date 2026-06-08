@@ -325,6 +325,14 @@ VALUES
      'yolo', 3130,
      unixepoch('now','subsec')*1000, unixepoch('now','subsec')*1000),
 
+    ('b7e8a9c4', '/api/assets/logos/tools/openclaw.svg', 'OpenClaw',
+     'openclaw', 'acp', 'builtin', '{"binary_name":"openclaw"}',
+     1, 'openclaw', '["acp"]', '[]',
+     NULL,
+     '{"supports_side_question":false}',
+     NULL, 3140,
+     unixepoch('now','subsec')*1000, unixepoch('now','subsec')*1000),
+
     -- Non-ACP builtins
     ('fb1083a5', '/api/assets/logos/tools/nanobot.svg', 'Nanobot',
      NULL, 'nanobot', 'builtin', '{"binary_name":"nanobot"}',

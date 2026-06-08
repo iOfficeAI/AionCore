@@ -17,6 +17,7 @@ use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::TextEventData;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentError, AgentStreamEvent, IWorkerTaskManager};
+use aionui_api_types::AgentSource;
 use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
 use aionui_db::UpsertAgentMetadataParams;
 use async_trait::async_trait;
@@ -279,6 +280,45 @@ async fn agents_endpoint_hides_deprecated_runtime_rows() {
     assert!(!types.contains(&"nanobot"));
     assert!(!types.contains(&"remote"));
     assert!(!types.contains(&"gemini"));
+}
+
+#[tokio::test]
+async fn agents_endpoint_lists_openclaw_as_acp_backend() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+
+    let meta = services
+        .agent_registry
+        .find_builtin_by_backend("openclaw")
+        .await
+        .expect("OpenClaw ACP builtin row should exist");
+    assert_eq!(meta.agent_type, AgentType::Acp);
+    assert_eq!(meta.backend.as_deref(), Some("openclaw"));
+    assert_eq!(meta.command.as_deref(), Some("openclaw"));
+    assert_eq!(meta.args, vec!["acp"]);
+    assert_eq!(meta.agent_source, AgentSource::Builtin);
+
+    let req = get_with_token("/api/agents", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    let agents = body["data"].as_array().expect("data should be array");
+
+    let openclaw = agents
+        .iter()
+        .find(|agent| agent["backend"].as_str() == Some("openclaw"))
+        .expect("OpenClaw ACP should be visible from /api/agents");
+    assert_eq!(openclaw["agent_type"], "acp");
+    assert_eq!(openclaw["command"], "openclaw");
+    assert_eq!(openclaw["args"], json!(["acp"]));
+
+    assert!(
+        agents
+            .iter()
+            .all(|agent| agent["agent_type"].as_str() != Some("openclaw-gateway")),
+        "old openclaw-gateway row must remain hidden from new conversation catalog"
+    );
 }
 
 // ── Message flow with mock agent ────────────────────────────────
