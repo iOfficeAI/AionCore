@@ -18,6 +18,7 @@ use aionui_ai_agent::protocol::events::TextEventData;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentError, AgentStreamEvent, IWorkerTaskManager};
 use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
+use aionui_db::UpsertAgentMetadataParams;
 use async_trait::async_trait;
 
 use common::{body_json, get_with_token, json_with_token, setup_and_login};
@@ -209,6 +210,78 @@ async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str, na
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = common::body_json(resp).await;
     json["data"]["id"].as_str().unwrap().to_owned()
+}
+
+async fn upsert_visible_agent_metadata(services: &aionui_app::AppServices, id: &str, agent_type: &str) {
+    services
+        .agent_registry
+        .repo_handle()
+        .upsert(&UpsertAgentMetadataParams {
+            id,
+            icon: None,
+            name: id,
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some(id),
+            agent_type,
+            agent_source: "internal",
+            agent_source_info: Some("{}"),
+            enabled: true,
+            command: None,
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: Some("{}"),
+            yolo_id: Some("yolo"),
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 1,
+        })
+        .await
+        .unwrap();
+}
+
+// ── Agent catalog tests ─────────────────────────────────────────
+
+#[tokio::test]
+async fn agents_endpoint_hides_deprecated_runtime_rows() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+
+    for (id, agent_type) in [
+        ("test-visible-acp", "acp"),
+        ("test-visible-aionrs", "aionrs"),
+        ("test-visible-openclaw", "openclaw-gateway"),
+        ("test-visible-nanobot", "nanobot"),
+        ("test-visible-remote", "remote"),
+        ("test-visible-gemini", "gemini"),
+    ] {
+        upsert_visible_agent_metadata(&services, id, agent_type).await;
+    }
+    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+
+    let req = get_with_token("/api/agents", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    let agents = body["data"].as_array().expect("data should be array");
+    let types: Vec<&str> = agents
+        .iter()
+        .filter_map(|agent| agent["agent_type"].as_str())
+        .collect();
+
+    assert!(types.contains(&"acp"));
+    assert!(types.contains(&"aionrs"));
+    assert!(!types.contains(&"openclaw-gateway"));
+    assert!(!types.contains(&"nanobot"));
+    assert!(!types.contains(&"remote"));
+    assert!(!types.contains(&"gemini"));
 }
 
 // ── Message flow with mock agent ────────────────────────────────
