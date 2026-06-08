@@ -42,6 +42,16 @@ struct InstalledPackageJson {
     name: String,
     #[serde(default)]
     bin: serde_json::Value,
+    #[serde(default)]
+    main: Option<String>,
+    #[serde(default)]
+    exports: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PackageSmokeTarget {
+    Import(PathBuf),
+    SyntaxCheck(PathBuf),
 }
 
 #[derive(Debug, Serialize)]
@@ -523,7 +533,7 @@ async fn prepare_local_tool_source_to_root(
     validate_bridge_entrypoint(&project_dir, &manifest)?;
     validate_platform_binary(tool, &project_dir, spec)?;
     validate_dependency_tree(node_runtime, &project_dir, &npm_cache_dir, tool).await?;
-    validate_package_import_smoke(node_runtime, &project_dir, tool).await?;
+    validate_package_smoke(node_runtime, &project_dir, tool).await?;
 
     let manifest_path = project_dir.join("manifest.json");
     fs::write(
@@ -536,7 +546,7 @@ async fn prepare_local_tool_source_to_root(
     managed_resources::materialize_directory(&project_dir, target_root).map_err(ManagedAcpToolError::io)?;
     let resolved = validate_tool_root(tool, target_root, None)?;
     validate_dependency_tree(node_runtime, target_root, &npm_cache_dir, tool).await?;
-    validate_package_import_smoke(node_runtime, target_root, tool).await?;
+    validate_package_smoke(node_runtime, target_root, tool).await?;
     info!(
         tool = tool.slug(),
         version = tool.version(),
@@ -689,23 +699,39 @@ async fn validate_dependency_tree(
     .await
 }
 
-async fn validate_package_import_smoke(
+async fn validate_package_smoke(
     node_runtime: &crate::ResolvedNodeRuntime,
     project_dir: &Path,
     tool: ManagedAcpToolId,
 ) -> Result<(), ManagedAcpToolError> {
+    let package_json_path = package_json_path(project_dir, tool.package_name());
+    let contents = fs::read_to_string(&package_json_path).map_err(ManagedAcpToolError::io)?;
+    let package_json: InstalledPackageJson = serde_json::from_str(&contents).map_err(|error| {
+        ManagedAcpToolError::invalid(format!(
+            "parse installed package manifest failed for {}: {error}",
+            package_json_path.display()
+        ))
+    })?;
+    let smoke_target = resolve_package_smoke_target(project_dir, &package_json)?;
     let mut builder = Builder::clean_cli(node_runtime.node_path.clone());
-    builder.current_dir(project_dir).args([
-        "--input-type=module",
-        "-e",
-        "await import(process.argv[1]);",
-        tool.package_name(),
-    ]);
+    builder.current_dir(project_dir);
+    match &smoke_target {
+        PackageSmokeTarget::Import(path) => {
+            builder
+                .arg("--input-type=module")
+                .arg("-e")
+                .arg("import { pathToFileURL } from 'node:url'; await import(pathToFileURL(process.argv[1]).href);")
+                .arg(path);
+        }
+        PackageSmokeTarget::SyntaxCheck(path) => {
+            builder.arg("--check").arg(path);
+        }
+    }
     let output = tokio::time::timeout(MANAGED_ACP_SMOKE_TIMEOUT, builder.output())
         .await
         .map_err(|_| {
             ManagedAcpToolError::invalid(format!(
-                "smoke test for managed {} package import timed out after {}s",
+                "smoke test for managed {} package timed out after {}s",
                 tool.display_name(),
                 MANAGED_ACP_SMOKE_TIMEOUT.as_secs()
             ))
@@ -725,18 +751,22 @@ async fn validate_package_import_smoke(
         format!("{stderr}; stdout: {stdout}")
     };
     Err(ManagedAcpToolError::invalid(format!(
-        "smoke test for managed {} package import failed with exit code {:?}: {detail}",
+        "smoke test for managed {} package failed with exit code {:?}: {detail}",
         tool.display_name(),
         output.status.code()
     )))
 }
 
 fn package_json_path(project_dir: &Path, package_name: &str) -> PathBuf {
+    package_root(project_dir, package_name).join("package.json")
+}
+
+fn package_root(project_dir: &Path, package_name: &str) -> PathBuf {
     let mut path = project_dir.join("node_modules");
     for segment in package_path_segments(package_name) {
         path.push(segment);
     }
-    path.join("package.json")
+    path
 }
 
 fn package_path_segments(package_name: &str) -> Vec<&str> {
@@ -772,6 +802,54 @@ fn resolve_package_bin_entry(package_name: &str, bin_field: &serde_json::Value) 
             "package {package_name} does not expose a usable bin entry"
         ))),
     }
+}
+
+fn resolve_package_smoke_target(
+    project_dir: &Path,
+    package_json: &InstalledPackageJson,
+) -> Result<PackageSmokeTarget, ManagedAcpToolError> {
+    if let Some(entry) = resolve_package_import_entry(&package_json.exports, package_json.main.as_deref()) {
+        return Ok(PackageSmokeTarget::Import(package_root(project_dir, &package_json.name).join(entry)));
+    }
+
+    let bin_entry = resolve_package_bin_entry(package_json.name.as_str(), &package_json.bin)?;
+    Ok(PackageSmokeTarget::SyntaxCheck(package_root(project_dir, &package_json.name).join(bin_entry)))
+}
+
+fn resolve_package_import_entry(
+    exports_field: &serde_json::Value,
+    main_field: Option<&str>,
+) -> Option<String> {
+    let exports_entry = match exports_field {
+        serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
+        serde_json::Value::Object(entries) => entries.get(".").and_then(|root| match root {
+            serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
+            serde_json::Value::Object(root_entries) => root_entries
+                .get("import")
+                .and_then(|value| match value {
+                    serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
+                    _ => None,
+                })
+                .or_else(|| {
+                    root_entries.get("default").and_then(|value| match value {
+                        serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
+                        _ => None,
+                    })
+                }),
+            _ => None,
+        }),
+        _ => None,
+    };
+
+    exports_entry.or_else(|| {
+        main_field.and_then(|value| {
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_owned())
+            }
+        })
+    })
 }
 
 fn normalize_slashes(path: &Path) -> String {
@@ -893,6 +971,7 @@ fn format_error_with_causes(error: &(dyn StdError + 'static)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::fmt;
 
     #[test]
@@ -1031,6 +1110,67 @@ mod tests {
         });
         let entry = resolve_package_bin_entry("@agentclientprotocol/claude-agent-acp", &bin_field).unwrap();
         assert_eq!(entry, "dist/index.js");
+    }
+
+    #[test]
+    fn resolve_package_smoke_target_prefers_importable_entry_for_exported_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+        let package_json = InstalledPackageJson {
+            name: "@agentclientprotocol/claude-agent-acp".into(),
+            bin: json!({
+                "claude-agent-acp": "dist/index.js",
+            }),
+            main: Some("dist/lib.js".into()),
+            exports: json!({
+                ".": {
+                    "types": "./dist/lib.d.ts",
+                    "import": "./dist/lib.js"
+                }
+            }),
+        };
+
+        let target = resolve_package_smoke_target(project_dir, &package_json).expect("smoke target");
+
+        assert_eq!(
+            target,
+            PackageSmokeTarget::Import(
+                project_dir
+                    .join("node_modules")
+                    .join("@agentclientprotocol")
+                    .join("claude-agent-acp")
+                    .join("dist")
+                    .join("lib.js")
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_package_smoke_target_falls_back_to_bin_check_for_cli_only_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+        let package_json = InstalledPackageJson {
+            name: "@zed-industries/codex-acp".into(),
+            bin: json!({
+                "codex-acp": "bin/codex-acp.js",
+            }),
+            main: None,
+            exports: serde_json::Value::Null,
+        };
+
+        let target = resolve_package_smoke_target(project_dir, &package_json).expect("smoke target");
+
+        assert_eq!(
+            target,
+            PackageSmokeTarget::SyntaxCheck(
+                project_dir
+                    .join("node_modules")
+                    .join("@zed-industries")
+                    .join("codex-acp")
+                    .join("bin")
+                    .join("codex-acp.js")
+            )
+        );
     }
 
     #[test]
