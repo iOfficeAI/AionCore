@@ -33,7 +33,6 @@ const ERROR_KEYWORDS: &[&str] = &[
     "api key",
     "quota",
     "billing",
-    "unrecognized arguments",
 ];
 
 const MAX_MESSAGE_CHARS: usize = 240;
@@ -67,13 +66,6 @@ fn strip_ansi(s: &str) -> String {
 /// We split on `": "` and take the last segment — that's almost always the
 /// message. Returns the trimmed segment.
 fn message_tail(stripped_line: &str) -> &str {
-    let lower = stripped_line.to_ascii_lowercase();
-    for needle in ["unrecognized arguments:"] {
-        if let Some(idx) = lower.find(needle) {
-            return stripped_line[idx..].trim();
-        }
-    }
-
     stripped_line
         .rsplit_once(": ")
         .map(|(_, tail)| tail)
@@ -224,12 +216,5 @@ mod tests {
         let stderr = "usage limit exceeded no colon here";
         let result = extract_error_message(stderr).expect("should match");
         assert_eq!(result, "usage limit exceeded no colon here");
-    }
-
-    #[test]
-    fn extracts_unrecognized_arguments_message() {
-        let stderr = "hermes: error: unrecognized arguments: --yolo";
-        let result = extract_error_message(stderr).expect("argparse errors should surface");
-        assert_eq!(result, "unrecognized arguments: --yolo");
     }
 }
