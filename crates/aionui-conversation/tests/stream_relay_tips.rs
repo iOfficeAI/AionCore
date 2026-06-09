@@ -47,6 +47,7 @@ async fn persist_info_tip_preserves_code_and_params() {
     let relay = StreamRelay::new(
         "conv-1".into(),
         "asst-1".into(),
+        "turn-1".into(),
         "system_default_user".into(),
         repo.clone(),
         bus,

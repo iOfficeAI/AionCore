@@ -817,6 +817,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
