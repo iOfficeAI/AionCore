@@ -249,6 +249,10 @@ impl AcpAgentManager {
             session_id: Some(sid.to_owned()),
         }));
 
+        // Scope stderr classification to this prompt so stale lines from an
+        // earlier turn cannot override a later benign empty turn.
+        self.process.clear_stderr().await;
+
         let prompt_response = self
             .protocol
             .prompt(PromptRequest::new(

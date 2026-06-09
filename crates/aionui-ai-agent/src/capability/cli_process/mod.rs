@@ -240,6 +240,12 @@ impl CliAgentProcess {
         std::mem::take(&mut *buf)
     }
 
+    /// Clear the buffered stderr ring so subsequent peeks only observe lines
+    /// written after the caller opens a new diagnostics window.
+    pub async fn clear_stderr(&self) {
+        let _ = self.take_stderr().await;
+    }
+
     /// Peek the last `max_lines` newline-delimited lines from the stderr ring
     /// buffer **without draining**.
     ///

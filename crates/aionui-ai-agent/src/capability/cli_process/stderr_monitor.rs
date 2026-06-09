@@ -322,4 +322,41 @@ mod tests {
 
         assert_eq!(proc.peek_stderr_tail(0).await, "");
     }
+
+    #[tokio::test]
+    async fn clear_stderr_starts_a_fresh_window_for_later_peeks() {
+        let script = r#"
+            while IFS= read -r line; do
+              case "$line" in
+                *first*) echo 'HTTP 402: stale turn failure' >&2 ;;
+                *second*) : ;;
+              esac
+              echo '{"type":"ack","data":{}}'
+            done
+        "#;
+        let proc = CliAgentProcess::spawn(simple_script_config(script)).await.unwrap();
+        let mut rx = proc.subscribe();
+
+        proc.send(&serde_json::json!({ "turn": "first" })).await.unwrap();
+        timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            proc.peek_stderr_tail(10).await.contains("stale turn failure"),
+            "first window should contain the prior stderr line"
+        );
+
+        proc.clear_stderr().await;
+
+        proc.send(&serde_json::json!({ "turn": "second" })).await.unwrap();
+        timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            proc.peek_stderr_tail(10).await,
+            "",
+            "clearing before the second window must prevent stale stderr from leaking forward"
+        );
+
+        proc.kill(Duration::from_millis(100)).await.unwrap();
+    }
 }
