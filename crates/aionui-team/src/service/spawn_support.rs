@@ -369,4 +369,9 @@ mod tests {
         let err = parse_agent_type("unknown").unwrap_err();
         assert!(matches!(err, TeamError::InvalidRequest(_)));
     }
+
+    #[test]
+    fn resolve_full_auto_mode_keeps_hermes_on_default() {
+        assert_eq!(resolve_full_auto_mode("hermes"), "default");
+    }
 }

@@ -3,7 +3,7 @@
 //! `#[path = "session_tests.rs"] mod tests;` from `session.rs`, so
 //! `super::*` resolves to the `session` module's private scope.
 
-use agent_client_protocol::schema::{SessionConfigSelectOption, SessionMode};
+use agent_client_protocol::schema::{ModelInfo, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode};
 
 use super::*;
 
@@ -533,6 +533,187 @@ fn apply_advertised_config_options_idempotent_when_unchanged() {
         events.is_empty(),
         "no ObservedConfigSynced when observed unchanged, got {events:?}"
     );
+}
+
+#[test]
+fn apply_advertised_config_options_derives_missing_mode_and_model_catalogs() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "modes",
+            "Mode",
+            "plan",
+            vec![
+                SessionConfigSelectOption::new("build", "Build"),
+                SessionConfigSelectOption::new("plan", "Plan"),
+            ],
+        ),
+        SessionConfigOption::select(
+            "models",
+            "Model",
+            "opus",
+            vec![
+                SessionConfigSelectOption::new("sonnet", "Sonnet"),
+                SessionConfigSelectOption::new("opus", "Opus"),
+            ],
+        ),
+    ]);
+
+    assert_eq!(session.observed_mode(), Some("plan"));
+    assert_eq!(session.current_mode_id().as_deref(), Some("plan"));
+    let modes = session.modes().expect("derived modes");
+    assert_eq!(modes.available_modes.len(), 2);
+    assert_eq!(modes.available_modes[1].id.to_string(), "plan");
+
+    assert_eq!(session.observed_model(), Some("opus"));
+    assert_eq!(session.current_model_id().as_deref(), Some("opus"));
+    let models = session.model_info().expect("derived models");
+    assert_eq!(models.available_models.len(), 2);
+    assert_eq!(models.available_models[1].model_id.to_string(), "opus");
+}
+
+#[test]
+fn apply_advertised_config_options_falls_back_to_existing_catalogs_when_config_options_have_no_catalogs() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.apply_advertised_modes(SessionModeState::new(
+        "build",
+        vec![SessionMode::new("build", "Build"), SessionMode::new("plan", "Plan")],
+    ));
+    session.apply_advertised_models(SessionModelState::new(
+        "sonnet",
+        vec![ModelInfo::new("sonnet", "Sonnet"), ModelInfo::new("opus", "Opus")],
+    ));
+    session.drain_events();
+
+    session.apply_advertised_config_options(vec![SessionConfigOption::select(
+        "reasoning",
+        "Reasoning",
+        "high",
+        vec![SessionConfigSelectOption::new("high", "High")],
+    )]);
+
+    assert_eq!(session.observed_mode(), Some("build"));
+    assert_eq!(session.current_mode_id().as_deref(), Some("build"));
+    let modes = session.modes().expect("explicit modes");
+    assert_eq!(modes.available_modes.len(), 2);
+    assert_eq!(modes.available_modes[0].id.to_string(), "build");
+
+    assert_eq!(session.observed_model(), Some("sonnet"));
+    assert_eq!(session.current_model_id().as_deref(), Some("sonnet"));
+    let models = session.model_info().expect("explicit models");
+    assert_eq!(models.available_models.len(), 2);
+    assert_eq!(models.available_models[0].model_id.to_string(), "sonnet");
+}
+
+#[test]
+fn apply_advertised_config_options_prefers_config_option_catalogs_over_existing_catalogs() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.apply_advertised_modes(SessionModeState::new(
+        "available-mode",
+        vec![SessionMode::new("available-mode", "Available Mode")],
+    ));
+    session.apply_advertised_models(SessionModelState::new(
+        "available-model",
+        vec![ModelInfo::new("available-model", "Available Model")],
+    ));
+    session.drain_events();
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "modes",
+            "Mode",
+            "config-mode",
+            vec![SessionConfigSelectOption::new("config-mode", "Config Mode")],
+        ),
+        SessionConfigOption::select(
+            "models",
+            "Model",
+            "config-model",
+            vec![SessionConfigSelectOption::new("config-model", "Config Model")],
+        ),
+    ]);
+
+    assert_eq!(session.observed_mode(), Some("config-mode"));
+    assert_eq!(session.current_mode_id().as_deref(), Some("config-mode"));
+    let modes = session.modes().expect("config option modes");
+    assert_eq!(modes.available_modes.len(), 1);
+    assert_eq!(modes.available_modes[0].id.to_string(), "config-mode");
+
+    assert_eq!(session.observed_model(), Some("config-model"));
+    assert_eq!(session.current_model_id().as_deref(), Some("config-model"));
+    let models = session.model_info().expect("config option models");
+    assert_eq!(models.available_models.len(), 1);
+    assert_eq!(models.available_models[0].model_id.to_string(), "config-model");
+}
+
+#[test]
+fn apply_advertised_config_options_merges_partial_updates_and_derives_model_reasoning_variants() {
+    let mut session = make_session();
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "full-access",
+            vec![
+                SessionConfigSelectOption::new("auto", "Default"),
+                SessionConfigSelectOption::new("full-access", "Full Access"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Mode),
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "gpt-5.4",
+            vec![SessionConfigSelectOption::new("gpt-5.4", "gpt-5.4")],
+        )
+        .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            "low",
+            vec![SessionConfigSelectOption::new("low", "Low")],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+    session.drain_events();
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "gpt-5.5",
+            vec![
+                SessionConfigSelectOption::new("gpt-5.5", "GPT-5.5"),
+                SessionConfigSelectOption::new("gpt-5.4", "gpt-5.4"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            "medium",
+            vec![
+                SessionConfigSelectOption::new("low", "Low"),
+                SessionConfigSelectOption::new("medium", "Medium"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+
+    let modes = session.modes().expect("mode catalog is preserved");
+    assert_eq!(modes.current_mode_id.to_string(), "full-access");
+    assert_eq!(modes.available_modes.len(), 2);
+
+    let config_options = session.config_options().expect("config options are preserved");
+    assert_eq!(config_options.len(), 3);
+    assert!(config_options.iter().any(|option| option.id.to_string() == "mode"));
+
+    let models = session.model_info().expect("model catalog");
+    assert_eq!(models.current_model_id.to_string(), "gpt-5.5/medium");
+    assert_eq!(models.available_models.len(), 4);
+    assert_eq!(models.available_models[0].model_id.to_string(), "gpt-5.5/low");
+    assert_eq!(models.available_models[1].model_id.to_string(), "gpt-5.5/medium");
 }
 
 #[test]

@@ -373,6 +373,7 @@ async fn row_to_mcp_server_config(
                 url: None,
                 headers: None,
                 deferred: Some(false),
+                startup_timeout_ms: None,
             })
         }
         "http" | "streamable_http" => {
@@ -398,6 +399,7 @@ async fn row_to_mcp_server_config(
                 url: Some(url.to_owned()),
                 headers: Some(headers),
                 deferred: Some(false),
+                startup_timeout_ms: None,
             })
         }
         "sse" => {
@@ -423,6 +425,7 @@ async fn row_to_mcp_server_config(
                 url: Some(url.to_owned()),
                 headers: Some(headers),
                 deferred: Some(false),
+                startup_timeout_ms: None,
             })
         }
         other => Err(format!("unsupported transport_type: {other}")),
@@ -450,6 +453,7 @@ async fn session_server_to_mcp_server_config(
                 url: None,
                 headers: None,
                 deferred: Some(false),
+                startup_timeout_ms: None,
             })
         }
         SessionMcpTransport::Http { url, headers } => {
@@ -464,6 +468,7 @@ async fn session_server_to_mcp_server_config(
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
                 deferred: Some(false),
+                startup_timeout_ms: None,
             })
         }
         SessionMcpTransport::Sse { url, headers } => {
@@ -478,6 +483,7 @@ async fn session_server_to_mcp_server_config(
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
                 deferred: Some(false),
+                startup_timeout_ms: None,
             })
         }
         SessionMcpTransport::StreamableHttp { url, headers } => {
@@ -492,6 +498,7 @@ async fn session_server_to_mcp_server_config(
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
                 deferred: Some(false),
+                startup_timeout_ms: None,
             })
         }
     }
@@ -586,6 +593,7 @@ fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConf
         url: None,
         headers: None,
         deferred: Some(false),
+        startup_timeout_ms: None,
     };
 
     HashMap::from([(TEAM_MCP_SERVER_NAME.to_owned(), server)])
@@ -611,6 +619,7 @@ fn guide_mcp_to_config(
         url: None,
         headers: None,
         deferred: Some(false),
+        startup_timeout_ms: None,
     };
 
     HashMap::from([("aionui-team-guide".into(), server)])
@@ -992,6 +1001,7 @@ mod tests {
                 url: None,
                 headers: None,
                 deferred: Some(false),
+                startup_timeout_ms: None,
             },
         )]);
 

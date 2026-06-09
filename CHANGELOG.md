@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.24](https://github.com/iOfficeAI/AionCore/compare/v0.1.23...v0.1.24) (2026-06-08)
+
+
+### Bug Fixes
+
+* **acp:** prefer config options catalogs ([#425](https://github.com/iOfficeAI/AionCore/issues/425)) ([9d89cc9](https://github.com/iOfficeAI/AionCore/commit/9d89cc9b46cc684a04c2cb9452ed9d792bd3a8de))
+* expose managed resource preparation failure details ([#430](https://github.com/iOfficeAI/AionCore/issues/430)) ([e010024](https://github.com/iOfficeAI/AionCore/commit/e010024fce3975fe5f6930c24377bde9f636b55b))
+* handle Hermes yolo fallback correctly ([#428](https://github.com/iOfficeAI/AionCore/issues/428)) ([e10d264](https://github.com/iOfficeAI/AionCore/commit/e10d26460ac6dabf292f8b1edd7eeb1c1ffd5cad))
+* harden managed ACP bundle preparation and builtin CLI availability ([#426](https://github.com/iOfficeAI/AionCore/issues/426)) ([e0121f9](https://github.com/iOfficeAI/AionCore/commit/e0121f938e0160f48d2f57e9205f78bf31b92233))
+* scope bundled ACP output under tool directories ([#431](https://github.com/iOfficeAI/AionCore/issues/431)) ([d079395](https://github.com/iOfficeAI/AionCore/commit/d079395b0679d5b9450497a4d088bc478c5cf45f))
+* **shell:** support UNC paths in Windows terminal ([#411](https://github.com/iOfficeAI/AionCore/issues/411)) ([a041953](https://github.com/iOfficeAI/AionCore/commit/a04195329996b921cee811066994efb885b833e1))
+* validate managed ACP packages via real entrypoints ([#429](https://github.com/iOfficeAI/AionCore/issues/429)) ([77221dd](https://github.com/iOfficeAI/AionCore/commit/77221ddddd883c56b954ca5cfea0f98038754efe))
+
+
+### Code Refactoring
+
+* **app:** organize CLI command boundaries ([#423](https://github.com/iOfficeAI/AionCore/issues/423)) ([cc84d52](https://github.com/iOfficeAI/AionCore/commit/cc84d523f1014978b0fb9c880842d4fd29330925))
+
 ## [0.1.23](https://github.com/iOfficeAI/AionCore/compare/v0.1.22...v0.1.23) (2026-06-07)
 
 

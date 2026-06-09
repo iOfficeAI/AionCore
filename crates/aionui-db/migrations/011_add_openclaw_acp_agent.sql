@@ -1,4 +1,4 @@
--- Migration 010: Add OpenClaw as an ACP builtin backend.
+-- Migration 011: Add OpenClaw as an ACP builtin backend.
 --
 -- Keep the legacy openclaw-gateway row for historical read-only conversations.
 -- New OpenClaw conversations must use agent_type='acp' with backend='openclaw'.

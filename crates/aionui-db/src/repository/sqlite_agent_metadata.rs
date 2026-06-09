@@ -275,6 +275,11 @@ mod tests {
             rows.iter()
                 .any(|r| r.name == "OpenClaw" && r.agent_type == "openclaw-gateway" && r.agent_source == "builtin")
         );
+        let hermes = rows
+            .iter()
+            .find(|r| r.name == "Hermes" && r.agent_source == "builtin")
+            .expect("seeded hermes row");
+        assert_eq!(hermes.yolo_id, None);
     }
 
     #[tokio::test]
