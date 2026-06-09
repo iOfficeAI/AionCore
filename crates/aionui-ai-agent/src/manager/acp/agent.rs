@@ -553,6 +553,9 @@ impl AcpAgentManager {
                     .map(|c| SlashCommandItem {
                         command: c.name.clone(),
                         description: c.description.clone(),
+                        completion_behavior: None,
+                        empty_turn_tip_code: None,
+                        empty_turn_tip_params: None,
                     })
                     .collect()
             })

@@ -151,9 +151,23 @@ pub struct AcpModelInfo {
     pub provider: Option<String>,
 }
 
+/// Controls what happens when a slash command produces an empty turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlashCommandCompletionBehavior {
+    Normal,
+    NeutralTipOnEmpty,
+}
+
 /// A slash command item available in a conversation session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlashCommandItem {
     pub command: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_behavior: Option<SlashCommandCompletionBehavior>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_turn_tip_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_turn_tip_params: Option<serde_json::Value>,
 }

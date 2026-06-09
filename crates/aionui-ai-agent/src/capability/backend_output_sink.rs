@@ -140,6 +140,8 @@ impl OutputSink for BackendOutputSink {
         let _ = self.event_tx.send(AgentStreamEvent::Tips(TipsEventData {
             content: msg.to_owned(),
             tip_type: TipType::Success,
+            code: None,
+            params: None,
         }));
     }
 }
