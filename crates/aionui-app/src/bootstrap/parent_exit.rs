@@ -74,8 +74,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_parent_exit_signal_resolves_when_parent_relationship_is_missing() {
-        let signal =
-            parent_exit_signal(Some(std::process::id())).expect("unix parent pid should produce a monitor");
+        let signal = parent_exit_signal(Some(std::process::id())).expect("unix parent pid should produce a monitor");
 
         tokio::time::timeout(std::time::Duration::from_millis(50), signal)
             .await
