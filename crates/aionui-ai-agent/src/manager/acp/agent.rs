@@ -17,10 +17,10 @@ use crate::registry::CatalogSender;
 use crate::shared_kernel::{ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::{
-    CancelNotification, SessionId, SessionModelState, SessionNotification, SetSessionModeRequest,
+    AvailableCommand, CancelNotification, SessionId, SessionModelState, SessionNotification, SetSessionModeRequest,
     SetSessionModelRequest, UsageUpdate,
 };
-use aionui_api_types::{AgentHandshake, SlashCommandItem};
+use aionui_api_types::{AgentHandshake, SlashCommandCompletionBehavior, SlashCommandItem};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case,
 };
@@ -125,6 +125,39 @@ pub(super) fn sdk_to_snake_value<T: serde::Serialize>(value: &T) -> Option<Value
     let mut v = serde_json::to_value(value).ok()?;
     normalize_keys_to_snake_case(&mut v);
     Some(v)
+}
+
+fn parse_completion_behavior(meta: &serde_json::Map<String, Value>) -> Option<SlashCommandCompletionBehavior> {
+    match meta.get("completion_behavior").and_then(Value::as_str) {
+        Some("normal") => Some(SlashCommandCompletionBehavior::Normal),
+        Some("neutral_tip_on_empty") => Some(SlashCommandCompletionBehavior::NeutralTipOnEmpty),
+        _ => None,
+    }
+}
+
+fn slash_command_item(command: &AvailableCommand) -> SlashCommandItem {
+    let meta = command.meta.as_ref();
+    let completion_behavior = meta.and_then(parse_completion_behavior);
+    let empty_turn_tip_code = meta
+        .and_then(|meta| meta.get("empty_turn_tip_code"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let empty_turn_tip_params = meta
+        .and_then(|meta| meta.get("empty_turn_tip_params"))
+        .filter(|value| value.is_object())
+        .cloned();
+
+    SlashCommandItem {
+        command: command.name.clone(),
+        description: command.description.clone(),
+        completion_behavior,
+        empty_turn_tip_code,
+        empty_turn_tip_params,
+    }
+}
+
+fn slash_command_items(commands: &[AvailableCommand]) -> Vec<SlashCommandItem> {
+    commands.iter().map(slash_command_item).collect()
 }
 
 /// Manages a single ACP Agent instance.
@@ -546,20 +579,7 @@ impl AcpAgentManager {
     /// Return available slash commands from the session aggregate.
     pub(crate) async fn load_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AgentError> {
         let session = self.session.read().await;
-        let items = session
-            .available_commands()
-            .map(|cmds| {
-                cmds.iter()
-                    .map(|c| SlashCommandItem {
-                        command: c.name.clone(),
-                        description: c.description.clone(),
-                        completion_behavior: None,
-                        empty_turn_tip_code: None,
-                        empty_turn_tip_params: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let items = session.available_commands().map(slash_command_items).unwrap_or_default();
         Ok(items)
     }
 }
@@ -905,6 +925,9 @@ impl AcpAgentManager {
 mod tests {
     use super::{exit_status_parts, user_facing_message};
     use crate::error::AgentError;
+    use crate::manager::acp::AcpSession;
+    use agent_client_protocol::schema::AvailableCommand;
+    use serde_json::json;
 
     #[test]
     fn exit_status_parts_handles_missing_status() {
@@ -1033,6 +1056,36 @@ mod tests {
         let err = AgentError::bad_gateway("Agent internal error (code -32603)");
 
         assert!(augment_via_process(&proc, &err).await.is_none());
+    }
+
+    #[test]
+    fn session_command_loading_preserves_empty_turn_meta() {
+        let mut session = AcpSession::new(None, None, Default::default());
+        let mut command = AvailableCommand::new("review", "Review the current diff");
+        command.meta = Some(
+            serde_json::from_value(json!({
+                "completion_behavior": "neutral_tip_on_empty",
+                "empty_turn_tip_code": "acp.empty_turn.choose_command",
+                "empty_turn_tip_params": {
+                    "command_count": 1
+                }
+            }))
+            .unwrap(),
+        );
+        session.apply_advertised_commands(vec![command]);
+
+        let items = super::slash_command_items(session.available_commands().expect("commands advertised"));
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.command, "review");
+        assert_eq!(item.description, "Review the current diff");
+        assert_eq!(
+            item.completion_behavior,
+            Some(aionui_api_types::SlashCommandCompletionBehavior::NeutralTipOnEmpty)
+        );
+        assert_eq!(item.empty_turn_tip_code.as_deref(), Some("acp.empty_turn.choose_command"));
+        assert_eq!(item.empty_turn_tip_params, Some(json!({ "command_count": 1 })));
     }
 
     // Close-reason compositional tests live in `agent_close.rs` so that
