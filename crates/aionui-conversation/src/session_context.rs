@@ -673,6 +673,38 @@ mod tests {
         assert_eq!(context.workspace.path, custom.to_string_lossy());
     }
 
+    fn assert_archived(err: ConversationError, expected_id: &str) {
+        match err {
+            ConversationError::Archived { id, reason } => {
+                assert_eq!(id, expected_id);
+                assert!(
+                    reason.contains("This historical conversation can no longer be continued."),
+                    "unexpected archive reason: {reason}"
+                );
+            }
+            other => panic!("expected ConversationError::Archived, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_agent_types_are_archived_before_runtime_context() {
+        let repos = setup().await;
+
+        for (agent_type, extra) in [
+            ("gemini", serde_json::json!({})),
+            (
+                "openclaw-gateway",
+                serde_json::json!({ "gateway": { "use_external_gateway": true } }),
+            ),
+            ("nanobot", serde_json::json!({})),
+            ("remote", serde_json::json!({})),
+        ] {
+            let row = row(agent_type, extra, None);
+            let err = repos.builder().build(&row).await.unwrap_err();
+            assert_archived(err, "conv-1");
+        }
+    }
+
     #[tokio::test]
     async fn remote_missing_remote_agent_id_is_rejected() {
         let repos = setup().await;
