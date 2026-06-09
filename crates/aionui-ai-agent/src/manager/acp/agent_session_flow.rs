@@ -10,7 +10,7 @@ use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::{ContentBlock, LoadSessionRequest, PromptRequest, SessionId, StopReason};
-use aionui_api_types::{SlashCommandCompletionBehavior, SlashCommandItem};
+use aionui_api_types::SlashCommandItem;
 use serde_json::Value;
 use tokio::sync::broadcast::error::TryRecvError;
 
@@ -389,7 +389,7 @@ fn prompt_outcome_from_stop_reason(
     session_id: &str,
     stop_reason: StopReason,
     empty_turn: bool,
-    matched_command: Option<&SlashCommandItem>,
+    _matched_command: Option<&SlashCommandItem>,
 ) -> PromptOutcome {
     if matches!(stop_reason, StopReason::Cancelled) {
         return PromptOutcome::Cancelled {
@@ -399,29 +399,9 @@ fn prompt_outcome_from_stop_reason(
 
     if empty_turn {
         if matches!(stop_reason, StopReason::EndTurn) {
-            if let Some(command) = matched_command
-                && matches!(
-                    command.completion_behavior,
-                    Some(SlashCommandCompletionBehavior::NeutralTipOnEmpty)
-                )
-            {
-                return PromptOutcome::InfoTip {
-                    session_id: session_id.to_owned(),
-                    tips: empty_turn_info_tip(
-                        command.empty_turn_tip_code.as_deref().unwrap_or("ACP_EMPTY_TURN"),
-                        command.empty_turn_tip_params.clone(),
-                        empty_finish_diagnostic_message(StopReason::EndTurn),
-                    ),
-                };
-            }
-
             return PromptOutcome::InfoTip {
                 session_id: session_id.to_owned(),
-                tips: empty_turn_info_tip(
-                    "ACP_EMPTY_TURN",
-                    None,
-                    empty_finish_diagnostic_message(StopReason::EndTurn),
-                ),
+                tips: empty_turn_info_tip("ACP_EMPTY_TURN", None),
             };
         }
 
@@ -436,9 +416,9 @@ fn prompt_outcome_from_stop_reason(
     }
 }
 
-fn empty_turn_info_tip(code: &str, params: Option<Value>, fallback_content: String) -> TipsEventData {
+fn empty_turn_info_tip(code: &str, params: Option<Value>) -> TipsEventData {
     TipsEventData {
-        content: fallback_content,
+        content: String::new(),
         tip_type: TipType::Info,
         code: Some(code.to_owned()),
         params,
@@ -447,9 +427,9 @@ fn empty_turn_info_tip(code: &str, params: Option<Value>, fallback_content: Stri
 
 fn empty_finish_diagnostic_tip(stop_reason: StopReason) -> TipsEventData {
     TipsEventData {
-        content: empty_finish_diagnostic_message(stop_reason),
+        content: String::new(),
         tip_type: TipType::Warning,
-        code: None,
+        code: Some(empty_finish_tip_code(stop_reason).to_owned()),
         params: None,
     }
 }
@@ -458,24 +438,12 @@ fn classify_empty_turn_stderr_error(detail: &str) -> ErrorEventData {
     AgentSendError::from_agent_error(AgentError::bad_gateway(detail.to_owned())).into_stream_error()
 }
 
-/// Build the user-facing message shown when the agent finished a turn
-/// without emitting any output. Wording is deliberately concrete so the
-/// user has something to act on (retry, reword, check provider).
-fn empty_finish_diagnostic_message(stop_reason: StopReason) -> String {
+fn empty_finish_tip_code(stop_reason: StopReason) -> &'static str {
     match stop_reason {
-        StopReason::MaxTokens => "The model reached its output token limit before producing any reply. \
-             Try asking a shorter question or raising the model's max output."
-            .to_owned(),
-        StopReason::MaxTurnRequests => "The model hit the per-turn request cap before producing any reply. \
-             Try a simpler request or restart the conversation."
-            .to_owned(),
-        StopReason::Refusal => "The model refused to continue without producing a reply.".to_owned(),
-        // EndTurn (and any non-exhaustive future variants) all map to the
-        // generic empty-reply message for no-visible-output turns.
-        _ => "This turn finished without producing any visible reply. \
-              This usually means the request returned an empty response — \
-              try resending the message or switching model/provider."
-            .to_owned(),
+        StopReason::MaxTokens => "ACP_EMPTY_TURN_MAX_TOKENS",
+        StopReason::MaxTurnRequests => "ACP_EMPTY_TURN_MAX_TURN_REQUESTS",
+        StopReason::Refusal => "ACP_EMPTY_TURN_REFUSAL",
+        _ => "ACP_EMPTY_TURN",
     }
 }
 
@@ -738,28 +706,31 @@ mod tests {
         assert!(!super::is_empty_turn(&mut rx));
     }
 
-    /// Each `StopReason` variant maps to a distinct, user-actionable
-    /// message. Pin the wording so future copy changes are deliberate.
+    /// Each empty-finish stop reason maps to a stable tip code so the UI can
+    /// own the final localized copy.
     #[test]
-    fn empty_finish_diagnostic_message_per_stop_reason() {
-        let endturn = super::empty_finish_diagnostic_message(StopReason::EndTurn);
-        assert!(endturn.to_lowercase().contains("finished"));
-
-        let max_tokens = super::empty_finish_diagnostic_message(StopReason::MaxTokens);
-        assert!(max_tokens.to_lowercase().contains("token"));
-
-        let max_turn = super::empty_finish_diagnostic_message(StopReason::MaxTurnRequests);
-        assert!(max_turn.to_lowercase().contains("per-turn") || max_turn.to_lowercase().contains("cap"));
-
-        let refusal = super::empty_finish_diagnostic_message(StopReason::Refusal);
-        assert!(refusal.to_lowercase().contains("refused"));
+    fn empty_finish_tip_code_per_stop_reason() {
+        assert_eq!(super::empty_finish_tip_code(StopReason::EndTurn), "ACP_EMPTY_TURN");
+        assert_eq!(
+            super::empty_finish_tip_code(StopReason::MaxTokens),
+            "ACP_EMPTY_TURN_MAX_TOKENS"
+        );
+        assert_eq!(
+            super::empty_finish_tip_code(StopReason::MaxTurnRequests),
+            "ACP_EMPTY_TURN_MAX_TURN_REQUESTS"
+        );
+        assert_eq!(
+            super::empty_finish_tip_code(StopReason::Refusal),
+            "ACP_EMPTY_TURN_REFUSAL"
+        );
     }
 
     #[test]
     fn empty_finish_diagnostic_tip_is_warning() {
         let tip = super::empty_finish_diagnostic_tip(StopReason::EndTurn);
         assert_eq!(tip.tip_type, TipType::Warning);
-        assert!(tip.content.to_lowercase().contains("finished"));
+        assert_eq!(tip.content, "");
+        assert_eq!(tip.code.as_deref(), Some("ACP_EMPTY_TURN"));
     }
 
     #[test]
@@ -771,20 +742,20 @@ mod tests {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(tips.tip_type, TipType::Info);
                 assert_eq!(tips.code.as_deref(), Some("ACP_EMPTY_TURN"));
-                assert!(tips.content.contains("without producing"));
+                assert_eq!(tips.content, "");
             }
             other => panic!("expected InfoTip, got {other:?}"),
         }
     }
 
     #[test]
-    fn metadata_driven_command_empty_turn_uses_command_tip_code() {
+    fn metadata_driven_command_empty_turn_uses_generic_tip_code() {
         let command = SlashCommandItem {
             command: "ctx-flush".into(),
             description: "Flush context".into(),
             completion_behavior: Some(SlashCommandCompletionBehavior::NeutralTipOnEmpty),
-            empty_turn_tip_code: None,
-            empty_turn_tip_params: None,
+            empty_turn_tip_code: Some("ACP_CTX_FLUSH_COMPLETED".into()),
+            empty_turn_tip_params: Some(serde_json::json!({ "scope": "session" })),
         };
 
         let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, true, Some(&command));
@@ -794,6 +765,7 @@ mod tests {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(tips.tip_type, TipType::Info);
                 assert_eq!(tips.code.as_deref(), Some("ACP_EMPTY_TURN"));
+                assert_eq!(tips.content, "");
                 assert_eq!(tips.params, None);
             }
             other => panic!("expected InfoTip, got {other:?}"),
@@ -808,7 +780,8 @@ mod tests {
             super::PromptOutcome::WarningTip { session_id, tips } => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(tips.tip_type, TipType::Warning);
-                assert!(tips.content.to_lowercase().contains("token"));
+                assert_eq!(tips.content, "");
+                assert_eq!(tips.code.as_deref(), Some("ACP_EMPTY_TURN_MAX_TOKENS"));
             }
             other => panic!("expected WarningTip, got {other:?}"),
         }

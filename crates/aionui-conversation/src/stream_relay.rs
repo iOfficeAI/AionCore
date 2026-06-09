@@ -803,9 +803,9 @@ mod tests {
 
         tx.send(AgentStreamEvent::Tips(
             aionui_ai_agent::protocol::events::TipsEventData {
-                content: "Agent completed the turn without producing visible output.".into(),
+                content: String::new(),
                 tip_type: aionui_ai_agent::protocol::events::TipType::Warning,
-                code: None,
+                code: Some("ACP_EMPTY_TURN".into()),
                 params: None,
             },
         ))
@@ -823,11 +823,9 @@ mod tests {
         assert_eq!(msg.status.as_deref(), Some("finish"));
 
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
-        assert_eq!(
-            content["content"],
-            "Agent completed the turn without producing visible output."
-        );
+        assert_eq!(content["content"], "");
         assert_eq!(content["type"], "warning");
+        assert_eq!(content["code"], "ACP_EMPTY_TURN");
     }
 
     #[tokio::test]
