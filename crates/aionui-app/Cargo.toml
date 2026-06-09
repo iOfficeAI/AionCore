@@ -57,6 +57,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 aionui-api-types.workspace = true
 aionui-realtime.workspace = true

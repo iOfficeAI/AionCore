@@ -400,6 +400,7 @@ dependencies = [
  "futures-util",
  "git2",
  "http-body-util",
+ "libc",
  "reqwest",
  "rmcp",
  "rust_xlsxwriter",
