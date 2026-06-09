@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Instant;
+use std::{future::Future, pin::Pin};
 
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -12,10 +13,17 @@ use aionui_api_types::{RuntimeStatusScope, RuntimeStatusScopeKind};
 use aionui_app::{AppConfig, AppServices, RouterBuildError, create_router};
 use aionui_system::RuntimePrepareService;
 
-use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ServerEnvironment};
+use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, ServerEnvironment};
 
 const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownReason {
+    Sigint,
+    Sigterm,
+    ParentExit,
+}
 
 #[derive(Debug)]
 pub(crate) struct BoundHttpListener {
@@ -192,6 +200,7 @@ pub(crate) async fn run_server(
     env: ServerEnvironment,
     services: AppServices,
     bound: BoundHttpListener,
+    parent_exit: Option<ParentExitSignal>,
 ) -> Result<ExitCode, BootstrapError> {
     let boot = Instant::now();
 
@@ -267,17 +276,25 @@ pub(crate) async fn run_server(
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            if let Err(error) = shutdown_signal().await {
-                error.log_source();
-                tracing::error!(error = %error.stderr_line(), "shutdown signal handler failed");
-                let _ = shutdown_error_tx.send(error);
-            } else {
-                let active_turn_count = conversation_runtime_state.mark_shutting_down();
-                info!(
-                    reason = "graceful_shutdown",
-                    active_turn_count, "conversation runtime shutdown prepared"
-                );
-                worker_task_manager.clear();
+            match shutdown_signal(parent_exit).await {
+                Err(error) => {
+                    error.log_source();
+                    tracing::error!(error = %error.stderr_line(), "shutdown signal handler failed");
+                    let _ = shutdown_error_tx.send(error);
+                }
+                Ok(reason) => {
+                    match reason {
+                        ShutdownReason::Sigint => info!("Received SIGINT, shutting down..."),
+                        ShutdownReason::Sigterm => info!("Received SIGTERM, shutting down..."),
+                        ShutdownReason::ParentExit => info!("Detected desktop parent exit, shutting down..."),
+                    }
+                    let active_turn_count = conversation_runtime_state.mark_shutting_down();
+                    info!(
+                        reason = "graceful_shutdown",
+                        active_turn_count, "conversation runtime shutdown prepared"
+                    );
+                    worker_task_manager.clear();
+                }
             }
             let _ = shutdown_tx.send(true);
         })
@@ -327,7 +344,9 @@ fn finish_server_shutdown(shutdown_error: Option<BootstrapError>) -> Result<Exit
     Ok(ExitCode::SUCCESS)
 }
 
-async fn shutdown_signal() -> Result<(), BootstrapError> {
+type ShutdownFuture = Pin<Box<dyn Future<Output = Result<ShutdownReason, BootstrapError>> + Send>>;
+
+async fn shutdown_signal(parent_exit: Option<ParentExitSignal>) -> Result<ShutdownReason, BootstrapError> {
     let ctrl_c = async {
         tokio::signal::ctrl_c().await.map_err(|error| {
             BootstrapError::new(
@@ -336,7 +355,8 @@ async fn shutdown_signal() -> Result<(), BootstrapError> {
                 "failed to install shutdown signal handler",
             )
             .with_source(error)
-        })
+        })?;
+        Ok::<ShutdownReason, BootstrapError>(ShutdownReason::Sigint)
     };
 
     #[cfg(unix)]
@@ -351,24 +371,25 @@ async fn shutdown_signal() -> Result<(), BootstrapError> {
                 .with_source(error)
             })?;
         terminate.recv().await;
-        Ok::<(), BootstrapError>(())
+        Ok::<ShutdownReason, BootstrapError>(ShutdownReason::Sigterm)
     };
 
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<Result<(), BootstrapError>>();
+    let terminate = std::future::pending::<Result<ShutdownReason, BootstrapError>>();
+
+    let parent_exit: ShutdownFuture = match parent_exit {
+        Some(signal) => Box::pin(async move {
+            signal.await;
+            Ok(ShutdownReason::ParentExit)
+        }),
+        None => Box::pin(std::future::pending()),
+    };
 
     tokio::select! {
-        result = ctrl_c => {
-            result?;
-            info!("Received SIGINT, shutting down...");
-        }
-        result = terminate => {
-            result?;
-            info!("Received SIGTERM, shutting down...");
-        }
+        result = ctrl_c => result,
+        result = terminate => result,
+        result = parent_exit => result,
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -411,6 +432,15 @@ mod tests {
 
         assert!(config.port > 0);
         assert_eq!(config.port, bound.addr.port());
+    }
+
+    #[tokio::test]
+    async fn parent_exit_signal_triggers_shutdown() {
+        let reason = shutdown_signal(Some(Box::pin(std::future::ready(()))))
+            .await
+            .expect("parent exit should shut down cleanly");
+
+        assert_eq!(reason, ShutdownReason::ParentExit);
     }
 
     #[tokio::test]
