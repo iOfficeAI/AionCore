@@ -77,6 +77,7 @@ pub struct SendMessageRequest {
 pub struct SendMessageResponse {
     pub msg_id: String,
     pub turn_id: String,
+    pub runtime: ConversationRuntimeSummary,
 }
 
 /// Body for `POST /api/conversations/:id/cancel`.

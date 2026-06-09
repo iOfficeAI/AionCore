@@ -2014,8 +2014,16 @@ async fn send_message_returns_msg_id_and_turn_id_and_summary_tracks_turn() {
     assert!(!response.msg_id.is_empty(), "msg_id must be non-empty");
     assert!(response.turn_id.starts_with("turn_"), "turn_id must use turn_ prefix");
     assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
+    assert_eq!(
+        response.runtime.turn_id.as_deref(),
+        Some(response.turn_id.as_str()),
+        "send response runtime must identify the accepted turn"
+    );
+    assert!(response.runtime.is_processing);
+    assert!(!response.runtime.can_send_message);
 
     let runtime = svc.runtime_summary_for(&conv.id).await;
+    assert_eq!(response.runtime, runtime);
     assert_eq!(runtime.turn_id.as_deref(), Some(response.turn_id.as_str()));
     assert!(runtime.is_processing);
     assert!(!runtime.can_send_message);

@@ -260,6 +260,19 @@ impl ConversationService {
             .summary_from_parts(conversation_id, task_status, has_task, pending_confirmations)
     }
 
+    async fn send_message_response(
+        &self,
+        conversation_id: &str,
+        msg_id: String,
+        turn_id: String,
+    ) -> SendMessageResponse {
+        SendMessageResponse {
+            msg_id,
+            turn_id,
+            runtime: self.runtime_summary_for(conversation_id).await,
+        }
+    }
+
     pub async fn complete_turn(&self, conversation_id: &str, turn_id: &str) {
         let runtime = self.runtime_summary_for(conversation_id).await;
         self.completion_publisher()
@@ -1436,10 +1449,7 @@ impl ConversationService {
             let was_deleting = turn_claim.release();
             self.complete_released_turn(conversation_id, &turn_id, was_deleting)
                 .await;
-            return Ok(SendMessageResponse {
-                msg_id: user_msg_id,
-                turn_id,
-            });
+            return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
         }
         if let Err(e) = self.conversation_repo.insert_message(&user_msg).await {
             warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
@@ -1483,10 +1493,7 @@ impl ConversationService {
                 let was_deleting = turn_claim.release();
                 self.complete_released_turn(conversation_id, &turn_id, was_deleting)
                     .await;
-                return Ok(SendMessageResponse {
-                    msg_id: user_msg_id,
-                    turn_id,
-                });
+                return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
         };
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
@@ -1510,10 +1517,9 @@ impl ConversationService {
             elapsed_ms = now_ms().saturating_sub(send_started_at),
             "Message accepted, agent work scheduled"
         );
-        Ok(SendMessageResponse {
-            msg_id: user_msg_id_ret,
-            turn_id,
-        })
+        Ok(self
+            .send_message_response(conversation_id, user_msg_id_ret, turn_id)
+            .await)
     }
 
     pub(crate) async fn persist_and_broadcast_send_failure_tip(
