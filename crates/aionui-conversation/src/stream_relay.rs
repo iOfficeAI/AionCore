@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use aionui_ai_agent::protocol::events::TipType;
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
 use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResult};
@@ -346,6 +347,12 @@ impl StreamRelay {
                                 .await;
                             self.forward_to_websocket(&event);
                             self.adapter.persist_tool_group(entries).await;
+                        }
+                        AgentStreamEvent::Tips(data) => {
+                            self.forward_to_websocket(&event);
+                            if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
+                                self.adapter.persist_tip(data).await;
+                            }
                         }
                         _ => {
                             self.forward_to_websocket(&event);
@@ -799,6 +806,50 @@ mod tests {
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Something went wrong");
         assert_eq!(content["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn run_warning_tip_with_finish_persists_warning_tip() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Tips(
+            aionui_ai_agent::protocol::events::TipsEventData {
+                content: String::new(),
+                tip_type: aionui_ai_agent::protocol::events::TipType::Warning,
+                code: Some("ACP_EMPTY_TURN".into()),
+                params: None,
+            },
+        ))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert!(outcome.system_responses.is_empty());
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+
+        let inserts = repo.take_inserts();
+        assert_eq!(inserts.len(), 1);
+        let msg = &inserts[0];
+        assert_eq!(msg.r#type, "tips");
+        assert_eq!(msg.status.as_deref(), Some("finish"));
+
+        let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
+        assert_eq!(content["content"], "");
+        assert_eq!(content["type"], "warning");
+        assert_eq!(content["code"], "ACP_EMPTY_TURN");
     }
 
     #[tokio::test]

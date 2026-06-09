@@ -523,7 +523,11 @@ fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
         &[
             "402",
             "insufficient balance",
+            "insufficient account balance",
             "credit balance is too low",
+            "add credits",
+            "update billing",
+            "account entitlement is exhausted",
             "purchase credits",
             "plans & billing",
             "plans and billing",

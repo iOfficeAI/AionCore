@@ -247,6 +247,7 @@ mod force_kill_tests {
 mod tests {
     use super::super::tests::{simple_script_config, spawn_sdk_test_process};
     use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::time::timeout;
 
     #[tokio::test]
@@ -320,5 +321,51 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(proc.peek_stderr_tail(0).await, "");
+    }
+
+    #[tokio::test]
+    async fn clear_stderr_starts_a_fresh_window_for_later_peeks() {
+        let script = r#"
+            while IFS= read -r line; do
+              case "$line" in
+                *first*) echo 'HTTP 402: stale turn failure' >&2 ;;
+                *second*) : ;;
+              esac
+              echo '{"type":"ack","data":{}}'
+            done
+        "#;
+        let proc = spawn_sdk_test_process(simple_script_config(script)).await;
+        let (mut stdin, stdout) = proc.take_stdio().await.unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+
+        stdin.write_all(b"first\n").await.unwrap();
+        timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            proc.peek_stderr_tail(10).await.contains("stale turn failure"),
+            "first window should contain the prior stderr line"
+        );
+
+        proc.clear_stderr().await;
+
+        line.clear();
+        stdin.write_all(b"second\n").await.unwrap();
+        timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            proc.peek_stderr_tail(10).await,
+            "",
+            "clearing before the second window must prevent stale stderr from leaking forward"
+        );
+
+        proc.kill(Duration::from_millis(100)).await.unwrap();
     }
 }

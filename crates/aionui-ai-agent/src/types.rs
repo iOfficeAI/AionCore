@@ -163,6 +163,9 @@ mod tests {
         let cmd = SlashCommandItem {
             command: "/review".into(),
             description: "Code review".into(),
+            completion_behavior: None,
+            empty_turn_tip_code: None,
+            empty_turn_tip_params: None,
         };
         let json = serde_json::to_value(&cmd).unwrap();
         assert_eq!(json["command"], "/review");
