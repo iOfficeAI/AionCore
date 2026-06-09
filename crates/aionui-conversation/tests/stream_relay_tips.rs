@@ -57,7 +57,7 @@ async fn persist_info_tip_preserves_code_and_params() {
     tx.send(AgentStreamEvent::Tips(TipsEventData {
         content: "No visible output, but the command completed successfully.".into(),
         tip_type: TipType::Info,
-        code: Some("ACP_CTX_FLUSH_COMPLETED".into()),
+        code: Some("ACP_EMPTY_TURN".into()),
         params: Some(json!({ "scope": "session", "cleared": 12 })),
     }))
     .unwrap();
@@ -80,6 +80,6 @@ async fn persist_info_tip_preserves_code_and_params() {
         "No visible output, but the command completed successfully."
     );
     assert_eq!(content["type"], "info");
-    assert_eq!(content["code"], "ACP_CTX_FLUSH_COMPLETED");
+    assert_eq!(content["code"], "ACP_EMPTY_TURN");
     assert_eq!(content["params"], json!({ "scope": "session", "cleared": 12 }));
 }

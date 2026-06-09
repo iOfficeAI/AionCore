@@ -471,9 +471,8 @@ fn empty_finish_diagnostic_message(stop_reason: StopReason) -> String {
             .to_owned(),
         StopReason::Refusal => "The model refused to continue without producing a reply.".to_owned(),
         // EndTurn (and any non-exhaustive future variants) all map to the
-        // generic empty-reply message — the model said it was done but
-        // produced nothing.
-        _ => "The model finished without producing any reply. \
+        // generic empty-reply message for no-visible-output turns.
+        _ => "This turn finished without producing any visible reply. \
               This usually means the request returned an empty response — \
               try resending the message or switching model/provider."
             .to_owned(),
@@ -784,8 +783,8 @@ mod tests {
             command: "ctx-flush".into(),
             description: "Flush context".into(),
             completion_behavior: Some(SlashCommandCompletionBehavior::NeutralTipOnEmpty),
-            empty_turn_tip_code: Some("ACP_CTX_FLUSH_COMPLETED".into()),
-            empty_turn_tip_params: Some(serde_json::json!({ "scope": "session" })),
+            empty_turn_tip_code: None,
+            empty_turn_tip_params: None,
         };
 
         let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, true, Some(&command));
@@ -794,8 +793,8 @@ mod tests {
             super::PromptOutcome::InfoTip { session_id, tips } => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(tips.tip_type, TipType::Info);
-                assert_eq!(tips.code.as_deref(), Some("ACP_CTX_FLUSH_COMPLETED"));
-                assert_eq!(tips.params, Some(serde_json::json!({ "scope": "session" })));
+                assert_eq!(tips.code.as_deref(), Some("ACP_EMPTY_TURN"));
+                assert_eq!(tips.params, None);
             }
             other => panic!("expected InfoTip, got {other:?}"),
         }

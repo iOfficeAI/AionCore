@@ -1137,7 +1137,6 @@ mod tests {
         command.meta = Some(
             serde_json::from_value(json!({
                 "completion_behavior": "neutral_tip_on_empty",
-                "empty_turn_tip_code": "ACP_CTX_FLUSH_COMPLETED",
             }))
             .unwrap(),
         );
@@ -1149,7 +1148,7 @@ mod tests {
             matched.completion_behavior,
             Some(aionui_api_types::SlashCommandCompletionBehavior::NeutralTipOnEmpty)
         );
-        assert_eq!(matched.empty_turn_tip_code.as_deref(), Some("ACP_CTX_FLUSH_COMPLETED"));
+        assert_eq!(matched.empty_turn_tip_code.as_deref(), None);
     }
 
     // Close-reason compositional tests live in `agent_close.rs` so that
