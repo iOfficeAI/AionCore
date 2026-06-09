@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::protocol::events::{
-    ErrorEventData,
+    ErrorEventData, TipType, TipsEventData,
     tool_call::{AcpToolCallSessionUpdateKind, AcpToolCallStatus, ToolCallStatus},
 };
 use aionui_api_types::{ConversationRuntimeSummary, WebSocketMessage};
@@ -310,6 +310,39 @@ impl StreamPersistenceAdapter {
         };
         if let Err(e) = self.repo.insert_message(&row).await {
             log_persist_error(&e, "Failed to store error message");
+        }
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn persist_tip(&self, data: &TipsEventData) {
+        if !self.allows_write(RuntimeWriteKind::TerminalFinalize) {
+            return;
+        }
+
+        let status = match data.tip_type {
+            TipType::Error => "error",
+            TipType::Success | TipType::Warning | TipType::Info => "finish",
+        };
+        let content = json!({
+            "content": &data.content,
+            "type": &data.tip_type,
+            "code": &data.code,
+            "params": &data.params,
+        })
+        .to_string();
+        let row = MessageRow {
+            id: ConversationService::mint_msg_id(),
+            conversation_id: self.conversation_id.clone(),
+            msg_id: None,
+            r#type: "tips".into(),
+            content,
+            position: Some("left".into()),
+            status: Some(status.into()),
+            hidden: false,
+            created_at: now_ms(),
+        };
+        if let Err(e) = self.repo.insert_message(&row).await {
+            log_persist_error(&e, "Failed to store tip message");
         }
     }
 
