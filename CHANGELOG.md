@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.25](https://github.com/iOfficeAI/AionCore/compare/v0.1.24...v0.1.25) (2026-06-09)
+
+
+### Features
+
+* enforce agent runtime policy and turn-aware state ([#436](https://github.com/iOfficeAI/AionCore/issues/436)) ([b7099fe](https://github.com/iOfficeAI/AionCore/commit/b7099fee0cd2488326957dfe7811bf87e15aabb7))
+
+
+### Bug Fixes
+
+* **acp:** preserve confirmed model selection ([#437](https://github.com/iOfficeAI/AionCore/issues/437)) ([e16e11f](https://github.com/iOfficeAI/AionCore/commit/e16e11fa1e6ff9bd6449a8b1bc6bcfb5859fc865))
+* **app:** stop backend when desktop exits ([#433](https://github.com/iOfficeAI/AionCore/issues/433)) ([d300235](https://github.com/iOfficeAI/AionCore/commit/d30023562bcb6d413f428fcb1dec412929a72ab3))
+
 ## [0.1.24](https://github.com/iOfficeAI/AionCore/compare/v0.1.23...v0.1.24) (2026-06-08)
 
 
