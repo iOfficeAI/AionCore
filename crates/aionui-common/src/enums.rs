@@ -19,6 +19,11 @@ pub enum AgentType {
     /// branch. New Gemini conversations use `AgentType::Acp` with
     /// `backend='gemini'`.
     Gemini,
+    /// Legacy Codex conversations. Kept solely so that historical rows
+    /// with `type='codex'` remain readable in the conversation list and
+    /// message history. New Codex conversations use `AgentType::Acp` with
+    /// `backend='codex'`.
+    Codex,
 }
 
 impl AgentType {
@@ -30,6 +35,7 @@ impl AgentType {
             AgentType::Remote => "Remote",
             AgentType::Aionrs => "Aion CLI",
             AgentType::Gemini => "Gemini (legacy)",
+            AgentType::Codex => "Codex (legacy)",
         }
     }
 
@@ -41,6 +47,7 @@ impl AgentType {
             AgentType::Remote => "remote",
             AgentType::Aionrs => "aionrs",
             AgentType::Gemini => "gemini",
+            AgentType::Codex => "codex",
         }
     }
 
@@ -71,6 +78,9 @@ impl AgentType {
     /// Historical `AgentType::Gemini` rows cannot start a new runtime
     /// (see the variant's doc comment) and therefore never reach this
     /// path during workspace provisioning.
+    ///
+    /// `AgentType::Codex` follows the same historical-only policy. New
+    /// Codex conversations use ACP metadata with `backend = "codex"`.
     pub fn native_skills_dirs(&self) -> Option<&'static [&'static str]> {
         match self {
             AgentType::Aionrs => Some(&[".aionrs/skills"]),
@@ -78,7 +88,8 @@ impl AgentType {
             | AgentType::OpenclawGateway
             | AgentType::Nanobot
             | AgentType::Remote
-            | AgentType::Gemini => None,
+            | AgentType::Gemini
+            | AgentType::Codex => None,
         }
     }
 
@@ -106,6 +117,7 @@ impl AgentType {
             },
             AgentType::Aionrs
             | AgentType::Gemini
+            | AgentType::Codex
             | AgentType::OpenclawGateway
             | AgentType::Nanobot
             | AgentType::Remote => "yolo",
@@ -295,6 +307,7 @@ mod tests {
         assert_eq!(AgentType::Nanobot.display_name(), "Nanobot");
         assert_eq!(AgentType::Remote.display_name(), "Remote");
         assert_eq!(AgentType::Acp.display_name(), "ACP");
+        assert_eq!(AgentType::Codex.display_name(), "Codex (legacy)");
     }
 
     #[test]
@@ -313,6 +326,7 @@ mod tests {
             AgentType::Nanobot,
             AgentType::Remote,
             AgentType::Aionrs,
+            AgentType::Codex,
         ]
         .iter()
         .map(|t| t.id())
@@ -338,6 +352,7 @@ mod tests {
             (AgentType::Nanobot, "nanobot"),
             (AgentType::Remote, "remote"),
             (AgentType::Aionrs, "aionrs"),
+            (AgentType::Codex, "codex"),
         ];
         for (variant, expected) in cases {
             let json = serde_json::to_string(&variant).unwrap();
@@ -353,6 +368,7 @@ mod tests {
         assert!(AgentType::Aionrs.supports_new_conversation());
 
         assert!(!AgentType::Gemini.supports_new_conversation());
+        assert!(!AgentType::Codex.supports_new_conversation());
         assert!(!AgentType::OpenclawGateway.supports_new_conversation());
         assert!(!AgentType::Nanobot.supports_new_conversation());
         assert!(!AgentType::Remote.supports_new_conversation());
@@ -364,6 +380,7 @@ mod tests {
         assert!(!AgentType::Aionrs.is_deprecated_runtime());
 
         assert!(AgentType::Gemini.is_deprecated_runtime());
+        assert!(AgentType::Codex.is_deprecated_runtime());
         assert!(AgentType::OpenclawGateway.is_deprecated_runtime());
         assert!(AgentType::Nanobot.is_deprecated_runtime());
         assert!(AgentType::Remote.is_deprecated_runtime());

@@ -700,6 +700,7 @@ async fn create_rejects_deprecated_agent_types_for_new_conversations() {
 
     for agent_type in [
         AgentType::Gemini,
+        AgentType::Codex,
         AgentType::OpenclawGateway,
         AgentType::Nanobot,
         AgentType::Remote,
@@ -2003,6 +2004,7 @@ async fn send_message_rejects_legacy_runtime_conversations_as_archived() {
 
     for agent_type in [
         AgentType::Gemini,
+        AgentType::Codex,
         AgentType::OpenclawGateway,
         AgentType::Nanobot,
         AgentType::Remote,
@@ -2787,6 +2789,7 @@ async fn warmup_rejects_legacy_runtime_conversations_as_archived() {
 
     for agent_type in [
         AgentType::Gemini,
+        AgentType::Codex,
         AgentType::OpenclawGateway,
         AgentType::Nanobot,
         AgentType::Remote,

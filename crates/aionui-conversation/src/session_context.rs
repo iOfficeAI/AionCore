@@ -156,7 +156,11 @@ impl<'a> SessionContextBuilder<'a> {
                 .await
                 .map(|context| AgentSessionKind::Acp(Box::new(context))),
             AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(row, extra)))),
-            AgentType::Gemini | AgentType::OpenclawGateway | AgentType::Remote | AgentType::Nanobot => {
+            AgentType::Gemini
+            | AgentType::Codex
+            | AgentType::OpenclawGateway
+            | AgentType::Remote
+            | AgentType::Nanobot => {
                 unreachable!("legacy agent types are rejected before build_kind")
             }
         }
@@ -689,6 +693,7 @@ mod tests {
 
         for (agent_type, extra) in [
             ("gemini", serde_json::json!({})),
+            ("codex", serde_json::json!({ "workspace": "/tmp/aionui-codex-history" })),
             (
                 "openclaw-gateway",
                 serde_json::json!({ "gateway": { "use_external_gateway": true } }),
