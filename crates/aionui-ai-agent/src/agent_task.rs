@@ -120,6 +120,10 @@ pub trait IMockAgent: IAgentTask {
             "Model switching is not supported for this mock",
         ))
     }
+    async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
+        self.set_model(model_id).await?;
+        self.get_model().await
+    }
     async fn get_usage(&self) -> Result<Option<serde_json::Value>, AgentError> {
         Ok(None)
     }
@@ -349,6 +353,25 @@ impl AgentInstance {
             )),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.set_model(model_id).await,
+        }
+    }
+
+    /// Switch the active model and return the confirmed model payload for
+    /// this specific mutation, rather than re-reading potentially stale
+    /// cached state.
+    pub async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
+        if model_id.trim().is_empty() {
+            return Err(AgentError::bad_request("model_id must not be empty"));
+        }
+        match self {
+            Self::Acp(m) => Ok(GetModelInfoResponse {
+                model_info: Some(map_sdk_model_to_payload(m.set_model_confirmed(model_id).await?)),
+            }),
+            Self::Aionrs(_) => Err(AgentError::bad_request(
+                "Model switching is not supported for this agent type",
+            )),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.set_model_confirmed(model_id).await,
         }
     }
 

@@ -1357,6 +1357,7 @@ struct MockAgent {
     stopped: Mutex<bool>,
     mode: Mutex<String>,
     model_id: Mutex<String>,
+    keep_reported_model_on_set: bool,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
     allow_direct_confirm: bool,
@@ -1365,6 +1366,25 @@ struct MockAgent {
 }
 
 impl MockAgent {
+    fn build_model_response(current: &str) -> GetModelInfoResponse {
+        GetModelInfoResponse {
+            model_info: Some(ModelInfoPayload {
+                current_model_id: Some(current.to_owned()),
+                current_model_label: Some(current.to_owned()),
+                available_models: vec![
+                    ModelInfoEntry {
+                        id: "model-a".to_owned(),
+                        label: "Model A".to_owned(),
+                    },
+                    ModelInfoEntry {
+                        id: "model-b".to_owned(),
+                        label: "Model B".to_owned(),
+                    },
+                ],
+            }),
+        }
+    }
+
     fn new(conversation_id: &str) -> Self {
         let (event_tx, _) = broadcast::channel(64);
         Self {
@@ -1373,6 +1393,7 @@ impl MockAgent {
             stopped: Mutex::new(false),
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
+            keep_reported_model_on_set: false,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -1388,6 +1409,7 @@ impl MockAgent {
             stopped: Mutex::new(false),
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
+            keep_reported_model_on_set: false,
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -1403,9 +1425,26 @@ impl MockAgent {
             stopped: Mutex::new(false),
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
+            keep_reported_model_on_set: false,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: true,
+            workspace_override: None,
+        }
+    }
+
+    fn with_stale_reported_model_after_set(conversation_id: &str) -> Self {
+        let (event_tx, _) = broadcast::channel(64);
+        Self {
+            conversation_id: conversation_id.to_owned(),
+            event_tx,
+            stopped: Mutex::new(false),
+            mode: Mutex::new("default".to_owned()),
+            model_id: Mutex::new("model-a".to_owned()),
+            keep_reported_model_on_set: true,
+            confirmations: Mutex::new(vec![]),
+            approval_memory: Mutex::new(std::collections::HashMap::new()),
+            allow_direct_confirm: false,
             workspace_override: None,
         }
     }
@@ -1497,27 +1536,19 @@ impl IMockAgent for MockAgent {
 
     async fn get_model(&self) -> Result<GetModelInfoResponse, AgentError> {
         let current = self.model_id.lock().unwrap().clone();
-        Ok(GetModelInfoResponse {
-            model_info: Some(ModelInfoPayload {
-                current_model_id: Some(current.clone()),
-                current_model_label: Some(current.clone()),
-                available_models: vec![
-                    ModelInfoEntry {
-                        id: "model-a".to_owned(),
-                        label: "Model A".to_owned(),
-                    },
-                    ModelInfoEntry {
-                        id: "model-b".to_owned(),
-                        label: "Model B".to_owned(),
-                    },
-                ],
-            }),
-        })
+        Ok(Self::build_model_response(&current))
     }
 
     async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
-        *self.model_id.lock().unwrap() = model_id.to_owned();
+        if !self.keep_reported_model_on_set {
+            *self.model_id.lock().unwrap() = model_id.to_owned();
+        }
         Ok(())
+    }
+
+    async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
+        self.set_model(model_id).await?;
+        Ok(Self::build_model_response(model_id))
     }
 }
 
@@ -2099,6 +2130,40 @@ async fn set_model_returns_confirmed_model_from_active_agent() {
     let model_info = response.model_info.expect("model info should be returned");
     assert_eq!(model_info.current_model_id.as_deref(), Some("model-b"));
     assert!(model_info.available_models.iter().any(|m| m.id == "model-b"));
+}
+
+#[tokio::test]
+async fn set_model_returns_confirmed_model_even_if_get_model_is_stale() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(MockAgent::with_stale_reported_model_after_set(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+
+    let response = svc
+        .set_model(
+            &conv.id,
+            SetModelRequest {
+                model_id: "model-b".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let model_info = response.model_info.expect("model info should be returned");
+    assert_eq!(
+        model_info.current_model_id.as_deref(),
+        Some("model-b"),
+        "set_model should return the confirmed model, not a stale get_model snapshot"
+    );
+
+    let stale_model_info = agent
+        .get_model()
+        .await
+        .unwrap()
+        .model_info
+        .expect("mock agent should still report model info");
+    assert_eq!(stale_model_info.current_model_id.as_deref(), Some("model-a"));
 }
 
 #[tokio::test]

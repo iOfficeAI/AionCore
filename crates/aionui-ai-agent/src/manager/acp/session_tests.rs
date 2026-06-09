@@ -717,6 +717,68 @@ fn apply_advertised_config_options_merges_partial_updates_and_derives_model_reas
 }
 
 #[test]
+fn apply_advertised_config_options_preserves_confirmed_explicit_model_when_current_values_lag() {
+    let mut session = make_session();
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "gpt-5.5",
+            vec![
+                SessionConfigSelectOption::new("gpt-5.5", "GPT-5.5"),
+                SessionConfigSelectOption::new("gpt-5.4", "GPT-5.4"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            "low",
+            vec![
+                SessionConfigSelectOption::new("low", "Low"),
+                SessionConfigSelectOption::new("medium", "Medium"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+    session.drain_events();
+
+    session.confirm_model(ModelId::new("gpt-5.5/medium"));
+    session.drain_events();
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "gpt-5.5",
+            vec![
+                SessionConfigSelectOption::new("gpt-5.5", "GPT-5.5"),
+                SessionConfigSelectOption::new("gpt-5.4", "GPT-5.4"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            "low",
+            vec![
+                SessionConfigSelectOption::new("low", "Low"),
+                SessionConfigSelectOption::new("medium", "Medium"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+
+    let models = session.model_info().expect("model catalog");
+    assert_eq!(
+        models.current_model_id.to_string(),
+        "gpt-5.5/medium",
+        "lagging config option current values must not overwrite an explicitly confirmed model"
+    );
+    assert_eq!(models.available_models.len(), 4);
+}
+
+#[test]
 fn pending_model_notice_roundtrip_and_take_once() {
     use crate::shared_kernel::ModelId;
 

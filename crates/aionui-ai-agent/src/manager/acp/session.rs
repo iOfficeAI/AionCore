@@ -469,6 +469,24 @@ impl AcpSession {
         }
     }
 
+    fn preserve_desired_model_in_catalog(&self, models: SessionModelState) -> SessionModelState {
+        let Some(desired_model) = self.desired.model_id.as_ref() else {
+            return models;
+        };
+        let desired_model_id = desired_model.as_str();
+        if models.current_model_id.to_string() == desired_model_id {
+            return models;
+        }
+        if models
+            .available_models
+            .iter()
+            .any(|model| model.model_id.to_string() == desired_model_id)
+        {
+            return SessionModelState::new(desired_model_id.to_owned(), models.available_models.clone());
+        }
+        models
+    }
+
     pub fn apply_advertised_config_options(&mut self, options: Vec<SessionConfigOption>) {
         let options = merge_config_options(self.advertised.config_options.as_deref(), options);
 
@@ -477,7 +495,7 @@ impl AcpSession {
         }
 
         if let Some(models) = derive_models_from_config_options(&options) {
-            self.apply_advertised_models(models);
+            self.apply_advertised_models(self.preserve_desired_model_in_catalog(models));
         }
 
         let mut changed = false;

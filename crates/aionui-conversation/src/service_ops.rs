@@ -75,8 +75,9 @@ impl ConversationService {
                 return Err(err);
             }
         };
-        task.set_model(&req.model_id).await.map_err(ConversationError::from)?;
-        task.get_model().await.map_err(ConversationError::from)
+        task.set_model_confirmed(&req.model_id)
+            .await
+            .map_err(ConversationError::from)
     }
 
     // ── Usage / Slash commands ──────────────────────────────────────

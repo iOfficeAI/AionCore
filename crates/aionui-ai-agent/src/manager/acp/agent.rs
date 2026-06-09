@@ -514,8 +514,7 @@ impl AcpAgentManager {
         Ok(())
     }
 
-    /// Set the model for the current session.
-    pub(crate) async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
+    async fn apply_confirmed_model_selection(&self, model_id: &str) -> Result<SessionModelState, AgentError> {
         let session_id = {
             let session = self.session.read().await;
             if !session.can_select_model(model_id) {
@@ -582,6 +581,10 @@ impl AcpAgentManager {
         if self.params.metadata.behavior_policy.self_identity_sticky {
             session.set_pending_model_notice(model);
         }
+        let confirmed_model = session
+            .model_info()
+            .cloned()
+            .unwrap_or_else(|| SessionModelState::new(model_id.to_owned(), Vec::new()));
         self.commit_session_changes(&mut session).await;
         info!(
             conversation_id = %self.params.conversation_id,
@@ -589,7 +592,19 @@ impl AcpAgentManager {
             confirmed_model_id = %model_id,
             "acp_set_model_confirmed"
         );
+        Ok(confirmed_model)
+    }
+
+    /// Set the model for the current session.
+    pub(crate) async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
+        self.apply_confirmed_model_selection(model_id).await?;
         Ok(())
+    }
+
+    /// Set the model and return the confirmed model state from this write,
+    /// without re-reading the asynchronously mutable session cache.
+    pub(crate) async fn set_model_confirmed(&self, model_id: &str) -> Result<SessionModelState, AgentError> {
+        self.apply_confirmed_model_selection(model_id).await
     }
 
     /// Return available slash commands from the session aggregate.
