@@ -184,7 +184,11 @@ async fn collect_idle_ignores_aionrs_agent_type() {
                 config: Default::default(),
                 belongs_to_team: false,
             })),
-            AgentType::Gemini | AgentType::OpenclawGateway | AgentType::Remote | AgentType::Nanobot => {
+            AgentType::Gemini
+            | AgentType::OpenclawGateway
+            | AgentType::Remote
+            | AgentType::Nanobot
+            | AgentType::Codex => {
                 unreachable!("legacy agent types cannot build an AgentSessionKind")
             }
         };
