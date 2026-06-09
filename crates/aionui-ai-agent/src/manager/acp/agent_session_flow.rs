@@ -9,8 +9,8 @@ use crate::protocol::events::{
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
-use aionui_api_types::{SlashCommandCompletionBehavior, SlashCommandItem};
 use agent_client_protocol::schema::{ContentBlock, LoadSessionRequest, PromptRequest, SessionId, StopReason};
+use aionui_api_types::{SlashCommandCompletionBehavior, SlashCommandItem};
 use serde_json::Value;
 use tokio::sync::broadcast::error::TryRecvError;
 
@@ -263,9 +263,7 @@ impl AcpAgentManager {
             .map_err(AcpSendFailure::from)?;
 
         let empty_turn = is_empty_turn(&mut probe_rx);
-        if empty_turn
-            && let Some(error) = self.empty_turn_terminal_error().await
-        {
+        if empty_turn && let Some(error) = self.empty_turn_terminal_error().await {
             return Ok(PromptOutcome::TerminalError {
                 session_id: sid.to_owned(),
                 error,
@@ -790,8 +788,7 @@ mod tests {
             empty_turn_tip_params: Some(serde_json::json!({ "scope": "session" })),
         };
 
-        let outcome =
-            super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, true, Some(&command));
+        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, true, Some(&command));
 
         match outcome {
             super::PromptOutcome::InfoTip { session_id, tips } => {
@@ -844,9 +841,7 @@ mod tests {
 
     #[test]
     fn classify_empty_turn_stderr_error_preserves_provider_billing_failure() {
-        let error = super::classify_empty_turn_stderr_error(
-            "HTTP 402: Insufficient account balance",
-        );
+        let error = super::classify_empty_turn_stderr_error("HTTP 402: Insufficient account balance");
 
         assert_eq!(error.code, Some(AgentErrorCode::UserLlmProviderBillingRequired));
         assert_eq!(error.retryable, Some(false));

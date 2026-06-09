@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 use aionui_ai_agent::protocol::events::TipType;
+use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
 use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResult};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
@@ -801,12 +801,14 @@ mod tests {
 
         let rx = tx.subscribe();
 
-        tx.send(AgentStreamEvent::Tips(aionui_ai_agent::protocol::events::TipsEventData {
-            content: "Agent completed the turn without producing visible output.".into(),
-            tip_type: aionui_ai_agent::protocol::events::TipType::Warning,
-            code: None,
-            params: None,
-        }))
+        tx.send(AgentStreamEvent::Tips(
+            aionui_ai_agent::protocol::events::TipsEventData {
+                content: "Agent completed the turn without producing visible output.".into(),
+                tip_type: aionui_ai_agent::protocol::events::TipType::Warning,
+                code: None,
+                params: None,
+            },
+        ))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
 

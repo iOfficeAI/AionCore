@@ -161,12 +161,19 @@ fn slash_command_items(commands: &[AvailableCommand]) -> Vec<SlashCommandItem> {
 }
 
 fn leading_slash_token(raw_user_input: &str) -> Option<&str> {
-    raw_user_input.split_whitespace().next()?.strip_prefix('/').filter(|token| !token.is_empty())
+    raw_user_input
+        .split_whitespace()
+        .next()?
+        .strip_prefix('/')
+        .filter(|token| !token.is_empty())
 }
 
 fn matched_slash_command(raw_user_input: &str, commands: &[AvailableCommand]) -> Option<SlashCommandItem> {
     let token = leading_slash_token(raw_user_input)?;
-    commands.iter().find(|command| command.name == token).map(slash_command_item)
+    commands
+        .iter()
+        .find(|command| command.name == token)
+        .map(slash_command_item)
 }
 
 /// Manages a single ACP Agent instance.
@@ -588,7 +595,10 @@ impl AcpAgentManager {
     /// Return available slash commands from the session aggregate.
     pub(crate) async fn load_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AgentError> {
         let session = self.session.read().await;
-        let items = session.available_commands().map(slash_command_items).unwrap_or_default();
+        let items = session
+            .available_commands()
+            .map(slash_command_items)
+            .unwrap_or_default();
         Ok(items)
     }
 }
@@ -695,7 +705,8 @@ impl AcpAgentManager {
             content,
             ..data.clone()
         };
-        self.prompt_existing_session(&data, Some(&sid), matched_command.as_ref()).await
+        self.prompt_existing_session(&data, Some(&sid), matched_command.as_ref())
+            .await
     }
 
     /// Pre-open the ACP session without sending a prompt. Called by the
@@ -1091,14 +1102,16 @@ mod tests {
     fn session_command_loading_preserves_empty_turn_meta() {
         let mut session = AcpSession::new(None, None, Default::default());
         let mut command = AvailableCommand::new("review", "Review the current diff");
-        command.meta = Some(serde_json::from_value(json!({
-            "completion_behavior": "neutral_tip_on_empty",
-            "empty_turn_tip_code": "acp.empty_turn.choose_command",
-            "empty_turn_tip_params": {
-                "command_count": 1
-            }
-        }))
-        .unwrap());
+        command.meta = Some(
+            serde_json::from_value(json!({
+                "completion_behavior": "neutral_tip_on_empty",
+                "empty_turn_tip_code": "acp.empty_turn.choose_command",
+                "empty_turn_tip_params": {
+                    "command_count": 1
+                }
+            }))
+            .unwrap(),
+        );
         session.apply_advertised_commands(vec![command]);
 
         let items = super::slash_command_items(session.available_commands().expect("commands advertised"));
@@ -1111,7 +1124,10 @@ mod tests {
             item.completion_behavior,
             Some(aionui_api_types::SlashCommandCompletionBehavior::NeutralTipOnEmpty)
         );
-        assert_eq!(item.empty_turn_tip_code.as_deref(), Some("acp.empty_turn.choose_command"));
+        assert_eq!(
+            item.empty_turn_tip_code.as_deref(),
+            Some("acp.empty_turn.choose_command")
+        );
         assert_eq!(item.empty_turn_tip_params, Some(json!({ "command_count": 1 })));
     }
 

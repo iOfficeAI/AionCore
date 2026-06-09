@@ -75,7 +75,10 @@ async fn persist_info_tip_preserves_code_and_params() {
     assert_eq!(tip.status.as_deref(), Some("finish"));
 
     let content: serde_json::Value = serde_json::from_str(&tip.content).unwrap();
-    assert_eq!(content["content"], "No visible output, but the command completed successfully.");
+    assert_eq!(
+        content["content"],
+        "No visible output, but the command completed successfully."
+    );
     assert_eq!(content["type"], "info");
     assert_eq!(content["code"], "ACP_CTX_FLUSH_COMPLETED");
     assert_eq!(content["params"], json!({ "scope": "session", "cleared": 12 }));
