@@ -683,7 +683,7 @@ async fn cj1_create_cron_job() {
 async fn create_job_rejects_deprecated_agent_types() {
     let (svc, _, _) = setup().await;
 
-    for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini"] {
+    for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini", "codex"] {
         let mut req = make_create_req(&format!("Deprecated {agent_type}"), every_60s());
         req.agent_type = agent_type.to_owned();
 
