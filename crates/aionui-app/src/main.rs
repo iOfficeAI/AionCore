@@ -11,6 +11,7 @@ use clap::Parser;
 use aionui_app::AppServices;
 use cli::{Cli, Command};
 
+use crate::bootstrap::parent_exit_signal;
 use crate::error::MainError;
 
 // MainError has been moved to src/error.rs
@@ -94,7 +95,8 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
                 )
                 .with_source(error)
             })?;
-            Ok(commands::run_server(env, services, listener).await?)
+            let parent_exit = parent_exit_signal(cli.parent_pid);
+            Ok(commands::run_server(env, services, listener, parent_exit).await?)
         }
     }
 }

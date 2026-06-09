@@ -7,8 +7,10 @@
 mod builtin_skills;
 mod environment;
 mod error;
+mod parent_exit;
 mod tracing_init;
 mod work_dir;
 
 pub use environment::{ServerEnvironment, init_data_layer, init_environment};
 pub(crate) use error::{BootstrapError, BootstrapErrorCode};
+pub(crate) use parent_exit::{ParentExitSignal, parent_exit_signal};

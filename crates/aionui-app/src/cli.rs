@@ -23,6 +23,10 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "data")]
     pub data_dir: PathBuf,
 
+    /// Parent process ID used to terminate the backend when the desktop app dies.
+    #[arg(long)]
+    pub parent_pid: Option<u32>,
+
     /// Working directory for conversation workspaces.
     /// Falls back to AIONUI_WORK_DIR env, then to data-dir.
     #[arg(long)]
@@ -191,6 +195,12 @@ mod tests {
     fn managed_resources_mode_accepts_download() {
         let cli = Cli::parse_from(["aioncore", "--managed-resources-mode", "download"]);
         assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
+    }
+
+    #[test]
+    fn parent_pid_accepts_positive_integer() {
+        let cli = Cli::parse_from(["aioncore", "--parent-pid", "4242"]);
+        assert_eq!(cli.parent_pid, Some(4242));
     }
 
     #[test]

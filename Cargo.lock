@@ -400,6 +400,7 @@ dependencies = [
  "futures-util",
  "git2",
  "http-body-util",
+ "libc",
  "reqwest",
  "rmcp",
  "rust_xlsxwriter",
@@ -415,6 +416,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 
