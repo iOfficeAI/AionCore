@@ -75,43 +75,6 @@ pub struct AcpBuildExtra {
     pub user_id: Option<String>,
 }
 
-/// OpenClaw gateway configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct OpenClawGatewayConfig {
-    pub host: Option<String>,
-    pub port: Option<u16>,
-    pub token: Option<String>,
-    pub password: Option<String>,
-    #[serde(default)]
-    pub use_external_gateway: bool,
-    pub cli_path: Option<String>,
-}
-
-/// OpenClaw-specific fields extracted from `extra` in build task options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenClawBuildExtra {
-    #[serde(default)]
-    pub backend: Option<String>,
-    #[serde(default)]
-    pub agent_name: Option<String>,
-    #[serde(default)]
-    pub gateway: OpenClawGatewayConfig,
-    #[serde(default)]
-    pub skills: Vec<String>,
-    #[serde(default)]
-    pub preset_assistant_id: Option<String>,
-    #[serde(default)]
-    pub cron_job_id: Option<String>,
-    #[serde(default, rename = "sessionKey")]
-    pub session_key: Option<String>,
-}
-
-/// Remote agent-specific fields extracted from `extra` in build task options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteBuildExtra {
-    pub remote_agent_id: String,
-}
-
 /// Aionrs-specific fields extracted from `extra` in build task options.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AionrsBuildExtra {

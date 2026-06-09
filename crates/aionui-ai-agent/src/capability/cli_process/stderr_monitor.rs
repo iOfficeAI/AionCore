@@ -245,15 +245,14 @@ mod force_kill_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::super::CliAgentProcess;
-    use super::super::tests::simple_script_config;
+    use super::super::tests::{simple_script_config, spawn_sdk_test_process};
     use std::time::Duration;
     use tokio::time::timeout;
 
     #[tokio::test]
     async fn stderr_captured_in_buffer() {
         let config = simple_script_config("echo 'error line 1' >&2 && echo 'error line 2' >&2");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -266,7 +265,7 @@ mod tests {
     #[tokio::test]
     async fn take_stderr_is_consuming() {
         let config = simple_script_config("echo 'hello' >&2");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -281,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn peek_stderr_tail_returns_last_n_lines() {
         let config = simple_script_config("for i in 1 2 3 4 5; do echo \"line $i\" >&2; done");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -298,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn peek_stderr_tail_does_not_drain() {
         let config = simple_script_config("echo 'first' >&2 && echo 'second' >&2");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -315,7 +314,7 @@ mod tests {
     #[tokio::test]
     async fn peek_stderr_tail_zero_returns_empty() {
         let config = simple_script_config("echo 'noise' >&2");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;

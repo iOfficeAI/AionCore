@@ -24,10 +24,7 @@ pub use agent_runtime::AgentRuntime;
 #[cfg(any(test, feature = "test-support"))]
 pub use agent_task::IMockAgent;
 pub use agent_task::{AgentInstance, IAgentTask};
-pub use aionui_api_types::{
-    AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, OpenClawBuildExtra, OpenClawGatewayConfig, RemoteBuildExtra,
-    SlashCommandItem,
-};
+pub use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashCommandItem};
 pub use capability::skill_manager::{
     AcpSkillManager, SkillDefinition, SkillIndex, build_skills_index_text, build_system_instructions,
     build_system_instructions_with_skills_index, detect_skill_load_request, prepare_first_message,
@@ -46,6 +43,6 @@ pub use services::AgentService;
 pub use services::RemoteAgentService;
 pub use session_context::{
     AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext,
-    NanobotSessionBuildContext, OpenClawSessionBuildContext, RemoteSessionBuildContext, WorkspaceContext,
+    WorkspaceContext,
 };
 pub use task_manager::{IWorkerTaskManager, WorkerTaskManagerImpl};

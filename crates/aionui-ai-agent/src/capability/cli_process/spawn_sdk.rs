@@ -4,14 +4,12 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::error::AgentError;
 
-use super::{
-    CliAgentProcess, EVENT_CHANNEL_CAPACITY, STDERR_BUFFER_MAX, prepare_command_cwd, tracked_process_group_id,
-};
+use super::{CliAgentProcess, STDERR_BUFFER_MAX, prepare_command_cwd, tracked_process_group_id};
 
 impl CliAgentProcess {
     /// Spawn a new CLI subprocess in **SDK mode**.
@@ -69,7 +67,6 @@ impl CliAgentProcess {
             AgentError::internal("Failed to capture stdin for child process")
         })?;
 
-        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (exit_tx, exit_rx) = watch::channel(None);
 
         // Background task: read stderr → ring buffer + log
@@ -115,11 +112,8 @@ impl CliAgentProcess {
             stdout: Mutex::new(Some(stdout)),
             pid,
             process_group_id: tracked_process_group_id(pid),
-            event_tx,
             exit_rx,
-            initial_rx: std::sync::Mutex::new(None),
             stderr_buffer,
-            _stdout_handle: None,
             _stderr_handle: Arc::new(stderr_handle),
             _exit_handle: Arc::new(exit_handle),
         })

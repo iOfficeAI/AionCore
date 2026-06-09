@@ -14,7 +14,7 @@ use aionui_conversation::runtime_state::ConversationRuntimeStateService;
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
     IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteConversationRepository,
-    SqliteMcpServerRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteUserRepository,
+    SqliteMcpServerRepository, SqliteProviderRepository, SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 use aionui_team::GuideMcpServer;
@@ -106,7 +106,6 @@ impl AppServices {
 
         let encryption_key = derive_encryption_key(&secret);
 
-        let remote_agent_repo = Arc::new(SqliteRemoteAgentRepository::new(database.pool().clone()));
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
         // User-configured MCP servers — injected into ACP `session/new`
@@ -170,7 +169,6 @@ impl AppServices {
 
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new(skill_paths.clone()),
-            remote_agent_repo,
             provider_repo,
             encryption_key,
             agent_registry: agent_registry.clone(),

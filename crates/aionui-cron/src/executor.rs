@@ -929,12 +929,10 @@ async fn wait_for_terminal_event(mut rx: broadcast::Receiver<AgentStreamEvent>) 
 /// Cron persists this field as a free-form string because legacy rows
 /// carry a vendor label (e.g. `"claude"`, `"gemini"`) instead of the
 /// canonical `"acp"`. Resolution order:
-/// 1. ACP vendor lookup via the registry — any builtin ACP row's
-///    `backend` aliases to [`AgentType::Acp`]. Checked first so vendor
-///    labels that also happen to match a legacy [`AgentType`] variant
-///    (e.g. `"gemini"`) are routed to the modern ACP runtime rather
-///    than the deprecated standalone adapter.
-/// 2. Exact [`AgentType`] serde match.
+/// 1. Exact [`AgentType`] serde match. Deprecated runtime variants are
+///    rejected before any conversation is created.
+/// 2. ACP vendor lookup via the registry — any builtin ACP row's
+///    `backend` aliases to [`AgentType::Acp`].
 /// 3. Fallback to [`AgentType::Acp`] to preserve the prior default.
 async fn parse_agent_type(registry: &AgentRegistry, agent_type_str: &str) -> Result<AgentType, CronError> {
     if let Ok(agent_type) = serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type_str.to_owned())) {
