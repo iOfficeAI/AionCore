@@ -160,6 +160,15 @@ fn slash_command_items(commands: &[AvailableCommand]) -> Vec<SlashCommandItem> {
     commands.iter().map(slash_command_item).collect()
 }
 
+fn leading_slash_token(raw_user_input: &str) -> Option<&str> {
+    raw_user_input.split_whitespace().next()?.strip_prefix('/').filter(|token| !token.is_empty())
+}
+
+fn matched_slash_command(raw_user_input: &str, commands: &[AvailableCommand]) -> Option<SlashCommandItem> {
+    let token = leading_slash_token(raw_user_input)?;
+    commands.iter().find(|command| command.name == token).map(slash_command_item)
+}
+
 /// Manages a single ACP Agent instance.
 ///
 /// ACP is the most complex agent type, supporting 20+ CLI sub-backends
@@ -661,6 +670,13 @@ impl AcpAgentManager {
     async fn ensure_session_and_send(&self, data: &SendMessageData) -> Result<PromptOutcome, AcpSendFailure> {
         let sid = self.ensure_session_opened().await.map_err(AcpSendFailure::from)?;
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
+        let raw_user_input = data.content.clone();
+        let matched_command = {
+            let session = self.session.read().await;
+            session
+                .available_commands()
+                .and_then(|commands| matched_slash_command(&raw_user_input, commands))
+        };
 
         let content = {
             let mut s = self.session.write().await;
@@ -679,7 +695,7 @@ impl AcpAgentManager {
             content,
             ..data.clone()
         };
-        self.prompt_existing_session(&data, Some(&sid)).await
+        self.prompt_existing_session(&data, Some(&sid), matched_command.as_ref()).await
     }
 
     /// Pre-open the ACP session without sending a prompt. Called by the
@@ -749,13 +765,26 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
                 self.runtime.emit_finish(Some(session_id));
                 Ok(())
             }
-            Ok(PromptOutcome::EmptyResponse { session_id, error }) => {
+            Ok(PromptOutcome::InfoTip { session_id, tips } | PromptOutcome::WarningTip { session_id, tips }) => {
                 info!(
                     agent_type = "acp",
-                    terminal_kind = "error",
+                    terminal_kind = "finish",
                     source = "empty_response",
                     session_id = %session_id,
                     "ACP send_message completed without visible output"
+                );
+                self.runtime.emit(AgentStreamEvent::Tips(tips));
+                self.runtime.emit_finish(Some(session_id));
+                Ok(())
+            }
+            Ok(PromptOutcome::TerminalError { session_id, error }) => {
+                info!(
+                    agent_type = "acp",
+                    terminal_kind = "error",
+                    source = "empty_response_stderr",
+                    session_id = %session_id,
+                    error_code = ?error.code,
+                    "ACP send_message empty turn classified as terminal upstream error"
                 );
                 self.runtime.emit_error_data(error);
                 Ok(())
@@ -1062,16 +1091,14 @@ mod tests {
     fn session_command_loading_preserves_empty_turn_meta() {
         let mut session = AcpSession::new(None, None, Default::default());
         let mut command = AvailableCommand::new("review", "Review the current diff");
-        command.meta = Some(
-            serde_json::from_value(json!({
-                "completion_behavior": "neutral_tip_on_empty",
-                "empty_turn_tip_code": "acp.empty_turn.choose_command",
-                "empty_turn_tip_params": {
-                    "command_count": 1
-                }
-            }))
-            .unwrap(),
-        );
+        command.meta = Some(serde_json::from_value(json!({
+            "completion_behavior": "neutral_tip_on_empty",
+            "empty_turn_tip_code": "acp.empty_turn.choose_command",
+            "empty_turn_tip_params": {
+                "command_count": 1
+            }
+        }))
+        .unwrap());
         session.apply_advertised_commands(vec![command]);
 
         let items = super::slash_command_items(session.available_commands().expect("commands advertised"));
@@ -1086,6 +1113,27 @@ mod tests {
         );
         assert_eq!(item.empty_turn_tip_code.as_deref(), Some("acp.empty_turn.choose_command"));
         assert_eq!(item.empty_turn_tip_params, Some(json!({ "command_count": 1 })));
+    }
+
+    #[test]
+    fn matches_leading_slash_token_against_advertised_commands() {
+        let mut command = AvailableCommand::new("ctx-flush", "Flush context");
+        command.meta = Some(
+            serde_json::from_value(json!({
+                "completion_behavior": "neutral_tip_on_empty",
+                "empty_turn_tip_code": "ACP_CTX_FLUSH_COMPLETED",
+            }))
+            .unwrap(),
+        );
+
+        let matched = super::matched_slash_command("/ctx-flush now", &[command]).expect("command should match");
+
+        assert_eq!(matched.command, "ctx-flush");
+        assert_eq!(
+            matched.completion_behavior,
+            Some(aionui_api_types::SlashCommandCompletionBehavior::NeutralTipOnEmpty)
+        );
+        assert_eq!(matched.empty_turn_tip_code.as_deref(), Some("ACP_CTX_FLUSH_COMPLETED"));
     }
 
     // Close-reason compositional tests live in `agent_close.rs` so that

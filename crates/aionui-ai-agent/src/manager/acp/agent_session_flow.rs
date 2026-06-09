@@ -3,18 +3,19 @@ use crate::manager::acp::AcpAgentManager;
 use crate::manager::acp::mode_normalize::agent_metadata_uses_meta_resume;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{
-    AgentStreamEvent, AvailableCommandsEventData, ErrorEventData, SessionAssignedEventData, StartEventData,
+    AgentStreamEvent, AvailableCommandsEventData, ErrorEventData, SessionAssignedEventData, StartEventData, TipType,
+    TipsEventData,
 };
+use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
+use aionui_api_types::{SlashCommandCompletionBehavior, SlashCommandItem};
 use agent_client_protocol::schema::{ContentBlock, LoadSessionRequest, PromptRequest, SessionId, StopReason};
-use aionui_api_types::{
-    AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, AgentErrorResolutionTarget,
-};
 use serde_json::Value;
 use tokio::sync::broadcast::error::TryRecvError;
 
 use super::agent::sdk_to_snake_value;
+use super::agent_close::STDERR_PEEK_LINES;
 use super::error_mapping::{AcpSendFailure, is_acp_session_not_found};
 use tracing::warn;
 
@@ -22,7 +23,9 @@ use tracing::warn;
 pub(super) enum PromptOutcome {
     Completed { session_id: String },
     Cancelled { session_id: String },
-    EmptyResponse { session_id: String, error: ErrorEventData },
+    TerminalError { session_id: String, error: ErrorEventData },
+    InfoTip { session_id: String, tips: TipsEventData },
+    WarningTip { session_id: String, tips: TipsEventData },
 }
 
 impl AcpAgentManager {
@@ -227,6 +230,7 @@ impl AcpAgentManager {
         &self,
         data: &SendMessageData,
         session_id: Option<&str>,
+        matched_command: Option<&SlashCommandItem>,
     ) -> Result<PromptOutcome, AcpSendFailure> {
         let sid = session_id
             .ok_or_else(|| AgentError::internal("Cannot prompt: no session ID available"))
@@ -254,10 +258,21 @@ impl AcpAgentManager {
             .await
             .map_err(AcpSendFailure::from)?;
 
+        let empty_turn = is_empty_turn(&mut probe_rx);
+        if empty_turn
+            && let Some(error) = self.empty_turn_terminal_error().await
+        {
+            return Ok(PromptOutcome::TerminalError {
+                session_id: sid.to_owned(),
+                error,
+            });
+        }
+
         Ok(prompt_outcome_from_stop_reason(
             sid,
             prompt_response.stop_reason,
-            is_empty_turn(&mut probe_rx),
+            empty_turn,
+            matched_command,
         ))
     }
 
@@ -317,6 +332,12 @@ impl AcpAgentManager {
                 }));
         }
     }
+
+    async fn empty_turn_terminal_error(&self) -> Option<ErrorEventData> {
+        let tail = self.process.peek_stderr_tail(STDERR_PEEK_LINES).await;
+        let detail = super::stderr_error_extractor::extract_error_message(&tail)?;
+        Some(classify_empty_turn_stderr_error(&detail))
+    }
 }
 
 /// Drain the supplied turn-scoped receiver and return `true` when the turn
@@ -362,7 +383,12 @@ fn event_is_user_visible_output(event: &AgentStreamEvent) -> bool {
     )
 }
 
-fn prompt_outcome_from_stop_reason(session_id: &str, stop_reason: StopReason, empty_turn: bool) -> PromptOutcome {
+fn prompt_outcome_from_stop_reason(
+    session_id: &str,
+    stop_reason: StopReason,
+    empty_turn: bool,
+    matched_command: Option<&SlashCommandItem>,
+) -> PromptOutcome {
     if matches!(stop_reason, StopReason::Cancelled) {
         return PromptOutcome::Cancelled {
             session_id: session_id.to_owned(),
@@ -370,9 +396,36 @@ fn prompt_outcome_from_stop_reason(session_id: &str, stop_reason: StopReason, em
     }
 
     if empty_turn {
-        return PromptOutcome::EmptyResponse {
+        if matches!(stop_reason, StopReason::EndTurn) {
+            if let Some(command) = matched_command
+                && matches!(
+                    command.completion_behavior,
+                    Some(SlashCommandCompletionBehavior::NeutralTipOnEmpty)
+                )
+            {
+                return PromptOutcome::InfoTip {
+                    session_id: session_id.to_owned(),
+                    tips: empty_turn_info_tip(
+                        command.empty_turn_tip_code.as_deref().unwrap_or("ACP_EMPTY_TURN"),
+                        command.empty_turn_tip_params.clone(),
+                        empty_finish_diagnostic_message(StopReason::EndTurn),
+                    ),
+                };
+            }
+
+            return PromptOutcome::InfoTip {
+                session_id: session_id.to_owned(),
+                tips: empty_turn_info_tip(
+                    "ACP_EMPTY_TURN",
+                    None,
+                    empty_finish_diagnostic_message(StopReason::EndTurn),
+                ),
+            };
+        }
+
+        return PromptOutcome::WarningTip {
             session_id: session_id.to_owned(),
-            error: empty_finish_diagnostic_error(stop_reason),
+            tips: empty_finish_diagnostic_tip(stop_reason),
         };
     }
 
@@ -381,22 +434,26 @@ fn prompt_outcome_from_stop_reason(session_id: &str, stop_reason: StopReason, em
     }
 }
 
-fn empty_finish_diagnostic_error(stop_reason: StopReason) -> ErrorEventData {
-    ErrorEventData::classified(
-        // TODO(i18n): wire to a frontend translation key once a
-        // pattern is established. For now this is the user-facing
-        // English string.
-        empty_finish_diagnostic_message(stop_reason),
-        AgentErrorCode::UnknownUpstreamError,
-        AgentErrorOwnership::UnknownUpstream,
-        Some("Agent completed the turn without producing visible output.".into()),
-        true,
-        true,
-        Some(AgentErrorResolution::new(
-            AgentErrorResolutionKind::SendFeedback,
-            Some(AgentErrorResolutionTarget::Feedback),
-        )),
-    )
+fn empty_turn_info_tip(code: &str, params: Option<Value>, fallback_content: String) -> TipsEventData {
+    TipsEventData {
+        content: fallback_content,
+        tip_type: TipType::Info,
+        code: Some(code.to_owned()),
+        params,
+    }
+}
+
+fn empty_finish_diagnostic_tip(stop_reason: StopReason) -> TipsEventData {
+    TipsEventData {
+        content: empty_finish_diagnostic_message(stop_reason),
+        tip_type: TipType::Warning,
+        code: None,
+        params: None,
+    }
+}
+
+fn classify_empty_turn_stderr_error(detail: &str) -> ErrorEventData {
+    AgentSendError::from_agent_error(AgentError::bad_gateway(detail.to_owned())).into_stream_error()
 }
 
 /// Build the user-facing message shown when the agent finished a turn
@@ -437,8 +494,6 @@ mod tests {
     use crate::protocol::error::AcpError;
     use crate::shared_kernel::SessionId as DomainSessionId;
     use agent_client_protocol::schema::AgentCapabilities;
-    use aionui_api_types::AgentErrorCode;
-
     fn make_session() -> AcpSession {
         AcpSession::new(None, None, Default::default())
     }
@@ -602,11 +657,11 @@ mod tests {
     // -- empty-finish diagnostic (ELECTRON-1JG) -------------------------------
 
     use crate::protocol::events::{
-        AgentStreamEvent, FinishEventData, StartEventData, TextEventData, ThinkingEventData, ToolCallEventData,
-        ToolCallStatus,
+        AgentStreamEvent, FinishEventData, StartEventData, TextEventData, ThinkingEventData, TipType,
+        ToolCallEventData, ToolCallStatus,
     };
     use agent_client_protocol::schema::StopReason;
-    use aionui_api_types::{AgentErrorResolutionKind, AgentErrorResolutionTarget};
+    use aionui_api_types::{AgentErrorCode, SlashCommandCompletionBehavior, SlashCommandItem};
     use tokio::sync::broadcast;
 
     /// Lifecycle-only events (`Start`/`Finish`) must NOT count as
@@ -700,33 +755,68 @@ mod tests {
     }
 
     #[test]
-    fn empty_finish_diagnostic_error_has_feedback_resolution() {
-        let error = super::empty_finish_diagnostic_error(StopReason::EndTurn);
-
-        let resolution = error
-            .resolution
-            .expect("empty-finish classified errors must include a resolution");
-        assert_eq!(resolution.kind, AgentErrorResolutionKind::SendFeedback);
-        assert_eq!(resolution.target, Some(AgentErrorResolutionTarget::Feedback));
+    fn empty_finish_diagnostic_tip_is_warning() {
+        let tip = super::empty_finish_diagnostic_tip(StopReason::EndTurn);
+        assert_eq!(tip.tip_type, TipType::Warning);
+        assert!(tip.content.to_lowercase().contains("finished"));
     }
 
     #[test]
-    fn prompt_outcome_empty_response_maps_to_error_without_finish() {
-        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, true);
+    fn benign_empty_turn_returns_info_tip() {
+        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, true, None);
 
         match outcome {
-            super::PromptOutcome::EmptyResponse { session_id, error } => {
+            super::PromptOutcome::InfoTip { session_id, tips } => {
                 assert_eq!(session_id, "sess-1");
-                assert_eq!(error.code, Some(AgentErrorCode::UnknownUpstreamError));
-                assert_eq!(error.feedback_recommended, Some(true));
+                assert_eq!(tips.tip_type, TipType::Info);
+                assert_eq!(tips.code.as_deref(), Some("ACP_EMPTY_TURN"));
+                assert!(tips.content.contains("without producing"));
             }
-            other => panic!("expected EmptyResponse, got {other:?}"),
+            other => panic!("expected InfoTip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metadata_driven_command_empty_turn_uses_command_tip_code() {
+        let command = SlashCommandItem {
+            command: "ctx-flush".into(),
+            description: "Flush context".into(),
+            completion_behavior: Some(SlashCommandCompletionBehavior::NeutralTipOnEmpty),
+            empty_turn_tip_code: Some("ACP_CTX_FLUSH_COMPLETED".into()),
+            empty_turn_tip_params: Some(serde_json::json!({ "scope": "session" })),
+        };
+
+        let outcome =
+            super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, true, Some(&command));
+
+        match outcome {
+            super::PromptOutcome::InfoTip { session_id, tips } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(tips.tip_type, TipType::Info);
+                assert_eq!(tips.code.as_deref(), Some("ACP_CTX_FLUSH_COMPLETED"));
+                assert_eq!(tips.params, Some(serde_json::json!({ "scope": "session" })));
+            }
+            other => panic!("expected InfoTip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_benign_empty_turn_can_stay_warning_tip() {
+        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::MaxTokens, true, None);
+
+        match outcome {
+            super::PromptOutcome::WarningTip { session_id, tips } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(tips.tip_type, TipType::Warning);
+                assert!(tips.content.to_lowercase().contains("token"));
+            }
+            other => panic!("expected WarningTip, got {other:?}"),
         }
     }
 
     #[test]
     fn prompt_outcome_cancelled_takes_priority_over_empty_response() {
-        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::Cancelled, true);
+        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::Cancelled, true, None);
 
         match outcome {
             super::PromptOutcome::Cancelled { session_id } => {
@@ -738,7 +828,7 @@ mod tests {
 
     #[test]
     fn prompt_outcome_completed_when_visible_output_exists() {
-        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, false);
+        let outcome = super::prompt_outcome_from_stop_reason("sess-1", StopReason::EndTurn, false, None);
 
         match outcome {
             super::PromptOutcome::Completed { session_id } => {
@@ -746,5 +836,31 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_empty_turn_stderr_error_preserves_provider_billing_failure() {
+        let error = super::classify_empty_turn_stderr_error(
+            "HTTP 402: Insufficient account balance",
+        );
+
+        assert_eq!(error.code, Some(AgentErrorCode::UserLlmProviderBillingRequired));
+        assert_eq!(error.retryable, Some(false));
+        assert_eq!(error.feedback_recommended, Some(false));
+    }
+
+    #[test]
+    fn classify_real_402_empty_turn_sentry_tail_preserves_provider_billing_failure() {
+        let stderr = "[warn] CLI process stderr stderr=\"2026-06-05 03:27:44 [INFO] agent.chat_completion_helpers: Streaming failed before delivery: Error code: 402 - {'error': {'code': '402', 'message': 'Insufficient account balance', 'type': 'insufficient_balance'}}\"\n\
+                      [warn] CLI process stderr stderr=\"💡 xiaomi reported that billing, credits, or account entitlement is exhausted for mimo-v2.5-pro.\"\n\
+                      [warn] CLI process stderr stderr=\"💡 Add credits or update billing with that provider, then retry.\"\n\
+                      [warn] CLI process stderr stderr=\"2026-06-05 03:27:44 [ERROR] agent.conversation_loop: Non-retryable client error: Error code: 402 - {'error': {'code': '402', 'message': 'Insufficient account balance', 'type': 'insufficient_balance'}}\"";
+        let detail = super::super::stderr_error_extractor::extract_error_message(stderr)
+            .expect("sample tail must surface a billing hint");
+        let error = super::classify_empty_turn_stderr_error(&detail);
+
+        assert_eq!(error.code, Some(AgentErrorCode::UserLlmProviderBillingRequired));
+        assert_eq!(error.retryable, Some(false));
+        assert_eq!(error.feedback_recommended, Some(false));
     }
 }
