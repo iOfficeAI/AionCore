@@ -66,6 +66,7 @@ impl RelayTerminal {
 pub struct StreamRelay {
     conversation_id: String,
     msg_id: String,
+    turn_id: String,
     user_id: String,
     broadcaster: Arc<dyn EventBroadcaster>,
     cron_service: Option<Arc<dyn ICronService>>,
@@ -79,6 +80,7 @@ impl StreamRelay {
     pub fn new(
         conversation_id: String,
         msg_id: String,
+        turn_id: String,
         user_id: String,
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
@@ -88,6 +90,7 @@ impl StreamRelay {
         Self {
             conversation_id,
             msg_id,
+            turn_id,
             user_id,
             broadcaster,
             cron_service,
@@ -120,6 +123,7 @@ impl StreamRelay {
         fields(
             conversation_id = %self.conversation_id,
             msg_id = %self.msg_id,
+            turn_id = %self.turn_id,
         )
     )]
     pub async fn consume(self, rx: broadcast::Receiver<AgentStreamEvent>) -> RelayOutcome {
@@ -133,6 +137,7 @@ impl StreamRelay {
         fields(
             conversation_id = %self.conversation_id,
             msg_id = %self.msg_id,
+            turn_id = %self.turn_id,
         )
     )]
     pub async fn consume_with_send_error(
@@ -149,7 +154,12 @@ impl StreamRelay {
         mut send_error_rx: Option<oneshot::Receiver<AgentSendError>>,
     ) -> RelayOutcome {
         let started_at = now_ms();
-        info!("StreamRelay started");
+        info!(
+            conversation_id = %self.conversation_id,
+            turn_id = %self.turn_id,
+            msg_id = %self.msg_id,
+            "StreamRelay started"
+        );
 
         let mut full_text_buffer = String::new();
         let mut text_segments: Vec<PersistedTextSegment> = Vec::new();
@@ -310,7 +320,9 @@ impl StreamRelay {
                                 self.finalize(&full_text_buffer, &text_segments, &event, terminal).await
                             };
                             if self.complete_turn && !deleting {
-                                self.adapter.complete_conversation(&self.broadcaster, None).await;
+                                self.adapter
+                                    .complete_conversation(&self.broadcaster, &self.turn_id, None)
+                                    .await;
                             }
                             break outcome;
                         }
@@ -372,7 +384,9 @@ impl StreamRelay {
                         .await
                     };
                     if self.complete_turn && !deleting {
-                        self.adapter.complete_conversation(&self.broadcaster, None).await;
+                        self.adapter
+                            .complete_conversation(&self.broadcaster, &self.turn_id, None)
+                            .await;
                     }
                     break outcome;
                 }
@@ -463,6 +477,7 @@ impl StreamRelay {
         let payload = json!({
             "conversation_id": self.conversation_id,
             "msg_id": msg_id,
+            "turn_id": self.turn_id,
             "type": event_data.get("type").cloned().unwrap_or(json!("unknown")),
             "data": event_data.get("data").cloned().unwrap_or(json!({})),
             "hidden": false,
@@ -562,6 +577,7 @@ impl StreamRelay {
         self.broadcast_stream_payload(json!({
             "conversation_id": self.conversation_id,
             "msg_id": msg_id,
+            "turn_id": self.turn_id,
             "type": "content",
             "data": { "content": text },
             "hidden": hidden,
@@ -574,6 +590,7 @@ impl StreamRelay {
             self.broadcast_stream_payload(json!({
                 "conversation_id": self.conversation_id,
                 "msg_id": ConversationService::mint_msg_id(),
+                "turn_id": self.turn_id,
                 "type": "system",
                 "data": response,
                 "hidden": true,
@@ -581,7 +598,11 @@ impl StreamRelay {
         }
     }
 
-    fn broadcast_stream_payload(&self, payload: serde_json::Value) {
+    fn broadcast_stream_payload(&self, mut payload: serde_json::Value) {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.entry("turn_id")
+                .or_insert_with(|| serde_json::Value::String(self.turn_id.clone()));
+        }
         let msg = WebSocketMessage::new("message.stream", payload);
         self.broadcaster.broadcast(msg);
     }
@@ -640,6 +661,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -687,6 +709,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -742,6 +765,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -786,6 +810,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -849,6 +874,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -890,6 +916,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -943,6 +970,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1006,6 +1034,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1067,6 +1096,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1102,6 +1132,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1129,8 +1160,15 @@ mod tests {
         let data = &turn_event.unwrap().data;
         assert_eq!(data["conversation_id"], "conv-1");
         assert_eq!(data["session_id"], "conv-1");
+        assert_eq!(data["turn_id"], "turn-1");
         assert_eq!(data["status"], "finished");
         assert_eq!(data["canSendMessage"], true);
+
+        let stream_event = ws_events
+            .iter()
+            .find(|e| e.name == "message.stream")
+            .expect("finish should be forwarded as message.stream");
+        assert_eq!(stream_event.data["turn_id"], "turn-1");
     }
 
     #[tokio::test]
@@ -1141,6 +1179,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1196,6 +1235,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1269,6 +1309,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1362,6 +1403,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1410,6 +1452,7 @@ mod tests {
         let relay = StreamRelay::new(
             "deleted-conv".into(),
             "assistant-msg".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo,
             bus,
@@ -1443,7 +1486,7 @@ mod tests {
         let bus: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
         let adapter = StreamPersistenceAdapter::new("deleted-conv".into(), "msg-1".into(), repo, None);
 
-        adapter.complete_conversation(&bus, None).await;
+        adapter.complete_conversation(&bus, "turn-1", None).await;
     }
 
     #[tokio::test]
@@ -1457,6 +1500,7 @@ mod tests {
         let relay = StreamRelay::new(
             "deleted-conv".into(),
             "assistant-msg".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus,
@@ -1486,6 +1530,7 @@ mod tests {
         let relay = StreamRelay::new(
             "deleted-conv".into(),
             "assistant-msg".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus,
@@ -1516,6 +1561,7 @@ mod tests {
         let relay = StreamRelay::new(
             "deleted-conv".into(),
             "assistant-msg".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus,

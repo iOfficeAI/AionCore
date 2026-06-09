@@ -96,11 +96,12 @@ impl StreamPersistenceAdapter {
     pub async fn complete_conversation(
         &self,
         broadcaster: &Arc<dyn EventBroadcaster>,
+        turn_id: &str,
         runtime: Option<ConversationRuntimeSummary>,
     ) {
         if let Some(persistence) = &self.persistence {
             RuntimeCompletionPublisher::new(self.repo.clone(), broadcaster.clone(), persistence.clone())
-                .publish(&self.conversation_id, runtime)
+                .publish(&self.conversation_id, turn_id, runtime)
                 .await;
             return;
         }
@@ -117,13 +118,14 @@ impl StreamPersistenceAdapter {
         let payload = json!({
             "conversation_id": self.conversation_id,
             "session_id": self.conversation_id,
+            "turn_id": turn_id,
             "status": "finished",
             "canSendMessage": true,
             "runtime": runtime,
         });
         broadcaster.broadcast(WebSocketMessage::new("turn.completed", payload));
 
-        debug!(conversation_id = %self.conversation_id, status = "finished", "Turn completed");
+        debug!(conversation_id = %self.conversation_id, turn_id, status = "finished", "Turn completed");
     }
 
     fn allows_write(&self, kind: RuntimeWriteKind) -> bool {

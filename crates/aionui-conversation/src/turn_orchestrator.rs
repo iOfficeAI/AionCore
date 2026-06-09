@@ -22,6 +22,7 @@ pub(crate) struct TurnStartInput {
     pub request: SendMessageRequest,
     pub build_options: BuildTaskOptions,
     pub stored_workspace: String,
+    pub turn_id: String,
     pub turn_claim: TurnClaim,
 }
 
@@ -44,12 +45,13 @@ impl ConversationTurnOrchestrator {
     async fn run_user_turn(self, input: TurnStartInput) {
         let mut turn_claim = input.turn_claim;
         let conv_id = input.conversation.id.clone();
+        let turn_id = input.turn_id.clone();
         let build_started_at = now_ms();
         let persistence = self.service.runtime_persistence();
         let runtime_state = self.service.runtime_state();
 
-        info!(conversation_id = %conv_id, "conversation turn orchestrator started");
-        info!(conversation_id = %conv_id, "Agent task build started");
+        info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
+        info!(conversation_id = %conv_id, turn_id = %turn_id, "Agent task build started");
         let agent = match self.task_manager.get_or_build_task(&conv_id, input.build_options).await {
             Ok(agent) => agent,
             Err(err) => {
@@ -57,15 +59,18 @@ impl ConversationTurnOrchestrator {
                 let send_error = AgentSendError::from_agent_error_ref(&err);
                 error!(
                     conversation_id = %conv_id,
+                    turn_id = %turn_id,
                     error_code = ?send_error.code(),
                     error = %ErrorChain(&err),
                     "Agent task build failed"
                 );
                 self.service
-                    .persist_and_broadcast_send_failure_tip(&conv_id, &send_error, Some(top_level_code))
+                    .persist_and_broadcast_send_failure_tip(&conv_id, &turn_id, &send_error, Some(top_level_code))
                     .await;
-                let was_deleting = turn_claim.release();
-                self.service.complete_released_turn(&conv_id, was_deleting).await;
+                let was_deleting = turn_claim.release_for_turn(&turn_id);
+                self.service
+                    .complete_released_turn(&conv_id, &turn_id, was_deleting)
+                    .await;
                 return;
             }
         };
@@ -79,20 +84,24 @@ impl ConversationTurnOrchestrator {
             let send_error = AgentSendError::from_agent_error(err.to_agent_error());
             error!(
                 conversation_id = %conv_id,
+                turn_id = %turn_id,
                 error_code = err.error_code(),
                 error = %ErrorChain(&err),
                 "Failed to persist resolved workspace"
             );
             self.service
-                .persist_and_broadcast_send_failure_tip(&conv_id, &send_error, Some(top_level_code))
+                .persist_and_broadcast_send_failure_tip(&conv_id, &turn_id, &send_error, Some(top_level_code))
                 .await;
-            let was_deleting = turn_claim.release();
-            self.service.complete_released_turn(&conv_id, was_deleting).await;
+            let was_deleting = turn_claim.release_for_turn(&turn_id);
+            self.service
+                .complete_released_turn(&conv_id, &turn_id, was_deleting)
+                .await;
             return;
         }
 
         info!(
             conversation_id = %conv_id,
+            turn_id = %turn_id,
             agent_type = ?agent.agent_type(),
             elapsed_ms = now_ms().saturating_sub(build_started_at),
             "Agent task ready"
@@ -115,6 +124,7 @@ impl ConversationTurnOrchestrator {
             let relay = StreamRelay::new(
                 conv_id.clone(),
                 msg_id,
+                turn_id.clone(),
                 input.user_id.clone(),
                 self.service.conversation_repo().clone(),
                 self.service.broadcaster().clone(),
@@ -127,6 +137,7 @@ impl ConversationTurnOrchestrator {
             let rx = agent.subscribe();
             let send_agent = agent.clone();
             let conv_id_send = conv_id.clone();
+            let turn_id_for_send = turn_id.clone();
             let (send_error_tx, send_error_rx) = oneshot::channel();
 
             tokio::spawn(async move {
@@ -135,6 +146,7 @@ impl ConversationTurnOrchestrator {
                     let agent_type = send_agent.agent_type();
                     error!(
                         conversation_id = %conv_id_send,
+                        turn_id = %turn_id_for_send,
                         ?agent_type,
                         ?task_status,
                         error = %ErrorChain(&e),
@@ -143,12 +155,14 @@ impl ConversationTurnOrchestrator {
                     if task_status == Some(ConversationStatus::Finished) {
                         debug!(
                             conversation_id = %conv_id_send,
+                            turn_id = %turn_id_for_send,
                             ?agent_type,
                             "Agent send_message failure already published runtime terminal; skipping fallback stream error"
                         );
                     } else {
                         warn!(
                             conversation_id = %conv_id_send,
+                            turn_id = %turn_id_for_send,
                             ?agent_type,
                             code = ?e.code(),
                             ownership = ?e.ownership(),
@@ -197,7 +211,9 @@ impl ConversationTurnOrchestrator {
             }
         }
 
-        let was_deleting = turn_claim.release();
-        self.service.complete_released_turn(&conv_id, was_deleting).await;
+        let was_deleting = turn_claim.release_for_turn(&turn_id);
+        self.service
+            .complete_released_turn(&conv_id, &turn_id, was_deleting)
+            .await;
     }
 }

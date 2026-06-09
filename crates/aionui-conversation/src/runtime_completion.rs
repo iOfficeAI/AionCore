@@ -29,13 +29,16 @@ impl RuntimeCompletionPublisher {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
-    pub async fn publish(&self, conversation_id: &str, runtime: Option<ConversationRuntimeSummary>) {
+    #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id, turn_id = %turn_id))]
+    pub async fn publish(&self, conversation_id: &str, turn_id: &str, runtime: Option<ConversationRuntimeSummary>) {
         if !self
             .persistence
             .allows(conversation_id, RuntimeWriteKind::ConversationFinished)
         {
-            debug!(conversation_id, "turn completion skipped by runtime persistence policy");
+            debug!(
+                conversation_id,
+                turn_id, "turn completion skipped by runtime persistence policy"
+            );
             return;
         }
 
@@ -44,13 +47,14 @@ impl RuntimeCompletionPublisher {
             Ok(None) => {
                 debug!(
                     conversation_id,
-                    "turn completion skipped because conversation row is missing"
+                    turn_id, "turn completion skipped because conversation row is missing"
                 );
                 return;
             }
             Err(error) => {
                 error!(
                     conversation_id,
+                    turn_id,
                     error = %ErrorChain(&error),
                     "turn completion skipped because conversation row lookup failed"
                 );
@@ -66,6 +70,7 @@ impl RuntimeCompletionPublisher {
         if let Err(error) = self.repo.update(conversation_id, &update).await {
             error!(
                 conversation_id,
+                turn_id,
                 error = %ErrorChain(&error),
                 "Failed to update conversation status"
             );
@@ -75,6 +80,7 @@ impl RuntimeCompletionPublisher {
         let payload = json!({
             "conversation_id": conversation_id,
             "session_id": conversation_id,
+            "turn_id": turn_id,
             "status": "finished",
             "canSendMessage": true,
             "runtime": runtime,
@@ -82,6 +88,6 @@ impl RuntimeCompletionPublisher {
         self.broadcaster
             .broadcast(WebSocketMessage::new("turn.completed", payload));
 
-        debug!(conversation_id, status = "finished", "Turn completed");
+        debug!(conversation_id, turn_id, status = "finished", "Turn completed");
     }
 }

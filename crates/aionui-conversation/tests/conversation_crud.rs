@@ -790,7 +790,7 @@ async fn complete_turn_skips_status_update_when_conversation_is_deleting() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     svc.runtime_state().mark_deleting(&conv.id);
-    svc.complete_turn(&conv.id).await;
+    svc.complete_turn(&conv.id, "turn-1").await;
 
     let row = svc.conversation_repo().get(&conv.id).await.unwrap().unwrap();
     assert_eq!(row.status.as_deref(), Some("pending"));
