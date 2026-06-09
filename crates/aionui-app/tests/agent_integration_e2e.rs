@@ -283,7 +283,7 @@ async fn agents_endpoint_hides_deprecated_runtime_rows() {
 }
 
 #[tokio::test]
-async fn agents_endpoint_lists_openclaw_as_acp_backend() {
+async fn agents_endpoint_handles_openclaw_as_acp_backend() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
 
@@ -307,11 +307,18 @@ async fn agents_endpoint_lists_openclaw_as_acp_backend() {
 
     let openclaw = agents
         .iter()
-        .find(|agent| agent["backend"].as_str() == Some("openclaw"))
-        .expect("OpenClaw ACP should be visible from /api/agents");
-    assert_eq!(openclaw["agent_type"], "acp");
-    assert_eq!(openclaw["command"], "openclaw");
-    assert_eq!(openclaw["args"], json!(["acp"]));
+        .find(|agent| agent["backend"].as_str() == Some("openclaw"));
+    if meta.available {
+        let openclaw = openclaw.expect("available OpenClaw ACP should be visible from /api/agents");
+        assert_eq!(openclaw["agent_type"], "acp");
+        assert_eq!(openclaw["command"], "openclaw");
+        assert_eq!(openclaw["args"], json!(["acp"]));
+    } else {
+        assert!(
+            openclaw.is_none(),
+            "unavailable OpenClaw ACP should be hidden from /api/agents"
+        );
+    }
 
     assert!(
         agents
