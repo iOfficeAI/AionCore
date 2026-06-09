@@ -350,10 +350,24 @@ async fn stop_stream_with_mock_agent() {
     let conv_id = create_conversation(&mut app, &token, &csrf, "Stop Test").await;
     mock_tm.insert(&conv_id, "/mock-workspace");
 
+    let send_req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({ "content": "Start mock agent" }),
+        &token,
+        &csrf,
+    );
+    let send_resp = app.clone().oneshot(send_req).await.unwrap();
+    assert_eq!(send_resp.status(), StatusCode::ACCEPTED);
+    let send_json = body_json(send_resp).await;
+    let turn_id = send_json["data"]["turn_id"]
+        .as_str()
+        .expect("send response includes turn_id");
+
     let req = json_with_token(
         "POST",
         &format!("/api/conversations/{conv_id}/cancel"),
-        json!({}),
+        json!({ "turn_id": turn_id }),
         &token,
         &csrf,
     );

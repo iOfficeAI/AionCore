@@ -325,7 +325,7 @@ async fn stop_stream_no_task() {
     let req = json_with_token(
         "POST",
         &format!("/api/conversations/{conv_id}/cancel"),
-        json!({}),
+        json!({ "turn_id": "turn_no_active_task" }),
         &token,
         &csrf,
     );
