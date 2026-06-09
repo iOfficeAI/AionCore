@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.26](https://github.com/iOfficeAI/AionCore/compare/v0.1.25...v0.1.26) (2026-06-09)
+
+
+### Bug Fixes
+
+* **app:** use process synchronize access for parent watcher ([#438](https://github.com/iOfficeAI/AionCore/issues/438)) ([95571f1](https://github.com/iOfficeAI/AionCore/commit/95571f1c9fcd69df6ec15d8f595178c4869c15d0))
+
 ## [0.1.25](https://github.com/iOfficeAI/AionCore/compare/v0.1.24...v0.1.25) (2026-06-09)
 
 
