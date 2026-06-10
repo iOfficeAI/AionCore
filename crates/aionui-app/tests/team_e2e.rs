@@ -231,6 +231,77 @@ async fn tl2_list_multiple_teams() {
     assert_eq!(json["data"].as_array().unwrap().len(), 2);
 }
 
+#[tokio::test]
+async fn team_api_rejects_cross_user_access() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "alice", "StrongP@ss2").await;
+
+    let data = create_team(&mut app, &owner_token, &owner_csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let slot_id = data["agents"][1]["slot_id"].as_str().unwrap();
+
+    let req = get_with_token("/api/teams", &other_token);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json["data"].as_array().unwrap().is_empty());
+
+    let req = get_with_token(&format!("/api/teams/{team_id}"), &other_token);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let forbidden_requests = [
+        json_with_token(
+            "PATCH",
+            &format!("/api/teams/{team_id}/name"),
+            json!({ "name": "Nope" }),
+            &other_token,
+            &other_csrf,
+        ),
+        json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/messages"),
+            json!({ "content": "Nope" }),
+            &other_token,
+            &other_csrf,
+        ),
+        json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/agents/{slot_id}/messages"),
+            json!({ "content": "Nope" }),
+            &other_token,
+            &other_csrf,
+        ),
+        json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/session"),
+            json!({}),
+            &other_token,
+            &other_csrf,
+        ),
+        json_with_token(
+            "DELETE",
+            &format!("/api/teams/{team_id}/session"),
+            json!({}),
+            &other_token,
+            &other_csrf,
+        ),
+        json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/session-mode"),
+            json!({ "mode": "auto" }),
+            &other_token,
+            &other_csrf,
+        ),
+    ];
+
+    for req in forbidden_requests {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+}
+
 // TL-3: Each team contains full agents info
 #[tokio::test]
 async fn tl3_teams_contain_full_agent_info() {

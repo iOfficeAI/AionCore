@@ -699,7 +699,11 @@ async fn exec_rename_agent(
     let resolved_slot = resolve_agent_target(scheduler, &input.slot_id).await?;
 
     if let Some(svc) = service.upgrade() {
-        svc.rename_agent(team_id, &resolved_slot, &input.new_name)
+        let user_id = svc
+            .get_session_user_id(team_id)
+            .await
+            .ok_or_else(|| format!("No active session for team {team_id}"))?;
+        svc.rename_agent(&user_id, team_id, &resolved_slot, &input.new_name)
             .await
             .map_err(|e| e.to_string())?;
     } else {

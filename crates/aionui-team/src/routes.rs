@@ -42,6 +42,7 @@ impl From<TeamError> for ApiError {
             TeamError::TaskNotFound(msg) => ApiError::NotFound(msg),
             TeamError::InvalidRequest(msg) => ApiError::BadRequest(msg),
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
+            TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
@@ -83,16 +84,20 @@ async fn create_team(
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(team))))
 }
 
-async fn list_teams(State(state): State<TeamRouterState>) -> Result<Json<ApiResponse<TeamListResponse>>, ApiError> {
-    let teams = state.service.list_teams().await?;
+async fn list_teams(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<TeamListResponse>>, ApiError> {
+    let teams = state.service.list_teams(&user.id).await?;
     Ok(Json(ApiResponse::ok(teams)))
 }
 
 async fn get_team(
     State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<TeamResponse>>, ApiError> {
-    let team = state.service.get_team(&id).await?;
+    let team = state.service.get_team(&user.id, &id).await?;
     Ok(Json(ApiResponse::ok(team)))
 }
 
@@ -107,11 +112,12 @@ async fn remove_team(
 
 async fn rename_team(
     State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<RenameTeamRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.service.rename_team(&id, &req.name).await?;
+    state.service.rename_team(&user.id, &id, &req.name).await?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -146,63 +152,72 @@ async fn remove_agent(
 
 async fn rename_agent(
     State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(params): Path<AgentPathParams>,
     body: Result<Json<RenameAgentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .service
-        .rename_agent(&params.id, &params.slot_id, &req.name)
+        .rename_agent(&user.id, &params.id, &params.slot_id, &req.name)
         .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn send_message(
     State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SendTeamMessageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.service.send_message(&id, &req.content, req.files).await?;
+    state
+        .service
+        .send_message(&user.id, &id, &req.content, req.files)
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn send_message_to_agent(
     State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(params): Path<AgentPathParams>,
     body: Result<Json<SendAgentMessageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .service
-        .send_message_to_agent(&params.id, &params.slot_id, &req.content, req.files)
+        .send_message_to_agent(&user.id, &params.id, &params.slot_id, &req.content, req.files)
         .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn set_session_mode(
     State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetModeRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.service.set_session_mode(&id, &req.mode).await?;
+    state.service.set_session_mode(&user.id, &id, &req.mode).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn ensure_session(
     State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.service.ensure_session(&id).await?;
+    state.service.ensure_session(&user.id, &id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn stop_session(
     State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.service.stop_session(&id);
+    state.service.stop_session(&user.id, &id).await?;
     Ok(Json(ApiResponse::success()))
 }
 

@@ -93,6 +93,20 @@ impl TeamSessionService {
         })
     }
 
+    async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
+        let row = self
+            .repo
+            .get_team(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        if row.user_id != user_id {
+            return Err(TeamError::Forbidden(format!(
+                "team {team_id} is not owned by current user"
+            )));
+        }
+        Ok(Team::from_row(&row)?)
+    }
+
     /// Restore sessions for all existing teams. Called once at app startup
     /// so that MCP servers are available before any user sends a message.
     pub async fn restore_all_sessions(&self) {
@@ -104,7 +118,7 @@ impl TeamSessionService {
             }
         };
         for team in &teams {
-            if let Err(e) = self.ensure_session(&team.id).await {
+            if let Err(e) = self.ensure_session_inner(&team.id, false).await {
                 tracing::warn!(team_id = %team.id, error = %e, "failed to restore session on startup");
                 continue;
             }
@@ -302,8 +316,8 @@ impl TeamSessionService {
         self.build_team_response(&team).await
     }
 
-    pub async fn list_teams(&self) -> Result<Vec<TeamResponse>, TeamError> {
-        let rows = self.repo.list_teams().await?;
+    pub async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamResponse>, TeamError> {
+        let rows = self.repo.list_teams_by_user(user_id).await?;
         let mut teams = Vec::with_capacity(rows.len());
         for row in &rows {
             match Team::from_row(row) {
@@ -321,25 +335,15 @@ impl TeamSessionService {
         Ok(teams)
     }
 
-    pub async fn get_team(&self, team_id: &str) -> Result<TeamResponse, TeamError> {
-        let row = self
-            .repo
-            .get_team(team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        let team = Team::from_row(&row)?;
+    pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
         self.build_team_response(&team).await
     }
 
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
-        let row = self
-            .repo
-            .get_team(team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        let team = Team::from_row(&row)?;
+        let team = self.load_owned_team(user_id, team_id).await?;
 
-        self.stop_session(team_id);
+        self.stop_session_unchecked(team_id);
 
         let kill_futures: Vec<_> = team
             .agents
@@ -370,11 +374,8 @@ impl TeamSessionService {
         Ok(())
     }
 
-    pub async fn rename_team(&self, team_id: &str, name: &str) -> Result<(), TeamError> {
-        self.repo
-            .get_team(team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+    pub async fn rename_team(&self, user_id: &str, team_id: &str, name: &str) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
 
         self.repo
             .update_team(
@@ -407,6 +408,11 @@ impl TeamSessionService {
             .get_team(team_id)
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        if row.user_id != user_id {
+            return Err(TeamError::Forbidden(format!(
+                "team {team_id} is not owned by current user"
+            )));
+        }
         let mut team = Team::from_row(&row)?;
 
         let slot_id = generate_id();
@@ -495,12 +501,7 @@ impl TeamSessionService {
     }
 
     pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
-        let row = self
-            .repo
-            .get_team(team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        let mut team = Team::from_row(&row)?;
+        let mut team = self.load_owned_team(user_id, team_id).await?;
 
         let idx = team
             .agents
@@ -534,13 +535,8 @@ impl TeamSessionService {
         Ok(())
     }
 
-    pub async fn rename_agent(&self, team_id: &str, slot_id: &str, name: &str) -> Result<(), TeamError> {
-        let row = self
-            .repo
-            .get_team(team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        let mut team = Team::from_row(&row)?;
+    pub async fn rename_agent(&self, user_id: &str, team_id: &str, slot_id: &str, name: &str) -> Result<(), TeamError> {
+        let mut team = self.load_owned_team(user_id, team_id).await?;
 
         let normalized = crate::scheduler::normalize_name(name);
         if normalized.is_empty() {
@@ -597,7 +593,16 @@ impl TeamSessionService {
     /// 4. Only insert into `sessions` after every step above succeeds — on
     ///    any failure, stop the session and leave the map untouched so a
     ///    retry can start cleanly.
-    pub async fn ensure_session(&self, team_id: &str) -> Result<(), TeamError> {
+    pub async fn ensure_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        let row = match self.repo.get_team(team_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) | Err(_) => return self.ensure_session_inner(team_id, false).await,
+        };
+        if row.user_id != user_id {
+            return Err(TeamError::Forbidden(format!(
+                "team {team_id} is not owned by current user"
+            )));
+        }
         self.ensure_session_inner(team_id, false).await
     }
 
@@ -844,7 +849,13 @@ impl TeamSessionService {
         self.sessions.get(team_id).map(|e| e.session.scheduler().clone())
     }
 
-    pub fn stop_session(&self, team_id: &str) {
+    pub async fn stop_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        self.stop_session_unchecked(team_id);
+        Ok(())
+    }
+
+    fn stop_session_unchecked(&self, team_id: &str) {
         if let Some((_, entry)) = self.sessions.remove(team_id) {
             entry.session.event_loops().shutdown();
             entry.session.stop();
@@ -853,11 +864,13 @@ impl TeamSessionService {
 
     pub async fn send_message(
         &self,
+        user_id: &str,
         team_id: &str,
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<(), TeamError> {
-        self.ensure_session(team_id).await?;
+        self.load_owned_team(user_id, team_id).await?;
+        self.ensure_session_inner(team_id, false).await?;
         let session = {
             let entry = self
                 .sessions
@@ -870,12 +883,14 @@ impl TeamSessionService {
 
     pub async fn send_message_to_agent(
         &self,
+        user_id: &str,
         team_id: &str,
         slot_id: &str,
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<(), TeamError> {
-        self.ensure_session(team_id).await?;
+        self.load_owned_team(user_id, team_id).await?;
+        self.ensure_session_inner(team_id, false).await?;
         let session = {
             let entry = self
                 .sessions
@@ -886,13 +901,8 @@ impl TeamSessionService {
         session.send_message_to_agent(slot_id, content, files).await
     }
 
-    pub async fn set_session_mode(&self, team_id: &str, mode: &str) -> Result<(), TeamError> {
-        let row = self
-            .repo
-            .get_team(team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        let team = Team::from_row(&row)?;
+    pub async fn set_session_mode(&self, user_id: &str, team_id: &str, mode: &str) -> Result<(), TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
 
         for agent in &team.agents {
             if let Some(instance) = self.task_manager.get_task(&agent.conversation_id)

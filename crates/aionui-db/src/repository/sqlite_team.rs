@@ -49,6 +49,14 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(rows)
     }
 
+    async fn list_teams_by_user(&self, user_id: &str) -> Result<Vec<TeamRow>, DbError> {
+        let rows = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE user_id = ? ORDER BY created_at ASC")
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
     async fn get_team(&self, team_id: &str) -> Result<Option<TeamRow>, DbError> {
         let row = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE id = ?")
             .bind(team_id)

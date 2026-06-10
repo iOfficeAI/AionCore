@@ -215,7 +215,7 @@ impl TeamSessionService {
     pub fn dispose_all(&self) {
         let keys: Vec<String> = self.sessions.iter().map(|entry| entry.key().clone()).collect();
         for key in keys {
-            self.stop_session(&key);
+            self.stop_session_unchecked(&key);
         }
         info!("All team sessions disposed");
     }

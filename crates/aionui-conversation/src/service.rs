@@ -1420,6 +1420,19 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
+        if let Some(team_id) = team_id_from_extra(&row.extra) {
+            info!(
+                conversation_id = %conversation_id,
+                team_id = %team_id,
+                outcome = "rejected",
+                error_code = "FORBIDDEN",
+                "Ordinary send rejected for team-owned conversation"
+            );
+            return Err(ConversationError::Forbidden {
+                reason: "Team-owned conversations must be sent through Team API".into(),
+            });
+        }
+
         reject_deprecated_runtime_row(&row)?;
 
         let turn_id = Self::mint_turn_id();
@@ -1929,6 +1942,15 @@ fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), Conver
         obj.insert("workspace".to_owned(), serde_json::Value::String(normalized));
     }
     Ok(())
+}
+
+fn team_id_from_extra(extra: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(extra).ok()?;
+    value
+        .get("teamId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|team_id| !team_id.trim().is_empty())
+        .map(str::to_owned)
 }
 
 fn normalize_workspace_path(workspace: &str) -> Result<String, ConversationError> {

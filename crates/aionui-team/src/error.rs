@@ -17,6 +17,9 @@ pub enum TeamError {
     #[error("Leader-only action: {0}")]
     LeaderOnly(String),
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 

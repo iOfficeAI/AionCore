@@ -6,7 +6,10 @@ use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app, delete_with_token, get_request, get_with_token, json_with_token, setup_and_login};
+use common::{
+    body_json, build_app, build_app_with_mock_agents, delete_with_token, get_request, get_with_token, json_with_token,
+    setup_and_login,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -764,6 +767,61 @@ async fn t7_3_reset_requires_auth() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn team_owned_conversation_rejects_ordinary_send_but_allows_history_reads() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/conversations",
+        create_body_with_extra("Team Owned", json!({ "teamId": "team-1" })),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    let id = json["data"]["id"].as_str().unwrap().to_owned();
+
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let msg = aionui_db::models::MessageRow {
+        id: "team-history-msg-1".into(),
+        conversation_id: id.clone(),
+        msg_id: Some("team-history-msg-1".into()),
+        r#type: "text".into(),
+        content: r#"{"content":"history remains readable"}"#.into(),
+        position: Some("left".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 1000,
+    };
+    aionui_db::IConversationRepository::insert_message(&repo, &msg)
+        .await
+        .unwrap();
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{id}/messages"),
+        json!({ "content": "ordinary send should be blocked" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "FORBIDDEN");
+    assert_eq!(json["error"], "Forbidden.");
+
+    let resp = app
+        .oneshot(get_with_token(&format!("/api/conversations/{id}/messages"), &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["items"].as_array().unwrap().len(), 1);
 }
 
 // ── T10: Associated ───────────────────────────────────────────────────

@@ -221,6 +221,16 @@ impl ITeamRepository for FullMockTeamRepo {
     async fn list_teams(&self) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
         Ok(self.teams.lock().unwrap().clone())
     }
+    async fn list_teams_by_user(&self, user_id: &str) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
+        Ok(self
+            .teams
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|team| team.user_id == user_id)
+            .cloned()
+            .collect())
+    }
     async fn get_team(&self, id: &str) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
         Ok(self.teams.lock().unwrap().iter().find(|t| t.id == id).cloned())
     }
@@ -822,8 +832,8 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
     ]
 }
 
-fn reset_auto_started_session(svc: &Arc<TeamSessionService>, tm: &Arc<CountingTaskManager>, team_id: &str) {
-    svc.stop_session(team_id);
+async fn reset_auto_started_session(svc: &Arc<TeamSessionService>, tm: &Arc<CountingTaskManager>, team_id: &str) {
+    svc.stop_session("user1", team_id).await.unwrap();
     tm.reset();
 }
 
@@ -1036,7 +1046,7 @@ async fn tc3_each_agent_has_conversation_id() {
 #[tokio::test]
 async fn tl1_empty_list() {
     let svc = setup();
-    let list = svc.list_teams().await.unwrap();
+    let list = svc.list_teams("user1").await.unwrap();
     assert!(list.is_empty());
 }
 
@@ -1064,8 +1074,38 @@ async fn tl2_list_multiple_teams() {
     .await
     .unwrap();
 
-    let list = svc.list_teams().await.unwrap();
+    let list = svc.list_teams("user1").await.unwrap();
     assert_eq!(list.len(), 2);
+}
+
+#[tokio::test]
+async fn tl3_list_teams_filters_by_owner() {
+    let svc = setup();
+    svc.create_team(
+        "user1",
+        CreateTeamRequest {
+            name: "Owned".into(),
+            agents: two_agent_input(),
+            workspace: None,
+        },
+    )
+    .await
+    .unwrap();
+    svc.create_team(
+        "user2",
+        CreateTeamRequest {
+            name: "Other".into(),
+            agents: two_agent_input(),
+            workspace: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let list = svc.list_teams("user1").await.unwrap();
+
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "Owned");
 }
 
 #[tokio::test]
@@ -1099,7 +1139,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
         .unwrap();
     let before = task_manager.snapshot();
 
-    let list = svc.list_teams().await.unwrap();
+    let list = svc.list_teams("user1").await.unwrap();
     let after = task_manager.snapshot();
 
     assert_eq!(list.len(), 1);
@@ -1125,7 +1165,7 @@ async fn tg1_get_existing_team() {
         .await
         .unwrap();
 
-    let got = svc.get_team(&created.id).await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.id, created.id);
     assert_eq!(got.name, "Alpha");
     assert_eq!(got.agents.len(), 2);
@@ -1134,8 +1174,28 @@ async fn tg1_get_existing_team() {
 #[tokio::test]
 async fn tg2_get_nonexistent_returns_error() {
     let svc = setup();
-    let result = svc.get_team("nonexistent").await;
+    let result = svc.get_team("user1", "nonexistent").await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn tg3_get_team_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = svc.get_team("user2", &created.id).await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 // -- Delete team --------------------------------------------------------------
@@ -1156,7 +1216,7 @@ async fn td1_delete_existing_team() {
         .unwrap();
 
     svc.remove_team("user1", &created.id).await.unwrap();
-    let list = svc.list_teams().await.unwrap();
+    let list = svc.list_teams("user1").await.unwrap();
     assert!(list.is_empty());
 }
 
@@ -1184,16 +1244,36 @@ async fn tr1_rename_existing_team() {
         .await
         .unwrap();
 
-    svc.rename_team(&created.id, "New Name").await.unwrap();
-    let got = svc.get_team(&created.id).await.unwrap();
+    svc.rename_team("user1", &created.id, "New Name").await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.name, "New Name");
 }
 
 #[tokio::test]
 async fn tr4_rename_nonexistent_returns_error() {
     let svc = setup();
-    let result = svc.rename_team("nonexistent", "X").await;
+    let result = svc.rename_team("user1", "nonexistent", "X").await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn tr5_rename_team_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = svc.rename_team("user2", &created.id, "Nope").await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 // ===========================================================================
@@ -1241,7 +1321,7 @@ async fn aa1_add_agent_to_team() {
     assert_eq!(agent.role, "teammate");
     assert!(!agent.conversation_id.is_empty());
 
-    let got = svc.get_team(&created.id).await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.agents.len(), 2);
 }
 
@@ -1331,7 +1411,7 @@ async fn ar1_remove_agent_from_team() {
     let worker_slot = created.agents[1].slot_id.clone();
     svc.remove_agent("user1", &created.id, &worker_slot).await.unwrap();
 
-    let got = svc.get_team(&created.id).await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.agents.len(), 1);
     assert!(got.agents.iter().all(|a| a.slot_id != worker_slot));
 }
@@ -1371,9 +1451,11 @@ async fn an1_rename_agent() {
         .unwrap();
 
     let slot_id = created.agents[1].slot_id.clone();
-    svc.rename_agent(&created.id, &slot_id, "Senior Worker").await.unwrap();
+    svc.rename_agent("user1", &created.id, &slot_id, "Senior Worker")
+        .await
+        .unwrap();
 
-    let got = svc.get_team(&created.id).await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     let agent = got.agents.iter().find(|a| a.slot_id == slot_id).unwrap();
     assert_eq!(agent.name, "Senior Worker");
 }
@@ -1393,7 +1475,7 @@ async fn an3_rename_nonexistent_agent() {
         .await
         .unwrap();
 
-    let result = svc.rename_agent(&created.id, "nonexistent", "X").await;
+    let result = svc.rename_agent("user1", &created.id, "nonexistent", "X").await;
     assert!(result.is_err());
 }
 
@@ -1416,7 +1498,7 @@ async fn es1_ensure_session_creates_session() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
 }
 
 #[tokio::test]
@@ -1434,15 +1516,35 @@ async fn es2_ensure_session_is_idempotent() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
 }
 
 #[tokio::test]
 async fn es3_ensure_session_nonexistent_team() {
     let svc = setup();
-    let result = svc.ensure_session("nonexistent").await;
+    let result = svc.ensure_session("user1", "nonexistent").await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn es4_ensure_session_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = svc.ensure_session("user2", &created.id).await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 // -- W5-D31b-2: team.mcpStatus service-layer broadcasts ---------------------
@@ -1459,7 +1561,7 @@ async fn es3_ensure_session_nonexistent_team() {
 #[tokio::test]
 async fn d31b2_ensure_session_broadcasts_load_failed_for_missing_team() {
     let (svc, recorder) = setup_with_recording_broadcaster();
-    let err = svc.ensure_session("nonexistent-team-xyz").await.unwrap_err();
+    let err = svc.ensure_session("user1", "nonexistent-team-xyz").await.unwrap_err();
     assert!(matches!(err, aionui_team::TeamError::TeamNotFound(_)));
 
     let load_failed = recorder
@@ -1495,8 +1597,8 @@ async fn ss1_stop_session() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
-    svc.stop_session(&created.id);
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.stop_session("user1", &created.id).await.unwrap();
 }
 
 #[tokio::test]
@@ -1514,7 +1616,27 @@ async fn ss3_stop_session_without_active_is_noop() {
         .await
         .unwrap();
 
-    svc.stop_session(&created.id);
+    svc.stop_session("user1", &created.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn ss4_stop_session_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = svc.stop_session("user2", &created.id).await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 // ===========================================================================
@@ -1524,7 +1646,7 @@ async fn ss3_stop_session_without_active_is_noop() {
 #[tokio::test]
 async fn sm4_send_message_no_session_returns_error() {
     let svc = setup();
-    let result = svc.send_message("nonexistent", "Hello", None).await;
+    let result = svc.send_message("user1", "nonexistent", "Hello", None).await;
     assert!(result.is_err());
 }
 
@@ -1543,8 +1665,30 @@ async fn sm1_send_message_with_active_session() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
-    svc.send_message(&created.id, "Hello team", None).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.send_message("user1", &created.id, "Hello team", None)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sm2_send_message_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = svc.send_message("user2", &created.id, "Hello", None).await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 #[tokio::test]
@@ -1562,11 +1706,34 @@ async fn sa_send_message_to_agent_with_active_session() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
     let worker_slot = created.agents[1].slot_id.clone();
-    svc.send_message_to_agent(&created.id, &worker_slot, "Do this", None)
+    svc.send_message_to_agent("user1", &created.id, &worker_slot, "Do this", None)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn sa2_send_message_to_agent_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker_slot = created.agents[1].slot_id.clone();
+
+    let result = svc
+        .send_message_to_agent("user2", &created.id, &worker_slot, "Do this", None)
+        .await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 #[tokio::test]
@@ -1584,9 +1751,9 @@ async fn sa3_send_message_to_nonexistent_agent() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
     let result = svc
-        .send_message_to_agent(&created.id, "nonexistent", "Hello", None)
+        .send_message_to_agent("user1", &created.id, "nonexistent", "Hello", None)
         .await;
     assert!(result.is_err());
 }
@@ -1621,8 +1788,8 @@ async fn dispose_all_cleans_up_sessions() {
         .await
         .unwrap();
 
-    svc.ensure_session(&t1.id).await.unwrap();
-    svc.ensure_session(&t2.id).await.unwrap();
+    svc.ensure_session("user1", &t1.id).await.unwrap();
+    svc.ensure_session("user1", &t2.id).await.unwrap();
 
     svc.dispose_all();
 
@@ -1650,10 +1817,10 @@ async fn td_delete_team_stops_session() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
     svc.remove_team("user1", &created.id).await.unwrap();
 
-    let result = svc.send_message(&created.id, "Hello", None).await;
+    let result = svc.send_message("user1", &created.id, "Hello", None).await;
     assert!(result.is_err());
 }
 
@@ -1676,8 +1843,8 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id);
-    svc.ensure_session(&created.id).await.unwrap();
+    reset_auto_started_session(&svc, &tm, &created.id).await;
+    svc.ensure_session("user1", &created.id).await.unwrap();
 
     // Two agents → kill called 2x and get_or_build_task called 2x, each with
     // the corresponding conversation_id. Order is agents-iteration order.
@@ -1732,7 +1899,7 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
 }
 
 #[tokio::test]
@@ -1750,9 +1917,9 @@ async fn d9_ensure_session_is_idempotent() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id);
-    svc.ensure_session(&created.id).await.unwrap();
-    svc.ensure_session(&created.id).await.unwrap();
+    reset_auto_started_session(&svc, &tm, &created.id).await;
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
 
     // Second call short-circuits — no additional kill/build calls.
     let calls = tm.snapshot();
@@ -1780,8 +1947,8 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id);
-    let result = svc.ensure_session(&created.id).await;
+    reset_auto_started_session(&svc, &tm, &created.id).await;
+    let result = svc.ensure_session("user1", &created.id).await;
     assert!(result.is_err(), "ensure_session should propagate build error");
 
     // Rebuild aborts on the first warmup failure, so only the first agent
@@ -1790,7 +1957,7 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
     assert_eq!(calls.kill.len(), 1);
     assert_eq!(calls.build.len(), 1);
 
-    let send_result = svc.send_message(&created.id, "Hello", None).await;
+    let send_result = svc.send_message("user1", &created.id, "Hello", None).await;
     assert!(
         send_result.is_err(),
         "session must not be registered after build failure"
@@ -1871,7 +2038,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
     a.unwrap().unwrap();
     b.unwrap().unwrap();
 
-    let got = svc.get_team(&created.id).await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(
         got.agents.len(),
         3,
@@ -1898,9 +2065,9 @@ async fn d115_remove_team_kills_every_agent_process() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id);
+    reset_auto_started_session(&svc, &tm, &created.id).await;
     // Bring two agents online — after ensure_session, active_count == 2.
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
     assert_eq!(tm.active_count(), 2, "ensure_session must register 2 live agents");
 
     let before_kill = tm.snapshot().kill.len();

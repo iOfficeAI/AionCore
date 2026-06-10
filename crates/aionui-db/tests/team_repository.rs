@@ -24,10 +24,14 @@ async fn repo() -> (Arc<dyn ITeamRepository>, aionui_db::Database) {
 }
 
 fn make_team(id: &str, name: &str) -> TeamRow {
+    make_team_for_user(id, "system_default_user", name)
+}
+
+fn make_team_for_user(id: &str, user_id: &str, name: &str) -> TeamRow {
     let now = now_ms();
     TeamRow {
         id: id.into(),
-        user_id: "system_default_user".into(),
+        user_id: user_id.into(),
         name: name.into(),
         workspace: String::new(),
         workspace_mode: "shared".into(),
@@ -112,6 +116,27 @@ async fn list_teams_multiple() {
     assert_eq!(teams.len(), 2);
     assert_eq!(teams[0].id, "t1");
     assert_eq!(teams[1].id, "t2");
+}
+
+#[tokio::test]
+async fn list_teams_by_user_filters_to_owner() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team_for_user("t1", "user-a", "Alpha"))
+        .await
+        .unwrap();
+    repo.create_team(&make_team_for_user("t2", "user-b", "Beta"))
+        .await
+        .unwrap();
+    repo.create_team(&make_team_for_user("t3", "user-a", "Gamma"))
+        .await
+        .unwrap();
+
+    let teams = repo.list_teams_by_user("user-a").await.unwrap();
+
+    assert_eq!(teams.len(), 2);
+    assert_eq!(teams[0].id, "t1");
+    assert_eq!(teams[1].id, "t3");
+    assert!(teams.iter().all(|team| team.user_id == "user-a"));
 }
 
 #[tokio::test]
