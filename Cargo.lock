@@ -708,6 +708,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "aionui-process"
+version = "0.1.26"
+dependencies = [
+ "aionui-common",
+ "aionui-runtime",
+ "async-trait",
+ "fs2",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "aionui-realtime"
 version = "0.1.26"
 dependencies = [
@@ -5759,6 +5779,7 @@ checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
