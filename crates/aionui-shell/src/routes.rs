@@ -212,7 +212,15 @@ async fn speech_to_text(
     let config: SpeechToTextConfig = prefs
         .get("tools.speechToText")
         .or_else(|| prefs.get("speechToText"))
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .and_then(|v| match serde_json::from_value(v.clone()) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                // Fall back to disabled, but leave a trace — a silent fallback
+                // makes a malformed config indistinguishable from a missing one.
+                tracing::warn!("ignoring malformed speechToText config: {e}");
+                None
+            }
+        })
         .unwrap_or(SpeechToTextConfig {
             enabled: false,
             provider: aionui_api_types::SpeechToTextProvider::Openai,

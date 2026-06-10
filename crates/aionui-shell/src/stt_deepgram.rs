@@ -5,6 +5,17 @@ use crate::error::SttError;
 
 const DEFAULT_BASE_URL: &str = "https://api.deepgram.com";
 
+/// Resolve the effective base URL. Unset or blank values fall back to the
+/// default — the settings UI saves unfilled fields as empty strings, which
+/// would otherwise produce a relative URL that fails the request builder.
+fn resolve_base_url(configured: Option<&str>) -> &str {
+    configured
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_BASE_URL)
+        .trim_end_matches('/')
+}
+
 pub async fn transcribe(
     client: &Client,
     config: &DeepgramSpeechToTextConfig,
@@ -16,11 +27,7 @@ pub async fn transcribe(
         return Err(SttError::DeepgramNotConfigured);
     }
 
-    let base_url = config
-        .base_url
-        .as_deref()
-        .unwrap_or(DEFAULT_BASE_URL)
-        .trim_end_matches('/');
+    let base_url = resolve_base_url(config.base_url.as_deref());
 
     let mut query_params = vec![("model", config.model.clone())];
 
@@ -102,6 +109,23 @@ mod tests {
     #[test]
     fn default_base_url_value() {
         assert_eq!(DEFAULT_BASE_URL, "https://api.deepgram.com");
+    }
+
+    #[test]
+    fn resolve_base_url_falls_back_on_none() {
+        assert_eq!(resolve_base_url(None), DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn resolve_base_url_falls_back_on_blank() {
+        // Settings UI saves unfilled base_url as "" — must not build a relative URL
+        assert_eq!(resolve_base_url(Some("")), DEFAULT_BASE_URL);
+        assert_eq!(resolve_base_url(Some("   ")), DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn resolve_base_url_trims_trailing_slash() {
+        assert_eq!(resolve_base_url(Some("https://example.com/")), "https://example.com");
     }
 
     #[tokio::test]

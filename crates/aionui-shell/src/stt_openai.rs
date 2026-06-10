@@ -5,6 +5,18 @@ use crate::error::SttError;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
+/// Resolve the effective base URL. Unset or blank values fall back to the
+/// default — the settings UI saves unfilled fields as empty strings, which
+/// would otherwise produce a relative URL that fails the request builder.
+fn resolve_base_url(configured: Option<&str>) -> &str {
+    configured
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_BASE_URL)
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+}
+
 pub async fn transcribe(
     client: &Client,
     config: &OpenAISpeechToTextConfig,
@@ -17,12 +29,7 @@ pub async fn transcribe(
         return Err(SttError::OpenaiNotConfigured);
     }
 
-    let base_url = config
-        .base_url
-        .as_deref()
-        .unwrap_or(DEFAULT_BASE_URL)
-        .trim_end_matches('/')
-        .trim_end_matches("/v1");
+    let base_url = resolve_base_url(config.base_url.as_deref());
     let url = format!("{base_url}/v1/audio/transcriptions");
 
     // Normalize MIME type: strip codec parameters (e.g. "audio/webm;codecs=opus" → "audio/webm")
@@ -93,6 +100,28 @@ mod tests {
     #[test]
     fn default_base_url_value() {
         assert_eq!(DEFAULT_BASE_URL, "https://api.openai.com");
+    }
+
+    #[test]
+    fn resolve_base_url_falls_back_on_none() {
+        assert_eq!(resolve_base_url(None), DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn resolve_base_url_falls_back_on_blank() {
+        // Settings UI saves unfilled base_url as "" — must not build a relative URL
+        assert_eq!(resolve_base_url(Some("")), DEFAULT_BASE_URL);
+        assert_eq!(resolve_base_url(Some("   ")), DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn resolve_base_url_trims_trailing_slash_and_v1() {
+        assert_eq!(
+            resolve_base_url(Some("https://api.groq.com/openai/v1")),
+            "https://api.groq.com/openai"
+        );
+        assert_eq!(resolve_base_url(Some("https://example.com/")), "https://example.com");
+        assert_eq!(resolve_base_url(Some("https://example.com/v1/")), "https://example.com");
     }
 
     #[tokio::test]
