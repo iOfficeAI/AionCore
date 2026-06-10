@@ -173,7 +173,7 @@ impl IWorkerTaskManager for MockTaskManager {
         Box::pin(std::future::ready(()))
     }
 
-    fn clear(&self) {
+    async fn clear(&self) {
         self.agents.lock().unwrap().clear();
     }
 

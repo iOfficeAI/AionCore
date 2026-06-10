@@ -425,7 +425,7 @@ impl aionui_ai_agent::IWorkerTaskManager for StubTaskManager {
         let _ = self.kill(conversation_id, reason);
         Box::pin(std::future::ready(()))
     }
-    fn clear(&self) {}
+    async fn clear(&self) {}
     fn active_count(&self) -> usize {
         self.tasks.lock().unwrap().len()
     }

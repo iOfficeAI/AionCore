@@ -695,8 +695,8 @@ impl CountingTaskManager {
         }
     }
 
-    fn reset(&self) {
-        self.inner.clear();
+    async fn reset(&self) {
+        self.inner.clear().await;
         *self.calls.lock().unwrap() = TaskManagerCalls::default();
     }
 
@@ -734,8 +734,8 @@ impl IWorkerTaskManager for CountingTaskManager {
         let _ = self.kill(conversation_id, reason);
         Box::pin(std::future::ready(()))
     }
-    fn clear(&self) {
-        self.inner.clear()
+    async fn clear(&self) {
+        self.inner.clear().await
     }
     fn active_count(&self) -> usize {
         self.inner.active_count()
@@ -1060,7 +1060,7 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
 
 async fn reset_auto_started_session(svc: &Arc<TeamSessionService>, tm: &Arc<CountingTaskManager>, team_id: &str) {
     svc.stop_session("user1", team_id).await.unwrap();
-    tm.reset();
+    tm.reset().await;
 }
 
 // ===========================================================================

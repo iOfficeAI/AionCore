@@ -89,7 +89,7 @@ impl aionui_ai_agent::task_manager::IWorkerTaskManager for StubTaskManager {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         Box::pin(std::future::ready(()))
     }
-    fn clear(&self) {}
+    async fn clear(&self) {}
     fn active_count(&self) -> usize {
         0
     }

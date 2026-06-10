@@ -5,7 +5,7 @@ use aionui_common::{
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
-use futures_util::future::BoxFuture;
+use futures_util::future::{BoxFuture, join_all};
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
@@ -54,8 +54,8 @@ pub trait IWorkerTaskManager: Send + Sync {
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
-    /// Kill and remove all active tasks.
-    fn clear(&self);
+    /// Kill, remove, and wait for all active tasks to stop.
+    async fn clear(&self);
 
     /// Number of active tasks (useful for diagnostics).
     fn active_count(&self) -> usize;
@@ -148,16 +148,18 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         Box::pin(std::future::ready(()))
     }
 
-    fn clear(&self) {
+    async fn clear(&self) {
         let keys: Vec<String> = self.tasks.iter().map(|r| r.key().clone()).collect();
+        let mut waits = Vec::new();
         for key in keys {
             if let Some((id, slot)) = self.tasks.remove(&key) {
                 info!(conversation_id = %id, "Clearing agent task");
                 if let Some(agent) = slot.get() {
-                    let _ = agent.kill(None);
+                    waits.push(agent.kill_and_wait(None));
                 }
             }
         }
+        join_all(waits).await;
     }
 
     fn active_count(&self) -> usize {
@@ -457,7 +459,7 @@ mod tests {
         mgr.get_or_build_task("conv-2", make_options("conv-2")).await.unwrap();
         assert_eq!(mgr.active_count(), 2);
 
-        mgr.clear();
+        mgr.clear().await;
         assert_eq!(mgr.active_count(), 0);
     }
 

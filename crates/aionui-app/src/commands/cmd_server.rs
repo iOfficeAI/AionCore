@@ -3,7 +3,7 @@
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{future::Future, pin::Pin};
 
 use tokio::net::TcpListener;
@@ -17,6 +17,7 @@ use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, Ser
 
 const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
+const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownReason {
@@ -293,7 +294,11 @@ pub(crate) async fn run_server(
                         reason = "graceful_shutdown",
                         active_turn_count, "conversation runtime shutdown prepared"
                     );
-                    worker_task_manager.clear();
+                    let active_task_count = worker_task_manager.active_count();
+                    match tokio::time::timeout(WORKER_TASK_SHUTDOWN_TIMEOUT, worker_task_manager.clear()).await {
+                        Ok(()) => info!(active_task_count, "worker task manager shutdown completed"),
+                        Err(_) => warn!(active_task_count, "worker task manager shutdown timed out"),
+                    }
                 }
             }
             let _ = shutdown_tx.send(true);
