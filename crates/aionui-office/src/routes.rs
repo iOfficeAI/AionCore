@@ -26,7 +26,7 @@ impl From<OfficeError> for ApiError {
     fn from(err: OfficeError) -> Self {
         match err {
             OfficeError::OfficecliNotFound => ApiError::BadRequest("officecli not found".into()),
-            OfficeError::InstallFailed(msg) => ApiError::Internal(format!("officecli install failed: {msg}")),
+            OfficeError::InstallFailed(_) => ApiError::Internal("officecli install failed".into()),
             OfficeError::StartFailed(msg) => ApiError::Internal(format!("preview start failed: {msg}")),
             OfficeError::PortTimeout(path) => {
                 ApiError::Internal(format!("preview service readiness timeout for {path}"))
@@ -380,8 +380,8 @@ mod tests {
 
     #[test]
     fn install_failed_maps_to_internal() {
-        let err = ApiError::from(OfficeError::InstallFailed("npm error".into()));
-        assert!(matches!(err, ApiError::Internal(msg) if msg.contains("npm error")));
+        let err = ApiError::from(OfficeError::InstallFailed("installer stderr".into()));
+        assert!(matches!(err, ApiError::Internal(msg) if msg == "officecli install failed"));
     }
 
     #[test]
