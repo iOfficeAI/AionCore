@@ -114,22 +114,15 @@ async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartF
         let name = field.name().unwrap_or("").to_owned();
         match name.as_str() {
             "file" | "audio" => {
-                // Extract filename from Content-Disposition if not already set
-                if file_name.is_none() {
-                    if let Some(cd) = field.headers().get("content-disposition") {
-                        // Parse filename from Content-Disposition: form-data; name="audio"; filename="recording.webm"
-                        if let Ok(cd_str) = cd.to_str() {
-                            for part in cd_str.split(';') {
-                                let part = part.trim();
-                                if part.starts_with("filename=") {
-                                    let fname = part.trim_start_matches("filename=").trim_matches('"');
-                                    if !fname.is_empty() {
-                                        file_name = Some(fname.to_owned());
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if file_name.is_none()
+                    && let Some(name) = field.file_name().filter(|name| !name.is_empty())
+                {
+                    file_name = Some(name.to_owned());
+                }
+                if mime_type.is_none()
+                    && let Some(content_type) = field.content_type().filter(|value| !value.is_empty())
+                {
+                    mime_type = Some(content_type.to_owned());
                 }
                 file_data = Some(
                     field

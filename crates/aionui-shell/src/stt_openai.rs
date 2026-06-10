@@ -40,11 +40,13 @@ pub async fn transcribe(
     // This lets users override the browser's locale (e.g. browser sends "en-US"
     // but user prefers "es" for transcription).
     let language = config.language.as_deref().filter(|s| !s.is_empty()).or(language_hint);
-    if let Some(lang) = language {
+    let normalized_language = language.map(|lang| {
         // Normalize language codes: "en-US" → "en", "es-MX" → "es"
         // Groq/OpenAI Whisper only accepts base language codes (e.g. "en", "es")
-        let normalized = lang.split('-').next().unwrap_or(lang).to_owned();
-        form = form.text("language", normalized);
+        lang.split('-').next().unwrap_or(lang).to_owned()
+    });
+    if let Some(lang) = normalized_language.as_deref() {
+        form = form.text("language", lang.to_owned());
     }
 
     if let Some(prompt) = config.prompt.as_deref().filter(|s| !s.is_empty()) {
@@ -80,7 +82,7 @@ pub async fn transcribe(
         text,
         model: config.model.clone(),
         provider: SpeechToTextProvider::Openai,
-        language: language.map(|s| s.to_owned()),
+        language: normalized_language,
     })
 }
 
