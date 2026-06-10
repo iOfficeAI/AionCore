@@ -23,7 +23,7 @@ use aionui_extension::{
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
-use aionui_file::{FileRouterState, FileService, FileWatchService, SnapshotService};
+use aionui_file::{BrowseRoots, FileRouterState, FileService, FileWatchService, SnapshotService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -36,12 +36,56 @@ use aionui_realtime::{NoopMessageRouter, WsHandlerState};
 use aionui_shell::ShellRouterState;
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, ModelFetchService, ProtocolDetectionService,
-    ProviderService, SettingsService, SystemRouterState, VersionCheckService,
+    ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService,
 };
 use aionui_team::{TeamRouterState, TeamSessionService};
 
 use crate::config::derive_encryption_key;
 use crate::services::AppServices;
+
+#[derive(Debug)]
+pub struct RouterBuildError {
+    stage: &'static str,
+    message: &'static str,
+    source: Option<anyhow::Error>,
+}
+
+impl RouterBuildError {
+    pub fn new(stage: &'static str, message: &'static str) -> Self {
+        Self {
+            stage,
+            message,
+            source: None,
+        }
+    }
+
+    pub fn with_source(mut self, source: impl Into<anyhow::Error>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    pub fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+}
+
+impl std::fmt::Display for RouterBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.stage, self.message)
+    }
+}
+
+impl std::error::Error for RouterBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// All module-level router states bundled into a single struct.
 ///
@@ -88,6 +132,22 @@ fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::P
     }
     roots
 }
+
+fn build_module_state_phase<T>(boot: &Instant, phase: &'static str, build: impl FnOnce() -> T) -> T {
+    tracing::info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        phase,
+        "startup: module state phase started"
+    );
+    let value = build();
+    tracing::info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        phase,
+        "startup: module state phase completed"
+    );
+    value
+}
+
 /// Components needed to start the channel orchestrator.
 ///
 /// Returned alongside `ChannelRouterState` by `build_channel_state`.
@@ -101,7 +161,9 @@ pub struct ChannelOrchestratorComponents {
 }
 
 /// Build all default `ModuleStates` from application services.
-pub async fn build_module_states(services: &AppServices) -> (ModuleStates, ChannelOrchestratorComponents) {
+pub async fn build_module_states(
+    services: &AppServices,
+) -> Result<(ModuleStates, ChannelOrchestratorComponents), RouterBuildError> {
     let boot = Instant::now();
     tracing::info!("startup: module state build started");
 
@@ -113,7 +175,12 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
 
     let scan_paths = resolve_scan_paths_for_data_dir(&services.data_dir);
     if let Err(error) = ext_state.registry.initialize_with_scan_paths(scan_paths).await {
-        tracing::warn!(error = %error, "extension registry initialize failed");
+        tracing::warn!(
+            code = "BOOTSTRAP_DEGRADED_EXTENSION_REGISTRY",
+            stage = "extension.registry.initialize",
+            error = %error,
+            "extension registry initialize failed"
+        );
     }
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -154,6 +221,7 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
+        services.event_bus.clone(),
         provider_repo,
         encryption_key,
         services.data_dir.clone(),
@@ -165,37 +233,46 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
         "startup: module states bundle started"
     );
     let states = ModuleStates {
-        system: build_system_state(services),
-        conversation: build_conversation_state(services, Some(cron.cron_service.clone())),
-        remote_agent: build_remote_agent_state(services),
-        agent: AgentRouterState {
+        system: build_module_state_phase(&boot, "system", || build_system_state(services)),
+        conversation: build_module_state_phase(&boot, "conversation", || {
+            build_conversation_state(services, Some(cron.cron_service.clone()))
+        }),
+        remote_agent: build_module_state_phase(&boot, "remote_agent", || build_remote_agent_state(services)),
+        agent: build_module_state_phase(&boot, "agent", || AgentRouterState {
             agent_registry: services.agent_registry.clone(),
             service: agent_service,
-        },
-        connection_test: build_connection_test_state(),
-        file: build_file_state(services),
-        mcp: build_mcp_state(services),
+        }),
+        connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
+        file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
+        mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
         skill: skill_state,
         channel: channel_state,
-        team: build_team_state(
-            services,
-            Some(cron.cron_service.clone()),
-            backend_binary_path.clone(),
-            services.guide_mcp_config.clone(),
-        ),
+        team: build_module_state_phase(&boot, "team", || {
+            build_team_state(
+                services,
+                Some(cron.cron_service.clone()),
+                backend_binary_path.clone(),
+                services.guide_mcp_config.clone(),
+            )
+        }),
         cron,
-        office: build_office_state(services),
-        shell: build_shell_state(services),
+        office: build_module_state_phase(&boot, "office", || build_office_state(services)),
+        shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
     );
+    states
+        .conversation
+        .service
+        .recover_stale_runtime_state_on_startup()
+        .await;
 
-    (states, channel_components)
+    Ok((states, channel_components))
 }
 
 /// Build the default `AssistantRouterState` from application services.
@@ -239,6 +316,7 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, env!("CARGO_PKG_VERSION").to_owned()),
+        runtime_prepare_service: RuntimePrepareService::new(services.event_bus.clone()),
     }
 }
 
@@ -299,20 +377,24 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 }
 
 /// Build the default `FileRouterState` from application services.
-pub fn build_file_state(services: &AppServices) -> FileRouterState {
+pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, RouterBuildError> {
     let broadcaster = services.event_bus.clone();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
-    let browse_roots = aionui_file::browse::default_browse_roots();
+    let browse_roots = BrowseRoots::new();
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
-    let watch_service = Arc::new(FileWatchService::new(broadcaster).expect("file watch service initialization"));
+    let watch_service = Arc::new(FileWatchService::new(broadcaster).map_err(file_watch_init_error)?);
     let snapshot_service = Arc::new(SnapshotService::new());
-    FileRouterState {
+    Ok(FileRouterState {
         file_service,
         watch_service,
         snapshot_service,
         allowed_roots,
         browse_roots,
-    }
+    })
+}
+
+fn file_watch_init_error(error: aionui_file::FileError) -> RouterBuildError {
+    RouterBuildError::new("router.file_watch", "failed to initialize file watch service").with_source(error)
 }
 
 /// Build the default `McpRouterState` from application services.
@@ -339,7 +421,7 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
     McpRouterState {
         config_service: McpConfigService::new(repo.clone()),
         sync_service: McpSyncService::new(repo, adapters),
-        connection_test_service: McpConnectionTestService::new(http_client.clone()),
+        connection_test_service: McpConnectionTestService::new(http_client.clone(), services.event_bus.clone()),
         oauth_service: aionui_mcp::McpOAuthService::new(oauth_token_repo, http_client),
     }
 }
@@ -591,12 +673,13 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
     let data_dir = services.data_dir.as_path();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
 
-    let spawner: Arc<dyn aionui_office::ProcessSpawner> = Arc::new(aionui_office::DefaultProcessSpawner);
+    let spawner: Arc<dyn aionui_office::ProcessSpawner> =
+        Arc::new(aionui_office::DefaultProcessSpawner::new(data_dir.to_path_buf()));
     let watch_manager = Arc::new(OfficecliWatchManager::new(spawner, services.event_bus.clone()));
 
     let snapshot_service = Arc::new(OfficeSnapshotService::new(data_dir));
     let star_office_detector = Arc::new(StarOfficeDetector::new(reqwest::Client::new()));
-    let conversion_service = Arc::new(ConversionService::new(None));
+    let conversion_service = Arc::new(ConversionService::with_data_dir(None, data_dir.to_path_buf()));
     let proxy_service = Arc::new(ProxyService::new(watch_manager.clone()));
 
     OfficeRouterState {
@@ -746,5 +829,14 @@ mod tests {
         assert_eq!(loaded[0].name, "demo-ext");
 
         services.database.close().await;
+    }
+
+    #[test]
+    fn file_watch_init_error_maps_to_bootstrap_server_failed() {
+        let err = file_watch_init_error(aionui_file::FileError::Internal("watch backend unavailable".into()));
+
+        assert_eq!(err.stage(), "router.file_watch");
+        assert_eq!(err.message(), "failed to initialize file watch service");
+        assert!(!err.to_string().contains("watch backend unavailable"));
     }
 }

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use aionui_api_types::{SystemSettingsResponse, UpdateSettingsRequest};
-use aionui_common::AppError;
 use aionui_db::ISettingsRepository;
+
+use crate::error::SystemError;
 
 /// Supported BCP 47 language codes.
 const SUPPORTED_LANGUAGES: &[&str] = &[
@@ -22,12 +23,12 @@ impl SettingsService {
     }
 
     /// Get current system settings, falling back to defaults if not yet persisted.
-    pub async fn get_settings(&self) -> Result<SystemSettingsResponse, AppError> {
+    pub async fn get_settings(&self) -> Result<SystemSettingsResponse, SystemError> {
         let row = self
             .repo
             .get_settings()
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to get settings: {e}")))?;
+            .map_err(|e| SystemError::Internal(format!("Failed to get settings: {e}")))?;
 
         Ok(
             row.map_or_else(SystemSettingsResponse::default, |s| SystemSettingsResponse {
@@ -41,7 +42,7 @@ impl SettingsService {
     }
 
     /// Partially update system settings. Only fields present in the request are changed.
-    pub async fn update_settings(&self, req: UpdateSettingsRequest) -> Result<SystemSettingsResponse, AppError> {
+    pub async fn update_settings(&self, req: UpdateSettingsRequest) -> Result<SystemSettingsResponse, SystemError> {
         if let Some(ref lang) = req.language {
             validate_language(lang)?;
         }
@@ -67,7 +68,7 @@ impl SettingsService {
                 save_upload_to_workspace,
             )
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to update settings: {e}")))?;
+            .map_err(|e| SystemError::Internal(format!("Failed to update settings: {e}")))?;
 
         Ok(SystemSettingsResponse {
             language: row.language,
@@ -79,11 +80,11 @@ impl SettingsService {
     }
 }
 
-fn validate_language(lang: &str) -> Result<(), AppError> {
+fn validate_language(lang: &str) -> Result<(), SystemError> {
     if SUPPORTED_LANGUAGES.contains(&lang) {
         Ok(())
     } else {
-        Err(AppError::BadRequest(format!("Unsupported language code: '{lang}'")))
+        Err(SystemError::BadRequest(format!("Unsupported language code: '{lang}'")))
     }
 }
 
@@ -164,7 +165,7 @@ mod tests {
             ..Default::default()
         };
         let err = svc.update_settings(req).await.unwrap_err();
-        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(matches!(err, SystemError::BadRequest(_)));
     }
 
     #[tokio::test]

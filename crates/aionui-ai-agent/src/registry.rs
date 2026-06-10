@@ -18,12 +18,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::{AgentEnvEntry, AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};
-use aionui_common::{AgentType, AppError};
+use aionui_common::AgentType;
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
-use aionui_runtime::resolve_command_path;
+use aionui_runtime::{
+    ManagedAcpToolId, RuntimeCommandProbe, probe_managed_acp_tool_supported, probe_node_runtime_supported,
+    probe_runtime_command, resolve_command_path,
+};
 use serde_json::Value;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
+
+use crate::error::AgentError;
+use crate::manager::acp::config_option_catalog::{
+    enrich_handshake_with_config_option_catalog, merge_config_option_values,
+};
 
 /// Capacity of the catalog-sync MPSC channel. A single writer thread
 /// drains it serially, so the bound just sizes the burst we can absorb
@@ -36,6 +44,14 @@ struct CatalogSyncMessage {
     agent_metadata_id: String,
     handshake: AgentHandshake,
 }
+
+#[cfg(test)]
+#[path = "registry_config_option_tests.rs"]
+mod registry_config_option_tests;
+
+#[cfg(test)]
+#[path = "registry_tests.rs"]
+mod registry_tests;
 
 pub struct AgentRegistry {
     repo: Arc<dyn IAgentMetadataRepository>,
@@ -85,7 +101,21 @@ impl AgentRegistry {
     /// tests and the consumer itself.
     ///
     /// `None` fields are left untouched (partial update).
-    async fn apply_handshake_inner(&self, id: &str, snapshot: &AgentHandshake) -> Result<(), AppError> {
+    async fn apply_handshake_inner(&self, id: &str, snapshot: &AgentHandshake) -> Result<(), AgentError> {
+        let mut snapshot = snapshot.clone();
+        if let Some(incoming_config_options) = snapshot.config_options.as_ref() {
+            let existing_config_options = {
+                let guard = self.by_id.read().await;
+                guard.get(id).and_then(|meta| meta.handshake.config_options.clone())
+            };
+            if let Some(merged_config_options) =
+                merge_config_option_values(existing_config_options.as_ref(), incoming_config_options)
+            {
+                snapshot.config_options = Some(merged_config_options);
+            }
+        }
+
+        let snapshot = enrich_handshake_with_config_option_catalog(&snapshot);
         let agent_capabilities = encode_optional(&snapshot.agent_capabilities, "agent_capabilities")?;
         let auth_methods = encode_optional(&snapshot.auth_methods, "auth_methods")?;
         let config_options = encode_optional(&snapshot.config_options, "config_options")?;
@@ -106,7 +136,7 @@ impl AgentRegistry {
             .repo
             .apply_handshake(id, &params)
             .await
-            .map_err(|e| AppError::Internal(format!("apply_handshake: {e}")))?
+            .map_err(|e| AgentError::internal(format!("apply_handshake: {e}")))?
         else {
             return Ok(());
         };
@@ -128,12 +158,12 @@ impl AgentRegistry {
     }
     /// Reload every enabled row from the database and re-probe their
     /// spawn commands on `$PATH`.
-    pub async fn hydrate(&self) -> Result<(), AppError> {
+    pub async fn hydrate(&self) -> Result<(), AgentError> {
         let rows = self
             .repo
             .list_all()
             .await
-            .map_err(|e| AppError::Internal(format!("load agent_metadata: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("load agent_metadata: {e}")))?;
 
         let mut map = HashMap::with_capacity(rows.len());
         for row in rows {
@@ -172,7 +202,7 @@ impl AgentRegistry {
     /// (update). Pure refresh with no DB writes — just rebuilds the
     /// in-memory snapshot so `list_all()` and `get()` return the latest
     /// catalog state without waiting for the next process restart.
-    pub async fn invalidate_and_rehydrate(&self) -> Result<(), AppError> {
+    pub async fn invalidate_and_rehydrate(&self) -> Result<(), AgentError> {
         self.hydrate().await?;
         self.refresh_availability().await;
         Ok(())
@@ -465,11 +495,11 @@ fn parse_json(raw: Option<&str>, field: &str) -> Option<Value> {
     })
 }
 
-fn encode_optional(value: &Option<Value>, field: &str) -> Result<Option<String>, AppError> {
+fn encode_optional(value: &Option<Value>, field: &str) -> Result<Option<String>, AgentError> {
     match value {
         Some(v) => serde_json::to_string(v)
             .map(Some)
-            .map_err(|e| AppError::Internal(format!("encode {field}: {e}"))),
+            .map_err(|e| AgentError::internal(format!("encode {field}: {e}"))),
         None => Ok(None),
     }
 }
@@ -530,6 +560,9 @@ pub enum UnavailableReason {
     /// direct-CLI rows this is the same binary as `binary_name`; for
     /// bridge rows it's the bridge.
     CommandMissing { command: String },
+    /// Managed runtime/tool support is unavailable even though the row
+    /// itself is builtin and no ambient PATH lookup should be required.
+    ManagedRuntimeUnavailable { resource: String, detail: String },
 }
 
 impl std::fmt::Display for UnavailableReason {
@@ -540,6 +573,9 @@ impl std::fmt::Display for UnavailableReason {
             Self::BridgeMissing { bridge } => write!(f, "bridge binary `{bridge}` not on $PATH"),
             Self::PrimaryMissing { binary } => write!(f, "primary binary `{binary}` not on $PATH"),
             Self::CommandMissing { command } => write!(f, "spawn command `{command}` not on $PATH"),
+            Self::ManagedRuntimeUnavailable { resource, detail } => {
+                write!(f, "managed `{resource}` unavailable: {detail}")
+            }
         }
     }
 }
@@ -559,13 +595,42 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
     if !meta.enabled {
         return Err(UnavailableReason::Disabled);
     }
+
+    if meta.agent_source == AgentSource::Builtin
+        && let Some(backend) = meta.backend.as_deref()
+        && let Some(tool) = ManagedAcpToolId::from_backend(backend)
+    {
+        let node_support = probe_node_runtime_supported();
+        if !node_support.is_supported() {
+            return Err(UnavailableReason::ManagedRuntimeUnavailable {
+                resource: "node".to_owned(),
+                detail: node_support.detail,
+            });
+        }
+        let tool_support = probe_managed_acp_tool_supported(tool);
+        if !tool_support.is_supported() {
+            return Err(UnavailableReason::ManagedRuntimeUnavailable {
+                resource: tool.slug().to_owned(),
+                detail: tool_support.detail,
+            });
+        }
+        if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
+            && probe_command_candidate(primary).is_none()
+        {
+            return Err(UnavailableReason::PrimaryMissing {
+                binary: primary.to_owned(),
+            });
+        }
+        return Ok(PathBuf::from(tool.slug()));
+    }
+
     let Some(cmd) = meta.command.as_deref().filter(|s| !s.is_empty()) else {
         return Err(UnavailableReason::NoCommand);
     };
 
     if let Some(bridge) = meta.agent_source_info.bridge_binary.as_deref()
         && bridge != cmd
-        && resolve_command_path(bridge).is_none()
+        && probe_command_candidate(bridge).is_none()
     {
         return Err(UnavailableReason::BridgeMissing {
             bridge: bridge.to_owned(),
@@ -574,16 +639,26 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
     if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
         && primary != cmd
         && meta.agent_source_info.bridge_binary.as_deref() != Some(primary)
-        && resolve_command_path(primary).is_none()
+        && probe_command_candidate(primary).is_none()
     {
         return Err(UnavailableReason::PrimaryMissing {
             binary: primary.to_owned(),
         });
     }
 
-    resolve_command_path(cmd).ok_or_else(|| UnavailableReason::CommandMissing {
+    probe_command_candidate(cmd).ok_or_else(|| UnavailableReason::CommandMissing {
         command: cmd.to_owned(),
     })
+}
+
+fn probe_command_candidate(command: &str) -> Option<PathBuf> {
+    match probe_runtime_command(command) {
+        RuntimeCommandProbe::ExplicitPath { path } => path.exists().then_some(path),
+        RuntimeCommandProbe::PathLookup { command } => resolve_command_path(&command),
+        RuntimeCommandProbe::NodeTool { command, .. } => probe_node_runtime_supported()
+            .is_supported()
+            .then(|| PathBuf::from(command)),
+    }
 }
 
 #[cfg(test)]
@@ -606,14 +681,16 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 20);
+        assert_eq!(all.len(), 21);
     }
 
     #[tokio::test]
-    async fn find_builtin_claude_has_bridge_command() {
+    async fn find_builtin_claude_uses_managed_acp_runtime_metadata() {
         let reg = registry().await;
         let m = reg.find_builtin_by_backend("claude").await.unwrap();
-        assert_eq!(m.command.as_deref(), Some("bun"));
+        assert!(m.command.is_none());
+        assert!(m.args.is_empty());
+        assert!(m.agent_source_info.bridge_binary.is_none());
         assert!(m.behavior_policy.supports_side_question);
         assert_eq!(
             m.native_skills_dirs.as_deref(),
@@ -635,6 +712,13 @@ mod tests {
         let reg = registry().await;
         let claude = reg.find_builtin_by_backend("claude").await.unwrap();
         assert_eq!(claude.yolo_id.as_deref(), Some("bypassPermissions"));
+    }
+
+    #[tokio::test]
+    async fn hermes_builtin_does_not_advertise_a_yolo_id() {
+        let reg = registry().await;
+        let hermes = reg.find_builtin_by_backend("hermes").await.unwrap();
+        assert_eq!(hermes.yolo_id, None);
     }
 
     /// On a host that has *none* of the seeded CLIs installed, the
@@ -669,7 +753,7 @@ mod tests {
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
         let count = |t: AgentType| all.iter().filter(|m| m.agent_type == t).count();
-        assert_eq!(count(AgentType::Acp), 17);
+        assert_eq!(count(AgentType::Acp), 18);
         assert_eq!(count(AgentType::Nanobot), 1);
         assert_eq!(count(AgentType::OpenclawGateway), 1);
         assert_eq!(count(AgentType::Aionrs), 1);
@@ -780,7 +864,7 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 20, "every row appears once");
+        assert_eq!(snapshot.len(), 21, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {

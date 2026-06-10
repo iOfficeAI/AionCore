@@ -141,6 +141,22 @@ fn send_json(text: &str) -> tungstenite::Message {
     tungstenite::Message::Text(text.into())
 }
 
+fn assert_realtime_error(msg: &Value, code: &str, recoverable: bool) {
+    assert_eq!(msg["name"], "realtime.error");
+    assert_eq!(msg["data"]["code"], code);
+    assert!(msg["data"]["message"].is_string());
+    assert_eq!(msg["data"]["recoverable"], recoverable);
+    assert!(msg["data"]["details"].is_object());
+}
+
+fn assert_invalid_message_error(msg: &Value) {
+    assert_realtime_error(msg, "REALTIME_INVALID_MESSAGE", true);
+    assert_eq!(
+        msg["data"]["details"]["expected"],
+        r#"{ "name": "event-name", "data": {...} }"#
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -164,19 +180,22 @@ async fn no_token_closes_with_1008() {
 
     let mut ws = connect_no_token(addr).await;
 
+    let msg = read_text(&mut ws).await;
+    assert_realtime_error(&msg, "REALTIME_AUTH_MISSING", false);
+
     let code = read_close(&mut ws).await;
     assert_eq!(code, Some(1008));
 }
 
 #[tokio::test]
-async fn invalid_token_sends_auth_expired_then_closes() {
+async fn invalid_token_sends_realtime_auth_expired_then_closes() {
     let (state, _) = default_state();
     let addr = start_server(state).await;
 
     let (_, mut rx) = connect_with_token(addr, "bad-token").await;
 
     let msg = read_text(&mut rx).await;
-    assert_eq!(msg["name"], "auth-expired");
+    assert_realtime_error(&msg, "REALTIME_AUTH_EXPIRED", false);
 
     let code = read_close(&mut rx).await;
     assert_eq!(code, Some(1008));
@@ -193,8 +212,17 @@ async fn invalid_json_message_returns_error() {
     tx.send(send_json("not valid json")).await.unwrap();
 
     let msg = read_text(&mut rx).await;
-    assert_eq!(msg["error"], "Invalid message format");
-    assert!(msg["expected"].is_string());
+    assert_invalid_message_error(&msg);
+
+    let payload = json!({
+        "name": "subscribe-show-open",
+        "data": {"id": "still-open", "data": {"properties": ["openFile"]}}
+    });
+    tx.send(send_json(&payload.to_string())).await.unwrap();
+
+    let msg = read_text(&mut rx).await;
+    assert_eq!(msg["name"], "show-open-request");
+    assert_eq!(msg["data"]["id"], "still-open");
 }
 
 #[tokio::test]
@@ -208,7 +236,21 @@ async fn missing_fields_returns_error() {
     tx.send(send_json(r#"{"foo":"bar"}"#)).await.unwrap();
 
     let msg = read_text(&mut rx).await;
-    assert_eq!(msg["error"], "Invalid message format");
+    assert_invalid_message_error(&msg);
+}
+
+#[tokio::test]
+async fn invalid_envelope_returns_error() {
+    let (state, _) = default_state();
+    let addr = start_server(state).await;
+
+    let (mut tx, mut rx) = connect_with_token(addr, "valid-token").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    tx.send(send_json(r#"{"name":"","data":{}}"#)).await.unwrap();
+
+    let msg = read_text(&mut rx).await;
+    assert_invalid_message_error(&msg);
 }
 
 #[tokio::test]
@@ -340,8 +382,9 @@ async fn unknown_message_routed_to_message_router() {
         called: AtomicBool,
     }
     impl MessageRouter for TrackingRouter {
-        fn route(&self, _conn_id: ConnectionId, _name: &str, _data: Value) {
+        fn route(&self, _conn_id: ConnectionId, _name: &str, _data: Value) -> bool {
             self.called.store(true, Ordering::Relaxed);
+            true
         }
     }
 

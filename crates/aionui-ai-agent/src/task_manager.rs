@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_common::{
-    AgentKillReason, AgentType, AppError, ConversationStatus, ErrorChain, OnConversationDelete, TimestampMs, now_ms,
+    AgentKillReason, AgentType, ConversationStatus, ErrorChain, OnConversationDelete, TimestampMs, now_ms,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -10,6 +10,7 @@ use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::agent_task::AgentInstance;
+use crate::error::AgentError;
 use crate::types::BuildTaskOptions;
 
 /// Factory function that creates an [`AgentInstance`] from build options.
@@ -19,7 +20,7 @@ use crate::types::BuildTaskOptions;
 /// `IWorkerTaskManager` call site. Returning `BoxFuture` keeps the trait
 /// object-safe for DI.
 pub type AgentFactory =
-    Arc<dyn Fn(BuildTaskOptions) -> BoxFuture<'static, Result<AgentInstance, AppError>> + Send + Sync>;
+    Arc<dyn Fn(BuildTaskOptions) -> BoxFuture<'static, Result<AgentInstance, AgentError>> + Send + Sync>;
 
 /// Manages the lifecycle of active Agent tasks.
 ///
@@ -41,10 +42,10 @@ pub trait IWorkerTaskManager: Send + Sync {
         &self,
         conversation_id: &str,
         options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError>;
+    ) -> Result<AgentInstance, AgentError>;
 
     /// Kill and remove a task.
-    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError>;
+    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError>;
 
     /// Kill a task and return a future that resolves when the process has terminated.
     fn kill_and_wait(
@@ -103,7 +104,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         &self,
         conversation_id: &str,
         options: BuildTaskOptions,
-    ) -> Result<AgentInstance, AppError> {
+    ) -> Result<AgentInstance, AgentError> {
         // Atomically obtain the per-conversation slot. `DashMap::entry` is
         // synchronous and side-effect-free — only an empty OnceCell is
         // allocated on the miss path, so concurrent callers for the same id
@@ -123,7 +124,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         Ok(instance.clone())
     }
 
-    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
             info!(conversation_id = %id, ?reason, "Killing agent task");
             if let Some(agent) = slot.get() {
@@ -180,7 +181,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
 }
 
 /// Wired up by `aionui-app` so deleting a conversation tears down its
-/// agent process. Without this hook, ACP/aionrs/nanobot subprocesses keep
+/// agent process. Without this hook, ACP/aionrs subprocesses keep
 /// streaming events for a `conversation_id` whose DB row is already gone
 /// (Sentry ELECTRON-1BD).
 #[async_trait]
@@ -201,6 +202,9 @@ mod tests {
     use super::*;
     use crate::agent_task::{IAgentTask, IMockAgent};
     use crate::protocol::events::AgentStreamEvent;
+    use crate::session_context::{
+        AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
+    };
     use crate::types::SendMessageData;
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, ProviderWithModel};
     use futures_util::FutureExt;
@@ -270,10 +274,10 @@ mod tests {
         ) -> Result<(), crate::protocol::send_error::AgentSendError> {
             Ok(())
         }
-        async fn cancel(&self) -> Result<(), AppError> {
+        async fn cancel(&self) -> Result<(), AgentError> {
             Ok(())
         }
-        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
             Ok(())
         }
     }
@@ -281,17 +285,31 @@ mod tests {
     impl IMockAgent for MockAgent {}
 
     fn make_options(conversation_id: &str) -> BuildTaskOptions {
-        BuildTaskOptions {
-            agent_type: AgentType::Acp,
-            workspace: "/tmp/test".into(),
+        BuildTaskOptions::new(AgentSessionContext {
+            conversation: ConversationContext {
+                conversation_id: conversation_id.into(),
+                user_id: "user-1".into(),
+                agent_type: AgentType::Acp,
+                source: None,
+            },
+            workspace: WorkspaceContext {
+                path: "/tmp/test".into(),
+                stored_path: "/tmp/test".into(),
+                is_custom: true,
+            },
             model: ProviderWithModel {
                 provider_id: "p1".into(),
                 model: "test".into(),
                 use_model: None,
             },
-            conversation_id: conversation_id.into(),
-            extra: serde_json::Value::Null,
-        }
+            skills: vec![],
+            kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
+                config: Default::default(),
+                belongs_to_team: false,
+                session_id: None,
+                session_snapshot: None,
+            })),
+        })
     }
 
     fn mock_instance(agent: MockAgent) -> AgentInstance {
@@ -300,7 +318,7 @@ mod tests {
 
     fn make_manager() -> WorkerTaskManagerImpl {
         let factory: AgentFactory = Arc::new(|opts: BuildTaskOptions| {
-            async move { Ok(mock_instance(MockAgent::new(&opts.conversation_id, None))) }.boxed()
+            async move { Ok(mock_instance(MockAgent::new(opts.conversation_id(), None))) }.boxed()
         });
         WorkerTaskManagerImpl::new(factory)
     }
@@ -349,7 +367,7 @@ mod tests {
                 // Simulate a slow build (CLI spawn + initialize handshake).
                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(mock_instance(MockAgent::new(&opts.conversation_id, None)))
+                Ok(mock_instance(MockAgent::new(opts.conversation_id(), None)))
             }
             .boxed()
         });
@@ -386,9 +404,9 @@ mod tests {
             let flag = Arc::clone(&flag);
             async move {
                 if flag.swap(false, Ordering::SeqCst) {
-                    Err(AppError::Internal("first call fails".into()))
+                    Err(AgentError::internal("first call fails"))
                 } else {
-                    Ok(mock_instance(MockAgent::new(&opts.conversation_id, None)))
+                    Ok(mock_instance(MockAgent::new(opts.conversation_id(), None)))
                 }
             }
             .boxed()
@@ -478,12 +496,12 @@ mod tests {
             ),
         );
 
-        // Non-ACP (Nanobot) + Finished + old activity → should NOT be collected
+        // Non-ACP (Aionrs) + Finished + old activity → should NOT be collected
         insert(
-            "conv-nanobot",
+            "conv-aionrs",
             mock_instance(
-                MockAgent::new("conv-nanobot", Some(ConversationStatus::Finished))
-                    .with_agent_type(AgentType::Nanobot)
+                MockAgent::new("conv-aionrs", Some(ConversationStatus::Finished))
+                    .with_agent_type(AgentType::Aionrs)
                     .with_last_activity(now_ms() - 600_000),
             ),
         );

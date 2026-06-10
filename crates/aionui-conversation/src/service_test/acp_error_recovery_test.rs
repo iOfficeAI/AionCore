@@ -9,7 +9,7 @@ async fn send_message_evicts_acp_task_after_terminal_error() {
     let scripted_agent = Arc::new(ScriptedAgent::new(
         &conv.id,
         vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
-            "Agent completed the turn without producing visible output.",
+            "mock terminal error",
             Some(AgentErrorCode::UnknownUpstreamError),
         ))]],
     ));
@@ -48,12 +48,13 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     );
     let task_mgr = Arc::new(MockTaskManager::new());
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let workspace = ensure_test_workspace_path();
     repo.update(
         &conv.id,
         &ConversationRowUpdate {
             extra: Some(
                 serde_json::to_string(&json!({
-                    "workspace": "/project",
+                    "workspace": workspace,
                     "current_model_id": "deepseek-v4-pro",
                 }))
                 .unwrap(),

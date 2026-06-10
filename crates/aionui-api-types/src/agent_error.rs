@@ -17,7 +17,8 @@ pub enum AgentErrorCode {
     AionuiStateInconsistent,
     AionuiPermissionError,
     AionuiInternalError,
-    WorkspacePathContainsWhitespaceRuntimeUnsupported,
+    #[serde(alias = "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED")]
+    WorkspacePathRuntimeUnavailable,
     UserAgentHandshakeFailed,
     UserAgentHandshakeTimeout,
     UserAgentAcpInitFailed,
@@ -230,7 +231,7 @@ mod tests {
     fn workspace_path_field_serializes_and_deserializes() {
         let payload = AgentStreamErrorData {
             message: "workspace path rejected".into(),
-            code: Some(AgentErrorCode::WorkspacePathContainsWhitespaceRuntimeUnsupported),
+            code: Some(AgentErrorCode::WorkspacePathRuntimeUnavailable),
             ownership: Some(AgentErrorOwnership::Aionui),
             detail: Some("workspace detail".into()),
             workspace_path: Some("/tmp/Archive ".into()),
@@ -240,7 +241,7 @@ mod tests {
         };
 
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED");
+        assert_eq!(json["code"], "WORKSPACE_PATH_RUNTIME_UNAVAILABLE");
         assert_eq!(json["workspacePath"], "/tmp/Archive ");
 
         let roundtrip: AgentStreamErrorData = serde_json::from_value(json).unwrap();

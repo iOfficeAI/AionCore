@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 
 use crate::error::OfficeError;
+use crate::officecli_runtime::{OFFICECLI_LATEST_RELEASE_URL, install_command, resolve_officecli_path};
 use crate::port::{allocate_port, is_port_listening};
 use crate::types::DocType;
 
@@ -99,7 +101,7 @@ impl OfficecliWatchManager {
                 Ok(*port)
             }
             Err(e) => {
-                self.broadcast_status(doc_type, PreviewState::Error, Some(e.to_string()));
+                self.broadcast_status(doc_type, PreviewState::Error, Some(public_preview_error_message(e)));
                 Err(match e {
                     OfficeError::OfficecliNotFound => OfficeError::OfficecliNotFound,
                     OfficeError::InstallFailed(m) => OfficeError::InstallFailed(m.clone()),
@@ -244,7 +246,15 @@ impl Drop for OfficecliWatchManager {
 // DefaultProcessSpawner — real implementation using tokio::process
 // ---------------------------------------------------------------------------
 
-pub struct DefaultProcessSpawner;
+pub struct DefaultProcessSpawner {
+    _data_dir: PathBuf,
+}
+
+impl DefaultProcessSpawner {
+    pub fn new(data_dir: PathBuf) -> Self {
+        Self { _data_dir: data_dir }
+    }
+}
 
 struct TokioProcessHandle {
     child: Mutex<Option<tokio::process::Child>>,
@@ -278,7 +288,12 @@ impl ProcessSpawner for DefaultProcessSpawner {
         port: u16,
         _doc_type: DocType,
     ) -> Result<Box<dyn ProcessHandle>, OfficeError> {
-        let mut builder = CmdBuilder::new("officecli");
+        let officecli = resolve_officecli_path().ok_or(OfficeError::OfficecliNotFound)?;
+        if !officecli_supports_watch(&officecli).await {
+            return Err(OfficeError::OfficecliNotFound);
+        }
+
+        let mut builder = CmdBuilder::new(&officecli);
         builder
             .arg("watch")
             .arg(file_path)
@@ -301,48 +316,76 @@ impl ProcessSpawner for DefaultProcessSpawner {
     }
 
     async fn install_officecli(&self) -> Result<(), OfficeError> {
-        let mut builder = CmdBuilder::clean_cli("npm");
-        builder.args(["install", "-g", "officecli"]);
+        let command = install_command();
+        tracing::info!(
+            platform = std::env::consts::OS,
+            "installing officecli via official iOfficeAI/OfficeCli installer"
+        );
+
+        let mut builder = CmdBuilder::clean_cli(&command.program);
+        builder.args(command.args.iter());
         let output = builder
             .output()
             .await
             .map_err(|e| OfficeError::InstallFailed(e.to_string()))?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OfficeError::InstallFailed(stderr.into_owned()));
+            tracing::warn!(
+                status = ?output.status.code(),
+                "officecli official installer failed"
+            );
+            return Err(OfficeError::InstallFailed("official OfficeCLI installer failed".into()));
         }
         Ok(())
     }
 
     async fn is_officecli_installed(&self) -> bool {
-        let mut builder = CmdBuilder::clean_cli("officecli");
-        builder.arg("--version");
-        builder.output().await.is_ok_and(|o| o.status.success())
+        let Some(officecli) = resolve_officecli_path() else {
+            return false;
+        };
+
+        officecli_supports_watch(&officecli).await
     }
 
     async fn check_update(&self, _doc_type: DocType) -> Result<(), OfficeError> {
-        let mut builder = CmdBuilder::clean_cli("npm");
-        builder.args(["outdated", "-g", "officecli"]);
+        let officecli = resolve_officecli_path().ok_or(OfficeError::OfficecliNotFound)?;
+        if !officecli_supports_watch(&officecli).await {
+            return Err(OfficeError::OfficecliNotFound);
+        }
+
+        let mut builder = CmdBuilder::clean_cli(&officecli);
+        builder.arg("--version");
         let output = builder
             .output()
             .await
             .map_err(|e| OfficeError::StartFailed(e.to_string()))?;
 
         if !output.status.success() {
-            tracing::info!("officecli update available, installing...");
-            let mut install_builder = CmdBuilder::clean_cli("npm");
-            install_builder.args(["install", "-g", "officecli@latest"]);
-            let install = install_builder
-                .output()
-                .await
-                .map_err(|e| OfficeError::InstallFailed(e.to_string()))?;
-
-            if !install.status.success() {
-                let stderr = String::from_utf8_lossy(&install.stderr);
-                tracing::warn!("officecli update failed: {stderr}");
-            }
+            return Ok(());
         }
+
+        let local_version = normalize_officecli_version(&String::from_utf8_lossy(&output.stdout));
+        let response = reqwest::Client::new()
+            .get(OFFICECLI_LATEST_RELEASE_URL)
+            .send()
+            .await
+            .map_err(|e| OfficeError::StartFailed(e.to_string()))?;
+        let remote_version = response
+            .url()
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .map(normalize_officecli_version)
+            .unwrap_or_default();
+
+        if !remote_version.is_empty() && remote_version != local_version {
+            tracing::info!(
+                local_version = %local_version,
+                remote_version = %remote_version,
+                "officecli update available, installing via official installer"
+            );
+            self.install_officecli().await?;
+        }
+
         Ok(())
     }
 }
@@ -352,13 +395,45 @@ impl ProcessSpawner for DefaultProcessSpawner {
 // ---------------------------------------------------------------------------
 
 fn resolve_path(file_path: &str) -> Result<String, OfficeError> {
-    let path = std::path::Path::new(file_path);
+    let path = Path::new(file_path);
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     Ok(resolved.to_string_lossy().into_owned())
 }
 
 fn session_key(resolved_path: &str, doc_type: DocType) -> String {
     format!("{doc_type}:{resolved_path}")
+}
+
+fn normalize_officecli_version(raw: &str) -> String {
+    raw.split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .trim_start_matches('v')
+        .to_owned()
+}
+
+async fn officecli_supports_watch(officecli: &Path) -> bool {
+    let mut version = CmdBuilder::clean_cli(officecli);
+    version.arg("--version");
+    if !version.output().await.is_ok_and(|o| o.status.success()) {
+        return false;
+    }
+
+    let mut watch_help = CmdBuilder::clean_cli(officecli);
+    watch_help.args(["watch", "--help"]);
+    let ok = watch_help.output().await.is_ok_and(|o| o.status.success());
+    if !ok {
+        tracing::warn!("officecli exists but does not expose watch command");
+    }
+    ok
+}
+
+fn public_preview_error_message(error: &OfficeError) -> String {
+    match error {
+        OfficeError::InstallFailed(_) => "officecli install failed".to_owned(),
+        OfficeError::OfficecliNotFound => "officecli not found".to_owned(),
+        _ => error.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +572,30 @@ mod tests {
         let k1 = session_key("/a.docx", DocType::Word);
         let k2 = session_key("/a.docx", DocType::Excel);
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn install_failed_public_preview_message_is_sanitized() {
+        let err = OfficeError::InstallFailed("installer stderr".into());
+        assert_eq!(public_preview_error_message(&err), "officecli install failed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn officecli_capability_probe_requires_watch_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let officecli = tmp.path().join("officecli");
+        std::fs::write(
+            &officecli,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif [ \"$1\" = \"watch\" ] && [ \"$2\" = \"--help\" ]; then exit 1; fi\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&officecli).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&officecli, perms).unwrap();
+
+        assert!(!officecli_supports_watch(&officecli).await);
     }
 
     #[tokio::test]

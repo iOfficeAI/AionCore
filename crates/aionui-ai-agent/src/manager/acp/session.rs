@@ -7,6 +7,9 @@ use agent_client_protocol::schema::{
 
 use super::agent_event_tracker::AcpSessionEvent;
 use super::agent_reconcile::ReconcileAction;
+use super::config_option_catalog::{
+    derive_models_from_config_options, derive_modes_from_config_options, merge_config_options,
+};
 use crate::protocol::error::CloseReason;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState, SessionId};
 
@@ -52,6 +55,10 @@ struct Advertised {
 pub struct AcpSession {
     session_id: Option<SessionId>,
     opened: bool,
+    desired: Desired,
+    observed: Observed,
+    advertised: Advertised,
+    pending_events: Vec<AcpSessionEvent>,
     /// Whether `open_session_new` has just completed and the next prompt
     /// should receive preset_context / skill-index injection.
     ///
@@ -64,10 +71,6 @@ pub struct AcpSession {
     /// Starts `false` so resume paths, warmup-only flows, and aborted
     /// session/new attempts all correctly observe "no prelude pending".
     pending_session_new_prelude: bool,
-    desired: Desired,
-    observed: Observed,
-    advertised: Advertised,
-    pending_events: Vec<AcpSessionEvent>,
     /// Model id the next prompt should announce to the CLI via an
     /// injected `<system-reminder>`. Written when the CLI bakes
     /// model identity into its cached system prompt (see
@@ -226,6 +229,14 @@ impl AcpSession {
         !model_id.is_empty() && self.is_model_valid(model_id)
     }
 
+    /// Whether the requested mode can be selected in the current session.
+    ///
+    /// Before the ACP backend advertises modes, keep the historical permissive
+    /// behavior so initial seeds can still be reconciled once the session opens.
+    pub fn can_select_mode(&self, mode_id: &str) -> bool {
+        !mode_id.is_empty() && self.is_mode_valid(mode_id)
+    }
+
     /// Set the user's desired mode. Emits `DesiredModeChanged` if the
     /// value actually changed. When advertised modes are known, the mode
     /// must be in the list (otherwise the call is a no-op).
@@ -277,6 +288,20 @@ impl AcpSession {
             self.pending_model_notice = None;
         }
         Some(model)
+    }
+
+    /// Drop a desired mode that is not advertised by the active ACP session.
+    ///
+    /// Initial mode seeds can be loaded before `session/new` reports the
+    /// provider's available modes. Once advertised modes are known, reconcile
+    /// must not issue `session/set_mode` for a stale seed.
+    pub fn clear_invalid_desired_mode(&mut self) -> Option<ModeId> {
+        let mode = self.desired.mode_id.clone()?;
+        if self.is_mode_valid(mode.as_str()) {
+            return None;
+        }
+        self.desired.mode_id = None;
+        Some(mode)
     }
 
     /// Set a user's desired config selection.
@@ -387,6 +412,26 @@ impl AcpSession {
         }
     }
 
+    /// Confirm a user command after the ACP backend accepted it.
+    ///
+    /// Unlike `apply_observed_mode`, this also aligns the pending intent so
+    /// a later startup/recovery reconcile does not pull the session back to
+    /// the previous desired mode.
+    pub fn confirm_mode(&mut self, mode: ModeId) {
+        self.desired.mode_id = Some(mode.clone());
+        self.apply_observed_mode(mode);
+    }
+
+    /// Confirm a user command after the ACP backend accepted it.
+    ///
+    /// Unlike `apply_observed_model`, this also aligns the pending intent so
+    /// a later startup/recovery reconcile does not pull the session back to
+    /// the previous desired model.
+    pub fn confirm_model(&mut self, model: ModelId) {
+        self.desired.model_id = Some(model.clone());
+        self.apply_observed_model(model);
+    }
+
     /// Record the CLI's current value for a single config option. Mirrors
     /// `apply_observed_mode/model`: diff-driven, emits `ObservedConfigSynced`
     /// with the full selection map when the value actually changed. Used by
@@ -424,7 +469,35 @@ impl AcpSession {
         }
     }
 
+    fn preserve_desired_model_in_catalog(&self, models: SessionModelState) -> SessionModelState {
+        let Some(desired_model) = self.desired.model_id.as_ref() else {
+            return models;
+        };
+        let desired_model_id = desired_model.as_str();
+        if models.current_model_id.to_string() == desired_model_id {
+            return models;
+        }
+        if models
+            .available_models
+            .iter()
+            .any(|model| model.model_id.to_string() == desired_model_id)
+        {
+            return SessionModelState::new(desired_model_id.to_owned(), models.available_models.clone());
+        }
+        models
+    }
+
     pub fn apply_advertised_config_options(&mut self, options: Vec<SessionConfigOption>) {
+        let options = merge_config_options(self.advertised.config_options.as_deref(), options);
+
+        if let Some(modes) = derive_modes_from_config_options(&options) {
+            self.apply_advertised_modes(modes);
+        }
+
+        if let Some(models) = derive_models_from_config_options(&options) {
+            self.apply_advertised_models(self.preserve_desired_model_in_catalog(models));
+        }
+
         let mut changed = false;
         for opt in &options {
             if let Some(current) = extract_config_current_value(&opt.kind) {

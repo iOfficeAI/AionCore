@@ -74,10 +74,10 @@ impl IAgentTask for TypedMockAgent {
     async fn send_message(&self, _data: SendMessageData) -> Result<(), aionui_ai_agent::AgentSendError> {
         Ok(())
     }
-    async fn cancel(&self) -> Result<(), aionui_common::AppError> {
+    async fn cancel(&self) -> Result<(), aionui_ai_agent::AgentError> {
         Ok(())
     }
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), aionui_common::AppError> {
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), aionui_ai_agent::AgentError> {
         Ok(())
     }
 }
@@ -140,55 +140,88 @@ async fn aionrs_agent_metadata() {
 }
 
 // ---------------------------------------------------------------------------
-// Idle scanner: collect_idle only finds ACP tasks
+// Runtime boundary and idle scanner
 // ---------------------------------------------------------------------------
 
+#[test]
+fn agent_session_kind_is_limited_to_runnable_runtimes() {
+    fn assert_runnable(kind: AgentSessionKind) {
+        match kind {
+            AgentSessionKind::Acp(_) | AgentSessionKind::Aionrs(_) => {}
+        }
+    }
+
+    let _ = assert_runnable;
+}
+
 #[tokio::test]
-async fn collect_idle_ignores_non_acp_agent_types() {
+async fn collect_idle_ignores_aionrs_agent_type() {
     use futures_util::FutureExt;
     let old_ts = now_ms() - 600_000; // 10 min ago
 
     // Build a factory that creates typed mocks (all finished + old)
     let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
         async move {
-            let mock = TypedMockAgent::new(
-                opts.agent_type,
-                &opts.conversation_id,
-                Some(ConversationStatus::Finished),
-            )
-            .with_last_activity(old_ts);
+            let agent_type = opts.context.conversation.agent_type;
+            let conversation_id = opts.context.conversation.conversation_id.clone();
+            let mock = TypedMockAgent::new(agent_type, &conversation_id, Some(ConversationStatus::Finished))
+                .with_last_activity(old_ts);
             Ok(AgentInstance::Mock(Arc::new(mock)))
         }
         .boxed()
     });
     let mgr = WorkerTaskManagerImpl::new(factory);
 
-    let make_opts = |agent_type: AgentType, id: &str| BuildTaskOptions {
-        agent_type,
-        workspace: "/tmp".into(),
-        model: ProviderWithModel {
-            provider_id: "p".into(),
-            model: "m".into(),
-            use_model: None,
-        },
-        conversation_id: id.into(),
-        extra: json!(null),
+    let make_opts = |agent_type: AgentType, id: &str| {
+        let kind = match agent_type {
+            AgentType::Acp => AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
+                config: Default::default(),
+                belongs_to_team: false,
+                session_id: None,
+                session_snapshot: None,
+            })),
+            AgentType::Aionrs => AgentSessionKind::Aionrs(Box::new(AionrsSessionBuildContext {
+                config: Default::default(),
+                belongs_to_team: false,
+            })),
+            AgentType::Gemini
+            | AgentType::OpenclawGateway
+            | AgentType::Remote
+            | AgentType::Nanobot
+            | AgentType::Codex => {
+                unreachable!("legacy agent types cannot build an AgentSessionKind")
+            }
+        };
+        BuildTaskOptions::new(AgentSessionContext {
+            conversation: ConversationContext {
+                conversation_id: id.into(),
+                user_id: "user-1".into(),
+                agent_type,
+                source: None,
+            },
+            workspace: WorkspaceContext {
+                path: "/tmp".into(),
+                stored_path: "/tmp".into(),
+                is_custom: true,
+            },
+            model: ProviderWithModel {
+                provider_id: "p".into(),
+                model: "m".into(),
+                use_model: None,
+            },
+            skills: vec![],
+            kind,
+        })
     };
 
-    mgr.get_or_build_task("nanobot-1", make_opts(AgentType::Nanobot, "nanobot-1"))
-        .await
-        .unwrap();
-    mgr.get_or_build_task("openclaw-1", make_opts(AgentType::OpenclawGateway, "openclaw-1"))
-        .await
-        .unwrap();
     mgr.get_or_build_task("acp-1", make_opts(AgentType::Acp, "acp-1"))
         .await
         .unwrap();
-    mgr.get_or_build_task("remote-1", make_opts(AgentType::Remote, "remote-1"))
+    mgr.get_or_build_task("aionrs-1", make_opts(AgentType::Aionrs, "aionrs-1"))
         .await
         .unwrap();
 
-    assert_eq!(mgr.active_count(), 4);
+    assert_eq!(mgr.active_count(), 2);
 
     // Only ACP should be collected
     let idle = mgr.collect_idle(300_000); // 5-min threshold

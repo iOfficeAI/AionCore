@@ -1,7 +1,8 @@
 use aionui_api_types::{FetchModelsResponse, ModelInfo};
-use aionui_common::AppError;
 use tokio::task::JoinSet;
 use tracing::debug;
+
+use crate::error::SystemError;
 
 use super::FetchConfig;
 use super::fetchers::fetch_openai_compatible;
@@ -23,7 +24,7 @@ const URL_VARIANTS: &[&str] = &[
 pub(crate) async fn try_fix_url(
     client: &reqwest::Client,
     config: &FetchConfig,
-) -> Result<FetchModelsResponse, AppError> {
+) -> Result<FetchModelsResponse, SystemError> {
     let base = config.base_url.trim_end_matches('/');
     let candidates = build_candidates(base);
 
@@ -39,7 +40,7 @@ pub(crate) async fn try_fix_url(
         let api_key = config.api_key.clone();
         set.spawn(async move {
             let models = fetch_openai_compatible(&client, &candidate, &api_key).await?;
-            Ok::<(Vec<ModelInfo>, String), AppError>((models, candidate))
+            Ok::<(Vec<ModelInfo>, String), SystemError>((models, candidate))
         });
     }
 
@@ -54,7 +55,9 @@ pub(crate) async fn try_fix_url(
         }
     }
 
-    Err(AppError::BadGateway("All URL variants failed during auto-fix".into()))
+    Err(SystemError::BadGateway(
+        "All URL variants failed during auto-fix".into(),
+    ))
 }
 
 /// Build candidate URLs from the base URL and standard path suffixes.

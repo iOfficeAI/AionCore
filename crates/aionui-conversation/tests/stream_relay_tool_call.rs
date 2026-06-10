@@ -47,6 +47,7 @@ async fn run_tool_call_with_empty_call_id_is_not_persisted() {
     let relay = StreamRelay::new(
         "conv-1".into(),
         "asst-1".into(),
+        "turn-1".into(),
         "system_default_user".into(),
         repo.clone(),
         bus,

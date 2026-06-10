@@ -76,6 +76,20 @@ pub struct SendMessageRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageResponse {
     pub msg_id: String,
+    pub turn_id: String,
+    pub runtime: ConversationRuntimeSummary,
+}
+
+/// Body for `POST /api/conversations/:id/cancel`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CancelConversationRequest {
+    pub turn_id: String,
+}
+
+/// Response for `POST /api/conversations/:id/cancel`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelConversationResponse {
+    pub runtime: ConversationRuntimeSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +109,7 @@ pub struct ConversationRuntimeSummary {
     pub task_status: Option<ConversationStatus>,
     pub is_processing: bool,
     pub pending_confirmations: usize,
+    pub turn_id: Option<String>,
 }
 
 // ── Query types ────────────────────────────────────────────────────

@@ -14,7 +14,7 @@ fn create_body(name: &str) -> serde_json::Value {
     json!({
         "type": "acp",
         "name": name,
-        "extra": { "workspace": "/project" }
+        "extra": {}
     })
 }
 
@@ -48,15 +48,15 @@ async fn t1_1_create_conversation_success() {
     assert!(data["id"].as_str().is_some());
     assert!(data["created_at"].as_i64().is_some());
     assert!(data["modified_at"].as_i64().is_some());
-    assert_eq!(data["extra"]["workspace"], "/project");
+    assert!(data["extra"]["workspace"].as_str().is_some());
 }
 
 #[tokio::test]
-async fn t1_2_create_various_agent_types() {
+async fn t1_2_create_supported_agent_types_and_reject_legacy_types() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let types = ["acp", "openclaw-gateway", "nanobot", "remote"];
+    let types = ["acp", "aionrs"];
     for agent_type in types {
         let body = json!({
             "type": agent_type,
@@ -67,6 +67,18 @@ async fn t1_2_create_various_agent_types() {
         assert_eq!(resp.status(), StatusCode::CREATED, "type={agent_type}");
         let json = body_json(resp).await;
         assert_eq!(json["data"]["type"], agent_type);
+    }
+
+    for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini"] {
+        let body = json!({
+            "type": agent_type,
+            "extra": {}
+        });
+        let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "type={agent_type}");
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "BAD_REQUEST");
     }
 }
 
@@ -137,7 +149,7 @@ async fn t1_5_create_invalid_type() {
 }
 
 #[tokio::test]
-async fn t1_5b_create_rejects_workspace_paths_with_whitespace_segments() {
+async fn t1_5b_create_accepts_workspace_paths_with_whitespace_segments() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
@@ -153,16 +165,47 @@ async fn t1_5b_create_rejects_workspace_paths_with_whitespace_segments() {
     });
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["data"]["extra"]["workspace"],
+        workspace.to_string_lossy().to_string()
+    );
+}
+
+#[tokio::test]
+async fn t1_5c_create_rejects_missing_workspace_path() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let missing_workspace =
+        std::env::temp_dir().join(format!("aionui-conv-missing-{}", aionui_common::generate_short_id()));
+
+    let body = json!({
+        "type": "acp",
+        "extra": {
+            "workspace": missing_workspace.to_string_lossy()
+        }
+    });
+    let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "WORKSPACE_PATH_CONTAINS_WHITESPACE_UNSUPPORTED");
+    assert_eq!(json["code"], "WORKSPACE_PATH_UNAVAILABLE");
+    assert_eq!(json["details"]["operation"], "create");
+    assert_eq!(
+        json["details"]["workspace_path"],
+        missing_workspace.to_string_lossy().to_string()
+    );
+
+    let list_resp = app.oneshot(get_with_token("/api/conversations", &token)).await.unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_json = body_json(list_resp).await;
     assert!(
-        json["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Workspace path contains whitespace"),
-        "unexpected error payload: {json}"
+        list_json["data"]["items"].as_array().unwrap().is_empty(),
+        "invalid conversation should not be persisted"
     );
 }
 
@@ -344,7 +387,9 @@ async fn t2_5_list_pinned_filter() {
 async fn t2_6_list_requires_auth() {
     let (app, _services) = build_app().await;
     let resp = app.oneshot(get_request("/api/conversations")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ── T3: Get ───────────────────────────────────────────────────────────
@@ -385,7 +430,9 @@ async fn t3_2_get_not_found() {
 async fn t3_3_get_requires_auth() {
     let (app, _services) = build_app().await;
     let resp = app.oneshot(get_request("/api/conversations/some-id")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ── T4: Update ────────────────────────────────────────────────────────
@@ -457,10 +504,15 @@ async fn t4_2_update_pin_and_unpin() {
 async fn t4_3_update_extra_merge() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let temp = tempfile::tempdir().unwrap();
+    let old_workspace = temp.path().join("old");
+    let new_workspace = temp.path().join("new");
+    std::fs::create_dir_all(&old_workspace).unwrap();
+    std::fs::create_dir_all(&new_workspace).unwrap();
 
     let body = create_body_with_extra(
         "Merge Test",
-        json!({"workspace": "/old", "context_file_name": "ctx.md"}),
+        json!({"workspace": old_workspace.to_string_lossy(), "context_file_name": "ctx.md"}),
     );
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -471,13 +523,16 @@ async fn t4_3_update_extra_merge() {
     let req = json_with_token(
         "PATCH",
         &format!("/api/conversations/{id}"),
-        json!({"extra": {"workspace": "/new"}}),
+        json!({"extra": {"workspace": new_workspace.to_string_lossy()}}),
         &token,
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["extra"]["workspace"], "/new");
+    assert_eq!(
+        json["data"]["extra"]["workspace"],
+        new_workspace.to_string_lossy().to_string()
+    );
     assert_eq!(json["data"]["extra"]["context_file_name"], "ctx.md");
 }
 
@@ -531,7 +586,9 @@ async fn t4_5_update_not_found() {
 async fn t4_6_update_requires_auth() {
     let (app, _services) = build_app().await;
     let resp = app.oneshot(get_request("/api/conversations/some-id")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ── T5: Delete ────────────────────────────────────────────────────────
@@ -715,19 +772,24 @@ async fn t7_3_reset_requires_auth() {
 async fn t10_1_associated_same_workspace() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let temp = tempfile::tempdir().unwrap();
+    let shared_workspace = temp.path().join("same");
+    let other_workspace = temp.path().join("other");
+    std::fs::create_dir_all(&shared_workspace).unwrap();
+    std::fs::create_dir_all(&other_workspace).unwrap();
 
     // Create 3 conversations: 2 same workspace, 1 different
-    let body1 = create_body_with_extra("Conv A", json!({"workspace": "/same"}));
+    let body1 = create_body_with_extra("Conv A", json!({"workspace": shared_workspace.to_string_lossy()}));
     let req = json_with_token("POST", "/api/conversations", body1, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
     let id_a = json["data"]["id"].as_str().unwrap().to_owned();
 
-    let body2 = create_body_with_extra("Conv B", json!({"workspace": "/same"}));
+    let body2 = create_body_with_extra("Conv B", json!({"workspace": shared_workspace.to_string_lossy()}));
     let req = json_with_token("POST", "/api/conversations", body2, &token, &csrf);
     app.clone().oneshot(req).await.unwrap();
 
-    let body3 = create_body_with_extra("Conv C", json!({"workspace": "/other"}));
+    let body3 = create_body_with_extra("Conv C", json!({"workspace": other_workspace.to_string_lossy()}));
     let req = json_with_token("POST", "/api/conversations", body3, &token, &csrf);
     app.clone().oneshot(req).await.unwrap();
 
@@ -739,15 +801,21 @@ async fn t10_1_associated_same_workspace() {
     let json = body_json(resp).await;
     let items = json["data"].as_array().unwrap();
     assert_eq!(items.len(), 1); // only Conv B, not self or Conv C
-    assert_eq!(items[0]["extra"]["workspace"], "/same");
+    assert_eq!(
+        items[0]["extra"]["workspace"],
+        shared_workspace.to_string_lossy().to_string()
+    );
 }
 
 #[tokio::test]
 async fn t10_2_associated_none() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let temp = tempfile::tempdir().unwrap();
+    let unique_workspace = temp.path().join("unique");
+    std::fs::create_dir_all(&unique_workspace).unwrap();
 
-    let body = create_body_with_extra("Unique", json!({"workspace": "/unique"}));
+    let body = create_body_with_extra("Unique", json!({"workspace": unique_workspace.to_string_lossy()}));
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
@@ -780,7 +848,9 @@ async fn t10_4_associated_requires_auth() {
         .oneshot(get_request("/api/conversations/some-id/associated"))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ── T12: Boundary scenarios ───────────────────────────────────────────
@@ -804,7 +874,6 @@ async fn t12_2_large_nested_extra() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let big_extra = json!({
-        "workspace": "/project",
         "nested": {
             "level1": {
                 "level2": {

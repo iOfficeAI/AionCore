@@ -47,7 +47,7 @@ Depended on by nearly all other crates. Changes require careful impact assessmen
 
 | Crate | Responsibility |
 |-------|----------------|
-| `aionui-common` | Shared error types (AppError), enums, ID generation, crypto utilities, timestamps, pagination |
+| `aionui-common` | Shared error types (ApiError), enums, ID generation, crypto utilities, timestamps, pagination |
 | `aionui-api-types` | All HTTP/WebSocket request and response types — the single source of truth for API contracts |
 | `aionui-db` | SQLite database layer, defines Repository traits and implementations |
 | `aionui-assets` | Embedded static assets (agent metadata, prompts) |
@@ -145,7 +145,7 @@ async fn handler(
     Extension(user): Extension<CurrentUser>, // Authenticated user
     Path(id): Path<String>,                  // Path parameter
     Json(body): Json<RequestType>,           // Request body
-) -> Result<(StatusCode, Json<ApiResponse<ResponseType>>), AppError>
+) -> Result<(StatusCode, Json<ApiResponse<ResponseType>>), ApiError>
 ```
 
 ### When to Create a New Crate vs. Extend an Existing One
@@ -201,7 +201,7 @@ All response types are defined in `aionui-api-types` — the single source of tr
 
 ### HTTP Status Code Mapping
 
-| AppError Variant | Status Code | Error Code | Use Case |
+| ApiError Variant | Status Code | Error Code | Use Case |
 |------------------|-------------|------------|----------|
 | BadRequest | 400 | BAD_REQUEST | Invalid request parameters |
 | Unauthorized | 401 | UNAUTHORIZED | Not authenticated or token expired |
@@ -318,15 +318,15 @@ Using sqlx's embedded migrations (`sqlx::migrate!()`):
 ```
 DbError (database layer)
   ↓ From trait implementation (aionui-db/src/error.rs)
-AppError (unified error type)
+ApiError (unified error type)
   ↓ IntoResponse implementation
 HTTP response (status code + ErrorResponse JSON)
 ```
 
 Mapping rules:
-- `DbError::NotFound` → `AppError::NotFound` (preserves semantics)
-- `DbError::Conflict` → `AppError::Conflict` (preserves semantics)
-- `DbError::Query` / `Migration` / `Init` → `AppError::Internal` (hides internal details)
+- `DbError::NotFound` → `ApiError::NotFound` (preserves semantics)
+- `DbError::Conflict` → `ApiError::Conflict` (preserves semantics)
+- `DbError::Query` / `Migration` / `Init` → `ApiError::Internal` (hides internal details)
 
 ## Dependency Injection
 
@@ -391,8 +391,8 @@ async fn create(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateConversationRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let conversation = state.conversation_service.create(&user.id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }

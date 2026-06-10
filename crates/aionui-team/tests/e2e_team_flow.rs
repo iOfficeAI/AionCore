@@ -23,13 +23,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
+use aionui_ai_agent::AgentError;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, FinishEventData};
 use aionui_ai_agent::shared_kernel::approval_key;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_api_types::AgentModeResponse;
 use aionui_api_types::WebSocketMessage;
-use aionui_common::{AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, TimestampMs, now_ms};
+use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
@@ -152,16 +153,16 @@ impl IAgentTask for RecordingAgent {
     async fn send_message(&self, data: SendMessageData) -> Result<(), aionui_ai_agent::AgentSendError> {
         self.sent.lock().unwrap().push(data);
         match &self.fail_with {
-            Some(msg) => Err(aionui_ai_agent::AgentSendError::from_app_error(AppError::Internal(
+            Some(msg) => Err(aionui_ai_agent::AgentSendError::from_agent_error(AgentError::internal(
                 msg.clone(),
             ))),
             None => Ok(()),
         }
     }
-    async fn cancel(&self) -> Result<(), AppError> {
+    async fn cancel(&self) -> Result<(), AgentError> {
         Ok(())
     }
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         Ok(())
     }
 }
@@ -175,10 +176,10 @@ impl IMockAgent for RecordingAgent {
         let _ = approval_key(Some(action), command_type);
         false
     }
-    fn confirm(&self, _: &str, _: &str, _: Value, _: bool) -> Result<(), AppError> {
+    fn confirm(&self, _: &str, _: &str, _: Value, _: bool) -> Result<(), AgentError> {
         Ok(())
     }
-    async fn mode(&self) -> Result<AgentModeResponse, AppError> {
+    async fn mode(&self) -> Result<AgentModeResponse, AgentError> {
         Ok(AgentModeResponse {
             mode: "default".to_owned(),
             initialized: false,
@@ -217,12 +218,12 @@ impl aionui_ai_agent::IWorkerTaskManager for StubTaskManager {
         self.tasks.lock().unwrap().get(conversation_id).cloned()
     }
 
-    async fn get_or_build_task(&self, _: &str, _: BuildTaskOptions) -> Result<AgentInstance, AppError> {
-        Err(AppError::Internal(
-            "StubTaskManager does not support get_or_build_task".into(),
+    async fn get_or_build_task(&self, _: &str, _: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
+        Err(AgentError::internal(
+            "StubTaskManager does not support get_or_build_task",
         ))
     }
-    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+    fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         self.kill_calls
             .lock()
             .unwrap()

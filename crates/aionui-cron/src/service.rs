@@ -6,7 +6,9 @@ use aionui_api_types::{
     CreateCronJobRequest, CronJobResponse, CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse,
     SaveCronSkillRequest, UpdateCronJobRequest,
 };
-use aionui_common::{AgentType, AppError, generate_prefixed_id, now_ms, workspace_path_has_whitespace_segment};
+use aionui_common::{
+    AgentType, WorkspacePathValidationError, generate_prefixed_id, now_ms, validate_workspace_path_availability,
+};
 use aionui_db::{ICronRepository, UpdateCronJobParams};
 use tracing::{error, info, warn};
 
@@ -33,6 +35,7 @@ const PLACEHOLDER_PATTERNS: &[&str] = &[
     "write your",
     "put your",
 ];
+const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 
 #[derive(Clone)]
 pub struct CronService {
@@ -67,6 +70,7 @@ impl CronService {
     pub async fn add_job(&self, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
         let schedule = schedule_from_dto(&req.schedule);
         validate_schedule(&schedule)?;
+        reject_deprecated_new_conversation_agent_type(&req.agent_type)?;
         validate_aionrs_agent_config(&req.agent_type, req.agent_config.as_ref())?;
 
         let execution_mode = parse_execution_mode(req.execution_mode.as_deref())?;
@@ -133,6 +137,7 @@ impl CronService {
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(existing_row)?;
+        reject_deprecated_new_conversation_agent_type(&job.agent_type)?;
 
         if let Some(name) = &req.name {
             job.name = name.clone();
@@ -483,15 +488,15 @@ impl CronService {
 
     async fn validate_job_workspace(&self, job: &CronJob) -> Result<(), CronError> {
         let workspace = self.executor.resolve_job_workspace_raw(job).await?;
-        if workspace.trim().is_empty() {
-            return Ok(());
+        match validate_workspace_path_availability(&workspace) {
+            Ok(_) => Ok(()),
+            Err(WorkspacePathValidationError::Empty) => Ok(()),
+            Err(WorkspacePathValidationError::DoesNotExist(path))
+            | Err(WorkspacePathValidationError::NotDirectory(path))
+            | Err(WorkspacePathValidationError::NotAccessible { path, .. }) => {
+                Err(CronError::WorkspacePathUnavailable(path))
+            }
         }
-
-        if workspace_path_has_whitespace_segment(Path::new(&workspace)) {
-            return Err(CronError::App(AppError::WorkspacePathContainsWhitespace(workspace)));
-        }
-
-        Ok(())
     }
 
     async fn handle_execution_result(&self, job: CronJob, result: ExecutionResult) {
@@ -1123,6 +1128,14 @@ fn validate_aionrs_agent_config(
         return Err(CronError::InvalidAgentConfig(
             "aionrs cron jobs require agent_config.backend (provider_id)".into(),
         ));
+    }
+    Ok(())
+}
+
+fn reject_deprecated_new_conversation_agent_type(agent_type: &str) -> Result<(), CronError> {
+    let parsed = serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type.to_owned())).ok();
+    if parsed.is_some_and(|agent_type| agent_type.is_deprecated_runtime()) {
+        return Err(CronError::InvalidAgentConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
     }
     Ok(())
 }

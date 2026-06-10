@@ -4,7 +4,7 @@
 //! is spawned** (including the tokio runtime). It rewrites
 //! `std::env::var("PATH")` to include:
 //!
-//! 1. The bundled bun directory (highest priority).
+//! 1. An explicit bun override directory, if configured.
 //! 2. Platform extra bins (`~/.bun/bin`, `~/.cargo/bin`, etc.).
 //! 3. The current `PATH` (inherited from the launching process).
 //! 4. The login-shell `PATH` (Unix only, 3s timeout) — fixes
@@ -38,7 +38,7 @@ pub unsafe fn enhance_process_path() -> String {
         tracing::info!(
             login = login.is_some(),
             extra_bin_count = extras.len(),
-            bun_bundled = bun_dir.is_some(),
+            bun_injected = bun_dir.is_some(),
             original_len = current.len(),
             merged_len = merged.len(),
             "PATH enhanced at startup"
@@ -355,9 +355,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn login_shell_path_returns_none_without_shell_var() {
-        // SAFETY: single-threaded test process.
-        unsafe {
-            std::env::remove_var("SHELL");
+        if !run_in_env_child(
+            "shell_env::tests::login_shell_path_returns_none_without_shell_var",
+            &[],
+            &["SHELL"],
+        ) {
+            return;
         }
         let result = login_shell_path();
         assert!(result.is_none());
@@ -366,30 +369,60 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn login_shell_path_rejects_relative_shell() {
-        // SAFETY: single-threaded test process.
-        unsafe {
-            std::env::set_var("SHELL", "sh");
+        if !run_in_env_child(
+            "shell_env::tests::login_shell_path_rejects_relative_shell",
+            &[("SHELL", "sh")],
+            &[],
+        ) {
+            return;
         }
         let result = login_shell_path();
         assert!(result.is_none());
-        unsafe {
-            std::env::remove_var("SHELL");
-        }
     }
 
     #[cfg(unix)]
     #[test]
     fn login_shell_path_roundtrip_with_sh() {
-        // SAFETY: single-threaded test process.
-        unsafe {
-            std::env::set_var("SHELL", "/bin/sh");
+        if !run_in_env_child(
+            "shell_env::tests::login_shell_path_roundtrip_with_sh",
+            &[("SHELL", "/bin/sh")],
+            &[],
+        ) {
+            return;
         }
         let result = login_shell_path();
         assert!(result.is_some(), "login shell probe should return Some");
         let path = result.unwrap();
         assert!(!path.is_empty(), "login shell PATH should not be empty");
-        unsafe {
-            std::env::remove_var("SHELL");
+    }
+
+    #[cfg(unix)]
+    fn run_in_env_child(test_name: &str, envs: &[(&str, &str)], removals: &[&str]) -> bool {
+        const CHILD_ENV: &str = "AIONUI_RUNTIME_SHELL_ENV_TEST_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            return true;
         }
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1");
+        for key in removals {
+            command.env_remove(key);
+        }
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
     }
 }

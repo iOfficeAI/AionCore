@@ -4,68 +4,51 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_common::{AppError, workspace_path_has_whitespace_segment};
-use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::{Mutex, broadcast, watch};
-use tracing::{debug, error, warn};
+use tokio::sync::{Mutex, watch};
+use tracing::{debug, warn};
 
-mod spawn_legacy;
+use crate::error::AgentError;
+
 mod spawn_sdk;
 mod stderr_monitor;
 
 use stderr_monitor::force_kill;
 
-/// Wrapper to hold a pre-subscribed receiver from before background tasks start.
-/// Ensures no events are lost between process spawn and consumer subscription.
-type InitialReceiver = std::sync::Mutex<Option<broadcast::Receiver<serde_json::Value>>>;
-
-/// Default broadcast channel capacity for stdout events.
-pub(super) const EVENT_CHANNEL_CAPACITY: usize = 256;
-
 /// Maximum stderr ring-buffer size in bytes.
 pub(super) const STDERR_BUFFER_MAX: usize = 8192;
 
-pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AppError> {
-    if cwd.trim().is_empty() {
-        return Err(AppError::BadRequest("Workspace directory is empty".into()));
-    }
-
-    let workspace_path = PathBuf::from(cwd);
-    if workspace_path_has_whitespace_segment(&workspace_path) {
-        return Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(
-            workspace_path.display().to_string(),
-        ));
-    }
-
-    match fs::metadata(&workspace_path) {
-        Ok(metadata) if metadata.is_dir() => Ok(workspace_path),
-        Ok(_) => Err(AppError::BadRequest(format!(
-            "Workspace path is not a directory: {}",
-            workspace_path.display()
-        ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::BadRequest(format!(
-            "Workspace directory does not exist: {}",
-            workspace_path.display()
-        ))),
-        Err(e) => Err(AppError::BadRequest(format!(
-            "Workspace directory is not accessible: {}: {}",
-            workspace_path.display(),
-            e
-        ))),
+/// Trim `buf` from the front so it holds at most the last `max` bytes.
+///
+/// The raw cut point can land inside a multi-byte UTF-8 character, where
+/// `String::drain` would panic; rounding up to the next char boundary keeps
+/// the buffer valid and never exceeds `max` (issue #392).
+pub(super) fn trim_to_tail(buf: &mut String, max: usize) {
+    if buf.len() > max {
+        let cut = buf.ceil_char_boundary(buf.len() - max);
+        buf.drain(..cut);
     }
 }
 
-/// Manages a CLI subprocess with optional JSON-over-stdin/stdout communication.
+pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AgentError> {
+    if cwd.trim().is_empty() {
+        return Err(AgentError::bad_request("Workspace directory is empty"));
+    }
+
+    let workspace_path = PathBuf::from(cwd);
+    match fs::metadata(&workspace_path) {
+        Ok(metadata) if metadata.is_dir() => Ok(workspace_path),
+        Ok(_) | Err(_) => Err(AgentError::workspace_path_runtime_unavailable(
+            workspace_path.display().to_string(),
+        )),
+    }
+}
+
+/// Manages a CLI subprocess used by SDK-based agent transports.
 ///
-/// Supports two modes:
-///
-/// 1. **Legacy mode** (Gemini, OpenClaw, Nanobot): stdout is read as line-delimited
-///    JSON and broadcast via `subscribe()`. Messages are sent via `send()`.
-///
-/// 2. **SDK mode** (ACP): call [`take_stdio`](Self::take_stdio) to hand raw
-///    stdin/stdout to the ACP SDK transport. After this, `send()` and `subscribe()`
-///    are no longer available.
+/// ACP sessions call [`take_stdio`](Self::take_stdio) to hand raw stdin/stdout
+/// to the ACP SDK transport. Aionrs uses its own manager and does not rely on
+/// line-delimited legacy JSON mode.
 pub struct CliAgentProcess {
     /// Stdin writer, wrapped in Mutex for concurrent send safety.
     /// Set to `None` once stdin is closed, taken, or process exited.
@@ -78,19 +61,11 @@ pub struct CliAgentProcess {
     /// Process group ID captured at spawn time so teardown can still target
     /// the whole tree after the direct child exits.
     process_group_id: Option<u32>,
-    /// Broadcast sender for parsed stdout events (legacy mode only).
-    #[allow(dead_code)] // Part of the complete CliProcess API; used in legacy mode via subscribe()
-    event_tx: broadcast::Sender<serde_json::Value>,
     /// Watch channel that transitions from `None` → `Some(ExitStatus)` on exit.
     exit_rx: watch::Receiver<Option<ExitStatus>>,
-    /// Pre-subscribed receiver created before background tasks start (legacy mode).
-    /// Take this via [`take_initial_receiver`] to guarantee no events are lost.
-    initial_rx: InitialReceiver,
     /// Stderr ring buffer for diagnostics.
     #[allow(dead_code)] // Read via take_stderr(); part of diagnostics API for startup crash reporting
     stderr_buffer: Arc<Mutex<String>>,
-    /// Handle to the stdout reader task (legacy mode, for cleanup).
-    _stdout_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     /// Handle to the stderr reader task (for cleanup).
     _stderr_handle: Arc<tokio::task::JoinHandle<()>>,
     /// Handle to the exit monitor task (for cleanup).
@@ -109,52 +84,6 @@ impl CliAgentProcess {
         Some((stdin, stdout))
     }
 
-    /// Send a JSON message to the subprocess via stdin (legacy mode).
-    ///
-    /// The message is serialized as a single line followed by a newline.
-    /// Returns an error if stdin has been closed (process exited) or taken
-    /// by [`take_stdio`](Self::take_stdio).
-    pub async fn send(&self, message: &serde_json::Value) -> Result<(), AppError> {
-        let mut guard = self.stdin.lock().await;
-        let stdin = guard
-            .as_mut()
-            .ok_or_else(|| AppError::Internal("Cannot send: stdin is closed (process exited or taken)".into()))?;
-
-        let mut buf =
-            serde_json::to_vec(message).map_err(|e| AppError::Internal(format!("Failed to serialize message: {e}")))?;
-        buf.push(b'\n');
-
-        stdin.write_all(&buf).await.map_err(|e| {
-            error!(pid = self.pid, error = %e, "Failed to write to stdin");
-            AppError::Internal(format!("Failed to write to stdin: {e}"))
-        })?;
-
-        stdin.flush().await.map_err(|e| {
-            error!(pid = self.pid, error = %e, "Failed to flush stdin");
-            AppError::Internal(format!("Failed to flush stdin: {e}"))
-        })?;
-
-        Ok(())
-    }
-
-    /// Subscribe to the event stream from stdout (legacy mode).
-    ///
-    /// Returns a broadcast receiver that yields raw `serde_json::Value` events
-    /// as they are parsed from the subprocess stdout.
-    #[allow(dead_code)] // Complete CliProcess API for legacy-mode event subscription
-    pub fn subscribe(&self) -> broadcast::Receiver<serde_json::Value> {
-        self.event_tx.subscribe()
-    }
-
-    /// Take the pre-subscribed receiver created before background tasks started
-    /// (legacy mode).
-    ///
-    /// This receiver captures all events from the very first output line.
-    /// Can only be called once; subsequent calls return `None`.
-    pub fn take_initial_receiver(&self) -> Option<broadcast::Receiver<serde_json::Value>> {
-        self.initial_rx.lock().unwrap().take()
-    }
-
     /// Close stdin, signaling the subprocess that no more input will arrive.
     pub async fn close_stdin(&self) {
         let mut guard = self.stdin.lock().await;
@@ -168,7 +97,7 @@ impl CliAgentProcess {
     /// 1. Close stdin
     /// 2. Wait up to `grace_period` for the process to exit on its own
     /// 3. If still running after grace period, send SIGKILL
-    pub async fn kill(&self, grace_period: Duration) -> Result<(), AppError> {
+    pub async fn kill(&self, grace_period: Duration) -> Result<(), AgentError> {
         // Close stdin first to signal the child
         self.close_stdin().await;
 
@@ -203,7 +132,7 @@ impl CliAgentProcess {
             let _ = rx.changed().await;
         })
         .await
-        .map_err(|_| AppError::Internal(format!("Process {} did not exit after force_kill", self.pid)))?;
+        .map_err(|_| AgentError::internal(format!("Process {} did not exit after force_kill", self.pid)))?;
 
         Ok(())
     }
@@ -255,6 +184,12 @@ impl CliAgentProcess {
         std::mem::take(&mut *buf)
     }
 
+    /// Clear the buffered stderr ring so subsequent peeks only observe lines
+    /// written after the caller opens a new diagnostics window.
+    pub async fn clear_stderr(&self) {
+        let _ = self.take_stderr().await;
+    }
+
     /// Peek the last `max_lines` newline-delimited lines from the stderr ring
     /// buffer **without draining**.
     ///
@@ -296,19 +231,10 @@ pub(super) fn tracked_process_group_id(_pid: u32) -> Option<u32> {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use aionui_common::{CommandSpec, EnvVar};
+    use aionui_common::CommandSpec;
 
     use super::*;
     use tokio::time::timeout;
-
-    pub(super) fn echo_json_config(json_str: &str) -> CommandSpec {
-        CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), format!("echo '{json_str}'")],
-            env: vec![],
-            cwd: None,
-        }
-    }
 
     pub(super) fn simple_script_config(script: &str) -> CommandSpec {
         CommandSpec {
@@ -319,12 +245,57 @@ pub(super) mod tests {
         }
     }
 
+    pub(super) async fn spawn_sdk_test_process(config: CommandSpec) -> CliAgentProcess {
+        let data_dir = tempfile::tempdir().unwrap();
+        CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap()
+    }
+
+    // ── trim_to_tail ─────────────────────────────────────────────────
+
+    #[test]
+    fn trim_to_tail_does_not_panic_when_cut_lands_inside_multibyte_char() {
+        // "ab" (2 bytes) + "中中中" (9 bytes) = 11 bytes; max 8 puts the raw
+        // cut point at byte 3, inside the first '中' (bytes 2..5).
+        let mut buf = String::from("ab中中中");
+        trim_to_tail(&mut buf, 8);
+        assert_eq!(buf, "中中");
+        assert!(buf.len() <= 8);
+    }
+
+    #[test]
+    fn trim_to_tail_keeps_exactly_max_bytes_for_ascii() {
+        let mut buf = String::from("abcdefghij");
+        trim_to_tail(&mut buf, 8);
+        assert_eq!(buf, "cdefghij");
+    }
+
+    #[test]
+    fn trim_to_tail_is_noop_when_under_max() {
+        let mut buf = String::from("short");
+        trim_to_tail(&mut buf, 8);
+        assert_eq!(buf, "short");
+    }
+
+    #[test]
+    fn trim_to_tail_never_exceeds_max_with_emoji_flood() {
+        // Regression for the production panic: emoji-rich stderr lines pushed
+        // the buffer over STDERR_BUFFER_MAX with cut points off-boundary.
+        let mut buf = String::new();
+        for _ in 0..600 {
+            buf.push_str("⚠️ API call failed 🌐\n");
+        }
+        let original = buf.clone();
+        trim_to_tail(&mut buf, STDERR_BUFFER_MAX);
+        assert!(buf.len() <= STDERR_BUFFER_MAX);
+        assert!(original.ends_with(buf.as_str()));
+    }
+
     // ── Lifecycle tests (apply to both modes) ────────────────────────
 
     #[tokio::test]
     async fn is_running_reflects_process_state() {
         let config = simple_script_config("sleep 10");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         assert!(proc.is_running());
         assert!(proc.exit_status().is_none());
@@ -339,7 +310,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn kill_with_grace_period_exits_cleanly() {
         let config = simple_script_config("read line");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
         assert!(proc.is_running());
 
         proc.kill(Duration::from_secs(5)).await.unwrap();
@@ -349,7 +320,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn kill_force_kills_after_grace_period() {
         let config = simple_script_config("trap '' TERM; while true; do sleep 1; done");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
         assert!(proc.is_running());
 
         let result = proc.kill(Duration::from_millis(100)).await;
@@ -360,28 +331,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_with_env_and_cwd() {
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), "echo \"{\\\"val\\\":\\\"$MY_TEST_VAR\\\"}\"".into()],
-            env: vec![EnvVar {
-                name: "MY_TEST_VAR".into(),
-                value: "hello_env".into(),
-            }],
-            cwd: Some("/tmp".into()),
-        };
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
-        let mut rx = proc.subscribe();
-
-        let event = timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("Timed out")
-            .expect("Channel closed");
-        assert_eq!(event["val"], "hello_env");
-    }
-
-    #[tokio::test]
-    async fn spawn_rejects_cwd_with_trailing_whitespace_in_request() {
+    async fn spawn_rejects_unavailable_cwd_with_trailing_whitespace_in_request() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("workspace");
         fs::create_dir(&cwd).unwrap();
@@ -393,16 +343,16 @@ pub(super) mod tests {
             env: vec![],
             cwd: Some(cwd_with_trailing_space.clone()),
         };
-        let result = CliAgentProcess::spawn(config).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(matches!(
             result,
-            Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
-                if message == cwd_with_trailing_space
+            Err(AgentError::WorkspacePathRuntimeUnavailable(message)) if message == cwd_with_trailing_space
         ));
     }
 
     #[tokio::test]
-    async fn spawn_rejects_cwd_with_whitespace_in_any_segment() {
+    async fn spawn_allows_cwd_with_whitespace_in_any_segment() {
         let dir = tempfile::tempdir().unwrap();
         let workspace_parent = dir.path().join("my workspace");
         fs::create_dir(&workspace_parent).unwrap();
@@ -416,16 +366,12 @@ pub(super) mod tests {
             cwd: Some(cwd.to_string_lossy().into_owned()),
         };
 
-        let result = CliAgentProcess::spawn(config).await;
-        assert!(matches!(
-            result,
-            Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
-                if message == cwd.to_string_lossy()
-        ));
+        let proc = spawn_sdk_test_process(config).await;
+        proc.kill(Duration::from_millis(100)).await.unwrap();
     }
 
     #[tokio::test]
-    async fn spawn_for_sdk_rejects_cwd_with_whitespace_in_any_segment() {
+    async fn spawn_for_sdk_allows_cwd_with_whitespace_in_any_segment() {
         let dir = tempfile::tempdir().unwrap();
         let workspace_parent = dir.path().join("my workspace");
         fs::create_dir(&workspace_parent).unwrap();
@@ -440,12 +386,8 @@ pub(super) mod tests {
             cwd: Some(cwd.to_string_lossy().into_owned()),
         };
 
-        let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
-        assert!(matches!(
-            result,
-            Err(AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message))
-                if message == cwd.to_string_lossy()
-        ));
+        let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
+        proc.kill(Duration::from_millis(100)).await.unwrap();
     }
 
     #[tokio::test]
@@ -461,10 +403,12 @@ pub(super) mod tests {
             cwd: Some(missing_cwd.to_string_lossy().into_owned()),
         };
 
-        let result = CliAgentProcess::spawn(config).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(matches!(
             result,
-            Err(AppError::BadRequest(message)) if message.contains("Workspace directory does not exist")
+            Err(AgentError::WorkspacePathRuntimeUnavailable(message))
+                if message == missing_cwd.to_string_lossy()
         ));
         assert!(!missing_cwd.exists());
     }
@@ -486,7 +430,8 @@ pub(super) mod tests {
         let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(matches!(
             result,
-            Err(AppError::BadRequest(message)) if message.contains("Workspace directory does not exist")
+            Err(AgentError::WorkspacePathRuntimeUnavailable(message))
+                if message == missing_cwd.to_string_lossy()
         ));
         assert!(!missing_cwd.exists());
     }
@@ -499,14 +444,15 @@ pub(super) mod tests {
             env: vec![],
             cwd: None,
         };
-        let result = CliAgentProcess::spawn(config).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn pid_is_nonzero_for_valid_process() {
         let config = simple_script_config("sleep 10");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
         assert!(proc.pid() > 0);
         proc.kill(Duration::from_millis(100)).await.unwrap();
     }
@@ -514,7 +460,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn wait_for_exit_returns_immediately_if_already_exited() {
         let config = simple_script_config("true");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         let status1 = timeout(Duration::from_secs(5), proc.wait_for_exit())
             .await
@@ -525,26 +471,5 @@ pub(super) mod tests {
             .await
             .expect("Should return immediately");
         assert!(status2.is_some());
-    }
-
-    #[tokio::test]
-    async fn multiple_subscribers_receive_same_events() {
-        let config = echo_json_config(r#"{"type":"broadcast","data":{"msg":"all"}}"#);
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
-
-        let mut rx1 = proc.subscribe();
-        let mut rx2 = proc.subscribe();
-
-        let e1 = timeout(Duration::from_secs(5), rx1.recv())
-            .await
-            .expect("Timed out")
-            .expect("Channel closed");
-        let e2 = timeout(Duration::from_secs(5), rx2.recv())
-            .await
-            .expect("Timed out")
-            .expect("Channel closed");
-
-        assert_eq!(e1, e2);
-        assert_eq!(e1["type"], "broadcast");
     }
 }

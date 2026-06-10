@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,7 +8,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use dashmap::DashMap;
 
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
 use crate::error::AuthError;
 use crate::extract::extract_client_ip;
@@ -151,9 +153,9 @@ pub async fn auth_rate_limit_middleware(
     State(limiter): State<Arc<RateLimiter>>,
     request: Request,
     next: Next,
-) -> Result<Response, AppError> {
+) -> Result<Response, ApiError> {
     let ip = extract_client_ip(&request);
-    limiter.check(&ip).map_err(AppError::from)?;
+    limiter.check(&ip).map_err(ApiError::from)?;
 
     let response = next.run(request).await;
 
@@ -169,9 +171,9 @@ pub async fn api_rate_limit_middleware(
     State(limiter): State<Arc<RateLimiter>>,
     request: Request,
     next: Next,
-) -> Result<Response, AppError> {
+) -> Result<Response, ApiError> {
     let ip = extract_client_ip(&request);
-    limiter.check_and_increment(&ip).map_err(AppError::from)?;
+    limiter.check_and_increment(&ip).map_err(ApiError::from)?;
     Ok(next.run(request).await)
 }
 
@@ -183,13 +185,13 @@ pub async fn authenticated_action_rate_limit_middleware(
     State(limiter): State<Arc<RateLimiter>>,
     request: Request,
     next: Next,
-) -> Result<Response, AppError> {
+) -> Result<Response, ApiError> {
     let key = request
         .extensions()
         .get::<CurrentUser>()
         .map(|u| format!("user:{}", u.id))
         .unwrap_or_else(|| format!("ip:{}", extract_client_ip(&request)));
-    limiter.check_and_increment(&key).map_err(AppError::from)?;
+    limiter.check_and_increment(&key).map_err(ApiError::from)?;
     Ok(next.run(request).await)
 }
 

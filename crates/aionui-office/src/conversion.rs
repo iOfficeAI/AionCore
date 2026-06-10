@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aionui_api_types::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionResponse, ExcelSheetData,
@@ -10,6 +10,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::error::OfficeError;
+use crate::officecli_runtime::resolve_officecli_path;
 
 pub struct ConversionService {
     officecli_path: Option<String>,
@@ -17,6 +18,10 @@ pub struct ConversionService {
 
 impl ConversionService {
     pub fn new(officecli_path: Option<String>) -> Self {
+        Self { officecli_path }
+    }
+
+    pub fn with_data_dir(officecli_path: Option<String>, _data_dir: PathBuf) -> Self {
         Self { officecli_path }
     }
 
@@ -233,12 +238,12 @@ async fn resolve_officecli(configured_path: &Option<String>) -> Result<String, O
         return Ok(path.clone());
     }
 
-    if let Some(found) = find_executable("officecli") {
-        return Ok(found);
+    if let Some(path) = resolve_officecli_path() {
+        return Ok(path.to_string_lossy().into_owned());
     }
 
     Err(OfficeError::ToolNotFound(
-        "officecli not installed. Install it to enable PPT → JSON conversion".into(),
+        "officecli not installed. Install iOfficeAI/OfficeCli to enable PPT -> JSON conversion".into(),
     ))
 }
 
@@ -311,6 +316,23 @@ mod tests {
 
         let svc = ConversionService::new(Some("/usr/local/bin/officecli".into()));
         assert_eq!(svc.officecli_path.as_deref(), Some("/usr/local/bin/officecli"));
+
+        let svc = ConversionService::with_data_dir(None, PathBuf::from("/tmp/aionui"));
+        assert!(svc.officecli_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_officecli_without_config_ignores_legacy_managed_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy_bin = ["runtime", "node", "tools", "officecli", "bin", "officecli"]
+            .into_iter()
+            .fold(tmp.path().to_path_buf(), |path, segment| path.join(segment));
+        std::fs::create_dir_all(legacy_bin.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        if let Ok(resolved) = resolve_officecli(&None).await {
+            assert_ne!(resolved, legacy_bin.to_string_lossy());
+        }
     }
 
     #[tokio::test]

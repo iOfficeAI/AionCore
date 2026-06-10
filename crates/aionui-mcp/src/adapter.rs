@@ -42,7 +42,7 @@ pub struct DetectedServer {
 ///
 /// # Error handling
 ///
-/// Methods return `McpError` rather than `AppError` to keep the adapter
+/// Methods return `McpError` rather than `ApiError` to keep the adapter
 /// layer independent of HTTP concerns.
 #[async_trait::async_trait]
 pub trait McpAgentAdapter: Send + Sync {

@@ -5,11 +5,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aionui_common::{AgentType, AppError, ErrorChain};
+use aionui_common::{AgentType, ErrorChain};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::capability::cli_process::CliAgentProcess;
+use crate::error::AgentError;
 
 pub(crate) const AGENT_PROCESS_REGISTRY_RELATIVE_PATH: &str = "runtime/agent-process-registry.json";
 
@@ -55,7 +56,7 @@ pub(crate) fn register_session_process(
     agent_type: AgentType,
     backend: Option<String>,
     command_preview: Option<String>,
-) -> Result<(), AppError> {
+) -> Result<(), AgentError> {
     let pid = process.pid();
     let process_group_id = process.process_group_id();
     let entry = RegisteredAgentProcess {
@@ -69,7 +70,7 @@ pub(crate) fn register_session_process(
     };
 
     register_agent_process(data_dir, entry).map_err(|e| {
-        AppError::Internal(format!(
+        AgentError::internal(format!(
             "Failed to register agent process {pid} in runtime registry: {e}"
         ))
     })?;

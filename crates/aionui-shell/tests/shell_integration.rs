@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use std::sync::Arc;
 
 use aionui_api_types::ToolType;
@@ -162,25 +164,25 @@ async fn open_external_javascript_scheme_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Error conversion: ShellError → AppError mapping
+// Error conversion: ShellError → ApiError mapping
 // ---------------------------------------------------------------------------
 #[test]
-fn shell_error_converts_to_app_error() {
-    use aionui_common::AppError;
+fn shell_error_converts_to_api_error() {
+    use aionui_common::ApiError;
     use aionui_shell::ShellError;
 
-    let err: AppError = ShellError::FileNotFound("/tmp/x".into()).into();
-    assert!(matches!(err, AppError::BadRequest(_)));
+    let err: ApiError = ShellError::FileNotFound("/tmp/x".into()).into();
+    assert!(matches!(err, ApiError::BadRequest(_)));
 
-    let err: AppError = ShellError::DirectoryNotFound("/tmp/y".into()).into();
-    assert!(matches!(err, AppError::BadRequest(_)));
+    let err: ApiError = ShellError::DirectoryNotFound("/tmp/y".into()).into();
+    assert!(matches!(err, ApiError::BadRequest(_)));
 
-    let err: AppError = ShellError::InvalidUrl("bad".into()).into();
-    assert!(matches!(err, AppError::BadRequest(_)));
+    let err: ApiError = ShellError::InvalidUrl("bad".into()).into();
+    assert!(matches!(err, ApiError::BadRequest(_)));
 
-    let err: AppError = ShellError::ToolNotInstalled("vscode".into()).into();
-    assert!(matches!(err, AppError::BadRequest(_)));
+    let err: ApiError = ShellError::ToolNotInstalled("vscode".into()).into();
+    assert!(matches!(err, ApiError::BadRequest(_)));
 
-    let err: AppError = ShellError::CommandFailed("oops".into()).into();
-    assert!(matches!(err, AppError::Internal(_)));
+    let err: ApiError = ShellError::CommandFailed("oops".into()).into();
+    assert!(matches!(err, ApiError::Internal(_)));
 }

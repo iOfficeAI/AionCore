@@ -432,6 +432,26 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn desired_mode_changed_does_not_persist() {
+        let (_svc, repo) = setup().await;
+        let (tx, rx) = mpsc::channel(64);
+
+        let cid = "conv-1".to_owned();
+        tokio::spawn(domain_event_consumer(cid, rx, repo.clone()));
+
+        tx.send(AcpSessionEvent::DesiredModeChanged { mode: "plan".into() })
+            .await
+            .unwrap();
+
+        sleep(Duration::from_millis(700)).await;
+        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        assert!(
+            state.current_mode_id.is_none(),
+            "DesiredModeChanged is reconcile/UI-only; persistence only follows Observed*",
+        );
+    }
+
     /// ObservedContextUsageChanged persists the usage blob so resume
     /// paths can preload `advertised.context_usage` before the CLI's
     /// first notification arrives.

@@ -159,6 +159,8 @@ pub struct TestMcpConnectionRequest {
     pub id: Option<String>,
     pub name: String,
     pub transport: McpTransport,
+    #[serde(default)]
+    pub runtime_scope_id: Option<String>,
 }
 
 /// Authentication method detected during connection test.

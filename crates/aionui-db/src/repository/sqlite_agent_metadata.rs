@@ -255,8 +255,8 @@ mod tests {
     async fn seed_rows_populated_after_migrations() {
         let (repo, _db) = setup().await;
         let rows = repo.list_all().await.unwrap();
-        // 17 ACP vendors + 2 non-ACP builtins + 1 internal = 20.
-        assert_eq!(rows.len(), 20);
+        // 18 ACP vendors + 2 non-ACP builtins + 1 internal = 21.
+        assert_eq!(rows.len(), 21);
         assert!(
             rows.iter()
                 .any(|r| r.name == "Claude Code" && r.agent_source == "builtin")
@@ -267,7 +267,19 @@ mod tests {
         );
         // Nanobot and OpenClaw are builtin (not internal).
         assert!(rows.iter().any(|r| r.name == "Nanobot" && r.agent_source == "builtin"));
-        assert!(rows.iter().any(|r| r.name == "OpenClaw" && r.agent_source == "builtin"));
+        assert!(rows.iter().any(|r| r.name == "OpenClaw"
+            && r.agent_type == "acp"
+            && r.backend.as_deref() == Some("openclaw")
+            && r.agent_source == "builtin"));
+        assert!(
+            rows.iter()
+                .any(|r| r.name == "OpenClaw" && r.agent_type == "openclaw-gateway" && r.agent_source == "builtin")
+        );
+        let hermes = rows
+            .iter()
+            .find(|r| r.name == "Hermes" && r.agent_source == "builtin")
+            .expect("seeded hermes row");
+        assert_eq!(hermes.yolo_id, None);
     }
 
     #[tokio::test]
@@ -294,6 +306,32 @@ mod tests {
 
         let kiro = repo.get("e044000d").await.unwrap().expect("seeded kiro row");
         assert!(kiro.icon.is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_managed_acp_rows_drop_runtime_bridge_command() {
+        let (repo, _db) = setup().await;
+
+        let claude = repo.get("2d23ff1c").await.unwrap().expect("seeded claude row");
+        assert!(claude.command.is_none());
+        assert_eq!(claude.args.as_deref(), Some(r#"[]"#));
+        assert_eq!(claude.agent_source_info.as_deref(), Some(r#"{"binary_name":"claude"}"#));
+
+        let codex = repo.get("8e1acf31").await.unwrap().expect("seeded codex row");
+        assert!(codex.command.is_none());
+        assert_eq!(codex.args.as_deref(), Some(r#"[]"#));
+        assert_eq!(codex.agent_source_info.as_deref(), Some(r#"{"binary_name":"codex"}"#));
+
+        let codebuddy = repo.get("8b20fd41").await.unwrap().expect("seeded codebuddy row");
+        assert_eq!(codebuddy.command.as_deref(), Some("npx"));
+        assert_eq!(
+            codebuddy.args.as_deref(),
+            Some(r#"["-y","--package","@tencent-ai/codebuddy-code@2.97.0","codebuddy","--acp"]"#)
+        );
+        assert_eq!(
+            codebuddy.agent_source_info.as_deref(),
+            Some(r#"{"binary_name":"codebuddy","bridge_binary":"npx"}"#)
+        );
     }
 
     #[tokio::test]

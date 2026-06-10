@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
@@ -5,33 +7,44 @@ use axum::http::StatusCode;
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
-    ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CloneConversationRequest,
-    ConfirmRequest, ConfirmationListResponse, ConversationArtifactListResponse, ConversationArtifactResponse,
-    ConversationListResponse, ConversationResponse, CreateConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
+    CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
+    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
+    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
-use aionui_common::AppError;
+use aionui_common::ApiError;
 
 use crate::ConversationError;
 use crate::state::ConversationRouterState;
 
-impl From<ConversationError> for AppError {
+impl From<ConversationError> for ApiError {
     fn from(error: ConversationError) -> Self {
         match error {
-            ConversationError::NotFound { id } => AppError::NotFound(format!("Conversation {id} not found")),
-            ConversationError::MessageNotFound { id } => AppError::NotFound(format!("Message {id} not found")),
-            ConversationError::ArtifactNotFound { id } => AppError::NotFound(format!("Artifact {id} not found")),
+            ConversationError::NotFound { id } => ApiError::NotFound(format!("Conversation {id} not found")),
+            ConversationError::MessageNotFound { id } => ApiError::NotFound(format!("Message {id} not found")),
+            ConversationError::ArtifactNotFound { id } => ApiError::NotFound(format!("Artifact {id} not found")),
             ConversationError::ActiveAgentNotFound { .. } => {
-                AppError::NotFound("No active agent for this conversation".into())
+                ApiError::NotFound("No active agent for this conversation".into())
             }
-            ConversationError::Archived { reason, .. } => AppError::ConversationArchived(reason),
-            ConversationError::BadRequest { reason } => AppError::BadRequest(reason),
-            ConversationError::Busy { reason } => AppError::Conflict(reason),
-            ConversationError::Forbidden { reason } => AppError::Forbidden(reason),
-            ConversationError::Acp(_) => AppError::BadGateway("Agent protocol error".into()),
-            ConversationError::App(error) => error,
+            ConversationError::Archived { reason, .. } => ApiError::ConversationArchived(reason),
+            ConversationError::BadRequest { reason } => ApiError::BadRequest(reason),
+            ConversationError::Busy { reason } => ApiError::Conflict(reason),
+            ConversationError::Forbidden { reason } => ApiError::Forbidden(reason),
+            ConversationError::NotFoundReason { reason } => ApiError::NotFound(reason),
+            ConversationError::Unauthorized { reason } => ApiError::Unauthorized(reason),
+            ConversationError::RateLimited => ApiError::RateLimited,
+            ConversationError::BadGateway { reason } => ApiError::BadGateway(reason),
+            ConversationError::Timeout { reason } => ApiError::Timeout(reason),
+            ConversationError::Unprocessable { reason } => ApiError::UnprocessableEntity(reason),
+            ConversationError::Internal { reason } => ApiError::Internal(reason),
+            ConversationError::WorkspacePathUnavailable { path } => ApiError::WorkspacePathUnavailable(path),
+            ConversationError::WorkspacePathRuntimeUnavailable { path } => {
+                ApiError::WorkspacePathRuntimeUnavailable(path)
+            }
+            ConversationError::Acp(_) => ApiError::BadGateway("Agent protocol error".into()),
         }
     }
 }
@@ -67,9 +80,9 @@ async fn create(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateConversationRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let conversation = state.service.create(&user.id, req).await.map_err(AppError::from)?;
+) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let conversation = state.service.create(&user.id, req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }
 
@@ -77,8 +90,8 @@ async fn list(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Query(query): Query<ListConversationsQuery>,
-) -> Result<Json<ApiResponse<ConversationListResponse>>, AppError> {
-    let result = state.service.list(&user.id, query).await.map_err(AppError::from)?;
+) -> Result<Json<ApiResponse<ConversationListResponse>>, ApiError> {
+    let result = state.service.list(&user.id, query).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -86,13 +99,13 @@ async fn clone(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CloneConversationRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
     let conversation = state
         .service
         .clone_create(&user.id, req)
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }
 
@@ -100,8 +113,8 @@ async fn get_one(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<ConversationResponse>>, AppError> {
-    let conversation = state.service.get(&user.id, &id).await.map_err(AppError::from)?;
+) -> Result<Json<ApiResponse<ConversationResponse>>, ApiError> {
+    let conversation = state.service.get(&user.id, &id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(conversation)))
 }
 
@@ -110,13 +123,13 @@ async fn update(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<UpdateConversationRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<ConversationResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<ConversationResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
     let conversation = state
         .service
         .update(&user.id, &id, req, &state.task_manager)
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(conversation)))
 }
 
@@ -124,8 +137,8 @@ async fn delete_one(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.delete(&user.id, &id).await.map_err(AppError::from)?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state.service.delete(&user.id, &id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -133,8 +146,8 @@ async fn reset(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.reset(&user.id, &id).await.map_err(AppError::from)?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state.service.reset(&user.id, &id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -142,12 +155,12 @@ async fn associated(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<Vec<ConversationResponse>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<ConversationResponse>>>, ApiError> {
     let items = state
         .service
         .list_associated(&user.id, &id)
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(items)))
 }
 
@@ -156,12 +169,12 @@ async fn list_msg(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     Query(query): Query<ListMessagesQuery>,
-) -> Result<Json<ApiResponse<MessageListResponse>>, AppError> {
+) -> Result<Json<ApiResponse<MessageListResponse>>, ApiError> {
     let result = state
         .service
         .list_messages(&user.id, &id, query)
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -176,12 +189,12 @@ async fn get_msg(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(params): Path<MessagePathParams>,
-) -> Result<Json<ApiResponse<MessageResponse>>, AppError> {
+) -> Result<Json<ApiResponse<MessageResponse>>, ApiError> {
     let result = state
         .service
         .get_message(&user.id, &params.id, &params.message_id)
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -190,29 +203,26 @@ async fn send_msg(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SendMessageRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let msg_id = state
+) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state
         .service
         .send_message(&user.id, &id, req, &state.task_manager)
         .await
-        .map_err(AppError::from)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(SendMessageResponse { msg_id })),
-    ))
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
 }
 
 async fn list_artifacts(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<ConversationArtifactListResponse>>, AppError> {
+) -> Result<Json<ApiResponse<ConversationArtifactListResponse>>, ApiError> {
     let result = state
         .service
         .list_artifacts(&user.id, &id)
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -228,13 +238,13 @@ async fn update_artifact(
     Extension(user): Extension<CurrentUser>,
     Path(params): Path<ArtifactPathParams>,
     body: Result<Json<UpdateConversationArtifactRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<ConversationArtifactResponse>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<ConversationArtifactResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
     let artifact = state
         .service
         .update_artifact(&user.id, &params.id, &params.artifact_id, req)
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(artifact)))
 }
 
@@ -242,25 +252,27 @@ async fn cancel(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    state
+    body: Result<Json<CancelConversationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<CancelConversationResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state
         .service
-        .cancel(&user.id, &id, &state.task_manager)
+        .cancel(&user.id, &id, &req.turn_id, &state.task_manager)
         .await
-        .map_err(AppError::from)?;
-    Ok(Json(ApiResponse::success()))
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 async fn warmup(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
+) -> Result<Json<ApiResponse<()>>, ApiError> {
     state
         .service
         .warmup(&user.id, &id, &state.task_manager)
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -268,12 +280,12 @@ async fn search_messages(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Query(query): Query<SearchMessagesQuery>,
-) -> Result<Json<ApiResponse<MessageSearchResponse>>, AppError> {
+) -> Result<Json<ApiResponse<MessageSearchResponse>>, ApiError> {
     let result = state
         .service
         .search_messages(&user.id, query)
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -283,12 +295,12 @@ async fn list_confirmations(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<ConfirmationListResponse>>, AppError> {
+) -> Result<Json<ApiResponse<ConfirmationListResponse>>, ApiError> {
     let items = state
         .service
         .list_confirmations(&user.id, &id, &state.task_manager)
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(items)))
 }
 
@@ -304,13 +316,13 @@ async fn confirm(
     Extension(user): Extension<CurrentUser>,
     Path(params): Path<ConfirmPathParams>,
     body: Result<Json<ConfirmRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
     state
         .service
         .confirm(&user.id, &params.id, &params.call_id, req, &state.task_manager)
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -319,9 +331,9 @@ async fn check_approval(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     Query(query): Query<ApprovalCheckQuery>,
-) -> Result<Json<ApiResponse<ApprovalCheckResponse>>, AppError> {
+) -> Result<Json<ApiResponse<ApprovalCheckResponse>>, ApiError> {
     if query.action.trim().is_empty() {
-        return Err(AppError::BadRequest("action must not be empty".into()));
+        return Err(ApiError::BadRequest("action must not be empty".into()));
     }
 
     let result = state
@@ -334,14 +346,14 @@ async fn check_approval(
             &state.task_manager,
         )
         .await
-        .map_err(AppError::from)?;
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
 async fn active_count(
     State(state): State<ConversationRouterState>,
     Extension(_user): Extension<CurrentUser>,
-) -> Result<Json<ApiResponse<ActiveCountResponse>>, AppError> {
+) -> Result<Json<ApiResponse<ActiveCountResponse>>, ApiError> {
     let count = state.task_manager.active_count();
     Ok(Json(ApiResponse::ok(ActiveCountResponse { count })))
 }
@@ -352,49 +364,49 @@ mod error_mapping_tests {
 
     #[test]
     fn conversation_not_found_maps_to_app_not_found() {
-        let app = AppError::from(ConversationError::NotFound { id: "conv_1".into() });
-        assert!(matches!(app, AppError::NotFound(message) if message == "Conversation conv_1 not found"));
+        let app = ApiError::from(ConversationError::NotFound { id: "conv_1".into() });
+        assert!(matches!(app, ApiError::NotFound(message) if message == "Conversation conv_1 not found"));
     }
 
     #[test]
     fn conversation_archived_maps_to_app_conversation_archived() {
-        let app = AppError::from(ConversationError::Archived {
+        let app = ApiError::from(ConversationError::Archived {
             id: "conv_1".into(),
             reason: "legacy runtime".into(),
         });
-        assert!(matches!(app, AppError::ConversationArchived(message) if message == "legacy runtime"));
+        assert!(matches!(app, ApiError::ConversationArchived(message) if message == "legacy runtime"));
     }
 
     #[test]
     fn message_not_found_maps_to_app_not_found() {
-        let app = AppError::from(ConversationError::MessageNotFound { id: "msg_1".into() });
-        assert!(matches!(app, AppError::NotFound(message) if message == "Message msg_1 not found"));
+        let app = ApiError::from(ConversationError::MessageNotFound { id: "msg_1".into() });
+        assert!(matches!(app, ApiError::NotFound(message) if message == "Message msg_1 not found"));
     }
 
     #[test]
     fn artifact_not_found_maps_to_app_not_found() {
-        let app = AppError::from(ConversationError::ArtifactNotFound {
+        let app = ApiError::from(ConversationError::ArtifactNotFound {
             id: "artifact_1".into(),
         });
-        assert!(matches!(app, AppError::NotFound(message) if message == "Artifact artifact_1 not found"));
+        assert!(matches!(app, ApiError::NotFound(message) if message == "Artifact artifact_1 not found"));
     }
 
     #[test]
     fn active_agent_not_found_maps_to_app_not_found() {
-        let app = AppError::from(ConversationError::ActiveAgentNotFound {
+        let app = ApiError::from(ConversationError::ActiveAgentNotFound {
             conversation_id: "conv_1".into(),
         });
-        assert!(matches!(app, AppError::NotFound(message) if message == "No active agent for this conversation"));
+        assert!(matches!(app, ApiError::NotFound(message) if message == "No active agent for this conversation"));
     }
 
     #[test]
-    fn conversation_app_error_passthrough_preserves_special_codes() {
-        let app = AppError::from(ConversationError::from(
-            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported("/tmp/my project".into()),
-        ));
+    fn conversation_api_error_compat_preserves_special_codes() {
+        let app = ApiError::from(ConversationError::WorkspacePathRuntimeUnavailable {
+            path: "/tmp/my project".into(),
+        });
         assert!(matches!(
             app,
-            AppError::WorkspacePathContainsWhitespaceRuntimeUnsupported(message) if message == "/tmp/my project"
+            ApiError::WorkspacePathRuntimeUnavailable(message) if message == "/tmp/my project"
         ));
     }
 }

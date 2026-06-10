@@ -1,6 +1,7 @@
 use aionui_api_types::{GitHubReleaseAsset, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
-use aionui_common::AppError;
 use serde::Deserialize;
+
+use crate::error::SystemError;
 
 const DEFAULT_REPO: &str = "iOfficeAI/AionUi";
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -35,12 +36,12 @@ impl VersionCheckService {
     }
 
     /// Check for updates against GitHub Releases.
-    pub async fn check_update(&self, req: &UpdateCheckRequest) -> Result<UpdateCheckResult, AppError> {
+    pub async fn check_update(&self, req: &UpdateCheckRequest) -> Result<UpdateCheckResult, SystemError> {
         let repo = resolve_repo(req.repo.as_deref());
         let releases = self.fetch_releases(&repo).await?;
 
         let current = parse_version(&self.current_version)
-            .ok_or_else(|| AppError::Internal(format!("invalid current version: {}", self.current_version)))?;
+            .ok_or_else(|| SystemError::Internal(format!("invalid current version: {}", self.current_version)))?;
 
         let platform = crate::sysinfo::get_system_info();
         let best = find_best_release(
@@ -70,7 +71,7 @@ impl VersionCheckService {
     /// Requests up to 100 releases per page (GitHub max). For most repositories
     /// a single page is sufficient, but we follow `Link: <..>; rel="next"` headers
     /// to collect additional pages (up to 5 pages / 500 releases).
-    async fn fetch_releases(&self, repo: &str) -> Result<Vec<GitHubRelease>, AppError> {
+    async fn fetch_releases(&self, repo: &str) -> Result<Vec<GitHubRelease>, SystemError> {
         const PER_PAGE: u32 = 100;
         const MAX_PAGES: u32 = 5;
 
@@ -89,12 +90,12 @@ impl VersionCheckService {
                 .header("User-Agent", "aioncore")
                 .send()
                 .await
-                .map_err(|e| AppError::BadGateway(format!("GitHub API request failed: {e}")))?;
+                .map_err(|e| SystemError::BadGateway(format!("GitHub API request failed: {e}")))?;
 
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                return Err(AppError::BadGateway(format!("GitHub API returned {status}: {body}")));
+                return Err(SystemError::BadGateway(format!("GitHub API returned {status}: {body}")));
             }
 
             let has_next = resp
@@ -106,7 +107,7 @@ impl VersionCheckService {
             let batch: Vec<GitHubRelease> = resp
                 .json()
                 .await
-                .map_err(|e| AppError::BadGateway(format!("Failed to parse GitHub releases: {e}")))?;
+                .map_err(|e| SystemError::BadGateway(format!("Failed to parse GitHub releases: {e}")))?;
 
             let batch_len = batch.len();
             all_releases.extend(batch);

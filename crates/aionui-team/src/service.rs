@@ -9,7 +9,10 @@ use aionui_api_types::{
     AddAgentRequest, CreateConversationRequest, CreateTeamRequest, GuideMcpConfig, TeamAgentResponse, TeamMcpPhase,
     TeamMcpStatusPayload, TeamResponse, WebSocketMessage,
 };
-use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id, now_ms};
+use aionui_common::{
+    AgentKillReason, AgentType, ProviderWithModel, WorkspacePathValidationError, generate_id, now_ms,
+    validate_workspace_path_availability,
+};
 use aionui_conversation::ConversationService;
 use aionui_db::models::TeamRow;
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
@@ -22,6 +25,12 @@ use crate::error::TeamError;
 use crate::event_loop::AgentLoopContext;
 use crate::session::TeamSession;
 use crate::types::{Team, TeamAgent, TeammateRole};
+
+pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
+    if !workspace.trim().is_empty() {
+        extra["workspace"] = serde_json::Value::String(workspace.to_owned());
+    }
+}
 
 struct SessionEntry {
     session: Arc<TeamSession>,
@@ -138,6 +147,11 @@ impl TeamSessionService {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
         }
 
+        let shared_workspace = match req.workspace.as_deref() {
+            Some(workspace) if !workspace.is_empty() => Some(validate_create_workspace_path(workspace)?),
+            _ => None,
+        };
+
         let team_id = generate_id();
         let now = now_ms();
         let mut agents = Vec::with_capacity(req.agents.len());
@@ -190,9 +204,7 @@ impl TeamSessionService {
                         "backend": input.backend,
                         "session_mode": resolve_full_auto_mode(&input.backend),
                     });
-                    if let Some(ref ws) = req.workspace
-                        && !ws.is_empty()
-                    {
+                    if let Some(ref ws) = shared_workspace {
                         extra["workspace"] = serde_json::Value::String(ws.clone());
                     }
                     (
@@ -211,9 +223,7 @@ impl TeamSessionService {
                         "provider_id": provider_id,
                         "current_model_id": input.model.clone(),
                     });
-                    if let Some(ref ws) = req.workspace
-                        && !ws.is_empty()
-                    {
+                    if let Some(ref ws) = shared_workspace {
                         extra["workspace"] = serde_json::Value::String(ws.clone());
                     }
                     (None, extra)
@@ -255,7 +265,7 @@ impl TeamSessionService {
             id: team_id.clone(),
             user_id: user_id.to_owned(),
             name: req.name.clone(),
-            workspace: req.workspace.clone().unwrap_or_default(),
+            workspace: shared_workspace.clone().unwrap_or_default(),
             workspace_mode: "shared".into(),
             agents: agents_json,
             lead_agent_id: lead_agent_id.clone(),
@@ -412,7 +422,7 @@ impl TeamSessionService {
         };
         // Top-level `model` is aionrs-only per spec 2026-05-12; for other
         // agent types the model/provider ride along in `extra`.
-        let (top_level_model, extra) = if agent_type == AgentType::Aionrs {
+        let (top_level_model, mut extra) = if agent_type == AgentType::Aionrs {
             (
                 Some(ProviderWithModel {
                     provider_id,
@@ -435,6 +445,7 @@ impl TeamSessionService {
                 }),
             )
         };
+        inherit_team_workspace(&mut extra, &row.workspace);
         let conv_req = CreateConversationRequest {
             r#type: agent_type,
             name: Some(req.name.clone()),
@@ -921,4 +932,13 @@ impl TeamSessionService {
         entry.session.notify_agent(slot_id);
         Ok(())
     }
+}
+
+fn validate_create_workspace_path(workspace: &str) -> Result<String, TeamError> {
+    validate_workspace_path_availability(workspace).map_err(|error| match error {
+        WorkspacePathValidationError::Empty => TeamError::InvalidRequest("Workspace directory is empty".into()),
+        WorkspacePathValidationError::DoesNotExist(path)
+        | WorkspacePathValidationError::NotDirectory(path)
+        | WorkspacePathValidationError::NotAccessible { path, .. } => TeamError::WorkspacePathUnavailable(path),
+    })
 }

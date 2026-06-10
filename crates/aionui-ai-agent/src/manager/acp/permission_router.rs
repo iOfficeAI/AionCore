@@ -1,4 +1,5 @@
 use crate::agent_runtime::AgentRuntime;
+use crate::error::AgentError;
 use crate::protocol::acp::{PermissionDecision, PermissionRequest};
 use crate::protocol::events::{AgentStreamEvent, permission_request_to_event_data};
 use aionui_common::Confirmation;
@@ -118,25 +119,18 @@ impl PermissionRouter {
     }
 
     /// Resolve a pending permission request with the user's selected option.
-    pub fn confirm(
-        &self,
-        call_id: &str,
-        option_id: String,
-        conversation_id: &str,
-    ) -> Result<(), aionui_common::AppError> {
+    pub fn confirm(&self, call_id: &str, option_id: String, conversation_id: &str) -> Result<(), AgentError> {
         let pending = self
             .pending_permissions
             .lock()
             .unwrap()
             .remove(call_id)
-            .ok_or_else(|| {
-                aionui_common::AppError::BadRequest(format!("Pending ACP permission not found: {call_id}"))
-            })?;
+            .ok_or_else(|| AgentError::bad_request(format!("Pending ACP permission not found: {call_id}")))?;
 
         pending
             .responder
             .send(PermissionDecision::Selected { option_id })
-            .map_err(|_| aionui_common::AppError::BadRequest(format!("Pending ACP permission expired: {call_id}")))?;
+            .map_err(|_| AgentError::bad_request(format!("Pending ACP permission expired: {call_id}")))?;
 
         debug!(conversation_id = %conversation_id, call_id, "ACP permission response forwarded");
         Ok(())

@@ -11,6 +11,16 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  migration-immutability:
+    name: Migration Immutability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - run: scripts/check-migration-immutability.test.sh
+      - run: scripts/check-migration-immutability.sh
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

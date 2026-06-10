@@ -5,6 +5,7 @@ pub mod agent_reconcile;
 mod agent_session_flow;
 pub mod catalog_forwarder;
 mod codex_sandbox;
+pub(crate) mod config_option_catalog;
 mod error_mapping;
 pub mod hooks;
 mod mode_normalize;

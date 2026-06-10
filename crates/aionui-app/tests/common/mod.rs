@@ -16,7 +16,7 @@ use aionui_system::VersionCheckService;
 pub async fn build_app() -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
-    let router = create_router(&services).await;
+    let router = create_router(&services).await.expect("build router");
     (router, services)
 }
 
@@ -30,7 +30,7 @@ pub async fn build_app() -> (axum::Router, AppServices) {
 pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router, AppServices, SkillPaths) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
-    let (mut states, _) = build_module_states(&services).await;
+    let (mut states, _) = build_module_states(&services).await.expect("build module states");
 
     let builtin_dir = root.join("builtin-skills");
     let paths = SkillPaths {
@@ -66,7 +66,7 @@ pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router
 pub async fn build_app_with_noop_opener() -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
-    let (mut states, _) = build_module_states(&services).await;
+    let (mut states, _) = build_module_states(&services).await.expect("build module states");
     states.shell.shell_service = std::sync::Arc::new(aionui_shell::ShellService::new(std::sync::Arc::new(
         aionui_shell::NoopSystemOpener,
     )));
@@ -77,7 +77,7 @@ pub async fn build_app_with_noop_opener() -> (axum::Router, AppServices) {
 pub async fn build_app_with_file_roots(allowed_roots: Vec<std::path::PathBuf>) -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
-    let (mut states, _) = build_module_states(&services).await;
+    let (mut states, _) = build_module_states(&services).await.expect("build module states");
     states.file.file_service = std::sync::Arc::new(FileService::new(services.event_bus.clone(), allowed_roots));
     let router = create_router_with_states(&services, states);
     (router, services)
@@ -89,7 +89,7 @@ pub async fn build_app_with_mock_version(
 ) -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
-    let (mut states, _) = build_module_states(&services).await;
+    let (mut states, _) = build_module_states(&services).await.expect("build module states");
     states.system.version_check_service =
         VersionCheckService::with_api_base(reqwest::Client::new(), current_version.to_owned(), mock_server.uri());
     let router = create_router_with_states(&services, states);
@@ -105,13 +105,14 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
     let factory: std::sync::Arc<
         dyn Fn(
                 aionui_ai_agent::types::BuildTaskOptions,
-            ) -> futures_util::future::BoxFuture<'static, Result<AgentInstance, aionui_common::AppError>>
+            )
+                -> futures_util::future::BoxFuture<'static, Result<AgentInstance, aionui_ai_agent::AgentError>>
             + Send
             + Sync,
     > = std::sync::Arc::new(|opts| {
         Box::pin(async move {
             Ok(AgentInstance::Mock(std::sync::Arc::new(NoopMockAgent {
-                conversation_id: opts.conversation_id,
+                conversation_id: opts.conversation_id().to_owned(),
             })))
         })
     });
@@ -121,7 +122,7 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
         .await
         .unwrap()
         .with_worker_task_manager(wtm);
-    let router = create_router(&services).await;
+    let router = create_router(&services).await.expect("build router");
     (router, services)
 }
 
@@ -156,10 +157,10 @@ impl IAgentTask for NoopMockAgent {
     ) -> Result<(), aionui_ai_agent::AgentSendError> {
         Ok(())
     }
-    async fn cancel(&self) -> Result<(), aionui_common::AppError> {
+    async fn cancel(&self) -> Result<(), aionui_ai_agent::AgentError> {
         Ok(())
     }
-    fn kill(&self, _reason: Option<aionui_common::AgentKillReason>) -> Result<(), aionui_common::AppError> {
+    fn kill(&self, _reason: Option<aionui_common::AgentKillReason>) -> Result<(), aionui_ai_agent::AgentError> {
         Ok(())
     }
 }

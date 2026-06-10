@@ -79,8 +79,9 @@ impl ShellService {
         if cfg!(target_os = "macos") {
             self.opener.run_command("open", &["-a", "Terminal", &path_str]).await
         } else if cfg!(target_os = "windows") {
+            let command = build_windows_terminal_command(&path_str);
             self.opener
-                .run_command("cmd", &["/c", "start", "cmd", "/K", &format!("cd /d {path_str}")])
+                .run_command("cmd", &["/c", "start", "cmd", "/K", &command])
                 .await
         } else {
             self.try_linux_terminal(&path_str).await
@@ -151,6 +152,10 @@ fn validate_directory_exists(dir_path: &str) -> Result<std::path::PathBuf, Shell
         return Err(ShellError::DirectoryNotFound(dir_path.to_owned()));
     }
     Ok(canonical)
+}
+
+fn build_windows_terminal_command(path: &str) -> String {
+    format!(r#"pushd "{path}""#)
 }
 
 fn validate_url(url: &str) -> Result<(), ShellError> {
@@ -340,5 +345,17 @@ mod tests {
             .open_folder_with(file_path.to_str().unwrap(), ToolType::Explorer)
             .await;
         assert!(matches!(result, Err(ShellError::DirectoryNotFound(_))));
+    }
+
+    #[test]
+    fn build_windows_terminal_command_quotes_paths_with_spaces() {
+        let command = build_windows_terminal_command(r#"C:\Users\zhoukai\My Project"#);
+        assert_eq!(command, r#"pushd "C:\Users\zhoukai\My Project""#);
+    }
+
+    #[test]
+    fn build_windows_terminal_command_supports_unc_paths() {
+        let command = build_windows_terminal_command(r#"\\server\share\My Project"#);
+        assert_eq!(command, r#"pushd "\\server\share\My Project""#);
     }
 }

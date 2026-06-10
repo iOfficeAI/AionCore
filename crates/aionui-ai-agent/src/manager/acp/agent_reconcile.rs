@@ -1,12 +1,12 @@
 use crate::manager::acp::AcpAgentManager;
 
-use crate::manager::acp::error_mapping::{acp_error_to_app_error, is_acp_session_not_found};
+use crate::manager::acp::error_mapping::is_acp_session_not_found;
 use crate::manager::acp::mode_normalize::normalize_requested_mode;
+use crate::protocol::error::AcpError;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId};
 use agent_client_protocol::schema::{
     SessionId, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest,
 };
-use aionui_common::AppError;
 use tracing::{error, info, warn};
 
 /// Actions the session driver must execute to align CLI state with user intent.
@@ -29,22 +29,30 @@ impl AcpAgentManager {
     /// alignment.
     ///
     /// Failure handling:
-    /// - `SessionNotFound`: returned as `AppError::NotFound` so callers
+    /// - `SessionNotFound`: returned as structured `AcpError::SessionNotFound` so callers
     ///   (e.g. `open_session_resume`) can drop the stale sid and rebuild
     ///   the session. ELECTRON-1HQ regressed because we silently swallowed
     ///   this case during warmup, leaving downstream `session/prompt` to
     ///   surface the same error to the user every turn.
     /// - Any other error: logged and skipped (best-effort), so a failed
     ///   `set_config_option` doesn't block a successful `set_mode`.
-    pub(super) async fn reconcile_session(&self, session_id: &str) -> Result<(), AppError> {
+    pub(super) async fn reconcile_session(&self, session_id: &str) -> Result<(), AcpError> {
         use crate::manager::acp::ReconcileAction;
 
-        let (invalid_model, actions) = {
+        let (invalid_mode, invalid_model, actions) = {
             let mut session = self.session.write().await;
+            let invalid_mode = session.clear_invalid_desired_mode();
             let invalid_model = session.clear_invalid_desired_model();
             let actions = session.plan_reconcile();
-            (invalid_model, actions)
+            (invalid_mode, invalid_model, actions)
         };
+        if let Some(mode) = invalid_mode {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                mode_id = %mode,
+                "reconcile_session: dropped unavailable desired mode"
+            );
+        }
         if let Some(model) = invalid_model {
             warn!(
                 conversation_id = %self.params.conversation_id,
@@ -74,7 +82,7 @@ impl AcpAgentManager {
                                 error = %e,
                                 "reconcile_session: set_mode hit SessionNotFound; aborting reconcile"
                             );
-                            return Err(acp_error_to_app_error(e));
+                            return Err(e);
                         }
                         error!(
                             conversation_id = %self.params.conversation_id,
@@ -108,7 +116,7 @@ impl AcpAgentManager {
                                 error = %e,
                                 "reconcile_session: set_model hit SessionNotFound; aborting reconcile"
                             );
-                            return Err(acp_error_to_app_error(e));
+                            return Err(e);
                         }
                         error!(
                             conversation_id = %self.params.conversation_id,
@@ -147,7 +155,7 @@ impl AcpAgentManager {
                                 error = %err,
                                 "reconcile_session: set_config_option hit SessionNotFound; aborting reconcile"
                             );
-                            return Err(acp_error_to_app_error(err));
+                            return Err(err);
                         }
                         info!(
                             conversation_id = %self.params.conversation_id,

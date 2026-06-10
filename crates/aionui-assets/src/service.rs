@@ -1,9 +1,10 @@
 use std::path::{Component, Path, PathBuf};
 
-use aionui_common::AppError;
 use http::HeaderValue;
 use rust_embed::RustEmbed;
 use sha2::{Digest, Sha256};
+
+use crate::error::AssetError;
 
 #[derive(RustEmbed)]
 #[folder = "assets/logos/"]
@@ -22,11 +23,11 @@ pub struct AssetService;
 
 impl AssetService {
     /// Look up a logo asset by its route-relative path.
-    pub fn get_logo(&self, asset_path: &str) -> Result<AssetFile, AppError> {
+    pub fn get_logo(&self, asset_path: &str) -> Result<AssetFile, AssetError> {
         let normalized = normalize_logo_path(asset_path)
-            .ok_or_else(|| AppError::Forbidden(format!("Asset path escapes logos root: {asset_path}")))?;
+            .ok_or_else(|| AssetError::Forbidden(format!("Asset path escapes logos root: {asset_path}")))?;
 
-        let file = LogoAssets::get(&normalized).ok_or_else(|| AppError::NotFound("Logo asset not found".into()))?;
+        let file = LogoAssets::get(&normalized).ok_or_else(|| AssetError::NotFound("Logo asset not found".into()))?;
         let bytes = file.data.into_owned();
 
         Ok(AssetFile {
@@ -81,9 +82,9 @@ fn content_type_for_path(path: &str) -> HeaderValue {
     HeaderValue::from_str(mime.as_ref()).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
 }
 
-fn build_etag(bytes: &[u8]) -> Result<HeaderValue, AppError> {
+fn build_etag(bytes: &[u8]) -> Result<HeaderValue, AssetError> {
     let digest = Sha256::digest(bytes);
-    HeaderValue::from_str(&format!("\"{digest:x}\"")).map_err(|error| AppError::Internal(error.to_string()))
+    HeaderValue::from_str(&format!("\"{digest:x}\"")).map_err(|error| AssetError::Internal(error.to_string()))
 }
 
 #[cfg(test)]

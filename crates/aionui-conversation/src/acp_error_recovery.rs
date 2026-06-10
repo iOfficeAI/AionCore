@@ -10,6 +10,8 @@ use crate::service::ConversationService;
 use crate::stream_relay::RelayOutcome;
 use aionui_ai_agent::IWorkerTaskManager;
 
+use crate::runtime_persistence::RuntimeWriteKind;
+
 impl ConversationService {
     async fn clear_conversation_model_seed_after_model_not_found(
         &self,
@@ -17,6 +19,12 @@ impl ConversationService {
         error_code: Option<AgentErrorCode>,
     ) {
         if error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound) {
+            return;
+        }
+        if !self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::AcpRecoveryCleanup)
+        {
             return;
         }
 
@@ -130,6 +138,12 @@ impl ConversationService {
         error_code: Option<AgentErrorCode>,
     ) {
         if error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound) {
+            return;
+        }
+        if !self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::AcpRecoveryCleanup)
+        {
             return;
         }
 

@@ -348,7 +348,7 @@ async fn test_on_save_cli_not_found_blocks_upsert() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let err = json["error"].as_str().expect("error string");
-    // AppError::BadRequest is serialized as "Bad request: <msg>", so we
+    // ApiError::BadRequest is serialized as "Bad request: <msg>", so we
     // check that the marker string appears anywhere in the error field.
     assert!(
         err.contains("cli_not_found:"),

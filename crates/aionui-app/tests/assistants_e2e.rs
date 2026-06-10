@@ -131,7 +131,7 @@ async fn fixture() -> Fixture {
     // Bring up in-memory DB + services + default module states.
     let db = init_database_memory().await.unwrap();
     let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
-    let (mut states, _): (ModuleStates, _) = build_module_states(&services).await;
+    let (mut states, _): (ModuleStates, _) = build_module_states(&services).await.expect("build module states");
 
     // Replace the extension + hub + skill states with freshly-constructed
     // ones rooted at our temp dirs. The defaults built by
@@ -278,9 +278,9 @@ async fn list_requires_auth() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = fx.app.clone().oneshot(req).await.unwrap();
-    // auth_middleware returns 403 Forbidden for any authentication failure
-    // (see `aionui_auth::middleware::auth_middleware`).
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // ===========================================================================

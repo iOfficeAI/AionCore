@@ -17,7 +17,7 @@ fn create_conv_body(name: &str, agent_type: &str) -> serde_json::Value {
     json!({
         "type": agent_type,
         "name": name,
-        "extra": { "workspace": "/project" }
+        "extra": {}
     })
 }
 
@@ -67,7 +67,7 @@ async fn build_app() -> (axum::Router, aionui_app::AppServices) {
     let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
         .await
         .unwrap();
-    let router = aionui_app::create_router(&services).await;
+    let router = aionui_app::create_router(&services).await.expect("build router");
     (router, services)
 }
 
@@ -82,7 +82,9 @@ async fn workspace_browse_requires_auth() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -194,6 +196,8 @@ async fn side_question_requires_auth() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "CSRF_INVALID");
 }
 
 #[tokio::test]
@@ -244,7 +248,9 @@ async fn slash_commands_requires_auth() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -254,31 +260,6 @@ async fn slash_commands_no_active_task() {
     let conv_id = create_conversation(&mut app, &token, &_csrf, "Slash Test", "acp").await;
 
     let req = get_with_token(&format!("/api/conversations/{conv_id}/slash-commands"), &token);
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-// ── 9.5 OpenClaw runtime ────────────────────────────────────────
-
-#[tokio::test]
-async fn openclaw_runtime_requires_auth() {
-    let (app, _) = build_app().await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri("/api/conversations/test-conv/openclaw/runtime")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn openclaw_runtime_no_active_task() {
-    let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-    let conv_id = create_conversation(&mut app, &token, &_csrf, "OpenClaw Test", "openclaw-gateway").await;
-
-    let req = get_with_token(&format!("/api/conversations/{conv_id}/openclaw/runtime"), &token);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
@@ -344,7 +325,7 @@ async fn stop_stream_no_task() {
     let req = json_with_token(
         "POST",
         &format!("/api/conversations/{conv_id}/cancel"),
-        json!({}),
+        json!({ "turn_id": "turn_no_active_task" }),
         &token,
         &csrf,
     );

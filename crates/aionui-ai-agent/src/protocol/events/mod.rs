@@ -80,6 +80,10 @@ pub struct TipsEventData {
     pub content: String,
     #[serde(rename = "type")]
     pub tip_type: TipType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
 }
 
 /// Severity level for a tip event.
@@ -87,6 +91,7 @@ pub struct TipsEventData {
 #[serde(rename_all = "snake_case")]
 pub enum TipType {
     Error,
+    Info,
     Success,
     Warning,
 }
@@ -130,10 +135,37 @@ mod tests {
         let event = AgentStreamEvent::Tips(TipsEventData {
             content: "Something went wrong".into(),
             tip_type: TipType::Error,
+            code: None,
+            params: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tips");
         assert_eq!(json["data"]["type"], "error");
+    }
+
+    #[test]
+    fn tips_event_roundtrip_preserves_info_code_and_params() {
+        let event = AgentStreamEvent::Tips(TipsEventData {
+            content: "Select a slash command to continue".into(),
+            tip_type: TipType::Info,
+            code: Some("acp.empty_turn.choose_command".into()),
+            params: Some(json!({ "command_count": 3 })),
+        });
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "tips");
+        assert_eq!(json["data"]["type"], "info");
+        assert_eq!(json["data"]["code"], "acp.empty_turn.choose_command");
+        assert_eq!(json["data"]["params"]["command_count"], 3);
+
+        let parsed: AgentStreamEvent = serde_json::from_value(json).unwrap();
+        if let AgentStreamEvent::Tips(data) = parsed {
+            assert_eq!(data.content, "Select a slash command to continue");
+            assert_eq!(data.tip_type, TipType::Info);
+            assert_eq!(data.code.as_deref(), Some("acp.empty_turn.choose_command"));
+            assert_eq!(data.params, Some(json!({ "command_count": 3 })));
+        } else {
+            panic!("Expected Tips event");
+        }
     }
 
     #[test]

@@ -1,69 +1,26 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::{
-    AgentSendError, AgentStreamEvent,
-    protocol::events::{
-        ThinkingEventData,
-        tool_call::{AcpToolCallSessionUpdateKind, AcpToolCallStatus, ToolCallStatus},
-    },
-};
+use aionui_ai_agent::protocol::events::TipType;
+use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
 use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResult};
-use aionui_api_types::{AgentErrorCode, ConversationRuntimeSummary, WebSocketMessage};
+use aionui_api_types::{AgentErrorCode, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
+use crate::runtime_persistence::RuntimePersistenceCoordinator;
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
-use aionui_db::models::MessageRow;
-use aionui_db::{DbError, IConversationRepository};
+use crate::stream_persistence::{
+    PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState, ThinkingSegmentState,
+};
+use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::{broadcast, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
-
-fn is_not_found(err: &DbError) -> bool {
-    matches!(err, DbError::NotFound(_))
-}
-
-fn is_foreign_key_constraint(err: &DbError) -> bool {
-    err.to_string().contains("FOREIGN KEY constraint failed")
-}
-
-fn is_deleted_during_stream_persistence(err: &DbError) -> bool {
-    is_not_found(err) || is_foreign_key_constraint(err)
-}
-
-fn log_persist_error(err: &DbError, message: &'static str) {
-    if is_deleted_during_stream_persistence(err) {
-        debug!(error = %ErrorChain(err), "{message}; conversation was likely deleted during stream finalization");
-    } else {
-        error!(error = %ErrorChain(err), "{message}");
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TextSegmentState {
-    id: String,
-    buffer: String,
-    created_at: i64,
-    record_created: bool,
-    flush_counter: u32,
-}
-
-#[derive(Debug, Clone)]
-struct PersistedTextSegment {
-    id: String,
-}
-
-#[derive(Debug, Clone)]
-struct ThinkingSegmentState {
-    id: String,
-    buffer: String,
-    started_at: i64,
-}
 
 /// Result returned after a relay turn has fully drained and finalized.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -110,11 +67,13 @@ impl RelayTerminal {
 pub struct StreamRelay {
     conversation_id: String,
     msg_id: String,
+    turn_id: String,
     user_id: String,
-    repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     cron_service: Option<Arc<dyn ICronService>>,
     runtime_state: Option<Arc<ConversationRuntimeStateService>>,
+    persistence: Option<RuntimePersistenceCoordinator>,
+    adapter: StreamPersistenceAdapter,
     complete_turn: bool,
 }
 
@@ -122,25 +81,35 @@ impl StreamRelay {
     pub fn new(
         conversation_id: String,
         msg_id: String,
+        turn_id: String,
         user_id: String,
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
         cron_service: Option<Arc<dyn ICronService>>,
     ) -> Self {
+        let adapter = StreamPersistenceAdapter::new(conversation_id.clone(), msg_id.clone(), repo, None);
         Self {
             conversation_id,
             msg_id,
+            turn_id,
             user_id,
-            repo,
             broadcaster,
             cron_service,
             runtime_state: None,
+            persistence: None,
+            adapter,
             complete_turn: true,
         }
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = Some(runtime_state);
+        self
+    }
+
+    pub fn with_persistence(mut self, persistence: RuntimePersistenceCoordinator) -> Self {
+        self.persistence = Some(persistence.clone());
+        self.adapter = self.adapter.with_persistence(persistence);
         self
     }
 
@@ -155,6 +124,7 @@ impl StreamRelay {
         fields(
             conversation_id = %self.conversation_id,
             msg_id = %self.msg_id,
+            turn_id = %self.turn_id,
         )
     )]
     pub async fn consume(self, rx: broadcast::Receiver<AgentStreamEvent>) -> RelayOutcome {
@@ -168,6 +138,7 @@ impl StreamRelay {
         fields(
             conversation_id = %self.conversation_id,
             msg_id = %self.msg_id,
+            turn_id = %self.turn_id,
         )
     )]
     pub async fn consume_with_send_error(
@@ -184,7 +155,12 @@ impl StreamRelay {
         mut send_error_rx: Option<oneshot::Receiver<AgentSendError>>,
     ) -> RelayOutcome {
         let started_at = now_ms();
-        info!("StreamRelay started");
+        info!(
+            conversation_id = %self.conversation_id,
+            turn_id = %self.turn_id,
+            msg_id = %self.msg_id,
+            "StreamRelay started"
+        );
 
         let mut full_text_buffer = String::new();
         let mut text_segments: Vec<PersistedTextSegment> = Vec::new();
@@ -287,7 +263,7 @@ impl StreamRelay {
                             full_text_buffer.push_str(&data.content);
                             segment.flush_counter += 1;
                             if segment.flush_counter >= FLUSH_INTERVAL {
-                                self.flush_text_segment(segment).await;
+                                self.adapter.flush_text_segment(segment).await;
                                 segment.flush_counter = 0;
                             }
                         }
@@ -345,7 +321,9 @@ impl StreamRelay {
                                 self.finalize(&full_text_buffer, &text_segments, &event, terminal).await
                             };
                             if self.complete_turn && !deleting {
-                                Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
+                                self.adapter
+                                    .complete_conversation(&self.broadcaster, &self.turn_id, None)
+                                    .await;
                             }
                             break outcome;
                         }
@@ -354,21 +332,27 @@ impl StreamRelay {
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
                             self.forward_to_websocket(&event);
-                            self.persist_tool_call(data).await;
+                            self.adapter.persist_tool_call(data).await;
                         }
                         AgentStreamEvent::AcpToolCall(data) => {
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
                             self.forward_to_websocket(&event);
-                            self.persist_acp_tool_call(data).await;
+                            self.adapter.persist_acp_tool_call(data).await;
                         }
                         AgentStreamEvent::ToolGroup(entries) => {
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
                             self.forward_to_websocket(&event);
-                            self.persist_tool_group(entries).await;
+                            self.adapter.persist_tool_group(entries).await;
+                        }
+                        AgentStreamEvent::Tips(data) => {
+                            self.forward_to_websocket(&event);
+                            if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
+                                self.adapter.persist_tip(data).await;
+                            }
                         }
                         _ => {
                             self.forward_to_websocket(&event);
@@ -407,7 +391,9 @@ impl StreamRelay {
                         .await
                     };
                     if self.complete_turn && !deleting {
-                        Self::complete_conversation(&self.repo, &self.broadcaster, &self.conversation_id).await;
+                        self.adapter
+                            .complete_conversation(&self.broadcaster, &self.turn_id, None)
+                            .await;
                     }
                     break outcome;
                 }
@@ -498,87 +484,13 @@ impl StreamRelay {
         let payload = json!({
             "conversation_id": self.conversation_id,
             "msg_id": msg_id,
+            "turn_id": self.turn_id,
             "type": event_data.get("type").cloned().unwrap_or(json!("unknown")),
             "data": event_data.get("data").cloned().unwrap_or(json!({})),
             "hidden": false,
         });
 
         self.broadcast_stream_payload(payload);
-    }
-
-    /// Flush an active text segment to the database (create or update).
-    #[tracing::instrument(skip_all)]
-    async fn flush_text_segment(&self, segment: &mut TextSegmentState) {
-        if segment.buffer.is_empty() {
-            return;
-        }
-
-        let content = json!({ "content": segment.buffer }).to_string();
-
-        if segment.record_created {
-            let update = aionui_db::MessageRowUpdate {
-                content: Some(content),
-                status: Some(Some("work".into())),
-                hidden: None,
-            };
-            if let Err(e) = self.repo.update_message(&segment.id, &update).await {
-                log_persist_error(&e, "Failed to update streaming text segment");
-            }
-        } else {
-            let row = MessageRow {
-                id: segment.id.clone(),
-                conversation_id: self.conversation_id.clone(),
-                msg_id: Some(segment.id.clone()),
-                r#type: "text".into(),
-                content,
-                position: Some("left".into()),
-                status: Some("work".into()),
-                hidden: false,
-                created_at: segment.created_at,
-            };
-            if let Err(e) = self.repo.insert_message(&row).await {
-                log_persist_error(&e, "Failed to create streaming text segment");
-            }
-            segment.record_created = true;
-        }
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn finalize_text_segment(&self, segment: TextSegmentState, status: &str) -> Option<PersistedTextSegment> {
-        if segment.buffer.is_empty() {
-            return None;
-        }
-
-        let content = json!({ "content": segment.buffer }).to_string();
-        if segment.record_created {
-            let update = aionui_db::MessageRowUpdate {
-                content: Some(content),
-                status: Some(Some(status.to_owned())),
-                hidden: Some(false),
-            };
-            if let Err(e) = self.repo.update_message(&segment.id, &update).await {
-                log_persist_error(&e, "Failed to finalize text segment");
-                return None;
-            }
-        } else {
-            let row = MessageRow {
-                id: segment.id.clone(),
-                conversation_id: self.conversation_id.clone(),
-                msg_id: Some(segment.id.clone()),
-                r#type: "text".into(),
-                content,
-                position: Some("left".into()),
-                status: Some(status.to_owned()),
-                hidden: false,
-                created_at: segment.created_at,
-            };
-            if let Err(e) = self.repo.insert_message(&row).await {
-                log_persist_error(&e, "Failed to create finalized text segment");
-                return None;
-            }
-        }
-
-        Some(PersistedTextSegment { id: segment.id })
     }
 
     /// Finalize assistant text on stream end and apply middleware rewrites.
@@ -604,78 +516,19 @@ impl StreamRelay {
             let final_text = processed.message.trim().to_owned();
             let hidden = final_text.is_empty();
 
-            if let Some(primary_segment) = text_segments.first() {
-                if processed.message != text || hidden {
-                    let content = json!({ "content": final_text }).to_string();
-                    let update = aionui_db::MessageRowUpdate {
-                        content: Some(content),
-                        status: Some(Some(status.to_owned())),
-                        hidden: Some(hidden),
-                    };
-                    if let Err(e) = self.repo.update_message(&primary_segment.id, &update).await {
-                        log_persist_error(&e, "Failed to rewrite finalized text segment");
-                    }
-                    self.send_final_text_override(&primary_segment.id, &processed.message, hidden);
-
-                    for segment in text_segments.iter().skip(1) {
-                        let hide_update = aionui_db::MessageRowUpdate {
-                            content: None,
-                            status: Some(Some(status.to_owned())),
-                            hidden: Some(true),
-                        };
-                        if let Err(e) = self.repo.update_message(&segment.id, &hide_update).await {
-                            log_persist_error(&e, "Failed to hide superseded text segment");
-                        }
-                        self.send_final_text_override(&segment.id, "", true);
-                    }
-                } else {
-                    for segment in text_segments {
-                        let status_update = aionui_db::MessageRowUpdate {
-                            content: None,
-                            status: Some(Some(status.to_owned())),
-                            hidden: Some(false),
-                        };
-                        if let Err(e) = self.repo.update_message(&segment.id, &status_update).await {
-                            log_persist_error(&e, "Failed to finalize text segment status");
-                        }
-                    }
-                }
-            } else if !hidden {
-                let row = MessageRow {
-                    id: self.msg_id.clone(),
-                    conversation_id: self.conversation_id.clone(),
-                    msg_id: Some(self.msg_id.clone()),
-                    r#type: "text".into(),
-                    content: json!({ "content": final_text }).to_string(),
-                    position: Some("left".into()),
-                    status: Some(status.to_owned()),
-                    hidden: false,
-                    created_at: now_ms(),
-                };
-                if let Err(e) = self.repo.insert_message(&row).await {
-                    log_persist_error(&e, "Failed to create final fallback message");
-                }
+            let rewrite_segments = processed.message != text || hidden;
+            let overrides = self
+                .adapter
+                .persist_final_text(text_segments, status, &final_text, hidden, rewrite_segments)
+                .await;
+            for override_event in overrides {
+                self.send_final_text_override(&override_event.msg_id, &override_event.text, override_event.hidden);
             }
 
             self.send_system_responses(&processed.system_responses);
             outcome.system_responses = processed.system_responses;
         } else if let AgentStreamEvent::Error(data) = event {
-            // No text accumulated but got an error — store error as tips message
-            let content = json!({ "content": &data.message, "type": "error", "error": &data }).to_string();
-            let row = MessageRow {
-                id: ConversationService::mint_msg_id(),
-                conversation_id: self.conversation_id.clone(),
-                msg_id: None,
-                r#type: "tips".into(),
-                content,
-                position: Some("left".into()),
-                status: Some("error".into()),
-                hidden: false,
-                created_at: now_ms(),
-            };
-            if let Err(e) = self.repo.insert_message(&row).await {
-                log_persist_error(&e, "Failed to store error message");
-            }
+            self.adapter.persist_error_tip(data).await;
         }
 
         outcome
@@ -688,29 +541,7 @@ impl StreamRelay {
         };
         let duration_ms = (now_ms() - segment.started_at).max(0);
         self.send_thinking_done(&segment.id, duration_ms as u64);
-        if segment.buffer.is_empty() {
-            return;
-        }
-        let content = json!({
-            "content": segment.buffer,
-            "status": "done",
-            "duration_ms": duration_ms,
-        })
-        .to_string();
-        let row = MessageRow {
-            id: segment.id.clone(),
-            conversation_id: self.conversation_id.clone(),
-            msg_id: Some(segment.id),
-            r#type: "thinking".into(),
-            content,
-            position: Some("left".into()),
-            status: Some("finish".into()),
-            hidden: false,
-            created_at: segment.started_at,
-        };
-        if let Err(e) = self.repo.insert_message(&row).await {
-            log_persist_error(&e, "Failed to persist thinking message");
-        }
+        self.adapter.persist_thinking_segment(segment, duration_ms as u64).await;
     }
 
     #[tracing::instrument(skip_all)]
@@ -723,225 +554,8 @@ impl StreamRelay {
         let Some(text_segment) = active_text.take() else {
             return;
         };
-        if let Some(segment) = self.finalize_text_segment(text_segment, status).await {
+        if let Some(segment) = self.adapter.finalize_text_segment(text_segment, status).await {
             text_segments.push(segment);
-        }
-    }
-
-    /// Persist a Gemini-style tool_call event.
-    #[tracing::instrument(skip_all)]
-    async fn persist_tool_call(&self, data: &aionui_ai_agent::protocol::events::tool_call::ToolCallEventData) {
-        if data.call_id.trim().is_empty() {
-            warn!(
-                tool = %data.name,
-                status = ?data.status,
-                "Skipping tool_call persistence because call_id is empty"
-            );
-            return;
-        }
-
-        let status = match data.status {
-            ToolCallStatus::Running => "work",
-            ToolCallStatus::Completed => "finish",
-            ToolCallStatus::Error => "error",
-        };
-        let content = serde_json::to_string(data).unwrap_or_default();
-
-        let existing = self
-            .repo
-            .get_message_by_msg_id(&self.conversation_id, &data.call_id, "tool_call")
-            .await
-            .unwrap_or(None);
-
-        if let Some(existing_row) = existing {
-            let merged_content = Self::merge_json_content(&existing_row.content, &content);
-            let update = aionui_db::MessageRowUpdate {
-                content: Some(merged_content),
-                status: Some(Some(status.to_owned())),
-                hidden: None,
-            };
-            if let Err(e) = self.repo.update_message(&data.call_id, &update).await {
-                error!(
-                    call_id = %data.call_id,
-                    tool = %data.name,
-                    status,
-                    error = %ErrorChain(&e),
-                    "Failed to update tool_call message"
-                );
-            } else {
-                debug!(
-                    call_id = %data.call_id,
-                    tool = %data.name,
-                    status,
-                    "Updated tool_call message"
-                );
-            }
-        } else {
-            let row = MessageRow {
-                id: data.call_id.clone(),
-                conversation_id: self.conversation_id.clone(),
-                msg_id: Some(data.call_id.clone()),
-                r#type: "tool_call".into(),
-                content,
-                position: Some("left".into()),
-                status: Some(status.to_owned()),
-                hidden: false,
-                created_at: now_ms(),
-            };
-            if let Err(e) = self.repo.insert_message(&row).await {
-                error!(
-                    call_id = %data.call_id,
-                    tool = %data.name,
-                    status,
-                    error = %ErrorChain(&e),
-                    "Failed to persist tool_call message"
-                );
-            } else {
-                debug!(
-                    call_id = %data.call_id,
-                    tool = %data.name,
-                    status,
-                    "Persisted tool_call message"
-                );
-            }
-        }
-    }
-
-    /// Persist an ACP (Claude CLI) tool call event.
-    /// First event (ToolCall) inserts; subsequent events (ToolCallUpdate) update.
-    #[tracing::instrument(skip_all)]
-    async fn persist_acp_tool_call(&self, data: &aionui_ai_agent::protocol::events::tool_call::AcpToolCallEventData) {
-        let tool_call_id = &data.update.tool_call_id;
-        let status = match data.update.status {
-            Some(AcpToolCallStatus::Pending) | None => "work",
-            Some(AcpToolCallStatus::InProgress) => "work",
-            Some(AcpToolCallStatus::Completed) => "finish",
-            Some(AcpToolCallStatus::Failed) => "error",
-        };
-
-        let mut value = serde_json::to_value(data).unwrap_or_default();
-        normalize_keys_to_snake_case(&mut value);
-        let content = value.to_string();
-
-        match data.update.session_update {
-            AcpToolCallSessionUpdateKind::ToolCall => {
-                let row = MessageRow {
-                    id: tool_call_id.clone(),
-                    conversation_id: self.conversation_id.clone(),
-                    msg_id: Some(tool_call_id.clone()),
-                    r#type: "acp_tool_call".into(),
-                    content,
-                    position: Some("left".into()),
-                    status: Some(status.to_owned()),
-                    hidden: false,
-                    created_at: now_ms(),
-                };
-                if let Err(e) = self.repo.insert_message(&row).await {
-                    error!(error = %ErrorChain(&e), "Failed to persist acp_tool_call message");
-                }
-            }
-            AcpToolCallSessionUpdateKind::ToolCallUpdate => {
-                let merged_content = self.merge_acp_tool_call_content(tool_call_id, &value).await;
-                let update = aionui_db::MessageRowUpdate {
-                    content: Some(merged_content),
-                    status: Some(Some(status.to_owned())),
-                    hidden: None,
-                };
-                if let Err(e) = self.repo.update_message(tool_call_id, &update).await {
-                    error!(error = %ErrorChain(&e), "Failed to update acp_tool_call message");
-                }
-            }
-        }
-    }
-
-    /// Merge two JSON content strings: overlays non-null fields from `new_json`
-    /// onto `existing_json`, preserving fields only present in the original.
-    fn merge_json_content(existing_json: &str, new_json: &str) -> String {
-        let mut base: serde_json::Value = serde_json::from_str(existing_json).unwrap_or_default();
-        let new_value: serde_json::Value = serde_json::from_str(new_json).unwrap_or_default();
-        if let (Some(base_obj), Some(new_obj)) = (base.as_object_mut(), new_value.as_object()) {
-            for (key, val) in new_obj {
-                if !val.is_null() {
-                    base_obj.insert(key.clone(), val.clone());
-                }
-            }
-        }
-        base.to_string()
-    }
-
-    /// Merge an AcpToolCall update into the existing DB record.
-    /// Reads the stored content, overlays non-null fields from the update,
-    /// preserving fields like `raw_input` that the update event omits.
-    async fn merge_acp_tool_call_content(&self, tool_call_id: &str, update_value: &serde_json::Value) -> String {
-        let existing = self
-            .repo
-            .get_message_by_msg_id(&self.conversation_id, tool_call_id, "acp_tool_call")
-            .await
-            .ok()
-            .flatten();
-
-        let Some(existing_row) = existing else {
-            return update_value.to_string();
-        };
-
-        let mut base: serde_json::Value = serde_json::from_str(&existing_row.content).unwrap_or_default();
-        if let (Some(base_update), Some(new_update)) = (
-            base.get_mut("update").and_then(|v| v.as_object_mut()),
-            update_value.get("update").and_then(|v| v.as_object()),
-        ) {
-            for (key, val) in new_update {
-                if !val.is_null() {
-                    base_update.insert(key.clone(), val.clone());
-                }
-            }
-        }
-        base.to_string()
-    }
-
-    /// Persist a tool_group event (array of tool summaries).
-    #[tracing::instrument(skip_all)]
-    async fn persist_tool_group(&self, entries: &[aionui_ai_agent::protocol::events::tool_call::ToolGroupEntry]) {
-        let all_done = entries
-            .iter()
-            .all(|e| matches!(e.status, ToolCallStatus::Completed | ToolCallStatus::Error));
-        let status = if all_done { "finish" } else { "work" };
-        let content = serde_json::to_string(entries).unwrap_or_default();
-
-        let group_id = entries
-            .first()
-            .map(|e| e.call_id.clone())
-            .unwrap_or_else(ConversationService::mint_msg_id);
-
-        let existing = self
-            .repo
-            .get_message_by_msg_id(&self.conversation_id, &group_id, "tool_group")
-            .await
-            .unwrap_or(None);
-
-        if existing.is_some() {
-            let update = aionui_db::MessageRowUpdate {
-                content: Some(content),
-                status: Some(Some(status.to_owned())),
-                hidden: None,
-            };
-            if let Err(e) = self.repo.update_message(&group_id, &update).await {
-                error!(error = %ErrorChain(&e), "Failed to update tool_group message");
-            }
-        } else {
-            let row = MessageRow {
-                id: group_id.clone(),
-                conversation_id: self.conversation_id.clone(),
-                msg_id: Some(group_id),
-                r#type: "tool_group".into(),
-                content,
-                position: Some("left".into()),
-                status: Some(status.to_owned()),
-                hidden: false,
-                created_at: now_ms(),
-            };
-            if let Err(e) = self.repo.insert_message(&row).await {
-                error!(error = %ErrorChain(&e), "Failed to persist tool_group message");
-            }
         }
     }
 
@@ -970,6 +584,7 @@ impl StreamRelay {
         self.broadcast_stream_payload(json!({
             "conversation_id": self.conversation_id,
             "msg_id": msg_id,
+            "turn_id": self.turn_id,
             "type": "content",
             "data": { "content": text },
             "hidden": hidden,
@@ -982,6 +597,7 @@ impl StreamRelay {
             self.broadcast_stream_payload(json!({
                 "conversation_id": self.conversation_id,
                 "msg_id": ConversationService::mint_msg_id(),
+                "turn_id": self.turn_id,
                 "type": "system",
                 "data": response,
                 "hidden": true,
@@ -989,47 +605,13 @@ impl StreamRelay {
         }
     }
 
-    fn broadcast_stream_payload(&self, payload: serde_json::Value) {
+    fn broadcast_stream_payload(&self, mut payload: serde_json::Value) {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.entry("turn_id")
+                .or_insert_with(|| serde_json::Value::String(self.turn_id.clone()));
+        }
         let msg = WebSocketMessage::new("message.stream", payload);
         self.broadcaster.broadcast(msg);
-    }
-
-    #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
-    pub async fn complete_conversation(
-        repo: &Arc<dyn IConversationRepository>,
-        broadcaster: &Arc<dyn EventBroadcaster>,
-        conversation_id: &str,
-    ) {
-        Self::complete_conversation_with_runtime(repo, broadcaster, conversation_id, None).await;
-    }
-
-    #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
-    pub async fn complete_conversation_with_runtime(
-        repo: &Arc<dyn IConversationRepository>,
-        broadcaster: &Arc<dyn EventBroadcaster>,
-        conversation_id: &str,
-        runtime: Option<ConversationRuntimeSummary>,
-    ) {
-        let update = aionui_db::ConversationRowUpdate {
-            status: Some("finished".to_owned()),
-            updated_at: Some(now_ms()),
-            ..Default::default()
-        };
-        if let Err(e) = repo.update(conversation_id, &update).await {
-            log_persist_error(&e, "Failed to update conversation status");
-        }
-
-        let payload = json!({
-            "conversation_id": conversation_id,
-            "session_id": conversation_id,
-            "status": "finished",
-            "canSendMessage": true,
-            "runtime": runtime,
-        });
-        let msg = WebSocketMessage::new("turn.completed", payload);
-        broadcaster.broadcast(msg);
-
-        debug!(conversation_id, status = "finished", "Turn completed");
     }
 }
 
@@ -1067,8 +649,11 @@ impl ICronService for SharedCronService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream_persistence::StreamPersistenceAdapter;
+    use aionui_ai_agent::AgentError;
     use aionui_ai_agent::protocol::events::{ErrorEventData, FinishEventData, TextEventData, ThinkingEventData};
     use aionui_db::DbError;
+    use aionui_db::models::MessageRow;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1083,6 +668,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1130,6 +716,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1185,6 +772,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1221,6 +809,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_warning_tip_with_finish_persists_warning_tip() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Tips(
+            aionui_ai_agent::protocol::events::TipsEventData {
+                content: String::new(),
+                tip_type: aionui_ai_agent::protocol::events::TipType::Warning,
+                code: Some("ACP_EMPTY_TURN".into()),
+                params: None,
+            },
+        ))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert!(outcome.system_responses.is_empty());
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+
+        let inserts = repo.take_inserts();
+        assert_eq!(inserts.len(), 1);
+        let msg = &inserts[0];
+        assert_eq!(msg.r#type, "tips");
+        assert_eq!(msg.status.as_deref(), Some("finish"));
+
+        let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
+        assert_eq!(content["content"], "");
+        assert_eq!(content["type"], "warning");
+        assert_eq!(content["code"], "ACP_EMPTY_TURN");
+    }
+
+    #[tokio::test]
     async fn run_send_error_injects_error_and_completes_turn() {
         let repo = Arc::new(RecordingRepo::new());
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
@@ -1229,6 +862,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1239,8 +873,8 @@ mod tests {
         let rx = tx.subscribe();
         let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
         send_error_tx
-            .send(AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
-                "provider returned 401 invalid api key".into(),
+            .send(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "provider returned 401 invalid api key",
             )))
             .unwrap();
 
@@ -1292,6 +926,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1299,9 +934,8 @@ mod tests {
         );
 
         let rx = tx.subscribe();
-        let send_error = AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
-            "provider returned 401 invalid api key".into(),
-        ));
+        let send_error =
+            AgentSendError::from_agent_error(AgentError::bad_gateway("provider returned 401 invalid api key"));
         tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
             "stream already emitted",
             None,
@@ -1334,6 +968,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1343,8 +978,8 @@ mod tests {
         let rx = tx.subscribe();
         let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
         send_error_tx
-            .send(AgentSendError::from_app_error(aionui_common::AppError::BadGateway(
-                "provider returned 401 invalid api key".into(),
+            .send(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "provider returned 401 invalid api key",
             )))
             .unwrap();
         let delayed_stream_error = tokio::spawn(async move {
@@ -1387,6 +1022,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1450,6 +1086,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1511,6 +1148,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1546,6 +1184,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1573,8 +1212,15 @@ mod tests {
         let data = &turn_event.unwrap().data;
         assert_eq!(data["conversation_id"], "conv-1");
         assert_eq!(data["session_id"], "conv-1");
+        assert_eq!(data["turn_id"], "turn-1");
         assert_eq!(data["status"], "finished");
         assert_eq!(data["canSendMessage"], true);
+
+        let stream_event = ws_events
+            .iter()
+            .find(|e| e.name == "message.stream")
+            .expect("finish should be forwarded as message.stream");
+        assert_eq!(stream_event.data["turn_id"], "turn-1");
     }
 
     #[tokio::test]
@@ -1585,6 +1231,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1640,6 +1287,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1713,6 +1361,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1806,6 +1455,7 @@ mod tests {
         let relay = StreamRelay::new(
             "conv-1".into(),
             "asst-1".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus.clone(),
@@ -1854,6 +1504,7 @@ mod tests {
         let relay = StreamRelay::new(
             "deleted-conv".into(),
             "assistant-msg".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo,
             bus,
@@ -1885,8 +1536,9 @@ mod tests {
         repo.set_not_found(true);
         let repo: Arc<dyn IConversationRepository> = repo;
         let bus: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let adapter = StreamPersistenceAdapter::new("deleted-conv".into(), "msg-1".into(), repo, None);
 
-        StreamRelay::complete_conversation_with_runtime(&repo, &bus, "deleted-conv", None).await;
+        adapter.complete_conversation(&bus, "turn-1", None).await;
     }
 
     #[tokio::test]
@@ -1900,6 +1552,7 @@ mod tests {
         let relay = StreamRelay::new(
             "deleted-conv".into(),
             "assistant-msg".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus,
@@ -1929,6 +1582,7 @@ mod tests {
         let relay = StreamRelay::new(
             "deleted-conv".into(),
             "assistant-msg".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus,
@@ -1959,6 +1613,7 @@ mod tests {
         let relay = StreamRelay::new(
             "deleted-conv".into(),
             "assistant-msg".into(),
+            "turn-1".into(),
             "user-1".into(),
             repo.clone(),
             bus,

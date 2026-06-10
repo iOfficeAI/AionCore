@@ -27,6 +27,8 @@ const ACP_VENDOR_LABELS: &[&str] = &[
     "snow",
 ];
 
+const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+
 pub(super) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     // Any registered ACP vendor label collapses to `AgentType::Acp`.
     if ACP_VENDOR_LABELS.contains(&backend) {
@@ -36,6 +38,9 @@ pub(super) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     // "nanobot", "aionrs", "remote", "openclaw-gateway").
     let quoted = format!("\"{backend}\"");
     if let Ok(agent_type) = serde_json::from_str::<AgentType>(&quoted) {
+        if agent_type.is_deprecated_runtime() {
+            return Err(TeamError::InvalidRequest(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
+        }
         return Ok(agent_type);
     }
     Err(TeamError::InvalidRequest(format!("unsupported backend: {backend}")))
@@ -259,7 +264,7 @@ impl TeamSessionService {
         };
         // Top-level `model` is aionrs-only per spec 2026-05-12; for other
         // agent types the model/provider ride along in `extra`.
-        let (top_level_model, extra) = if agent_type == AgentType::Aionrs {
+        let (top_level_model, mut extra) = if agent_type == AgentType::Aionrs {
             (
                 Some(ProviderWithModel {
                     provider_id,
@@ -282,6 +287,7 @@ impl TeamSessionService {
                 }),
             )
         };
+        inherit_team_workspace(&mut extra, &row.workspace);
         let conv_req = CreateConversationRequest {
             r#type: agent_type,
             name: Some(name.clone()),
@@ -341,9 +347,21 @@ mod tests {
     #[test]
     fn parse_agent_type_known_backends() {
         assert_eq!(parse_agent_type("acp").unwrap(), AgentType::Acp);
-        assert_eq!(parse_agent_type("nanobot").unwrap(), AgentType::Nanobot);
-        assert_eq!(parse_agent_type("remote").unwrap(), AgentType::Remote);
+        assert_eq!(parse_agent_type("gemini").unwrap(), AgentType::Acp);
         assert_eq!(parse_agent_type("aionrs").unwrap(), AgentType::Aionrs);
+    }
+
+    #[test]
+    fn parse_agent_type_rejects_deprecated_runtime_types() {
+        for backend in ["nanobot", "remote", "openclaw-gateway"] {
+            let err = parse_agent_type(backend).unwrap_err();
+            assert!(matches!(err, TeamError::InvalidRequest(_)));
+            assert!(
+                err.to_string()
+                    .contains("This agent type is no longer supported for new conversations."),
+                "unexpected error for {backend}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -353,10 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_type_openclaw_gateway() {
-        assert_eq!(
-            parse_agent_type("openclaw-gateway").unwrap(),
-            AgentType::OpenclawGateway
-        );
+    fn resolve_full_auto_mode_keeps_hermes_on_default() {
+        assert_eq!(resolve_full_auto_mode("hermes"), "default");
     }
 }
