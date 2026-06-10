@@ -8,6 +8,8 @@ use aionui_realtime::EventBroadcaster;
 
 use crate::types::{TeamAgent, TeammateStatus};
 
+pub const TEAMMATE_MESSAGE_EVENT: &str = "team.teammateMessage";
+
 pub struct TeamEventEmitter {
     team_id: String,
     broadcaster: Arc<dyn EventBroadcaster>,

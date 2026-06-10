@@ -5,13 +5,20 @@ use std::sync::Arc;
 use aionui_api_types::{
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, WebSocketMessage,
 };
+use aionui_db::models::MessageRow;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::events::TeamEventEmitter;
+use aionui_team::message_projection::{
+    ProjectedTeamMessage, TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest,
+    TeamProjectionSource,
+};
 use aionui_team::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use aionui_team::types::{
     MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
 };
+use aionui_team::visibility::TeamVisibilityPolicy;
 use aionui_team::{Mailbox, TaskBoard, TeammateManager};
+use async_trait::async_trait;
 use common::MockTeamRepo;
 
 // ---------------------------------------------------------------------------
@@ -40,6 +47,44 @@ impl EventBroadcaster for RecordingBroadcaster {
     }
 }
 
+#[derive(Default)]
+struct RecordingProjectionStore {
+    rows: std::sync::Mutex<Vec<MessageRow>>,
+}
+
+impl RecordingProjectionStore {
+    fn rows(&self) -> Vec<MessageRow> {
+        self.rows.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl TeamProjectionMessageStore for RecordingProjectionStore {
+    async fn find_projected_message(
+        &self,
+        conversation_id: &str,
+        msg_id: &str,
+        msg_type: &str,
+    ) -> Result<Option<MessageRow>, aionui_team::TeamError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row.conversation_id == conversation_id
+                    && row.msg_id.as_deref() == Some(msg_id)
+                    && row.r#type == msg_type
+            })
+            .cloned())
+    }
+
+    async fn insert_projected_message(&self, row: &MessageRow) -> Result<(), aionui_team::TeamError> {
+        self.rows.lock().unwrap().push(row.clone());
+        Ok(())
+    }
+}
+
 fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
     TeamAgent {
         slot_id: slot_id.into(),
@@ -53,6 +98,111 @@ fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
         conversation_type: None,
         cli_path: None,
     }
+}
+
+// ===========================================================================
+// Round 2: Visibility policy and Team message projection
+// ===========================================================================
+
+#[test]
+fn visibility_policy_user_message_has_explicit_decisions() {
+    let policy = TeamVisibilityPolicy::user_message();
+
+    assert!(policy.write_mailbox);
+    assert!(policy.insert_user_visible_bubble);
+    assert!(!policy.insert_teammate_visible_bubble);
+    assert!(!policy.allow_hidden_conversation_message);
+    assert!(policy.strip_system_notes);
+}
+
+#[test]
+fn projection_request_for_teammate_mirror_uses_stable_mailbox_dedupe_key() {
+    let req = TeamProjectionRequest::teammate_visible(
+        "team-1",
+        "lead-1",
+        "conv-lead",
+        "worker-1",
+        "Worker",
+        "Done",
+        "mailbox-123",
+    );
+
+    assert_eq!(
+        req.dedupe_key.as_deref(),
+        Some("team:team-1:mailbox:mailbox-123:conversation:conv-lead")
+    );
+    assert!(req.visibility.insert_teammate_visible_bubble);
+    assert!(!req.visibility.allow_hidden_conversation_message);
+}
+
+#[tokio::test]
+async fn projection_inserts_user_visible_bubble_with_stripped_system_notes() {
+    let store = Arc::new(RecordingProjectionStore::default());
+    let bc = Arc::new(RecordingBroadcaster::new());
+    let projection = TeamMessageProjection::new(store.clone(), bc.clone());
+    let req = TeamProjectionRequest {
+        team_id: "team-1".into(),
+        slot_id: "lead-1".into(),
+        conversation_id: "conv-lead".into(),
+        source: TeamProjectionSource::User,
+        content: "Visible\n[SYSTEM NOTE: internal]\ntext".into(),
+        files: vec![],
+        visibility: TeamVisibilityPolicy::user_message(),
+        dedupe_key: None,
+    };
+
+    let projected = projection.project(req).await.unwrap();
+
+    assert!(matches!(projected, ProjectedTeamMessage::Inserted { .. }));
+    let rows = store.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].position.as_deref(), Some("right"));
+    assert!(!rows[0].hidden);
+    let content: serde_json::Value = serde_json::from_str(&rows[0].content).unwrap();
+    assert_eq!(content["content"], "Visible\ntext");
+    assert!(!rows[0].content.contains("SYSTEM NOTE"));
+    assert!(bc.events().is_empty(), "user projection should rely on message.stream");
+}
+
+#[tokio::test]
+async fn projection_dedupes_teammate_mirror_and_broadcasts_persisted_msg_id() {
+    let store = Arc::new(RecordingProjectionStore::default());
+    let bc = Arc::new(RecordingBroadcaster::new());
+    let projection = TeamMessageProjection::new(store.clone(), bc.clone());
+    let req = TeamProjectionRequest::teammate_visible(
+        "team-1",
+        "lead-1",
+        "conv-lead",
+        "worker-1",
+        "Worker",
+        "Done",
+        "mailbox-123",
+    );
+
+    let first = projection.project(req.clone()).await.unwrap();
+    let second = projection.project(req).await.unwrap();
+
+    let first_msg_id = match first {
+        ProjectedTeamMessage::Inserted { msg_id } => msg_id,
+        other => panic!("expected insert, got {other:?}"),
+    };
+    assert!(matches!(
+        second,
+        ProjectedTeamMessage::AlreadyProjected { ref msg_id } if msg_id == &first_msg_id
+    ));
+    assert_eq!(
+        store.rows().len(),
+        1,
+        "duplicate projection must not insert a second row"
+    );
+
+    let events = bc.events();
+    assert_eq!(events.len(), 1, "duplicate projection must not re-broadcast");
+    assert_eq!(events[0].name, "team.teammateMessage");
+    assert_eq!(events[0].data["conversation_id"], "conv-lead");
+    assert_eq!(events[0].data["msg_id"], first_msg_id);
+    assert_eq!(events[0].data["from_slot_id"], "worker-1");
+    assert_eq!(events[0].data["from_name"], "Worker");
 }
 
 // ===========================================================================

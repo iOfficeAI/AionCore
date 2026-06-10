@@ -13,6 +13,9 @@ use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
 use crate::mailbox::Mailbox;
 use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
+use crate::message_projection::{
+    TeamMessageProjection, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
+};
 use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
@@ -36,10 +39,7 @@ pub struct WakeInput {
     /// **not** yet marked as read — the caller must call
     /// `mailbox.mark_read_batch` after successful delivery.
     pub unread: Vec<crate::types::MailboxMessage>,
-    /// Role of the wake target. Leader wakes do **not** mirror mailbox rows
-    /// into the conversation — the content is already embedded in the role
-    /// prompt sent to the leader directly. Only teammate wakes get the left
-    /// bubble treatment.
+    /// Role of the wake target.
     pub agent_role: TeammateRole,
 }
 
@@ -309,28 +309,25 @@ impl TeamSession {
             )
             .await?;
 
-        // Persist the user message as a right bubble in the leader's conversation.
-        // Strip [SYSTEM NOTE: ...] blocks so internal instructions are not visible
-        // to the user in the chat UI.
         if let Some(svc) = self.service.upgrade() {
-            let visible_content = strip_system_notes(content);
-            let msg_id = ConversationService::mint_msg_id();
-            let row = aionui_db::models::MessageRow {
-                id: msg_id.clone(),
-                conversation_id: lead_conv_id,
-                msg_id: Some(msg_id),
-                r#type: "text".into(),
-                content: serde_json::json!({ "content": visible_content }).to_string(),
-                position: Some("right".into()),
-                status: Some("finish".into()),
-                hidden: false,
-                created_at: aionui_common::now_ms(),
-            };
-            if let Err(e) = svc.conversation_service_ref().insert_raw_message(&row).await {
+            let projection = TeamMessageProjection::new(
+                Arc::new(svc.conversation_service_ref().clone()),
+                self.broadcaster.clone(),
+            );
+            let request = TeamProjectionRequest::user_visible(
+                &self.team.id,
+                &lead_slot_id,
+                &lead_conv_id,
+                content,
+                files.clone().unwrap_or_default(),
+            );
+            if let Err(e) = projection.project(request).await {
                 warn!(
                     team_id = %self.team.id,
+                    slot_id = %lead_slot_id,
+                    conversation_id = %lead_conv_id,
                     error = %e,
-                    "failed to persist user right bubble for leader (non-fatal)"
+                    "failed to project user right bubble for leader (non-fatal)"
                 );
             }
         }
@@ -363,27 +360,25 @@ impl TeamSession {
             )
             .await?;
 
-        // Persist the user message as a right bubble in the agent's conversation
-        // so the teammate panel shows what the user said.
         if let Some(svc) = self.service.upgrade() {
-            let msg_id = ConversationService::mint_msg_id();
-            let row = aionui_db::models::MessageRow {
-                id: msg_id.clone(),
-                conversation_id: agent.conversation_id.clone(),
-                msg_id: Some(msg_id),
-                r#type: "text".into(),
-                content: serde_json::json!({ "content": content }).to_string(),
-                position: Some("right".into()),
-                status: Some("finish".into()),
-                hidden: false,
-                created_at: aionui_common::now_ms(),
-            };
-            if let Err(e) = svc.conversation_service_ref().insert_raw_message(&row).await {
+            let projection = TeamMessageProjection::new(
+                Arc::new(svc.conversation_service_ref().clone()),
+                self.broadcaster.clone(),
+            );
+            let request = TeamProjectionRequest::user_visible(
+                &self.team.id,
+                slot_id,
+                &agent.conversation_id,
+                content,
+                files.clone().unwrap_or_default(),
+            );
+            if let Err(e) = projection.project(request).await {
                 warn!(
                     team_id = %self.team.id,
                     slot_id,
+                    conversation_id = %agent.conversation_id,
                     error = %e,
-                    "failed to persist user right bubble (non-fatal)"
+                    "failed to project user right bubble (non-fatal)"
                 );
             }
         }
@@ -491,12 +486,9 @@ impl TeamSession {
 
     /// Mirror each non-user mailbox row into the target agent's conversation
     /// as a left bubble so the UI shows "who said what" when the user opens
-    /// a teammate's chat panel.
+    /// an agent's chat panel.
     ///
     /// Skipped for:
-    /// - Leader wakes: the mailbox content is embedded inside the role prompt
-    ///   sent to the leader directly; duplicating it as a bubble would clutter
-    ///   the leader's own thread (AionUi parity: `agent.role !== 'leader'`).
     /// - `from_agent_id == "user"`: user-originated messages are already
     ///   written to the conversation by the standard user-send path, and we
     ///   must not double-write them.
@@ -510,13 +502,13 @@ impl TeamSession {
         if input.unread.is_empty() {
             return;
         }
-        if matches!(input.agent_role, TeammateRole::Lead) {
-            return;
-        }
         let Some(service) = self.service.upgrade() else {
             return;
         };
-        let conversation_service = service.conversation_service_ref();
+        let projection = TeamMessageProjection::new(
+            Arc::new(service.conversation_service_ref().clone()),
+            self.broadcaster.clone(),
+        );
         let agents = self.scheduler.list_agents().await;
         let total = input.unread.len();
 
@@ -535,51 +527,30 @@ impl TeamSession {
             } else {
                 msg.content.clone()
             };
-            let msg_id = ConversationService::mint_msg_id();
-            let content_json = serde_json::json!({
-                "content": display_content,
-                "teammate_message": true,
-                "sender_name": sender_name,
-                "sender_backend": sender_backend,
-                "sender_conversation_id": sender_conv_id,
-            })
-            .to_string();
-            let row = aionui_db::models::MessageRow {
-                id: msg_id.clone(),
+            let request = TeamProjectionRequest {
+                team_id: self.team.id.clone(),
+                slot_id: msg.to_agent_id.clone(),
                 conversation_id: input.conversation_id.clone(),
-                msg_id: Some(msg_id.clone()),
-                r#type: "text".into(),
-                content: content_json,
-                position: Some("left".into()),
-                status: Some("finish".into()),
-                hidden: false,
-                created_at: aionui_common::now_ms(),
+                source: TeamProjectionSource::Teammate {
+                    from_slot_id: msg.from_agent_id.clone(),
+                    from_name: sender_name,
+                    sender_backend,
+                    sender_conversation_id: sender_conv_id,
+                },
+                content: display_content,
+                files: msg.files.clone().unwrap_or_default(),
+                visibility: crate::visibility::TeamVisibilityPolicy::teammate_message(),
+                dedupe_key: Some(teammate_dedupe_key(&self.team.id, &msg.id, &input.conversation_id)),
             };
-            if let Err(err) = conversation_service.insert_raw_message(&row).await {
+            if let Err(err) = projection.project(request).await {
                 warn!(
                     team_id = %self.team.id,
                     conversation_id = %input.conversation_id,
                     from = %msg.from_agent_id,
                     error = %err,
-                    "mirror_unread_to_conversation: insert_raw_message failed (non-fatal)"
+                    "mirror_unread_to_conversation: projection failed (non-fatal)"
                 );
-                continue;
             }
-
-            // Broadcast so the frontend can render the bubble in real-time
-            // without a full message reload. The msg_id is included for
-            // deduplication against the DB-persisted row.
-            let ws_payload = serde_json::json!({
-                "conversation_id": input.conversation_id,
-                "msg_id": msg_id,
-                "content": display_content,
-                "from_slot_id": msg.from_agent_id,
-                "from_name": sender_name,
-                "teammate_message": true,
-                "sender_backend": sender_backend,
-            });
-            let event = aionui_api_types::WebSocketMessage::new("team.teammate.message", ws_payload);
-            self.broadcaster.broadcast(event);
         }
     }
 
@@ -814,25 +785,6 @@ impl TeamSession {
     pub fn task_board(&self) -> &Arc<TaskBoard> {
         &self.task_board
     }
-}
-
-/// Remove `[SYSTEM NOTE: ...]` blocks from a message so they don't appear in
-/// user-visible chat bubbles. The full content (with notes) is still delivered
-/// to the agent via the mailbox/wake payload.
-fn strip_system_notes(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("[SYSTEM NOTE:") {
-        result.push_str(&rest[..start]);
-        if let Some(end) = rest[start..].find(']') {
-            rest = &rest[start + end + 1..];
-        } else {
-            rest = &rest[start..];
-            break;
-        }
-    }
-    result.push_str(rest);
-    result.trim().to_owned()
 }
 
 #[cfg(test)]
@@ -1481,7 +1433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mirror_unread_to_conversation_is_noop_for_leader() {
+    async fn mirror_unread_to_conversation_skips_when_service_weak_is_dangling_for_leader() {
         let session = start_session().await;
         session
             .mailbox
@@ -1498,8 +1450,8 @@ mod tests {
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
 
-        // The service `Weak` is dangling in unit tests, but the leader short-circuit
-        // must hit before any upgrade — this call must not panic.
+        // In unit tests, `service` is a dangling Weak — the mirror helper must
+        // skip gracefully even for leader targets.
         session.mirror_unread_to_conversation(&input).await;
         session.stop();
     }
