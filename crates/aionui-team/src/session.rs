@@ -19,7 +19,6 @@ use crate::message_projection::{
 use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
-use crate::service::spawn_support::resolve_full_auto_mode;
 use crate::task_board::TaskBoard;
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 
@@ -741,36 +740,10 @@ impl TeamSession {
         user_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), TeamError> {
-        let patch = serde_json::json!({
-            "team_mcp_stdio_config": mcp_stdio_cfg,
-            "session_mode": resolve_full_auto_mode(&agent.backend),
-        });
-
         service
-            .conversation_service_ref()
-            .update_extra(&agent.conversation_id, patch)
+            .provisioner()
+            .attach_agent_process(user_id, agent, mcp_stdio_cfg, task_manager)
             .await
-            .map_err(|e| {
-                TeamError::InvalidRequest(format!(
-                    "failed to persist team_mcp_stdio_config for {}: {e}",
-                    agent.slot_id
-                ))
-            })?;
-
-        let _ = task_manager.kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild));
-
-        service
-            .conversation_service_ref()
-            .warmup(user_id, &agent.conversation_id, task_manager)
-            .await
-            .map_err(|e| {
-                TeamError::InvalidRequest(format!(
-                    "failed to warm up spawned agent {}: {e}",
-                    agent.conversation_id
-                ))
-            })?;
-
-        Ok(())
     }
 
     pub fn stop(&self) {

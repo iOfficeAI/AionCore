@@ -101,8 +101,10 @@ fn make_aionrs_options(
         },
         model,
         skills: vec![],
+        team: None,
         kind: AgentSessionKind::Aionrs(Box::new(AionrsSessionBuildContext {
             config,
+            team: None,
             belongs_to_team: false,
         })),
     })

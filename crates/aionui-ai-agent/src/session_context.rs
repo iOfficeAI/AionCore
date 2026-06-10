@@ -1,4 +1,4 @@
-use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra};
+use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, TeamSessionBinding};
 use aionui_common::{AgentType, ProviderWithModel};
 
 use crate::shared_kernel::PersistedSessionState;
@@ -14,6 +14,7 @@ pub struct AgentSessionContext {
     pub workspace: WorkspaceContext,
     pub model: ProviderWithModel,
     pub skills: Vec<String>,
+    pub team: Option<TeamSessionBinding>,
     pub kind: AgentSessionKind,
 }
 
@@ -45,6 +46,7 @@ pub enum AgentSessionKind {
 #[derive(Debug, Clone)]
 pub struct AcpSessionBuildContext {
     pub config: AcpBuildExtra,
+    pub team: Option<TeamSessionBinding>,
     pub belongs_to_team: bool,
     pub session_id: Option<String>,
     pub session_snapshot: Option<PersistedSessionState>,
@@ -53,6 +55,7 @@ pub struct AcpSessionBuildContext {
 #[derive(Debug, Clone)]
 pub struct AionrsSessionBuildContext {
     pub config: AionrsBuildExtra,
+    pub team: Option<TeamSessionBinding>,
     pub belongs_to_team: bool,
 }
 

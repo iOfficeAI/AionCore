@@ -26,7 +26,7 @@ pub(super) async fn build(
     build_context: AcpSessionBuildContext,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
-    let belongs_to_team = build_context.belongs_to_team;
+    let belongs_to_team = build_context.team.is_some();
     let mut config = build_context.config;
 
     // Resolve the catalog row — prefer explicit agent_id, fall
@@ -58,7 +58,7 @@ pub(super) async fn build(
     } else if belongs_to_team {
         debug!(
             ctx.conversation_id,
-            "guide_mcp: skipped: conversation belongs to a team (extra.teamId)"
+            "guide_mcp: skipped: conversation belongs to a team"
         );
     } else if config.guide_mcp_config.is_some() {
         debug!(

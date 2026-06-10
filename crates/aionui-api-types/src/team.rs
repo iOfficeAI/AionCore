@@ -1,6 +1,8 @@
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
+use crate::TeamMcpStdioConfig;
+
 // ---------------------------------------------------------------------------
 // A. Team management — Request DTOs
 // ---------------------------------------------------------------------------
@@ -70,7 +72,47 @@ pub struct RenameAgentRequest {
 }
 
 // ---------------------------------------------------------------------------
-// C. Message & session — Request DTOs
+// C. Team runtime context — persisted conversation.extra contract
+// ---------------------------------------------------------------------------
+
+/// Typed Team binding decoded from a team-owned conversation's `extra`.
+///
+/// This is the runtime-build contract consumed after `SessionContextBuilder`
+/// has parsed persisted JSON. `team_id` is the ownership marker; `slot_id`
+/// and `role` identify the agent slot when the conversation is attached to an
+/// active Team session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamSessionBinding {
+    pub team_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub runtime_seed: TeamRuntimeSeed,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<TeamMcpRuntimeConfig>,
+}
+
+/// Startup seed values Team provisioning persists for runtime build.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamRuntimeSeed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_model_id: Option<String>,
+}
+
+/// Typed Team MCP runtime configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamMcpRuntimeConfig {
+    pub stdio: TeamMcpStdioConfig,
+}
+
+// ---------------------------------------------------------------------------
+// D. Message & session — Request DTOs
 // ---------------------------------------------------------------------------
 
 /// Request body for `POST /api/teams/:id/messages`.
@@ -97,7 +139,7 @@ pub struct SendAgentMessageRequest {
 }
 
 // ---------------------------------------------------------------------------
-// D. Team management — Response DTOs
+// E. Team management — Response DTOs
 // ---------------------------------------------------------------------------
 
 /// Single agent within a team response.
@@ -139,7 +181,7 @@ pub struct TeamResponse {
 pub type TeamListResponse = Vec<TeamResponse>;
 
 // ---------------------------------------------------------------------------
-// E. WebSocket event payloads
+// F. WebSocket event payloads
 // ---------------------------------------------------------------------------
 
 /// Payload for `team.agent.status` WebSocket event.

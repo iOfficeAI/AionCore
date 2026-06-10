@@ -651,8 +651,10 @@ fn test_acp_build_options(conversation_id: String, workspace: String) -> BuildTa
             use_model: None,
         },
         skills: Vec::new(),
+        team: None,
         kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
             config: AcpBuildExtra::default(),
+            team: None,
             belongs_to_team: false,
             session_id: None,
             session_snapshot: None,
@@ -1375,6 +1377,74 @@ async fn aa_add_agent_inherits_team_workspace() {
 }
 
 #[tokio::test]
+async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Typed".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    for agent in &created.agents {
+        let extra = conv_repo.get_extra(&agent.conversation_id).unwrap();
+        assert_eq!(extra.get("teamId").and_then(|v| v.as_str()), Some(created.id.as_str()));
+        assert_eq!(
+            extra.get("slot_id").and_then(|v| v.as_str()),
+            Some(agent.slot_id.as_str())
+        );
+        assert_eq!(extra.get("role").and_then(|v| v.as_str()), Some(agent.role.as_str()));
+        assert_eq!(
+            extra.get("backend").and_then(|v| v.as_str()),
+            Some(agent.backend.as_str())
+        );
+        assert_eq!(
+            extra.get("session_mode").and_then(|v| v.as_str()),
+            Some("yolo"),
+            "Team provisioning should write the runtime seed for initial agents"
+        );
+    }
+
+    let added = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Extra".into(),
+                role: "teammate".into(),
+                backend: "acp".into(),
+                model: "claude".into(),
+                custom_agent_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let extra = conv_repo.get_extra(&added.conversation_id).unwrap();
+    assert_eq!(extra.get("teamId").and_then(|v| v.as_str()), Some(created.id.as_str()));
+    assert_eq!(
+        extra.get("slot_id").and_then(|v| v.as_str()),
+        Some(added.slot_id.as_str())
+    );
+    assert_eq!(extra.get("role").and_then(|v| v.as_str()), Some(added.role.as_str()));
+    assert_eq!(
+        extra.get("backend").and_then(|v| v.as_str()),
+        Some(added.backend.as_str())
+    );
+    assert_eq!(
+        extra.get("session_mode").and_then(|v| v.as_str()),
+        Some("yolo"),
+        "Team provisioning should write the runtime seed for added agents"
+    );
+}
+
+#[tokio::test]
 async fn aa4_add_agent_to_nonexistent_team() {
     let svc = setup();
     let result = svc
@@ -1862,23 +1932,31 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
 async fn d9_ensure_session_persists_team_mcp_stdio_config() {
     // Each agent's conversation.extra must carry a `team_mcp_stdio_config`
     // object by the time the factory is called — that is what the rebuilt
-    // ACP process will read to reach the MCP server.
+    // typed Team context will expose to reach the MCP server.
     use futures_util::FutureExt;
     let (svc, _tm) = setup_with_factory(Arc::new(|opts: BuildTaskOptions| {
         async move {
             let context = opts.context;
-            let extra_has_cfg = match &context.kind {
-                AgentSessionKind::Acp(acp) => acp
-                    .config
-                    .team_mcp_stdio_config
-                    .as_ref()
-                    .is_some_and(|cfg| cfg.port > 0 && !cfg.slot_id.is_empty()),
+            let typed_has_cfg = context
+                .team
+                .as_ref()
+                .and_then(|team| team.mcp.as_ref())
+                .is_some_and(|mcp| mcp.stdio.port > 0 && !mcp.stdio.slot_id.is_empty());
+            let compat_has_cfg = match &context.kind {
+                AgentSessionKind::Acp(acp) => {
+                    assert!(acp.belongs_to_team);
+                    assert!(acp.team.is_some(), "ACP build context must carry typed team binding");
+                    acp.config
+                        .team_mcp_stdio_config
+                        .as_ref()
+                        .is_some_and(|cfg| cfg.port > 0 && !cfg.slot_id.is_empty())
+                }
                 _ => false,
             };
             assert!(
-                extra_has_cfg,
-                "factory called without team_mcp_stdio_config in typed context: {:?}",
-                context.kind
+                typed_has_cfg && compat_has_cfg,
+                "factory called without typed team_mcp_stdio_config in context: {:?}",
+                context.team
             );
             Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
                 mock_agent::MockAgent::new(context.conversation.conversation_id, context.workspace.path),

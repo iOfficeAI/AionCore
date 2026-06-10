@@ -29,7 +29,7 @@ const ACP_VENDOR_LABELS: &[&str] = &[
 
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 
-pub(super) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
+pub(crate) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     // Any registered ACP vendor label collapses to `AgentType::Acp`.
     if ACP_VENDOR_LABELS.contains(&backend) {
         return Ok(AgentType::Acp);
@@ -166,22 +166,6 @@ impl TeamSessionService {
             .collect()
     }
 
-    /// Find the provider ID that contains a given model name.
-    /// Iterates all enabled providers and checks their models JSON array.
-    pub(crate) async fn resolve_provider_for_model(&self, model: &str) -> Option<String> {
-        let providers = self.provider_repo.list().await.ok()?;
-        for p in providers {
-            if !p.enabled {
-                continue;
-            }
-            let models: Vec<String> = serde_json::from_str(&p.models).unwrap_or_default();
-            if models.iter().any(|m| m == model) {
-                return Some(p.id);
-            }
-        }
-        None
-    }
-
     pub(crate) async fn default_model_for_backend(&self, backend: &str) -> Option<String> {
         let row = self.agent_metadata_repo.find_builtin_by_backend(backend).await.ok()??;
         let json: serde_json::Value = serde_json::from_str(row.available_models.as_deref()?).ok()?;
@@ -249,86 +233,9 @@ impl TeamSessionService {
             .clone();
         let _guard = lock.lock().await;
 
-        let row = self
-            .repo
-            .get_team(team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        let mut team = Team::from_row(&row)?;
-
-        let agent_type = parse_agent_type(&backend)?;
-        let provider_id = if agent_type == AgentType::Aionrs {
-            self.resolve_provider_for_model(&model).await.unwrap_or(backend.clone())
-        } else {
-            backend.clone()
-        };
-        // Top-level `model` is aionrs-only per spec 2026-05-12; for other
-        // agent types the model/provider ride along in `extra`.
-        let (top_level_model, mut extra) = if agent_type == AgentType::Aionrs {
-            (
-                Some(ProviderWithModel {
-                    provider_id,
-                    model: model.clone(),
-                    use_model: None,
-                }),
-                serde_json::json!({
-                    "teamId": team_id,
-                    "backend": backend,
-                }),
-            )
-        } else {
-            (
-                None,
-                serde_json::json!({
-                    "teamId": team_id,
-                    "backend": backend,
-                    "provider_id": provider_id,
-                    "current_model_id": model.clone(),
-                }),
-            )
-        };
-        inherit_team_workspace(&mut extra, &row.workspace);
-        let conv_req = CreateConversationRequest {
-            r#type: agent_type,
-            name: Some(name.clone()),
-            model: top_level_model,
-            source: None,
-            channel_chat_id: None,
-            extra,
-        };
-        let conv = self
-            .conversation_service
-            .create(user_id, conv_req)
+        self.provisioner()
+            .persist_spawned_agent(user_id, team_id, name, backend, model, custom_agent_id)
             .await
-            .map_err(TeamError::from_conversation_create)?;
-
-        let agent = TeamAgent {
-            slot_id: generate_id(),
-            name,
-            role: TeammateRole::Teammate,
-            conversation_id: conv.id,
-            backend,
-            model,
-            custom_agent_id,
-            status: None,
-            conversation_type: None,
-            cli_path: None,
-        };
-
-        team.agents.push(agent.clone());
-        let agents_json = serde_json::to_string(&team.agents)?;
-        self.repo
-            .update_team(
-                team_id,
-                &UpdateTeamParams {
-                    name: None,
-                    agents: Some(agents_json),
-                    lead_agent_id: None,
-                },
-            )
-            .await?;
-
-        Ok(agent)
     }
 }
 

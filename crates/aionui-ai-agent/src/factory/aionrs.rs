@@ -31,7 +31,7 @@ pub(super) async fn build(
     model: ProviderWithModel,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
-    let belongs_to_team = build_context.belongs_to_team;
+    let belongs_to_team = build_context.team.is_some();
     let mut overrides = build_context.config;
 
     // Merge preset assistant rules into system_prompt (used as custom_prompt
@@ -45,7 +45,7 @@ pub(super) async fn build(
     }
 
     // Inject Guide MCP config for solo (non-team) sessions, mirroring acp.rs.
-    // Skip if the conversation already belongs to a team (extra.teamId set).
+    // Skip if the conversation already belongs to a team.
     if overrides.team_mcp_stdio_config.is_none()
         && overrides.guide_mcp_config.is_none()
         && deps.guide_mcp_config.is_some()

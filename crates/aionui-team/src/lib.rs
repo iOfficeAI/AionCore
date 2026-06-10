@@ -10,6 +10,7 @@ pub mod mailbox;
 pub mod mcp;
 pub mod message_projection;
 pub mod prompts;
+pub mod provisioning;
 pub mod routes;
 pub mod scheduler;
 pub mod service;
@@ -32,6 +33,7 @@ pub use message_projection::{
 };
 
 pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
+pub use provisioning::TeamAgentProvisioner;
 pub use routes::{TeamRouterState, team_routes};
 pub use scheduler::{
     SchedulerAction, TeammateManager, WAKE_TIMEOUT_MS, WakePayload, format_crash_testament, normalize_name,

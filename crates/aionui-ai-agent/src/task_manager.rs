@@ -303,8 +303,10 @@ mod tests {
                 use_model: None,
             },
             skills: vec![],
+            team: None,
             kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
                 config: Default::default(),
+                team: None,
                 belongs_to_team: false,
                 session_id: None,
                 session_snapshot: None,

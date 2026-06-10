@@ -176,12 +176,14 @@ async fn collect_idle_ignores_aionrs_agent_type() {
         let kind = match agent_type {
             AgentType::Acp => AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
                 config: Default::default(),
+                team: None,
                 belongs_to_team: false,
                 session_id: None,
                 session_snapshot: None,
             })),
             AgentType::Aionrs => AgentSessionKind::Aionrs(Box::new(AionrsSessionBuildContext {
                 config: Default::default(),
+                team: None,
                 belongs_to_team: false,
             })),
             AgentType::Gemini
@@ -210,6 +212,7 @@ async fn collect_idle_ignores_aionrs_agent_type() {
                 use_model: None,
             },
             skills: vec![],
+            team: None,
             kind,
         })
     };
