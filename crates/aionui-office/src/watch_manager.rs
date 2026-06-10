@@ -538,24 +538,6 @@ mod tests {
         assert_eq!(path, managed_bin);
     }
 
-    #[test]
-    fn officecli_resolves_npm_prefix_install_layout() {
-        // `npm install --prefix <dir> officecli` (see install_officecli) is a
-        // local-style install: the executable shim lands in
-        // <dir>/node_modules/.bin, and <dir>/bin is never created.
-        let tmp = tempfile::tempdir().unwrap();
-        let shim_name = if cfg!(windows) { "officecli.cmd" } else { "officecli" };
-        let npm_shim = tmp
-            .path()
-            .join("runtime/node/tools/officecli/node_modules/.bin")
-            .join(shim_name);
-        std::fs::create_dir_all(npm_shim.parent().unwrap()).unwrap();
-        std::fs::write(&npm_shim, b"#!/bin/sh\nexit 0\n").unwrap();
-
-        let path = resolve_officecli_path(tmp.path()).expect("npm-installed officecli");
-        assert_eq!(path, npm_shim);
-    }
-
     #[tokio::test]
     async fn start_creates_session() {
         let spawner = Arc::new(MockSpawner::new());

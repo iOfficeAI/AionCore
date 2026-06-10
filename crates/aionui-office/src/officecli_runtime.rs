@@ -10,15 +10,12 @@ pub(crate) fn officecli_prefix(data_dir: &Path) -> PathBuf {
 
 pub(crate) fn resolve_officecli_path(data_dir: &Path) -> Option<PathBuf> {
     let prefix = officecli_prefix(data_dir);
-    let shim_name = if cfg!(windows) { "officecli.cmd" } else { "officecli" };
-    let candidates = [
-        prefix.join("bin").join(shim_name),
-        // `npm install --prefix <dir> officecli` (see install_officecli) is a
-        // local-style install: the executable shim lands in
-        // <dir>/node_modules/.bin, and <dir>/bin is never created.
-        prefix.join("node_modules").join(".bin").join(shim_name),
-    ];
-    candidates.into_iter().find(|bin| bin.is_file())
+    let bin = if cfg!(windows) {
+        prefix.join("bin").join("officecli.cmd")
+    } else {
+        prefix.join("bin").join("officecli")
+    };
+    bin.is_file().then_some(bin)
 }
 
 pub(crate) async fn resolve_officecli_command(data_dir: &Path) -> Result<ResolvedCommand, OfficeError> {
