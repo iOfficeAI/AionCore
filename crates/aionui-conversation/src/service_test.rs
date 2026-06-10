@@ -638,6 +638,34 @@ fn ensure_test_workspace_path() -> String {
     workspace.to_string_lossy().to_string()
 }
 
+async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agent_type: AgentType) -> ConversationRow {
+    let id = format!(
+        "legacy-{}-{}",
+        agent_type.serde_name(),
+        aionui_common::generate_short_id()
+    );
+    let row = ConversationRow {
+        id,
+        user_id: user_id.to_owned(),
+        name: format!("legacy {}", agent_type.serde_name()),
+        r#type: agent_type.serde_name().to_owned(),
+        extra: json!({
+            "workspace": ensure_test_workspace_path()
+        })
+        .to_string(),
+        model: None,
+        status: Some("finished".into()),
+        source: Some("aionui".into()),
+        channel_chat_id: None,
+        pinned: false,
+        pinned_at: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    repo.create(&row).await.unwrap();
+    row
+}
+
 // ── Create tests ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -664,6 +692,35 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "aionui");
+}
+
+#[tokio::test]
+async fn create_rejects_deprecated_agent_types_for_new_conversations() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    for agent_type in [
+        AgentType::Gemini,
+        AgentType::Codex,
+        AgentType::OpenclawGateway,
+        AgentType::Nanobot,
+        AgentType::Remote,
+    ] {
+        let mut req = make_create_req();
+        req.r#type = agent_type;
+        req.model = None;
+        req.extra = json!({
+            "workspace": ensure_test_workspace_path()
+        });
+
+        let err = svc.create("user_1", req).await.unwrap_err();
+        assert_eq!(err.error_code(), "BAD_REQUEST");
+        assert!(
+            err.to_string()
+                .contains("This agent type is no longer supported for new conversations."),
+            "unexpected error for {}: {err}",
+            agent_type.serde_name()
+        );
+    }
 }
 
 #[tokio::test]
@@ -1300,6 +1357,7 @@ struct MockAgent {
     stopped: Mutex<bool>,
     mode: Mutex<String>,
     model_id: Mutex<String>,
+    keep_reported_model_on_set: bool,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
     allow_direct_confirm: bool,
@@ -1308,6 +1366,25 @@ struct MockAgent {
 }
 
 impl MockAgent {
+    fn build_model_response(current: &str) -> GetModelInfoResponse {
+        GetModelInfoResponse {
+            model_info: Some(ModelInfoPayload {
+                current_model_id: Some(current.to_owned()),
+                current_model_label: Some(current.to_owned()),
+                available_models: vec![
+                    ModelInfoEntry {
+                        id: "model-a".to_owned(),
+                        label: "Model A".to_owned(),
+                    },
+                    ModelInfoEntry {
+                        id: "model-b".to_owned(),
+                        label: "Model B".to_owned(),
+                    },
+                ],
+            }),
+        }
+    }
+
     fn new(conversation_id: &str) -> Self {
         let (event_tx, _) = broadcast::channel(64);
         Self {
@@ -1316,6 +1393,7 @@ impl MockAgent {
             stopped: Mutex::new(false),
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
+            keep_reported_model_on_set: false,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -1331,6 +1409,7 @@ impl MockAgent {
             stopped: Mutex::new(false),
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
+            keep_reported_model_on_set: false,
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -1346,9 +1425,26 @@ impl MockAgent {
             stopped: Mutex::new(false),
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
+            keep_reported_model_on_set: false,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: true,
+            workspace_override: None,
+        }
+    }
+
+    fn with_stale_reported_model_after_set(conversation_id: &str) -> Self {
+        let (event_tx, _) = broadcast::channel(64);
+        Self {
+            conversation_id: conversation_id.to_owned(),
+            event_tx,
+            stopped: Mutex::new(false),
+            mode: Mutex::new("default".to_owned()),
+            model_id: Mutex::new("model-a".to_owned()),
+            keep_reported_model_on_set: true,
+            confirmations: Mutex::new(vec![]),
+            approval_memory: Mutex::new(std::collections::HashMap::new()),
+            allow_direct_confirm: false,
             workspace_override: None,
         }
     }
@@ -1440,27 +1536,19 @@ impl IMockAgent for MockAgent {
 
     async fn get_model(&self) -> Result<GetModelInfoResponse, AgentError> {
         let current = self.model_id.lock().unwrap().clone();
-        Ok(GetModelInfoResponse {
-            model_info: Some(ModelInfoPayload {
-                current_model_id: Some(current.clone()),
-                current_model_label: Some(current.clone()),
-                available_models: vec![
-                    ModelInfoEntry {
-                        id: "model-a".to_owned(),
-                        label: "Model A".to_owned(),
-                    },
-                    ModelInfoEntry {
-                        id: "model-b".to_owned(),
-                        label: "Model B".to_owned(),
-                    },
-                ],
-            }),
-        })
+        Ok(Self::build_model_response(&current))
     }
 
     async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
-        *self.model_id.lock().unwrap() = model_id.to_owned();
+        if !self.keep_reported_model_on_set {
+            *self.model_id.lock().unwrap() = model_id.to_owned();
+        }
         Ok(())
+    }
+
+    async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
+        self.set_model(model_id).await?;
+        Ok(Self::build_model_response(model_id))
     }
 }
 
@@ -1931,13 +2019,74 @@ async fn send_message_returns_accepted() {
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let msg_id = svc
+    let response = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap();
 
-    assert!(!msg_id.is_empty(), "msg_id must be non-empty");
-    assert_eq!(msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
+    assert!(!response.msg_id.is_empty(), "msg_id must be non-empty");
+    assert_eq!(response.msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
+    assert!(response.turn_id.starts_with("turn_"), "turn_id must use turn_ prefix");
+    assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
+}
+
+#[tokio::test]
+async fn send_message_returns_msg_id_and_turn_id_and_summary_tracks_turn() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let slow_task_mgr = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(500)));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = slow_task_mgr.clone();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let response = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+
+    assert!(!response.msg_id.is_empty(), "msg_id must be non-empty");
+    assert!(response.turn_id.starts_with("turn_"), "turn_id must use turn_ prefix");
+    assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
+    assert_eq!(
+        response.runtime.turn_id.as_deref(),
+        Some(response.turn_id.as_str()),
+        "send response runtime must identify the accepted turn"
+    );
+    assert!(response.runtime.is_processing);
+    assert!(!response.runtime.can_send_message);
+
+    let runtime = svc.runtime_summary_for(&conv.id).await;
+    assert_eq!(response.runtime, runtime);
+    assert_eq!(runtime.turn_id.as_deref(), Some(response.turn_id.as_str()));
+    assert!(runtime.is_processing);
+    assert!(!runtime.can_send_message);
+}
+
+#[tokio::test]
+async fn send_message_rejects_legacy_runtime_conversations_as_archived() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    for agent_type in [
+        AgentType::Gemini,
+        AgentType::Codex,
+        AgentType::OpenclawGateway,
+        AgentType::Nanobot,
+        AgentType::Remote,
+    ] {
+        let conv = insert_conversation_with_type(&repo, "user_1", agent_type).await;
+
+        let err = svc
+            .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "CONVERSATION_ARCHIVED");
+        assert!(
+            err.to_string()
+                .contains("This historical conversation can no longer be continued. Please start a new conversation."),
+            "unexpected archived message for {}: {err}",
+            agent_type.serde_name()
+        );
+    }
 }
 
 #[tokio::test]
@@ -1984,6 +2133,40 @@ async fn set_model_returns_confirmed_model_from_active_agent() {
 }
 
 #[tokio::test]
+async fn set_model_returns_confirmed_model_even_if_get_model_is_stale() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(MockAgent::with_stale_reported_model_after_set(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+
+    let response = svc
+        .set_model(
+            &conv.id,
+            SetModelRequest {
+                model_id: "model-b".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let model_info = response.model_info.expect("model info should be returned");
+    assert_eq!(
+        model_info.current_model_id.as_deref(),
+        Some("model-b"),
+        "set_model should return the confirmed model, not a stale get_model snapshot"
+    );
+
+    let stale_model_info = agent
+        .get_model()
+        .await
+        .unwrap()
+        .model_info
+        .expect("mock agent should still report model info");
+    assert_eq!(stale_model_info.current_model_id.as_deref(), Some("model-a"));
+}
+
+#[tokio::test]
 async fn send_message_missing_workspace_persists_message_and_failure_tip() {
     let (svc, broadcaster, repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
@@ -2001,12 +2184,12 @@ async fn send_message_missing_workspace_persists_message_and_failure_tip() {
     .await
     .unwrap();
 
-    let msg_id = svc
+    let response = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap();
     assert!(
-        !msg_id.is_empty(),
+        !response.msg_id.is_empty(),
         "msg_id must still be returned when runtime workspace validation fails"
     );
 
@@ -2028,7 +2211,7 @@ async fn send_message_missing_workspace_persists_message_and_failure_tip() {
         .iter()
         .find(|message| message.r#type == "text")
         .expect("missing workspace failure should persist the user message");
-    assert_eq!(user_message.msg_id.as_deref(), Some(msg_id.as_str()));
+    assert_eq!(user_message.msg_id.as_deref(), Some(response.msg_id.as_str()));
 
     let error_tip = messages
         .iter()
@@ -2050,11 +2233,13 @@ async fn send_message_missing_workspace_persists_message_and_failure_tip() {
         error_tip_event.data["data"]["code"],
         "WORKSPACE_PATH_RUNTIME_UNAVAILABLE"
     );
+    assert_eq!(error_tip_event.data["turn_id"], response.turn_id);
 
     let turn_event = events
         .iter()
         .find(|event| event.name == "turn.completed")
         .expect("missing workspace failure should complete the turn");
+    assert_eq!(turn_event.data["turn_id"], response.turn_id);
     assert_eq!(turn_event.data["runtime"]["is_processing"], false);
     assert_eq!(turn_event.data["runtime"]["can_send_message"], true);
 }
@@ -2068,7 +2253,7 @@ async fn send_message_broadcasts_user_created_event() {
     // Clear events from create
     broadcaster.take_events();
 
-    let msg_id = svc
+    let response = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap();
@@ -2080,7 +2265,7 @@ async fn send_message_broadcasts_user_created_event() {
         .expect("should broadcast message.userCreated event");
 
     assert_eq!(user_created.data["conversation_id"], conv.id);
-    assert_eq!(user_created.data["msg_id"], msg_id);
+    assert_eq!(user_created.data["msg_id"], response.msg_id);
     assert_eq!(user_created.data["content"], "Hello");
     assert_eq!(user_created.data["position"], "right");
 }
@@ -2092,7 +2277,7 @@ async fn send_message_returns_before_cold_agent_build_completes() {
     let task_mgr: Arc<dyn IWorkerTaskManager> = slow_task_mgr.clone();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let msg_id = tokio::time::timeout(
+    let response = tokio::time::timeout(
         Duration::from_millis(50),
         svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr),
     )
@@ -2100,7 +2285,8 @@ async fn send_message_returns_before_cold_agent_build_completes() {
     .expect("send_message should return before cold agent build finishes")
     .unwrap();
 
-    assert!(!msg_id.is_empty(), "msg_id must be non-empty");
+    assert!(!response.msg_id.is_empty(), "msg_id must be non-empty");
+    assert!(response.turn_id.starts_with("turn_"));
     assert!(
         !slow_task_mgr.was_built(),
         "cold agent build should continue in the background after send_message returns"
@@ -2148,12 +2334,13 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     broadcaster.take_events();
 
-    let msg_id = svc
+    let response = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap();
 
-    assert!(!msg_id.is_empty(), "msg_id must be non-empty");
+    assert!(!response.msg_id.is_empty(), "msg_id must be non-empty");
+    assert!(response.turn_id.starts_with("turn_"));
 
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -2203,6 +2390,7 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
         .expect("agent build failure should broadcast the error tips message");
     assert_eq!(error_tip_event.data["status"], "error");
     assert_eq!(error_tip_event.data["data"]["code"], "BAD_GATEWAY");
+    assert_eq!(error_tip_event.data["turn_id"], response.turn_id);
 }
 
 #[tokio::test]
@@ -2286,7 +2474,7 @@ async fn send_message_rejects_active_runtime_claim() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let _claim = svc
         .runtime_state()
-        .try_claim_turn(&conv.id)
+        .try_claim_turn(&conv.id, "turn-test")
         .expect("test claim should be created");
 
     let err = svc
@@ -2328,11 +2516,11 @@ async fn send_message_build_failure_while_deleting_skips_failure_tip_and_complet
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     broadcaster.take_events();
 
-    let msg_id = svc
+    let response = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap();
-    assert!(!msg_id.is_empty());
+    assert!(!response.msg_id.is_empty());
 
     svc.runtime_state().mark_deleting(&conv.id);
     wait_for_turn_released(&svc, &conv.id).await;
@@ -2632,20 +2820,45 @@ async fn stop_stream_with_active_agent() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
     // Build agent via send_message
-    svc.send_message(
-        "user_1",
-        &conv.id,
-        make_send_req(),
-        &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
-    )
-    .await
-    .unwrap();
+    let send = svc
+        .send_message(
+            "user_1",
+            &conv.id,
+            make_send_req(),
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
 
     // Stop should succeed since agent exists
     let result = svc
-        .cancel("user_1", &conv.id, &(task_mgr as Arc<dyn IWorkerTaskManager>))
+        .cancel(
+            "user_1",
+            &conv.id,
+            &send.turn_id,
+            &(task_mgr as Arc<dyn IWorkerTaskManager>),
+        )
         .await;
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn cancel_with_mismatched_turn_id_does_not_cancel_and_returns_current_runtime() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let slow_task_mgr = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(500)));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = slow_task_mgr.clone();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+
+    let response = svc.cancel("user_1", &conv.id, "turn_stale", &task_mgr).await.unwrap();
+
+    assert_eq!(response.runtime.turn_id.as_deref(), Some(send.turn_id.as_str()));
+    assert!(response.runtime.is_processing);
+    assert!(svc.runtime_state().is_claimed(&conv.id));
 }
 
 #[tokio::test]
@@ -2653,7 +2866,10 @@ async fn stop_stream_conversation_not_found() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
-    let err = svc.cancel("user_1", "no-such-id", &task_mgr).await.unwrap_err();
+    let err = svc
+        .cancel("user_1", "no-such-id", "turn-test", &task_mgr)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
@@ -2664,7 +2880,7 @@ async fn stop_stream_no_active_agent_is_idempotent() {
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    let result = svc.cancel("user_1", &conv.id, &task_mgr).await;
+    let result = svc.cancel("user_1", &conv.id, "turn-test", &task_mgr).await;
     assert!(result.is_ok());
 }
 
@@ -2674,7 +2890,10 @@ async fn stop_stream_wrong_user_returns_not_found() {
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let err = svc.cancel("user_2", &conv.id, &task_mgr).await.unwrap_err();
+    let err = svc
+        .cancel("user_2", &conv.id, "turn-test", &task_mgr)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
@@ -2694,6 +2913,32 @@ async fn warmup_creates_agent_task() {
 
     // Agent should now exist
     assert!(task_mgr.get_task(&conv.id).is_some());
+}
+
+#[tokio::test]
+async fn warmup_rejects_legacy_runtime_conversations_as_archived() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+
+    for agent_type in [
+        AgentType::Gemini,
+        AgentType::Codex,
+        AgentType::OpenclawGateway,
+        AgentType::Nanobot,
+        AgentType::Remote,
+    ] {
+        let conv = insert_conversation_with_type(&repo, "user_1", agent_type).await;
+
+        let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+
+        assert_eq!(err.error_code(), "CONVERSATION_ARCHIVED");
+        assert!(
+            err.to_string()
+                .contains("This historical conversation can no longer be continued. Please start a new conversation."),
+            "unexpected archived message for {}: {err}",
+            agent_type.serde_name()
+        );
+    }
 }
 
 #[tokio::test]

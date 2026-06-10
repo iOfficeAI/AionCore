@@ -10,12 +10,12 @@ use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::{
-    ApprovalCheckResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ApprovalCheckResponse, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
+    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
     ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SessionMcpServer, SessionMcpTransport, UpdateConversationArtifactRequest,
+    SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport, UpdateConversationArtifactRequest,
     UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
@@ -45,6 +45,8 @@ use crate::turn_orchestrator::{ConversationTurnOrchestrator, TurnStartInput};
 use std::sync::RwLock;
 
 pub(crate) const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
+const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
+    "This historical conversation can no longer be continued. Please start a new conversation.";
 
 #[derive(Debug, Clone, Copy)]
 struct McpSupportPolicy {
@@ -89,6 +91,30 @@ impl McpSupportPolicy {
             SessionMcpTransport::StreamableHttp { .. } => self.streamable_http,
         }
     }
+}
+
+fn parse_agent_type_from_row(row: &ConversationRow) -> Option<AgentType> {
+    serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok()
+}
+
+fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), ConversationError> {
+    let Some(agent_type) = parse_agent_type_from_row(row) else {
+        return Ok(());
+    };
+
+    if agent_type.is_deprecated_runtime() {
+        debug!(
+            conversation_id = %row.id,
+            agent_type = agent_type.serde_name(),
+            "Rejected deprecated runtime conversation"
+        );
+        return Err(ConversationError::Archived {
+            id: row.id.clone(),
+            reason: LEGACY_CONVERSATION_ARCHIVED_MESSAGE.into(),
+        });
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -184,6 +210,10 @@ impl ConversationService {
         generate_short_id()
     }
 
+    pub fn mint_turn_id() -> String {
+        format!("turn_{}", generate_short_id())
+    }
+
     pub fn conversation_repo(&self) -> &Arc<dyn IConversationRepository> {
         &self.conversation_repo
     }
@@ -230,23 +260,36 @@ impl ConversationService {
             .summary_from_parts(conversation_id, task_status, has_task, pending_confirmations)
     }
 
-    pub async fn complete_turn(&self, conversation_id: &str) {
+    async fn send_message_response(
+        &self,
+        conversation_id: &str,
+        msg_id: String,
+        turn_id: String,
+    ) -> SendMessageResponse {
+        SendMessageResponse {
+            msg_id,
+            turn_id,
+            runtime: self.runtime_summary_for(conversation_id).await,
+        }
+    }
+
+    pub async fn complete_turn(&self, conversation_id: &str, turn_id: &str) {
         let runtime = self.runtime_summary_for(conversation_id).await;
         self.completion_publisher()
-            .publish(conversation_id, Some(runtime))
+            .publish(conversation_id, turn_id, Some(runtime))
             .await;
     }
 
-    pub(crate) async fn complete_released_turn(&self, conversation_id: &str, was_deleting: bool) {
+    pub(crate) async fn complete_released_turn(&self, conversation_id: &str, turn_id: &str, was_deleting: bool) {
         if was_deleting {
             debug!(
                 conversation_id,
-                "Skipping turn completion because conversation was deleting at claim release"
+                turn_id, "Skipping turn completion because conversation was deleting at claim release"
             );
             return;
         }
 
-        self.complete_turn(conversation_id).await;
+        self.complete_turn(conversation_id, turn_id).await;
     }
 }
 
@@ -266,6 +309,17 @@ impl ConversationService {
         let id = generate_short_id();
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
+
+        if !req.r#type.supports_new_conversation() {
+            info!(
+                agent_type = req.r#type.serde_name(),
+                source = ?source,
+                "Rejected deprecated agent type for new conversation"
+            );
+            return Err(ConversationError::BadRequest {
+                reason: "This agent type is no longer supported for new conversations.".into(),
+            });
+        }
 
         // Type-aware rule: top-level `model` is aionrs-only. Other agent types
         // carry model/mode via `extra` (see spec 2026-05-12). Reject early so
@@ -1348,7 +1402,7 @@ impl ConversationService {
         conversation_id: &str,
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<String, ConversationError> {
+    ) -> Result<SendMessageResponse, ConversationError> {
         if req.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Message content must not be empty".into(),
@@ -1366,22 +1420,10 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
-        // Short-circuit for legacy Gemini conversations: the dedicated Gemini
-        // runtime has been removed, so we cannot build an agent for this row.
-        // Emit CONVERSATION_ARCHIVED (HTTP 410 Gone) without touching the
-        // legacy `model` column, which may hold shapes the new parser can't
-        // deserialize. The client identifies this case by `code` and renders
-        // a dedicated archived-conversation UI rather than a generic banner.
-        if row.r#type == "gemini" {
-            return Err(ConversationError::Archived {
-                id: conversation_id.to_owned(),
-                reason: "This conversation was created with the legacy Gemini runtime, which has been \
-                         removed. Please start a new conversation with the Gemini ACP backend to continue."
-                    .into(),
-            });
-        }
+        reject_deprecated_runtime_row(&row)?;
 
-        let turn_claim = self.runtime_state.try_claim_turn(conversation_id)?;
+        let turn_id = Self::mint_turn_id();
+        let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same
@@ -1405,8 +1447,9 @@ impl ConversationService {
         {
             let mut turn_claim = turn_claim;
             let was_deleting = turn_claim.release();
-            self.complete_released_turn(conversation_id, was_deleting).await;
-            return Ok(user_msg_id);
+            self.complete_released_turn(conversation_id, &turn_id, was_deleting)
+                .await;
+            return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
         }
         if let Err(e) = self.conversation_repo.insert_message(&user_msg).await {
             warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
@@ -1439,12 +1482,18 @@ impl ConversationService {
                 );
                 let top_level_code = err.error_code();
                 let send_error = AgentSendError::from_agent_error(err.to_agent_error());
-                self.persist_and_broadcast_send_failure_tip(conversation_id, &send_error, Some(top_level_code))
-                    .await;
+                self.persist_and_broadcast_send_failure_tip(
+                    conversation_id,
+                    &turn_id,
+                    &send_error,
+                    Some(top_level_code),
+                )
+                .await;
                 let mut turn_claim = turn_claim;
                 let was_deleting = turn_claim.release();
-                self.complete_released_turn(conversation_id, was_deleting).await;
-                return Ok(user_msg_id);
+                self.complete_released_turn(conversation_id, &turn_id, was_deleting)
+                    .await;
+                return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
         };
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
@@ -1457,20 +1506,26 @@ impl ConversationService {
             request: req,
             build_options: build_opts,
             stored_workspace,
+            turn_id: turn_id.clone(),
             turn_claim,
         });
 
         info!(
+            conversation_id = %conversation_id,
             msg_id = %user_msg_id_ret,
+            turn_id = %turn_id,
             elapsed_ms = now_ms().saturating_sub(send_started_at),
             "Message accepted, agent work scheduled"
         );
-        Ok(user_msg_id_ret)
+        Ok(self
+            .send_message_response(conversation_id, user_msg_id_ret, turn_id)
+            .await)
     }
 
     pub(crate) async fn persist_and_broadcast_send_failure_tip(
         &self,
         conversation_id: &str,
+        turn_id: &str,
         err: &AgentSendError,
         top_level_code: Option<&'static str>,
     ) {
@@ -1489,6 +1544,7 @@ impl ConversationService {
             serde_json::json!({
                 "conversation_id": row.conversation_id,
                 "msg_id": msg_id,
+                "turn_id": turn_id,
                 "type": row.r#type,
                 "data": content_value,
                 "position": row.position,
@@ -1533,8 +1589,9 @@ impl ConversationService {
         &self,
         user_id: &str,
         conversation_id: &str,
+        turn_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-    ) -> Result<(), ConversationError> {
+    ) -> Result<CancelConversationResponse, ConversationError> {
         // Verify conversation exists and belongs to user
         self.conversation_repo
             .get(conversation_id)
@@ -1544,18 +1601,39 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
+        let active_turn_id = self.runtime_state.active_turn_id_for(conversation_id);
+        if active_turn_id.as_deref() != Some(turn_id) {
+            info!(
+                conversation_id,
+                requested_turn_id = %turn_id,
+                active_turn_id = active_turn_id.as_deref(),
+                "cancel ignored because turn id mismatched"
+            );
+            return Ok(CancelConversationResponse {
+                runtime: self.runtime_summary_for(conversation_id).await,
+            });
+        }
+
         let Some(agent) = task_manager.get_task(conversation_id) else {
-            info!("No active agent to cancel; treating as idempotent success");
-            return Ok(());
+            info!(
+                conversation_id,
+                turn_id, "No active agent to cancel; returning runtime summary"
+            );
+            return Ok(CancelConversationResponse {
+                runtime: self.runtime_summary_for(conversation_id).await,
+            });
         };
 
+        self.runtime_state.mark_cancelling(conversation_id);
         if let Err(e) = agent.cancel().await {
-            warn!(error = %ErrorChain(&e), "Failed to cancel agent");
+            warn!(conversation_id, turn_id, error = %ErrorChain(&e), "Failed to cancel agent");
             return Err(e.into());
         }
 
-        info!("Stream canceled");
-        Ok(())
+        info!(conversation_id, turn_id, "Stream cancel acknowledged");
+        Ok(CancelConversationResponse {
+            runtime: self.runtime_summary_for(conversation_id).await,
+        })
     }
 
     /// Pre-initialize an agent task for a conversation (warmup).
@@ -1577,6 +1655,8 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+
+        reject_deprecated_runtime_row(&row)?;
 
         let build_opts = self.build_task_options(&row).await?;
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
@@ -1621,6 +1701,7 @@ impl ConversationService {
         &self,
         row: &aionui_db::models::ConversationRow,
     ) -> Result<BuildTaskOptions, ConversationError> {
+        reject_deprecated_runtime_row(row)?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
             .build_options(row)
             .await
@@ -1631,6 +1712,7 @@ impl ConversationService {
         row: &aionui_db::models::ConversationRow,
         workspace_override: Option<&str>,
     ) -> Result<BuildTaskOptions, ConversationError> {
+        reject_deprecated_runtime_row(row)?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
             .build_options_with_workspace_override(row, workspace_override)
             .await

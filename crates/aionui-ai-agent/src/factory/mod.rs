@@ -3,15 +3,12 @@ pub mod acp_assembler;
 mod acp;
 pub(crate) mod aionrs;
 mod context;
-mod nanobot;
-mod openclaw;
-mod remote;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::GuideMcpConfig;
-use aionui_db::{IMcpServerRepository, IProviderRepository, IRemoteAgentRepository};
+use aionui_db::{IMcpServerRepository, IProviderRepository};
 use aionui_realtime::EventBroadcaster;
 use futures_util::FutureExt;
 
@@ -28,7 +25,6 @@ use crate::types::BuildTaskOptions;
 /// Dependencies needed by the agent factory to construct agents.
 pub struct AgentFactoryDeps {
     pub skill_manager: Arc<AcpSkillManager>,
-    pub remote_agent_repo: Arc<dyn IRemoteAgentRepository>,
     pub provider_repo: Arc<dyn IProviderRepository>,
     pub encryption_key: [u8; 32],
     pub agent_registry: Arc<AgentRegistry>,
@@ -70,14 +66,7 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
     match context.kind {
-        AgentSessionKind::Gemini => Err(AgentError::conversation_archived(
-            "This conversation was created with the legacy Gemini runtime, which has been \
-             removed. Please start a new conversation with the Gemini ACP backend to continue.",
-        )),
         AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,
-        AgentSessionKind::OpenClaw(openclaw_context) => openclaw::build(deps, *openclaw_context, ctx).await,
-        AgentSessionKind::Nanobot(nanobot_context) => nanobot::build(deps, nanobot_context, ctx).await,
-        AgentSessionKind::Remote(remote_context) => remote::build(deps, remote_context, ctx).await,
         AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
     }
 }

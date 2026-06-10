@@ -38,8 +38,8 @@ pub use acp::{
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
-    AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, OpenClawBuildExtra, OpenClawGatewayConfig, RemoteBuildExtra,
-    SessionMcpServer, SessionMcpTransport, SlashCommandItem,
+    AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SessionMcpServer, SessionMcpTransport,
+    SlashCommandCompletionBehavior, SlashCommandItem,
 };
 pub use agent_discovery::{AgentEnvEntry, AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};
 pub use agent_error::{
@@ -64,11 +64,12 @@ pub use channel::{
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
-    ActiveCountResponse, CloneConversationRequest, ConversationArtifactKind, ConversationArtifactListResponse,
-    ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
-    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
-    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchItem, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    ActiveCountResponse, CancelConversationRequest, CancelConversationResponse, CloneConversationRequest,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{

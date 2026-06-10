@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{
     AgentStreamEvent,
-    protocol::events::{FinishEventData, ToolCallEventData, ToolCallStatus},
+    protocol::events::{FinishEventData, TipType, TipsEventData},
 };
 use aionui_common::now_ms;
 use aionui_conversation::stream_relay::StreamRelay;
@@ -20,8 +20,8 @@ async fn setup_repo() -> (Arc<SqliteConversationRepository>, aionui_db::Database
     repo.create(&ConversationRow {
         id: "conv-1".into(),
         user_id: "system_default_user".into(),
-        name: "Tool call test".into(),
-        r#type: "aionrs".into(),
+        name: "Stream relay tips test".into(),
+        r#type: "acp".into(),
         extra: "{}".into(),
         model: None,
         status: Some("running".into()),
@@ -39,7 +39,7 @@ async fn setup_repo() -> (Arc<SqliteConversationRepository>, aionui_db::Database
 }
 
 #[tokio::test]
-async fn run_tool_call_with_empty_call_id_is_not_persisted() {
+async fn persist_info_tip_preserves_code_and_params() {
     let (repo, _db) = setup_repo().await;
     let bus = Arc::new(BroadcastEventBus::new(64));
     let (tx, _) = broadcast::channel(64);
@@ -55,14 +55,11 @@ async fn run_tool_call_with_empty_call_id_is_not_persisted() {
     );
 
     let rx = tx.subscribe();
-    tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
-        call_id: "".into(),
-        name: "Glob".into(),
-        args: json!({"pattern": "*.rs"}),
-        status: ToolCallStatus::Running,
-        input: Some(json!({"pattern": "*.rs"})),
-        output: None,
-        description: None,
+    tx.send(AgentStreamEvent::Tips(TipsEventData {
+        content: String::new(),
+        tip_type: TipType::Info,
+        code: Some("ACP_EMPTY_TURN".into()),
+        params: Some(json!({ "scope": "session", "cleared": 12 })),
     }))
     .unwrap();
     tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -70,9 +67,17 @@ async fn run_tool_call_with_empty_call_id_is_not_persisted() {
     relay.consume(rx).await;
 
     let messages = repo.get_messages("conv-1", 1, 100, SortOrder::Asc).await.unwrap();
+    let tip = messages
+        .items
+        .iter()
+        .find(|row| row.r#type == "tips")
+        .expect("info tip should be persisted");
 
-    assert!(
-        messages.items.iter().all(|row| row.r#type != "tool_call"),
-        "empty call_id tool_call must not be persisted"
-    );
+    assert_eq!(tip.status.as_deref(), Some("finish"));
+
+    let content: serde_json::Value = serde_json::from_str(&tip.content).unwrap();
+    assert_eq!(content["content"], "");
+    assert_eq!(content["type"], "info");
+    assert_eq!(content["code"], "ACP_EMPTY_TURN");
+    assert_eq!(content["params"], json!({ "scope": "session", "cleared": 12 }));
 }

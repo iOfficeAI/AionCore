@@ -145,7 +145,13 @@ impl AionrsAgentManager {
         let slash_commands = engine
             .slash_command_list()
             .into_iter()
-            .map(|(command, description)| SlashCommandItem { command, description })
+            .map(|(command, description)| SlashCommandItem {
+                command,
+                description,
+                completion_behavior: None,
+                empty_turn_tip_code: None,
+                empty_turn_tip_params: None,
+            })
             .collect();
 
         runtime.transition_to(ConversationStatus::Pending);

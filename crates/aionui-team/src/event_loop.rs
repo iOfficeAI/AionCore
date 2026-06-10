@@ -99,6 +99,7 @@ pub struct AgentLoopContext {
 
 struct TurnExecution {
     finish_ok: bool,
+    turn_id: String,
     claim: TurnClaim,
 }
 
@@ -210,10 +211,11 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
     if handle.status() == Some(ConversationStatus::Running) {
         return None;
     }
+    let turn_id = ConversationService::mint_turn_id();
     let claim = match ctx
         .conversation_service
         .runtime_state()
-        .try_claim_turn(&input.conversation_id)
+        .try_claim_turn(&input.conversation_id, &turn_id)
     {
         Ok(claim) => claim,
         Err(e) => {
@@ -221,6 +223,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                 team_id = %ctx.team_id,
                 slot_id = %ctx.slot_id,
                 conversation_id = %input.conversation_id,
+                turn_id = %turn_id,
                 error = %e,
                 "event loop: runtime turn claim rejected"
             );
@@ -238,6 +241,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
     let relay = aionui_conversation::stream_relay::StreamRelay::new(
         input.conversation_id.clone(),
         msg_id.clone(),
+        turn_id.clone(),
         ctx.user_id.clone(),
         Arc::clone(repo),
         ctx.broadcaster.clone(),
@@ -268,6 +272,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                 team_id = %ctx.team_id,
                 slot_id = %ctx.slot_id,
                 conversation_id = %input.conversation_id,
+                turn_id = %turn_id,
                 error = %e,
                 "event loop: send_message failed"
             );
@@ -290,13 +295,14 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
 
     Some(TurnExecution {
         finish_ok: turn_ok,
+        turn_id,
         claim,
     })
 }
 
 /// Finalize a completed turn: release runtime claim, mark idle (or error), cascade to leader.
 async fn finalize_turn(ctx: &AgentLoopContext, mut turn: TurnExecution, _conversation_id: &str) {
-    turn.claim.release();
+    turn.claim.release_for_turn(&turn.turn_id);
 
     if !turn.finish_ok {
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;

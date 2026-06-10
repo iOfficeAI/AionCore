@@ -21,7 +21,6 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/usage", get(get_usage))
         .route("/api/conversations/{id}/mode", get(get_mode).put(set_mode))
         .route("/api/conversations/{id}/model", get(get_model).put(set_model))
-        .route("/api/conversations/{id}/openclaw/runtime", get(get_openclaw_runtime))
         .route("/api/conversations/{id}/workspace", get(browse_workspace))
         .with_state(state)
 }
@@ -104,16 +103,6 @@ async fn get_slash_commands(
 ) -> Result<Json<ApiResponse<Vec<SlashCommandItem>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state.service.get_slash_commands(&id).await.map_err(ApiError::from)?,
-    )))
-}
-
-async fn get_openclaw_runtime(
-    State(state): State<ConversationRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    Ok(Json(ApiResponse::ok(
-        state.service.get_openclaw_runtime(&id).await.map_err(ApiError::from)?,
     )))
 }
 

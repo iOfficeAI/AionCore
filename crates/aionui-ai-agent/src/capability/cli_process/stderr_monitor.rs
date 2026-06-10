@@ -245,15 +245,15 @@ mod force_kill_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::super::CliAgentProcess;
-    use super::super::tests::simple_script_config;
+    use super::super::tests::{simple_script_config, spawn_sdk_test_process};
     use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::time::timeout;
 
     #[tokio::test]
     async fn stderr_captured_in_buffer() {
         let config = simple_script_config("echo 'error line 1' >&2 && echo 'error line 2' >&2");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -266,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn take_stderr_is_consuming() {
         let config = simple_script_config("echo 'hello' >&2");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -281,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn peek_stderr_tail_returns_last_n_lines() {
         let config = simple_script_config("for i in 1 2 3 4 5; do echo \"line $i\" >&2; done");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -298,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn peek_stderr_tail_does_not_drain() {
         let config = simple_script_config("echo 'first' >&2 && echo 'second' >&2");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -315,11 +315,57 @@ mod tests {
     #[tokio::test]
     async fn peek_stderr_tail_zero_returns_empty() {
         let config = simple_script_config("echo 'noise' >&2");
-        let proc = CliAgentProcess::spawn(config).await.unwrap();
+        let proc = spawn_sdk_test_process(config).await;
 
         timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(proc.peek_stderr_tail(0).await, "");
+    }
+
+    #[tokio::test]
+    async fn clear_stderr_starts_a_fresh_window_for_later_peeks() {
+        let script = r#"
+            while IFS= read -r line; do
+              case "$line" in
+                *first*) echo 'HTTP 402: stale turn failure' >&2 ;;
+                *second*) : ;;
+              esac
+              echo '{"type":"ack","data":{}}'
+            done
+        "#;
+        let proc = spawn_sdk_test_process(simple_script_config(script)).await;
+        let (mut stdin, stdout) = proc.take_stdio().await.unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+
+        stdin.write_all(b"first\n").await.unwrap();
+        timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            proc.peek_stderr_tail(10).await.contains("stale turn failure"),
+            "first window should contain the prior stderr line"
+        );
+
+        proc.clear_stderr().await;
+
+        line.clear();
+        stdin.write_all(b"second\n").await.unwrap();
+        timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            proc.peek_stderr_tail(10).await,
+            "",
+            "clearing before the second window must prevent stale stderr from leaking forward"
+        );
+
+        proc.kill(Duration::from_millis(100)).await.unwrap();
     }
 }

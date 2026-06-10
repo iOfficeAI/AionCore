@@ -29,6 +29,9 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::error::AgentError;
+use crate::manager::acp::config_option_catalog::{
+    enrich_handshake_with_config_option_catalog, merge_config_option_values,
+};
 
 /// Capacity of the catalog-sync MPSC channel. A single writer thread
 /// drains it serially, so the bound just sizes the burst we can absorb
@@ -41,6 +44,14 @@ struct CatalogSyncMessage {
     agent_metadata_id: String,
     handshake: AgentHandshake,
 }
+
+#[cfg(test)]
+#[path = "registry_config_option_tests.rs"]
+mod registry_config_option_tests;
+
+#[cfg(test)]
+#[path = "registry_tests.rs"]
+mod registry_tests;
 
 pub struct AgentRegistry {
     repo: Arc<dyn IAgentMetadataRepository>,
@@ -91,6 +102,20 @@ impl AgentRegistry {
     ///
     /// `None` fields are left untouched (partial update).
     async fn apply_handshake_inner(&self, id: &str, snapshot: &AgentHandshake) -> Result<(), AgentError> {
+        let mut snapshot = snapshot.clone();
+        if let Some(incoming_config_options) = snapshot.config_options.as_ref() {
+            let existing_config_options = {
+                let guard = self.by_id.read().await;
+                guard.get(id).and_then(|meta| meta.handshake.config_options.clone())
+            };
+            if let Some(merged_config_options) =
+                merge_config_option_values(existing_config_options.as_ref(), incoming_config_options)
+            {
+                snapshot.config_options = Some(merged_config_options);
+            }
+        }
+
+        let snapshot = enrich_handshake_with_config_option_catalog(&snapshot);
         let agent_capabilities = encode_optional(&snapshot.agent_capabilities, "agent_capabilities")?;
         let auth_methods = encode_optional(&snapshot.auth_methods, "auth_methods")?;
         let config_options = encode_optional(&snapshot.config_options, "config_options")?;
@@ -589,6 +614,13 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
                 detail: tool_support.detail,
             });
         }
+        if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
+            && probe_command_candidate(primary).is_none()
+        {
+            return Err(UnavailableReason::PrimaryMissing {
+                binary: primary.to_owned(),
+            });
+        }
         return Ok(PathBuf::from(tool.slug()));
     }
 
@@ -642,41 +674,6 @@ mod tests {
         reg
     }
 
-    #[test]
-    fn probe_resolved_command_accepts_bare_npx_when_managed_runtime_is_supported() {
-        if !probe_node_runtime_supported().is_supported() {
-            return;
-        }
-
-        let meta = AgentMetadata {
-            id: "agent-1".into(),
-            icon: None,
-            name: "Test ACP".into(),
-            name_i18n: None,
-            description: None,
-            description_i18n: None,
-            backend: Some("custom".into()),
-            agent_type: AgentType::Acp,
-            agent_source: AgentSource::Custom,
-            agent_source_info: AgentSourceInfo::default(),
-            enabled: true,
-            available: false,
-            command: Some("npx".into()),
-            resolved_command: None,
-            args: vec![],
-            env: vec![],
-            native_skills_dirs: None,
-            behavior_policy: BehaviorPolicy::default(),
-            yolo_id: None,
-            sort_order: 0,
-            team_capable: false,
-            handshake: AgentHandshake::default(),
-        };
-
-        let resolved = probe_resolved_command(&meta).expect("probe");
-        assert_eq!(resolved, PathBuf::from("npx"));
-    }
-
     #[tokio::test]
     async fn hydrate_loads_seed_rows() {
         // `list_all_including_hidden` bypasses the available/enabled
@@ -684,7 +681,7 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 20);
+        assert_eq!(all.len(), 21);
     }
 
     #[tokio::test]
@@ -715,6 +712,13 @@ mod tests {
         let reg = registry().await;
         let claude = reg.find_builtin_by_backend("claude").await.unwrap();
         assert_eq!(claude.yolo_id.as_deref(), Some("bypassPermissions"));
+    }
+
+    #[tokio::test]
+    async fn hermes_builtin_does_not_advertise_a_yolo_id() {
+        let reg = registry().await;
+        let hermes = reg.find_builtin_by_backend("hermes").await.unwrap();
+        assert_eq!(hermes.yolo_id, None);
     }
 
     /// On a host that has *none* of the seeded CLIs installed, the
@@ -749,7 +753,7 @@ mod tests {
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
         let count = |t: AgentType| all.iter().filter(|m| m.agent_type == t).count();
-        assert_eq!(count(AgentType::Acp), 17);
+        assert_eq!(count(AgentType::Acp), 18);
         assert_eq!(count(AgentType::Nanobot), 1);
         assert_eq!(count(AgentType::OpenclawGateway), 1);
         assert_eq!(count(AgentType::Aionrs), 1);
@@ -860,7 +864,7 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 20, "every row appears once");
+        assert_eq!(snapshot.len(), 21, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {

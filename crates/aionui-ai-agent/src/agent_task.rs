@@ -4,8 +4,8 @@
 //! implements identically and that the generic task_manager / idle_scanner /
 //! message-flow code actually needs. Anything that is type-specific
 //! (session modes, session keys, model switching, config options, pending
-//! confirmation lists, approval memory, ACP usage, OpenClaw diagnostics,
-//! etc.) lives as **inherent** methods on each concrete `XxxAgentManager`
+//! confirmation lists, approval memory, ACP usage, etc.) lives as
+//! **inherent** methods on each concrete `XxxAgentManager`
 //! and is reached through the `AgentInstance` enum — forcing every callsite
 //! to say out loud which agent type it is addressing.
 //!
@@ -19,9 +19,6 @@ use tokio::sync::broadcast;
 use crate::error::AgentError;
 use crate::manager::acp::AcpAgentManager;
 use crate::manager::aionrs::AionrsAgentManager;
-use crate::manager::nanobot::NanobotAgentManager;
-use crate::manager::openclaw::OpenClawAgentManager;
-use crate::manager::remote::RemoteAgentManager;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::types::SendMessageData;
@@ -123,6 +120,10 @@ pub trait IMockAgent: IAgentTask {
             "Model switching is not supported for this mock",
         ))
     }
+    async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
+        self.set_model(model_id).await?;
+        self.get_model().await
+    }
     async fn get_usage(&self) -> Result<Option<serde_json::Value>, AgentError> {
         Ok(None)
     }
@@ -135,12 +136,9 @@ pub trait IMockAgent: IAgentTask {
             answer: None,
         })
     }
-    async fn get_openclaw_runtime(&self) -> Result<serde_json::Value, AgentError> {
-        Ok(serde_json::Value::Null)
-    }
 }
 
-/// Concrete, closed-set dispatcher for the five agent variants.
+/// Concrete, closed-set dispatcher for runnable agent variants.
 ///
 /// Every generic path holds an `AgentInstance` (not `Arc<dyn IAgentTask>`):
 /// this gives us the `IAgentTask` ten-method surface via [`Self::as_task`]
@@ -153,15 +151,12 @@ pub trait IMockAgent: IAgentTask {
 pub enum AgentInstance {
     Acp(Arc<AcpAgentManager>),
     Aionrs(Arc<AionrsAgentManager>),
-    OpenClaw(Arc<OpenClawAgentManager>),
-    Nanobot(Arc<NanobotAgentManager>),
-    Remote(Arc<RemoteAgentManager>),
     /// Test-only trait-object escape hatch used by downstream crates
     /// (conversation/cron/team/app tests) to inject fake agents without
     /// spinning up a real CLI or WebSocket connection. Gated behind
     /// `#[cfg(any(test, feature = "test-support"))]`: production builds
     /// never see this variant, so every `match` in release code can
-    /// rely on the five-variant closed set. The trait object is
+    /// rely on the runnable closed set. The trait object is
     /// [`IMockAgent`] (extends `IAgentTask`) so mocks can also override
     /// the enum-level helpers — `get_confirmations`, `check_approval`,
     /// `confirm`, `get_session_key`, `get_mode`, `set_mode`.
@@ -175,9 +170,6 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.as_ref(),
             Self::Aionrs(m) => m.as_ref(),
-            Self::OpenClaw(m) => m.as_ref(),
-            Self::Nanobot(m) => m.as_ref(),
-            Self::Remote(m) => m.as_ref(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.as_ref(),
         }
@@ -242,10 +234,7 @@ impl AgentInstance {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         match self {
             Self::Acp(m) => m.kill_and_wait(reason),
-            Self::OpenClaw(m) => m.kill_and_wait(reason),
-            Self::Nanobot(m) => m.kill_and_wait(reason),
             Self::Aionrs(m) => m.kill_and_wait(reason),
-            Self::Remote(m) => m.kill_and_wait(reason),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(_) => Box::pin(std::future::ready(())),
         }
@@ -261,15 +250,11 @@ impl AgentInstance {
     /// Pending confirmation items for this task.
     ///
     /// ACP surfaces pending permission prompts through its permission
-    /// router. Aionrs / OpenClaw / Remote maintain inline confirmation lists.
-    /// Nanobot has no concept of confirmations.
+    /// router. Aionrs maintains inline confirmation lists.
     pub fn get_confirmations(&self) -> Vec<aionui_common::Confirmation> {
         match self {
             Self::Acp(m) => m.get_confirmations(),
             Self::Aionrs(m) => m.get_confirmations(),
-            Self::OpenClaw(m) => m.get_confirmations(),
-            Self::Nanobot(_) => Vec::new(),
-            Self::Remote(m) => m.get_confirmations(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_confirmations(),
         }
@@ -286,9 +271,6 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.confirm(msg_id, call_id, data, always_allow),
             Self::Aionrs(m) => m.confirm(msg_id, call_id, data, always_allow),
-            Self::OpenClaw(m) => m.confirm(msg_id, call_id, data, always_allow),
-            Self::Nanobot(m) => m.confirm(msg_id, call_id, data, always_allow),
-            Self::Remote(m) => m.confirm(msg_id, call_id, data, always_allow),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.confirm(msg_id, call_id, data, always_allow),
         }
@@ -299,35 +281,25 @@ impl AgentInstance {
         match self {
             Self::Acp(_) => false,
             Self::Aionrs(m) => m.check_approval(action, command_type),
-            Self::OpenClaw(m) => m.check_approval(action, command_type),
-            Self::Nanobot(_) => false,
-            Self::Remote(m) => m.check_approval(action, command_type),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.check_approval(action, command_type),
         }
     }
 
-    /// Session key for agent types that expose one (currently OpenClaw).
+    /// Session key for test doubles that expose one.
     pub fn get_session_key(&self) -> Option<String> {
         match self {
-            Self::OpenClaw(m) => m.get_session_key(),
-            Self::Acp(_) | Self::Aionrs(_) | Self::Nanobot(_) | Self::Remote(_) => None,
+            Self::Acp(_) | Self::Aionrs(_) => None,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_session_key(),
         }
     }
 
-    /// Get the current session mode. Only ACP and Aionrs model a mode;
-    /// other variants report `mode = "default"`, `initialized = false`
-    /// so cron / UI can skip mode reconciliation.
+    /// Get the current session mode.
     pub async fn get_mode(&self) -> Result<aionui_api_types::AgentModeResponse, AgentError> {
         match self {
             Self::Acp(m) => m.mode().await,
             Self::Aionrs(m) => m.mode().await,
-            Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Ok(aionui_api_types::AgentModeResponse {
-                mode: "default".into(),
-                initialized: false,
-            }),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.mode().await,
         }
@@ -340,9 +312,6 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.set_mode(mode).await,
             Self::Aionrs(m) => m.set_mode(mode).await,
-            Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Err(AgentError::bad_request(
-                "Mode switching is not supported for this agent type",
-            )),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.set_mode(mode).await,
         }
@@ -364,9 +333,7 @@ impl AgentInstance {
                 let model_info = merge_model_info(sdk_info, cc_switch_info);
                 Ok(GetModelInfoResponse { model_info })
             }
-            Self::Aionrs(_) | Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => {
-                Ok(GetModelInfoResponse { model_info: None })
-            }
+            Self::Aionrs(_) => Ok(GetModelInfoResponse { model_info: None }),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_model().await,
         }
@@ -381,11 +348,30 @@ impl AgentInstance {
         }
         match self {
             Self::Acp(m) => m.set_model(model_id).await,
-            Self::Aionrs(_) | Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Err(AgentError::bad_request(
+            Self::Aionrs(_) => Err(AgentError::bad_request(
                 "Model switching is not supported for this agent type",
             )),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.set_model(model_id).await,
+        }
+    }
+
+    /// Switch the active model and return the confirmed model payload for
+    /// this specific mutation, rather than re-reading potentially stale
+    /// cached state.
+    pub async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
+        if model_id.trim().is_empty() {
+            return Err(AgentError::bad_request("model_id must not be empty"));
+        }
+        match self {
+            Self::Acp(m) => Ok(GetModelInfoResponse {
+                model_info: Some(map_sdk_model_to_payload(m.set_model_confirmed(model_id).await?)),
+            }),
+            Self::Aionrs(_) => Err(AgentError::bad_request(
+                "Model switching is not supported for this agent type",
+            )),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.set_model_confirmed(model_id).await,
         }
     }
 
@@ -406,7 +392,7 @@ impl AgentInstance {
                 aionui_common::normalize_keys_to_snake_case(&mut value);
                 Ok(Some(value))
             }
-            Self::Aionrs(_) | Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Ok(None),
+            Self::Aionrs(_) => Ok(None),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_usage().await,
         }
@@ -419,7 +405,6 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.load_slash_commands().await,
             Self::Aionrs(m) => m.get_slash_commands().await,
-            Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Ok(Vec::new()),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_slash_commands().await,
         }
@@ -446,24 +431,12 @@ impl AgentInstance {
                     answer: Some("Side question support will be fully wired in app integration phase.".into()),
                 })
             }
-            Self::Aionrs(_) | Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => Ok(SideQuestionResponse {
+            Self::Aionrs(_) => Ok(SideQuestionResponse {
                 status: "unsupported".into(),
                 answer: None,
             }),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.handle_side_question(req).await,
-        }
-    }
-
-    /// OpenClaw-specific runtime diagnostics. Only OpenClaw reports
-    /// diagnostics; other variants report `Value::Null` so diagnostic
-    /// UIs degrade gracefully.
-    pub async fn get_openclaw_runtime(&self) -> Result<serde_json::Value, AgentError> {
-        match self {
-            Self::OpenClaw(m) => Ok(m.get_diagnostics().await),
-            Self::Acp(_) | Self::Aionrs(_) | Self::Nanobot(_) | Self::Remote(_) => Ok(serde_json::Value::Null),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Mock(m) => m.get_openclaw_runtime().await,
         }
     }
 }

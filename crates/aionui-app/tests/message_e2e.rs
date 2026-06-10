@@ -851,7 +851,7 @@ async fn t2_2_stop_stream_conversation_not_found() {
     let req = common::json_with_token(
         "POST",
         "/api/conversations/non-existent/cancel",
-        json!({}),
+        json!({ "turn_id": "turn_missing_conversation" }),
         &token,
         &csrf,
     );

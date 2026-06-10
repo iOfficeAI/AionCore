@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, Weak},
 };
 
@@ -16,7 +16,7 @@ pub struct ConversationRuntimeStateService {
 
 #[derive(Debug, Default)]
 struct ConversationRuntimeState {
-    active_turns: HashSet<String>,
+    active_turns: HashMap<String, String>,
     deleting_conversations: HashSet<String>,
     cancelling_conversations: HashSet<String>,
     shutting_down: bool,
@@ -25,6 +25,7 @@ struct ConversationRuntimeState {
 #[derive(Debug)]
 pub struct TurnClaim {
     conversation_id: String,
+    turn_id: String,
     state: Weak<ConversationRuntimeStateService>,
     released: bool,
 }
@@ -38,11 +39,15 @@ pub enum RuntimeLifecycleState {
 }
 
 impl ConversationRuntimeStateService {
-    pub fn try_claim_turn(self: &Arc<Self>, conversation_id: &str) -> Result<TurnClaim, ConversationError> {
+    pub fn try_claim_turn(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<TurnClaim, ConversationError> {
         let mut state = self.state.lock().map_err(|_| {
             warn!(
                 conversation_id,
-                "conversation runtime state lock poisoned while claiming turn"
+                turn_id, "conversation runtime state lock poisoned while claiming turn"
             );
             ConversationError::internal("conversation runtime state lock poisoned")
         })?;
@@ -50,7 +55,7 @@ impl ConversationRuntimeStateService {
         if state.shutting_down {
             info!(
                 conversation_id,
-                "conversation runtime turn claim rejected because runtime is shutting down"
+                turn_id, "conversation runtime turn claim rejected because runtime is shutting down"
             );
             return Err(ConversationError::Busy {
                 reason: "conversation runtime is shutting down".into(),
@@ -60,24 +65,34 @@ impl ConversationRuntimeStateService {
         if state.deleting_conversations.contains(conversation_id) {
             info!(
                 conversation_id,
-                "conversation runtime turn claim rejected because conversation is deleting"
+                turn_id, "conversation runtime turn claim rejected because conversation is deleting"
             );
             return Err(ConversationError::Busy {
                 reason: format!("conversation {conversation_id} is being deleted"),
             });
         }
 
-        if !state.active_turns.insert(conversation_id.to_owned()) {
-            info!(conversation_id, "conversation runtime turn claim rejected");
+        if state.active_turns.contains_key(conversation_id) {
+            info!(
+                conversation_id,
+                turn_id,
+                active_turn_id = state.active_turns.get(conversation_id).map(String::as_str),
+                "conversation runtime turn claim rejected"
+            );
             return Err(ConversationError::Busy {
                 reason: format!("conversation {conversation_id} is already running"),
             });
         }
 
-        info!(conversation_id, "conversation runtime turn claimed");
+        state
+            .active_turns
+            .insert(conversation_id.to_owned(), turn_id.to_owned());
+
+        info!(conversation_id, turn_id, "conversation runtime turn claimed");
 
         Ok(TurnClaim {
             conversation_id: conversation_id.to_owned(),
+            turn_id: turn_id.to_owned(),
             state: Arc::downgrade(self),
             released: false,
         })
@@ -86,15 +101,22 @@ impl ConversationRuntimeStateService {
     pub fn is_claimed(&self, conversation_id: &str) -> bool {
         self.state
             .lock()
-            .map(|state| state.active_turns.contains(conversation_id))
+            .map(|state| state.active_turns.contains_key(conversation_id))
             .unwrap_or(false)
+    }
+
+    pub fn active_turn_id_for(&self, conversation_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.active_turns.get(conversation_id).cloned())
     }
 
     pub fn mark_deleting(&self, conversation_id: &str) -> bool {
         match self.state.lock() {
             Ok(mut state) => {
                 state.deleting_conversations.insert(conversation_id.to_owned());
-                let active = state.active_turns.contains(conversation_id);
+                let active = state.active_turns.contains_key(conversation_id);
                 info!(conversation_id, active, "conversation marked deleting");
                 active
             }
@@ -214,7 +236,8 @@ impl ConversationRuntimeStateService {
         has_task: bool,
         pending_confirmations: usize,
     ) -> ConversationRuntimeSummary {
-        let claimed = self.is_claimed(conversation_id);
+        let active_turn_id = self.active_turn_id_for(conversation_id);
+        let claimed = active_turn_id.is_some();
 
         let state = if pending_confirmations > 0 {
             ConversationRuntimeStateKind::WaitingConfirmation
@@ -235,17 +258,39 @@ impl ConversationRuntimeStateService {
             task_status,
             is_processing,
             pending_confirmations,
+            turn_id: active_turn_id,
         }
     }
 
-    fn release(&self, conversation_id: &str) -> bool {
+    fn release(&self, conversation_id: &str, turn_id: &str) -> bool {
         match self.state.lock() {
             Ok(mut state) => {
-                state.active_turns.remove(conversation_id);
+                let removed = match state.active_turns.get(conversation_id) {
+                    Some(active_turn_id) if active_turn_id == turn_id => {
+                        state.active_turns.remove(conversation_id);
+                        true
+                    }
+                    Some(active_turn_id) => {
+                        info!(
+                            conversation_id,
+                            turn_id,
+                            active_turn_id = %active_turn_id,
+                            "conversation runtime turn claim release ignored because turn id mismatched"
+                        );
+                        false
+                    }
+                    None => false,
+                };
+
+                if !removed {
+                    return false;
+                }
+
                 let was_deleting = state.deleting_conversations.remove(conversation_id);
                 state.cancelling_conversations.remove(conversation_id);
                 info!(
                     conversation_id,
+                    turn_id,
                     deleting = was_deleting,
                     "conversation runtime turn claim released"
                 );
@@ -254,7 +299,7 @@ impl ConversationRuntimeStateService {
             Err(_) => {
                 warn!(
                     conversation_id,
-                    "conversation runtime state lock poisoned while releasing turn"
+                    turn_id, "conversation runtime state lock poisoned while releasing turn"
                 );
                 false
             }
@@ -263,7 +308,18 @@ impl ConversationRuntimeStateService {
 }
 
 impl TurnClaim {
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
     pub fn release(&mut self) -> bool {
+        self.release_inner()
+    }
+
+    pub fn release_for_turn(&mut self, turn_id: &str) -> bool {
+        if self.turn_id != turn_id {
+            return false;
+        }
         self.release_inner()
     }
 
@@ -275,7 +331,7 @@ impl TurnClaim {
         let was_deleting = self
             .state
             .upgrade()
-            .map(|state| state.release(&self.conversation_id))
+            .map(|state| state.release(&self.conversation_id, &self.turn_id))
             .unwrap_or(false);
         self.released = true;
         was_deleting
@@ -295,11 +351,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn claim_records_active_turn_id_in_summary() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = state
+            .try_claim_turn("conv-1", "turn-a")
+            .expect("claim should be created");
+
+        assert_eq!(state.active_turn_id_for("conv-1").as_deref(), Some("turn-a"));
+
+        let summary = state.summary_from_parts("conv-1", None, false, 0);
+        assert_eq!(summary.turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(summary.state, ConversationRuntimeStateKind::Starting);
+    }
+
+    #[test]
+    fn releasing_wrong_turn_does_not_clear_active_claim() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let mut claim = state
+            .try_claim_turn("conv-1", "turn-a")
+            .expect("claim should be created");
+
+        assert!(!claim.release_for_turn("turn-b"));
+        assert!(state.is_claimed("conv-1"));
+        assert_eq!(state.active_turn_id_for("conv-1").as_deref(), Some("turn-a"));
+
+        assert!(!claim.release_for_turn("turn-a"));
+        assert!(!state.is_claimed("conv-1"));
+    }
+
+    #[test]
     fn claim_rejects_second_active_turn() {
         let state = Arc::new(ConversationRuntimeStateService::default());
-        let _claim = state.try_claim_turn("conv-1").expect("first claim should win");
+        let _claim = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect("first claim should win");
 
-        let err = state.try_claim_turn("conv-1").expect_err("second claim should fail");
+        let err = state
+            .try_claim_turn("conv-1", "turn-2")
+            .expect_err("second claim should fail");
         assert!(err.to_string().contains("already running"));
     }
 
@@ -307,12 +396,14 @@ mod tests {
     fn claim_releases_on_drop() {
         let state = Arc::new(ConversationRuntimeStateService::default());
         {
-            let _claim = state.try_claim_turn("conv-1").expect("claim should be created");
+            let _claim = state
+                .try_claim_turn("conv-1", "turn-1")
+                .expect("claim should be created");
             assert!(state.is_claimed("conv-1"));
         }
 
         assert!(!state.is_claimed("conv-1"));
-        assert!(state.try_claim_turn("conv-1").is_ok());
+        assert!(state.try_claim_turn("conv-1", "turn-2").is_ok());
     }
 
     #[test]
@@ -322,7 +413,7 @@ mod tests {
         state.mark_deleting("conv-1");
 
         let err = state
-            .try_claim_turn("conv-1")
+            .try_claim_turn("conv-1", "turn-1")
             .expect_err("deleting conversation should reject new turns");
         assert!(err.to_string().contains("being deleted"));
     }
@@ -330,7 +421,9 @@ mod tests {
     #[test]
     fn release_clears_deleting_flag_for_active_turn() {
         let state = Arc::new(ConversationRuntimeStateService::default());
-        let mut claim = state.try_claim_turn("conv-1").expect("claim should be created");
+        let mut claim = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect("claim should be created");
 
         state.mark_deleting("conv-1");
         assert!(state.is_deleting("conv-1"));
@@ -347,7 +440,7 @@ mod tests {
         state.mark_shutting_down();
 
         let err = state
-            .try_claim_turn("conv-1")
+            .try_claim_turn("conv-1", "turn-1")
             .expect_err("shutting down runtime should reject new turns");
         assert!(err.to_string().contains("shutting down"));
     }
@@ -367,7 +460,9 @@ mod tests {
     #[test]
     fn release_clears_cancelling_flag_for_active_turn() {
         let state = Arc::new(ConversationRuntimeStateService::default());
-        let mut claim = state.try_claim_turn("conv-1").expect("claim should be created");
+        let mut claim = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect("claim should be created");
 
         state.mark_cancelling("conv-1");
         assert!(state.is_cancelling("conv-1"));
@@ -380,7 +475,9 @@ mod tests {
     #[test]
     fn summary_uses_claim_as_starting_state() {
         let state = Arc::new(ConversationRuntimeStateService::default());
-        let _claim = state.try_claim_turn("conv-1").expect("claim should be created");
+        let _claim = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect("claim should be created");
 
         let summary = state.summary_from_parts("conv-1", None, false, 0);
 
@@ -392,7 +489,9 @@ mod tests {
     #[test]
     fn summary_waiting_confirmation_takes_priority() {
         let state = Arc::new(ConversationRuntimeStateService::default());
-        let _claim = state.try_claim_turn("conv-1").expect("claim should be created");
+        let _claim = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect("claim should be created");
 
         let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 1);
 

@@ -65,6 +65,14 @@ install:
 test:
     cargo nextest run --workspace
 
+# Ensure already-shipped database migrations stay immutable
+migration-check:
+    scripts/check-migration-immutability.sh
+
+# Test the migration immutability guard itself
+migration-check-test:
+    scripts/check-migration-immutability.test.sh
+
 # Lint (warnings = errors)
 lint:
     cargo clippy --workspace -- -D warnings
@@ -81,8 +89,8 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
-# Lint + format check + test
-check: lint fmt-check test
+# Lint + format check + migration check + test
+check: migration-check lint fmt-check test
 
 # Run the server (debug)
 run *ARGS:
@@ -92,8 +100,8 @@ run *ARGS:
 run-release *ARGS:
     cargo run --release --bin aioncore -- {{ARGS}}
 
-# Pre-push gate: format, lint, auto-commit fixes, test, then push
-push *ARGS: lint-fix fmt _auto-commit-fixes test
+# Pre-push gate: migration check, format, lint, auto-commit fixes, test, then push
+push *ARGS: migration-check lint-fix fmt _auto-commit-fixes test
     git push {{ ARGS }}
 
 # Auto-commit any formatting/lint fixes if there are changes

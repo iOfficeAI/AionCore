@@ -140,11 +140,22 @@ async fn aionrs_agent_metadata() {
 }
 
 // ---------------------------------------------------------------------------
-// Idle scanner: collect_idle only finds ACP tasks
+// Runtime boundary and idle scanner
 // ---------------------------------------------------------------------------
 
+#[test]
+fn agent_session_kind_is_limited_to_runnable_runtimes() {
+    fn assert_runnable(kind: AgentSessionKind) {
+        match kind {
+            AgentSessionKind::Acp(_) | AgentSessionKind::Aionrs(_) => {}
+        }
+    }
+
+    let _ = assert_runnable;
+}
+
 #[tokio::test]
-async fn collect_idle_ignores_non_acp_agent_types() {
+async fn collect_idle_ignores_aionrs_agent_type() {
     use futures_util::FutureExt;
     let old_ts = now_ms() - 600_000; // 10 min ago
 
@@ -173,22 +184,13 @@ async fn collect_idle_ignores_non_acp_agent_types() {
                 config: Default::default(),
                 belongs_to_team: false,
             })),
-            AgentType::OpenclawGateway => AgentSessionKind::OpenClaw(Box::new(OpenClawSessionBuildContext {
-                config: aionui_api_types::OpenClawBuildExtra {
-                    backend: None,
-                    agent_name: None,
-                    gateway: Default::default(),
-                    skills: vec![],
-                    preset_assistant_id: None,
-                    cron_job_id: None,
-                    session_key: None,
-                },
-            })),
-            AgentType::Remote => AgentSessionKind::Remote(RemoteSessionBuildContext {
-                remote_agent_id: "remote-1".into(),
-            }),
-            AgentType::Nanobot => AgentSessionKind::Nanobot(NanobotSessionBuildContext),
-            AgentType::Gemini => AgentSessionKind::Gemini,
+            AgentType::Gemini
+            | AgentType::OpenclawGateway
+            | AgentType::Remote
+            | AgentType::Nanobot
+            | AgentType::Codex => {
+                unreachable!("legacy agent types cannot build an AgentSessionKind")
+            }
         };
         BuildTaskOptions::new(AgentSessionContext {
             conversation: ConversationContext {
@@ -212,20 +214,14 @@ async fn collect_idle_ignores_non_acp_agent_types() {
         })
     };
 
-    mgr.get_or_build_task("nanobot-1", make_opts(AgentType::Nanobot, "nanobot-1"))
-        .await
-        .unwrap();
-    mgr.get_or_build_task("openclaw-1", make_opts(AgentType::OpenclawGateway, "openclaw-1"))
-        .await
-        .unwrap();
     mgr.get_or_build_task("acp-1", make_opts(AgentType::Acp, "acp-1"))
         .await
         .unwrap();
-    mgr.get_or_build_task("remote-1", make_opts(AgentType::Remote, "remote-1"))
+    mgr.get_or_build_task("aionrs-1", make_opts(AgentType::Aionrs, "aionrs-1"))
         .await
         .unwrap();
 
-    assert_eq!(mgr.active_count(), 4);
+    assert_eq!(mgr.active_count(), 2);
 
     // Only ACP should be collected
     let idle = mgr.collect_idle(300_000); // 5-min threshold

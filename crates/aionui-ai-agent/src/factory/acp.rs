@@ -15,7 +15,7 @@ use aionui_db::models::McpServerRow;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_runtime::{
     ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, ensure_runtime_command,
-    ensure_runtime_command_with_reporter,
+    ensure_runtime_command_with_reporter, resolve_command_path,
 };
 use tracing::{debug, info, warn};
 
@@ -254,6 +254,15 @@ async fn resolve_builtin_managed_acp_command_spec(
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
     tool: ManagedAcpToolId,
 ) -> Result<CommandSpec, AgentError> {
+    if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
+        && resolve_command_path(primary).is_none()
+    {
+        return Err(AgentError::bad_request(format!(
+            "Agent '{}' requires `{primary}` to be installed and available on PATH",
+            meta.name
+        )));
+    }
+
     let node_reporter = conversation_runtime_reporter(broadcaster.clone(), conversation_id.to_owned());
     let node_runtime = ensure_node_runtime_with_reporter(Some(node_reporter.as_ref()))
         .await

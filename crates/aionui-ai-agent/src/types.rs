@@ -75,7 +75,7 @@ pub struct AionrsResolvedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, OpenClawGatewayConfig, SlashCommandItem};
+    use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashCommandItem};
     use serde_json::json;
 
     #[test]
@@ -163,18 +163,12 @@ mod tests {
         let cmd = SlashCommandItem {
             command: "/review".into(),
             description: "Code review".into(),
+            completion_behavior: None,
+            empty_turn_tip_code: None,
+            empty_turn_tip_params: None,
         };
         let json = serde_json::to_value(&cmd).unwrap();
         assert_eq!(json["command"], "/review");
-    }
-
-    #[test]
-    fn openclaw_gateway_config_defaults() {
-        let json = json!({});
-        let config: OpenClawGatewayConfig = serde_json::from_value(json).unwrap();
-        assert!(!config.use_external_gateway);
-        assert!(config.host.is_none());
-        assert!(config.port.is_none());
     }
 
     #[test]

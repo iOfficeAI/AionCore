@@ -33,6 +33,11 @@ use tokio::process::{Child, Command};
 use crate::ResolvedCommand;
 use crate::resolver::resolve_command_path;
 
+struct ProgramPlan {
+    program: OsString,
+    args_prefix: Vec<OsString>,
+}
+
 /// Construction mode — determines default stdio + env extras.
 #[derive(Debug, Clone, Copy)]
 enum Mode {
@@ -91,7 +96,7 @@ impl Builder {
     /// - `kill_on_drop(true)`
     /// - removes `NODE_OPTIONS`, `NODE_INSPECT`, `NODE_DEBUG`, `CLAUDECODE`
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
-        let mut inner = Command::new(resolve_program(program.as_ref()));
+        let mut inner = command_from_program(program.as_ref());
         inner.kill_on_drop(true);
         configure_platform_spawn(&mut inner);
         strip_pollution(&mut inner);
@@ -109,7 +114,7 @@ impl Builder {
     /// - removes `NODE_OPTIONS`, `NODE_INSPECT`, `NODE_DEBUG`, `CLAUDECODE`
     /// - sets `NO_COLOR=1`, `TERM=dumb`
     pub fn clean_cli<S: AsRef<OsStr>>(program: S) -> Self {
-        let mut inner = Command::new(resolve_program(program.as_ref()));
+        let mut inner = command_from_program(program.as_ref());
         inner
             .kill_on_drop(true)
             .stdin(Stdio::null())
@@ -130,7 +135,7 @@ impl Builder {
     /// This bypasses `resolve_command_path` and uses the provided
     /// `program + args_prefix + env` directly.
     pub fn from_resolved(resolved: &ResolvedCommand) -> Self {
-        let mut inner = Command::new(&resolved.program);
+        let mut inner = command_from_resolved_program(resolved.program.as_os_str());
         inner.kill_on_drop(true);
         configure_platform_spawn(&mut inner);
         strip_pollution(&mut inner);
@@ -214,6 +219,65 @@ impl Builder {
     pub async fn output(mut self) -> io::Result<std::process::Output> {
         self.inner.output().await
     }
+}
+
+fn command_from_program(program: &OsStr) -> Command {
+    command_from_plan(plan_program(program))
+}
+
+fn command_from_resolved_program(program: &OsStr) -> Command {
+    command_from_plan(plan_resolved_program(program))
+}
+
+fn command_from_plan(plan: ProgramPlan) -> Command {
+    let mut command = Command::new(&plan.program);
+    command.args(plan.args_prefix);
+    command
+}
+
+fn plan_program(program: &OsStr) -> ProgramPlan {
+    plan_resolved_program(&resolve_program(program))
+}
+
+fn plan_resolved_program(program: &OsStr) -> ProgramPlan {
+    let program = program.to_os_string();
+    match shell_wrap_windows_script(&program) {
+        Some(plan) => plan,
+        None => ProgramPlan {
+            program,
+            args_prefix: Vec::new(),
+        },
+    }
+}
+
+#[cfg(any(windows, test))]
+fn shell_wrap_windows_script(program: &OsStr) -> Option<ProgramPlan> {
+    let ext = Path::new(&program).extension()?.to_str()?;
+    if ext.eq_ignore_ascii_case("ps1") {
+        return Some(ProgramPlan {
+            program: "powershell".into(),
+            args_prefix: vec![
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                program.into(),
+            ],
+        });
+    }
+
+    if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
+        return Some(ProgramPlan {
+            program: "cmd".into(),
+            args_prefix: vec!["/c".into(), program.into()],
+        });
+    }
+
+    None
+}
+
+#[cfg(not(any(windows, test)))]
+fn shell_wrap_windows_script(_program: &OsStr) -> Option<ProgramPlan> {
+    None
 }
 
 fn strip_pollution(cmd: &mut Command) {
@@ -429,6 +493,61 @@ mod tests {
         );
         assert!(preview.contains(r#""--flag""#), "arg --flag missing: {preview}");
         assert!(preview.contains(r#""with space""#), "arg with space missing: {preview}");
+    }
+
+    #[test]
+    fn windows_powershell_shim_is_wrapped_before_args() {
+        let mut b = Builder::new(r"C:\Users\me\scoop\shims\opencode.ps1");
+        b.args(["--print", "hello"]);
+
+        let command = b.inner.as_std();
+        assert_eq!(command.get_program(), OsStr::new("powershell"));
+        let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-ExecutionPolicy"),
+                OsString::from("Bypass"),
+                OsString::from("-File"),
+                OsString::from(r"C:\Users\me\scoop\shims\opencode.ps1"),
+                OsString::from("--print"),
+                OsString::from("hello"),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_cmd_and_bat_shims_are_wrapped_before_args() {
+        let mut b = Builder::new(r"C:\Users\me\AppData\Roaming\npm\opencode.cmd");
+        b.args(["run", "task"]);
+
+        let command = b.inner.as_std();
+        assert_eq!(command.get_program(), OsStr::new("cmd"));
+        let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("/c"),
+                OsString::from(r"C:\Users\me\AppData\Roaming\npm\opencode.cmd"),
+                OsString::from("run"),
+                OsString::from("task"),
+            ]
+        );
+
+        let mut b = Builder::new(r"C:\Users\me\AppData\Roaming\npm\opencode.bat");
+        b.arg("--version");
+
+        let command = b.inner.as_std();
+        assert_eq!(command.get_program(), OsStr::new("cmd"));
+        let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("/c"),
+                OsString::from(r"C:\Users\me\AppData\Roaming\npm\opencode.bat"),
+                OsString::from("--version"),
+            ]
+        );
     }
 
     #[cfg(unix)]

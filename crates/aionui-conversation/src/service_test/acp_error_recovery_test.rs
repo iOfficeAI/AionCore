@@ -9,7 +9,7 @@ async fn send_message_evicts_acp_task_after_terminal_error() {
     let scripted_agent = Arc::new(ScriptedAgent::new(
         &conv.id,
         vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
-            "Agent completed the turn without producing visible output.",
+            "mock terminal error",
             Some(AgentErrorCode::UnknownUpstreamError),
         ))]],
     ));

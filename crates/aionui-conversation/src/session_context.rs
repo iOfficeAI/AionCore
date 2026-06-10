@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{
     AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext,
-    NanobotSessionBuildContext, OpenClawSessionBuildContext, RemoteSessionBuildContext, WorkspaceContext,
+    WorkspaceContext,
 };
 use aionui_ai_agent::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState};
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, OpenClawBuildExtra, RemoteBuildExtra};
+use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra};
 use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
 use aionui_db::models::ConversationRow;
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
@@ -17,6 +17,9 @@ use tracing::{debug, warn};
 use crate::convert::string_to_enum;
 use crate::error::ConversationError;
 use crate::task_options::provider_model_from_conversation_row;
+
+const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
+    "This historical conversation can no longer be continued. Please start a new conversation.";
 
 pub(crate) struct SessionContextBuilder<'a> {
     workspace_root: &'a Path,
@@ -61,6 +64,7 @@ impl<'a> SessionContextBuilder<'a> {
         workspace_override: Option<&str>,
     ) -> Result<AgentSessionContext, ConversationError> {
         let agent_type: AgentType = string_to_enum(&row.r#type)?;
+        reject_deprecated_runtime_kind(row, &agent_type)?;
         let extra = parse_extra(row)?;
         let workspace = self.resolve_workspace(row, &agent_type, &extra, workspace_override)?;
         let model = provider_model_from_conversation_row(row);
@@ -147,17 +151,18 @@ impl<'a> SessionContextBuilder<'a> {
         extra: serde_json::Value,
     ) -> Result<AgentSessionKind, ConversationError> {
         match agent_type {
-            AgentType::Gemini => Ok(AgentSessionKind::Gemini),
             AgentType::Acp => self
                 .build_acp_context(row, extra)
                 .await
                 .map(|context| AgentSessionKind::Acp(Box::new(context))),
             AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(row, extra)))),
-            AgentType::OpenclawGateway => {
-                build_openclaw_context(extra).map(|context| AgentSessionKind::OpenClaw(Box::new(context)))
+            AgentType::Gemini
+            | AgentType::Codex
+            | AgentType::OpenclawGateway
+            | AgentType::Remote
+            | AgentType::Nanobot => {
+                unreachable!("legacy agent types are rejected before build_kind")
             }
-            AgentType::Remote => build_remote_context(extra).map(AgentSessionKind::Remote),
-            AgentType::Nanobot => Ok(AgentSessionKind::Nanobot(NanobotSessionBuildContext)),
         }
     }
 
@@ -311,29 +316,25 @@ fn build_aionrs_context(row: &ConversationRow, extra: serde_json::Value) -> Aion
     }
 }
 
-fn build_openclaw_context(extra: serde_json::Value) -> Result<OpenClawSessionBuildContext, ConversationError> {
-    let config: OpenClawBuildExtra = serde_json::from_value(extra).map_err(|e| ConversationError::BadRequest {
-        reason: format!("Invalid OpenClaw build options: {e}"),
-    })?;
-    Ok(OpenClawSessionBuildContext { config })
-}
-
-fn build_remote_context(extra: serde_json::Value) -> Result<RemoteSessionBuildContext, ConversationError> {
-    let config: RemoteBuildExtra = serde_json::from_value(extra).map_err(|e| ConversationError::BadRequest {
-        reason: format!("Invalid Remote build options: {e}"),
-    })?;
-    if config.remote_agent_id.trim().is_empty() {
-        return Err(ConversationError::BadRequest {
-            reason: "Remote agent requires remote_agent_id in extra".to_owned(),
-        });
-    }
-    Ok(RemoteSessionBuildContext {
-        remote_agent_id: config.remote_agent_id,
-    })
-}
-
 fn parse_extra(row: &ConversationRow) -> Result<serde_json::Value, ConversationError> {
     serde_json::from_str(&row.extra).map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))
+}
+
+fn reject_deprecated_runtime_kind(row: &ConversationRow, agent_type: &AgentType) -> Result<(), ConversationError> {
+    if !agent_type.is_deprecated_runtime() {
+        return Ok(());
+    }
+
+    debug!(
+        conversation_id = %row.id,
+        agent_type = agent_type.serde_name(),
+        "Rejected deprecated runtime conversation before session context build"
+    );
+
+    Err(ConversationError::Archived {
+        id: row.id.clone(),
+        reason: LEGACY_CONVERSATION_ARCHIVED_MESSAGE.into(),
+    })
 }
 
 fn parse_string_array(value: Option<serde_json::Value>) -> Option<Vec<String>> {
@@ -539,6 +540,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_openclaw_builtin_backend_fallback_resolves_agent_id() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-openclaw-test", "openclaw").await;
+        let row = row("acp", serde_json::json!({ "backend": "openclaw" }), None);
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.agent_id.as_deref(), Some("builtin-openclaw-test"));
+        assert_eq!(acp.config.backend.as_deref(), Some("openclaw"));
+    }
+
+    #[tokio::test]
     async fn acp_non_builtin_without_agent_id_is_rejected() {
         let repos = setup().await;
         let row = row(
@@ -661,12 +674,36 @@ mod tests {
         assert_eq!(context.workspace.path, custom.to_string_lossy());
     }
 
-    #[tokio::test]
-    async fn remote_missing_remote_agent_id_is_rejected() {
-        let repos = setup().await;
-        let row = row("remote", serde_json::json!({}), None);
+    fn assert_archived(err: ConversationError, expected_id: &str) {
+        match err {
+            ConversationError::Archived { id, reason } => {
+                assert_eq!(id, expected_id);
+                assert!(
+                    reason.contains("This historical conversation can no longer be continued."),
+                    "unexpected archive reason: {reason}"
+                );
+            }
+            other => panic!("expected ConversationError::Archived, got {other:?}"),
+        }
+    }
 
-        let err = repos.builder().build(&row).await.unwrap_err();
-        assert!(err.to_string().contains("remote_agent_id"));
+    #[tokio::test]
+    async fn legacy_agent_types_are_archived_before_runtime_context() {
+        let repos = setup().await;
+
+        for (agent_type, extra) in [
+            ("gemini", serde_json::json!({})),
+            ("codex", serde_json::json!({ "workspace": "/tmp/aionui-codex-history" })),
+            (
+                "openclaw-gateway",
+                serde_json::json!({ "gateway": { "use_external_gateway": true } }),
+            ),
+            ("nanobot", serde_json::json!({})),
+            ("remote", serde_json::json!({})),
+        ] {
+            let row = row(agent_type, extra, None);
+            let err = repos.builder().build(&row).await.unwrap_err();
+            assert_archived(err, "conv-1");
+        }
     }
 }

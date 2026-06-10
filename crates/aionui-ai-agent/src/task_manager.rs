@@ -181,7 +181,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
 }
 
 /// Wired up by `aionui-app` so deleting a conversation tears down its
-/// agent process. Without this hook, ACP/aionrs/nanobot subprocesses keep
+/// agent process. Without this hook, ACP/aionrs subprocesses keep
 /// streaming events for a `conversation_id` whose DB row is already gone
 /// (Sentry ELECTRON-1BD).
 #[async_trait]
@@ -496,12 +496,12 @@ mod tests {
             ),
         );
 
-        // Non-ACP (Nanobot) + Finished + old activity → should NOT be collected
+        // Non-ACP (Aionrs) + Finished + old activity → should NOT be collected
         insert(
-            "conv-nanobot",
+            "conv-aionrs",
             mock_instance(
-                MockAgent::new("conv-nanobot", Some(ConversationStatus::Finished))
-                    .with_agent_type(AgentType::Nanobot)
+                MockAgent::new("conv-aionrs", Some(ConversationStatus::Finished))
+                    .with_agent_type(AgentType::Aionrs)
                     .with_last_activity(now_ms() - 600_000),
             ),
         );

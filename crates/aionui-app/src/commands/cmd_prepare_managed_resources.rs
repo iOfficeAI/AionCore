@@ -3,8 +3,8 @@ use std::process::ExitCode;
 use crate::cli::PrepareManagedResourcesArgs;
 use crate::commands::error::{CliBoundaryCode, CliBoundaryError};
 use aionui_runtime::acp_tool_runtime::ManagedAcpToolId;
-use aionui_runtime::managed_resources::{export_acp_tool_to_root, export_node_runtime_to_root};
-use aionui_runtime::{ensure_managed_acp_tool, ensure_node_runtime};
+use aionui_runtime::managed_resources::export_node_runtime_to_root;
+use aionui_runtime::{ensure_node_runtime, prepare_managed_acp_tool_to_root};
 
 const SUBCOMMAND: &str = "prepare-managed-resources";
 
@@ -14,30 +14,23 @@ pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) ->
 
     let node_runtime = ensure_node_runtime()
         .await
-        .map_err(|_| prepare_managed_resources_error("node.prepare"))?;
+        .map_err(|error| prepare_managed_resources_error_with_detail("node.prepare", error))?;
     let node_dir_name = node_runtime
         .root
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| prepare_managed_resources_error("node.layout"))?;
     let exported_node = export_node_runtime_to_root(&output_root, &node_runtime.root, node_dir_name)
-        .map_err(|_| prepare_managed_resources_error("node.export"))?;
+        .map_err(|error| prepare_managed_resources_error_with_detail("node.export", error))?;
 
     println!("Prepared managed resources under {}", output_root.display());
     println!("  node   -> {}", exported_node.display());
 
     for tool in [ManagedAcpToolId::CodexAcp, ManagedAcpToolId::ClaudeAgentAcp] {
-        let resolved = ensure_managed_acp_tool(tool)
+        let prepared = prepare_managed_acp_tool_to_root(tool, &output_root)
             .await
-            .map_err(|_| prepare_managed_resources_error("acp.prepare"))?;
-        let platform = resolved
-            .root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| prepare_managed_resources_error("acp.layout"))?;
-        let exported = export_acp_tool_to_root(&output_root, &resolved.root, tool.slug(), tool.version(), platform)
-            .map_err(|_| prepare_managed_resources_error("acp.export"))?;
-        println!("  {:<6} -> {}", tool.slug(), exported.display());
+            .map_err(|error| prepare_managed_resources_error_with_detail("acp.prepare", error))?;
+        println!("  {:<6} -> {}", tool.slug(), prepared.root.display());
     }
 
     Ok(ExitCode::SUCCESS)
@@ -50,6 +43,11 @@ fn prepare_managed_resources_error(stage: &'static str) -> CliBoundaryError {
         "failed to prepare managed resources",
     )
     .with_field("stage", stage)
+}
+
+fn prepare_managed_resources_error_with_detail(stage: &'static str, error: impl std::fmt::Display) -> CliBoundaryError {
+    eprintln!("prepare-managed-resources stage={stage} detail: {error}");
+    prepare_managed_resources_error(stage)
 }
 
 #[cfg(test)]

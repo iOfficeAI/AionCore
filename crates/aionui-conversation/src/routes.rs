@@ -7,11 +7,12 @@ use axum::http::StatusCode;
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
-    ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CloneConversationRequest,
-    ConfirmRequest, ConfirmationListResponse, ConversationArtifactListResponse, ConversationArtifactResponse,
-    ConversationListResponse, ConversationResponse, CreateConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
+    CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
+    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
+    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -204,15 +205,12 @@ async fn send_msg(
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let msg_id = state
+    let response = state
         .service
         .send_message(&user.id, &id, req, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(SendMessageResponse { msg_id })),
-    ))
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
 }
 
 async fn list_artifacts(
@@ -254,13 +252,15 @@ async fn cancel(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state
+    body: Result<Json<CancelConversationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<CancelConversationResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state
         .service
-        .cancel(&user.id, &id, &state.task_manager)
+        .cancel(&user.id, &id, &req.turn_id, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(ApiResponse::success()))
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 async fn warmup(

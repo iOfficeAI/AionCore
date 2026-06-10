@@ -70,12 +70,24 @@ impl AgentService {
 // Agent operations
 impl AgentService {
     pub async fn list_agents(&self) -> Result<Vec<AgentMetadata>, AgentError> {
-        Ok(self.registry.list_all().await)
+        Ok(self
+            .registry
+            .list_all()
+            .await
+            .into_iter()
+            .filter(|agent| agent.agent_type.supports_new_conversation())
+            .collect())
     }
 
     pub async fn refresh_agents(&self) -> Result<Vec<AgentMetadata>, AgentError> {
         self.registry.refresh_availability().await;
-        Ok(self.registry.list_all().await)
+        Ok(self
+            .registry
+            .list_all()
+            .await
+            .into_iter()
+            .filter(|agent| agent.agent_type.supports_new_conversation())
+            .collect())
     }
 
     pub async fn acp_health_check(&self, req: AcpHealthCheckRequest) -> Result<AcpHealthCheckResponse, AgentError> {
