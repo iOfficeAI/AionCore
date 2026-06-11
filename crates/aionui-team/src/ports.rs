@@ -1,6 +1,25 @@
 use aionui_api_types::ConversationRuntimeSummary;
 use async_trait::async_trait;
 
+use crate::error::TeamError;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamConversationBindingLookup {
+    pub conversation_id: String,
+    pub user_id: String,
+    pub team_id: Option<String>,
+    pub slot_id: Option<String>,
+    pub role: Option<String>,
+}
+
+#[async_trait]
+pub trait TeamConversationLookupPort: Send + Sync {
+    async fn lookup_team_binding_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamConversationBindingLookup>, TeamError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTurnSource {
     Mailbox {

@@ -49,7 +49,6 @@ impl From<TeamError> for ApiError {
             TeamError::DuplicateAgentName(msg) => ApiError::BadRequest(format!("Agent name already taken: {msg}")),
             TeamError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
             TeamError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
-            TeamError::Conversation(conversation_err) => ApiError::from(conversation_err),
             TeamError::Database(db_err) => db_error_to_api_error(db_err),
             TeamError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
         }
@@ -292,10 +291,9 @@ mod tests {
     }
 
     #[test]
-    fn conversation_error_maps_through_boundary_mapper() {
-        let err: ApiError =
-            TeamError::Conversation(aionui_conversation::ConversationError::NotFound { id: "conv-1".into() }).into();
-        assert!(matches!(err, ApiError::NotFound(msg) if msg == "Conversation conv-1 not found"));
+    fn invalid_request_maps_to_bad_request_without_internal_details() {
+        let err: ApiError = TeamError::InvalidRequest("failed to adopt conversation".into()).into();
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg == "failed to adopt conversation"));
     }
 
     #[test]

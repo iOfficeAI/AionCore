@@ -14,9 +14,9 @@ use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState};
 use aionui_db::{
     IAcpSessionRepository, IAgentMetadataRepository, IAssistantOverrideRepository, IAssistantRepository,
-    IProviderRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantOverrideRepository,
-    SqliteAssistantRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    IConversationRepository, IProviderRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteAssistantOverrideRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
+    SqliteConversationRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -38,10 +38,13 @@ use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, ModelFetchService, ProtocolDetectionService,
     ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService,
 };
-use aionui_team::{TeamRouterState, TeamSessionService};
+use aionui_team::{
+    TeamConversationLookupPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState,
+    TeamSessionService,
+};
 
 use crate::config::derive_encryption_key;
-use crate::router::team_turn_adapter::TeamConversationTurnAdapter;
+use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
 
 #[derive(Debug)]
@@ -537,12 +540,23 @@ pub fn build_team_state(
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> = Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
     let conv_service = services.conversation_service.clone();
-    let turn_port = Arc::new(TeamConversationTurnAdapter::new(conv_service.clone()));
+    let conv_repo: Arc<dyn IConversationRepository> = Arc::new(SqliteConversationRepository::new(pool));
+    let adapters = Arc::new(TeamConversationAdapters::new(
+        conv_service,
+        conv_repo,
+        services.event_bus.clone(),
+    ));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = adapters.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = adapters.clone();
+    let lookup_port: Arc<dyn TeamConversationLookupPort> = adapters.clone();
+    let turn_port = adapters;
     let service = TeamSessionService::new(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
         Arc::new(SqliteProviderRepository::new(services.database.pool().clone())),
-        conv_service,
+        conversation_port,
+        projection_store,
+        lookup_port,
         services.event_bus.clone(),
         services.worker_task_manager.clone(),
         turn_port,

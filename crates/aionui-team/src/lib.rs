@@ -34,11 +34,13 @@ pub use message_projection::{
 };
 pub use ports::{
     AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest, AgentTurnSource,
-    AgentTurnStatus,
+    AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
 };
 
 pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
-pub use provisioning::TeamAgentProvisioner;
+pub use provisioning::{
+    TeamAgentProvisioner, TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationProvisioningPort,
+};
 pub use routes::{TeamRouterState, team_routes};
 pub use scheduler::{
     SchedulerAction, TeammateManager, WAKE_TIMEOUT_MS, WakePayload, format_crash_testament, normalize_name,

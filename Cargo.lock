@@ -811,7 +811,6 @@ dependencies = [
  "aionui-api-types",
  "aionui-auth",
  "aionui-common",
- "aionui-conversation",
  "aionui-db",
  "aionui-realtime",
  "async-trait",

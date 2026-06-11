@@ -60,6 +60,10 @@ impl RecordingProjectionStore {
 
 #[async_trait]
 impl TeamProjectionMessageStore for RecordingProjectionStore {
+    fn mint_message_id(&self) -> String {
+        format!("msg-recorded-{}", self.rows.lock().unwrap().len())
+    }
+
     async fn find_projected_message(
         &self,
         conversation_id: &str,

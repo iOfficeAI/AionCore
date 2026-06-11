@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AddAgentRequest, CreateConversationRequest, TeamAgentInput, WebSocketMessage};
+use aionui_api_types::{AddAgentRequest, TeamAgentInput};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
-use aionui_conversation::ConversationService;
 use aionui_db::{IProviderRepository, ITeamRepository, UpdateTeamParams};
-use aionui_realtime::EventBroadcaster;
+use async_trait::async_trait;
 use tracing::info;
 
 use crate::error::TeamError;
@@ -18,8 +17,7 @@ use crate::types::{Team, TeamAgent, TeammateRole};
 pub struct TeamAgentProvisioner {
     repo: Arc<dyn ITeamRepository>,
     provider_repo: Arc<dyn IProviderRepository>,
-    conversation_service: ConversationService,
-    broadcaster: Arc<dyn EventBroadcaster>,
+    conversation_port: Arc<dyn TeamConversationProvisioningPort>,
 }
 
 pub(crate) struct InitialProvisioningResult {
@@ -38,18 +36,49 @@ struct NewAgentProvisioning {
     workspace: Option<String>,
 }
 
+pub struct TeamConversationCreateRequest {
+    pub user_id: String,
+    pub agent_type: AgentType,
+    pub name: String,
+    pub top_level_model: Option<ProviderWithModel>,
+    pub extra: serde_json::Value,
+}
+
+pub struct TeamConversationAdoptRequest {
+    pub conversation_id: String,
+    pub extra: serde_json::Value,
+}
+
+#[async_trait]
+pub trait TeamConversationProvisioningPort: Send + Sync {
+    async fn create_team_conversation(&self, request: TeamConversationCreateRequest) -> Result<String, TeamError>;
+
+    async fn adopt_team_conversation(&self, request: TeamConversationAdoptRequest) -> Result<(), TeamError>;
+
+    async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
+
+    async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError>;
+
+    async fn warmup_agent_process(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), TeamError>;
+
+    async fn delete_team_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), TeamError>;
+}
+
 impl TeamAgentProvisioner {
     pub(crate) fn new(
         repo: Arc<dyn ITeamRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
-        conversation_service: ConversationService,
-        broadcaster: Arc<dyn EventBroadcaster>,
+        conversation_port: Arc<dyn TeamConversationProvisioningPort>,
     ) -> Self {
         Self {
             repo,
             provider_repo,
-            conversation_service,
-            broadcaster,
+            conversation_port,
         }
     }
 
@@ -166,14 +195,11 @@ impl TeamAgentProvisioner {
         let team_id = mcp_stdio_cfg.team_id.clone();
         self.write_team_mcp_runtime_config(agent, mcp_stdio_cfg).await?;
         let _ = task_manager.kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild));
-        self.conversation_service
-            .warmup(user_id, &agent.conversation_id, task_manager)
+        self.conversation_port
+            .warmup_agent_process(user_id, &agent.conversation_id, task_manager)
             .await
             .map_err(|e| {
-                TeamError::InvalidRequest(format!(
-                    "failed to warm up rebuilt agent {}: {e}",
-                    agent.conversation_id
-                ))
+                TeamError::InvalidRequest(format!("failed to warm up rebuilt agent {}: {e}", agent.slot_id))
             })?;
         info!(
             team_id = %team_id,
@@ -194,8 +220,8 @@ impl TeamAgentProvisioner {
             "team_mcp_stdio_config": mcp_stdio_cfg,
             "session_mode": resolve_full_auto_mode(&agent.backend),
         });
-        self.conversation_service
-            .update_extra(&agent.conversation_id, patch)
+        self.conversation_port
+            .patch_runtime_config(&agent.conversation_id, patch)
             .await
             .map_err(|e| {
                 TeamError::InvalidRequest(format!(
@@ -206,13 +232,13 @@ impl TeamAgentProvisioner {
     }
 
     pub(crate) async fn update_session_mode_seed(&self, agent: &TeamAgent, mode: &str) -> Result<(), TeamError> {
-        self.conversation_service
-            .update_extra(&agent.conversation_id, serde_json::json!({ "session_mode": mode }))
+        self.conversation_port
+            .patch_runtime_config(&agent.conversation_id, serde_json::json!({ "session_mode": mode }))
             .await
             .map_err(|e| {
                 TeamError::InvalidRequest(format!("failed to persist session_mode for {}: {e}", agent.slot_id))
             })?;
-        self.conversation_service
+        self.conversation_port
             .save_acp_runtime_mode(&agent.conversation_id, mode)
             .await
             .map_err(|e| {
@@ -267,17 +293,12 @@ impl TeamAgentProvisioner {
             .build_team_extra(team_id, slot_id, role, backend, model, workspace)
             .await?;
         if let Some(existing_id) = existing_conversation_id {
-            self.conversation_service
-                .update_extra(existing_id, extra)
-                .await
-                .map_err(|e| TeamError::InvalidRequest(format!("failed to adopt conversation: {e}")))?;
-            self.broadcaster.broadcast(WebSocketMessage::new(
-                "conversation.listChanged",
-                serde_json::json!({
-                    "conversation_id": existing_id,
-                    "action": "updated",
-                }),
-            ));
+            self.conversation_port
+                .adopt_team_conversation(TeamConversationAdoptRequest {
+                    conversation_id: existing_id.to_owned(),
+                    extra,
+                })
+                .await?;
             info!(
                 team_id,
                 slot_id,
@@ -311,29 +332,37 @@ impl TeamAgentProvisioner {
             extra["current_model_id"] = serde_json::Value::String(model.to_owned());
             (None, extra)
         };
-        let conv = self
-            .conversation_service
-            .create(
-                user_id,
-                CreateConversationRequest {
-                    r#type: agent_type,
-                    name: Some(name.to_owned()),
-                    model: top_level_model,
-                    source: None,
-                    channel_chat_id: None,
-                    extra,
-                },
-            )
-            .await
-            .map_err(TeamError::from_conversation_create)?;
+        let conv_id = self
+            .conversation_port
+            .create_team_conversation(TeamConversationCreateRequest {
+                user_id: user_id.to_owned(),
+                agent_type,
+                name: name.to_owned(),
+                top_level_model,
+                extra,
+            })
+            .await?;
         info!(
             team_id,
             slot_id,
-            conversation_id = %conv.id,
+            conversation_id = %conv_id,
             outcome = "created",
             "Team agent provisioned"
         );
-        Ok(conv.id)
+        Ok(conv_id)
+    }
+
+    pub(crate) async fn patch_guide_mcp_config(
+        &self,
+        agent: &TeamAgent,
+        config: &aionui_api_types::GuideMcpConfig,
+    ) -> Result<(), TeamError> {
+        self.conversation_port
+            .patch_runtime_config(
+                &agent.conversation_id,
+                serde_json::json!({ "guide_mcp_config": config }),
+            )
+            .await
     }
 
     async fn build_team_extra(

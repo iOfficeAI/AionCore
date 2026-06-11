@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use aionui_api_types::WebSocketMessage;
-use aionui_conversation::ConversationService;
 use aionui_db::models::MessageRow;
 use aionui_realtime::EventBroadcaster;
 use async_trait::async_trait;
@@ -106,6 +105,8 @@ pub enum ProjectedTeamMessage {
 
 #[async_trait]
 pub trait TeamProjectionMessageStore: Send + Sync {
+    fn mint_message_id(&self) -> String;
+
     async fn find_projected_message(
         &self,
         conversation_id: &str,
@@ -116,34 +117,14 @@ pub trait TeamProjectionMessageStore: Send + Sync {
     async fn insert_projected_message(&self, row: &MessageRow) -> Result<(), TeamError>;
 }
 
-#[async_trait]
-impl TeamProjectionMessageStore for ConversationService {
-    async fn find_projected_message(
-        &self,
-        conversation_id: &str,
-        msg_id: &str,
-        msg_type: &str,
-    ) -> Result<Option<MessageRow>, TeamError> {
-        Ok(self
-            .conversation_repo()
-            .get_message_by_msg_id(conversation_id, msg_id, msg_type)
-            .await?)
-    }
-
-    async fn insert_projected_message(&self, row: &MessageRow) -> Result<(), TeamError> {
-        self.insert_raw_message(row).await?;
-        Ok(())
-    }
-}
-
-pub struct TeamMessageProjection<S> {
+pub struct TeamMessageProjection<S: ?Sized> {
     store: Arc<S>,
     broadcaster: Arc<dyn EventBroadcaster>,
 }
 
 impl<S> TeamMessageProjection<S>
 where
-    S: TeamProjectionMessageStore,
+    S: TeamProjectionMessageStore + ?Sized,
 {
     pub fn new(store: Arc<S>, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
         Self { store, broadcaster }
@@ -165,7 +146,7 @@ where
         let msg_id = request
             .dedupe_key
             .clone()
-            .unwrap_or_else(ConversationService::mint_msg_id);
+            .unwrap_or_else(|| self.store.mint_message_id());
 
         if request.dedupe_key.is_some()
             && let Some(existing) = self

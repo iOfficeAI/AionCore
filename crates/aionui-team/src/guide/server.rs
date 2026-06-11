@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
-use aionui_api_types::TeamSessionBinding;
 use aionui_common::generate_id;
 use axum::Json;
 use axum::extract::State;
@@ -223,14 +222,8 @@ async fn exec_create_team(
     // This prevents duplicate team creation when guide MCP is
     // erroneously injected into an existing team leader session.
     if let Some(ref conv_id) = caller_conversation_id {
-        let repo = svc.conversation_service_ref().conversation_repo().clone();
-        if let Ok(Some(row)) = repo.get(conv_id).await {
-            let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
-            if extra
-                .get("teamId")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|s| !s.is_empty())
-            {
+        match svc.lookup_team_binding_by_conversation(conv_id).await {
+            Ok(Some(binding)) if binding.team_id.as_deref().is_some_and(|s| !s.is_empty()) => {
                 warn!(
                     conversation_id = conv_id,
                     "Guide HTTP: aion_create_team refused — conversation already belongs to a team"
@@ -238,6 +231,11 @@ async fn exec_create_team(
                 return serde_json::json!({
                     "error": "This conversation already belongs to a team. Cannot create another team from here."
                 });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(conversation_id = conv_id, error = %error, "Guide HTTP: team binding lookup failed");
+                return serde_json::json!({"error": "Failed to inspect conversation team binding."});
             }
         }
     }
@@ -350,29 +348,32 @@ async fn exec_team_tool(
 /// whose `conversation_id` matches. Returns an error string if no active team is
 /// found for this conversation.
 async fn resolve_team_context(service: &TeamSessionService, conversation_id: &str) -> Result<(String, String), String> {
-    let repo = service.conversation_service_ref().conversation_repo().clone();
-    let row = repo
-        .get(conversation_id)
+    let binding = service
+        .lookup_team_binding_by_conversation(conversation_id)
         .await
         .map_err(|e| format!("DB error reading conversation: {e}"))?
         .ok_or_else(|| format!("Conversation not found: {conversation_id}"))?;
 
-    let binding = TeamSessionBinding::from_extra_str(&row.extra)
-        .map_err(|e| format!("Invalid Team runtime context: {e}"))?
+    let team_id = binding
+        .team_id
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| "No active team for this conversation. Create a team first with aion_create_team.".to_owned())?;
-    let team_id = binding.team_id;
 
     // Find the slot_id by matching conversation_id in the session scheduler.
     let scheduler = service
         .get_session_scheduler(&team_id)
         .ok_or_else(|| "No active team session. The team may still be starting up.".to_owned())?;
 
-    let agents = scheduler.list_agents().await;
-    let slot_id = agents
-        .iter()
-        .find(|a| a.conversation_id == conversation_id)
-        .map(|a| a.slot_id.clone())
-        .ok_or_else(|| format!("Agent with conversation_id={conversation_id} not found in team {team_id}"))?;
+    let slot_id = if let Some(slot_id) = binding.slot_id.filter(|s| !s.is_empty()) {
+        slot_id
+    } else {
+        let agents = scheduler.list_agents().await;
+        agents
+            .iter()
+            .find(|a| a.conversation_id == conversation_id)
+            .map(|a| a.slot_id.clone())
+            .ok_or_else(|| format!("Agent with conversation_id={conversation_id} not found in team {team_id}"))?
+    };
 
     Ok((team_id, slot_id))
 }

@@ -12,7 +12,7 @@ use crate::event_loop::EventLoopRegistry;
 use crate::mailbox::Mailbox;
 use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
 use crate::message_projection::{
-    TeamMessageProjection, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
+    TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
 };
 use crate::ports::AgentTurnExecutionPort;
 use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
@@ -60,6 +60,7 @@ pub struct TeamSession {
     backend_binary_path: Arc<PathBuf>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     turn_port: Arc<dyn AgentTurnExecutionPort>,
+    projection_store: Arc<dyn TeamProjectionMessageStore>,
     /// Owner user_id for this team — needed when spawn_agent creates a
     /// new conversation (conversations are scoped per user).
     user_id: String,
@@ -86,6 +87,7 @@ impl TeamSession {
         backend_binary_path: Arc<PathBuf>,
         task_manager: Arc<dyn IWorkerTaskManager>,
         turn_port: Arc<dyn AgentTurnExecutionPort>,
+        projection_store: Arc<dyn TeamProjectionMessageStore>,
         user_id: String,
         service: Weak<TeamSessionService>,
     ) -> Result<Self, TeamError> {
@@ -127,6 +129,7 @@ impl TeamSession {
             backend_binary_path,
             task_manager,
             turn_port,
+            projection_store,
             user_id,
             service,
             broadcaster,
@@ -315,27 +318,22 @@ impl TeamSession {
             )
             .await?;
 
-        if let Some(svc) = self.service.upgrade() {
-            let projection = TeamMessageProjection::new(
-                Arc::new(svc.conversation_service_ref().clone()),
-                self.broadcaster.clone(),
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        let request = TeamProjectionRequest::user_visible(
+            &self.team.id,
+            &lead_slot_id,
+            &lead_conv_id,
+            content,
+            files.clone().unwrap_or_default(),
+        );
+        if let Err(e) = projection.project(request).await {
+            warn!(
+                team_id = %self.team.id,
+                slot_id = %lead_slot_id,
+                conversation_id = %lead_conv_id,
+                error = %e,
+                "failed to project user right bubble for leader (non-fatal)"
             );
-            let request = TeamProjectionRequest::user_visible(
-                &self.team.id,
-                &lead_slot_id,
-                &lead_conv_id,
-                content,
-                files.clone().unwrap_or_default(),
-            );
-            if let Err(e) = projection.project(request).await {
-                warn!(
-                    team_id = %self.team.id,
-                    slot_id = %lead_slot_id,
-                    conversation_id = %lead_conv_id,
-                    error = %e,
-                    "failed to project user right bubble for leader (non-fatal)"
-                );
-            }
         }
 
         self.try_wake(&lead_slot_id, files).await;
@@ -366,27 +364,22 @@ impl TeamSession {
             )
             .await?;
 
-        if let Some(svc) = self.service.upgrade() {
-            let projection = TeamMessageProjection::new(
-                Arc::new(svc.conversation_service_ref().clone()),
-                self.broadcaster.clone(),
-            );
-            let request = TeamProjectionRequest::user_visible(
-                &self.team.id,
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        let request = TeamProjectionRequest::user_visible(
+            &self.team.id,
+            slot_id,
+            &agent.conversation_id,
+            content,
+            files.clone().unwrap_or_default(),
+        );
+        if let Err(e) = projection.project(request).await {
+            warn!(
+                team_id = %self.team.id,
                 slot_id,
-                &agent.conversation_id,
-                content,
-                files.clone().unwrap_or_default(),
+                conversation_id = %agent.conversation_id,
+                error = %e,
+                "failed to project user right bubble (non-fatal)"
             );
-            if let Err(e) = projection.project(request).await {
-                warn!(
-                    team_id = %self.team.id,
-                    slot_id,
-                    conversation_id = %agent.conversation_id,
-                    error = %e,
-                    "failed to project user right bubble (non-fatal)"
-                );
-            }
         }
 
         self.try_wake(slot_id, files).await;
@@ -426,8 +419,6 @@ impl TeamSession {
     /// - `from_agent_id == "user"`: user-originated messages are already
     ///   written to the conversation by the standard user-send path, and we
     ///   must not double-write them.
-    /// - Test/unit contexts where `TeamSession::service` is a dangling
-    ///   `Weak` (no conversation service reachable).
     ///
     /// Failures per-message are logged and swallowed — the mailbox rows are
     /// already marked read, and we never let a conversation-write failure
@@ -436,13 +427,7 @@ impl TeamSession {
         if input.unread.is_empty() {
             return;
         }
-        let Some(service) = self.service.upgrade() else {
-            return;
-        };
-        let projection = TeamMessageProjection::new(
-            Arc::new(service.conversation_service_ref().clone()),
-            self.broadcaster.clone(),
-        );
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let agents = self.scheduler.list_agents().await;
         let total = input.unread.len();
 
@@ -733,6 +718,33 @@ mod tests {
         Arc::new(NoopTurnPort)
     }
 
+    #[derive(Default)]
+    struct NoopProjectionStore;
+
+    #[async_trait::async_trait]
+    impl TeamProjectionMessageStore for NoopProjectionStore {
+        fn mint_message_id(&self) -> String {
+            "msg-test".into()
+        }
+
+        async fn find_projected_message(
+            &self,
+            _conversation_id: &str,
+            _msg_id: &str,
+            _msg_type: &str,
+        ) -> Result<Option<aionui_db::models::MessageRow>, TeamError> {
+            Ok(None)
+        }
+
+        async fn insert_projected_message(&self, _row: &aionui_db::models::MessageRow) -> Result<(), TeamError> {
+            Ok(())
+        }
+    }
+
+    fn noop_projection_store() -> Arc<dyn TeamProjectionMessageStore> {
+        Arc::new(NoopProjectionStore)
+    }
+
     /// RecordingBroadcaster used by the D29d-1 ratification test below to
     /// assert that `team.agentSpawned` is *not* emitted on failed spawns.
     #[derive(Default)]
@@ -883,6 +895,7 @@ mod tests {
             backend_path(),
             empty_task_manager(),
             noop_turn_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -931,6 +944,7 @@ mod tests {
             backend_path(),
             empty_task_manager(),
             noop_turn_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -958,6 +972,7 @@ mod tests {
             backend_path(),
             empty_task_manager(),
             noop_turn_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1026,6 +1041,7 @@ mod tests {
             backend_path(),
             stub_dyn,
             noop_turn_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1057,6 +1073,7 @@ mod tests {
             backend_path(),
             stub_dyn,
             noop_turn_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1368,6 +1385,7 @@ mod tests {
             backend_path(),
             task_manager,
             noop_turn_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1467,6 +1485,7 @@ mod tests {
             backend_path(),
             empty_task_manager(),
             noop_turn_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1487,6 +1506,7 @@ mod tests {
             backend_path(),
             empty_task_manager(),
             noop_turn_port(),
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )

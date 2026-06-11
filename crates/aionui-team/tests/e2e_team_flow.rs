@@ -39,7 +39,7 @@ use aionui_team::ports::{
     AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest, AgentTurnStatus,
 };
 use aionui_team::service::TeamSessionService;
-use aionui_team::{TeamAgent, TeamSession, TeammateRole};
+use aionui_team::{TeamAgent, TeamProjectionMessageStore, TeamSession, TeammateRole};
 use async_trait::async_trait;
 use common::MockTeamRepo;
 use serde_json::{Value, json};
@@ -80,6 +80,32 @@ impl AgentTurnExecutionPort for RecordingTurnPort {
             status: AgentTurnStatus::Completed,
             runtime: None,
         })
+    }
+}
+
+#[derive(Default)]
+struct NoopProjectionStore;
+
+#[async_trait]
+impl TeamProjectionMessageStore for NoopProjectionStore {
+    fn mint_message_id(&self) -> String {
+        "msg-e2e".into()
+    }
+
+    async fn find_projected_message(
+        &self,
+        _conversation_id: &str,
+        _msg_id: &str,
+        _msg_type: &str,
+    ) -> Result<Option<aionui_db::models::MessageRow>, aionui_team::TeamError> {
+        Ok(None)
+    }
+
+    async fn insert_projected_message(
+        &self,
+        _row: &aionui_db::models::MessageRow,
+    ) -> Result<(), aionui_team::TeamError> {
+        Ok(())
     }
 }
 
@@ -439,6 +465,7 @@ async fn setup_session_with_turn_recorder() -> (
         backend_path(),
         task_manager_dyn,
         turn_port,
+        Arc::new(NoopProjectionStore),
         "user-e2e".into(),
         Weak::<TeamSessionService>::new(),
     )

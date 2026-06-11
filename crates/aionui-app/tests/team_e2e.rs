@@ -1,5 +1,6 @@
 mod common;
 
+use aionui_db::{IConversationRepository, SortOrder};
 use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
@@ -79,6 +80,26 @@ async fn tc3_each_agent_has_conversation_id() {
         data["agents"][0]["conversation_id"],
         data["agents"][1]["conversation_id"]
     );
+}
+
+#[tokio::test]
+async fn tc3b_create_team_writes_legacy_extra_shape() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_team(&mut app, &token, &csrf).await;
+    let conversation_id = data["agents"][0]["conversation_id"].as_str().unwrap();
+
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let row = repo.get(conversation_id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+
+    assert_eq!(extra["teamId"], data["id"]);
+    assert!(extra["slot_id"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(extra["role"], "lead");
+    assert_eq!(extra["backend"], "acp");
+    assert_eq!(extra["session_mode"], "yolo");
+    assert_eq!(extra["current_model_id"], "claude");
 }
 
 // TC-4: First agent defaults to lead
@@ -780,6 +801,77 @@ async fn sm1_send_message_with_session() {
     );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sm1b_team_send_persists_user_bubble_through_projection_adapter() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_team(&mut app, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let lead_conversation_id = data["agents"][0]["conversation_id"].as_str().unwrap();
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/messages"),
+        json!({ "content": "Hello through adapter" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let messages = repo
+        .get_messages(lead_conversation_id, 1, 50, SortOrder::Asc)
+        .await
+        .unwrap();
+    assert!(messages.items.iter().any(|row| {
+        row.position.as_deref() == Some("right")
+            && row.status.as_deref() == Some("finish")
+            && row.content.contains("Hello through adapter")
+    }));
+}
+
+#[tokio::test]
+async fn sm1c_team_owned_conversation_regular_send_is_forbidden() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_team(&mut app, &token, &csrf).await;
+    let conversation_id = data["agents"][0]["conversation_id"].as_str().unwrap();
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{conversation_id}/messages"),
+        json!({ "content": "must go through team api" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["error"], "Forbidden.");
+}
+
+#[tokio::test]
+async fn sm1d_team_send_rejects_missing_csrf() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/teams/{team_id}/messages"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(r#"{"content":"x"}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // SM-4: Send message without session returns 404

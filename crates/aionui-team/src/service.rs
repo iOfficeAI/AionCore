@@ -12,7 +12,6 @@ use aionui_api_types::{
 use aionui_common::{
     AgentKillReason, WorkspacePathValidationError, generate_id, now_ms, validate_workspace_path_availability,
 };
-use aionui_conversation::ConversationService;
 use aionui_db::models::TeamRow;
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
 use aionui_realtime::EventBroadcaster;
@@ -22,8 +21,9 @@ use tracing::{info, warn};
 use crate::error::TeamError;
 use crate::event_loop::AgentLoopContext;
 use crate::events::{TEAM_CREATED_EVENT, TEAM_MCP_STATUS_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT};
-use crate::ports::AgentTurnExecutionPort;
-use crate::provisioning::TeamAgentProvisioner;
+use crate::message_projection::TeamProjectionMessageStore;
+use crate::ports::{AgentTurnExecutionPort, TeamConversationBindingLookup, TeamConversationLookupPort};
+use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::session::TeamSession;
 use crate::types::{Team, TeamAgent, TeammateRole};
 
@@ -41,7 +41,9 @@ pub struct TeamSessionService {
     repo: Arc<dyn ITeamRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     provider_repo: Arc<dyn IProviderRepository>,
-    conversation_service: ConversationService,
+    conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+    projection_store: Arc<dyn TeamProjectionMessageStore>,
+    lookup_port: Arc<dyn TeamConversationLookupPort>,
     broadcaster: Arc<dyn EventBroadcaster>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     turn_port: Arc<dyn AgentTurnExecutionPort>,
@@ -73,7 +75,9 @@ impl TeamSessionService {
         repo: Arc<dyn ITeamRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
-        conversation_service: ConversationService,
+        conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+        projection_store: Arc<dyn TeamProjectionMessageStore>,
+        lookup_port: Arc<dyn TeamConversationLookupPort>,
         broadcaster: Arc<dyn EventBroadcaster>,
         task_manager: Arc<dyn IWorkerTaskManager>,
         turn_port: Arc<dyn AgentTurnExecutionPort>,
@@ -84,7 +88,9 @@ impl TeamSessionService {
             repo,
             agent_metadata_repo,
             provider_repo,
-            conversation_service,
+            conversation_port,
+            projection_store,
+            lookup_port,
             broadcaster,
             task_manager,
             turn_port,
@@ -101,9 +107,17 @@ impl TeamSessionService {
         TeamAgentProvisioner::new(
             self.repo.clone(),
             self.provider_repo.clone(),
-            self.conversation_service.clone(),
-            self.broadcaster.clone(),
+            self.conversation_port.clone(),
         )
+    }
+
+    pub(crate) async fn lookup_team_binding_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamConversationBindingLookup>, TeamError> {
+        self.lookup_port
+            .lookup_team_binding_by_conversation(conversation_id)
+            .await
     }
 
     async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
@@ -147,20 +161,15 @@ impl TeamSessionService {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
-                if let Some(leader) = team_data.agents.iter().find(|a| a.role == TeammateRole::Lead) {
-                    let patch = serde_json::json!({ "guide_mcp_config": cfg });
-                    if let Err(e) = self
-                        .conversation_service
-                        .update_extra(&leader.conversation_id, patch)
-                        .await
-                    {
-                        warn!(
-                            team_id = %team.id,
-                            conversation_id = %leader.conversation_id,
-                            error = %e,
-                            "failed to patch leader guide_mcp_config on restore"
-                        );
-                    }
+                if let Some(leader) = team_data.agents.iter().find(|a| a.role == TeammateRole::Lead)
+                    && let Err(e) = self.provisioner().patch_guide_mcp_config(leader, cfg).await
+                {
+                    warn!(
+                        team_id = %team.id,
+                        conversation_id = %leader.conversation_id,
+                        error = %e,
+                        "failed to patch leader guide_mcp_config on restore"
+                    );
                 }
             }
         }
@@ -273,7 +282,10 @@ impl TeamSessionService {
         .await;
 
         for agent in &team.agents {
-            let _ = self.conversation_service.delete(user_id, &agent.conversation_id).await;
+            let _ = self
+                .conversation_port
+                .delete_team_conversation(user_id, &agent.conversation_id)
+                .await;
         }
 
         self.repo.delete_mailbox_by_team(team_id).await?;
@@ -353,8 +365,8 @@ impl TeamSessionService {
         let removed = team.agents.remove(idx);
 
         let _ = self
-            .conversation_service
-            .delete(user_id, &removed.conversation_id)
+            .conversation_port
+            .delete_team_conversation(user_id, &removed.conversation_id)
             .await;
 
         let agents_json = serde_json::to_string(&team.agents)?;
@@ -428,7 +440,8 @@ impl TeamSessionService {
     /// 1. Start `TeamSession` (opens the MCP TCP server).
     /// 2. For each agent: persist `team_mcp_stdio_config` into
     ///    `conversation.extra` → `task_manager.kill(conv_id, TeamMcpRebuild)`
-    ///    → `conversation_service.warmup(...)` rebuilds the ACP process with
+    ///    → `TeamConversationProvisioningPort::warmup_agent_process(...)`
+    ///    rebuilds the ACP process with
     ///    the new extra.
     /// 3. Spawn per-agent event loops that drain the mailbox whenever notified.
     /// 4. Only insert into `sessions` after every step above succeeds — on
@@ -490,6 +503,7 @@ impl TeamSessionService {
             self.backend_binary_path.clone(),
             self.task_manager.clone(),
             self.turn_port.clone(),
+            self.projection_store.clone(),
             user_id.clone(),
             self.self_ref.clone(),
         )

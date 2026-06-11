@@ -204,10 +204,6 @@ impl TeamSessionService {
         info!("All team sessions disposed");
     }
 
-    pub(crate) fn conversation_service_ref(&self) -> &ConversationService {
-        &self.conversation_service
-    }
-
     /// Create the conversation + persist the new agent slot for a spawn.
     ///
     /// Holds the per-team `add_agent` lock for the entirety of the

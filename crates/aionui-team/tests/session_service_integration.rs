@@ -11,21 +11,24 @@ use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
-use aionui_common::{AgentKillReason, PaginatedResult, ProviderWithModel};
+use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
-    AcpSessionRow, AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+    AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
-    IAgentMetadataRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessageRowUpdate,
-    MessageSearchRow, PersistedSessionState, SaveRuntimeStateParams, SortOrder,
+    ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IConversationRepository,
+    IProviderRepository, ITeamRepository, MessageRowUpdate, MessageSearchRow, SortOrder,
 };
 use aionui_realtime::EventBroadcaster;
 
-use aionui_conversation::ConversationService;
 use aionui_team::TeamSessionService;
 use aionui_team::ports::{
     AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest, AgentTurnStatus,
+    TeamConversationBindingLookup, TeamConversationLookupPort,
+};
+use aionui_team::{
+    TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationProvisioningPort,
+    TeamProjectionMessageStore,
 };
 use common::MockTeamRepo;
 
@@ -188,6 +191,239 @@ fn noop_turn_port() -> Arc<dyn AgentTurnExecutionPort> {
     Arc::new(NoopTurnPort)
 }
 
+struct FakeConversationPorts {
+    repo: Arc<MockConversationRepo>,
+    broadcaster: Arc<dyn EventBroadcaster>,
+}
+
+impl FakeConversationPorts {
+    fn new(repo: Arc<MockConversationRepo>, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
+        Self { repo, broadcaster }
+    }
+}
+
+#[async_trait::async_trait]
+impl TeamConversationProvisioningPort for FakeConversationPorts {
+    async fn create_team_conversation(
+        &self,
+        request: TeamConversationCreateRequest,
+    ) -> Result<String, aionui_team::TeamError> {
+        let id = aionui_common::generate_id();
+        let now = aionui_common::now_ms();
+        self.repo
+            .create(&ConversationRow {
+                id: id.clone(),
+                user_id: request.user_id,
+                name: request.name,
+                r#type: request.agent_type.serde_name().to_owned(),
+                pinned: false,
+                pinned_at: None,
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::to_string(&request.extra).unwrap(),
+                model: request
+                    .top_level_model
+                    .map(|m| serde_json::to_string(&m).expect("serialize provider model")),
+                status: Some("pending".into()),
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        Ok(id)
+    }
+
+    async fn adopt_team_conversation(
+        &self,
+        request: TeamConversationAdoptRequest,
+    ) -> Result<(), aionui_team::TeamError> {
+        self.repo
+            .update(
+                &request.conversation_id,
+                &ConversationRowUpdate {
+                    name: None,
+                    model: None,
+                    pinned: None,
+                    pinned_at: None,
+                    extra: Some(serde_json::to_string(&request.extra).unwrap()),
+                    status: None,
+                    updated_at: Some(aionui_common::now_ms()),
+                },
+            )
+            .await?;
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "conversation.listChanged",
+            serde_json::json!({
+                "conversation_id": request.conversation_id,
+                "action": "updated",
+            }),
+        ));
+        Ok(())
+    }
+
+    async fn patch_runtime_config(
+        &self,
+        conversation_id: &str,
+        patch: serde_json::Value,
+    ) -> Result<(), aionui_team::TeamError> {
+        let mut extra = self
+            .repo
+            .get_extra(conversation_id)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let (Some(target), Some(source)) = (extra.as_object_mut(), patch.as_object()) {
+            for (key, value) in source {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        self.repo
+            .update(
+                conversation_id,
+                &ConversationRowUpdate {
+                    name: None,
+                    model: None,
+                    pinned: None,
+                    pinned_at: None,
+                    extra: Some(serde_json::to_string(&extra).unwrap()),
+                    status: None,
+                    updated_at: Some(aionui_common::now_ms()),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), aionui_team::TeamError> {
+        self.patch_runtime_config(conversation_id, serde_json::json!({ "session_mode": mode }))
+            .await
+    }
+
+    async fn warmup_agent_process(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), aionui_team::TeamError> {
+        let row = self
+            .repo
+            .get(conversation_id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| {
+                aionui_team::TeamError::InvalidRequest(format!("conversation not found: {conversation_id}"))
+            })?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra)?;
+        let team = aionui_api_types::TeamSessionBinding::from_extra_value(&extra)?;
+        let config: AcpBuildExtra = serde_json::from_value(extra.clone()).unwrap_or_default();
+        let workspace = extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let provider_id = extra
+            .get("provider_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("acp")
+            .to_owned();
+        let model = extra
+            .get("current_model_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("claude")
+            .to_owned();
+        let context = AgentSessionContext {
+            conversation: ConversationContext {
+                conversation_id: row.id.clone(),
+                user_id: row.user_id,
+                agent_type: AgentType::Acp,
+                source: row.source,
+            },
+            workspace: WorkspaceContext {
+                path: workspace.clone(),
+                stored_path: workspace,
+                is_custom: false,
+            },
+            model: ProviderWithModel {
+                provider_id,
+                model,
+                use_model: None,
+            },
+            skills: config.skills.clone(),
+            team: team.clone(),
+            kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
+                config,
+                team: team.clone(),
+                belongs_to_team: team.is_some(),
+                session_id: None,
+                session_snapshot: None,
+            })),
+        };
+        task_manager
+            .get_or_build_task(conversation_id, BuildTaskOptions::new(context))
+            .await
+            .map_err(|error| {
+                aionui_team::TeamError::InvalidRequest(format!("failed to warm up agent process: {error}"))
+            })?;
+        Ok(())
+    }
+
+    async fn delete_team_conversation(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), aionui_team::TeamError> {
+        self.repo.delete(conversation_id).await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl TeamProjectionMessageStore for FakeConversationPorts {
+    fn mint_message_id(&self) -> String {
+        aionui_common::generate_id()
+    }
+
+    async fn find_projected_message(
+        &self,
+        conversation_id: &str,
+        msg_id: &str,
+        msg_type: &str,
+    ) -> Result<Option<MessageRow>, aionui_team::TeamError> {
+        Ok(self
+            .repo
+            .get_message_by_msg_id(conversation_id, msg_id, msg_type)
+            .await?)
+    }
+
+    async fn insert_projected_message(&self, row: &MessageRow) -> Result<(), aionui_team::TeamError> {
+        self.repo.insert_message(row).await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl TeamConversationLookupPort for FakeConversationPorts {
+    async fn lookup_team_binding_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamConversationBindingLookup>, aionui_team::TeamError> {
+        let Some(row) = self.repo.get(conversation_id).await? else {
+            return Ok(None);
+        };
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        Ok(Some(TeamConversationBindingLookup {
+            conversation_id: row.id,
+            user_id: row.user_id,
+            team_id: extra
+                .get("teamId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            slot_id: extra
+                .get("slot_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            role: extra.get("role").and_then(serde_json::Value::as_str).map(str::to_owned),
+        }))
+    }
+}
+
 #[derive(Default)]
 struct RecordingBroadcaster {
     events: std::sync::Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
@@ -341,25 +577,6 @@ impl ITeamRepository for FullMockTeamRepo {
 // Helpers
 // ---------------------------------------------------------------------------
 
-struct StubSkillResolver;
-#[async_trait::async_trait]
-impl aionui_conversation::skill_resolver::SkillResolver for StubSkillResolver {
-    async fn auto_inject_names(&self) -> Vec<String> {
-        Vec::new()
-    }
-    async fn resolve_skills(&self, _names: &[String]) -> Vec<aionui_conversation::skill_resolver::ResolvedAgentSkill> {
-        Vec::new()
-    }
-    async fn link_workspace_skills(
-        &self,
-        _workspace: &std::path::Path,
-        _rel_dirs: &[&str],
-        _skills: &[aionui_conversation::skill_resolver::ResolvedAgentSkill],
-    ) -> usize {
-        0
-    }
-}
-
 #[derive(Default)]
 struct StubAgentMetadataRepo {
     rows_by_id: HashMap<String, AgentMetadataRow>,
@@ -421,44 +638,6 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
         Ok(false)
     }
     async fn delete(&self, _id: &str) -> Result<bool, DbError> {
-        Ok(false)
-    }
-}
-
-struct StubAcpSessionRepo;
-
-#[async_trait::async_trait]
-impl IAcpSessionRepository for StubAcpSessionRepo {
-    async fn get(&self, _conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
-        Ok(None)
-    }
-    async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
-        Ok(AcpSessionRow {
-            conversation_id: params.conversation_id.to_owned(),
-            agent_backend: params.agent_backend.to_owned(),
-            agent_source: params.agent_source.to_owned(),
-            agent_id: params.agent_id.to_owned(),
-            session_id: None,
-            session_status: "created".to_owned(),
-            session_config: "{}".to_owned(),
-            last_active_at: None,
-            suspended_at: None,
-        })
-    }
-    async fn update_session_id(&self, _conversation_id: &str, _session_id: &str) -> Result<bool, DbError> {
-        Ok(false)
-    }
-    async fn delete(&self, _conversation_id: &str) -> Result<bool, DbError> {
-        Ok(false)
-    }
-    async fn load_runtime_state(&self, _conversation_id: &str) -> Result<Option<PersistedSessionState>, DbError> {
-        Ok(None)
-    }
-    async fn save_runtime_state(
-        &self,
-        _conversation_id: &str,
-        _params: &SaveRuntimeStateParams<'_>,
-    ) -> Result<bool, DbError> {
         Ok(false)
     }
 }
@@ -733,27 +912,22 @@ fn setup_with_factory_and_metadata_and_conversation_repo(
 ) {
     let team_repo: Arc<dyn ITeamRepository> = Arc::new(FullMockTeamRepo::new());
     let conv_repo = Arc::new(MockConversationRepo::new());
-    let conv_repo_dyn: Arc<dyn IConversationRepository> = conv_repo.clone();
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone(), broadcaster.clone()));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
     let task_manager = Arc::new(CountingTaskManager::new(factory));
     let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
-    let conv_service = ConversationService::new(
-        std::env::temp_dir(),
-        broadcaster.clone(),
-        Arc::new(StubSkillResolver),
-        task_manager_dyn.clone(),
-        conv_repo_dyn,
-        agent_metadata_repo.clone(),
-        acp_session_repo,
-    );
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
     let svc = TeamSessionService::new(
         team_repo,
         agent_metadata_repo,
         provider_repo,
-        conv_service,
+        conversation_port,
+        projection_store,
+        lookup_port,
         broadcaster,
         task_manager_dyn,
         noop_turn_port(),
@@ -769,28 +943,24 @@ fn setup() -> Arc<TeamSessionService> {
 
 fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<RecordingBroadcaster>) {
     let team_repo: Arc<dyn ITeamRepository> = Arc::new(FullMockTeamRepo::new());
-    let conv_repo: Arc<dyn IConversationRepository> = Arc::new(MockConversationRepo::new());
+    let conv_repo = Arc::new(MockConversationRepo::new());
     let recorder = Arc::new(RecordingBroadcaster::new());
     let broadcaster: Arc<dyn EventBroadcaster> = recorder.clone();
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo, broadcaster.clone()));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
-    let conv_service = ConversationService::new(
-        std::env::temp_dir(),
-        broadcaster.clone(),
-        Arc::new(StubSkillResolver),
-        task_manager.clone(),
-        conv_repo,
-        agent_metadata_repo.clone(),
-        acp_session_repo,
-    );
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
     let svc = TeamSessionService::new(
         team_repo,
         agent_metadata_repo,
         provider_repo,
-        conv_service,
+        conversation_port,
+        projection_store,
+        lookup_port,
         broadcaster,
         task_manager,
         noop_turn_port(),
@@ -1642,14 +1812,8 @@ async fn es4_ensure_session_rejects_cross_user_access() {
 
 // -- W5-D31b-2: team.mcpStatus service-layer broadcasts ---------------------
 //
-// The happy-path assertion (session_injecting → session_ready) would require
-// `create_team` to succeed, but on this branch base `create_team` panics at
-// conversation creation because `StubAcpSessionRepo::create` returns Err
-// (pre-existing baseline break — same root cause `es1_ensure_session_creates_session`
-// fails with on `feat/team-wave4-5` HEAD). We therefore only assert the
-// `load_failed` broadcast end-to-end here; the remaining phase transitions
-// (SessionInjecting / SessionReady / ConfigWriteFailed / SessionError) are
-// covered by inline assertions that do not depend on `create_team`.
+// The happy-path phase transitions are covered by focused service/session
+// assertions. This test keeps the load-failed broadcast covered end-to-end.
 
 #[tokio::test]
 async fn d31b2_ensure_session_broadcasts_load_failed_for_missing_team() {
