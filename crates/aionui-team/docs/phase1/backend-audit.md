@@ -136,7 +136,7 @@ pub fn new(
 
 | 方法 | 行 | 作用 |
 |------|----|------|
-| `set_status(slot_id, status)` | 120 | 改状态 + `team.agent.status` WS 事件 |
+| `set_status(slot_id, status)` | 120 | 改状态 + `team.agentStatusChanged` WS 事件 |
 | `get_status(slot_id)` / `get_agent(slot_id)` | 134, 142 | getter |
 | `build_wake_payload(slot_id)` | 150 | 组装 `{agent, tasks, unread_messages}` |
 | `try_wake(slot_id)` | 164 | **原子 Idle→Working，返回 payload；非 idle 返回 None** |

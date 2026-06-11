@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::AgentLoopContext;
+use crate::events::{TEAM_CREATED_EVENT, TEAM_MCP_STATUS_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT};
 use crate::ports::AgentTurnExecutionPort;
 use crate::provisioning::TeamAgentProvisioner;
 use crate::session::TeamSession;
@@ -215,10 +216,7 @@ impl TeamSessionService {
 
         info!(team_id = %team.id, "Team created");
 
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            "team.created",
-            serde_json::json!({ "team_id": team.id, "team_name": team.name }),
-        ));
+        self.broadcast_team_created(&team.id, &team.name);
 
         // Auto-start session so MCP is injected immediately after team creation.
         // Failure only logs — the team is persisted and frontend can retry
@@ -285,6 +283,7 @@ impl TeamSessionService {
         self.add_agent_locks.remove(team_id);
 
         info!(team_id = %team_id, "Team removed");
+        self.broadcast_team_removed(team_id);
         Ok(())
     }
 
@@ -301,6 +300,7 @@ impl TeamSessionService {
                 },
             )
             .await?;
+        self.broadcast_team_renamed(team_id, name);
         Ok(())
     }
 
@@ -556,10 +556,45 @@ impl TeamSessionService {
         };
         customize(&mut payload);
         let event = WebSocketMessage::new(
-            "team.mcpStatus",
+            TEAM_MCP_STATUS_EVENT,
             serde_json::to_value(payload).expect("serialize mcp status payload"),
         );
         self.broadcaster.broadcast(event);
+    }
+
+    fn broadcast_team_created(&self, team_id: &str, team_name: &str) {
+        info!(team_id = %team_id, event_name = TEAM_CREATED_EVENT, "team event broadcast");
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            TEAM_CREATED_EVENT,
+            serde_json::json!({ "team_id": team_id, "team_name": team_name }),
+        ));
+        self.broadcast_team_list_changed(team_id, "created");
+    }
+
+    fn broadcast_team_removed(&self, team_id: &str) {
+        info!(team_id = %team_id, event_name = TEAM_REMOVED_EVENT, "team event broadcast");
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            TEAM_REMOVED_EVENT,
+            serde_json::json!({ "team_id": team_id }),
+        ));
+        self.broadcast_team_list_changed(team_id, "removed");
+    }
+
+    fn broadcast_team_renamed(&self, team_id: &str, team_name: &str) {
+        info!(team_id = %team_id, event_name = TEAM_RENAMED_EVENT, "team event broadcast");
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            TEAM_RENAMED_EVENT,
+            serde_json::json!({ "team_id": team_id, "team_name": team_name }),
+        ));
+        self.broadcast_team_list_changed(team_id, "renamed");
+    }
+
+    fn broadcast_team_list_changed(&self, team_id: &str, action: &str) {
+        info!(team_id = %team_id, event_name = crate::events::TEAM_LIST_CHANGED_EVENT, action, "team event broadcast");
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            crate::events::TEAM_LIST_CHANGED_EVENT,
+            serde_json::json!({ "team_id": team_id, "action": action }),
+        ));
     }
 
     async fn rebuild_agent_processes(

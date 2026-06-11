@@ -253,11 +253,11 @@ async fn smoke_spawn_agent_creates_real_session() {
 /// 3. Worker's mailbox receives a `shutdown_request`.
 /// 4. Worker replies `shutdown_approved` via `team_send_message`.
 /// 5. Worker is removed from the team roster.
-/// 6. `team.agent.removed` WebSocket event is broadcast.
+/// 6. `team.agentRemoved` WebSocket event is broadcast.
 #[tokio::test]
 #[ignore = "unblocks when shutdown_request/approved round-trip is wired (W5-D30a/b/c/d series)"]
 async fn smoke_shutdown_agent_full_protocol() {
-    todo!("scenario 3: fill once shutdown round-trip + team.agent.removed event are wired");
+    todo!("scenario 3: fill once shutdown round-trip + team.agentRemoved event are wired");
 }
 
 // ===========================================================================

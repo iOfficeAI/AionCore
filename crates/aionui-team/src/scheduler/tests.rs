@@ -122,7 +122,7 @@ async fn set_status_updates_and_broadcasts() {
 
     let events = bc.events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].name, "team.agent.status");
+    assert_eq!(events[0].name, "team.agentStatusChanged");
     assert_eq!(events[0].data["slot_id"], "worker-1");
     assert_eq!(events[0].data["status"], "working");
 }
@@ -156,7 +156,7 @@ async fn try_wake_idle_agent_returns_payload() {
     let status_events: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.status")
+        .filter(|e| e.name == "team.agentStatusChanged")
         .collect();
     assert_eq!(status_events.len(), 1);
     assert_eq!(status_events[0].data["status"], "working");
@@ -263,7 +263,7 @@ async fn add_agent_broadcasts_spawned_event() {
     let spawned_events: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.spawned")
+        .filter(|e| e.name == "team.agentSpawned")
         .collect();
     assert_eq!(spawned_events.len(), 1);
 }
@@ -298,27 +298,23 @@ async fn remove_agent_broadcasts_removed_event() {
     let removed_events: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.removed")
+        .filter(|e| e.name == "team.agentRemoved")
         .collect();
     assert_eq!(removed_events.len(), 1);
     assert_eq!(removed_events[0].data["slot_id"], "worker-2");
 }
 
 #[tokio::test]
-async fn notify_shutdown_acknowledged_broadcasts_shutdown_event() {
+async fn notify_shutdown_acknowledged_does_not_broadcast_shutdown_event() {
     let agents = make_team_agents();
     let (mgr, bc) = make_manager(&agents);
 
     mgr.notify_shutdown_acknowledged("worker-2");
 
-    let shutdown_events: Vec<_> = bc
-        .events()
-        .into_iter()
-        .filter(|e| e.name == "team.agent.shutdown")
-        .collect();
-    assert_eq!(shutdown_events.len(), 1);
-    assert_eq!(shutdown_events[0].data["slot_id"], "worker-2");
-    assert_eq!(shutdown_events[0].data["team_id"], mgr.team_id);
+    assert!(
+        bc.events().is_empty(),
+        "shutdown acknowledgement is internal scheduler state and must not emit a legacy Team event"
+    );
 }
 
 #[tokio::test]
@@ -384,12 +380,12 @@ async fn remove_agent_twice_second_call_is_noop_and_no_extra_broadcast() {
     let removed_events: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.removed")
+        .filter(|e| e.name == "team.agentRemoved")
         .collect();
     assert_eq!(
         removed_events.len(),
         1,
-        "failed second remove must not emit another team.agent.removed"
+        "failed second remove must not emit another team.agentRemoved"
     );
 }
 
@@ -420,7 +416,7 @@ async fn rename_agent_broadcasts_renamed_event() {
     let renamed_events: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.renamed")
+        .filter(|e| e.name == "team.agentRenamed")
         .collect();
     assert_eq!(renamed_events.len(), 1);
     assert_eq!(renamed_events[0].data["name"], "Renamed Worker");
@@ -702,7 +698,7 @@ async fn execute_rename_agent() {
     let renamed: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.renamed")
+        .filter(|e| e.name == "team.agentRenamed")
         .collect();
     assert_eq!(renamed.len(), 1);
 }
@@ -782,7 +778,7 @@ async fn finalize_turn_with_idle_notification_skips_double_idle() {
     let idle_events: Vec<_> = broadcaster
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.status" && e.data["status"] == "idle")
+        .filter(|e| e.name == "team.agentStatusChanged" && e.data["status"] == "idle")
         .collect();
     assert_eq!(idle_events.len(), 1, "idle should be set exactly once");
 }
@@ -905,7 +901,7 @@ async fn mark_idle_broadcasts_status_event() {
     let idle_events: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.status" && e.data["status"] == "idle")
+        .filter(|e| e.name == "team.agentStatusChanged" && e.data["status"] == "idle")
         .collect();
     assert_eq!(idle_events.len(), 1);
     assert_eq!(idle_events[0].data["slot_id"], "worker-1");

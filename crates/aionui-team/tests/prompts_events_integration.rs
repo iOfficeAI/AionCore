@@ -425,7 +425,7 @@ async fn we1_agent_status_change_event() {
 
     let events = bc.events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].name, "team.agent.status");
+    assert_eq!(events[0].name, "team.agentStatusChanged");
 
     let payload: TeamAgentStatusPayload = serde_json::from_value(events[0].data.clone()).unwrap();
     assert_eq!(payload.team_id, "t1");
@@ -450,7 +450,7 @@ async fn we2_agent_spawned_event() {
     let spawned: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.spawned")
+        .filter(|e| e.name == "team.agentSpawned")
         .collect();
     assert_eq!(spawned.len(), 1);
 
@@ -479,7 +479,7 @@ async fn we3_agent_removed_event() {
     let removed: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.removed")
+        .filter(|e| e.name == "team.agentRemoved")
         .collect();
     assert_eq!(removed.len(), 1);
 
@@ -507,7 +507,7 @@ async fn we4_agent_renamed_event() {
     let renamed: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.renamed")
+        .filter(|e| e.name == "team.agentRenamed")
         .collect();
     assert_eq!(renamed.len(), 1);
 

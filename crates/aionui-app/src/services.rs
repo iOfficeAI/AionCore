@@ -10,7 +10,7 @@ use aionui_ai_agent::{
 use aionui_api_types::GuideMcpConfig;
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
-use aionui_conversation::runtime_state::ConversationRuntimeStateService;
+use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
     IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteConversationRepository,
@@ -31,6 +31,7 @@ pub struct AppServices {
     pub event_bus: Arc<BroadcastEventBus>,
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
+    pub conversation_service: ConversationService,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -62,6 +63,16 @@ impl AppServices {
     /// Primarily used by tests to inject mock implementations.
     pub fn with_worker_task_manager(mut self, wtm: Arc<dyn IWorkerTaskManager>) -> Self {
         self.worker_task_manager = wtm;
+        self.conversation_service = build_conversation_service(ConversationServiceDeps {
+            database: &self.database,
+            work_dir: self.work_dir.clone(),
+            event_bus: self.event_bus.clone(),
+            skill_paths: self.skill_paths.clone(),
+            worker_task_manager: self.worker_task_manager.clone(),
+            conversation_runtime_state: self.conversation_runtime_state.clone(),
+            conversation_repo: self.conversation_repo.clone(),
+            task_manager_delete_hook: self.task_manager_delete_hook.clone(),
+        });
         self
     }
 
@@ -187,6 +198,16 @@ impl AppServices {
         let worker_task_manager: Arc<dyn IWorkerTaskManager> = task_manager_concrete.clone();
         let task_manager_delete_hook: Arc<dyn OnConversationDelete> = task_manager_concrete;
         let conversation_runtime_state = Arc::new(ConversationRuntimeStateService::default());
+        let conversation_service = build_conversation_service(ConversationServiceDeps {
+            database: &database,
+            work_dir: work_dir.clone(),
+            event_bus: event_bus.clone(),
+            skill_paths: skill_paths.clone(),
+            worker_task_manager: worker_task_manager.clone(),
+            conversation_runtime_state: conversation_runtime_state.clone(),
+            conversation_repo: conversation_repo.clone(),
+            task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
+        });
 
         Ok(Self {
             database,
@@ -198,6 +219,7 @@ impl AppServices {
             event_bus,
             worker_task_manager,
             conversation_runtime_state,
+            conversation_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
@@ -212,6 +234,38 @@ impl AppServices {
             _guide_server: guide_server,
         })
     }
+}
+
+struct ConversationServiceDeps<'a> {
+    database: &'a Database,
+    work_dir: PathBuf,
+    event_bus: Arc<BroadcastEventBus>,
+    skill_paths: Arc<aionui_extension::SkillPaths>,
+    worker_task_manager: Arc<dyn IWorkerTaskManager>,
+    conversation_runtime_state: Arc<ConversationRuntimeStateService>,
+    conversation_repo: Arc<dyn IConversationRepository>,
+    task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
+}
+
+fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
+    let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
+        deps.skill_paths,
+    ));
+    let service = ConversationService::new(
+        deps.work_dir,
+        deps.event_bus,
+        skill_resolver,
+        deps.worker_task_manager,
+        deps.conversation_repo,
+        Arc::new(SqliteAgentMetadataRepository::new(deps.database.pool().clone())),
+        Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
+    )
+    .with_runtime_state(deps.conversation_runtime_state);
+    service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
+    if let Some(hook) = deps.task_manager_delete_hook {
+        service.with_delete_hook(hook);
+    }
+    service
 }
 
 #[cfg(test)]

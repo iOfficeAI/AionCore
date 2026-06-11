@@ -24,7 +24,7 @@
 | Agent 间 MCP 通信（team_send_message 等工具） | ✅ | HTTP transport，agent 主动连接 |
 | Agent wake 机制（发消息后 agent 自动响应） | ✅ | |
 | 建团自动起 session（MCP 自动注入） | ✅ | `POST /api/teams` 后自动 ensure_session，前端无需额外调用 |
-| WS 事件推送（team.agent.status 等） | ✅ | |
+| WS 事件推送（team.agentStatusChanged 等） | ✅ | |
 | user_id 权限隔离（list/get/remove 按用户过滤） | ✅ | Wave 3 |
 | 单聊→建团（conversation 复用） | ✅ | agents 里传 `conversation_id` 可复用 |
 | rename 规范化 | ✅ | Wave 3 |
@@ -70,10 +70,10 @@
 | D29a-3 name normalize + 唯一性 | ✅ | |
 | D29a-4 backend 白名单校验 | ✅ | |
 | **D29b spawn_agent 真实落地** | ✅ | **已合入** — conversation 创建 + slot 分配 + kill/warmup agent |
-| D29d-1 `team.agent.spawned` WS 事件 | ✅ | spawn 成功后广播 |
+| D29d-1 `team.agentSpawned` WS 事件 | ✅ | spawn 成功后广播 |
 | D29e MCP dispatch 接通 session | ✅ | `exec_spawn_agent` 改成调 `TeamSession::spawn_agent` |
 | D30a-1 shutdown_approved/rejected 字符串拦截 | ✅ | |
-| D30a-2 `team.agent.shutdown` WS 事件 | ✅ | shutdown_approved 后广播通知前端 |
+| D30a-2 `team.agentRemoved` WS 事件 | ✅ | shutdown_approved 后广播通知前端 |
 | D30b `shutdown_rejected:<reason>` 处理 | ✅ | `mcp/server.rs` 已拦截 |
 | D30c `shutdown_agent` target=Lead 校验 | ✅ | 拒绝关 lead |
 | D30d-1 `remove_agent` 真 kill agent 进程 | ✅ | |
@@ -137,12 +137,12 @@ D28b/c 已合入：solo team-capable agent 的首轮消息里已注入 Team Guid
 
 Lead 调 `team_shutdown_agent` 后，teammate 可以在下一个回合里用 `team_send_message` 回复，内容以特定字符串开头：
 
-- `shutdown_approved` → scheduler 触发 `remove_agent`，该 agent 的 `active_wakes` / `wake_timeouts` / `finalized_turns` 被清，最终广播 `team.agent.removed`
+- `shutdown_approved` → scheduler 触发 `remove_agent`，该 agent 的 `active_wakes` / `wake_timeouts` / `finalized_turns` 被清，最终广播 `team.agentRemoved`
 - `shutdown_rejected:<reason>` → scheduler 取消 pending 的 shutdown，lead 下一回合能看到理由（已实现）
 
-完整 `remove_agent` 链路已闭环：kill 进程 (D30d-1 ✅) + 清状态 (D30d-2 ✅) + 摘 slot + 广播 `team.agent.removed` (D30d-3 ✅)。shutdown_approved 后还会额外广播 `team.agent.shutdown` (D30a-2 ✅)。
+完整 `remove_agent` 链路已闭环：kill 进程 (D30d-1 ✅) + 清状态 (D30d-2 ✅) + 摘 slot + 广播 `team.agentRemoved` (D30d-3 ✅)。shutdown_approved 后还会额外广播 `team.agentRemoved` (D30a-2 ✅)。
 
-前端不需要特殊处理 — 继续订阅 `team.agent.removed` / `team.agent.status`，收到 `removed` 就把 slot 从列表摘掉。
+前端不需要特殊处理 — 继续订阅 `team.agentRemoved` / `team.agentStatusChanged`，收到 `removed` 就把 slot 从列表摘掉。
 
 ### 新 WS 事件（Wave 5 D31）
 
@@ -165,13 +165,13 @@ Payload 类型定义：`aionui-api-types::TeamMcpStatusPayload`、`TeamMcpPhase`
 
 ### 前端须知
 
-- `team_spawn_agent` **已真实落地**：lead 调用后会创建 conversation + 分配 slot + 启动 agent 进程。前端以 `team.agent.spawned` WS 事件为准更新成员列表
-- shutdown 完整链路已闭环：`team_shutdown_agent` → teammate 回复 `shutdown_approved` → kill 进程 + 清状态 + 广播 `team.agent.shutdown` + `team.agent.removed`
+- `team_spawn_agent` **已真实落地**：lead 调用后会创建 conversation + 分配 slot + 启动 agent 进程。前端以 `team.agentSpawned` WS 事件为准更新成员列表
+- shutdown 完整链路已闭环：`team_shutdown_agent` → teammate 回复 `shutdown_approved` → kill 进程 + 清状态 + 广播 `team.agentRemoved` + `team.agentRemoved`
 - 阵容确认流程：leader 被 prompt 强制要求先查模型、展示方案、等用户确认后才 spawn。前端无需加确认 UI — 这是对话里自然完成的
 - D24b/c（stdio MCP ready 握手）已跳过 — HTTP transport 不需要
-- 已有的 `team.agent.*` 事件格式不变，无需迁移
+- 已有的 `team.agent*` 事件格式不变，无需迁移
 - `team.mcpStatus` 是**新**事件：前端可以选择订阅用于显示 MCP 连接进度条，忽略也不影响功能
-- `team.agent.shutdown` 是**新**事件：shutdown 被批准后、实际 remove 之前广播，前端可用于展示"正在下线"过渡态
+- `team.agentRemoved` 是**新**事件：shutdown 被批准后、实际 remove 之前广播，前端可用于展示"正在下线"过渡态
 
 ---
 
@@ -225,15 +225,15 @@ Team 模块不再提供 `POST /api/teams/{id}/messages` 或 `POST /api/teams/{id
 
 ## 必须走 WebSocket 的事件
 
-后端通过 `/ws` 推，event name 格式 `team.agent.<action>`：
+后端通过 `/ws` 推，event name 使用二级 camelCase 格式：
 
 | Event | 何时触发 | Payload 关键字段 |
 |-------|---------|----------------|
-| `team.agent.status` | Agent 状态迁移（Idle/Working/...） | `team_id, slot_id, status` |
-| `team.agent.spawned` | 新增 agent（REST 或 MCP spawn） | `team_id, agent` |
-| `team.agent.shutdown` | Teammate 批准下线（remove 之前） | `team_id, slot_id` |
-| `team.agent.removed` | 移除 agent（kill + 清状态完成后） | `team_id, slot_id` |
-| `team.agent.renamed` | 改名 | `team_id, slot_id, name` |
+| `team.agentStatusChanged` | Agent 状态迁移（Idle/Working/...） | `team_id, slot_id, status` |
+| `team.agentSpawned` | 新增 agent（REST 或 MCP spawn） | `team_id, agent` |
+| `team.agentRemoved` | Teammate 批准下线（remove 之前） | `team_id, slot_id` |
+| `team.agentRemoved` | 移除 agent（kill + 清状态完成后） | `team_id, slot_id` |
+| `team.agentRenamed` | 改名 | `team_id, slot_id, name` |
 | `team.mcpStatus` | per-team MCP server 生命周期 | `team_id, slot_id?, phase, port?, error?, server_count?` |
 
 Payload 类型定义在 `crates/aionui-api-types/src/team.rs`（含 `TeamMcpPhase`、`TeamMcpStatusPayload`、`TeammateMessagePayload`）。**HTTP 没有状态轮询端点**，想知道 agent 现在在干啥只能靠 WS。
@@ -251,7 +251,7 @@ GET /api/conversations/{conversation_id}/messages
 ## 最小接入 checklist
 
 1. [ ] `POST /api/teams` 建团队，拿到 `team.id` 和每个 `agent.slot_id / conversation_id`（后端自动起 session + 注入 MCP）
-2. [ ] 订阅 WS，过滤 `team.agent.*` 事件更新 UI 上的 agent 状态
+2. [ ] 订阅 WS，过滤 `team.agent*` 事件更新 UI 上的 agent 状态
 3. [ ] （可选）订阅 `team.mcpStatus` 展示 MCP 连接进度，不订阅也能正常用
 4. [ ] 进入某 agent 聊天页：`GET /api/conversations/{conversation_id}/messages` 拉历史
 5. [ ] 用户在任意 agent 页发言：`POST /api/conversations/{conversation_id}/messages`（lead 也走这个，不再有 team-level 发消息端点）

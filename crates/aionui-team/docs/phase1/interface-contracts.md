@@ -274,7 +274,7 @@ impl TeammateManager {
     /// mark_idle 扩展：
     /// 1. set_status(slot_id, Idle)（现有）
     /// 2. 【新增】写一条 idle_notification 到 mailbox（from=slot_id, to=lead, summary=完成摘要）
-    /// 3. 【新增】广播 team.agent.status WS 事件
+    /// 3. 【新增】广播 team.agentStatusChanged WS 事件
     /// 4. 调 maybe_wake_leader_when_all_idle（现有，但 settled 判定要扩展）
     pub async fn mark_idle(
         &self,

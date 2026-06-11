@@ -125,7 +125,7 @@ Session resume 时 CLI 重新 spawn `mcp-guide-stdio` 子进程，Guide HTTP ser
 
 ### 根因
 
-`mirror_unread_to_conversation` 同时：(1) 写入 DB message (2) 广播 `team.teammate.message` WebSocket 事件。前端两个通道都处理了，显示两次。
+`mirror_unread_to_conversation` 同时：(1) 写入 DB message (2) 广播 `team.teammateMessage` WebSocket 事件。前端两个通道都处理了，显示两次。
 
 ### 修复
 

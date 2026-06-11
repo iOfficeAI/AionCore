@@ -143,9 +143,8 @@ pub use system::{
 pub use team::{
     AddAgentRequest, CreateTeamRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
     SendTeamMessageRequest, TeamAgentInput, TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse,
-    TeamAgentShutdownPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamListResponse, TeamMcpPhase,
-    TeamMcpRuntimeConfig, TeamMcpStatusPayload, TeamResponse, TeamRuntimeSeed, TeamSessionBinding,
-    TeammateMessagePayload,
+    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamListResponse, TeamMcpPhase, TeamMcpRuntimeConfig,
+    TeamMcpStatusPayload, TeamResponse, TeamRuntimeSeed, TeamSessionBinding, TeammateMessagePayload,
 };
 pub use team_mcp::{GuideMcpConfig, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use websocket::WebSocketMessage;

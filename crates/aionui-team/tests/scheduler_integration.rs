@@ -352,7 +352,7 @@ async fn ae4_spawn_agent_action_logged() {
 // Test-plan §8: WebSocket 事件推送
 // ===========================================================================
 
-// -- WE-1: Agent status change broadcasts team.agent.status -----------------
+// -- WE-1: Agent status change broadcasts team.agentStatusChanged -----------------
 
 #[tokio::test]
 async fn we1_status_change_broadcasts_event() {
@@ -361,14 +361,14 @@ async fn we1_status_change_broadcasts_event() {
 
     h.mgr.set_status("w1", TeammateStatus::Working).await.unwrap();
 
-    let events = h.broadcaster.events_by_name("team.agent.status");
+    let events = h.broadcaster.events_by_name("team.agentStatusChanged");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].data["team_id"], "team-1");
     assert_eq!(events[0].data["slot_id"], "w1");
     assert_eq!(events[0].data["status"], "working");
 }
 
-// -- WE-2: Dynamic agent creation broadcasts team.agent.spawned -------------
+// -- WE-2: Dynamic agent creation broadcasts team.agentSpawned -------------
 
 #[tokio::test]
 async fn we2_add_agent_broadcasts_spawned() {
@@ -378,13 +378,13 @@ async fn we2_add_agent_broadcasts_spawned() {
     let new = make_agent("w1", "Worker", TeammateRole::Teammate);
     h.mgr.add_agent(&new).await;
 
-    let events = h.broadcaster.events_by_name("team.agent.spawned");
+    let events = h.broadcaster.events_by_name("team.agentSpawned");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].data["team_id"], "team-1");
     assert!(events[0].data["agent"].is_object());
 }
 
-// -- WE-3: Remove agent broadcasts team.agent.removed ----------------------
+// -- WE-3: Remove agent broadcasts team.agentRemoved ----------------------
 
 #[tokio::test]
 async fn we3_remove_agent_broadcasts_removed() {
@@ -396,12 +396,12 @@ async fn we3_remove_agent_broadcasts_removed() {
 
     h.mgr.remove_agent("w1").await.unwrap();
 
-    let events = h.broadcaster.events_by_name("team.agent.removed");
+    let events = h.broadcaster.events_by_name("team.agentRemoved");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].data["slot_id"], "w1");
 }
 
-// -- WE-4: Rename agent broadcasts team.agent.renamed ----------------------
+// -- WE-4: Rename agent broadcasts team.agentRenamed ----------------------
 
 #[tokio::test]
 async fn we4_rename_agent_broadcasts_renamed() {
@@ -410,7 +410,7 @@ async fn we4_rename_agent_broadcasts_renamed() {
 
     h.mgr.rename_agent("w1", "SuperWorker").await.unwrap();
 
-    let events = h.broadcaster.events_by_name("team.agent.renamed");
+    let events = h.broadcaster.events_by_name("team.agentRenamed");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].data["slot_id"], "w1");
     assert_eq!(events[0].data["name"], "SuperWorker");

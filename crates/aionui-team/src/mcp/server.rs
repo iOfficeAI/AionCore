@@ -9,6 +9,7 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use crate::error::TeamError;
+use crate::events::TEAM_MCP_STATUS_EVENT;
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::SpawnAgentRequest;
@@ -151,7 +152,7 @@ impl Drop for TeamMcpServer {
 
 fn broadcast_mcp_status(broadcaster: &dyn EventBroadcaster, payload: TeamMcpStatusPayload) {
     let event = WebSocketMessage::new(
-        "team.mcpStatus",
+        TEAM_MCP_STATUS_EVENT,
         serde_json::to_value(payload).expect("serialize mcp status payload"),
     );
     broadcaster.broadcast(event);

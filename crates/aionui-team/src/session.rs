@@ -734,7 +734,7 @@ mod tests {
     }
 
     /// RecordingBroadcaster used by the D29d-1 ratification test below to
-    /// assert that `team.agent.spawned` is *not* emitted on failed spawns.
+    /// assert that `team.agentSpawned` is *not* emitted on failed spawns.
     #[derive(Default)]
     struct RecordingBroadcaster {
         events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
@@ -1630,7 +1630,7 @@ mod tests {
 
     // -- W5-D29d-1 ratification: spawn emit-order contract ------------------
     //
-    // The success-path emission of `team.agent.spawned` is exercised by
+    // The success-path emission of `team.agentSpawned` is exercised by
     // `scheduler::tests::add_agent_broadcasts_spawned_event` — `spawn_agent`
     // reaches that emission via `scheduler.add_agent(&new_agent)` after
     // `persist_spawned_agent` returns. This ratification test locks the
@@ -1648,8 +1648,8 @@ mod tests {
             .expect_err("unit test has no service wire; spawn stops at DB step");
         assert_reached_db_step(err);
         assert!(
-            !recorder.names().iter().any(|n| n == "team.agent.spawned"),
-            "team.agent.spawned must not be emitted when spawn fails before add_agent; saw {:?}",
+            !recorder.names().iter().any(|n| n == "team.agentSpawned"),
+            "team.agentSpawned must not be emitted when spawn fails before add_agent; saw {:?}",
             recorder.names()
         );
         session.stop();
@@ -1664,8 +1664,8 @@ mod tests {
             .expect_err("non-lead caller must be rejected");
         assert!(matches!(&err, TeamError::LeaderOnly(what) if what == "spawn_agent"));
         assert!(
-            !recorder.names().iter().any(|n| n == "team.agent.spawned"),
-            "team.agent.spawned must not be emitted when guard rejects the caller; saw {:?}",
+            !recorder.names().iter().any(|n| n == "team.agentSpawned"),
+            "team.agentSpawned must not be emitted when guard rejects the caller; saw {:?}",
             recorder.names()
         );
         session.stop();

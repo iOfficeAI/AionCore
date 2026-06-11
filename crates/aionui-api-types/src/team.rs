@@ -184,7 +184,7 @@ pub type TeamListResponse = Vec<TeamResponse>;
 // F. WebSocket event payloads
 // ---------------------------------------------------------------------------
 
-/// Payload for `team.agent.status` WebSocket event.
+/// Payload for `team.agentStatusChanged` WebSocket event.
 ///
 /// Pushed when an agent's runtime status changes (e.g., idle → working).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -194,7 +194,7 @@ pub struct TeamAgentStatusPayload {
     pub status: String,
 }
 
-/// Payload for `team.agent.spawned` WebSocket event.
+/// Payload for `team.agentSpawned` WebSocket event.
 ///
 /// Pushed when the lead dynamically creates a new agent via
 /// `team_spawn_agent`.
@@ -204,7 +204,7 @@ pub struct TeamAgentSpawnedPayload {
     pub agent: TeamAgentResponse,
 }
 
-/// Payload for `team.agent.removed` WebSocket event.
+/// Payload for `team.agentRemoved` WebSocket event.
 ///
 /// Pushed when an agent is removed from the team.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -213,7 +213,7 @@ pub struct TeamAgentRemovedPayload {
     pub slot_id: String,
 }
 
-/// Payload for `team.agent.renamed` WebSocket event.
+/// Payload for `team.agentRenamed` WebSocket event.
 ///
 /// Pushed when an agent's display name is changed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -221,19 +221,6 @@ pub struct TeamAgentRenamedPayload {
     pub team_id: String,
     pub slot_id: String,
     pub name: String,
-}
-
-/// Payload for `team.agent.shutdown` WebSocket event.
-///
-/// Pushed when a teammate acknowledges a Lead-initiated shutdown by
-/// replying `shutdown_approved`. The acknowledging teammate is identified
-/// by `slot_id`; `remove_agent` (and the accompanying
-/// `team.agent.removed` event) follows asynchronously once the agent
-/// process is actually killed and state is cleared.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TeamAgentShutdownPayload {
-    pub team_id: String,
-    pub slot_id: String,
 }
 
 /// Lifecycle phases of the per-team MCP stdio bridge + ACP session.
@@ -256,7 +243,7 @@ pub enum TeamMcpPhase {
     McpToolsReady,
 }
 
-/// Payload for `team.mcp.status` WebSocket event.
+/// Payload for `team.mcpStatus` WebSocket event.
 ///
 /// Pushed whenever a teammate's MCP bridge or ACP session transitions to
 /// a new [`TeamMcpPhase`]. Optional fields carry phase-specific detail:
@@ -275,7 +262,7 @@ pub struct TeamMcpStatusPayload {
     pub error: Option<String>,
 }
 
-/// Payload for `team.teammate.message` WebSocket event.
+/// Payload for `team.teammateMessage` WebSocket event.
 ///
 /// Pushed when a teammate sends a message to another agent within the
 /// team; identifies both the sender (`from_slot_id` / `from_name`) and
@@ -754,19 +741,6 @@ mod tests {
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: TeamAgentRenamedPayload = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, payload);
-    }
-
-    #[test]
-    fn team_agent_shutdown_payload_roundtrip() {
-        let payload = TeamAgentShutdownPayload {
-            team_id: "t1".into(),
-            slot_id: "s2".into(),
-        };
-        let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["team_id"], "t1");
-        assert_eq!(json["slot_id"], "s2");
-        let parsed: TeamAgentShutdownPayload = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, payload);
     }
 

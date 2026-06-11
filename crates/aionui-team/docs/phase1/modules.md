@@ -344,7 +344,7 @@ Wave 5（3 人关键路径 + 可并行点）
 | 输入 | D7 / D9 / D10 |
 | 输出 | 装配完整 + 可通过的 smoke test |
 | 依赖 | D7 + D9 + D10（Wave 2 最后） |
-| 测试策略 | **e2e 真跑**：启动后端 in-memory DB → HTTP 建 team（2 个 agent，都是真实 claude CLI） → session → 发消息 → 等 30s → 校验 task_board 有 leader 创的任务 **或** 校验 WS 事件 `team.agent.status` 出现 Working 态 |
+| 测试策略 | **e2e 真跑**：启动后端 in-memory DB → HTTP 建 team（2 个 agent，都是真实 claude CLI） → session → 发消息 → 等 30s → 校验 task_board 有 leader 创的任务 **或** 校验 WS 事件 `team.agentStatusChanged` 出现 Working 态 |
 | 预估 LoC | 180 行 |
 | 预估人天 | 2.0 |
 | ⚠️ 前置 | 开发机必须装 `claude --experimental-acp` 可用；CI 暂 skip 真 CLI，靠本地手工跑证据（screenshot + 日志） |

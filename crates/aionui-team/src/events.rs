@@ -1,14 +1,24 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentShutdownPayload, TeamAgentSpawnedPayload,
-    TeamAgentStatusPayload, WebSocketMessage,
+    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
 
 use crate::types::{TeamAgent, TeammateStatus};
 
 pub const TEAMMATE_MESSAGE_EVENT: &str = "team.teammateMessage";
+pub const TEAM_AGENT_STATUS_CHANGED_EVENT: &str = "team.agentStatusChanged";
+pub const TEAM_AGENT_SPAWNED_EVENT: &str = "team.agentSpawned";
+pub const TEAM_AGENT_REMOVED_EVENT: &str = "team.agentRemoved";
+pub const TEAM_AGENT_RENAMED_EVENT: &str = "team.agentRenamed";
+pub const TEAM_LIST_CHANGED_EVENT: &str = "team.listChanged";
+pub const TEAM_CREATED_EVENT: &str = "team.created";
+pub const TEAM_REMOVED_EVENT: &str = "team.removed";
+pub const TEAM_RENAMED_EVENT: &str = "team.renamed";
+pub const TEAM_MCP_STATUS_EVENT: &str = "team.mcpStatus";
+pub const TEAM_TASK_CHANGED_EVENT: &str = "team.taskChanged";
+pub const TEAM_SESSION_CHANGED_EVENT: &str = "team.sessionChanged";
 
 pub struct TeamEventEmitter {
     team_id: String,
@@ -31,7 +41,7 @@ impl TeamEventEmitter {
             status: status.to_string(),
         };
         let event = WebSocketMessage::new(
-            "team.agent.status",
+            TEAM_AGENT_STATUS_CHANGED_EVENT,
             serde_json::to_value(payload).expect("serialize status payload"),
         );
         self.broadcaster.broadcast(event);
@@ -43,7 +53,7 @@ impl TeamEventEmitter {
             agent: agent.to_response(),
         };
         let event = WebSocketMessage::new(
-            "team.agent.spawned",
+            TEAM_AGENT_SPAWNED_EVENT,
             serde_json::to_value(payload).expect("serialize spawned payload"),
         );
         self.broadcaster.broadcast(event);
@@ -55,24 +65,8 @@ impl TeamEventEmitter {
             slot_id: slot_id.to_owned(),
         };
         let event = WebSocketMessage::new(
-            "team.agent.removed",
+            TEAM_AGENT_REMOVED_EVENT,
             serde_json::to_value(payload).expect("serialize removed payload"),
-        );
-        self.broadcaster.broadcast(event);
-    }
-
-    /// Emit `team.agent.shutdown` to signal that the named teammate has
-    /// acknowledged a Lead-initiated shutdown request. The actual removal
-    /// (and `team.agent.removed`) follows once the agent process is killed
-    /// and scheduler state is cleared.
-    pub fn broadcast_agent_shutdown(&self, slot_id: &str) {
-        let payload = TeamAgentShutdownPayload {
-            team_id: self.team_id.clone(),
-            slot_id: slot_id.to_owned(),
-        };
-        let event = WebSocketMessage::new(
-            "team.agent.shutdown",
-            serde_json::to_value(payload).expect("serialize shutdown payload"),
         );
         self.broadcaster.broadcast(event);
     }
@@ -84,7 +78,7 @@ impl TeamEventEmitter {
             name: name.to_owned(),
         };
         let event = WebSocketMessage::new(
-            "team.agent.renamed",
+            TEAM_AGENT_RENAMED_EVENT,
             serde_json::to_value(payload).expect("serialize renamed payload"),
         );
         self.broadcaster.broadcast(event);
@@ -96,8 +90,7 @@ mod tests {
     use super::*;
     use crate::types::TeammateRole;
     use aionui_api_types::{
-        TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentShutdownPayload, TeamAgentSpawnedPayload,
-        TeamAgentStatusPayload,
+        TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload,
     };
 
     struct RecordingBroadcaster {
@@ -135,7 +128,7 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "team.agent.status");
+        assert_eq!(events[0].name, "team.agentStatusChanged");
 
         let payload: TeamAgentStatusPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
@@ -162,7 +155,7 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "team.agent.spawned");
+        assert_eq!(events[0].name, "team.agentSpawned");
 
         let payload: TeamAgentSpawnedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
@@ -178,25 +171,11 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "team.agent.removed");
+        assert_eq!(events[0].name, "team.agentRemoved");
 
         let payload: TeamAgentRemovedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
         assert_eq!(payload.slot_id, "slot-3");
-    }
-
-    #[test]
-    fn shutdown_event_has_correct_shape() {
-        let (emitter, bc) = make_emitter();
-        emitter.broadcast_agent_shutdown("slot-9");
-
-        let events = bc.events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "team.agent.shutdown");
-
-        let payload: TeamAgentShutdownPayload = serde_json::from_value(events[0].data.clone()).unwrap();
-        assert_eq!(payload.team_id, "team-1");
-        assert_eq!(payload.slot_id, "slot-9");
     }
 
     #[test]
@@ -206,7 +185,7 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "team.agent.renamed");
+        assert_eq!(events[0].name, "team.agentRenamed");
 
         let payload: TeamAgentRenamedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
@@ -229,9 +208,9 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].name, "team.agent.status");
-        assert_eq!(events[1].name, "team.agent.status");
-        assert_eq!(events[2].name, "team.agent.removed");
+        assert_eq!(events[0].name, "team.agentStatusChanged");
+        assert_eq!(events[1].name, "team.agentStatusChanged");
+        assert_eq!(events[2].name, "team.agentRemoved");
     }
 
     #[test]
