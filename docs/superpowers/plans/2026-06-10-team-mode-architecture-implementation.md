@@ -854,4 +854,5 @@ Logs:
 Known follow-up for next round:
 - Start Round 6 only after confirmation; perform final cleanup, regression searches, and architecture verification.
 Commit:
-- pending; commit will be created after this handoff update.
+- AionCore: `3622999bc00b418da3f76fc15cc621337fa8edb6`
+- AionUi: `41bb1eb956a828451c873b9a7d0dc305ca0ed768`
