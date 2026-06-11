@@ -87,21 +87,30 @@ impl StarOfficeDetector {
     async fn scan_candidates(&self, candidates: &[String], timeout: Duration) -> Option<String> {
         for chunk in candidates.chunks(MAX_CONCURRENT_WORKERS) {
             let mut set = tokio::task::JoinSet::new();
-            for url in chunk {
+            for (idx, url) in chunk.iter().enumerate() {
                 let client = self.client.clone();
                 let url = url.clone();
                 set.spawn(async move {
                     if check_health(&client, &url, timeout).await {
-                        Some(url)
+                        Some((idx, url))
                     } else {
                         None
                     }
                 });
             }
+            // Pick the winner by candidate order, not completion order: the
+            // user's preferred URL is candidate 0 and must beat an equivalent
+            // localhost candidate that happens to respond a few ms faster.
+            let mut best: Option<(usize, String)> = None;
             while let Some(result) = set.join_next().await {
-                if let Ok(Some(url)) = result {
-                    return Some(url);
+                if let Ok(Some((idx, url))) = result
+                    && best.as_ref().is_none_or(|(best_idx, _)| idx < *best_idx)
+                {
+                    best = Some((idx, url));
                 }
+            }
+            if let Some((_, url)) = best {
+                return Some(url);
             }
         }
         None
@@ -109,18 +118,26 @@ impl StarOfficeDetector {
 }
 
 fn build_candidate_urls(preferred_url: Option<&str>, scan_neighbors: bool) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
     let mut seed_ports: Vec<u16> = Vec::new();
 
-    if let Some(url) = preferred_url
-        && let Some(port) = extract_port(url)
-    {
-        seed_ports.push(port);
+    if let Some(url) = preferred_url {
+        // Probe the caller-supplied address exactly as given (issue
+        // aionui#3212): rewriting its host to localhost makes detection
+        // "succeed" against the wrong interface on remote deployments and
+        // the returned URL then overwrites the user's configuration.
+        if let Some(base) = normalize_base_url(url) {
+            urls.push(base);
+        }
+        if let Some(port) = extract_port(url) {
+            seed_ports.push(port);
+        }
     }
 
     if !scan_neighbors {
         // Exact mode: skip KNOWN_PORTS and the ±SCAN_RADIUS expansion so the
         // detector talks to the caller-supplied URL only.
-        return seed_ports.iter().map(|p| format!("http://localhost:{p}")).collect();
+        return urls;
     }
 
     for p in KNOWN_PORTS {
@@ -140,17 +157,42 @@ fn build_candidate_urls(preferred_url: Option<&str>, scan_neighbors: bool) -> Ve
         }
     }
 
-    let mut urls = Vec::with_capacity(expanded.len());
     for &p in &seed_ports {
-        urls.push(format!("http://localhost:{p}"));
+        push_unique(&mut urls, format!("http://localhost:{p}"));
     }
     for &p in &expanded {
         if !seed_ports.contains(&p) {
-            urls.push(format!("http://localhost:{p}"));
+            push_unique(&mut urls, format!("http://localhost:{p}"));
         }
     }
 
     urls
+}
+
+fn push_unique(urls: &mut Vec<String>, url: String) {
+    if !urls.contains(&url) {
+        urls.push(url);
+    }
+}
+
+/// Reduce a user-supplied URL to its `{scheme}://{host}:{port}` base so the
+/// health endpoints can be joined onto it. Returns None when the URL has no
+/// scheme or no explicit port — neighborhood scanning covers those cases.
+fn normalize_base_url(url: &str) -> Option<String> {
+    let (scheme, rest) = if let Some(rest) = url.strip_prefix("http://") {
+        ("http", rest)
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        ("https", rest)
+    } else {
+        return None;
+    };
+    let host_part = rest.split('/').next()?;
+    let (host, port) = host_part.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}:{port}"))
 }
 
 fn extract_port(url: &str) -> Option<u16> {
@@ -256,6 +298,28 @@ mod tests {
         let urls = build_candidate_urls(Some("http://localhost:19000"), true);
         assert_eq!(urls[0], "http://localhost:19000");
         assert_eq!(urls[1], "http://localhost:18791");
+    }
+
+    // Issue aionui#3212: a remote-deployment user enters the server's public
+    // address; the detector must probe that address as-is, not rewrite it to
+    // localhost (which silently "succeeds" against the local service and then
+    // overwrites the user's configured URL).
+    #[test]
+    fn build_candidates_preferred_remote_host_preserved() {
+        let urls = build_candidate_urls(Some("http://192.168.1.27:19000"), true);
+        assert_eq!(urls[0], "http://192.168.1.27:19000");
+    }
+
+    #[test]
+    fn build_candidates_exact_mode_preserves_remote_host() {
+        let urls = build_candidate_urls(Some("http://192.168.1.27:19000"), false);
+        assert_eq!(urls, vec!["http://192.168.1.27:19000".to_owned()]);
+    }
+
+    #[test]
+    fn build_candidates_preferred_path_and_trailing_slash_stripped() {
+        let urls = build_candidate_urls(Some("http://192.168.1.27:19000/star/"), true);
+        assert_eq!(urls[0], "http://192.168.1.27:19000");
     }
 
     #[test]

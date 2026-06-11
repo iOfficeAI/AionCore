@@ -319,3 +319,24 @@ async fn cache_miss_ttl_expires() {
 
     handle.abort();
 }
+
+// ---------------------------------------------------------------------------
+// Issue aionui#3212: detect must return the preferred URL verbatim when it is
+// healthy, even though an equivalent localhost candidate is also reachable.
+// The full scan path is used (not detect_exact) because the bug lives in the
+// candidate expansion: the preferred host used to be rewritten to localhost.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn detect_returns_healthy_preferred_url_verbatim() {
+    let port = allocate_port();
+    let handle = mock_star_office_server(port, true, "idle", "<html><body>star office</body></html>").await;
+
+    let detector = StarOfficeDetector::new(reqwest::Client::new());
+    let url = format!("http://127.0.0.1:{port}");
+    let result = detector.detect(Some(&url), true, Some(2000)).await;
+
+    assert_eq!(result, Some(url));
+
+    handle.abort();
+}
