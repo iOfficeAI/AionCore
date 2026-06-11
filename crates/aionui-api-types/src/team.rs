@@ -94,6 +94,51 @@ pub struct TeamSessionBinding {
     pub mcp: Option<TeamMcpRuntimeConfig>,
 }
 
+impl TeamSessionBinding {
+    pub fn from_extra_str(extra: &str) -> Result<Option<Self>, serde_json::Error> {
+        let value: serde_json::Value = serde_json::from_str(extra)?;
+        Self::from_extra_value(&value)
+    }
+
+    pub fn from_extra_value(extra: &serde_json::Value) -> Result<Option<Self>, serde_json::Error> {
+        let Some(team_id) = extra_string_field(extra, "teamId") else {
+            return Ok(None);
+        };
+
+        let mcp = match extra.get("team_mcp_stdio_config").cloned() {
+            Some(value) if !value.is_null() => Some(TeamMcpRuntimeConfig {
+                stdio: serde_json::from_value(value)?,
+            }),
+            _ => None,
+        };
+
+        Ok(Some(Self {
+            team_id,
+            slot_id: extra_string_field(extra, "slot_id"),
+            role: extra_string_field(extra, "role"),
+            runtime_seed: TeamRuntimeSeed {
+                backend: extra_string_field(extra, "backend"),
+                session_mode: extra_string_field(extra, "session_mode"),
+                current_model_id: extra_string_field(extra, "current_model_id"),
+            },
+            mcp,
+        }))
+    }
+
+    pub fn team_id_marker_from_extra_str(extra: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(extra).ok()?;
+        extra_string_field(&value, "teamId")
+    }
+}
+
+fn extra_string_field(extra: &serde_json::Value, key: &str) -> Option<String> {
+    extra
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
 /// Startup seed values Team provisioning persists for runtime build.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamRuntimeSeed {
@@ -894,5 +939,59 @@ mod tests {
         assert_eq!(json["content"], "ping");
         assert_eq!(json["from_slot_id"], "slot-1");
         assert_eq!(json["from_name"], "Lead");
+    }
+
+    #[test]
+    fn team_session_binding_decodes_persisted_extra_contract() {
+        let extra = serde_json::json!({
+            "teamId": "team-1",
+            "slot_id": "lead-1",
+            "role": "lead",
+            "backend": "claude",
+            "session_mode": "full_auto",
+            "current_model_id": "opus",
+            "team_mcp_stdio_config": {
+                "team_id": "team-1",
+                "port": 4242,
+                "token": "token",
+                "slot_id": "lead-1",
+                "binary_path": "/tmp/aioncore"
+            }
+        });
+
+        let binding = TeamSessionBinding::from_extra_value(&extra).unwrap().unwrap();
+
+        assert_eq!(binding.team_id, "team-1");
+        assert_eq!(binding.slot_id.as_deref(), Some("lead-1"));
+        assert_eq!(binding.role.as_deref(), Some("lead"));
+        assert_eq!(binding.runtime_seed.backend.as_deref(), Some("claude"));
+        assert_eq!(binding.runtime_seed.session_mode.as_deref(), Some("full_auto"));
+        assert_eq!(binding.runtime_seed.current_model_id.as_deref(), Some("opus"));
+        let mcp = binding.mcp.unwrap();
+        assert_eq!(mcp.stdio.team_id, "team-1");
+        assert_eq!(mcp.stdio.slot_id, "lead-1");
+    }
+
+    #[test]
+    fn team_session_binding_ignores_missing_or_blank_team_marker() {
+        assert!(
+            TeamSessionBinding::from_extra_value(&serde_json::json!({}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            TeamSessionBinding::from_extra_value(&serde_json::json!({"teamId": "  "}))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn team_session_binding_marker_reader_extracts_team_id_only() {
+        let extra = r#"{"teamId":"team-9","team_mcp_stdio_config":{"invalid":true}}"#;
+        assert_eq!(
+            TeamSessionBinding::team_id_marker_from_extra_str(extra).as_deref(),
+            Some("team-9")
+        );
     }
 }

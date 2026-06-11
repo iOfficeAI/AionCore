@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
+use aionui_api_types::TeamSessionBinding;
 use aionui_common::generate_id;
 use axum::Json;
 use axum::extract::State;
@@ -345,11 +346,10 @@ async fn exec_team_tool(
 
 /// Resolve `(team_id, slot_id)` for a caller identified by `conversation_id`.
 ///
-/// Reads the conversation row's `extra` JSON to extract `teamId`, then finds
-/// the agent slot whose `conversation_id` matches. Returns an error string if
-/// no active team is found for this conversation.
+/// Decodes the conversation row's typed Team binding, then finds the agent slot
+/// whose `conversation_id` matches. Returns an error string if no active team is
+/// found for this conversation.
 async fn resolve_team_context(service: &TeamSessionService, conversation_id: &str) -> Result<(String, String), String> {
-    // Extract teamId from conversation.extra via the conversation service repo.
     let repo = service.conversation_service_ref().conversation_repo().clone();
     let row = repo
         .get(conversation_id)
@@ -357,13 +357,10 @@ async fn resolve_team_context(service: &TeamSessionService, conversation_id: &st
         .map_err(|e| format!("DB error reading conversation: {e}"))?
         .ok_or_else(|| format!("Conversation not found: {conversation_id}"))?;
 
-    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
-    let team_id = extra
-        .get("teamId")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "No active team for this conversation. Create a team first with aion_create_team.".to_owned())?
-        .to_owned();
+    let binding = TeamSessionBinding::from_extra_str(&row.extra)
+        .map_err(|e| format!("Invalid Team runtime context: {e}"))?
+        .ok_or_else(|| "No active team for this conversation. Create a team first with aion_create_team.".to_owned())?;
+    let team_id = binding.team_id;
 
     // Find the slot_id by matching conversation_id in the session scheduler.
     let scheduler = service

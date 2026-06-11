@@ -8,7 +8,7 @@ use aionui_ai_agent::session_context::{
 };
 use aionui_ai_agent::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState};
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, TeamMcpRuntimeConfig, TeamRuntimeSeed, TeamSessionBinding};
+use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, TeamSessionBinding};
 use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
 use aionui_db::models::ConversationRow;
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
@@ -69,7 +69,9 @@ impl<'a> SessionContextBuilder<'a> {
         let workspace = self.resolve_workspace(row, &agent_type, &extra, workspace_override)?;
         let model = provider_model_from_conversation_row(row);
         let skills = parse_string_array(extra.get("skills").cloned()).unwrap_or_default();
-        let team = parse_team_binding(&extra)?;
+        let team = TeamSessionBinding::from_extra_value(&extra).map_err(|e| ConversationError::BadRequest {
+            reason: format!("Invalid Team runtime context: {e}"),
+        })?;
         let kind = self.build_kind(row, &agent_type, extra, team.clone()).await?;
 
         Ok(AgentSessionContext {
@@ -324,34 +326,6 @@ fn build_aionrs_context(
     }
 }
 
-fn parse_team_binding(extra: &serde_json::Value) -> Result<Option<TeamSessionBinding>, ConversationError> {
-    let Some(team_id) = string_field(extra, "teamId") else {
-        return Ok(None);
-    };
-
-    let mcp = match extra.get("team_mcp_stdio_config").cloned() {
-        Some(value) if !value.is_null() => {
-            let stdio = serde_json::from_value(value).map_err(|e| ConversationError::BadRequest {
-                reason: format!("Invalid Team MCP runtime config: {e}"),
-            })?;
-            Some(TeamMcpRuntimeConfig { stdio })
-        }
-        _ => None,
-    };
-
-    Ok(Some(TeamSessionBinding {
-        team_id,
-        slot_id: string_field(extra, "slot_id"),
-        role: string_field(extra, "role"),
-        runtime_seed: TeamRuntimeSeed {
-            backend: string_field(extra, "backend"),
-            session_mode: string_field(extra, "session_mode"),
-            current_model_id: string_field(extra, "current_model_id"),
-        },
-        mcp,
-    }))
-}
-
 fn apply_team_seed_to_acp_config(team: &Option<TeamSessionBinding>, config: &mut AcpBuildExtra) {
     let Some(team) = team else {
         return;
@@ -383,15 +357,6 @@ fn apply_team_seed_to_aionrs_config(team: &Option<TeamSessionBinding>, config: &
     if config.team_mcp_stdio_config.is_none() {
         config.team_mcp_stdio_config = team.mcp.as_ref().map(|mcp| mcp.stdio.clone());
     }
-}
-
-fn string_field(extra: &serde_json::Value, key: &str) -> Option<String> {
-    extra
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
 }
 
 fn parse_extra(row: &ConversationRow) -> Result<serde_json::Value, ConversationError> {

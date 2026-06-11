@@ -15,8 +15,8 @@ use aionui_api_types::{
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
     ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage,
+    SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete, PaginatedResult,
@@ -2052,12 +2052,7 @@ fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), Conver
 }
 
 fn team_id_from_extra(extra: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(extra).ok()?;
-    value
-        .get("teamId")
-        .and_then(serde_json::Value::as_str)
-        .filter(|team_id| !team_id.trim().is_empty())
-        .map(str::to_owned)
+    TeamSessionBinding::team_id_marker_from_extra_str(extra)
 }
 
 fn normalize_workspace_path(workspace: &str) -> Result<String, ConversationError> {
