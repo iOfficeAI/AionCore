@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.28](https://github.com/iOfficeAI/AionCore/compare/v0.1.27...v0.1.28) (2026-06-11)
+
+
+### Bug Fixes
+
+* **auth:** allow same-origin framing on office preview proxy routes ([#454](https://github.com/iOfficeAI/AionCore/issues/454)) ([3543dbd](https://github.com/iOfficeAI/AionCore/commit/3543dbdc0b8ca46682b84383d2b6c4aee9bdbdd6))
+* **file:** strip Windows verbatim prefix from /api/fs/browse paths ([#453](https://github.com/iOfficeAI/AionCore/issues/453)) ([f8c3f95](https://github.com/iOfficeAI/AionCore/commit/f8c3f950f9897c4e13ae7bb1dbb7816017b86480))
+* **stt:** STT compatibility fixes for Groq Whisper and AionUI web frontend ([#400](https://github.com/iOfficeAI/AionCore/issues/400)) ([4c3fa09](https://github.com/iOfficeAI/AionCore/commit/4c3fa094087c8479d0c2975ec896ce46fb37abca))
+* **stt:** treat blank base_url as unset and log malformed config ([#448](https://github.com/iOfficeAI/AionCore/issues/448)) ([f6b653b](https://github.com/iOfficeAI/AionCore/commit/f6b653bbdd5822dcd1b52790f0cf28db65115011))
+
 ## [0.1.27](https://github.com/iOfficeAI/AionCore/compare/v0.1.26...v0.1.27) (2026-06-10)
 
 
