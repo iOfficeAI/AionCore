@@ -2,9 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_ai_agent::types::SendMessageData;
 use aionui_common::AgentKillReason;
-use aionui_conversation::ConversationService;
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
 use tracing::{info, warn};
@@ -16,6 +14,7 @@ use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
 use crate::message_projection::{
     TeamMessageProjection, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
 };
+use crate::ports::AgentTurnExecutionPort;
 use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
@@ -60,6 +59,7 @@ pub struct TeamSession {
     mcp_server: TeamMcpServer,
     backend_binary_path: Arc<PathBuf>,
     task_manager: Arc<dyn IWorkerTaskManager>,
+    turn_port: Arc<dyn AgentTurnExecutionPort>,
     /// Owner user_id for this team — needed when spawn_agent creates a
     /// new conversation (conversations are scoped per user).
     user_id: String,
@@ -78,12 +78,14 @@ pub struct TeamSession {
 }
 
 impl TeamSession {
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         team: Team,
         repo: Arc<dyn ITeamRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
         backend_binary_path: Arc<PathBuf>,
         task_manager: Arc<dyn IWorkerTaskManager>,
+        turn_port: Arc<dyn AgentTurnExecutionPort>,
         user_id: String,
         service: Weak<TeamSessionService>,
     ) -> Result<Self, TeamError> {
@@ -124,6 +126,7 @@ impl TeamSession {
             mcp_server,
             backend_binary_path,
             task_manager,
+            turn_port,
             user_id,
             service,
             broadcaster,
@@ -145,6 +148,10 @@ impl TeamSession {
 
     pub fn event_loops(&self) -> &Arc<EventLoopRegistry> {
         &self.event_loops
+    }
+
+    pub fn turn_port(&self) -> &Arc<dyn AgentTurnExecutionPort> {
+        &self.turn_port
     }
 
     /// Signal an agent's event loop to drain its mailbox.
@@ -396,91 +403,19 @@ impl TeamSession {
     /// - `on_agent_finish` cascade (all-settled → leader)
     ///
     /// When an event loop is registered for the slot, it just notifies it.
-    /// When no loop exists (unit tests, race during spawn), falls back to
-    /// a direct inline send so messages are not silently dropped.
+    /// If no loop exists, the mailbox row remains persisted and will be
+    /// drained once a Team session registers the event loop.
     pub(crate) async fn try_wake(&self, slot_id: &str, files: Option<Vec<String>>) {
-        // Prefer the event loop path
+        let _ = files;
         if self.event_loops.has(slot_id) {
             self.event_loops.notify(slot_id);
             return;
         }
-
-        // Fallback: inline send (used in unit tests and during spawn race)
-        self.try_wake_inline(slot_id, files).await;
-    }
-
-    /// Legacy inline wake implementation. Used as fallback when no event loop
-    /// is registered for the slot.
-    async fn try_wake_inline(&self, slot_id: &str, files: Option<Vec<String>>) {
-        if !self.scheduler.acquire_wake_lock(slot_id) {
-            return;
-        }
-
-        let input = match self.compute_wake_input(slot_id).await {
-            Ok(Some(input)) => input,
-            Ok(None) => {
-                self.scheduler.release_wake_lock(slot_id);
-                return;
-            }
-            Err(err) => {
-                warn!(
-                    team_id = %self.team.id,
-                    slot_id,
-                    error = %err,
-                    "try_wake_inline: compute_wake_input failed"
-                );
-                self.scheduler.release_wake_lock(slot_id);
-                return;
-            }
-        };
-
-        if !input.should_send {
-            self.scheduler.release_wake_lock(slot_id);
-            return;
-        }
-
-        self.mirror_unread_to_conversation(&input).await;
-
-        let handle = if let Some(h) = self.task_manager.get_task(&input.conversation_id) {
-            h
-        } else {
-            self.scheduler.release_wake_lock(slot_id);
-            return;
-        };
-
-        if handle.status() == Some(aionui_common::ConversationStatus::Running) {
-            self.scheduler.release_wake_lock(slot_id);
-            return;
-        }
-
-        let _ = self.scheduler.set_status(slot_id, TeammateStatus::Working).await;
-
-        let msg_id = ConversationService::mint_msg_id();
-        let data = SendMessageData {
-            content: input.first_message,
-            msg_id,
-            files: files.unwrap_or_default(),
-            inject_skills: Vec::new(),
-        };
-
-        if let Err(err) = handle.send_message(data).await {
-            warn!(
-                team_id = %self.team.id,
-                slot_id,
-                error = %err,
-                "try_wake_inline: send_message failed"
-            );
-            let _ = self.scheduler.set_status(slot_id, TeammateStatus::Idle).await;
-            self.scheduler.release_wake_lock(slot_id);
-            return;
-        }
-
-        let msg_ids: Vec<String> = input.unread.iter().map(|m| m.id.clone()).collect();
-        if !msg_ids.is_empty() {
-            let _ = self.mailbox.mark_read_batch(&msg_ids).await;
-        }
-
-        self.scheduler.release_wake_lock(slot_id);
+        warn!(
+            team_id = %self.team.id,
+            slot_id,
+            "try_wake: event loop not registered; mailbox retained for later drain"
+        );
     }
 
     /// Mirror each non-user mailbox row into the target agent's conversation
@@ -766,19 +701,36 @@ mod tests {
     use crate::test_utils::MockTeamRepo;
     use crate::types::{Team, TeamAgent, TeammateRole};
     use aionui_ai_agent::AgentError;
-    use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
-    use aionui_ai_agent::protocol::events::AgentStreamEvent;
-    use aionui_ai_agent::shared_kernel::approval_key;
+    use aionui_ai_agent::agent_task::AgentInstance;
     use aionui_ai_agent::types::BuildTaskOptions;
-    use aionui_ai_agent::types::SendMessageData;
-    use aionui_api_types::{AgentModeResponse, WebSocketMessage};
-    use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
+    use aionui_api_types::WebSocketMessage;
+    use aionui_common::{AgentKillReason, TimestampMs};
     use std::sync::{Arc, Mutex};
-    use tokio::sync::broadcast;
 
     struct NullBroadcaster;
     impl EventBroadcaster for NullBroadcaster {
         fn broadcast(&self, _msg: WebSocketMessage<serde_json::Value>) {}
+    }
+
+    struct NoopTurnPort;
+
+    #[async_trait::async_trait]
+    impl crate::ports::AgentTurnExecutionPort for NoopTurnPort {
+        async fn run_agent_turn(
+            &self,
+            request: crate::ports::AgentTurnRequest,
+        ) -> Result<crate::ports::AgentTurnOutcome, crate::ports::AgentTurnExecutionError> {
+            Ok(crate::ports::AgentTurnOutcome {
+                conversation_id: request.conversation_id,
+                turn_id: "turn-test".into(),
+                status: crate::ports::AgentTurnStatus::Completed,
+                runtime: None,
+            })
+        }
+    }
+
+    fn noop_turn_port() -> Arc<dyn crate::ports::AgentTurnExecutionPort> {
+        Arc::new(NoopTurnPort)
     }
 
     /// RecordingBroadcaster used by the D29d-1 ratification test below to
@@ -808,81 +760,6 @@ mod tests {
         Arc::new(PathBuf::from("/tmp/aioncore-test"))
     }
 
-    /// Mock agent whose `send_message` pushes the received payload into a
-    /// shared log, optionally failing with a configurable error.
-    struct RecordingAgent {
-        conversation_id: String,
-        sent: Arc<Mutex<Vec<SendMessageData>>>,
-        fail_with: Option<String>,
-        event_tx: broadcast::Sender<AgentStreamEvent>,
-    }
-
-    impl RecordingAgent {
-        fn new(conversation_id: &str, sent: Arc<Mutex<Vec<SendMessageData>>>, fail_with: Option<String>) -> Self {
-            let (event_tx, _) = broadcast::channel(4);
-            Self {
-                conversation_id: conversation_id.into(),
-                sent,
-                fail_with,
-                event_tx,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl IAgentTask for RecordingAgent {
-        fn agent_type(&self) -> AgentType {
-            AgentType::Acp
-        }
-        fn conversation_id(&self) -> &str {
-            &self.conversation_id
-        }
-        fn workspace(&self) -> &str {
-            "/tmp/ws"
-        }
-        fn status(&self) -> Option<ConversationStatus> {
-            None
-        }
-        fn last_activity_at(&self) -> TimestampMs {
-            now_ms()
-        }
-        fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
-            self.event_tx.subscribe()
-        }
-        async fn send_message(&self, data: SendMessageData) -> Result<(), aionui_ai_agent::AgentSendError> {
-            self.sent.lock().unwrap().push(data);
-            match &self.fail_with {
-                Some(msg) => Err(aionui_ai_agent::AgentSendError::from_agent_error(AgentError::internal(
-                    msg.clone(),
-                ))),
-                None => Ok(()),
-            }
-        }
-        async fn cancel(&self) -> Result<(), AgentError> {
-            Ok(())
-        }
-        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
-            Ok(())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl IMockAgent for RecordingAgent {
-        fn get_confirmations(&self) -> Vec<Confirmation> {
-            Vec::new()
-        }
-        fn check_approval(&self, action: &str, command_type: Option<&str>) -> bool {
-            let _ = approval_key(Some(action), command_type);
-            false
-        }
-        async fn mode(&self) -> Result<AgentModeResponse, AgentError> {
-            Ok(AgentModeResponse {
-                mode: "default".into(),
-                initialized: false,
-            })
-        }
-    }
-
     /// In-memory stub for [`IWorkerTaskManager`]. Only `get_task` is
     /// exercised by D7b; the other methods are unreachable in these tests
     /// and panic to surface drift early.
@@ -909,10 +786,6 @@ mod tests {
                 kill_calls: Mutex::new(Vec::new()),
                 kill_error: Some(msg.to_owned()),
             }
-        }
-
-        fn insert(&self, conv_id: &str, handle: AgentInstance) {
-            self.tasks.lock().unwrap().insert(conv_id.into(), handle);
         }
 
         fn kill_calls(&self) -> Vec<(String, Option<AgentKillReason>)> {
@@ -957,23 +830,6 @@ mod tests {
         fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
             Vec::new()
         }
-    }
-
-    /// Build a task_manager pre-populated with a [`RecordingAgent`] per
-    /// conversation in `conv_ids`. `fail_with` — when set — makes
-    /// `send_message` fail for every agent so tests can exercise the
-    /// log-not-throw path.
-    fn task_manager_with_agents(
-        conv_ids: &[&str],
-        fail_with: Option<String>,
-    ) -> (Arc<dyn IWorkerTaskManager>, Arc<Mutex<Vec<SendMessageData>>>) {
-        let sent: Arc<Mutex<Vec<SendMessageData>>> = Arc::new(Mutex::new(Vec::new()));
-        let stub = StubTaskManager::new();
-        for conv_id in conv_ids {
-            let agent = AgentInstance::Mock(Arc::new(RecordingAgent::new(conv_id, sent.clone(), fail_with.clone())));
-            stub.insert(conv_id, agent);
-        }
-        (Arc::new(stub), sent)
     }
 
     /// Empty task_manager — `get_task` returns `None` for every conversation.
@@ -1026,6 +882,7 @@ mod tests {
             broadcaster,
             backend_path(),
             empty_task_manager(),
+            noop_turn_port(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1073,6 +930,7 @@ mod tests {
             broadcaster,
             backend_path(),
             empty_task_manager(),
+            noop_turn_port(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1099,6 +957,7 @@ mod tests {
             broadcaster,
             backend_path(),
             empty_task_manager(),
+            noop_turn_port(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1166,6 +1025,7 @@ mod tests {
             broadcaster,
             backend_path(),
             stub_dyn,
+            noop_turn_port(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1196,6 +1056,7 @@ mod tests {
             broadcaster,
             backend_path(),
             stub_dyn,
+            noop_turn_port(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1506,6 +1367,7 @@ mod tests {
             broadcaster,
             backend_path(),
             task_manager,
+            noop_turn_port(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1515,20 +1377,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_forwards_files_to_task_manager() {
-        let (task_manager, sent) = task_manager_with_agents(&["c1"], None);
-        let (session, _repo) = start_session_with(task_manager).await;
+    async fn send_message_persists_files_in_mailbox_without_inline_wake() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
 
         session
             .send_message("Hello", Some(vec!["/tmp/a.txt".into(), "/tmp/b.txt".into()]))
             .await
             .unwrap();
 
-        let log = sent.lock().unwrap();
-        assert_eq!(log.len(), 1, "expected exactly one send_message call");
-        assert_eq!(log[0].files, vec!["/tmp/a.txt", "/tmp/b.txt"]);
-        assert!(log[0].content.contains("Hello"));
-        assert!(!log[0].msg_id.is_empty());
+        let unread = session.mailbox.peek_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(
+            unread[0].files.as_deref(),
+            Some(&["/tmp/a.txt".into(), "/tmp/b.txt".into()][..])
+        );
+        assert_eq!(unread[0].content, "Hello");
         session.stop();
     }
 
@@ -1550,51 +1413,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_swallows_task_manager_send_failure() {
-        // Agent present but send_message fails — D7b must log and return Ok
-        // (P0#46). A propagated error would invite retries that double-write
-        // the mailbox.
-        let (task_manager, sent) = task_manager_with_agents(&["c1"], Some("boom".into()));
-        let (session, _repo) = start_session_with(task_manager).await;
+    async fn send_message_without_event_loop_retains_mailbox_message() {
+        let (session, repo) = start_session_with(empty_task_manager()).await;
 
         session
             .send_message("payload", None)
             .await
-            .expect("wake failure must be swallowed");
+            .expect("send_message must persist mailbox row without inline wake");
 
-        // The attempt still reached the agent, so the sent log has one entry.
-        assert_eq!(sent.lock().unwrap().len(), 1);
+        let state = repo.state.lock().unwrap();
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].content, "payload");
         session.stop();
     }
 
     #[tokio::test]
-    async fn send_message_to_agent_targets_specific_conversation() {
-        let (task_manager, sent) = task_manager_with_agents(&["c1", "c2"], None);
-        let (session, _repo) = start_session_with(task_manager).await;
+    async fn send_message_to_agent_persists_files_for_target_mailbox() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
 
         session
             .send_message_to_agent("worker-1", "do X", Some(vec!["/tmp/x.md".into()]))
             .await
             .unwrap();
 
-        let log = sent.lock().unwrap();
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].files, vec!["/tmp/x.md"]);
-        assert!(log[0].content.contains("do X"));
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].files.as_deref(), Some(&["/tmp/x.md".into()][..]));
+        assert_eq!(unread[0].content, "do X");
         session.stop();
     }
 
     #[tokio::test]
-    async fn send_message_with_empty_content_still_wakes() {
-        // compute_wake_input returns should_send=true whenever the mailbox has
-        // unread entries, regardless of content. Ensure the wake still fires
-        // when a caller passes an empty string.
-        let (task_manager, sent) = task_manager_with_agents(&["c1"], None);
-        let (session, _repo) = start_session_with(task_manager).await;
+    async fn send_message_with_empty_content_still_persists_mailbox_row() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
 
         session.send_message("", None).await.unwrap();
 
-        assert_eq!(sent.lock().unwrap().len(), 1);
+        let unread = session.mailbox.peek_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].content, "");
         session.stop();
     }
 
@@ -1609,6 +1466,7 @@ mod tests {
             broadcaster,
             backend_path(),
             empty_task_manager(),
+            noop_turn_port(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1628,6 +1486,7 @@ mod tests {
             broadcaster,
             backend_path(),
             empty_task_manager(),
+            noop_turn_port(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )

@@ -24,6 +24,9 @@ use aionui_realtime::EventBroadcaster;
 
 use aionui_conversation::ConversationService;
 use aionui_team::TeamSessionService;
+use aionui_team::ports::{
+    AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest, AgentTurnStatus,
+};
 use common::MockTeamRepo;
 
 // ---------------------------------------------------------------------------
@@ -165,6 +168,24 @@ impl IConversationRepository for MockConversationRepo {
 struct NullBroadcaster;
 impl EventBroadcaster for NullBroadcaster {
     fn broadcast(&self, _msg: WebSocketMessage<serde_json::Value>) {}
+}
+
+struct NoopTurnPort;
+
+#[async_trait::async_trait]
+impl AgentTurnExecutionPort for NoopTurnPort {
+    async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        Ok(AgentTurnOutcome {
+            conversation_id: request.conversation_id,
+            turn_id: "turn-test".into(),
+            status: AgentTurnStatus::Completed,
+            runtime: None,
+        })
+    }
+}
+
+fn noop_turn_port() -> Arc<dyn AgentTurnExecutionPort> {
+    Arc::new(NoopTurnPort)
 }
 
 #[derive(Default)]
@@ -735,6 +756,7 @@ fn setup_with_factory_and_metadata_and_conversation_repo(
         conv_service,
         broadcaster,
         task_manager_dyn,
+        noop_turn_port(),
         backend_binary_path,
         None,
     );
@@ -771,6 +793,7 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
         conv_service,
         broadcaster,
         task_manager,
+        noop_turn_port(),
         backend_binary_path,
         None,
     );

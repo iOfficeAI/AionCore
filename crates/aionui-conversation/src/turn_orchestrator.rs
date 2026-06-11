@@ -26,6 +26,16 @@ pub(crate) struct TurnStartInput {
     pub turn_claim: TurnClaim,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversationTurnStatus {
+    Completed,
+    Failed,
+}
+
+pub(crate) struct ConversationTurnResult {
+    pub status: ConversationTurnStatus,
+}
+
 pub(crate) struct ConversationTurnOrchestrator {
     service: ConversationService,
     task_manager: Arc<dyn IWorkerTaskManager>,
@@ -38,17 +48,18 @@ impl ConversationTurnOrchestrator {
 
     pub fn spawn_user_turn(self, input: TurnStartInput) {
         tokio::spawn(async move {
-            self.run_user_turn(input).await;
+            let _ = self.run_user_turn(input).await;
         });
     }
 
-    async fn run_user_turn(self, input: TurnStartInput) {
+    pub(crate) async fn run_user_turn(self, input: TurnStartInput) -> ConversationTurnResult {
         let mut turn_claim = input.turn_claim;
         let conv_id = input.conversation.id.clone();
         let turn_id = input.turn_id.clone();
         let build_started_at = now_ms();
         let persistence = self.service.runtime_persistence();
         let runtime_state = self.service.runtime_state();
+        let mut turn_failed = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
         info!(conversation_id = %conv_id, turn_id = %turn_id, "Agent task build started");
@@ -71,7 +82,9 @@ impl ConversationTurnOrchestrator {
                 self.service
                     .complete_released_turn(&conv_id, &turn_id, was_deleting)
                     .await;
-                return;
+                return ConversationTurnResult {
+                    status: ConversationTurnStatus::Failed,
+                };
             }
         };
 
@@ -96,7 +109,9 @@ impl ConversationTurnOrchestrator {
             self.service
                 .complete_released_turn(&conv_id, &turn_id, was_deleting)
                 .await;
-            return;
+            return ConversationTurnResult {
+                status: ConversationTurnStatus::Failed,
+            };
         }
 
         info!(
@@ -175,6 +190,9 @@ impl ConversationTurnOrchestrator {
 
             let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
+            if outcome.terminal.is_error() {
+                turn_failed = true;
+            }
 
             if let Some(session_key) = agent.get_session_key() {
                 persist_session_key(self.service.conversation_repo(), &persistence, &conv_id, &session_key).await;
@@ -215,5 +233,12 @@ impl ConversationTurnOrchestrator {
         self.service
             .complete_released_turn(&conv_id, &turn_id, was_deleting)
             .await;
+        ConversationTurnResult {
+            status: if turn_failed {
+                ConversationTurnStatus::Failed
+            } else {
+                ConversationTurnStatus::Completed
+            },
+        }
     }
 }

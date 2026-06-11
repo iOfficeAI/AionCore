@@ -9,6 +9,7 @@ pub mod guide;
 pub mod mailbox;
 pub mod mcp;
 pub mod message_projection;
+pub mod ports;
 pub mod prompts;
 pub mod provisioning;
 pub mod routes;
@@ -30,6 +31,10 @@ pub use mcp::{TEAM_MCP_SERVER_NAME, TeamMcpServer, TeamMcpStdioConfig, TeamMcpSt
 pub use message_projection::{
     ProjectedTeamMessage, TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest,
     TeamProjectionSource,
+};
+pub use ports::{
+    AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest, AgentTurnSource,
+    AgentTurnStatus,
 };
 
 pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};

@@ -41,6 +41,7 @@ use aionui_system::{
 use aionui_team::{TeamRouterState, TeamSessionService};
 
 use crate::config::derive_encryption_key;
+use crate::router::team_turn_adapter::TeamConversationTurnAdapter;
 use crate::services::AppServices;
 
 #[derive(Debug)]
@@ -586,6 +587,7 @@ pub fn build_team_state(
         conv_service.with_delete_hook(cron_service.clone());
         conv_service.with_cron_service(Some(cron_service));
     }
+    let turn_port = Arc::new(TeamConversationTurnAdapter::new(conv_service.clone()));
     let service = TeamSessionService::new(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
@@ -593,6 +595,7 @@ pub fn build_team_state(
         conv_service,
         services.event_bus.clone(),
         services.worker_task_manager.clone(),
+        turn_port,
         backend_binary_path,
         guide_mcp_config,
     );

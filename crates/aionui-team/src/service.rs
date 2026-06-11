@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::AgentLoopContext;
+use crate::ports::AgentTurnExecutionPort;
 use crate::provisioning::TeamAgentProvisioner;
 use crate::session::TeamSession;
 use crate::types::{Team, TeamAgent, TeammateRole};
@@ -42,6 +43,7 @@ pub struct TeamSessionService {
     conversation_service: ConversationService,
     broadcaster: Arc<dyn EventBroadcaster>,
     task_manager: Arc<dyn IWorkerTaskManager>,
+    turn_port: Arc<dyn AgentTurnExecutionPort>,
     backend_binary_path: Arc<PathBuf>,
     sessions: Arc<DashMap<String, SessionEntry>>,
     /// Per-team mutex serializing `add_agent` so concurrent callers cannot
@@ -73,6 +75,7 @@ impl TeamSessionService {
         conversation_service: ConversationService,
         broadcaster: Arc<dyn EventBroadcaster>,
         task_manager: Arc<dyn IWorkerTaskManager>,
+        turn_port: Arc<dyn AgentTurnExecutionPort>,
         backend_binary_path: Arc<PathBuf>,
         guide_mcp_config: Option<GuideMcpConfig>,
     ) -> Arc<Self> {
@@ -83,6 +86,7 @@ impl TeamSessionService {
             conversation_service,
             broadcaster,
             task_manager,
+            turn_port,
             backend_binary_path,
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
@@ -485,6 +489,7 @@ impl TeamSessionService {
             self.broadcaster.clone(),
             self.backend_binary_path.clone(),
             self.task_manager.clone(),
+            self.turn_port.clone(),
             user_id.clone(),
             self.self_ref.clone(),
         )
@@ -618,9 +623,7 @@ impl TeamSessionService {
                 session: session.clone(),
                 scheduler: session.scheduler().clone(),
                 mailbox: session.mailbox().clone(),
-                task_manager: self.task_manager.clone(),
-                conversation_service: self.conversation_service.clone(),
-                broadcaster: self.broadcaster.clone(),
+                turn_port: self.turn_port.clone(),
                 registry: registry.clone(),
             };
             registry.spawn(&agent.slot_id, ctx);
@@ -646,9 +649,7 @@ impl TeamSessionService {
             session: session.clone(),
             scheduler: session.scheduler().clone(),
             mailbox: session.mailbox().clone(),
-            task_manager: self.task_manager.clone(),
-            conversation_service: self.conversation_service.clone(),
-            broadcaster: self.broadcaster.clone(),
+            turn_port: self.turn_port.clone(),
             registry: registry.clone(),
         };
         registry.spawn(slot_id, ctx);

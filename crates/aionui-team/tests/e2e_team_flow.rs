@@ -33,7 +33,11 @@ use aionui_api_types::WebSocketMessage;
 use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
+use aionui_team::event_loop::AgentLoopContext;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
+use aionui_team::ports::{
+    AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest, AgentTurnStatus,
+};
 use aionui_team::service::TeamSessionService;
 use aionui_team::{TeamAgent, TeamSession, TeammateRole};
 use async_trait::async_trait;
@@ -49,6 +53,34 @@ use tokio::sync::broadcast;
 struct NullBroadcaster;
 impl EventBroadcaster for NullBroadcaster {
     fn broadcast(&self, _msg: WebSocketMessage<Value>) {}
+}
+
+#[derive(Default)]
+struct RecordingTurnPort {
+    requests: Arc<Mutex<Vec<AgentTurnRequest>>>,
+}
+
+impl RecordingTurnPort {
+    fn requests(&self) -> Arc<Mutex<Vec<AgentTurnRequest>>> {
+        self.requests.clone()
+    }
+}
+
+#[async_trait]
+impl AgentTurnExecutionPort for RecordingTurnPort {
+    async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        let turn_index = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            requests.len()
+        };
+        Ok(AgentTurnOutcome {
+            conversation_id: request.conversation_id,
+            turn_id: format!("turn-test-{turn_index}"),
+            status: AgentTurnStatus::Completed,
+            runtime: None,
+        })
+    }
 }
 
 /// RecordingBroadcaster captures all WebSocket events for assertion.
@@ -367,11 +399,12 @@ fn two_agents() -> Vec<TeamAgent> {
 /// - Arc<StubTaskManager>
 /// - Arc<MockTeamRepo>  (for low-level mailbox inspection)
 /// - Arc<Mutex<Vec<SendMessageData>>>  (shared sent-messages log)
-async fn setup_session() -> (
+async fn setup_session_with_turn_recorder() -> (
     Arc<TeamSession>,
     Arc<StubTaskManager>,
     Arc<MockTeamRepo>,
     Arc<Mutex<Vec<SendMessageData>>>,
+    Arc<Mutex<Vec<AgentTurnRequest>>>,
 ) {
     let repo = Arc::new(MockTeamRepo::new());
     let repo_dyn: Arc<dyn ITeamRepository> = repo.clone();
@@ -386,6 +419,9 @@ async fn setup_session() -> (
     }
 
     let task_manager_dyn: Arc<dyn aionui_ai_agent::IWorkerTaskManager> = task_manager.clone();
+    let turn_port_impl = Arc::new(RecordingTurnPort::default());
+    let turn_requests = turn_port_impl.requests();
+    let turn_port: Arc<dyn AgentTurnExecutionPort> = turn_port_impl;
 
     let team = aionui_team::types::Team {
         id: "e2e-team".into(),
@@ -402,13 +438,44 @@ async fn setup_session() -> (
         broadcaster,
         backend_path(),
         task_manager_dyn,
+        turn_port,
         "user-e2e".into(),
         Weak::<TeamSessionService>::new(),
     )
     .await
     .expect("TeamSession::start failed");
 
-    (Arc::new(session), task_manager, repo, sent)
+    let session = Arc::new(session);
+    register_test_event_loops(&session);
+
+    (session, task_manager, repo, sent, turn_requests)
+}
+
+async fn setup_session() -> (
+    Arc<TeamSession>,
+    Arc<StubTaskManager>,
+    Arc<MockTeamRepo>,
+    Arc<Mutex<Vec<SendMessageData>>>,
+) {
+    let (session, task_manager, repo, sent, _turn_requests) = setup_session_with_turn_recorder().await;
+    (session, task_manager, repo, sent)
+}
+
+fn register_test_event_loops(session: &Arc<TeamSession>) {
+    let registry = session.event_loops().clone();
+    for agent in two_agents() {
+        let ctx = AgentLoopContext {
+            team_id: session.team_id().to_owned(),
+            slot_id: agent.slot_id.clone(),
+            user_id: session.user_id().to_owned(),
+            session: session.clone(),
+            scheduler: session.scheduler().clone(),
+            mailbox: session.mailbox().clone(),
+            turn_port: session.turn_port().clone(),
+            registry: registry.clone(),
+        };
+        registry.spawn(&agent.slot_id, ctx);
+    }
 }
 
 // ===========================================================================
@@ -671,7 +738,7 @@ async fn s3b_lead_finish_does_not_write_idle_notification() {
 /// lead mailbox has IdleNotification → lead's send_message is called.
 #[tokio::test]
 async fn s3c_finish_triggers_lead_wake_with_idle_notification() {
-    let (session, _tm, repo, sent) = setup_session().await;
+    let (session, _tm, repo, _sent, turn_requests) = setup_session_with_turn_recorder().await;
 
     // Write a message to worker's mailbox (so the wake has content to send)
     session
@@ -721,11 +788,13 @@ async fn s3c_finish_triggers_lead_wake_with_idle_notification() {
     // Allow async propagation
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Lead's agent send_message must have been called
-    let log = sent.lock().unwrap();
+    // Lead's turn must go through the Team-defined port, not direct agent send.
+    let log = turn_requests.lock().unwrap();
     assert!(
-        !log.is_empty(),
-        "lead's RecordingAgent.send_message must be called after wake; sent log: {log:?}"
+        log.iter().any(|request| request.slot_id == "lead-1"
+            && request.conversation_id == "conv-lead"
+            && request.team_id == "e2e-team"),
+        "lead turn port must be called after wake; requests: {log:?}"
     );
 
     session.stop();
@@ -739,7 +808,7 @@ async fn s3c_finish_triggers_lead_wake_with_idle_notification() {
 /// then verifying the new agent receives messages and can finish.
 #[tokio::test]
 async fn s4_dynamic_agent_added_then_finish_propagates() {
-    let (session, task_manager, repo, sent) = setup_session().await;
+    let (session, task_manager, repo, sent, turn_requests) = setup_session_with_turn_recorder().await;
 
     // Add a new agent at runtime
     let new_agent = TeamAgent {
@@ -761,6 +830,20 @@ async fn s4_dynamic_agent_added_then_finish_propagates() {
 
     // Add the agent to the session's scheduler
     session.add_agent(&new_agent).await;
+    let registry = session.event_loops().clone();
+    registry.spawn(
+        &new_agent.slot_id,
+        AgentLoopContext {
+            team_id: session.team_id().to_owned(),
+            slot_id: new_agent.slot_id.clone(),
+            user_id: session.user_id().to_owned(),
+            session: session.clone(),
+            scheduler: session.scheduler().clone(),
+            mailbox: session.mailbox().clone(),
+            turn_port: session.turn_port().clone(),
+            registry: registry.clone(),
+        },
+    );
 
     // Verify the agent is in the roster
     let agents = session.scheduler().list_agents().await;
@@ -790,11 +873,13 @@ async fn s4_dynamic_agent_added_then_finish_propagates() {
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Helper's send_message should have been called
-    let log = sent.lock().unwrap();
+    // Helper's turn must go through the Team-defined port.
+    let log = turn_requests.lock().unwrap();
     assert!(
-        !log.is_empty(),
-        "helper's RecordingAgent.send_message must be called after send_message_to_agent; log: {log:?}"
+        log.iter().any(|request| request.slot_id == "helper-1"
+            && request.conversation_id == "conv-helper"
+            && request.team_id == "e2e-team"),
+        "helper turn port must be called after send_message_to_agent; requests: {log:?}"
     );
     drop(log);
 
@@ -1098,7 +1183,7 @@ async fn s8b_worker_cannot_call_spawn_agent() {
 /// triggers lead's RecordingAgent.send_message.
 #[tokio::test]
 async fn s9_session_send_message_wakes_lead() {
-    let (session, _tm, repo, sent) = setup_session().await;
+    let (session, _tm, repo, _sent, turn_requests) = setup_session_with_turn_recorder().await;
 
     session
         .send_message("user input to team", None)
@@ -1116,13 +1201,17 @@ async fn s9_session_send_message_wakes_lead() {
         assert!(!lead_msgs.is_empty(), "message must be in lead mailbox");
     }
 
-    // Lead's send_message must be called
+    // Lead's turn must go through the Team-defined port with Team metadata.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let log = sent.lock().unwrap();
-    assert!(
-        log.iter().any(|d| d.content.contains("user input to team")),
-        "lead's RecordingAgent.send_message must be called; log: {log:?}"
-    );
+    let log = turn_requests.lock().unwrap();
+    let request = log
+        .iter()
+        .find(|request| request.slot_id == "lead-1")
+        .expect("lead turn port request must be recorded");
+    assert_eq!(request.team_id, "e2e-team");
+    assert_eq!(request.conversation_id, "conv-lead");
+    assert_eq!(request.user_id, "user-e2e");
+    assert!(request.content.contains("user input to team"));
 
     session.stop();
 }

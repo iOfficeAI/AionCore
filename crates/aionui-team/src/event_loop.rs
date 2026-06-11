@@ -1,18 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_ai_agent::IWorkerTaskManager;
-use aionui_ai_agent::types::SendMessageData;
-use aionui_common::ConversationStatus;
-use aionui_conversation::ConversationService;
-use aionui_conversation::runtime_state::TurnClaim;
-use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::mailbox::Mailbox;
+use crate::ports::{AgentTurnExecutionPort, AgentTurnRequest, AgentTurnSource};
 use crate::scheduler::TeammateManager;
 use crate::session::TeamSession;
 use crate::types::TeammateStatus;
@@ -90,17 +85,13 @@ pub struct AgentLoopContext {
     pub session: Arc<TeamSession>,
     pub scheduler: Arc<TeammateManager>,
     pub mailbox: Arc<Mailbox>,
-    pub task_manager: Arc<dyn IWorkerTaskManager>,
-    pub conversation_service: ConversationService,
-    pub broadcaster: Arc<dyn EventBroadcaster>,
+    pub turn_port: Arc<dyn AgentTurnExecutionPort>,
     /// Used to notify other agents' event loops (e.g. leader after all-settled).
     pub registry: Arc<EventLoopRegistry>,
 }
 
 struct TurnExecution {
     finish_ok: bool,
-    turn_id: String,
-    claim: TurnClaim,
 }
 
 /// The event loop for one agent slot. Spawned as a tokio task.
@@ -168,88 +159,14 @@ async fn run_event_loop(
     }
 }
 
-/// Execute one agent turn: warmup → guard → set Working → StreamRelay → send_message (blocking).
-/// Returns `Some(true)` on success, `Some(false)` on error,
-/// `None` if the turn was not started (guard hit, warmup fail, etc.).
+/// Execute one agent turn through the Team-defined port. Conversation/runtime
+/// lifecycle remains behind the port; Team keeps projection, mark-read, and
+/// scheduler finalization here.
 async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput) -> Option<TurnExecution> {
     ctx.session.mirror_unread_to_conversation(input).await;
 
-    // Ensure agent task exists
-    let handle = match ctx.task_manager.get_task(&input.conversation_id) {
-        Some(h) => h,
-        None => {
-            if let Err(e) = ctx
-                .conversation_service
-                .warmup(&ctx.user_id, &input.conversation_id, &ctx.task_manager)
-                .await
-            {
-                warn!(
-                    team_id = %ctx.team_id,
-                    slot_id = %ctx.slot_id,
-                    conversation_id = %input.conversation_id,
-                    error = %e,
-                    "event loop: warmup failed"
-                );
-                return None;
-            }
-            match ctx.task_manager.get_task(&input.conversation_id) {
-                Some(h) => h,
-                None => {
-                    warn!(
-                        team_id = %ctx.team_id,
-                        slot_id = %ctx.slot_id,
-                        conversation_id = %input.conversation_id,
-                        "event loop: no task after warmup"
-                    );
-                    return None;
-                }
-            }
-        }
-    };
-
-    // Guard: skip if already running
-    if handle.status() == Some(ConversationStatus::Running) {
-        return None;
-    }
-    let turn_id = ConversationService::mint_turn_id();
-    let claim = match ctx
-        .conversation_service
-        .runtime_state()
-        .try_claim_turn(&input.conversation_id, &turn_id)
-    {
-        Ok(claim) => claim,
-        Err(e) => {
-            warn!(
-                team_id = %ctx.team_id,
-                slot_id = %ctx.slot_id,
-                conversation_id = %input.conversation_id,
-                turn_id = %turn_id,
-                error = %e,
-                "event loop: runtime turn claim rejected"
-            );
-            return None;
-        }
-    };
-
-    // Point-of-no-return: set Working. Runtime state, not DB status, is the turn guard.
     let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Working).await;
-    let repo = ctx.conversation_service.conversation_repo();
 
-    // StreamRelay for response persistence + WebSocket forwarding
-    let msg_id = ConversationService::mint_msg_id();
-    let rx = handle.subscribe();
-    let relay = aionui_conversation::stream_relay::StreamRelay::new(
-        input.conversation_id.clone(),
-        msg_id.clone(),
-        turn_id.clone(),
-        ctx.user_id.clone(),
-        Arc::clone(repo),
-        ctx.broadcaster.clone(),
-        None,
-    );
-    tokio::spawn(async move { relay.consume(rx).await });
-
-    // Collect files from unread messages (user-attached files)
     let files: Vec<String> = input
         .unread
         .iter()
@@ -258,29 +175,51 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
         .cloned()
         .collect();
 
-    let data = SendMessageData {
+    let unread_message_ids = input.unread.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+    let request = AgentTurnRequest {
+        team_id: ctx.team_id.clone(),
+        slot_id: ctx.slot_id.clone(),
+        conversation_id: input.conversation_id.clone(),
+        user_id: ctx.user_id.clone(),
         content: input.first_message.clone(),
-        msg_id,
         files,
-        inject_skills: Vec::new(),
+        source: AgentTurnSource::Mailbox {
+            unread_count: input.unread.len(),
+            unread_message_ids,
+        },
     };
 
-    let turn_ok = match handle.send_message(data).await {
-        Ok(()) => true,
+    info!(
+        team_id = %ctx.team_id,
+        slot_id = %ctx.slot_id,
+        conversation_id = %input.conversation_id,
+        "event loop: agent turn port call started"
+    );
+    let outcome = match ctx.turn_port.run_agent_turn(request).await {
+        Ok(outcome) => outcome,
         Err(e) => {
             warn!(
                 team_id = %ctx.team_id,
                 slot_id = %ctx.slot_id,
                 conversation_id = %input.conversation_id,
-                turn_id = %turn_id,
                 error = %e,
-                "event loop: send_message failed"
+                outcome = "failed",
+                "event loop: agent turn port call failed"
             );
-            false
+            return Some(TurnExecution { finish_ok: false });
         }
     };
 
-    // Mark messages as read regardless of turn outcome
+    let turn_ok = outcome.status.is_success();
+    info!(
+        team_id = %ctx.team_id,
+        slot_id = %ctx.slot_id,
+        conversation_id = %outcome.conversation_id,
+        turn_id = %outcome.turn_id,
+        outcome = ?outcome.status,
+        "event loop: agent turn port call completed"
+    );
+
     let msg_ids: Vec<String> = input.unread.iter().map(|m| m.id.clone()).collect();
     if !msg_ids.is_empty()
         && let Err(e) = ctx.mailbox.mark_read_batch(&msg_ids).await
@@ -293,17 +232,11 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
         );
     }
 
-    Some(TurnExecution {
-        finish_ok: turn_ok,
-        turn_id,
-        claim,
-    })
+    Some(TurnExecution { finish_ok: turn_ok })
 }
 
-/// Finalize a completed turn: release runtime claim, mark idle (or error), cascade to leader.
-async fn finalize_turn(ctx: &AgentLoopContext, mut turn: TurnExecution, _conversation_id: &str) {
-    turn.claim.release_for_turn(&turn.turn_id);
-
+/// Finalize a completed turn: mark idle (or error), cascade to leader.
+async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, _conversation_id: &str) {
     if !turn.finish_ok {
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
     }

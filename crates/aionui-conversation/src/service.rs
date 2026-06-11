@@ -41,7 +41,7 @@ use crate::error::ConversationError;
 use crate::session_context::SessionContextBuilder;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
-use crate::turn_orchestrator::{ConversationTurnOrchestrator, TurnStartInput};
+use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
 
 pub(crate) const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
@@ -137,6 +137,29 @@ pub struct ConversationService {
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConversationAgentTurnRequest {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub content: String,
+    pub files: Vec<String>,
+    pub inject_skills: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationAgentTurnStatus {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConversationAgentTurnOutcome {
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub status: ConversationAgentTurnStatus,
+    pub runtime: ConversationRuntimeSummary,
 }
 
 // ── Construction & Dependency Injection ──────────────────────────────
@@ -1533,6 +1556,90 @@ impl ConversationService {
         Ok(self
             .send_message_response(conversation_id, user_msg_id_ret, turn_id)
             .await)
+    }
+
+    /// Run a conversation-backed agent turn without expressing it as the
+    /// ordinary user-message API. This is used by upper-level domains that own
+    /// their own message projection and scheduling semantics.
+    #[tracing::instrument(skip_all, fields(user_id = %request.user_id, conversation_id = %request.conversation_id))]
+    pub async fn run_agent_turn(
+        &self,
+        request: ConversationAgentTurnRequest,
+    ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
+        if request.content.trim().is_empty() {
+            return Err(ConversationError::BadRequest {
+                reason: "Agent turn content must not be empty".into(),
+            });
+        }
+
+        let row = self
+            .conversation_repo
+            .get(&request.conversation_id)
+            .await?
+            .filter(|r| r.user_id == request.user_id)
+            .ok_or_else(|| ConversationError::NotFound {
+                id: request.conversation_id.clone(),
+            })?;
+
+        reject_deprecated_runtime_row(&row)?;
+
+        let turn_id = Self::mint_turn_id();
+        let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
+
+        let build_opts = match self.build_task_options(&row).await {
+            Ok(opts) => opts,
+            Err(err) => {
+                let top_level_code = err.error_code();
+                let send_error = AgentSendError::from_agent_error(err.to_agent_error());
+                self.persist_and_broadcast_send_failure_tip(
+                    &request.conversation_id,
+                    &turn_id,
+                    &send_error,
+                    Some(top_level_code),
+                )
+                .await;
+                let mut turn_claim = turn_claim;
+                let was_deleting = turn_claim.release();
+                self.complete_released_turn(&request.conversation_id, &turn_id, was_deleting)
+                    .await;
+                return Ok(ConversationAgentTurnOutcome {
+                    conversation_id: request.conversation_id.clone(),
+                    turn_id,
+                    status: ConversationAgentTurnStatus::Failed,
+                    runtime: self.runtime_summary_for(&request.conversation_id).await,
+                });
+            }
+        };
+
+        self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
+        let stored_workspace = build_opts.context.workspace.stored_path.clone();
+        let conversation_id = request.conversation_id.clone();
+        let result = ConversationTurnOrchestrator::new(self.clone(), self.task_manager.clone())
+            .run_user_turn(TurnStartInput {
+                user_id: request.user_id,
+                conversation: row,
+                request: SendMessageRequest {
+                    content: request.content,
+                    files: request.files,
+                    inject_skills: request.inject_skills,
+                    hidden: false,
+                },
+                build_options: build_opts,
+                stored_workspace,
+                turn_id: turn_id.clone(),
+                turn_claim,
+            })
+            .await;
+
+        Ok(ConversationAgentTurnOutcome {
+            runtime: self.runtime_summary_for(&conversation_id).await,
+            conversation_id,
+            turn_id,
+            status: match result.status {
+                ConversationTurnStatus::Completed => ConversationAgentTurnStatus::Completed,
+                ConversationTurnStatus::Failed => ConversationAgentTurnStatus::Failed,
+            },
+        })
     }
 
     pub(crate) async fn persist_and_broadcast_send_failure_tip(

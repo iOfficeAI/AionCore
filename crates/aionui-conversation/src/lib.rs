@@ -32,7 +32,9 @@ pub use response_middleware::{
 };
 pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;
-pub use service::ConversationService;
+pub use service::{
+    ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationService,
+};
 pub use state::ConversationRouterState;
 
 #[cfg(test)]
