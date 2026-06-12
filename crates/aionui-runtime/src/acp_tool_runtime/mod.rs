@@ -386,6 +386,9 @@ fn validate_tool_root(
         )));
     }
 
+    let spec = platform_spec()?;
+    validate_platform_binary(tool, root, spec)?;
+
     let env_path_entries = manifest
         .path_entries
         .into_iter()
@@ -1031,6 +1034,66 @@ mod tests {
 
         assert_eq!(kind, ManagedAcpToolFailureKind::BundledResourceInvalid);
         assert_eq!(status_code, None);
+    }
+
+    #[test]
+    fn validate_tool_root_rejects_claude_artifact_missing_platform_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let entrypoint = root
+            .join("node_modules")
+            .join("@agentclientprotocol")
+            .join("claude-agent-acp")
+            .join("dist")
+            .join("index.js");
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::write(&entrypoint, "console.log('claude bridge');\n").unwrap();
+        std::fs::write(
+            root.join("manifest.json"),
+            br#"{"entrypoint":"node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js","path_entries":["node_modules/.bin"]}"#,
+        )
+        .unwrap();
+
+        let error = validate_tool_root(ManagedAcpToolId::ClaudeAgentAcp, root, None)
+            .expect_err("Claude ACP artifact without platform binary should fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected managed Claude ACP platform binary missing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_tool_root_rejects_codex_artifact_missing_platform_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let entrypoint = root
+            .join("node_modules")
+            .join("@zed-industries")
+            .join("codex-acp")
+            .join("bin")
+            .join("codex-acp.js");
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::write(&entrypoint, "console.log('codex bridge');\n").unwrap();
+        std::fs::write(
+            root.join("manifest.json"),
+            br#"{"entrypoint":"node_modules/@zed-industries/codex-acp/bin/codex-acp.js","path_entries":["node_modules/.bin"]}"#,
+        )
+        .unwrap();
+
+        let error = validate_tool_root(ManagedAcpToolId::CodexAcp, root, None)
+            .expect_err("Codex ACP artifact without platform binary should fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected managed Codex ACP platform binary missing"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
