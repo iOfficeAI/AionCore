@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, WebSocketMessage,
+    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload,
+    TeamChildTurnPayload, TeamRunPayload, WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -19,6 +20,15 @@ pub const TEAM_RENAMED_EVENT: &str = "team.renamed";
 pub const TEAM_MCP_STATUS_EVENT: &str = "team.mcpStatus";
 pub const TEAM_TASK_CHANGED_EVENT: &str = "team.taskChanged";
 pub const TEAM_SESSION_CHANGED_EVENT: &str = "team.sessionChanged";
+pub const TEAM_RUN_ACCEPTED_EVENT: &str = "team.runAccepted";
+pub const TEAM_RUN_STARTED_EVENT: &str = "team.runStarted";
+pub const TEAM_RUN_UPDATED_EVENT: &str = "team.runUpdated";
+pub const TEAM_RUN_COMPLETED_EVENT: &str = "team.runCompleted";
+pub const TEAM_RUN_CANCELLED_EVENT: &str = "team.runCancelled";
+pub const TEAM_RUN_FAILED_EVENT: &str = "team.runFailed";
+pub const TEAM_CHILD_TURN_STARTED_EVENT: &str = "team.childTurnStarted";
+pub const TEAM_CHILD_TURN_COMPLETED_EVENT: &str = "team.childTurnCompleted";
+pub const TEAM_CHILD_TURN_CANCELLED_EVENT: &str = "team.childTurnCancelled";
 
 pub struct TeamEventEmitter {
     team_id: String,
@@ -80,6 +90,22 @@ impl TeamEventEmitter {
         let event = WebSocketMessage::new(
             TEAM_AGENT_RENAMED_EVENT,
             serde_json::to_value(payload).expect("serialize renamed payload"),
+        );
+        self.broadcaster.broadcast(event);
+    }
+
+    pub fn broadcast_team_run(&self, event_name: &'static str, payload: TeamRunPayload) {
+        let event = WebSocketMessage::new(
+            event_name,
+            serde_json::to_value(payload).expect("serialize team run payload"),
+        );
+        self.broadcaster.broadcast(event);
+    }
+
+    pub fn broadcast_child_turn(&self, event_name: &'static str, payload: TeamChildTurnPayload) {
+        let event = WebSocketMessage::new(
+            event_name,
+            serde_json::to_value(payload).expect("serialize team child turn payload"),
         );
         self.broadcaster.broadcast(event);
     }
@@ -211,6 +237,60 @@ mod tests {
         assert_eq!(events[0].name, "team.agentStatusChanged");
         assert_eq!(events[1].name, "team.agentStatusChanged");
         assert_eq!(events[2].name, "team.agentRemoved");
+    }
+
+    #[test]
+    fn team_run_event_has_correct_shape() {
+        let (emitter, bc) = make_emitter();
+        emitter.broadcast_team_run(
+            TEAM_RUN_ACCEPTED_EVENT,
+            aionui_api_types::TeamRunPayload {
+                team_id: "team-1".into(),
+                team_run_id: "run-1".into(),
+                target_slot_id: "lead-1".into(),
+                target_role: aionui_api_types::TeamRunTargetRole::Lead,
+                status: aionui_api_types::TeamRunStatus::Accepted,
+                active_child_count: 0,
+                pending_wake_count: 1,
+            },
+        );
+
+        let events = bc.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "team.runAccepted");
+
+        let payload: aionui_api_types::TeamRunPayload = serde_json::from_value(events[0].data.clone()).unwrap();
+        assert_eq!(payload.team_id, "team-1");
+        assert_eq!(payload.team_run_id, "run-1");
+        assert_eq!(payload.target_role, aionui_api_types::TeamRunTargetRole::Lead);
+        assert_eq!(payload.status, aionui_api_types::TeamRunStatus::Accepted);
+    }
+
+    #[test]
+    fn child_turn_event_has_correct_shape() {
+        let (emitter, bc) = make_emitter();
+        emitter.broadcast_child_turn(
+            TEAM_CHILD_TURN_STARTED_EVENT,
+            aionui_api_types::TeamChildTurnPayload {
+                team_id: "team-1".into(),
+                team_run_id: "run-1".into(),
+                slot_id: "worker-1".into(),
+                role: aionui_api_types::TeamRunTargetRole::Teammate,
+                conversation_id: "conv-1".into(),
+                turn_id: "turn-1".into(),
+                status: aionui_api_types::TeamRunStatus::Running,
+            },
+        );
+
+        let events = bc.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "team.childTurnStarted");
+
+        let payload: aionui_api_types::TeamChildTurnPayload = serde_json::from_value(events[0].data.clone()).unwrap();
+        assert_eq!(payload.team_id, "team-1");
+        assert_eq!(payload.team_run_id, "run-1");
+        assert_eq!(payload.slot_id, "worker-1");
+        assert_eq!(payload.status, aionui_api_types::TeamRunStatus::Running);
     }
 
     #[test]

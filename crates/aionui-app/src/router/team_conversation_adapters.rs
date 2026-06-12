@@ -3,15 +3,17 @@ use std::sync::Arc;
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{CreateConversationRequest, WebSocketMessage};
 use aionui_conversation::{
-    ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError, ConversationService,
+    ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
+    ConversationService,
 };
 use aionui_db::IConversationRepository;
 use aionui_db::models::MessageRow;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::{
-    AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest, AgentTurnStatus,
-    TeamConversationAdoptRequest, TeamConversationBindingLookup, TeamConversationCreateRequest,
-    TeamConversationLookupPort, TeamConversationProvisioningPort, TeamError, TeamProjectionMessageStore,
+    AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
+    AgentTurnStarted, AgentTurnStatus, TeamConversationAdoptRequest, TeamConversationBindingLookup,
+    TeamConversationCreateRequest, TeamConversationLookupPort, TeamConversationProvisioningPort, TeamError,
+    TeamProjectionMessageStore,
 };
 use async_trait::async_trait;
 
@@ -19,6 +21,7 @@ pub struct TeamConversationAdapters {
     conversation_service: ConversationService,
     conversation_repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
+    task_manager: Arc<dyn IWorkerTaskManager>,
 }
 
 impl TeamConversationAdapters {
@@ -26,11 +29,13 @@ impl TeamConversationAdapters {
         conversation_service: ConversationService,
         conversation_repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
+        task_manager: Arc<dyn IWorkerTaskManager>,
     ) -> Self {
         Self {
             conversation_service,
             conversation_repo,
             broadcaster,
+            task_manager,
         }
     }
 }
@@ -38,6 +43,36 @@ impl TeamConversationAdapters {
 #[async_trait]
 impl AgentTurnExecutionPort for TeamConversationAdapters {
     async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        let team_started = request.on_started.clone();
+        let team_run_id = request.team_run_id.clone();
+        let slot_id = request.slot_id.clone();
+        let role = request.role.clone();
+        let on_started = team_started.zip(team_run_id).map(|(callback, team_run_id)| {
+            Arc::new(move |started: ConversationAgentTurnStarted| {
+                let callback = callback.clone();
+                let team_run_id = team_run_id.clone();
+                let slot_id = slot_id.clone();
+                let role = role.clone();
+                Box::pin(async move {
+                    callback(AgentTurnStarted {
+                        team_run_id,
+                        slot_id,
+                        role,
+                        conversation_id: started.conversation_id,
+                        turn_id: started.turn_id,
+                    })
+                    .await;
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            })
+                as Arc<
+                    dyn Fn(
+                            ConversationAgentTurnStarted,
+                        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                        + Send
+                        + Sync,
+                >
+        });
+
         let outcome = self
             .conversation_service
             .run_agent_turn(ConversationAgentTurnRequest {
@@ -46,6 +81,7 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
                 content: request.content,
                 files: request.files,
                 inject_skills: Vec::new(),
+                on_started,
             })
             .await
             .map_err(map_conversation_turn_error)?;
@@ -59,6 +95,22 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
             },
             runtime: Some(outcome.runtime),
         })
+    }
+}
+
+#[async_trait]
+impl AgentTurnCancellationPort for TeamConversationAdapters {
+    async fn cancel_agent_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<(), AgentTurnExecutionError> {
+        self.conversation_service
+            .cancel(user_id, conversation_id, turn_id, &self.task_manager)
+            .await
+            .map(|_| ())
+            .map_err(map_conversation_turn_error)
     }
 }
 

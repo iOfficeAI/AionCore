@@ -23,8 +23,8 @@ use aionui_realtime::EventBroadcaster;
 
 use aionui_team::TeamSessionService;
 use aionui_team::ports::{
-    AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest, AgentTurnStatus,
-    TeamConversationBindingLookup, TeamConversationLookupPort,
+    AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
+    AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
 };
 use aionui_team::{
     TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationProvisioningPort,
@@ -189,6 +189,24 @@ impl AgentTurnExecutionPort for NoopTurnPort {
 
 fn noop_turn_port() -> Arc<dyn AgentTurnExecutionPort> {
     Arc::new(NoopTurnPort)
+}
+
+struct NoopCancellationPort;
+
+#[async_trait::async_trait]
+impl AgentTurnCancellationPort for NoopCancellationPort {
+    async fn cancel_agent_turn(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _turn_id: &str,
+    ) -> Result<(), AgentTurnExecutionError> {
+        Ok(())
+    }
+}
+
+fn noop_cancellation_port() -> Arc<dyn AgentTurnCancellationPort> {
+    Arc::new(NoopCancellationPort)
 }
 
 struct FakeConversationPorts {
@@ -931,6 +949,7 @@ fn setup_with_factory_and_metadata_and_conversation_repo(
         broadcaster,
         task_manager_dyn,
         noop_turn_port(),
+        noop_cancellation_port(),
         backend_binary_path,
         None,
     );
@@ -964,6 +983,7 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
         broadcaster,
         task_manager,
         noop_turn_port(),
+        noop_cancellation_port(),
         backend_binary_path,
         None,
     );

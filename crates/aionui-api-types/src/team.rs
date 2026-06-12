@@ -183,6 +183,71 @@ pub struct SendAgentMessageRequest {
     pub files: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamRunTargetRole {
+    Lead,
+    Teammate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamRunStatus {
+    Accepted,
+    Running,
+    Cancelling,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelTeamRunRequest {
+    #[serde(default)]
+    pub target_slot_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelTeamChildTurnRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamRunAckResponse {
+    pub team_run_id: String,
+    pub team_id: String,
+    pub target_slot_id: String,
+    pub target_role: TeamRunTargetRole,
+    pub status: TeamRunStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamRunPayload {
+    pub team_id: String,
+    pub team_run_id: String,
+    pub target_slot_id: String,
+    pub target_role: TeamRunTargetRole,
+    pub status: TeamRunStatus,
+    pub active_child_count: usize,
+    pub pending_wake_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamChildTurnPayload {
+    pub team_id: String,
+    pub team_run_id: String,
+    pub slot_id: String,
+    pub role: TeamRunTargetRole,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub status: TeamRunStatus,
+}
+
 // ---------------------------------------------------------------------------
 // E. Team management — Response DTOs
 // ---------------------------------------------------------------------------
@@ -939,6 +1004,41 @@ mod tests {
         assert_eq!(json["content"], "ping");
         assert_eq!(json["from_slot_id"], "slot-1");
         assert_eq!(json["from_name"], "Lead");
+    }
+
+    #[test]
+    fn team_run_ack_serializes_snake_case_enums() {
+        let ack = TeamRunAckResponse {
+            team_run_id: "trun-1".into(),
+            team_id: "team-1".into(),
+            target_slot_id: "lead-1".into(),
+            target_role: TeamRunTargetRole::Lead,
+            status: TeamRunStatus::Accepted,
+            message_id: Some("msg-1".into()),
+        };
+
+        let value = serde_json::to_value(&ack).unwrap();
+        assert_eq!(value["target_role"], "lead");
+        assert_eq!(value["status"], "accepted");
+        assert_eq!(value["message_id"], "msg-1");
+    }
+
+    #[test]
+    fn team_run_payload_omits_sensitive_content() {
+        let payload = TeamRunPayload {
+            team_id: "team-1".into(),
+            team_run_id: "trun-1".into(),
+            target_slot_id: "worker-1".into(),
+            target_role: TeamRunTargetRole::Teammate,
+            status: TeamRunStatus::Running,
+            active_child_count: 1,
+            pending_wake_count: 0,
+        };
+
+        let value = serde_json::to_value(&payload).unwrap();
+        assert!(value.get("content").is_none());
+        assert!(value.get("prompt").is_none());
+        assert!(value.get("tool_input").is_none());
     }
 
     #[test]

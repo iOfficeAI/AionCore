@@ -141,10 +141,11 @@ pub use system::{
     ClientPreferencesResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{
-    AddAgentRequest, CreateTeamRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, TeamAgentInput, TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse,
-    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamListResponse, TeamMcpPhase, TeamMcpRuntimeConfig,
-    TeamMcpStatusPayload, TeamResponse, TeamRuntimeSeed, TeamSessionBinding, TeammateMessagePayload,
+    AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, RenameAgentRequest,
+    RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput, TeamAgentRemovedPayload,
+    TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload,
+    TeamListResponse, TeamMcpPhase, TeamMcpRuntimeConfig, TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse,
+    TeamRunPayload, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed, TeamSessionBinding, TeammateMessagePayload,
 };
 pub use team_mcp::{GuideMcpConfig, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use websocket::WebSocketMessage;

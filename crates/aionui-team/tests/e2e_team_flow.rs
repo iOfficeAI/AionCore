@@ -36,7 +36,8 @@ use aionui_realtime::EventBroadcaster;
 use aionui_team::event_loop::AgentLoopContext;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use aionui_team::ports::{
-    AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest, AgentTurnStatus,
+    AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
+    AgentTurnStatus,
 };
 use aionui_team::service::TeamSessionService;
 use aionui_team::{TeamAgent, TeamProjectionMessageStore, TeamSession, TeammateRole};
@@ -80,6 +81,20 @@ impl AgentTurnExecutionPort for RecordingTurnPort {
             status: AgentTurnStatus::Completed,
             runtime: None,
         })
+    }
+}
+
+struct NoopCancellationPort;
+
+#[async_trait]
+impl AgentTurnCancellationPort for NoopCancellationPort {
+    async fn cancel_agent_turn(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _turn_id: &str,
+    ) -> Result<(), AgentTurnExecutionError> {
+        Ok(())
     }
 }
 
@@ -448,6 +463,7 @@ async fn setup_session_with_turn_recorder() -> (
     let turn_port_impl = Arc::new(RecordingTurnPort::default());
     let turn_requests = turn_port_impl.requests();
     let turn_port: Arc<dyn AgentTurnExecutionPort> = turn_port_impl;
+    let cancellation_port: Arc<dyn AgentTurnCancellationPort> = Arc::new(NoopCancellationPort);
 
     let team = aionui_team::types::Team {
         id: "e2e-team".into(),
@@ -465,6 +481,7 @@ async fn setup_session_with_turn_recorder() -> (
         backend_path(),
         task_manager_dyn,
         turn_port,
+        cancellation_port,
         Arc::new(NoopProjectionStore),
         "user-e2e".into(),
         Weak::<TeamSessionService>::new(),

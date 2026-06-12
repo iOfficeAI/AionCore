@@ -9,8 +9,9 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 
 use aionui_api_types::{
-    AddAgentRequest, ApiResponse, CreateTeamRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse,
+    AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
+    RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, SetModeRequest,
+    TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -68,6 +69,11 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         )
         .route("/api/teams/{id}/messages", post(send_message))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
+        .route("/api/teams/{id}/runs/{team_run_id}/cancel", post(cancel_run))
+        .route(
+            "/api/teams/{id}/runs/{team_run_id}/agents/{slot_id}/cancel",
+            post(cancel_child_turn),
+        )
         .route("/api/teams/{id}/session", post(ensure_session).delete(stop_session))
         .route("/api/teams/{id}/session-mode", post(set_session_mode))
         .with_state(state)
@@ -126,6 +132,19 @@ struct AgentPathParams {
     slot_id: String,
 }
 
+#[derive(serde::Deserialize)]
+struct RunPathParams {
+    id: String,
+    team_run_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RunAgentPathParams {
+    id: String,
+    team_run_id: String,
+    slot_id: String,
+}
+
 async fn add_agent(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -168,13 +187,13 @@ async fn send_message(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SendTeamMessageRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
+) -> Result<Json<ApiResponse<TeamRunAckResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state
+    let ack = state
         .service
         .send_message(&user.id, &id, &req.content, req.files)
         .await?;
-    Ok(Json(ApiResponse::success()))
+    Ok(Json(ApiResponse::ok(ack)))
 }
 
 async fn send_message_to_agent(
@@ -182,11 +201,45 @@ async fn send_message_to_agent(
     Extension(user): Extension<CurrentUser>,
     Path(params): Path<AgentPathParams>,
     body: Result<Json<SendAgentMessageRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamRunAckResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let ack = state
+        .service
+        .send_message_to_agent(&user.id, &params.id, &params.slot_id, &req.content, req.files)
+        .await?;
+    Ok(Json(ApiResponse::ok(ack)))
+}
+
+async fn cancel_run(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<RunPathParams>,
+    body: Result<Json<CancelTeamRunRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .service
-        .send_message_to_agent(&user.id, &params.id, &params.slot_id, &req.content, req.files)
+        .cancel_run(
+            &user.id,
+            &params.id,
+            &params.team_run_id,
+            req.target_slot_id,
+            req.reason,
+        )
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn cancel_child_turn(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<RunAgentPathParams>,
+    body: Result<Json<CancelTeamChildTurnRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .service
+        .cancel_child_turn(&user.id, &params.id, &params.team_run_id, &params.slot_id, req.reason)
         .await?;
     Ok(Json(ApiResponse::success()))
 }

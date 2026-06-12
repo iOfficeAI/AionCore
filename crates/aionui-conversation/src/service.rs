@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
@@ -139,13 +141,23 @@ pub struct ConversationService {
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConversationAgentTurnRequest {
     pub user_id: String,
     pub conversation_id: String,
     pub content: String,
     pub files: Vec<String>,
     pub inject_skills: Vec<String>,
+    pub on_started: Option<ConversationAgentTurnStartedCallback>,
+}
+
+pub type ConversationAgentTurnStartedCallback =
+    Arc<dyn Fn(ConversationAgentTurnStarted) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationAgentTurnStarted {
+    pub conversation_id: String,
+    pub turn_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1585,6 +1597,13 @@ impl ConversationService {
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
+        if let Some(on_started) = request.on_started.as_ref() {
+            on_started(ConversationAgentTurnStarted {
+                conversation_id: request.conversation_id.clone(),
+                turn_id: turn_id.clone(),
+            })
+            .await;
+        }
 
         let build_opts = match self.build_task_options(&row).await {
             Ok(opts) => opts,

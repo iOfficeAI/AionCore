@@ -7,10 +7,14 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::mailbox::Mailbox;
-use crate::ports::{AgentTurnExecutionPort, AgentTurnRequest, AgentTurnSource};
+use crate::ports::{
+    AgentTurnExecutionPort, AgentTurnRequest, AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback,
+};
 use crate::scheduler::TeammateManager;
 use crate::session::TeamSession;
+use crate::team_run::{ActiveChildTurn, target_role_for};
 use crate::types::TeammateStatus;
+use aionui_api_types::TeamRunStatus;
 
 /// Registry of per-agent Notify handles. Used by any trigger source to poke
 /// an agent's event loop without needing to know its internals.
@@ -92,6 +96,8 @@ pub struct AgentLoopContext {
 
 struct TurnExecution {
     finish_ok: bool,
+    team_run_id: Option<String>,
+    turn_id: Option<String>,
 }
 
 /// The event loop for one agent slot. Spawned as a tokio task.
@@ -148,6 +154,8 @@ async fn run_event_loop(
             };
 
             if !input.should_send {
+                ctx.session.team_run_manager().record_wake_consumed().await;
+                ctx.session.team_run_manager().maybe_complete().await;
                 break;
             }
 
@@ -176,9 +184,29 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
         .collect();
 
     let unread_message_ids = input.unread.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+    let role = target_role_for(input.agent_role);
+    let on_started: Option<AgentTurnStartedCallback> = input.team_run_id.as_ref().map(|_| {
+        let team_run_manager = ctx.session.team_run_manager().clone();
+        Arc::new(move |started: AgentTurnStarted| {
+            let team_run_manager = team_run_manager.clone();
+            Box::pin(async move {
+                team_run_manager
+                    .record_child_started(ActiveChildTurn {
+                        team_run_id: started.team_run_id,
+                        slot_id: started.slot_id,
+                        role: started.role,
+                        conversation_id: started.conversation_id,
+                        turn_id: started.turn_id,
+                    })
+                    .await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        }) as AgentTurnStartedCallback
+    });
     let request = AgentTurnRequest {
+        team_run_id: input.team_run_id.clone(),
         team_id: ctx.team_id.clone(),
         slot_id: ctx.slot_id.clone(),
+        role,
         conversation_id: input.conversation_id.clone(),
         user_id: ctx.user_id.clone(),
         content: input.first_message.clone(),
@@ -187,6 +215,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
             unread_count: input.unread.len(),
             unread_message_ids,
         },
+        on_started,
     };
 
     info!(
@@ -206,7 +235,14 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                 outcome = "failed",
                 "event loop: agent turn port call failed"
             );
-            return Some(TurnExecution { finish_ok: false });
+            if input.team_run_id.is_some() {
+                ctx.session.team_run_manager().complete_failed().await;
+            }
+            return Some(TurnExecution {
+                finish_ok: false,
+                team_run_id: input.team_run_id.clone(),
+                turn_id: None,
+            });
         }
     };
 
@@ -232,7 +268,11 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
         );
     }
 
-    Some(TurnExecution { finish_ok: turn_ok })
+    Some(TurnExecution {
+        finish_ok: turn_ok,
+        team_run_id: input.team_run_id.clone(),
+        turn_id: Some(outcome.turn_id),
+    })
 }
 
 /// Finalize a completed turn: mark idle (or error), cascade to leader.
@@ -243,6 +283,7 @@ async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, _conversatio
     match ctx.scheduler.finalize_turn(&ctx.slot_id, &[]).await {
         Ok(Some(wake_target)) => {
             if wake_target != ctx.slot_id {
+                ctx.session.team_run_manager().record_pending_wake().await;
                 ctx.registry.notify(&wake_target);
             }
         }
@@ -255,5 +296,17 @@ async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, _conversatio
                 "event loop: finalize_turn failed"
             );
         }
+    }
+    if let (Some(_team_run_id), Some(turn_id)) = (turn.team_run_id, turn.turn_id) {
+        let status = if turn.finish_ok {
+            TeamRunStatus::Completed
+        } else {
+            TeamRunStatus::Failed
+        };
+        ctx.session
+            .team_run_manager()
+            .record_child_completed(&ctx.slot_id, &turn_id, status)
+            .await;
+        ctx.session.team_run_manager().maybe_complete().await;
     }
 }

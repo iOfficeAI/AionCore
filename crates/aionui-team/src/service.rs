@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GuideMcpConfig, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload,
-    TeamResponse, WebSocketMessage,
+    TeamResponse, TeamRunAckResponse, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, WorkspacePathValidationError, generate_id, now_ms, validate_workspace_path_availability,
@@ -22,7 +22,9 @@ use crate::error::TeamError;
 use crate::event_loop::AgentLoopContext;
 use crate::events::{TEAM_CREATED_EVENT, TEAM_MCP_STATUS_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT};
 use crate::message_projection::TeamProjectionMessageStore;
-use crate::ports::{AgentTurnExecutionPort, TeamConversationBindingLookup, TeamConversationLookupPort};
+use crate::ports::{
+    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamConversationBindingLookup, TeamConversationLookupPort,
+};
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::session::TeamSession;
 use crate::types::{Team, TeamAgent, TeammateRole};
@@ -47,6 +49,7 @@ pub struct TeamSessionService {
     broadcaster: Arc<dyn EventBroadcaster>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     turn_port: Arc<dyn AgentTurnExecutionPort>,
+    cancellation_port: Arc<dyn AgentTurnCancellationPort>,
     backend_binary_path: Arc<PathBuf>,
     sessions: Arc<DashMap<String, SessionEntry>>,
     /// Per-team mutex serializing `add_agent` so concurrent callers cannot
@@ -81,6 +84,7 @@ impl TeamSessionService {
         broadcaster: Arc<dyn EventBroadcaster>,
         task_manager: Arc<dyn IWorkerTaskManager>,
         turn_port: Arc<dyn AgentTurnExecutionPort>,
+        cancellation_port: Arc<dyn AgentTurnCancellationPort>,
         backend_binary_path: Arc<PathBuf>,
         guide_mcp_config: Option<GuideMcpConfig>,
     ) -> Arc<Self> {
@@ -94,6 +98,7 @@ impl TeamSessionService {
             broadcaster,
             task_manager,
             turn_port,
+            cancellation_port,
             backend_binary_path,
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
@@ -503,6 +508,7 @@ impl TeamSessionService {
             self.backend_binary_path.clone(),
             self.task_manager.clone(),
             self.turn_port.clone(),
+            self.cancellation_port.clone(),
             self.projection_store.clone(),
             user_id.clone(),
             self.self_ref.clone(),
@@ -731,7 +737,7 @@ impl TeamSessionService {
         team_id: &str,
         content: &str,
         files: Option<Vec<String>>,
-    ) -> Result<(), TeamError> {
+    ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, false).await?;
         let session = {
@@ -751,7 +757,7 @@ impl TeamSessionService {
         slot_id: &str,
         content: &str,
         files: Option<Vec<String>>,
-    ) -> Result<(), TeamError> {
+    ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, false).await?;
         let session = {
@@ -762,6 +768,46 @@ impl TeamSessionService {
             Arc::clone(&entry.session)
         };
         session.send_message_to_agent(slot_id, content, files).await
+    }
+
+    pub async fn cancel_run(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        team_run_id: &str,
+        target_slot_id: Option<String>,
+        reason: Option<String>,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        self.ensure_session_inner(team_id, false).await?;
+        let session = {
+            let entry = self
+                .sessions
+                .get(team_id)
+                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+            Arc::clone(&entry.session)
+        };
+        session.cancel_run(team_run_id, target_slot_id, reason).await
+    }
+
+    pub async fn cancel_child_turn(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        team_run_id: &str,
+        slot_id: &str,
+        reason: Option<String>,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        self.ensure_session_inner(team_id, false).await?;
+        let session = {
+            let entry = self
+                .sessions
+                .get(team_id)
+                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+            Arc::clone(&entry.session)
+        };
+        session.cancel_child_turn(team_run_id, slot_id, reason).await
     }
 
     pub async fn set_session_mode(&self, user_id: &str, team_id: &str, mode: &str) -> Result<(), TeamError> {

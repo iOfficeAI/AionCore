@@ -17,6 +17,7 @@ pub mod scheduler;
 pub mod service;
 pub mod session;
 pub mod task_board;
+pub mod team_run;
 #[cfg(test)]
 pub(crate) mod test_utils;
 pub mod types;
@@ -33,8 +34,9 @@ pub use message_projection::{
     TeamProjectionSource,
 };
 pub use ports::{
-    AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest, AgentTurnSource,
-    AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
+    AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
+    AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback, AgentTurnStatus, TeamConversationBindingLookup,
+    TeamConversationLookupPort,
 };
 
 pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
@@ -48,6 +50,7 @@ pub use scheduler::{
 pub use service::TeamSessionService;
 pub use session::{TeamSession, WakeInput};
 pub use task_board::{TaskBoard, TaskUpdate};
+pub use team_run::{ActiveChildTurn, TeamRunManager, target_role_for};
 pub use types::{
     MailboxMessage, MailboxMessageType, TaskStatus, Team, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
 };

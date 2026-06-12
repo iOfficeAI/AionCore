@@ -39,8 +39,8 @@ use aionui_system::{
     ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService,
 };
 use aionui_team::{
-    TeamConversationLookupPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState,
-    TeamSessionService,
+    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamConversationLookupPort, TeamConversationProvisioningPort,
+    TeamProjectionMessageStore, TeamRouterState, TeamSessionService,
 };
 
 use crate::config::derive_encryption_key;
@@ -545,11 +545,13 @@ pub fn build_team_state(
         conv_service,
         conv_repo,
         services.event_bus.clone(),
+        services.worker_task_manager.clone(),
     ));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = adapters.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = adapters.clone();
     let lookup_port: Arc<dyn TeamConversationLookupPort> = adapters.clone();
-    let turn_port = adapters;
+    let turn_port: Arc<dyn AgentTurnExecutionPort> = adapters.clone();
+    let cancellation_port: Arc<dyn AgentTurnCancellationPort> = adapters;
     let service = TeamSessionService::new(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
@@ -560,6 +562,7 @@ pub fn build_team_state(
         services.event_bus.clone(),
         services.worker_task_manager.clone(),
         turn_port,
+        cancellation_port,
         backend_binary_path,
         guide_mcp_config,
     );

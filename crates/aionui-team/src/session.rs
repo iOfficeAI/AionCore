@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::IWorkerTaskManager;
+use aionui_api_types::{TeamRunAckResponse, TeamRunTargetRole};
 use aionui_common::AgentKillReason;
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
@@ -9,16 +10,18 @@ use tracing::{info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
+use crate::events::TeamEventEmitter;
 use crate::mailbox::Mailbox;
 use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
 use crate::message_projection::{
     TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
 };
-use crate::ports::AgentTurnExecutionPort;
+use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
 use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
+use crate::team_run::{TeamRunManager, target_role_for};
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 
 /// Input for the wake path. Produced by [`TeamSession::compute_wake_input`],
@@ -26,6 +29,7 @@ use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateSt
 /// in D7a). `first_message` includes the role prompt on cold starts.
 #[derive(Debug, Clone)]
 pub struct WakeInput {
+    pub team_run_id: Option<String>,
     pub conversation_id: String,
     pub first_message: String,
     /// `false` when the mailbox is empty — caller should skip wake and
@@ -60,7 +64,9 @@ pub struct TeamSession {
     backend_binary_path: Arc<PathBuf>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     turn_port: Arc<dyn AgentTurnExecutionPort>,
+    cancellation_port: Arc<dyn AgentTurnCancellationPort>,
     projection_store: Arc<dyn TeamProjectionMessageStore>,
+    team_run_manager: Arc<TeamRunManager>,
     /// Owner user_id for this team — needed when spawn_agent creates a
     /// new conversation (conversations are scoped per user).
     user_id: String,
@@ -87,12 +93,17 @@ impl TeamSession {
         backend_binary_path: Arc<PathBuf>,
         task_manager: Arc<dyn IWorkerTaskManager>,
         turn_port: Arc<dyn AgentTurnExecutionPort>,
+        cancellation_port: Arc<dyn AgentTurnCancellationPort>,
         projection_store: Arc<dyn TeamProjectionMessageStore>,
         user_id: String,
         service: Weak<TeamSessionService>,
     ) -> Result<Self, TeamError> {
         let mailbox = Arc::new(Mailbox::new(repo.clone()));
         let task_board = Arc::new(TaskBoard::new(repo));
+        let team_run_manager = Arc::new(TeamRunManager::new(
+            team.id.clone(),
+            Arc::new(TeamEventEmitter::new(team.id.clone(), broadcaster.clone())),
+        ));
 
         let scheduler = Arc::new(TeammateManager::new(
             team.id.clone(),
@@ -129,7 +140,9 @@ impl TeamSession {
             backend_binary_path,
             task_manager,
             turn_port,
+            cancellation_port,
             projection_store,
+            team_run_manager,
             user_id,
             service,
             broadcaster,
@@ -155,6 +168,10 @@ impl TeamSession {
 
     pub fn turn_port(&self) -> &Arc<dyn AgentTurnExecutionPort> {
         &self.turn_port
+    }
+
+    pub fn team_run_manager(&self) -> &Arc<TeamRunManager> {
+        &self.team_run_manager
     }
 
     /// Signal an agent's event loop to drain its mailbox.
@@ -235,6 +252,7 @@ impl TeamSession {
         let should_send = !unread.is_empty();
 
         Ok(Some(WakeInput {
+            team_run_id: self.team_run_manager.active_run_id().await,
             conversation_id: agent.conversation_id,
             first_message,
             should_send,
@@ -297,7 +315,11 @@ impl TeamSession {
     /// semantics — see backend-audit §3.5 #46): the mailbox row is already
     /// persisted, so surfacing an error to the HTTP caller would invite a
     /// retry that double-writes the message.
-    pub async fn send_message(&self, content: &str, files: Option<Vec<String>>) -> Result<(), TeamError> {
+    pub async fn send_message(
+        &self,
+        content: &str,
+        files: Option<Vec<String>>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let lead_slot_id = self
             .scheduler
             .find_lead_slot_id()
@@ -305,8 +327,13 @@ impl TeamSession {
             .ok_or_else(|| TeamError::AgentNotFound("no lead agent in team".into()))?;
 
         let lead_conv_id = self.scheduler.get_agent(&lead_slot_id).await?.conversation_id;
+        let mut ack = self
+            .team_run_manager
+            .accept_user_message(&lead_slot_id, TeamRunTargetRole::Lead, false, None)
+            .await?;
 
-        self.mailbox
+        let mailbox_message = match self
+            .mailbox
             .write_with_files(
                 &self.team.id,
                 &lead_slot_id,
@@ -316,7 +343,15 @@ impl TeamSession {
                 None,
                 files.as_deref(),
             )
-            .await?;
+            .await
+        {
+            Ok(message) => message,
+            Err(err) => {
+                self.team_run_manager.complete_failed().await;
+                return Err(err);
+            }
+        };
+        ack.message_id = Some(mailbox_message.id.clone());
 
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest::user_visible(
@@ -337,7 +372,7 @@ impl TeamSession {
         }
 
         self.try_wake(&lead_slot_id, files).await;
-        Ok(())
+        Ok(ack)
     }
 
     /// Write a user message to the specified agent's mailbox and trigger a wake.
@@ -349,10 +384,20 @@ impl TeamSession {
         slot_id: &str,
         content: &str,
         files: Option<Vec<String>>,
-    ) -> Result<(), TeamError> {
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
+        let mut ack = self
+            .team_run_manager
+            .accept_user_message(
+                slot_id,
+                target_role_for(agent.role),
+                agent.role == TeammateRole::Teammate,
+                None,
+            )
+            .await?;
 
-        self.mailbox
+        let mailbox_message = match self
+            .mailbox
             .write_with_files(
                 &self.team.id,
                 slot_id,
@@ -362,7 +407,15 @@ impl TeamSession {
                 None,
                 files.as_deref(),
             )
-            .await?;
+            .await
+        {
+            Ok(message) => message,
+            Err(err) => {
+                self.team_run_manager.complete_failed().await;
+                return Err(err);
+            }
+        };
+        ack.message_id = Some(mailbox_message.id.clone());
 
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest::user_visible(
@@ -383,7 +436,7 @@ impl TeamSession {
         }
 
         self.try_wake(slot_id, files).await;
-        Ok(())
+        Ok(ack)
     }
 
     /// Signal an agent's event loop to process its mailbox.
@@ -400,6 +453,7 @@ impl TeamSession {
     /// drained once a Team session registers the event loop.
     pub(crate) async fn try_wake(&self, slot_id: &str, files: Option<Vec<String>>) {
         let _ = files;
+        self.team_run_manager.record_pending_wake().await;
         if self.event_loops.has(slot_id) {
             self.event_loops.notify(slot_id);
             return;
@@ -471,6 +525,103 @@ impl TeamSession {
                 );
             }
         }
+    }
+
+    pub async fn cancel_run(
+        &self,
+        team_run_id: &str,
+        target_slot_id: Option<String>,
+        reason: Option<String>,
+    ) -> Result<(), TeamError> {
+        let current_run_id = self
+            .team_run_manager
+            .current_run_id()
+            .await
+            .ok_or_else(|| TeamError::InvalidRequest("no active team run to cancel".into()))?;
+        if current_run_id != team_run_id {
+            return Err(TeamError::InvalidRequest(format!(
+                "team run {team_run_id} is not active"
+            )));
+        }
+
+        self.team_run_manager.begin_cancel(target_slot_id, reason).await?;
+
+        let agent_ids = self
+            .scheduler
+            .list_agents()
+            .await
+            .into_iter()
+            .map(|agent| agent.slot_id)
+            .collect::<Vec<_>>();
+        let marked = self
+            .mailbox
+            .mark_all_unread_for_agents_read(&self.team.id, &agent_ids)
+            .await?;
+        info!(
+            team_id = %self.team.id,
+            team_run_id,
+            marked_unread = marked,
+            "team_run cancel drained unread mailbox rows"
+        );
+
+        for child in self.team_run_manager.active_child_turns().await {
+            if let Err(err) = self
+                .cancellation_port
+                .cancel_agent_turn(&self.user_id, &child.conversation_id, &child.turn_id)
+                .await
+            {
+                warn!(
+                    team_id = %self.team.id,
+                    team_run_id,
+                    slot_id = %child.slot_id,
+                    turn_id = %child.turn_id,
+                    error = %err,
+                    "team_run cancel child turn failed (continuing)"
+                );
+            }
+        }
+
+        self.team_run_manager.complete_cancelled().await;
+        Ok(())
+    }
+
+    pub async fn cancel_child_turn(
+        &self,
+        team_run_id: &str,
+        slot_id: &str,
+        reason: Option<String>,
+    ) -> Result<(), TeamError> {
+        let child = self.team_run_manager.begin_cancel_child(slot_id).await?;
+        if child.team_run_id != team_run_id {
+            return Err(TeamError::InvalidRequest(format!(
+                "agent {slot_id} is not active in team run {team_run_id}"
+            )));
+        }
+        self.cancellation_port
+            .cancel_agent_turn(&self.user_id, &child.conversation_id, &child.turn_id)
+            .await
+            .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
+        self.team_run_manager.record_child_cancelled(&child).await;
+
+        if child.role == TeamRunTargetRole::Teammate
+            && let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await
+        {
+            let content = reason.unwrap_or_else(|| format!("Agent {slot_id} was interrupted by the user."));
+            self.mailbox
+                .write(
+                    &self.team.id,
+                    &lead_slot_id,
+                    slot_id,
+                    MailboxMessageType::IdleNotification,
+                    &content,
+                    Some("Interrupted by user"),
+                )
+                .await?;
+            self.try_wake(&lead_slot_id, None).await;
+        } else {
+            self.team_run_manager.maybe_complete().await;
+        }
+        Ok(())
     }
 
     pub async fn add_agent(&self, agent: &TeamAgent) {
@@ -718,6 +869,24 @@ mod tests {
         Arc::new(NoopTurnPort)
     }
 
+    struct NoopCancellationPort;
+
+    #[async_trait::async_trait]
+    impl crate::ports::AgentTurnCancellationPort for NoopCancellationPort {
+        async fn cancel_agent_turn(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _turn_id: &str,
+        ) -> Result<(), crate::ports::AgentTurnExecutionError> {
+            Ok(())
+        }
+    }
+
+    fn noop_cancellation_port() -> Arc<dyn crate::ports::AgentTurnCancellationPort> {
+        Arc::new(NoopCancellationPort)
+    }
+
     #[derive(Default)]
     struct NoopProjectionStore;
 
@@ -895,6 +1064,7 @@ mod tests {
             backend_path(),
             empty_task_manager(),
             noop_turn_port(),
+            noop_cancellation_port(),
             noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
@@ -944,6 +1114,7 @@ mod tests {
             backend_path(),
             empty_task_manager(),
             noop_turn_port(),
+            noop_cancellation_port(),
             noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
@@ -972,6 +1143,7 @@ mod tests {
             backend_path(),
             empty_task_manager(),
             noop_turn_port(),
+            noop_cancellation_port(),
             noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
@@ -1041,6 +1213,7 @@ mod tests {
             backend_path(),
             stub_dyn,
             noop_turn_port(),
+            noop_cancellation_port(),
             noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
@@ -1073,6 +1246,7 @@ mod tests {
             backend_path(),
             stub_dyn,
             noop_turn_port(),
+            noop_cancellation_port(),
             noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
@@ -1385,6 +1559,7 @@ mod tests {
             backend_path(),
             task_manager,
             noop_turn_port(),
+            noop_cancellation_port(),
             noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
@@ -1485,6 +1660,7 @@ mod tests {
             backend_path(),
             empty_task_manager(),
             noop_turn_port(),
+            noop_cancellation_port(),
             noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
@@ -1506,6 +1682,7 @@ mod tests {
             backend_path(),
             empty_task_manager(),
             noop_turn_port(),
+            noop_cancellation_port(),
             noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),

@@ -33,7 +33,8 @@ pub use response_middleware::{
 pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;
 pub use service::{
-    ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationService,
+    ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
+    ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
 };
 pub use state::ConversationRouterState;
 
