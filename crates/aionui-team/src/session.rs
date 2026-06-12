@@ -21,7 +21,7 @@ use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payloa
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
-use crate::team_run::{TeamRunManager, target_role_for};
+use crate::team_run::{ChildCancelTarget, TeamRunManager, target_role_for};
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 
 /// Input for the wake path. Produced by [`TeamSession::compute_wake_input`],
@@ -168,6 +168,10 @@ impl TeamSession {
 
     pub fn turn_port(&self) -> &Arc<dyn AgentTurnExecutionPort> {
         &self.turn_port
+    }
+
+    pub fn cancellation_port(&self) -> &Arc<dyn AgentTurnCancellationPort> {
+        &self.cancellation_port
     }
 
     pub fn team_run_manager(&self) -> &Arc<TeamRunManager> {
@@ -582,16 +586,31 @@ impl TeamSession {
                     "team_run cancel child turn failed (continuing)"
                 );
             }
+            self.team_run_manager.record_child_cancelled(&child).await;
         }
 
-        self.team_run_manager.complete_cancelled().await;
-        info!(
-            team_id = %self.team.id,
-            team_run_id,
-            active_child_count,
-            marked_unread = marked,
-            "team_run cancel completed"
-        );
+        match self.team_run_manager.try_complete_cancelled().await {
+            Some(payload) => {
+                info!(
+                    team_id = %self.team.id,
+                    team_run_id,
+                    active_child_count,
+                    starting_child_count = payload.starting_child_count,
+                    pending_wake_count = payload.pending_wake_count,
+                    marked_unread = marked,
+                    "team_run cancel completed"
+                );
+            }
+            None => {
+                info!(
+                    team_id = %self.team.id,
+                    team_run_id,
+                    active_child_count,
+                    marked_unread = marked,
+                    "team_run cancel completion pending"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -601,21 +620,43 @@ impl TeamSession {
         slot_id: &str,
         reason: Option<String>,
     ) -> Result<(), TeamError> {
-        let child = self.team_run_manager.begin_cancel_child(slot_id).await?;
-        if child.team_run_id != team_run_id {
-            return Err(TeamError::InvalidRequest(format!(
-                "agent {slot_id} is not active in team run {team_run_id}"
-            )));
-        }
-        self.cancellation_port
-            .cancel_agent_turn(&self.user_id, &child.conversation_id, &child.turn_id)
-            .await
-            .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
-        self.team_run_manager.record_child_cancelled(&child).await;
+        let target = self.team_run_manager.begin_cancel_child(slot_id).await?;
+        match target {
+            ChildCancelTarget::Active(child) => {
+                if child.team_run_id != team_run_id {
+                    return Err(TeamError::InvalidRequest(format!(
+                        "agent {slot_id} is not active in team run {team_run_id}"
+                    )));
+                }
+                self.cancellation_port
+                    .cancel_agent_turn(&self.user_id, &child.conversation_id, &child.turn_id)
+                    .await
+                    .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
+                self.team_run_manager.record_child_cancelled(&child).await;
 
-        if child.role == TeamRunTargetRole::Teammate
-            && let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await
-        {
+                if child.role == TeamRunTargetRole::Teammate {
+                    self.notify_leader_child_interrupted(slot_id, reason).await?;
+                } else {
+                    self.team_run_manager.maybe_complete().await;
+                }
+            }
+            ChildCancelTarget::Starting(reservation) => {
+                if reservation.team_run_id != team_run_id {
+                    return Err(TeamError::InvalidRequest(format!(
+                        "agent {slot_id} is not starting in team run {team_run_id}"
+                    )));
+                }
+                if reservation.role == TeamRunTargetRole::Teammate {
+                    self.notify_leader_child_interrupted(slot_id, reason).await?;
+                }
+                self.team_run_manager.try_complete_cancelled().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn notify_leader_child_interrupted(&self, slot_id: &str, reason: Option<String>) -> Result<(), TeamError> {
+        if let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await {
             let content = reason.unwrap_or_else(|| format!("Agent {slot_id} was interrupted by the user."));
             self.mailbox
                 .write(
@@ -628,8 +669,6 @@ impl TeamSession {
                 )
                 .await?;
             self.try_wake(&lead_slot_id, None).await;
-        } else {
-            self.team_run_manager.maybe_complete().await;
         }
         Ok(())
     }
@@ -866,6 +905,16 @@ mod tests {
             &self,
             request: crate::ports::AgentTurnRequest,
         ) -> Result<crate::ports::AgentTurnOutcome, crate::ports::AgentTurnExecutionError> {
+            if let Some(on_started) = request.on_started.as_ref() {
+                on_started(crate::ports::AgentTurnStarted {
+                    team_run_id: request.team_run_id.clone().expect("team run id"),
+                    slot_id: request.slot_id.clone(),
+                    role: request.role.clone(),
+                    conversation_id: request.conversation_id.clone(),
+                    turn_id: "turn-test".into(),
+                })
+                .await;
+            }
             Ok(crate::ports::AgentTurnOutcome {
                 conversation_id: request.conversation_id,
                 turn_id: "turn-test".into(),

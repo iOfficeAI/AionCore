@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -12,7 +15,7 @@ use crate::ports::{
 };
 use crate::scheduler::TeammateManager;
 use crate::session::TeamSession;
-use crate::team_run::{ActiveChildTurn, target_role_for};
+use crate::team_run::{ActiveChildTurn, ChildStartDecision, target_role_for};
 use crate::types::TeammateStatus;
 use aionui_api_types::TeamRunStatus;
 
@@ -154,8 +157,10 @@ async fn run_event_loop(
             };
 
             if !input.should_send {
-                ctx.session.team_run_manager().record_wake_consumed().await;
-                ctx.session.team_run_manager().maybe_complete().await;
+                ctx.session
+                    .team_run_manager()
+                    .record_empty_wake_observed(&ctx.slot_id)
+                    .await;
                 break;
             }
 
@@ -185,20 +190,72 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
 
     let unread_message_ids = input.unread.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
     let role = target_role_for(input.agent_role);
-    let on_started: Option<AgentTurnStartedCallback> = input.team_run_id.as_ref().map(|_| {
+    let reservation = if input.team_run_id.is_some() {
+        match ctx
+            .session
+            .team_run_manager()
+            .claim_wake_for_turn(&ctx.slot_id, role.clone(), &input.conversation_id)
+            .await
+        {
+            Some(reservation) => Some(reservation),
+            None => {
+                warn!(
+                    team_id = %ctx.team_id,
+                    team_run_id = ?input.team_run_id,
+                    slot_id = %ctx.slot_id,
+                    conversation_id = %input.conversation_id,
+                    "event loop: team run wake skipped because reservation could not be claimed"
+                );
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    let started_seen = Arc::new(AtomicBool::new(false));
+    let on_started: Option<AgentTurnStartedCallback> = reservation.clone().map(|reservation| {
         let team_run_manager = ctx.session.team_run_manager().clone();
+        let cancellation_port = ctx.session.cancellation_port().clone();
+        let user_id = ctx.user_id.clone();
+        let started_seen = started_seen.clone();
         Arc::new(move |started: AgentTurnStarted| {
             let team_run_manager = team_run_manager.clone();
+            let cancellation_port = cancellation_port.clone();
+            let user_id = user_id.clone();
+            let reservation_id = reservation.reservation_id.clone();
+            started_seen.store(true, Ordering::SeqCst);
             Box::pin(async move {
-                team_run_manager
-                    .record_child_started(ActiveChildTurn {
-                        team_run_id: started.team_run_id,
-                        slot_id: started.slot_id,
-                        role: started.role,
-                        conversation_id: started.conversation_id,
-                        turn_id: started.turn_id,
-                    })
-                    .await;
+                let child = ActiveChildTurn {
+                    team_run_id: started.team_run_id,
+                    slot_id: started.slot_id,
+                    role: started.role,
+                    conversation_id: started.conversation_id,
+                    turn_id: started.turn_id,
+                };
+                match team_run_manager
+                    .record_child_started(&reservation_id, child.clone())
+                    .await
+                {
+                    ChildStartDecision::Accepted => {}
+                    ChildStartDecision::CancelImmediately(child) => {
+                        if let Err(err) = cancellation_port
+                            .cancel_agent_turn(&user_id, &child.conversation_id, &child.turn_id)
+                            .await
+                        {
+                            warn!(
+                                team_run_id = %child.team_run_id,
+                                slot_id = %child.slot_id,
+                                conversation_id = %child.conversation_id,
+                                turn_id = %child.turn_id,
+                                error = %err,
+                                "event loop: late-start child cancellation failed"
+                            );
+                        }
+                        team_run_manager.record_child_cancelled(&child).await;
+                        team_run_manager.try_complete_cancelled().await;
+                    }
+                    ChildStartDecision::Ignored => {}
+                }
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         }) as AgentTurnStartedCallback
     });
@@ -237,8 +294,17 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                 outcome = "failed",
                 "event loop: agent turn port call failed"
             );
-            if input.team_run_id.is_some() {
-                ctx.session.team_run_manager().complete_failed().await;
+            if input.team_run_id.is_some()
+                && let Some(reservation) = reservation.as_ref()
+            {
+                if started_seen.load(Ordering::SeqCst) {
+                    ctx.session.team_run_manager().complete_failed().await;
+                } else {
+                    ctx.session
+                        .team_run_manager()
+                        .record_child_start_failed(&reservation.reservation_id, &e.to_string())
+                        .await;
+                }
             }
             return Some(TurnExecution {
                 finish_ok: false,

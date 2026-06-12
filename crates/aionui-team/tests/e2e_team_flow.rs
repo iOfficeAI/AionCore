@@ -22,6 +22,7 @@ mod common;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use aionui_ai_agent::AgentError;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
@@ -37,7 +38,7 @@ use aionui_team::event_loop::AgentLoopContext;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnStatus,
+    AgentTurnStarted, AgentTurnStatus,
 };
 use aionui_team::service::TeamSessionService;
 use aionui_team::{TeamAgent, TeamProjectionMessageStore, TeamSession, TeammateRole};
@@ -45,7 +46,7 @@ use async_trait::async_trait;
 use common::MockTeamRepo;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 // ===========================================================================
 // Shared test infrastructure
@@ -75,9 +76,20 @@ impl AgentTurnExecutionPort for RecordingTurnPort {
             requests.push(request.clone());
             requests.len()
         };
+        let turn_id = format!("turn-test-{turn_index}");
+        if let Some(on_started) = request.on_started.as_ref() {
+            on_started(AgentTurnStarted {
+                team_run_id: request.team_run_id.clone().expect("team run id"),
+                slot_id: request.slot_id.clone(),
+                role: request.role.clone(),
+                conversation_id: request.conversation_id.clone(),
+                turn_id: turn_id.clone(),
+            })
+            .await;
+        }
         Ok(AgentTurnOutcome {
             conversation_id: request.conversation_id,
-            turn_id: format!("turn-test-{turn_index}"),
+            turn_id,
             status: AgentTurnStatus::Completed,
             runtime: None,
         })
@@ -94,6 +106,108 @@ impl AgentTurnCancellationPort for NoopCancellationPort {
         _conversation_id: &str,
         _turn_id: &str,
     ) -> Result<(), AgentTurnExecutionError> {
+        Ok(())
+    }
+}
+
+struct ErrorBeforeStartTurnPort;
+
+#[async_trait]
+impl AgentTurnExecutionPort for ErrorBeforeStartTurnPort {
+    async fn run_agent_turn(&self, _request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        Err(AgentTurnExecutionError::Failed {
+            reason: "failed before start".into(),
+        })
+    }
+}
+
+struct StartedThenFailedTurnPort;
+
+#[async_trait]
+impl AgentTurnExecutionPort for StartedThenFailedTurnPort {
+    async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        if let Some(on_started) = request.on_started.as_ref() {
+            on_started(AgentTurnStarted {
+                team_run_id: request.team_run_id.clone().expect("team run id"),
+                slot_id: request.slot_id.clone(),
+                role: request.role.clone(),
+                conversation_id: request.conversation_id.clone(),
+                turn_id: "turn-failed".into(),
+            })
+            .await;
+        }
+        Ok(AgentTurnOutcome {
+            conversation_id: request.conversation_id,
+            turn_id: "turn-failed".into(),
+            status: AgentTurnStatus::Failed,
+            runtime: None,
+        })
+    }
+}
+
+struct BlockingStartTurnPort {
+    claimed_tx: Mutex<Option<oneshot::Sender<()>>>,
+    release_rx: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl BlockingStartTurnPort {
+    fn new(claimed_tx: oneshot::Sender<()>, release_rx: oneshot::Receiver<()>) -> Self {
+        Self {
+            claimed_tx: Mutex::new(Some(claimed_tx)),
+            release_rx: Mutex::new(Some(release_rx)),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentTurnExecutionPort for BlockingStartTurnPort {
+    async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        if let Some(tx) = self.claimed_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        let release_rx = self.release_rx.lock().unwrap().take();
+        if let Some(rx) = release_rx {
+            let _ = rx.await;
+        }
+        if let Some(on_started) = request.on_started.as_ref() {
+            on_started(AgentTurnStarted {
+                team_run_id: request.team_run_id.clone().expect("team run id"),
+                slot_id: request.slot_id.clone(),
+                role: request.role.clone(),
+                conversation_id: request.conversation_id.clone(),
+                turn_id: "turn-late-start".into(),
+            })
+            .await;
+        }
+        Ok(AgentTurnOutcome {
+            conversation_id: request.conversation_id,
+            turn_id: "turn-late-start".into(),
+            status: AgentTurnStatus::Completed,
+            runtime: None,
+        })
+    }
+}
+
+#[derive(Default)]
+struct RecordingCancellationPort {
+    cancelled: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingCancellationPort {
+    fn cancelled(&self) -> Arc<Mutex<Vec<String>>> {
+        self.cancelled.clone()
+    }
+}
+
+#[async_trait]
+impl AgentTurnCancellationPort for RecordingCancellationPort {
+    async fn cancel_agent_turn(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<(), AgentTurnExecutionError> {
+        self.cancelled.lock().unwrap().push(turn_id.to_owned());
         Ok(())
     }
 }
@@ -503,6 +617,59 @@ async fn setup_session() -> (
 ) {
     let (session, task_manager, repo, sent, _turn_requests) = setup_session_with_turn_recorder().await;
     (session, task_manager, repo, sent)
+}
+
+async fn setup_session_with_runtime_ports(
+    turn_port: Arc<dyn AgentTurnExecutionPort>,
+    cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+    broadcaster: Arc<RecordingBroadcaster>,
+) -> Arc<TeamSession> {
+    let repo = Arc::new(MockTeamRepo::new());
+    let repo_dyn: Arc<dyn ITeamRepository> = repo;
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster;
+    let task_manager = Arc::new(StubTaskManager::new());
+    for agent in two_agents() {
+        let sent: Arc<Mutex<Vec<SendMessageData>>> = Arc::new(Mutex::new(Vec::new()));
+        let handle = AgentInstance::Mock(Arc::new(RecordingAgent::new(&agent.conversation_id, sent)));
+        task_manager.insert(&agent.conversation_id, handle);
+    }
+    let task_manager_dyn: Arc<dyn aionui_ai_agent::IWorkerTaskManager> = task_manager;
+    let team = aionui_team::types::Team {
+        id: "e2e-team".into(),
+        name: "E2E Team".into(),
+        agents: two_agents(),
+        lead_agent_id: Some("lead-1".into()),
+        created_at: 1000,
+        updated_at: 1000,
+    };
+
+    let session = TeamSession::start(
+        team,
+        repo_dyn,
+        broadcaster_dyn,
+        backend_path(),
+        task_manager_dyn,
+        turn_port,
+        cancellation_port,
+        Arc::new(NoopProjectionStore),
+        "user-e2e".into(),
+        Weak::<TeamSessionService>::new(),
+    )
+    .await
+    .expect("TeamSession::start failed");
+    let session = Arc::new(session);
+    register_test_event_loops(&session);
+    session
+}
+
+async fn wait_for_event(broadcaster: &RecordingBroadcaster, name: &str) {
+    for _ in 0..100 {
+        if !broadcaster.events_named(name).is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for event {name}");
 }
 
 fn register_test_event_loops(session: &Arc<TeamSession>) {
@@ -1256,6 +1423,86 @@ async fn s9_session_send_message_wakes_lead() {
     assert_eq!(request.conversation_id, "conv-lead");
     assert_eq!(request.user_id, "user-e2e");
     assert!(request.content.contains("user input to team"));
+
+    session.stop();
+}
+
+#[tokio::test]
+async fn s9b_event_loop_fails_run_when_turn_errors_before_started() {
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let session = setup_session_with_runtime_ports(
+        Arc::new(ErrorBeforeStartTurnPort),
+        Arc::new(NoopCancellationPort),
+        broadcaster.clone(),
+    )
+    .await;
+
+    session
+        .send_message("user input to team", None)
+        .await
+        .expect("send_message must succeed");
+
+    wait_for_event(&broadcaster, "team.runFailed").await;
+    assert_eq!(session.team_run_manager().active_run_id().await, None);
+
+    session.stop();
+}
+
+#[tokio::test]
+async fn s9c_event_loop_fails_run_when_started_turn_returns_failed() {
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let session = setup_session_with_runtime_ports(
+        Arc::new(StartedThenFailedTurnPort),
+        Arc::new(NoopCancellationPort),
+        broadcaster.clone(),
+    )
+    .await;
+
+    session
+        .send_message("user input to team", None)
+        .await
+        .expect("send_message must succeed");
+
+    wait_for_event(&broadcaster, "team.childTurnCompleted").await;
+    wait_for_event(&broadcaster, "team.runFailed").await;
+    assert_eq!(session.team_run_manager().active_run_id().await, None);
+
+    session.stop();
+}
+
+#[tokio::test]
+async fn s9d_late_child_start_after_team_cancel_is_cancelled_without_reviving_run() {
+    let (claimed_tx, claimed_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let cancellation_port = Arc::new(RecordingCancellationPort::default());
+    let cancelled = cancellation_port.cancelled();
+    let session = setup_session_with_runtime_ports(
+        Arc::new(BlockingStartTurnPort::new(claimed_tx, release_rx)),
+        cancellation_port,
+        broadcaster.clone(),
+    )
+    .await;
+
+    let ack = session
+        .send_message("user input to team", None)
+        .await
+        .expect("send_message must succeed");
+    tokio::time::timeout(Duration::from_secs(2), claimed_rx)
+        .await
+        .expect("turn port should be called")
+        .expect("claim signal should be sent");
+
+    session
+        .cancel_run(&ack.team_run_id, None, Some("stop".into()))
+        .await
+        .expect("team run cancel must succeed");
+    release_tx.send(()).expect("release signal should be sent");
+
+    wait_for_event(&broadcaster, "team.runCancelled").await;
+    let cancelled_turns = cancelled.lock().unwrap().clone();
+    assert_eq!(cancelled_turns, vec!["turn-late-start".to_owned()]);
+    assert_eq!(session.team_run_manager().active_run_id().await, None);
 
     session.stop();
 }

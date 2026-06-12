@@ -24,7 +24,7 @@ use aionui_realtime::EventBroadcaster;
 use aionui_team::TeamSessionService;
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
+    AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
 };
 use aionui_team::{
     TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationProvisioningPort,
@@ -178,6 +178,16 @@ struct NoopTurnPort;
 #[async_trait::async_trait]
 impl AgentTurnExecutionPort for NoopTurnPort {
     async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        if let Some(on_started) = request.on_started.as_ref() {
+            on_started(AgentTurnStarted {
+                team_run_id: request.team_run_id.clone().expect("team run id"),
+                slot_id: request.slot_id.clone(),
+                role: request.role.clone(),
+                conversation_id: request.conversation_id.clone(),
+                turn_id: "turn-test".into(),
+            })
+            .await;
+        }
         Ok(AgentTurnOutcome {
             conversation_id: request.conversation_id,
             turn_id: "turn-test".into(),

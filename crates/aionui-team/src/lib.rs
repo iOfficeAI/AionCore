@@ -50,7 +50,10 @@ pub use scheduler::{
 pub use service::TeamSessionService;
 pub use session::{TeamSession, WakeInput};
 pub use task_board::{TaskBoard, TaskUpdate};
-pub use team_run::{ActiveChildTurn, TeamRunManager, target_role_for};
+pub use team_run::{
+    ActiveChildTurn, ChildCancelTarget, ChildStartDecision, StartingChildReservation, StartingReservationState,
+    TeamRunManager, target_role_for,
+};
 pub use types::{
     MailboxMessage, MailboxMessageType, TaskStatus, Team, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
 };
