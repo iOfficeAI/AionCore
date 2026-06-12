@@ -48,6 +48,16 @@ pub struct AssistantService {
     user_data_dir: PathBuf,
 }
 
+pub struct AssistantServiceDeps {
+    pub definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    pub state_repo: Arc<dyn IAssistantOverlayRepository>,
+    pub preference_repo: Arc<dyn IAssistantPreferenceRepository>,
+    pub repo: Arc<dyn IAssistantRepository>,
+    pub override_repo: Arc<dyn IAssistantOverrideRepository>,
+    pub provider_repo: Arc<dyn IProviderRepository>,
+    pub builtin: Arc<BuiltinAssistantRegistry>,
+}
+
 impl AssistantService {
     /// Construct an `AssistantService` pinned to the runtime data directory.
     ///
@@ -64,17 +74,16 @@ impl AssistantService {
     /// release directory while the db lived under `~/.aionui-dev/`,
     /// resulting in `read_rule` returning empty in dev mode. Forcing the
     /// caller to pass a path makes the wiring explicit.
-    pub fn new(
-        pool: SqlitePool,
-        definition_repo: Arc<dyn IAssistantDefinitionRepository>,
-        state_repo: Arc<dyn IAssistantOverlayRepository>,
-        preference_repo: Arc<dyn IAssistantPreferenceRepository>,
-        repo: Arc<dyn IAssistantRepository>,
-        override_repo: Arc<dyn IAssistantOverrideRepository>,
-        provider_repo: Arc<dyn IProviderRepository>,
-        builtin: Arc<BuiltinAssistantRegistry>,
-        user_data_dir: PathBuf,
-    ) -> Self {
+    pub fn new(pool: SqlitePool, deps: AssistantServiceDeps, user_data_dir: PathBuf) -> Self {
+        let AssistantServiceDeps {
+            definition_repo,
+            state_repo,
+            preference_repo,
+            repo,
+            override_repo,
+            provider_repo,
+            builtin,
+        } = deps;
         Self {
             pool,
             definition_repo,
@@ -1170,6 +1179,7 @@ impl AssistantService {
     ///   override when `AIONUI_BUILTIN_ASSISTANTS_PATH` is set).
     /// - User source → scan the user-writable avatars directory for a file
     ///   whose stem equals `id`.
+    ///
     /// Built-ins whose manifest `avatar` field is an inline emoji (and thus
     /// has no on-disk file) also return `None`; clients fall back to the
     /// text avatar for those.
@@ -1232,6 +1242,11 @@ impl AssistantService {
                 }
                 return self.persist_user_avatar_file(id, &existing_avatar_path).map(Some);
             }
+            if let Some(builtin_avatar) = self.builtin.avatar_asset(&source_assistant_id) {
+                return self
+                    .persist_user_avatar_bytes(id, &builtin_avatar.bytes, builtin_avatar.extension.as_deref())
+                    .map(Some);
+            }
             return Ok(Some(value.to_string()));
         }
 
@@ -1268,6 +1283,35 @@ impl AssistantService {
                 source_path.display(),
                 destination.display()
             ))
+        })?;
+
+        Ok(destination.to_string_lossy().to_string())
+    }
+
+    fn persist_user_avatar_bytes(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        extension: Option<&str>,
+    ) -> Result<String, AssistantError> {
+        let extension = extension
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| AssistantError::BadRequest("assistant avatar must have a file extension".into()))?;
+
+        if !is_supported_avatar_extension(&extension) {
+            return Err(AssistantError::BadRequest(format!(
+                "unsupported assistant avatar format: .{extension}"
+            )));
+        }
+
+        let destination_dir = self.user_avatars_dir();
+        std::fs::create_dir_all(&destination_dir)
+            .map_err(|e| AssistantError::Internal(format!("create assistant avatar directory: {e}")))?;
+        remove_assistant_avatar_files(&destination_dir, id);
+
+        let destination = destination_dir.join(format!("{id}.{extension}"));
+        std::fs::write(&destination, bytes).map_err(|e| {
+            AssistantError::Internal(format!("write assistant avatar to '{}': {e}", destination.display()))
         })?;
 
         Ok(destination.to_string_lossy().to_string())
@@ -1389,7 +1433,7 @@ fn assistant_error_to_extension_error(error: AssistantError) -> ExtensionError {
 
 fn avatar_display_value(definition: &AssistantDefinitionRow) -> Option<String> {
     match definition.avatar_type.as_str() {
-        "user_asset" => definition.avatar_value.as_deref().map(|value| {
+        "builtin_asset" | "user_asset" => definition.avatar_value.as_deref().map(|value| {
             if is_direct_avatar_url(value) {
                 value.to_string()
             } else {
@@ -1444,7 +1488,11 @@ fn is_direct_avatar_url(value: &str) -> bool {
 fn parse_assistant_avatar_route(value: &str) -> Option<String> {
     let prefix = "/api/assistants/";
     let suffix = "/avatar";
-    let id = value.strip_prefix(prefix)?.strip_suffix(suffix)?.trim();
+    let route = value
+        .strip_prefix(prefix)
+        .map(|rest| format!("{prefix}{rest}"))
+        .or_else(|| value.find(prefix).map(|index| value[index..].to_string()))?;
+    let id = route.strip_prefix(prefix)?.strip_suffix(suffix)?.trim();
     (!id.is_empty()).then(|| id.to_string())
 }
 
@@ -1975,13 +2023,15 @@ mod tests {
 
         let service = AssistantService::new(
             db.pool().clone(),
-            definition_repo.clone(),
-            state_repo.clone(),
-            preference_repo.clone(),
-            repo,
-            orepo,
-            provider_repo.clone(),
-            builtin_reg,
+            AssistantServiceDeps {
+                definition_repo: definition_repo.clone(),
+                state_repo: state_repo.clone(),
+                preference_repo: preference_repo.clone(),
+                repo,
+                override_repo: orepo,
+                provider_repo: provider_repo.clone(),
+                builtin: builtin_reg,
+            },
             tmp.path().to_path_buf(),
         );
         service.bootstrap_assistant_storage().await.unwrap();
@@ -2876,13 +2926,15 @@ mod tests {
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
         let service = AssistantService::new(
             db.pool().clone(),
-            definition_repo,
-            state_repo,
-            preference_repo,
-            repo,
-            orepo,
-            provider_repo,
-            builtin_reg,
+            AssistantServiceDeps {
+                definition_repo,
+                state_repo,
+                preference_repo,
+                repo,
+                override_repo: orepo,
+                provider_repo,
+                builtin: builtin_reg,
+            },
             tmp.path().to_path_buf(),
         );
         let content = service.read_rule("builtin-office", Some("en-US")).await.unwrap();

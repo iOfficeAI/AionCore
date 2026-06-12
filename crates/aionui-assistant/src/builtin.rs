@@ -442,10 +442,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn avatar_asset_is_none_for_emoji_avatar() {
+    fn avatar_asset_is_none_for_inline_emoji_avatar() {
         let reg = BuiltinAssistantRegistry::load_embedded();
-        // word-creator ships with avatar: "📝" in the manifest.
-        assert!(reg.avatar_asset("word-creator").is_none());
+        // word-form-creator still ships with an inline emoji avatar.
+        assert!(reg.avatar_asset("word-form-creator").is_none());
+    }
+
+    #[test]
+    fn embedded_avatar_asset_returns_bytes_and_extension_for_shipped_file_avatar() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        let asset = reg
+            .avatar_asset("word-creator")
+            .expect("shipped word-creator avatar should resolve from the embedded bundle");
+        assert!(!asset.bytes.is_empty());
+        assert_eq!(asset.extension.as_deref(), Some("jpg"));
     }
 
     #[test]

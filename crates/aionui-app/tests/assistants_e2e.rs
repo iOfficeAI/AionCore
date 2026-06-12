@@ -224,13 +224,15 @@ async fn fixture() -> Fixture {
     let builtin = Arc::new(BuiltinAssistantRegistry::load_from_dir(builtin_assets_dir.clone()));
     let service = Arc::new(AssistantService::new(
         pool,
-        definition_repo,
-        state_repo,
-        preference_repo,
-        repo,
-        override_repo,
-        provider_repo,
-        builtin,
+        aionui_assistant::service::AssistantServiceDeps {
+            definition_repo,
+            state_repo,
+            preference_repo,
+            repo,
+            override_repo,
+            provider_repo,
+            builtin,
+        },
         user_data_dir.clone(),
     ));
     service.bootstrap_assistant_storage().await.unwrap();
@@ -286,6 +288,30 @@ async fn list_populated_excludes_extension_assistants() {
     let sources: Vec<&str> = list.iter().map(|a| a["source"].as_str().unwrap()).collect();
     assert!(sources.contains(&"builtin"));
     assert!(!sources.contains(&"extension"));
+}
+
+#[tokio::test]
+async fn list_builtin_file_avatar_is_served_via_assistant_avatar_route() {
+    let fx = fixture().await;
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let list = json["data"].as_array().unwrap();
+    let builtin_office = list
+        .iter()
+        .find(|assistant| assistant["id"] == "builtin-office")
+        .expect("builtin-office missing from assistant list");
+
+    assert_eq!(
+        builtin_office["avatar"].as_str(),
+        Some("/api/assistants/builtin-office/avatar")
+    );
 }
 
 #[tokio::test]
@@ -529,6 +555,91 @@ async fn create_user_avatar_from_local_file_is_served_via_assistant_avatar_route
         .unwrap()
         .to_bytes();
     assert_eq!(&bytes[..], b"picked-avatar-bytes");
+}
+
+#[tokio::test]
+async fn create_user_avatar_from_builtin_avatar_route_copies_builtin_asset() {
+    let fx = fixture().await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "u-avatar-from-builtin",
+            "name": "Builtin Avatar Copy",
+            "avatar": "/api/assistants/builtin-office/avatar",
+            "preset_agent_type": "aionrs",
+        }),
+        &fx.token,
+        &fx.csrf,
+    );
+    let resp = fx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["avatar"], "/api/assistants/u-avatar-from-builtin/avatar");
+
+    let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar-from-builtin.png");
+    assert!(
+        persisted_avatar.exists(),
+        "persisted avatar missing: {}",
+        persisted_avatar.display()
+    );
+    assert_eq!(std::fs::read(&persisted_avatar).unwrap(), b"not-a-real-png");
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token(
+            "/api/assistants/u-avatar-from-builtin/avatar",
+            &fx.token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        Some("image/png")
+    );
+    let bytes = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&bytes[..], b"not-a-real-png");
+}
+
+#[tokio::test]
+async fn create_user_avatar_from_absolute_builtin_avatar_route_copies_builtin_asset() {
+    let fx = fixture().await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "u-avatar-from-builtin-absolute",
+            "name": "Builtin Avatar Absolute Copy",
+            "avatar": "http://127.0.0.1:56663/api/assistants/builtin-office/avatar",
+            "preset_agent_type": "aionrs",
+        }),
+        &fx.token,
+        &fx.csrf,
+    );
+    let resp = fx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["data"]["avatar"],
+        "/api/assistants/u-avatar-from-builtin-absolute/avatar"
+    );
+
+    let persisted_avatar = fx
+        .user_data_dir
+        .join("assistant-avatars/u-avatar-from-builtin-absolute.png");
+    assert!(
+        persisted_avatar.exists(),
+        "persisted avatar missing: {}",
+        persisted_avatar.display()
+    );
+    assert_eq!(std::fs::read(&persisted_avatar).unwrap(), b"not-a-real-png");
 }
 
 #[tokio::test]

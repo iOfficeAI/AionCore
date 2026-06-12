@@ -308,13 +308,15 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
     // under `~/.aionui-dev/`).
     let service = Arc::new(AssistantService::new(
         pool,
-        definition_repo,
-        state_repo,
-        preference_repo,
-        repo,
-        override_repo,
-        provider_repo,
-        builtin,
+        aionui_assistant::service::AssistantServiceDeps {
+            definition_repo,
+            state_repo,
+            preference_repo,
+            repo,
+            override_repo,
+            provider_repo,
+            builtin,
+        },
         services.data_dir.clone(),
     ));
     AssistantRouterState { service }
