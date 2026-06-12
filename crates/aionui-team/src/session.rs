@@ -456,14 +456,10 @@ impl TeamSession {
         slot_id: &str,
         source: TeamWakeSource,
     ) -> Result<(), TeamError> {
-        let agent = self.scheduler.get_agent(slot_id).await?;
-        let target_role = target_role_for(agent.role);
-        self.team_run_manager
-            .record_pending_wake(slot_id, target_role.clone(), source)
-            .await?;
+        let target_role = self.reserve_wake_for_team_work(slot_id, source).await?;
 
         if self.event_loops.has(slot_id) {
-            self.event_loops.notify(slot_id);
+            self.notify_reserved_wake_for_team_work(slot_id, target_role, source);
             return Ok(());
         }
 
@@ -475,6 +471,46 @@ impl TeamSession {
             "team wake recorded but event loop is not registered; pending wake retained"
         );
         Ok(())
+    }
+
+    pub(crate) async fn reserve_wake_for_team_work(
+        &self,
+        slot_id: &str,
+        source: TeamWakeSource,
+    ) -> Result<TeamRunTargetRole, TeamError> {
+        let agent = self.scheduler.get_agent(slot_id).await?;
+        let target_role = target_role_for(agent.role);
+        self.team_run_manager
+            .record_pending_wake(slot_id, target_role.clone(), source)
+            .await?;
+        Ok(target_role)
+    }
+
+    pub(crate) fn notify_reserved_wake_for_team_work(
+        &self,
+        slot_id: &str,
+        target_role: TeamRunTargetRole,
+        source: TeamWakeSource,
+    ) {
+        if self.event_loops.has(slot_id) {
+            self.event_loops.notify(slot_id);
+            info!(
+                team_id = %self.team.id,
+                slot_id,
+                target_role = ?target_role,
+                wake_source = %source,
+                "team reserved wake notified"
+            );
+            return;
+        }
+
+        warn!(
+            team_id = %self.team.id,
+            slot_id,
+            target_role = ?target_role,
+            wake_source = %source,
+            "team reserved wake notification skipped because event loop is not registered"
+        );
     }
 
     /// Mirror each non-user mailbox row into the target agent's conversation
@@ -850,6 +886,17 @@ impl TeamSession {
             )
             .await?;
 
+        let spawn_welcome_role = self
+            .reserve_wake_for_team_work(&new_agent.slot_id, TeamWakeSource::SpawnWelcome)
+            .await?;
+        info!(
+            team_id = %self.team.id,
+            slot_id = %new_agent.slot_id,
+            target_role = ?spawn_welcome_role,
+            wake_source = %TeamWakeSource::SpawnWelcome,
+            "spawn welcome wake reserved before runtime attach"
+        );
+
         // Step 7: attach the CLI process and register the finish subscriber
         // in a background task. This involves spawning the CLI process and
         // completing the ACP protocol handshake, which can take significant
@@ -900,18 +947,12 @@ impl TeamSession {
                 service.register_event_loop(&team_id, &agent_clone.slot_id);
 
                 // Notify the event loop to drain the welcome message.
-                if let Err(e) = service
-                    .wake_agent_for_team_work(&team_id, &agent_clone.slot_id, TeamWakeSource::SpawnWelcome)
-                    .await
-                {
-                    warn!(
-                        team_id = %team_id,
-                        slot_id = %agent_clone.slot_id,
-                        wake_source = %TeamWakeSource::SpawnWelcome,
-                        error = %e,
-                        "wake after spawn process ready failed"
-                    );
-                }
+                service.notify_reserved_wake_for_team_work(
+                    &team_id,
+                    &agent_clone.slot_id,
+                    spawn_welcome_role,
+                    TeamWakeSource::SpawnWelcome,
+                );
             });
         }
 
@@ -1223,6 +1264,61 @@ mod tests {
             .expect("wake should be claimable");
 
         assert_eq!(reservation.slot_id, "worker-1");
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn reserved_spawn_welcome_survives_leader_empty_wake_until_teammate_registers() {
+        let session = start_session().await;
+        let ack = session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("accept run");
+
+        let role = session
+            .reserve_wake_for_team_work("worker-1", TeamWakeSource::SpawnWelcome)
+            .await
+            .expect("reserve spawn welcome");
+        assert_eq!(role, TeamRunTargetRole::Teammate);
+
+        assert!(
+            session
+                .team_run_manager()
+                .record_empty_wake_observed("lead-1")
+                .await
+                .is_none(),
+            "lead empty wake must not complete while worker spawn welcome is pending"
+        );
+        assert_eq!(
+            session.team_run_manager().active_run_id().await.as_deref(),
+            Some(ack.team_run_id.as_str())
+        );
+
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await
+            .expect("worker should claim reserved spawn welcome");
+
+        assert_eq!(reservation.slot_id, "worker-1");
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn reserve_wake_for_team_work_rejects_without_active_run() {
+        let session = start_session().await;
+
+        let err = session
+            .reserve_wake_for_team_work("worker-1", TeamWakeSource::SpawnWelcome)
+            .await
+            .expect_err("run-scoped reserve without active run must fail");
+
+        assert!(matches!(
+            err,
+            TeamError::InvalidRequest(message)
+                if message == "no active team run for run-scoped wake"
+        ));
         session.stop();
     }
 

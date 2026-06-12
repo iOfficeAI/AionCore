@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GuideMcpConfig, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload,
-    TeamResponse, TeamRunAckResponse, WebSocketMessage,
+    TeamResponse, TeamRunAckResponse, TeamRunTargetRole, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, WorkspacePathValidationError, generate_id, now_ms, validate_workspace_path_availability,
@@ -691,7 +691,7 @@ impl TeamSessionService {
                 turn_port: self.turn_port.clone(),
                 registry: registry.clone(),
             };
-            registry.spawn(&agent.slot_id, ctx);
+            let _ = registry.spawn(&agent.slot_id, ctx);
         }
     }
 
@@ -717,7 +717,10 @@ impl TeamSessionService {
             turn_port: self.turn_port.clone(),
             registry: registry.clone(),
         };
-        registry.spawn(slot_id, ctx);
+        let registered = registry.spawn(slot_id, ctx);
+        if registered {
+            info!(team_id, slot_id, "agent event loop registered");
+        }
     }
 
     pub async fn get_session_user_id(&self, team_id: &str) -> Option<String> {
@@ -861,6 +864,28 @@ impl TeamSessionService {
             .get(team_id)
             .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
         entry.session.wake_agent_for_team_work(slot_id, source).await
+    }
+
+    pub(crate) fn notify_reserved_wake_for_team_work(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+        target_role: TeamRunTargetRole,
+        source: TeamWakeSource,
+    ) {
+        let Some(entry) = self.sessions.get(team_id) else {
+            warn!(
+                team_id,
+                slot_id,
+                target_role = ?target_role,
+                wake_source = %source,
+                "reserved wake notify skipped because session is missing"
+            );
+            return;
+        };
+        entry
+            .session
+            .notify_reserved_wake_for_team_work(slot_id, target_role, source);
     }
 
     pub(crate) async fn require_active_team_run_for_team_work(&self, team_id: &str) -> Result<(), TeamError> {

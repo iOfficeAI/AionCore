@@ -29,8 +29,8 @@ use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, FinishEventData};
 use aionui_ai_agent::shared_kernel::approval_key;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_api_types::AgentModeResponse;
 use aionui_api_types::WebSocketMessage;
+use aionui_api_types::{AgentModeResponse, TeamRunTargetRole};
 use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
@@ -1095,6 +1095,83 @@ async fn s4_dynamic_agent_added_then_finish_propagates() {
         !lead_notifs.is_empty(),
         "lead must receive idle_notification from helper; msgs={:?}",
         state.messages
+    );
+
+    session.stop();
+}
+
+#[tokio::test]
+async fn s4b_pending_wake_for_unregistered_dynamic_agent_survives_leader_empty_wake() {
+    let (session, task_manager, _repo, sent, turn_requests) = setup_session_with_turn_recorder().await;
+
+    let ack = session
+        .team_run_manager()
+        .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+        .await
+        .expect("accept active Team Run");
+
+    let new_agent = TeamAgent {
+        slot_id: "helper-1".into(),
+        name: "Helper".into(),
+        role: TeammateRole::Teammate,
+        conversation_id: "conv-helper".into(),
+        backend: "acp".into(),
+        model: "claude".into(),
+        custom_agent_id: None,
+        status: None,
+        conversation_type: None,
+        cli_path: None,
+    };
+
+    let handle = AgentInstance::Mock(Arc::new(RecordingAgent::new("conv-helper", sent.clone())));
+    task_manager.insert("conv-helper", handle);
+    session.add_agent(&new_agent).await;
+
+    session
+        .send_message_to_agent("helper-1", "start your task", None)
+        .await
+        .expect("send to unregistered helper should record pending wake");
+
+    assert!(
+        session
+            .team_run_manager()
+            .record_empty_wake_observed("lead-1")
+            .await
+            .is_none(),
+        "leader empty wake must not complete while helper pending wake is retained"
+    );
+    assert_eq!(
+        session.team_run_manager().active_run_id().await.as_deref(),
+        Some(ack.team_run_id.as_str())
+    );
+
+    let registry = session.event_loops().clone();
+    registry.spawn(
+        &new_agent.slot_id,
+        AgentLoopContext {
+            team_id: session.team_id().to_owned(),
+            slot_id: new_agent.slot_id.clone(),
+            user_id: session.user_id().to_owned(),
+            session: session.clone(),
+            scheduler: session.scheduler().clone(),
+            mailbox: session.mailbox().clone(),
+            turn_port: session.turn_port().clone(),
+            registry: registry.clone(),
+        },
+    );
+    registry.notify("helper-1");
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let log = turn_requests.lock().unwrap();
+    assert!(
+        log.iter().any(|request| {
+            request.slot_id == "helper-1"
+                && request.conversation_id == "conv-helper"
+                && request.team_id == "e2e-team"
+                && request.team_run_id.as_deref() == Some(ack.team_run_id.as_str())
+        }),
+        "helper turn port must be called after delayed registration; requests: {log:?}"
     );
 
     session.stop();

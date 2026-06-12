@@ -189,6 +189,7 @@ impl TeamSessionService {
         caller_slot_id: &str,
         req: crate::session::SpawnAgentRequest,
     ) -> Result<TeamAgent, TeamError> {
+        self.require_active_team_run_for_team_work(team_id).await?;
         let entry = self
             .sessions
             .get(team_id)

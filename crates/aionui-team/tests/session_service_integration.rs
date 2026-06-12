@@ -21,15 +21,16 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 
-use aionui_team::TeamSessionService;
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
 };
+use aionui_team::session::SpawnAgentRequest;
 use aionui_team::{
     TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationProvisioningPort,
     TeamProjectionMessageStore,
 };
+use aionui_team::{TeamError, TeamSessionService};
 use common::MockTeamRepo;
 
 // ---------------------------------------------------------------------------
@@ -1792,6 +1793,58 @@ async fn es1_ensure_session_creates_session() {
         .unwrap();
 
     svc.ensure_session("user1", &created.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn spawn_agent_in_session_rejects_without_active_team_run_before_persisting_agent() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+
+    svc.ensure_session("user1", &created.id)
+        .await
+        .expect("session should be loaded without active Team Run");
+    let lead_slot_id = created
+        .lead_agent_id
+        .clone()
+        .expect("created team should have a lead slot");
+
+    let req = SpawnAgentRequest {
+        name: "Helper".into(),
+        agent_type: Some("claude".into()),
+        custom_agent_id: None,
+        model: Some("claude-sonnet-4".into()),
+    };
+
+    let err = svc
+        .spawn_agent_in_session(&created.id, &lead_slot_id, req)
+        .await
+        .expect_err("spawn without active Team Run must fail before persistence");
+
+    assert!(matches!(
+        err,
+        TeamError::InvalidRequest(message)
+            if message == "no active team run for run-scoped wake"
+    ));
+
+    let after = svc
+        .get_team("user1", &created.id)
+        .await
+        .expect("team should still be readable");
+    assert_eq!(
+        after.agents.len(),
+        created.agents.len(),
+        "failed spawn must not persist a partial teammate"
+    );
 }
 
 #[tokio::test]

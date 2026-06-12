@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use aionui_api_types::{TeamChildTurnPayload, TeamRunAckResponse, TeamRunPayload, TeamRunStatus, TeamRunTargetRole};
@@ -41,6 +41,13 @@ pub struct StartingChildReservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingWake {
+    slot_id: String,
+    role: TeamRunTargetRole,
+    source: TeamWakeSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildStartDecision {
     Accepted,
     CancelImmediately(ActiveChildTurn),
@@ -66,10 +73,18 @@ struct TeamRunRecord {
     cancel_reason: Option<String>,
     active_child_turns: HashMap<String, ActiveChildTurn>,
     starting_reservations: HashMap<String, StartingChildReservation>,
-    pending_wake_count: usize,
+    pending_wakes: HashMap<String, VecDeque<PendingWake>>,
 }
 
 impl TeamRunRecord {
+    fn pending_wake_count(&self) -> usize {
+        self.pending_wakes.values().map(VecDeque::len).sum()
+    }
+
+    fn pending_wake_count_for_slot(&self, slot_id: &str) -> usize {
+        self.pending_wakes.get(slot_id).map(VecDeque::len).unwrap_or(0)
+    }
+
     fn payload(&self) -> TeamRunPayload {
         TeamRunPayload {
             team_id: self.team_id.clone(),
@@ -78,7 +93,7 @@ impl TeamRunRecord {
             target_role: self.target_role.clone(),
             status: self.status.clone(),
             active_child_count: self.active_child_turns.len(),
-            pending_wake_count: self.pending_wake_count,
+            pending_wake_count: self.pending_wake_count(),
             starting_child_count: self.starting_reservations.len(),
         }
     }
@@ -157,7 +172,7 @@ impl TeamRunManager {
             cancel_reason: None,
             active_child_turns: HashMap::new(),
             starting_reservations: HashMap::new(),
-            pending_wake_count: 0,
+            pending_wakes: HashMap::new(),
         };
         let ack = record.ack(message_id);
         let payload = record.payload();
@@ -213,19 +228,30 @@ impl TeamRunManager {
             ));
         };
 
-        run.pending_wake_count = run.pending_wake_count.saturating_add(1);
+        let pending = PendingWake {
+            slot_id: slot_id.to_owned(),
+            role: target_role.clone(),
+            source: wake_source,
+        };
+        run.pending_wakes
+            .entry(slot_id.to_owned())
+            .or_default()
+            .push_back(pending);
+        let slot_pending_wake_count = run.pending_wake_count_for_slot(slot_id);
+        let payload = run.payload();
         info!(
             team_id = %self.team_id,
             team_run_id = %run.team_run_id,
             slot_id,
             target_role = ?target_role,
             wake_source = %wake_source,
-            pending_wake_count = run.pending_wake_count,
-            starting_child_count = run.starting_reservations.len(),
-            active_child_count = run.active_child_turns.len(),
+            slot_pending_wake_count,
+            pending_wake_count = payload.pending_wake_count,
+            starting_child_count = payload.starting_child_count,
+            active_child_count = payload.active_child_count,
             "team_run pending wake recorded"
         );
-        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, run.payload());
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
         Ok(())
     }
 
@@ -237,20 +263,48 @@ impl TeamRunManager {
     ) -> Option<StartingChildReservation> {
         let mut guard = self.state.lock().await;
         let run = guard.as_mut().filter(|r| r.is_active())?;
-        if run.pending_wake_count == 0 {
+        let pending = match run.pending_wakes.get_mut(slot_id).and_then(VecDeque::pop_front) {
+            Some(pending) => pending,
+            None => {
+                warn!(
+                    team_id = %self.team_id,
+                    team_run_id = %run.team_run_id,
+                    slot_id,
+                    role = ?role,
+                    pending_wake_count = run.pending_wake_count(),
+                    "team_run reservation claim ignored because no pending wake exists for slot"
+                );
+                return None;
+            }
+        };
+        if run.pending_wakes.get(slot_id).is_some_and(VecDeque::is_empty) {
+            run.pending_wakes.remove(slot_id);
+        }
+        if pending.slot_id != slot_id {
+            warn!(
+                team_id = %self.team_id,
+                team_run_id = %run.team_run_id,
+                expected_slot_id = %pending.slot_id,
+                actual_slot_id = %slot_id,
+                wake_source = %pending.source,
+                "team_run reservation claimed with slot mismatch"
+            );
+        }
+        if pending.role != role {
             warn!(
                 team_id = %self.team_id,
                 team_run_id = %run.team_run_id,
                 slot_id,
-                "team_run reservation claim ignored because no pending wake exists"
+                expected_role = ?pending.role,
+                actual_role = ?role,
+                wake_source = %pending.source,
+                "team_run reservation claimed with role mismatch"
             );
-            return None;
         }
-        run.pending_wake_count = run.pending_wake_count.saturating_sub(1);
         let reservation = StartingChildReservation {
             reservation_id: generate_id(),
             team_run_id: run.team_run_id.clone(),
-            slot_id: slot_id.to_owned(),
+            slot_id: pending.slot_id.clone(),
             role,
             conversation_id: conversation_id.to_owned(),
             state: StartingReservationState::Starting,
@@ -264,6 +318,8 @@ impl TeamRunManager {
             reservation_id = %reservation.reservation_id,
             slot_id = %reservation.slot_id,
             role = ?reservation.role,
+            wake_source = %pending.source,
+            slot_pending_wake_count = run.pending_wake_count_for_slot(slot_id),
             pending_wake_count = payload.pending_wake_count,
             starting_child_count = payload.starting_child_count,
             active_child_count = payload.active_child_count,
@@ -277,16 +333,25 @@ impl TeamRunManager {
     pub async fn record_empty_wake_observed(&self, slot_id: &str) -> Option<TeamRunPayload> {
         let mut guard = self.state.lock().await;
         let run = guard.as_mut()?;
-        if run.pending_wake_count > 0 {
-            run.pending_wake_count = run.pending_wake_count.saturating_sub(1);
-        }
+        let consumed = match run.pending_wakes.get_mut(slot_id).and_then(VecDeque::pop_front) {
+            Some(pending) => {
+                if run.pending_wakes.get(slot_id).is_some_and(VecDeque::is_empty) {
+                    run.pending_wakes.remove(slot_id);
+                }
+                Some(pending)
+            }
+            None => None,
+        };
+        let payload_before_completion = run.payload();
         debug!(
             team_id = %self.team_id,
             team_run_id = %run.team_run_id,
             slot_id,
-            pending_wake_count = run.pending_wake_count,
-            starting_child_count = run.starting_reservations.len(),
-            active_child_count = run.active_child_turns.len(),
+            consumed_wake_source = ?consumed.as_ref().map(|wake| wake.source.as_str()),
+            slot_pending_wake_count = run.pending_wake_count_for_slot(slot_id),
+            pending_wake_count = payload_before_completion.pending_wake_count,
+            starting_child_count = payload_before_completion.starting_child_count,
+            active_child_count = payload_before_completion.active_child_count,
             "team_run empty mailbox wake observed"
         );
         let payload = maybe_complete_locked(run, &self.emitter);
@@ -417,7 +482,7 @@ impl TeamRunManager {
             slot_id = %reservation.slot_id,
             error = %reason,
             active_child_count = run.active_child_turns.len(),
-            pending_wake_count = run.pending_wake_count,
+            pending_wake_count = run.pending_wake_count(),
             starting_child_count = run.starting_reservations.len(),
             "team_run reservation failed before start"
         );
@@ -455,7 +520,7 @@ impl TeamRunManager {
                     conversation_id = %child.conversation_id,
                     turn_id = %child.turn_id,
                     active_child_count = run.active_child_turns.len(),
-                    pending_wake_count = run.pending_wake_count,
+                    pending_wake_count = run.pending_wake_count(),
                     starting_child_count = run.starting_reservations.len(),
                     "team_child_turn failed"
                 );
@@ -489,7 +554,7 @@ impl TeamRunManager {
                     turn_id = %child.turn_id,
                     status = ?status,
                     active_child_count = run.active_child_turns.len(),
-                    pending_wake_count = run.pending_wake_count,
+                    pending_wake_count = run.pending_wake_count(),
                     starting_child_count = run.starting_reservations.len(),
                     "team_child_turn completed"
                 );
@@ -529,7 +594,7 @@ impl TeamRunManager {
         }
         run.status = TeamRunStatus::Cancelling;
         run.cancel_reason = reason;
-        run.pending_wake_count = 0;
+        run.pending_wakes.clear();
         for reservation in run.starting_reservations.values_mut() {
             reservation.state = StartingReservationState::Cancelling;
         }
@@ -540,7 +605,7 @@ impl TeamRunManager {
             target_slot_id = ?target_slot_id.as_deref(),
             active_child_count = run.active_child_turns.len(),
             starting_child_count = run.starting_reservations.len(),
-            pending_wake_count = run.pending_wake_count,
+            pending_wake_count = payload.pending_wake_count,
             "team_run cancel requested"
         );
         drop(guard);
@@ -592,7 +657,7 @@ impl TeamRunManager {
                 turn_id = %child.turn_id,
                 state = "active",
                 active_child_count = run.active_child_turns.len(),
-                pending_wake_count = run.pending_wake_count,
+                pending_wake_count = run.pending_wake_count(),
                 starting_child_count = run.starting_reservations.len(),
                 "team_run child cancel requested"
             );
@@ -607,7 +672,7 @@ impl TeamRunManager {
             let reservation = reservation.clone();
             let team_run_id = run.team_run_id.clone();
             let active_child_count = run.active_child_turns.len();
-            let pending_wake_count = run.pending_wake_count;
+            let pending_wake_count = run.pending_wake_count();
             let starting_child_count = run.starting_reservations.len();
             info!(
                 team_id = %self.team_id,
@@ -682,7 +747,7 @@ fn child_payload(team_id: &str, child: &ActiveChildTurn, status: TeamRunStatus) 
 }
 
 fn maybe_complete_locked(run: &mut TeamRunRecord, emitter: &TeamEventEmitter) -> Option<TeamRunPayload> {
-    if run.pending_wake_count > 0 || !run.starting_reservations.is_empty() || !run.active_child_turns.is_empty() {
+    if run.pending_wake_count() > 0 || !run.starting_reservations.is_empty() || !run.active_child_turns.is_empty() {
         emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, run.payload());
         return None;
     }
@@ -711,7 +776,7 @@ fn maybe_cancelled_locked(run: &mut TeamRunRecord, emitter: &TeamEventEmitter) -
     if !matches!(run.status, TeamRunStatus::Cancelling) {
         return None;
     }
-    if run.pending_wake_count > 0 || !run.starting_reservations.is_empty() || !run.active_child_turns.is_empty() {
+    if run.pending_wake_count() > 0 || !run.starting_reservations.is_empty() || !run.active_child_turns.is_empty() {
         emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, run.payload());
         return None;
     }
@@ -816,6 +881,74 @@ mod tests {
 
         assert_eq!(reservation.slot_id, "worker-1");
         assert_eq!(reservation.role, TeamRunTargetRole::Teammate);
+    }
+
+    #[tokio::test]
+    async fn empty_wake_for_one_slot_does_not_consume_another_slot_pending_wake() {
+        let (manager, _) = manager();
+        let ack = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("accept run");
+
+        manager
+            .record_pending_wake("worker", TeamRunTargetRole::Teammate, TeamWakeSource::McpSendMessage)
+            .await
+            .expect("record worker pending wake");
+
+        let completed = manager.record_empty_wake_observed("lead").await;
+        assert!(
+            completed.is_none(),
+            "leader empty wake must not complete while worker has pending wake"
+        );
+        assert_eq!(manager.active_run_id().await.as_deref(), Some(ack.team_run_id.as_str()));
+
+        let reservation = manager
+            .claim_wake_for_turn("worker", TeamRunTargetRole::Teammate, "conv-worker")
+            .await
+            .expect("worker pending wake must remain claimable");
+
+        assert_eq!(reservation.slot_id, "worker");
+        assert_eq!(reservation.role, TeamRunTargetRole::Teammate);
+    }
+
+    #[tokio::test]
+    async fn empty_wake_consumes_only_same_slot_pending_wake() {
+        let (manager, _) = manager();
+        manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("accept run");
+
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .expect("record lead pending wake");
+        manager
+            .record_pending_wake("worker", TeamRunTargetRole::Teammate, TeamWakeSource::McpSendMessage)
+            .await
+            .expect("record worker pending wake");
+
+        assert!(
+            manager.record_empty_wake_observed("lead").await.is_none(),
+            "worker wake should keep run active"
+        );
+
+        assert!(
+            manager
+                .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+                .await
+                .is_none(),
+            "lead pending wake was consumed by lead empty wake"
+        );
+
+        assert!(
+            manager
+                .claim_wake_for_turn("worker", TeamRunTargetRole::Teammate, "conv-worker")
+                .await
+                .is_some(),
+            "worker pending wake must remain"
+        );
     }
 
     #[tokio::test]

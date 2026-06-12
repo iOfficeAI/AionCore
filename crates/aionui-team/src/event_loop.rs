@@ -5,9 +5,10 @@ use std::sync::{
 use std::time::Duration;
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::mailbox::Mailbox;
 use crate::ports::{
@@ -59,11 +60,24 @@ impl EventLoopRegistry {
     }
 
     /// Register and spawn an event loop for one agent.
-    pub fn spawn(&self, slot_id: &str, ctx: AgentLoopContext) {
+    pub fn spawn(&self, slot_id: &str, ctx: AgentLoopContext) -> bool {
         let notify = Arc::new(Notify::new());
-        self.notifiers.insert(slot_id.to_owned(), notify.clone());
+        match self.notifiers.entry(slot_id.to_owned()) {
+            Entry::Occupied(_) => {
+                debug!(
+                    team_id = %ctx.team_id,
+                    slot_id,
+                    "agent event loop registration ignored because slot is already registered"
+                );
+                return false;
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(notify.clone());
+            }
+        }
         let handle = tokio::spawn(run_event_loop(notify, self.shutdown_rx.clone(), ctx));
         self.handles.insert(slot_id.to_owned(), handle);
+        true
     }
 
     /// Remove an agent's event loop (agent removed from team).
