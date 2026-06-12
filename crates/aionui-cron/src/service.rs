@@ -466,7 +466,7 @@ impl CronService {
             return false;
         }
 
-        if self.executor.busy_guard().is_busy(&job.conversation_id) {
+        if self.executor.is_conversation_claimed(&job.conversation_id) {
             return false;
         }
 

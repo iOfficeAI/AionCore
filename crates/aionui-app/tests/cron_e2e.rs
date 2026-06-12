@@ -560,6 +560,57 @@ async fn rn1_run_now_returns_conversation_id_for_new_conversation_job() {
 }
 
 #[tokio::test]
+async fn rn1b_run_now_returns_conflict_when_conversation_is_busy() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let create_conv_req = json_with_token(
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "name": "Busy Run Now Source",
+            "extra": {}
+        }),
+        &token,
+        &csrf,
+    );
+    let create_conv_resp = app.clone().oneshot(create_conv_req).await.unwrap();
+    assert_eq!(create_conv_resp.status(), StatusCode::CREATED);
+    let created_conv = body_json(create_conv_resp).await;
+    let conversation_id = created_conv["data"]["id"].as_str().unwrap().to_owned();
+
+    let mut body = create_job_body("Busy Run Now Job");
+    body["conversation_id"] = json!(conversation_id);
+    let created = create_job(&mut app, &token, &csrf, body).await;
+    let job_id = created["id"].as_str().unwrap();
+
+    let claim = services
+        .conversation_runtime_state
+        .try_claim_turn(&conversation_id, "turn-busy-e2e")
+        .expect("runtime claim should succeed");
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{job_id}/run"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "CONFLICT");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("already running"),
+        "busy run-now should surface conversation busy semantics"
+    );
+
+    drop(claim);
+}
+
+#[tokio::test]
 async fn rn2_run_now_nonexistent() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

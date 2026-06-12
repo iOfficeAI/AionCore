@@ -9,7 +9,7 @@ use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
 use aionui_common::{
     AgentType, ProviderWithModel, WorkspacePathValidationError, now_ms, validate_workspace_path_availability,
 };
-use aionui_conversation::ConversationService;
+use aionui_conversation::{ConversationError, ConversationService};
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationRowUpdate, IConversationRepository};
 use aionui_realtime::EventBroadcaster;
@@ -18,7 +18,6 @@ use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 use crate::artifacts::{broadcast_artifact, build_cron_trigger_artifact};
-use crate::busy_guard::CronBusyGuard;
 use crate::error::CronError;
 use crate::prompt::{
     build_existing_conversation_prompt, build_new_conversation_prompt_with_skill_suggest,
@@ -66,7 +65,6 @@ pub struct JobExecutor {
     task_manager: Arc<dyn IWorkerTaskManager>,
     conversation_repo: Arc<dyn IConversationRepository>,
     conversation_service: Arc<ConversationService>,
-    busy_guard: Arc<CronBusyGuard>,
     work_dir: PathBuf,
     data_dir: PathBuf,
     broadcaster: Arc<dyn EventBroadcaster>,
@@ -80,7 +78,6 @@ impl JobExecutor {
         task_manager: Arc<dyn IWorkerTaskManager>,
         conversation_repo: Arc<dyn IConversationRepository>,
         conversation_service: Arc<ConversationService>,
-        busy_guard: Arc<CronBusyGuard>,
         work_dir: PathBuf,
         data_dir: PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
@@ -92,7 +89,6 @@ impl JobExecutor {
             task_manager,
             conversation_repo,
             conversation_service,
-            busy_guard,
             work_dir,
             data_dir,
             broadcaster,
@@ -102,12 +98,6 @@ impl JobExecutor {
     }
 
     pub async fn execute(&self, job: &CronJob) -> ExecutionResult {
-        let conversation_id = &job.conversation_id;
-
-        if self.busy_guard.is_busy(conversation_id) {
-            return self.handle_busy(job);
-        }
-
         let saved_skill = match self.prepare_saved_skill(job).await {
             Ok(skill) => skill,
             Err(e) => {
@@ -129,15 +119,17 @@ impl JobExecutor {
             }
         };
 
-        self.busy_guard.set_processing(&target_conversation_id, true);
+        if self.is_conversation_claimed(&target_conversation_id) {
+            info!(
+                job_id = %job.id,
+                conversation_id = %target_conversation_id,
+                "Cron target conversation already has an active turn; scheduling retry"
+            );
+            return self.handle_busy(job);
+        }
 
-        let result = self
-            .execute_inner(job, &target_conversation_id, saved_skill.as_ref())
-            .await;
-
-        self.busy_guard.set_processing(&target_conversation_id, false);
-
-        result
+        self.execute_inner(job, &target_conversation_id, saved_skill.as_ref())
+            .await
     }
 
     pub(crate) async fn prepare_run_now(&self, job: &CronJob) -> Result<PreparedExecution, CronError> {
@@ -156,6 +148,17 @@ impl JobExecutor {
         self.validate_runtime_job_workspace(job).await?;
         let conversation_id = self.resolve_conversation(job, saved_skill.as_ref()).await?;
 
+        if self.is_conversation_claimed(&conversation_id) {
+            info!(
+                job_id = %job.id,
+                conversation_id = %conversation_id,
+                "Run-now rejected because target conversation already has an active turn"
+            );
+            return Err(CronError::Conversation(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} is already running"),
+            }));
+        }
+
         Ok(PreparedExecution {
             conversation_id,
             saved_skill,
@@ -163,19 +166,8 @@ impl JobExecutor {
     }
 
     pub(crate) async fn execute_prepared(&self, job: &CronJob, prepared: PreparedExecution) -> ExecutionResult {
-        self.busy_guard.set_processing(&prepared.conversation_id, true);
-
-        let result = self
-            .execute_inner(job, &prepared.conversation_id, prepared.saved_skill.as_ref())
-            .await;
-
-        self.busy_guard.set_processing(&prepared.conversation_id, false);
-
-        result
-    }
-
-    pub fn busy_guard(&self) -> &CronBusyGuard {
-        &self.busy_guard
+        self.execute_inner_with_busy_retry(job, &prepared.conversation_id, prepared.saved_skill.as_ref(), false)
+            .await
     }
 
     pub async fn conversation_exists(&self, conversation_id: &str) -> Result<bool, CronError> {
@@ -185,6 +177,10 @@ impl JobExecutor {
             .await
             .map_err(CronError::Database)?;
         Ok(row.is_some())
+    }
+
+    pub fn is_conversation_claimed(&self, conversation_id: &str) -> bool {
+        self.conversation_service.runtime_state().is_claimed(conversation_id)
     }
 
     pub async fn get_conversation_row(
@@ -439,6 +435,7 @@ impl JobExecutor {
             r#type: agent_type,
             name: Some(job.name.clone()),
             model,
+            assistant: None,
             source: None,
             channel_chat_id: None,
             extra,
@@ -494,6 +491,17 @@ impl JobExecutor {
         job: &CronJob,
         conversation_id: &str,
         saved_skill: Option<&SavedSkillContext>,
+    ) -> ExecutionResult {
+        self.execute_inner_with_busy_retry(job, conversation_id, saved_skill, true)
+            .await
+    }
+
+    async fn execute_inner_with_busy_retry(
+        &self,
+        job: &CronJob,
+        conversation_id: &str,
+        saved_skill: Option<&SavedSkillContext>,
+        retry_on_busy: bool,
     ) -> ExecutionResult {
         let conversation_row = match self.get_conversation_row(conversation_id).await {
             Ok(Some(row)) => row,
@@ -652,6 +660,15 @@ impl JobExecutor {
                 ExecutionResult::Success {
                     conversation_id: conversation_id.to_owned(),
                 }
+            }
+            Err(ConversationError::Busy { reason }) if retry_on_busy => {
+                warn!(
+                    job_id = %job.id,
+                    conversation_id,
+                    reason,
+                    "Cron target conversation became busy during send; scheduling retry"
+                );
+                self.handle_busy(job)
             }
             Err(e) => {
                 error!(
@@ -1281,8 +1298,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_busy_returns_retrying_when_under_limit() {
-        let guard = CronBusyGuard::new();
-        let executor = make_executor_for_busy_tests(Arc::new(guard));
+        let executor = make_executor_for_busy_tests();
 
         let job = CronJob {
             retry_count: 1,
@@ -1295,8 +1311,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_busy_returns_skipped_when_at_limit() {
-        let guard = CronBusyGuard::new();
-        let executor = make_executor_for_busy_tests(Arc::new(guard));
+        let executor = make_executor_for_busy_tests();
 
         let job = CronJob {
             retry_count: 3,
@@ -1309,8 +1324,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_busy_returns_skipped_when_over_limit() {
-        let guard = CronBusyGuard::new();
-        let executor = make_executor_for_busy_tests(Arc::new(guard));
+        let executor = make_executor_for_busy_tests();
 
         let job = CronJob {
             retry_count: 5,
@@ -1323,8 +1337,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_busy_first_retry_returns_attempt_1() {
-        let guard = CronBusyGuard::new();
-        let executor = make_executor_for_busy_tests(Arc::new(guard));
+        let executor = make_executor_for_busy_tests();
 
         let job = CronJob {
             retry_count: 0,
@@ -1333,6 +1346,50 @@ mod tests {
         };
         let result = executor.handle_busy(&job);
         assert_eq!(result, ExecutionResult::Retrying { attempt: 1 });
+    }
+
+    #[tokio::test]
+    async fn execute_returns_retrying_when_runtime_state_is_already_claimed() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
+        let job = sample_job();
+        let claim = executor
+            .conversation_service
+            .runtime_state()
+            .try_claim_turn(&job.conversation_id, "turn-existing")
+            .expect("runtime claim should succeed");
+
+        let result = executor.execute(&job).await;
+
+        assert_eq!(result, ExecutionResult::Retrying { attempt: 1 });
+        assert_eq!(agent.send_calls(), 0, "busy precheck should avoid send attempts");
+
+        drop(claim);
+    }
+
+    #[tokio::test]
+    async fn prepare_run_now_returns_busy_error_when_runtime_state_is_already_claimed() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let executor = make_executor_with_agent(AgentInstance::Mock(agent));
+        let job = sample_job();
+        let claim = executor
+            .conversation_service
+            .runtime_state()
+            .try_claim_turn(&job.conversation_id, "turn-existing")
+            .expect("runtime claim should succeed");
+
+        let err = executor
+            .prepare_run_now(&job)
+            .await
+            .expect_err("run-now should reject a claimed conversation");
+
+        assert!(matches!(
+            err,
+            CronError::Conversation(ConversationError::Busy { reason })
+                if reason == format!("conversation {} is already running", job.conversation_id)
+        ));
+
+        drop(claim);
     }
 
     // -- build_prompt tests --------------------------------------------------
@@ -2035,9 +2092,28 @@ mod tests {
         assert!(trigger_event["data"]["payload"]["triggered_at"].as_i64().is_some());
     }
 
+    #[tokio::test]
+    async fn execute_inner_returns_retrying_when_send_message_reports_busy() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
+        let job = sample_job();
+        let claim = executor
+            .conversation_service
+            .runtime_state()
+            .try_claim_turn(&job.conversation_id, "turn-existing")
+            .expect("runtime claim should succeed");
+
+        let result = executor.execute_inner(&job, &job.conversation_id, None).await;
+
+        assert_eq!(result, ExecutionResult::Retrying { attempt: 1 });
+        assert_eq!(agent.send_calls(), 0, "busy send failure should not reach the agent");
+
+        drop(claim);
+    }
+
     // -- helper ---------------------------------------------------------------
 
-    fn make_executor_for_busy_tests(guard: Arc<CronBusyGuard>) -> JobExecutor {
+    fn make_executor_for_busy_tests() -> JobExecutor {
         struct StubTaskManager;
         #[async_trait::async_trait]
         impl IWorkerTaskManager for StubTaskManager {
@@ -2218,7 +2294,6 @@ mod tests {
             Arc::new(StubTaskManager),
             stub_repo,
             conv_service,
-            guard,
             std::env::temp_dir(),
             std::env::temp_dir(),
             Arc::new(StubBroadcaster),
@@ -2823,7 +2898,6 @@ mod tests {
             task_manager,
             repo,
             conversation_service,
-            Arc::new(CronBusyGuard::new()),
             std::env::temp_dir(),
             std::env::temp_dir(),
             broadcaster,

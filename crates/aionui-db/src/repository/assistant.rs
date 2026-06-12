@@ -2,7 +2,9 @@
 
 use crate::error::DbError;
 use crate::models::{
-    AssistantOverrideRow, AssistantRow, CreateAssistantParams, UpdateAssistantParams, UpsertOverrideParams,
+    AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow,
+    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, UpsertOverrideParams,
 };
 
 /// CRUD access for user-authored assistant rows.
@@ -52,4 +54,36 @@ pub trait IAssistantOverrideRepository: Send + Sync {
     /// Remove override rows whose `assistant_id` is not in `valid_ids`.
     /// Returns the number of rows deleted.
     async fn delete_orphans(&self, valid_ids: &[&str]) -> Result<u64, DbError>;
+}
+
+/// Runtime assistant definitions across builtin / user / generated / extension sources.
+#[async_trait::async_trait]
+pub trait IAssistantDefinitionRepository: Send + Sync {
+    async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError>;
+    async fn get_by_key(&self, assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, DbError>;
+    async fn get_by_definition_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError>;
+    async fn get_by_source_ref(
+        &self,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError>;
+    async fn upsert(&self, params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError>;
+    async fn soft_delete(&self, definition_id: &str, deleted_at: i64) -> Result<bool, DbError>;
+}
+
+/// Runtime per-user assistant overlay used by the current app version.
+#[async_trait::async_trait]
+pub trait IAssistantOverlayRepository: Send + Sync {
+    async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError>;
+    async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError>;
+    async fn upsert(&self, params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError>;
+    async fn delete(&self, definition_id: &str) -> Result<bool, DbError>;
+}
+
+/// Assistant-scoped "auto remember last" preferences.
+#[async_trait::async_trait]
+pub trait IAssistantPreferenceRepository: Send + Sync {
+    async fn get(&self, definition_id: &str) -> Result<Option<AssistantPreferenceRow>, DbError>;
+    async fn upsert(&self, params: &UpsertAssistantPreferenceParams<'_>) -> Result<AssistantPreferenceRow, DbError>;
+    async fn delete(&self, definition_id: &str) -> Result<bool, DbError>;
 }

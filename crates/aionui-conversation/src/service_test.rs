@@ -13,25 +13,30 @@ use aionui_ai_agent::{AgentError, AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
-    AgentErrorCode, AgentModeResponse, ConversationArtifactKind, GetModelInfoResponse, ModelInfoEntry,
-    ModelInfoPayload, SetModeRequest, SetModelRequest,
+    AgentErrorCode, AgentModeResponse, ConversationArtifactKind, ConversationResponse, GetModelInfoResponse,
+    ModelInfoEntry, ModelInfoPayload, SetModeRequest, SetModelRequest,
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
     SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
-    AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult, TimestampMs,
+    AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
+    ProviderWithModel, TimestampMs,
 };
 use aionui_db::models::{
-    AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams,
-    UpsertAgentMetadataParams,
+    AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow,
+    MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
-    IAgentMetadataRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
-    SaveRuntimeStateParams, SortOrder,
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
+    SaveRuntimeStateParams, SortOrder, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantPreferenceRepository, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, init_database_memory,
 };
+use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
@@ -53,6 +58,37 @@ struct SkillLinkCall {
 struct RecordingSkillResolver {
     names: Vec<String>,
     links: Arc<Mutex<Vec<SkillLinkCall>>>,
+}
+
+struct StaticAssistantDispatcher {
+    rules: std::collections::HashMap<String, String>,
+}
+
+#[async_trait::async_trait]
+impl AssistantRuleDispatcher for StaticAssistantDispatcher {
+    async fn read_rule(&self, id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
+        Ok(self.rules.get(id).cloned().unwrap_or_default())
+    }
+
+    async fn write_rule(&self, _id: &str, _locale: Option<&str>, _content: &str) -> Result<(), ExtensionError> {
+        Ok(())
+    }
+
+    async fn delete_rule(&self, _id: &str) -> Result<bool, ExtensionError> {
+        Ok(true)
+    }
+
+    async fn read_skill(&self, _id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
+        Ok(String::new())
+    }
+
+    async fn write_skill(&self, _id: &str, _locale: Option<&str>, _content: &str) -> Result<(), ExtensionError> {
+        Ok(())
+    }
+
+    async fn delete_skill(&self, _id: &str) -> Result<bool, ExtensionError> {
+        Ok(true)
+    }
 }
 
 impl RecordingSkillResolver {
@@ -133,6 +169,7 @@ struct MockRepo {
     rows: Mutex<Vec<ConversationRow>>,
     messages: Mutex<Vec<MessageRow>>,
     artifacts: Mutex<Vec<ConversationArtifactRow>>,
+    assistant_snapshots: Mutex<Vec<ConversationAssistantSnapshotRow>>,
 }
 
 impl MockRepo {
@@ -141,6 +178,7 @@ impl MockRepo {
             rows: Mutex::new(vec![]),
             messages: Mutex::new(vec![]),
             artifacts: Mutex::new(vec![]),
+            assistant_snapshots: Mutex::new(vec![]),
         }
     }
 }
@@ -247,6 +285,53 @@ impl IConversationRepository for MockRepo {
         _conversation_id: &str,
     ) -> Result<Vec<ConversationRow>, aionui_db::DbError> {
         Ok(vec![])
+    }
+
+    async fn get_assistant_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationAssistantSnapshotRow>, aionui_db::DbError> {
+        let rows = self.assistant_snapshots.lock().unwrap();
+        Ok(rows.iter().find(|row| row.conversation_id == conversation_id).cloned())
+    }
+
+    async fn upsert_assistant_snapshot(
+        &self,
+        params: &UpsertConversationAssistantSnapshotParams<'_>,
+    ) -> Result<Option<ConversationAssistantSnapshotRow>, aionui_db::DbError> {
+        let row = ConversationAssistantSnapshotRow {
+            conversation_id: params.conversation_id.to_owned(),
+            assistant_definition_id: params.assistant_definition_id.to_owned(),
+            assistant_key: params.assistant_key.to_owned(),
+            assistant_source: params.assistant_source.to_owned(),
+            assistant_name: params.assistant_name.to_owned(),
+            assistant_avatar_type: params.assistant_avatar_type.to_owned(),
+            assistant_avatar_value: params.assistant_avatar_value.map(ToOwned::to_owned),
+            agent_backend: params.agent_backend.to_owned(),
+            rules_content: params.rules_content.to_owned(),
+            default_model_mode: params.default_model_mode.to_owned(),
+            resolved_model_id: params.resolved_model_id.map(ToOwned::to_owned),
+            default_permission_mode: params.default_permission_mode.to_owned(),
+            resolved_permission_value: params.resolved_permission_value.map(ToOwned::to_owned),
+            default_skills_mode: params.default_skills_mode.to_owned(),
+            resolved_skill_ids: params.resolved_skill_ids.to_owned(),
+            resolved_disabled_builtin_skill_ids: params.resolved_disabled_builtin_skill_ids.to_owned(),
+            default_mcps_mode: params.default_mcps_mode.to_owned(),
+            resolved_mcp_ids: params.resolved_mcp_ids.to_owned(),
+            created_at: 1,
+            updated_at: 1,
+        };
+        let mut rows = self.assistant_snapshots.lock().unwrap();
+        rows.retain(|existing| existing.conversation_id != params.conversation_id);
+        rows.push(row.clone());
+        Ok(Some(row))
+    }
+
+    async fn delete_assistant_snapshot(&self, conversation_id: &str) -> Result<bool, aionui_db::DbError> {
+        let mut rows = self.assistant_snapshots.lock().unwrap();
+        let before = rows.len();
+        rows.retain(|row| row.conversation_id != conversation_id);
+        Ok(rows.len() != before)
     }
 
     async fn get_messages(
@@ -623,6 +708,56 @@ fn make_service_with_mock_task_manager(
     (svc, broadcaster, repo)
 }
 
+async fn make_service_with_mock_task_manager_and_assistant_support(
+    task_mgr: Arc<MockTaskManager>,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<SqliteAssistantDefinitionRepository>,
+    Arc<SqliteAssistantOverlayRepository>,
+    Arc<dyn IAssistantPreferenceRepository>,
+) {
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr);
+    let db = init_database_memory().await.unwrap();
+    let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
+    let overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
+    let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
+        Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone()));
+
+    svc.with_assistant_definition_repo(definition_repo.clone());
+    svc.with_assistant_state_repo(overlay_repo.clone());
+    svc.with_assistant_preference_repo(preference_repo.clone());
+
+    (svc, broadcaster, repo, definition_repo, overlay_repo, preference_repo)
+}
+
+async fn make_service_with_assistant_support(
+    skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
+    dispatcher: Arc<dyn AssistantRuleDispatcher>,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<SqliteAssistantDefinitionRepository>,
+    Arc<SqliteAssistantOverlayRepository>,
+    Arc<dyn IAssistantPreferenceRepository>,
+) {
+    let (svc, broadcaster, repo, _task_mgr) = make_service_with_resolver(skill_resolver);
+    let db = init_database_memory().await.unwrap();
+    let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
+    let state_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
+    let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
+        Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone()));
+
+    svc.with_assistant_definition_repo(definition_repo.clone());
+    svc.with_assistant_state_repo(state_repo.clone());
+    svc.with_assistant_preference_repo(preference_repo.clone());
+    svc.with_assistant_dispatcher(dispatcher);
+
+    (svc, broadcaster, repo, definition_repo, state_repo, preference_repo)
+}
+
 fn make_create_req() -> CreateConversationRequest {
     let workspace = ensure_test_workspace_path();
     serde_json::from_value(json!({
@@ -636,6 +771,82 @@ fn ensure_test_workspace_path() -> String {
     let workspace = std::env::temp_dir().join("aionui-conversation-service-test-project");
     std::fs::create_dir_all(&workspace).unwrap();
     workspace.to_string_lossy().to_string()
+}
+
+async fn upsert_test_assistant_definition(
+    repo: &SqliteAssistantDefinitionRepository,
+    definition_id: &str,
+    assistant_key: &str,
+    agent_backend: &str,
+    default_model_mode: &str,
+    default_permission_mode: &str,
+) {
+    repo.upsert(&UpsertAssistantDefinitionParams {
+        definition_id,
+        assistant_key,
+        source: "builtin",
+        owner_type: "system",
+        source_ref: Some(assistant_key),
+        source_version: None,
+        source_hash: None,
+        name: assistant_key,
+        name_i18n: "{}",
+        description: Some("desc"),
+        description_i18n: "{}",
+        avatar_type: "emoji",
+        avatar_value: Some("🤖"),
+        agent_backend,
+        rule_resource_type: "builtin_asset",
+        rule_resource_ref: Some(assistant_key),
+        rule_inline_content: None,
+        recommended_prompts: "[]",
+        recommended_prompts_i18n: "{}",
+        default_model_mode,
+        default_model_value: None,
+        default_permission_mode,
+        default_permission_value: None,
+        default_skills_mode: "auto",
+        default_skill_ids: "[]",
+        custom_skill_names: "[]",
+        default_disabled_builtin_skill_ids: "[]",
+        default_mcps_mode: "auto",
+        default_mcp_ids: "[]",
+    })
+    .await
+    .unwrap();
+}
+
+async fn create_assistant_backed_conversation(
+    svc: &ConversationService,
+    user_id: &str,
+    conversation_type: &str,
+    backend: &str,
+    assistant_id: &str,
+) -> ConversationResponse {
+    let workspace = ensure_test_workspace_path();
+    let mut payload = json!({
+        "type": conversation_type,
+        "name": "assistant conversation",
+        "assistant": {
+            "id": assistant_id,
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace,
+            "backend": backend
+        }
+    });
+
+    if conversation_type == "aionrs" {
+        payload["model"] = json!({
+            "provider_id": "provider-1",
+            "model": "model-a",
+            "use_model": "model-a"
+        });
+    }
+
+    let req: CreateConversationRequest = serde_json::from_value(payload).unwrap();
+    svc.create(user_id, req).await.unwrap()
 }
 
 async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agent_type: AgentType) -> ConversationRow {
@@ -2258,6 +2469,372 @@ async fn set_model_returns_confirmed_model_even_if_get_model_is_stale() {
 }
 
 #[tokio::test]
+async fn set_model_updates_assistant_preference_only_when_snapshot_model_mode_is_auto() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_model_auto",
+        "assistant-model-auto",
+        "claude",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_model_auto",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            definition_id: "asstdef_model_auto",
+            last_model_id: Some("legacy-model"),
+            last_permission_value: None,
+            last_skill_ids: "[]",
+            last_disabled_builtin_skill_ids: "[]",
+            last_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let auto_conv = create_assistant_backed_conversation(&svc, "user_1", "acp", "claude", "assistant-model-auto").await;
+    task_mgr.insert_agent(
+        &auto_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&auto_conv.id))),
+    );
+
+    let response = svc
+        .set_model(
+            &auto_conv.id,
+            SetModelRequest {
+                model_id: "model-b".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response
+            .model_info
+            .as_ref()
+            .and_then(|info| info.current_model_id.as_deref()),
+        Some("model-b")
+    );
+    let auto_pref = preference_repo.get("asstdef_model_auto").await.unwrap().unwrap();
+    assert_eq!(auto_pref.last_model_id.as_deref(), Some("model-b"));
+    let auto_snapshot = repo.get_assistant_snapshot(&auto_conv.id).await.unwrap().unwrap();
+    assert_eq!(auto_snapshot.resolved_model_id.as_deref(), Some("model-b"));
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_model_fixed",
+        "assistant-model-fixed",
+        "claude",
+        "fixed",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_model_fixed",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            definition_id: "asstdef_model_fixed",
+            last_model_id: Some("legacy-fixed-model"),
+            last_permission_value: None,
+            last_skill_ids: "[]",
+            last_disabled_builtin_skill_ids: "[]",
+            last_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let fixed_conv =
+        create_assistant_backed_conversation(&svc, "user_1", "acp", "claude", "assistant-model-fixed").await;
+    task_mgr.insert_agent(
+        &fixed_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&fixed_conv.id))),
+    );
+
+    let _ = svc
+        .set_model(
+            &fixed_conv.id,
+            SetModelRequest {
+                model_id: "model-c".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let fixed_pref = preference_repo.get("asstdef_model_fixed").await.unwrap().unwrap();
+    assert_eq!(fixed_pref.last_model_id.as_deref(), Some("legacy-fixed-model"));
+    let fixed_snapshot = repo.get_assistant_snapshot(&fixed_conv.id).await.unwrap().unwrap();
+    assert_eq!(fixed_snapshot.resolved_model_id.as_deref(), Some("model-c"));
+}
+
+#[tokio::test]
+async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mode_is_auto() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_mode_auto",
+        "assistant-mode-auto",
+        "claude",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_mode_auto",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            definition_id: "asstdef_mode_auto",
+            last_model_id: None,
+            last_permission_value: Some("legacy-mode"),
+            last_skill_ids: "[]",
+            last_disabled_builtin_skill_ids: "[]",
+            last_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let auto_conv = create_assistant_backed_conversation(&svc, "user_1", "acp", "claude", "assistant-mode-auto").await;
+    task_mgr.insert_agent(
+        &auto_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&auto_conv.id))),
+    );
+
+    let response = svc
+        .set_mode(
+            &auto_conv.id,
+            SetModeRequest {
+                mode: "plan".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.mode, "plan");
+    let auto_pref = preference_repo.get("asstdef_mode_auto").await.unwrap().unwrap();
+    assert_eq!(auto_pref.last_permission_value.as_deref(), Some("plan"));
+    let auto_snapshot = repo.get_assistant_snapshot(&auto_conv.id).await.unwrap().unwrap();
+    assert_eq!(auto_snapshot.resolved_permission_value.as_deref(), Some("plan"));
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_mode_fixed",
+        "assistant-mode-fixed",
+        "claude",
+        "auto",
+        "fixed",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_mode_fixed",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            definition_id: "asstdef_mode_fixed",
+            last_model_id: None,
+            last_permission_value: Some("legacy-fixed-mode"),
+            last_skill_ids: "[]",
+            last_disabled_builtin_skill_ids: "[]",
+            last_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let fixed_conv =
+        create_assistant_backed_conversation(&svc, "user_1", "acp", "claude", "assistant-mode-fixed").await;
+    task_mgr.insert_agent(
+        &fixed_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&fixed_conv.id))),
+    );
+
+    let _ = svc
+        .set_mode(
+            &fixed_conv.id,
+            SetModeRequest {
+                mode: "acceptEdits".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let fixed_pref = preference_repo.get("asstdef_mode_fixed").await.unwrap().unwrap();
+    assert_eq!(fixed_pref.last_permission_value.as_deref(), Some("legacy-fixed-mode"));
+    let fixed_snapshot = repo.get_assistant_snapshot(&fixed_conv.id).await.unwrap().unwrap();
+    assert_eq!(fixed_snapshot.resolved_permission_value.as_deref(), Some("acceptEdits"));
+}
+
+#[tokio::test]
+async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_model_mode_is_auto() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_aionrs_auto",
+        "assistant-aionrs-auto",
+        "aionrs",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_aionrs_auto",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            definition_id: "asstdef_aionrs_auto",
+            last_model_id: Some("legacy-aionrs-model"),
+            last_permission_value: None,
+            last_skill_ids: "[]",
+            last_disabled_builtin_skill_ids: "[]",
+            last_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let auto_conv =
+        create_assistant_backed_conversation(&svc, "user_1", "aionrs", "aionrs", "assistant-aionrs-auto").await;
+    let updated = svc
+        .update(
+            "user_1",
+            &auto_conv.id,
+            UpdateConversationRequest {
+                model: Some(ProviderWithModel {
+                    provider_id: "provider-2".to_owned(),
+                    model: "model-z".to_owned(),
+                    use_model: Some("model-z".to_owned()),
+                }),
+                name: None,
+                extra: None,
+                pinned: None,
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        updated.model.as_ref().and_then(|model| model.use_model.as_deref()),
+        Some("model-z")
+    );
+    let auto_pref = preference_repo.get("asstdef_aionrs_auto").await.unwrap().unwrap();
+    assert_eq!(auto_pref.last_model_id.as_deref(), Some("model-z"));
+    let auto_snapshot = repo.get_assistant_snapshot(&auto_conv.id).await.unwrap().unwrap();
+    assert_eq!(auto_snapshot.resolved_model_id.as_deref(), Some("model-z"));
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_aionrs_fixed",
+        "assistant-aionrs-fixed",
+        "aionrs",
+        "fixed",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_aionrs_fixed",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            definition_id: "asstdef_aionrs_fixed",
+            last_model_id: Some("legacy-aionrs-fixed-model"),
+            last_permission_value: None,
+            last_skill_ids: "[]",
+            last_disabled_builtin_skill_ids: "[]",
+            last_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let fixed_conv =
+        create_assistant_backed_conversation(&svc, "user_1", "aionrs", "aionrs", "assistant-aionrs-fixed").await;
+    let _ = svc
+        .update(
+            "user_1",
+            &fixed_conv.id,
+            UpdateConversationRequest {
+                model: Some(ProviderWithModel {
+                    provider_id: "provider-3".to_owned(),
+                    model: "model-y".to_owned(),
+                    use_model: Some("model-y".to_owned()),
+                }),
+                name: None,
+                extra: None,
+                pinned: None,
+            },
+            &(task_mgr as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
+
+    let fixed_pref = preference_repo.get("asstdef_aionrs_fixed").await.unwrap().unwrap();
+    assert_eq!(fixed_pref.last_model_id.as_deref(), Some("legacy-aionrs-fixed-model"));
+    let fixed_snapshot = repo.get_assistant_snapshot(&fixed_conv.id).await.unwrap().unwrap();
+    assert_eq!(fixed_snapshot.resolved_model_id.as_deref(), Some("model-y"));
+
+    // Ensure the update path used the repository row, not a no-op.
+    let updated_row = repo.get(&fixed_conv.id).await.unwrap().unwrap();
+    assert!(
+        updated_row
+            .model
+            .as_deref()
+            .is_some_and(|model| model.contains("model-y"))
+    );
+}
+
+#[tokio::test]
 async fn send_message_missing_workspace_persists_message_and_failure_tip() {
     let (svc, broadcaster, repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
@@ -3531,6 +4108,308 @@ async fn create_writes_extra_skills_from_auto_inject_and_preset() {
     assert_eq!(resp.extra["skills"], json!(["cron", "pdf"]));
     assert!(resp.extra.get("preset_enabled_skills").is_none());
     assert!(resp.extra.get("exclude_auto_inject_skills").is_none());
+}
+
+#[tokio::test]
+async fn create_resolves_assistant_snapshot_and_updates_preferences() {
+    let resolver = Arc::new(FixedSkillResolver {
+        names: vec!["cron".into(), "todo-tracker".into()],
+    });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("preset-1".to_string(), "assistant rule body".to_string())]),
+    });
+    let (svc, _broadcaster, repo, definition_repo, state_repo, preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+    let workspace = ensure_test_workspace_path();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            definition_id: "asstdef_preset_1",
+            assistant_key: "preset-1",
+            source: "builtin",
+            owner_type: "system",
+            source_ref: Some("preset-1"),
+            source_version: None,
+            source_hash: None,
+            name: "Preset",
+            name_i18n: "{}",
+            description: Some("desc"),
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🤖"),
+            agent_backend: "claude",
+            rule_resource_type: "builtin_asset",
+            rule_resource_ref: Some("preset-1"),
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_preset_1",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: Some("codex"),
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            definition_id: "asstdef_preset_1",
+            last_model_id: Some("old-model"),
+            last_permission_value: Some("workspace-write"),
+            last_skill_ids: r#"["legacy-skill"]"#,
+            last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
+            last_mcp_ids: r#"["legacy-mcp"]"#,
+        })
+        .await
+        .unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "assistant": {
+            "id": "preset-1",
+            "locale": "zh-CN",
+            "conversation_overrides": {
+                "model": "new-model",
+                "skill_ids": ["pdf"],
+                "disabled_builtin_skill_ids": ["todo-tracker"],
+            }
+        },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(resp.extra["assistant_id"], json!("preset-1"));
+    assert_eq!(resp.extra["preset_assistant_id"], json!("preset-1"));
+    assert_eq!(resp.extra["preset_context"], json!("assistant rule body"));
+    assert_eq!(resp.extra["current_model_id"], json!("new-model"));
+    assert_eq!(resp.extra["skills"], json!(["cron", "pdf"]));
+    assert!(resp.extra.get("assistant_snapshot").is_none());
+
+    let snapshot = repo.get_assistant_snapshot(&resp.id).await.unwrap().unwrap();
+    assert_eq!(snapshot.assistant_definition_id, "asstdef_preset_1");
+    assert_eq!(snapshot.assistant_key, "preset-1");
+    assert_eq!(snapshot.agent_backend, "codex");
+    assert_eq!(snapshot.rules_content, "assistant rule body");
+    assert_eq!(snapshot.default_model_mode, "auto");
+    assert_eq!(snapshot.resolved_model_id.as_deref(), Some("new-model"));
+    assert_eq!(snapshot.default_skills_mode, "auto");
+    assert_eq!(snapshot.resolved_skill_ids, r#"["pdf"]"#);
+
+    let updated_pref = preference_repo.get("asstdef_preset_1").await.unwrap().unwrap();
+    assert_eq!(updated_pref.last_model_id.as_deref(), Some("new-model"));
+    assert_eq!(updated_pref.last_skill_ids, r#"["pdf"]"#);
+    assert_eq!(updated_pref.last_disabled_builtin_skill_ids, r#"["todo-tracker"]"#);
+}
+
+#[tokio::test]
+async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
+    let resolver = Arc::new(FixedSkillResolver {
+        names: vec!["cron".into(), "todo-tracker".into()],
+    });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("preset-fixed".to_string(), "assistant rule body".to_string())]),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, state_repo, preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+    let workspace = ensure_test_workspace_path();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            definition_id: "asstdef_preset_fixed",
+            assistant_key: "preset-fixed",
+            source: "builtin",
+            owner_type: "system",
+            source_ref: Some("preset-fixed"),
+            source_version: None,
+            source_hash: None,
+            name: "Preset Fixed",
+            name_i18n: "{}",
+            description: Some("desc"),
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🤖"),
+            agent_backend: "claude",
+            rule_resource_type: "builtin_asset",
+            rule_resource_ref: Some("preset-fixed"),
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "fixed",
+            default_skill_ids: r#"["pdf"]"#,
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: r#"["todo-tracker"]"#,
+            default_mcps_mode: "fixed",
+            default_mcp_ids: r#"["mcp-fixed"]"#,
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_preset_fixed",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: Some("codex"),
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            definition_id: "asstdef_preset_fixed",
+            last_model_id: Some("legacy-model"),
+            last_permission_value: Some("workspace-write"),
+            last_skill_ids: r#"["legacy-skill"]"#,
+            last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
+            last_mcp_ids: r#"["legacy-mcp"]"#,
+        })
+        .await
+        .unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "assistant": {
+            "id": "preset-fixed",
+            "locale": "zh-CN",
+            "conversation_overrides": {
+                "model": "new-model",
+                "permission": "workspace-read",
+                "skill_ids": ["pdf", "cron"],
+                "disabled_builtin_skill_ids": [],
+                "mcp_ids": ["mcp-temp"]
+            }
+        },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
+        },
+    }))
+    .unwrap();
+    let _resp = svc.create("user-1", req).await.unwrap();
+
+    let updated_pref = preference_repo.get("asstdef_preset_fixed").await.unwrap().unwrap();
+    assert_eq!(updated_pref.last_model_id.as_deref(), Some("new-model"));
+    assert_eq!(updated_pref.last_permission_value.as_deref(), Some("workspace-read"));
+    assert_eq!(updated_pref.last_skill_ids, r#"["legacy-skill"]"#);
+    assert_eq!(updated_pref.last_disabled_builtin_skill_ids, r#"["legacy-disabled"]"#);
+    assert_eq!(updated_pref.last_mcp_ids, r#"["legacy-mcp"]"#);
+}
+
+#[tokio::test]
+async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_values_empty() {
+    let resolver = Arc::new(FixedSkillResolver {
+        names: vec!["cron".into(), "todo-tracker".into()],
+    });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("preset-auto".to_string(), "assistant rule body".to_string())]),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, state_repo, preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+    let workspace = ensure_test_workspace_path();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            definition_id: "asstdef_preset_auto",
+            assistant_key: "preset-auto",
+            source: "builtin",
+            owner_type: "system",
+            source_ref: Some("preset-auto"),
+            source_version: None,
+            source_hash: None,
+            name: "Preset Unset",
+            name_i18n: "{}",
+            description: Some("desc"),
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🤖"),
+            agent_backend: "claude",
+            rule_resource_type: "builtin_asset",
+            rule_resource_ref: Some("preset-auto"),
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "fixed",
+            default_skill_ids: r#"["pdf"]"#,
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_preset_auto",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: Some("codex"),
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            definition_id: "asstdef_preset_auto",
+            last_model_id: None,
+            last_permission_value: None,
+            last_skill_ids: "[]",
+            last_disabled_builtin_skill_ids: "[]",
+            last_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "assistant": {
+            "id": "preset-auto",
+            "locale": "zh-CN"
+        },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert!(resp.extra.get("current_model_id").is_none());
+    assert!(resp.extra.get("permission_mode").is_none());
+    assert!(resp.extra.get("assistant_snapshot").is_none());
+
+    let updated_pref = preference_repo.get("asstdef_preset_auto").await.unwrap().unwrap();
+    assert_eq!(updated_pref.last_model_id, None);
+    assert_eq!(updated_pref.last_permission_value, None);
+    assert_eq!(updated_pref.last_mcp_ids, "[]");
 }
 
 #[tokio::test]

@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 pub enum AssistantSource {
     Builtin,
     User,
-    Extension,
 }
 
 /// Wire shape returned by `GET /api/assistants` (single element) and
@@ -58,6 +57,132 @@ pub struct AssistantResponse {
     pub last_used_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantProfileResponse {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub name_i18n: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub description_i18n: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantStateResponse {
+    pub enabled: bool,
+    pub sort_order: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantEngineResponse {
+    pub agent_backend: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantRulesResponse {
+    pub content: String,
+    pub storage_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantPromptsResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommended: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub recommended_i18n: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDefaultScalarResponse {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDefaultListResponse {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDefaultScalarRequest {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDefaultListRequest {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AssistantDefaultsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<AssistantDefaultScalarRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<AssistantDefaultScalarRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<AssistantDefaultListRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcps: Option<AssistantDefaultListRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDefaultsResponse {
+    pub model: AssistantDefaultScalarResponse,
+    pub permission: AssistantDefaultScalarResponse,
+    pub skills: AssistantDefaultListResponse,
+    pub mcps: AssistantDefaultListResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantCapabilitiesResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_skill_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_skill_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_disabled_builtin_skill_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantPreferencesResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_permission_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_skill_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_disabled_builtin_skill_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_mcp_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDetailResponse {
+    pub id: String,
+    pub source: AssistantSource,
+    pub profile: AssistantProfileResponse,
+    pub state: AssistantStateResponse,
+    pub engine: AssistantEngineResponse,
+    pub rules: AssistantRulesResponse,
+    pub prompts: AssistantPromptsResponse,
+    pub defaults: AssistantDefaultsResponse,
+    pub capabilities: AssistantCapabilitiesResponse,
+    pub preferences: AssistantPreferencesResponse,
+}
+
 // ---------------------------------------------------------------------------
 // Request types
 // ---------------------------------------------------------------------------
@@ -90,6 +215,12 @@ pub struct CreateAssistantRequest {
     pub description_i18n: Option<HashMap<String, String>>,
     #[serde(default)]
     pub prompts_i18n: Option<HashMap<String, Vec<String>>>,
+    #[serde(default)]
+    pub recommended_prompts: Option<Vec<String>>,
+    #[serde(default)]
+    pub recommended_prompts_i18n: Option<HashMap<String, Vec<String>>>,
+    #[serde(default)]
+    pub defaults: Option<AssistantDefaultsRequest>,
 }
 
 /// `PUT /api/assistants/{id}`. All fields optional; partial update semantics.
@@ -119,6 +250,12 @@ pub struct UpdateAssistantRequest {
     pub description_i18n: Option<HashMap<String, String>>,
     #[serde(default)]
     pub prompts_i18n: Option<HashMap<String, Vec<String>>>,
+    #[serde(default)]
+    pub recommended_prompts: Option<Vec<String>>,
+    #[serde(default)]
+    pub recommended_prompts_i18n: Option<HashMap<String, Vec<String>>>,
+    #[serde(default)]
+    pub defaults: Option<AssistantDefaultsRequest>,
 }
 
 /// `PATCH /api/assistants/{id}/state`. Upserts `assistant_overrides`.
@@ -166,8 +303,6 @@ mod tests {
         assert_eq!(json, "\"builtin\"");
         let json = serde_json::to_string(&AssistantSource::User).unwrap();
         assert_eq!(json, "\"user\"");
-        let json = serde_json::to_string(&AssistantSource::Extension).unwrap();
-        assert_eq!(json, "\"extension\"");
     }
 
     #[test]
@@ -207,6 +342,7 @@ mod tests {
         assert_eq!(req.name, "X");
         assert!(req.id.is_none());
         assert!(req.preset_agent_type.is_none());
+        assert!(req.defaults.is_none());
     }
 
     #[test]
@@ -215,6 +351,24 @@ mod tests {
         let req: UpdateAssistantRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.name.as_deref(), Some("renamed"));
         assert!(req.description.is_none());
+        assert!(req.defaults.is_none());
+    }
+
+    #[test]
+    fn create_request_accepts_defaults_and_recommended_prompts() {
+        let json = serde_json::json!({
+            "name": "planner",
+            "recommended_prompts": ["Plan work"],
+            "defaults": {
+                "model": { "mode": "fixed", "value": "openai/gpt-5" },
+                "skills": { "mode": "fixed", "value": ["skill-a"] }
+            }
+        });
+        let req: CreateAssistantRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.recommended_prompts.unwrap(), vec!["Plan work"]);
+        let defaults = req.defaults.unwrap();
+        assert_eq!(defaults.model.unwrap().mode, "fixed");
+        assert_eq!(defaults.skills.unwrap().value, vec!["skill-a"]);
     }
 
     #[test]
