@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.1.29](https://github.com/iOfficeAI/AionCore/compare/v0.1.28...v0.1.29) (2026-06-12)
+
+
+### Features
+
+* converge team mode runtime architecture ([#464](https://github.com/iOfficeAI/AionCore/issues/464)) ([abeb9a1](https://github.com/iOfficeAI/AionCore/commit/abeb9a184a280a8da1f9089a90f7be2db3c94af4))
+* **stt:** streaming transcription proxy over websocket ([#455](https://github.com/iOfficeAI/AionCore/issues/455)) ([1c19a8b](https://github.com/iOfficeAI/AionCore/commit/1c19a8b9a80be665d30310071c0c12bc95881c11))
+
+
+### Bug Fixes
+
+* **agent:** validate managed ACP platform binaries ([#462](https://github.com/iOfficeAI/AionCore/issues/462)) ([651c79f](https://github.com/iOfficeAI/AionCore/commit/651c79f0ec0e07009f637ebb2afa14de47c95ba3))
+* **cron:** retry busy jobs from runtime state ([#459](https://github.com/iOfficeAI/AionCore/issues/459)) ([9918058](https://github.com/iOfficeAI/AionCore/commit/9918058788e07508ee61fc841e4c85cf757b8bb6))
+* isolate ACP cancel turn completion ([#461](https://github.com/iOfficeAI/AionCore/issues/461)) ([ea01ee6](https://github.com/iOfficeAI/AionCore/commit/ea01ee6849d66dad698fee48f6374233d23985ae))
+* **office:** probe star-office preferred_url host as given ([#456](https://github.com/iOfficeAI/AionCore/issues/456)) ([3c2149c](https://github.com/iOfficeAI/AionCore/commit/3c2149ca92aad8a0e19fae0d8083083500f60267))
+
+
+### Code Refactoring
+
+* **assistant:** finalize unified governance storage ([#449](https://github.com/iOfficeAI/AionCore/issues/449)) ([aba2d2a](https://github.com/iOfficeAI/AionCore/commit/aba2d2acc0a855152ae372c04b4249e956fc4cbf))
+
+
+### Documentation
+
+* clarify production logging guidance ([#460](https://github.com/iOfficeAI/AionCore/issues/460)) ([118ed03](https://github.com/iOfficeAI/AionCore/commit/118ed03b5393ec87edf8801ed7395d917c87855a))
+
 ## [0.1.28](https://github.com/iOfficeAI/AionCore/compare/v0.1.27...v0.1.28) (2026-06-11)
 
 
