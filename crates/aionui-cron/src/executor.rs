@@ -763,6 +763,7 @@ impl JobExecutor {
                 let follow_up = SendMessageData {
                     content: build_skill_suggest_prompt(&job_name),
                     msg_id: ConversationService::mint_msg_id(),
+                    turn_id: None,
                     files: vec![],
                     inject_skills: skill_names,
                 };

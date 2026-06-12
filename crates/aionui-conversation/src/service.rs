@@ -19,8 +19,8 @@ use aionui_api_types::{
     UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
-    AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete, PaginatedResult,
-    WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
+    AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
+    PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
@@ -31,6 +31,7 @@ use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::convert::{
@@ -45,6 +46,7 @@ use crate::turn_orchestrator::{ConversationTurnOrchestrator, TurnStartInput};
 use std::sync::RwLock;
 
 pub(crate) const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
+const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 
@@ -1626,8 +1628,33 @@ impl ConversationService {
 
         self.runtime_state.mark_cancelling(conversation_id);
         if let Err(e) = agent.cancel().await {
+            self.runtime_state.clear_cancelling(conversation_id);
             warn!(conversation_id, turn_id, error = %ErrorChain(&e), "Failed to cancel agent");
             return Err(e.into());
+        }
+
+        if agent.agent_type() == AgentType::Acp {
+            let runtime_state = self.runtime_state();
+            let task_manager = Arc::clone(task_manager);
+            let conv_id = conversation_id.to_owned();
+            let active_turn = turn_id.to_owned();
+
+            tokio::spawn(async move {
+                tokio::time::sleep(ACP_CANCEL_DRAIN_TIMEOUT).await;
+                if runtime_state.active_turn_id_for(&conv_id).as_deref() == Some(active_turn.as_str())
+                    && runtime_state.is_cancelling(&conv_id)
+                {
+                    warn!(
+                        conversation_id = %conv_id,
+                        turn_id = %active_turn,
+                        timeout_ms = ACP_CANCEL_DRAIN_TIMEOUT.as_millis() as u64,
+                        "ACP cancel did not drain before timeout; killing task"
+                    );
+                    task_manager
+                        .kill_and_wait(&conv_id, Some(AgentKillReason::UserCancelTimeout))
+                        .await;
+                }
+            });
         }
 
         info!(conversation_id, turn_id, "Stream cancel acknowledged");

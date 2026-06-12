@@ -34,7 +34,7 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 use crate::ConversationError;
 use crate::service::ConversationService;
@@ -1552,6 +1552,97 @@ impl IMockAgent for MockAgent {
     }
 }
 
+struct BlockingCancelAgent {
+    conversation_id: String,
+    agent_type: AgentType,
+    event_tx: broadcast::Sender<AgentStreamEvent>,
+    send_started: Notify,
+    finish_notify: Notify,
+    cancel_count: AtomicUsize,
+    cancel_error: bool,
+}
+
+impl BlockingCancelAgent {
+    fn new(conversation_id: &str) -> Self {
+        Self::new_with_type(conversation_id, AgentType::Acp)
+    }
+
+    fn new_with_type(conversation_id: &str, agent_type: AgentType) -> Self {
+        let (event_tx, _) = broadcast::channel(64);
+        Self {
+            conversation_id: conversation_id.to_owned(),
+            agent_type,
+            event_tx,
+            send_started: Notify::new(),
+            finish_notify: Notify::new(),
+            cancel_count: AtomicUsize::new(0),
+            cancel_error: false,
+        }
+    }
+
+    fn new_with_cancel_error(conversation_id: &str) -> Self {
+        let mut agent = Self::new(conversation_id);
+        agent.cancel_error = true;
+        agent
+    }
+
+    async fn wait_until_send_started(&self) {
+        self.send_started.notified().await;
+    }
+
+    fn release_finish(&self) {
+        self.finish_notify.notify_waiters();
+    }
+}
+
+#[async_trait::async_trait]
+impl IAgentTask for BlockingCancelAgent {
+    fn agent_type(&self) -> AgentType {
+        self.agent_type
+    }
+
+    fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+
+    fn workspace(&self) -> &str {
+        "/tmp/test"
+    }
+
+    fn status(&self) -> Option<ConversationStatus> {
+        Some(ConversationStatus::Running)
+    }
+
+    fn last_activity_at(&self) -> TimestampMs {
+        0
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+        self.event_tx.subscribe()
+    }
+
+    async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
+        self.send_started.notify_waiters();
+        self.finish_notify.notified().await;
+        let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
+        Ok(())
+    }
+
+    async fn cancel(&self) -> Result<(), AgentError> {
+        self.cancel_count.fetch_add(1, Ordering::SeqCst);
+        if self.cancel_error {
+            return Err(AgentError::bad_gateway("cancel failed"));
+        }
+        Ok(())
+    }
+
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
+impl IMockAgent for BlockingCancelAgent {}
+
 // ── Mock WorkerTaskManager ──────────────────────────────────────
 
 struct MockTaskManager {
@@ -2859,6 +2950,125 @@ async fn cancel_with_mismatched_turn_id_does_not_cancel_and_returns_current_runt
     assert_eq!(response.runtime.turn_id.as_deref(), Some(send.turn_id.as_str()));
     assert!(response.runtime.is_processing);
     assert!(svc.runtime_state().is_claimed(&conv.id));
+}
+
+#[tokio::test]
+async fn cancel_keeps_turn_claim_until_agent_terminal_event() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(BlockingCancelAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    agent.wait_until_send_started().await;
+
+    let cancel = svc
+        .cancel("user_1", &conv.id, &send.turn_id, &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    assert_eq!(cancel.runtime.turn_id.as_deref(), Some(send.turn_id.as_str()));
+    assert!(cancel.runtime.is_processing);
+    assert!(!cancel.runtime.can_send_message);
+    assert!(svc.runtime_state().is_claimed(&conv.id));
+
+    let second = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap_err();
+    assert!(matches!(second, ConversationError::Busy { .. }));
+
+    agent.release_finish();
+    wait_for_turn_released(&svc, &conv.id).await;
+}
+
+#[tokio::test]
+async fn cancel_error_clears_cancelling_state() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(BlockingCancelAgent::new_with_cancel_error(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    agent.wait_until_send_started().await;
+
+    let err = svc
+        .cancel("user_1", &conv.id, &send.turn_id, &task_mgr_dyn)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ConversationError::BadGateway { .. }));
+    assert!(!svc.runtime_state().is_cancelling(&conv.id));
+
+    agent.release_finish();
+    wait_for_turn_released(&svc, &conv.id).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_timeout_kills_acp_task_when_turn_still_claimed() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(BlockingCancelAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    svc.cancel("user_1", &conv.id, &send.turn_id, &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(15) + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        task_mgr.kill_records(),
+        vec![(conv.id.clone(), Some(AgentKillReason::UserCancelTimeout))]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_timeout_does_not_kill_non_acp_task() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(BlockingCancelAgent::new_with_type(&conv.id, AgentType::Aionrs));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    svc.cancel("user_1", &conv.id, &send.turn_id, &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(15) + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    assert!(task_mgr.kill_records().is_empty());
 }
 
 #[tokio::test]

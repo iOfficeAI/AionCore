@@ -261,6 +261,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
     let data = SendMessageData {
         content: input.first_message.clone(),
         msg_id,
+        turn_id: None,
         files,
         inject_skills: Vec::new(),
     };

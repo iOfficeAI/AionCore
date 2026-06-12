@@ -12,6 +12,9 @@ pub struct SendMessageData {
     pub content: String,
     /// Client-generated message ID for correlation.
     pub msg_id: String,
+    /// Runtime turn ID for backend logs and tests. Not part of the ACP wire protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     /// File paths attached to the message.
     #[serde(default)]
     pub files: Vec<String>,
@@ -124,24 +127,28 @@ mod tests {
         let data = SendMessageData {
             content: "Hello".into(),
             msg_id: "msg-001".into(),
+            turn_id: Some("turn-001".into()),
             files: vec!["/tmp/a.txt".into()],
             inject_skills: vec!["review".into()],
         };
         let json = serde_json::to_value(&data).unwrap();
         assert_eq!(json["content"], "Hello");
         assert_eq!(json["msg_id"], "msg-001");
+        assert_eq!(json["turn_id"], "turn-001");
         assert_eq!(json["files"], json!(["/tmp/a.txt"]));
         assert_eq!(json["inject_skills"], json!(["review"]));
 
         let parsed: SendMessageData = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.content, "Hello");
         assert_eq!(parsed.msg_id, "msg-001");
+        assert_eq!(parsed.turn_id.as_deref(), Some("turn-001"));
     }
 
     #[test]
     fn send_message_data_defaults_optional_fields() {
         let json = json!({ "content": "Hi", "msg_id": "m1" });
         let data: SendMessageData = serde_json::from_value(json).unwrap();
+        assert!(data.turn_id.is_none());
         assert!(data.files.is_empty());
         assert!(data.inject_skills.is_empty());
     }

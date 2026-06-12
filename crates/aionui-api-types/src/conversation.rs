@@ -98,6 +98,7 @@ pub enum ConversationRuntimeStateKind {
     Idle,
     Starting,
     Running,
+    Cancelling,
     WaitingConfirmation,
 }
 
