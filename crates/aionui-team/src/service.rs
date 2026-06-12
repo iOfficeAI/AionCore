@@ -28,6 +28,7 @@ use crate::ports::{
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::session::TeamSession;
 use crate::types::{Team, TeamAgent, TeammateRole};
+use crate::wake::TeamWakeSource;
 
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
     if !workspace.trim().is_empty() {
@@ -547,7 +548,16 @@ impl TeamSessionService {
         // Notify all agents so they drain any pre-existing mailbox messages
         // (e.g. from a prior session or backend restart).
         for agent in &agents_snapshot {
-            session.notify_agent(&agent.slot_id);
+            if session.team_run_manager().active_run_id().await.is_some() {
+                warn!(
+                    team_id,
+                    slot_id = %agent.slot_id,
+                    wake_policy = "session_restore_drain",
+                    "session restore drain skipped because active team run exists"
+                );
+            } else {
+                session.notify_agent_for_session_restore_drain(&agent.slot_id);
+            }
         }
 
         let active_count = if skip_leader {
@@ -840,17 +850,62 @@ impl TeamSessionService {
         Ok(())
     }
 
-    /// Wake a specific agent in a team session (trigger it to read mailbox).
-    /// Called by MCP dispatch after `team_send_message` writes to mailbox.
-    ///
-    /// In the event-loop model this simply notifies the agent's event loop.
-    pub async fn wake_agent_in_session(&self, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+    pub(crate) async fn wake_agent_for_team_work(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+        source: TeamWakeSource,
+    ) -> Result<(), TeamError> {
         let entry = self
             .sessions
             .get(team_id)
             .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-        entry.session.notify_agent(slot_id);
-        Ok(())
+        entry.session.wake_agent_for_team_work(slot_id, source).await
+    }
+
+    pub(crate) async fn require_active_team_run_for_team_work(&self, team_id: &str) -> Result<(), TeamError> {
+        let entry = self
+            .sessions
+            .get(team_id)
+            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+        if entry.session.team_run_manager().active_run_id().await.is_some() {
+            return Ok(());
+        }
+        Err(TeamError::InvalidRequest(
+            "no active team run for run-scoped wake".into(),
+        ))
+    }
+
+    pub(crate) async fn notify_leader_spawn_attach_failed(
+        &self,
+        team_id: &str,
+        failed_slot_id: &str,
+        error: &str,
+    ) -> Result<(), TeamError> {
+        let entry = self
+            .sessions
+            .get(team_id)
+            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+        entry
+            .session
+            .notify_leader_spawn_attach_failed(failed_slot_id, error)
+            .await
+    }
+
+    pub(crate) async fn wake_leader_after_recovery_message(
+        &self,
+        team_id: &str,
+        source_slot_id: &str,
+        source: TeamWakeSource,
+    ) -> Result<(), TeamError> {
+        let entry = self
+            .sessions
+            .get(team_id)
+            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+        entry
+            .session
+            .wake_leader_after_recovery_message(source_slot_id, source)
+            .await
     }
 }
 

@@ -17,6 +17,7 @@ use crate::scheduler::TeammateManager;
 use crate::session::TeamSession;
 use crate::team_run::{ActiveChildTurn, ChildStartDecision, target_role_for};
 use crate::types::TeammateStatus;
+use crate::wake::TeamWakeSource;
 use aionui_api_types::TeamRunStatus;
 
 /// Registry of per-agent Notify handles. Used by any trigger source to poke
@@ -176,19 +177,6 @@ async fn run_event_loop(
 /// lifecycle remains behind the port; Team keeps projection, mark-read, and
 /// scheduler finalization here.
 async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput) -> Option<TurnExecution> {
-    ctx.session.mirror_unread_to_conversation(input).await;
-
-    let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Working).await;
-
-    let files: Vec<String> = input
-        .unread
-        .iter()
-        .filter_map(|m| m.files.as_ref())
-        .flatten()
-        .cloned()
-        .collect();
-
-    let unread_message_ids = input.unread.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
     let role = target_role_for(input.agent_role);
     let reservation = if input.team_run_id.is_some() {
         match ctx
@@ -206,12 +194,34 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                     conversation_id = %input.conversation_id,
                     "event loop: team run wake skipped because reservation could not be claimed"
                 );
+                if let Err(e) = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await {
+                    warn!(
+                        team_id = %ctx.team_id,
+                        slot_id = %ctx.slot_id,
+                        error = %e,
+                        "event loop: failed to roll back status after reservation claim failure"
+                    );
+                }
                 return None;
             }
         }
     } else {
         None
     };
+
+    ctx.session.mirror_unread_to_conversation(input).await;
+
+    let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Working).await;
+
+    let files: Vec<String> = input
+        .unread
+        .iter()
+        .filter_map(|m| m.files.as_ref())
+        .flatten()
+        .cloned()
+        .collect();
+
+    let unread_message_ids = input.unread.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
     let started_seen = Arc::new(AtomicBool::new(false));
     let on_started: Option<AgentTurnStartedCallback> = reservation.clone().map(|reservation| {
         let team_run_manager = ctx.session.team_run_manager().clone();
@@ -351,9 +361,19 @@ async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, _conversatio
     }
     match ctx.scheduler.finalize_turn(&ctx.slot_id, &[]).await {
         Ok(Some(wake_target)) => {
-            if wake_target != ctx.slot_id {
-                ctx.session.team_run_manager().record_pending_wake().await;
-                ctx.registry.notify(&wake_target);
+            if wake_target != ctx.slot_id
+                && let Err(e) = ctx
+                    .session
+                    .wake_agent_for_team_work(&wake_target, TeamWakeSource::IdleNotification)
+                    .await
+            {
+                warn!(
+                    team_id = %ctx.team_id,
+                    slot_id = %ctx.slot_id,
+                    wake_target = %wake_target,
+                    error = %e,
+                    "event loop: failed to wake leader after teammate finalize"
+                );
             }
         }
         Ok(None) => {}

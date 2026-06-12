@@ -752,16 +752,9 @@ async fn s1b_mcp_stdio_config_per_agent() {
 // Scenario 2: MCP team_send_message end-to-end
 // ===========================================================================
 
-/// Scenario 2a: Lead calls team_send_message via MCP → mailbox written.
-///
-/// This is the core side-effect test: MCP tool call must persist the message
-/// to the mailbox repo. The wake path (wake_agent_in_session) requires a live
-/// TeamSessionService Weak pointer which is not available in this standalone
-/// TeamSession test environment. Verify mailbox persistence only here;
-/// wake propagation is covered by s9_session_send_message_wakes_lead which
-/// uses the public `send_message` / `send_message_to_agent` API.
+/// Scenario 2a: Standalone MCP send requires a live Team Run service.
 #[tokio::test]
-async fn s2a_mcp_team_send_message_writes_mailbox() {
+async fn s2a_mcp_team_send_message_rejects_without_live_service() {
     let (session, _tm, repo, _sent) = setup_session().await;
     let port = session_port(&session);
     let token = session_token(&session);
@@ -775,31 +768,24 @@ async fn s2a_mcp_team_send_message_writes_mailbox() {
     )
     .await;
 
-    assert!(!is_mcp_error(&resp), "team_send_message returned error: {resp}");
     assert!(
-        mcp_text(&resp).contains("Message sent"),
-        "response text must confirm delivery"
+        is_mcp_error(&resp),
+        "team_send_message must reject without service: {resp}"
     );
+    assert!(mcp_text(&resp).contains("Team service not available"));
 
-    // Mailbox must have the message (persisted by the MCP handler's execute_action)
     let state = repo.state.lock().unwrap();
-    let worker_msgs: Vec<_> = state
-        .messages
-        .iter()
-        .filter(|m| m.to_agent_id == "worker-1" && m.content.contains("e2e test payload"))
-        .collect();
     assert!(
-        !worker_msgs.is_empty(),
-        "mailbox must contain the message for worker-1; repo state: {:?}",
-        state.messages
+        state.messages.is_empty(),
+        "rejected MCP send must not write mailbox rows"
     );
 
     session.stop();
 }
 
-/// Scenario 2b: Broadcast team_send_message (to="*") writes to all teammates.
+/// Scenario 2b: Broadcast send is also guarded by the Team Run service.
 #[tokio::test]
-async fn s2b_mcp_broadcast_writes_to_all_agents() {
+async fn s2b_mcp_broadcast_rejects_without_live_service() {
     let (session, _tm, repo, _sent) = setup_session().await;
     let port = session_port(&session);
     let token = session_token(&session);
@@ -813,28 +799,21 @@ async fn s2b_mcp_broadcast_writes_to_all_agents() {
     )
     .await;
 
-    assert!(!is_mcp_error(&resp), "broadcast team_send_message failed: {resp}");
+    assert!(is_mcp_error(&resp), "broadcast must reject without service: {resp}");
+    assert!(mcp_text(&resp).contains("Team service not available"));
 
-    // Both lead and worker should have received the broadcast
     let state = repo.state.lock().unwrap();
-    let worker_msgs: Vec<_> = state
-        .messages
-        .iter()
-        .filter(|m| m.content.contains("broadcast msg"))
-        .collect();
     assert!(
-        !worker_msgs.is_empty(),
-        "broadcast must write to at least one agent; state.messages={:?}",
-        state.messages
+        state.messages.is_empty(),
+        "rejected broadcast must not write mailbox rows"
     );
 
     session.stop();
 }
 
-/// Scenario 2c: team_send_message is not a no-op — the repo actually receives
-/// the row (guards against the "success with no side effect" failure mode).
+/// Scenario 2c: rejected team_send_message has no mailbox side effect.
 #[tokio::test]
-async fn s2c_send_message_side_effect_reaches_repo() {
+async fn s2c_rejected_send_message_does_not_reach_repo() {
     let (session, _tm, repo, _sent) = setup_session().await;
     let port = session_port(&session);
     let token = session_token(&session);
@@ -846,19 +825,22 @@ async fn s2c_send_message_side_effect_reaches_repo() {
     }
 
     let mut stream = mcp_connect(port, &token, "lead-1").await;
-    mcp_call_tool(
+    let resp = mcp_call_tool(
         &mut stream,
         12,
         "team_send_message",
         json!({ "to": "worker-1", "message": "side-effect check" }),
     )
     .await;
+    assert!(
+        is_mcp_error(&resp),
+        "team_send_message must reject without service: {resp}"
+    );
 
-    // After tool call, repo must have at least one row
     let state = repo.state.lock().unwrap();
     assert!(
-        !state.messages.is_empty(),
-        "team_send_message must persist at least one message row to repo"
+        state.messages.is_empty(),
+        "rejected team_send_message must not persist mailbox rows"
     );
 
     session.stop();

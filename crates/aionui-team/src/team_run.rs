@@ -13,6 +13,7 @@ use crate::events::{
     TEAM_RUN_STARTED_EVENT, TEAM_RUN_UPDATED_EVENT, TeamEventEmitter,
 };
 use crate::types::TeammateRole;
+use crate::wake::TeamWakeSource;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveChildTurn {
@@ -192,20 +193,40 @@ impl TeamRunManager {
             .unwrap_or_default()
     }
 
-    pub async fn record_pending_wake(&self) {
+    pub(crate) async fn record_pending_wake(
+        &self,
+        slot_id: &str,
+        target_role: TeamRunTargetRole,
+        wake_source: TeamWakeSource,
+    ) -> Result<(), TeamError> {
         let mut guard = self.state.lock().await;
-        if let Some(run) = guard.as_mut().filter(|r| r.is_active()) {
-            run.pending_wake_count = run.pending_wake_count.saturating_add(1);
-            info!(
+        let Some(run) = guard.as_mut().filter(|r| r.is_active()) else {
+            warn!(
                 team_id = %self.team_id,
-                team_run_id = %run.team_run_id,
-                pending_wake_count = run.pending_wake_count,
-                starting_child_count = run.starting_reservations.len(),
-                active_child_count = run.active_child_turns.len(),
-                "team_run pending wake recorded"
+                slot_id,
+                target_role = ?target_role,
+                wake_source = %wake_source,
+                "team_run pending wake rejected because no active run exists"
             );
-            self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, run.payload());
-        }
+            return Err(TeamError::InvalidRequest(
+                "no active team run for run-scoped wake".into(),
+            ));
+        };
+
+        run.pending_wake_count = run.pending_wake_count.saturating_add(1);
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %run.team_run_id,
+            slot_id,
+            target_role = ?target_role,
+            wake_source = %wake_source,
+            pending_wake_count = run.pending_wake_count,
+            starting_child_count = run.starting_reservations.len(),
+            active_child_count = run.active_child_turns.len(),
+            "team_run pending wake recorded"
+        );
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, run.payload());
+        Ok(())
     }
 
     pub async fn claim_wake_for_turn(
@@ -715,6 +736,7 @@ fn maybe_cancelled_locked(run: &mut TeamRunRecord, emitter: &TeamEventEmitter) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wake::TeamWakeSource;
     use aionui_api_types::WebSocketMessage;
     use aionui_realtime::EventBroadcaster;
 
@@ -759,6 +781,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_pending_wake_requires_active_run() {
+        let (manager, _) = manager();
+
+        let err = manager
+            .record_pending_wake("worker-1", TeamRunTargetRole::Teammate, TeamWakeSource::McpSendMessage)
+            .await
+            .expect_err("run-scoped wake without active run must fail");
+
+        assert!(matches!(
+            err,
+            TeamError::InvalidRequest(message)
+                if message == "no active team run for run-scoped wake"
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_pending_wake_increments_active_run_count() {
+        let (manager, _) = manager();
+        manager
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("accept run");
+
+        manager
+            .record_pending_wake("worker-1", TeamRunTargetRole::Teammate, TeamWakeSource::McpSendMessage)
+            .await
+            .expect("record pending wake");
+
+        let reservation = manager
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "conv-worker")
+            .await
+            .expect("pending wake should be claimable");
+
+        assert_eq!(reservation.slot_id, "worker-1");
+        assert_eq!(reservation.role, TeamRunTargetRole::Teammate);
+    }
+
+    #[tokio::test]
     async fn leader_message_rejects_when_run_is_active() {
         let (manager, _) = manager();
         manager
@@ -798,7 +858,10 @@ mod tests {
             .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
             .await
             .unwrap();
-        manager.record_pending_wake().await;
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
         let reservation = manager
             .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv")
             .await
@@ -834,7 +897,10 @@ mod tests {
             .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
             .await
             .unwrap();
-        manager.record_pending_wake().await;
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
 
         let reservation = manager
             .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv")
@@ -856,7 +922,10 @@ mod tests {
             .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
             .await
             .unwrap();
-        manager.record_pending_wake().await;
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
         let reservation = manager
             .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv")
             .await
@@ -891,7 +960,10 @@ mod tests {
             .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
             .await
             .unwrap();
-        manager.record_pending_wake().await;
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
         let reservation = manager
             .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv")
             .await
@@ -932,7 +1004,10 @@ mod tests {
             .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
             .await
             .unwrap();
-        manager.record_pending_wake().await;
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
         let reservation = manager
             .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv")
             .await
@@ -956,7 +1031,10 @@ mod tests {
             .accept_user_message("worker", TeamRunTargetRole::Teammate, true, None)
             .await
             .unwrap();
-        manager.record_pending_wake().await;
+        manager
+            .record_pending_wake("worker", TeamRunTargetRole::Teammate, TeamWakeSource::UserIntervention)
+            .await
+            .unwrap();
         let reservation = manager
             .claim_wake_for_turn("worker", TeamRunTargetRole::Teammate, "conv-worker")
             .await
@@ -988,7 +1066,10 @@ mod tests {
             .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
             .await
             .unwrap();
-        manager.record_pending_wake().await;
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
         let reservation = manager
             .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv")
             .await

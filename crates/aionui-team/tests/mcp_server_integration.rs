@@ -276,7 +276,7 @@ async fn tools_list_returns_all_10_tools() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn ts1_send_message_to_agent() {
+async fn ts1_send_message_requires_live_team_run_service() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
@@ -288,15 +288,15 @@ async fn ts1_send_message_to_agent() {
     )
     .await;
 
-    assert!(!is_error_response(&resp));
+    assert!(is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(text.contains("worker-1"));
+    assert!(text.contains("Team service not available"));
 
     env.server.stop();
 }
 
 #[tokio::test]
-async fn ts2_broadcast_message() {
+async fn ts2_broadcast_message_requires_live_team_run_service() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
@@ -308,7 +308,9 @@ async fn ts2_broadcast_message() {
     )
     .await;
 
-    assert!(!is_error_response(&resp));
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(text.contains("Team service not available"));
 
     env.server.stop();
 }
@@ -375,7 +377,7 @@ async fn ts_shutdown_rejected_intercepted() {
 }
 
 #[tokio::test]
-async fn ts_regular_message_not_intercepted() {
+async fn ts_regular_message_rejects_without_live_team_run_service() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
 
@@ -387,9 +389,9 @@ async fn ts_regular_message_not_intercepted() {
     )
     .await;
 
-    assert!(!is_error_response(&resp));
+    assert!(is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(text.contains("lead-1"));
+    assert!(text.contains("Team service not available"));
     assert!(!text.contains("shutdown_approved_received"));
     assert!(!text.contains("shutdown_rejected_received"));
 
@@ -691,7 +693,7 @@ async fn tra2_rename_nonexistent_agent() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tsa1_lead_sends_shutdown_request() {
+async fn tsa1_lead_shutdown_request_requires_live_team_run_service() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
@@ -703,9 +705,9 @@ async fn tsa1_lead_sends_shutdown_request() {
     )
     .await;
 
-    assert!(!is_error_response(&resp));
+    assert!(is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(text.contains("Shutdown request sent"));
+    assert!(text.contains("Team service not available"));
 
     env.server.stop();
 }
@@ -957,7 +959,7 @@ async fn tsr2_shutdown_rejected_with_whitespace_reason() {
 }
 
 #[tokio::test]
-async fn tsr3_send_message_without_sentinel_still_routes_normally() {
+async fn tsr3_send_message_without_sentinel_rejects_without_live_team_run_service() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
 
@@ -969,18 +971,17 @@ async fn tsr3_send_message_without_sentinel_still_routes_normally() {
     )
     .await;
 
-    assert!(!is_error_response(&resp));
+    assert!(is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(text.contains("Message sent"));
+    assert!(text.contains("Team service not available"));
 
-    // The literal message lands in the lead mailbox unchanged.
+    // The literal message must not land in the lead mailbox.
     let state = env._repo.state.lock().unwrap();
-    let lead_msg = state
-        .messages
-        .iter()
-        .find(|m| m.to_agent_id == "lead-1")
-        .expect("message should be delivered");
-    assert_eq!(lead_msg.content, "regular update");
+    assert!(
+        state.messages.iter().all(|m| m.content != "regular update"),
+        "rejected message should not be delivered: {:?}",
+        state.messages
+    );
     drop(state);
 
     env.server.stop();
