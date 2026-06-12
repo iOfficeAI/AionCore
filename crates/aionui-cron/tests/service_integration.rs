@@ -28,7 +28,6 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 
-use aionui_cron::busy_guard::CronBusyGuard;
 use aionui_cron::events::CronEventEmitter;
 use aionui_cron::executor::JobExecutor;
 use aionui_cron::scheduler::CronScheduler;
@@ -600,12 +599,10 @@ async fn setup_with_conv_repo() -> (
     ));
     let agent_registry = AgentRegistry::new(agent_metadata_repo);
     agent_registry.hydrate().await.unwrap();
-    let busy_guard = Arc::new(CronBusyGuard::new());
     let executor = Arc::new(JobExecutor::new(
         task_manager,
         stub_conv_repo_trait,
         conv_service,
-        busy_guard,
         data_dir.clone(),
         data_dir.clone(),
         bc.clone() as Arc<dyn EventBroadcaster>,

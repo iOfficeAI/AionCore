@@ -18,11 +18,13 @@ mod user;
 pub use acp_session::AcpSessionRow;
 pub use agent_metadata::{AgentMetadataRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams};
 pub use assistant::{
-    AssistantOverrideRow, AssistantRow, CreateAssistantParams, UpdateAssistantParams, UpsertOverrideParams,
+    AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow,
+    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, UpsertOverrideParams,
 };
 pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
 pub use client_preference::ClientPreference;
-pub use conversation::ConversationRow;
+pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, UpsertConversationAssistantSnapshotParams};
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
 pub use mcp_server::McpServerRow;

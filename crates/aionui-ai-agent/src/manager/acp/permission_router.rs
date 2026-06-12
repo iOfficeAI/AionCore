@@ -2,20 +2,18 @@ use crate::agent_runtime::AgentRuntime;
 use crate::error::AgentError;
 use crate::protocol::acp::{PermissionDecision, PermissionRequest};
 use crate::protocol::events::{AgentStreamEvent, permission_request_to_event_data};
+use agent_client_protocol::schema::PermissionOptionKind as SdkPermissionOptionKind;
+use aionui_api_types::TEAM_MCP_SERVER_NAME;
 use aionui_common::Confirmation;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tracing::debug;
+use tracing::{debug, info};
 
-/// MCP tool prefixes that are auto-approved without user permission.
-///
-/// `mcp__aionui-team__` matches the team stdio bridge tools (server name is now
-/// the fixed `aionui-team` — see `TEAM_MCP_SERVER_NAME`).
-/// `mcp__aionui-team-guide__` matches the solo-session Guide tools.
-const AUTO_APPROVE_PREFIXES: &[&str] = &["mcp__aionui-team__", "mcp__aionui-team-guide__"];
+const TEAM_GUIDE_MCP_SERVER_NAME: &str = "aionui-team-guide";
+const AUTO_APPROVE_MCP_SERVERS: &[&str] = &[TEAM_MCP_SERVER_NAME, TEAM_GUIDE_MCP_SERVER_NAME];
 
 struct PendingPermission {
     responder: oneshot::Sender<PermissionDecision>,
@@ -67,10 +65,15 @@ impl PermissionRouter {
                 let call_id = perm_req.request.tool_call.tool_call_id.to_string();
 
                 // Auto-approve team MCP tools without user interaction.
-                if is_auto_approve_tool(&perm_req.request) {
-                    let _ = perm_req.response_tx.send(PermissionDecision::Selected {
-                        option_id: "allow_always".into(),
-                    });
+                if let Some(option_id) = auto_approve_option_id(&perm_req.request) {
+                    info!(
+                        conversation_id = %runtime.conversation_id(),
+                        call_id,
+                        option_id = %option_id,
+                        server_name = ?extract_mcp_server_name(&perm_req.request),
+                        "ACP team MCP permission auto-approved"
+                    );
+                    let _ = perm_req.response_tx.send(PermissionDecision::Selected { option_id });
                     continue;
                 }
 
@@ -170,9 +173,66 @@ impl PermissionRouter {
     }
 }
 
+#[cfg(test)]
 fn is_auto_approve_tool(request: &agent_client_protocol::schema::RequestPermissionRequest) -> bool {
-    let title = request.tool_call.fields.title.as_deref().unwrap_or("");
-    AUTO_APPROVE_PREFIXES.iter().any(|prefix| title.starts_with(prefix))
+    auto_approve_option_id(request).is_some()
+}
+
+fn auto_approve_option_id(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
+    let server_name = extract_mcp_server_name(request)?;
+    if !AUTO_APPROVE_MCP_SERVERS.contains(&server_name.as_str()) {
+        return None;
+    }
+    select_allow_option_id(request)
+}
+
+fn select_allow_option_id(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
+    request
+        .options
+        .iter()
+        .find(|option| matches!(option.kind, SdkPermissionOptionKind::AllowAlways))
+        .or_else(|| {
+            request
+                .options
+                .iter()
+                .find(|option| matches!(option.kind, SdkPermissionOptionKind::AllowOnce))
+        })
+        .map(|option| option.option_id.to_string())
+}
+
+fn extract_mcp_server_name(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
+    extract_mcp_server_from_raw_input(request).or_else(|| {
+        request
+            .tool_call
+            .fields
+            .title
+            .as_deref()
+            .and_then(extract_mcp_server_from_prefixed_title)
+            .map(str::to_owned)
+    })
+}
+
+fn extract_mcp_server_from_raw_input(
+    request: &agent_client_protocol::schema::RequestPermissionRequest,
+) -> Option<String> {
+    request
+        .tool_call
+        .fields
+        .raw_input
+        .as_ref()
+        .and_then(|raw_input| raw_input.get("server_name"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|server_name| !server_name.is_empty())
+        .map(str::to_owned)
+}
+
+fn extract_mcp_server_from_prefixed_title(title: &str) -> Option<&str> {
+    let rest = title.strip_prefix("mcp__")?;
+    let (server_name, tool_name) = rest.split_once("__")?;
+    if server_name.is_empty() || tool_name.is_empty() {
+        return None;
+    }
+    Some(server_name)
 }
 
 #[cfg(test)]
@@ -186,6 +246,40 @@ mod tests {
     use aionui_common::Confirmation;
     use serde_json::json;
     use std::time::Duration;
+
+    fn permission_request_with_title_and_raw_input(
+        title: &str,
+        raw_input: Option<serde_json::Value>,
+        options: Vec<PermissionOption>,
+    ) -> RequestPermissionRequest {
+        RequestPermissionRequest::new(
+            "session-1",
+            SdkToolCallUpdate::new(
+                "tool-1",
+                ToolCallUpdateFields::new()
+                    .kind(SdkToolKind::Other)
+                    .title(title.to_owned())
+                    .raw_input(raw_input),
+            ),
+            options,
+        )
+    }
+
+    fn allow_always_option(option_id: &'static str) -> PermissionOption {
+        PermissionOption::new(
+            option_id,
+            "Allow for this session",
+            SdkPermissionOptionKind::AllowAlways,
+        )
+    }
+
+    fn allow_once_option(option_id: &'static str) -> PermissionOption {
+        PermissionOption::new(option_id, "Allow", SdkPermissionOptionKind::AllowOnce)
+    }
+
+    fn reject_option(option_id: &'static str) -> PermissionOption {
+        PermissionOption::new(option_id, "Reject", SdkPermissionOptionKind::RejectOnce)
+    }
 
     fn sample_confirmation(call_id: &str) -> Confirmation {
         Confirmation {
@@ -234,6 +328,114 @@ mod tests {
             response_rx.try_recv(),
             Ok(PermissionDecision::Selected { option_id }) if option_id == "allow_once"
         ));
+    }
+
+    #[test]
+    fn auto_approve_matches_claude_team_mcp_title_prefix() {
+        let request = permission_request_with_title_and_raw_input(
+            "mcp__aionui-team__team_members",
+            None,
+            vec![allow_always_option("allow_always"), reject_option("reject")],
+        );
+
+        assert!(is_auto_approve_tool(&request));
+    }
+
+    #[test]
+    fn auto_approve_matches_codex_raw_input_server_name() {
+        let request = permission_request_with_title_and_raw_input(
+            "Approve MCP tool call",
+            Some(json!({
+                "server_name": "aionui-team",
+                "request": {
+                    "_meta": {
+                        "codex_approval_kind": "mcp_tool_call"
+                    }
+                }
+            })),
+            vec![
+                allow_once_option("approved"),
+                allow_always_option("approved-for-session"),
+                allow_always_option("approved-always"),
+                reject_option("cancel"),
+            ],
+        );
+
+        assert!(is_auto_approve_tool(&request));
+    }
+
+    #[test]
+    fn auto_approve_rejects_non_team_mcp_server() {
+        let request = permission_request_with_title_and_raw_input(
+            "Approve MCP tool call",
+            Some(json!({ "server_name": "aionui-image-generation" })),
+            vec![allow_always_option("approved-for-session"), reject_option("cancel")],
+        );
+
+        assert!(!is_auto_approve_tool(&request));
+    }
+
+    #[test]
+    fn auto_approve_selects_first_codex_allow_always_option() {
+        let request = permission_request_with_title_and_raw_input(
+            "Approve MCP tool call",
+            Some(json!({ "server_name": "aionui-team" })),
+            vec![
+                allow_once_option("approved"),
+                allow_always_option("approved-for-session"),
+                allow_always_option("approved-always"),
+                reject_option("cancel"),
+            ],
+        );
+
+        // `approved-for-session` is selected because it is the first AllowAlways option,
+        // not because the option id has special meaning in AionCore.
+        assert_eq!(
+            auto_approve_option_id(&request).as_deref(),
+            Some("approved-for-session")
+        );
+    }
+
+    #[test]
+    fn auto_approve_selects_claude_allow_always_by_kind() {
+        let request = permission_request_with_title_and_raw_input(
+            "mcp__aionui-team-guide__guide_write_plan",
+            None,
+            vec![
+                allow_always_option("allow_always"),
+                allow_once_option("allow"),
+                reject_option("reject"),
+            ],
+        );
+
+        // `allow_always` is selected because it is the only AllowAlways option,
+        // not because the option id has special meaning in AionCore.
+        assert_eq!(auto_approve_option_id(&request).as_deref(), Some("allow_always"));
+    }
+
+    #[test]
+    fn auto_approve_selects_first_available_allow_always_option() {
+        let request = permission_request_with_title_and_raw_input(
+            "Approve MCP tool call",
+            Some(json!({ "server_name": "aionui-team" })),
+            vec![
+                allow_always_option("custom-allow-always"),
+                allow_once_option("custom-allow-once"),
+            ],
+        );
+
+        assert_eq!(auto_approve_option_id(&request).as_deref(), Some("custom-allow-always"));
+    }
+
+    #[test]
+    fn auto_approve_returns_none_when_team_mcp_has_no_allow_option() {
+        let request = permission_request_with_title_and_raw_input(
+            "Approve MCP tool call",
+            Some(json!({ "server_name": "aionui-team" })),
+            vec![reject_option("cancel")],
+        );
+
+        assert_eq!(auto_approve_option_id(&request), None);
     }
 
     #[test]
@@ -315,5 +517,40 @@ mod tests {
             response_rx.try_recv(),
             Ok(PermissionDecision::Selected { option_id }) if option_id == "allow_once"
         ));
+    }
+
+    #[tokio::test]
+    async fn start_auto_approves_team_mcp_with_existing_option_id() {
+        let (permission_tx, permission_rx) = mpsc::channel(1);
+        let router = Arc::new(PermissionRouter::new(permission_rx));
+        let runtime = AgentRuntime::new("conv-1", "/tmp/workspace", 8);
+        router.start(runtime);
+
+        let request = permission_request_with_title_and_raw_input(
+            "Approve MCP tool call",
+            Some(json!({ "server_name": "aionui-team" })),
+            vec![
+                allow_once_option("approved"),
+                allow_always_option("approved-for-session"),
+                reject_option("cancel"),
+            ],
+        );
+        let (response_tx, response_rx) = oneshot::channel();
+
+        permission_tx
+            .send(PermissionRequest { request, response_tx })
+            .await
+            .expect("permission request should be accepted");
+
+        let decision = tokio::time::timeout(Duration::from_secs(1), response_rx)
+            .await
+            .expect("auto approval should respond")
+            .expect("auto approval responder should stay open");
+
+        assert!(matches!(
+            decision,
+            PermissionDecision::Selected { option_id } if option_id == "approved-for-session"
+        ));
+        assert!(router.get_confirmations().is_empty());
     }
 }

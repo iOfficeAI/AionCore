@@ -59,6 +59,7 @@ impl CloseReason {
                 Some(AgentKillReason::TeamMcpRebuild) => "Agent killed: team MCP rebuild".to_owned(),
                 Some(AgentKillReason::TeamDeleted) => "Agent killed: team deleted".to_owned(),
                 Some(AgentKillReason::ConversationDeleted) => "Agent killed: conversation deleted".to_owned(),
+                Some(AgentKillReason::UserCancelTimeout) => "Conversation cancelled; agent restarted".to_owned(),
                 None => "Agent killed".to_owned(),
             },
             CloseReason::ProcessExited {

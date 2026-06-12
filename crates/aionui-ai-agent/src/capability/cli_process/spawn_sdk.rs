@@ -84,10 +84,7 @@ impl CliAgentProcess {
                 let mut buf = stderr_buf_clone.lock().await;
                 buf.push_str(&line);
                 buf.push('\n');
-                if buf.len() > STDERR_BUFFER_MAX {
-                    let cut = buf.len() - STDERR_BUFFER_MAX;
-                    buf.drain(..cut);
-                }
+                super::trim_to_tail(&mut buf, STDERR_BUFFER_MAX);
             }
 
             debug!(pid, "Stderr reader finished");

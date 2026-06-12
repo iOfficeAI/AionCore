@@ -501,12 +501,40 @@ impl StreamPersistenceAdapter {
             AcpToolCallSessionUpdateKind::ToolCallUpdate => {
                 let merged_content = self.merge_acp_tool_call_content(tool_call_id, &value).await;
                 let update = MessageRowUpdate {
-                    content: Some(merged_content),
+                    content: Some(merged_content.clone()),
                     status: Some(Some(status.to_owned())),
                     hidden: None,
                 };
                 if let Err(e) = self.repo.update_message(tool_call_id, &update).await {
-                    error!(error = %ErrorChain(&e), "Failed to update acp_tool_call message");
+                    match e {
+                        DbError::NotFound(_) => {
+                            warn!(
+                                conversation_id = %self.conversation_id,
+                                tool_call_id = %tool_call_id,
+                                "ACP tool call update arrived before initial tool call; inserting placeholder"
+                            );
+                            let row = MessageRow {
+                                id: tool_call_id.clone(),
+                                conversation_id: self.conversation_id.clone(),
+                                msg_id: Some(tool_call_id.clone()),
+                                r#type: "acp_tool_call".into(),
+                                content: merged_content,
+                                position: Some("left".into()),
+                                status: Some(status.to_owned()),
+                                hidden: false,
+                                created_at: now_ms(),
+                            };
+                            if let Err(insert_err) = self.repo.insert_message(&row).await {
+                                error!(
+                                    error = %ErrorChain(&insert_err),
+                                    "Failed to insert late acp_tool_call placeholder"
+                                );
+                            }
+                        }
+                        other => {
+                            error!(error = %ErrorChain(&other), "Failed to update acp_tool_call message");
+                        }
+                    }
                 }
             }
         }

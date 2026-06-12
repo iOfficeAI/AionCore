@@ -47,8 +47,12 @@ pub use agent_error::{
     AgentStreamErrorData,
 };
 pub use assistant::{
-    AssistantResponse, AssistantSource, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult,
-    ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
+    AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
+    AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse,
+    AssistantDetailResponse, AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse,
+    AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse,
+    CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest,
+    UpdateAssistantRequest,
 };
 pub use auth::{
     AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
@@ -64,13 +68,14 @@ pub use channel::{
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
-    ActiveCountResponse, CancelConversationRequest, CancelConversationResponse, CloneConversationRequest,
-    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
-    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
+    CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
+    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
+    ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationResponse,
+    ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 pub use cron::{
     CreateCronJobRequest, CronAgentConfigDto, CronJobExecutedEvent, CronJobMetadataDto, CronJobPayloadDto,
@@ -127,7 +132,7 @@ pub use runtime::{
 pub use shell::{
     CheckToolInstalledRequest, CheckToolInstalledResponse, DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig,
     OpenExternalRequest, OpenFileRequest, OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig,
-    SpeechToTextProvider, SpeechToTextResult, ToolType,
+    SpeechToTextProvider, SpeechToTextResult, SttStreamClientMessage, SttStreamServerMessage, ToolType,
 };
 pub use skill::{
     AddExternalPathRequest, BuiltinAutoSkillResponse, DeleteSkillRequest, ExportSkillRequest,

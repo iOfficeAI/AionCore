@@ -25,12 +25,36 @@ pub struct ConversationMcpStatus {
 
 // ── Request types ──────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct AssistantConversationOverridesRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub permission: Option<String>,
+    #[serde(default)]
+    pub skill_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub disabled_builtin_skill_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub mcp_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct AssistantConversationRequest {
+    pub id: String,
+    #[serde(default)]
+    pub locale: Option<String>,
+    #[serde(default)]
+    pub conversation_overrides: Option<AssistantConversationOverridesRequest>,
+}
+
 /// Body for `POST /api/conversations`.
 #[derive(Debug, Deserialize)]
 pub struct CreateConversationRequest {
     pub r#type: AgentType,
     pub name: Option<String>,
     pub model: Option<ProviderWithModel>,
+    pub assistant: Option<AssistantConversationRequest>,
     pub source: Option<ConversationSource>,
     pub channel_chat_id: Option<String>,
     pub extra: serde_json::Value,
@@ -98,6 +122,7 @@ pub enum ConversationRuntimeStateKind {
     Idle,
     Starting,
     Running,
+    Cancelling,
     WaitingConfirmation,
 }
 
@@ -269,6 +294,17 @@ mod tests {
             "type": "acp",
             "name": "Code Review",
             "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" },
+            "assistant": {
+                "id": "assistant-1",
+                "locale": "zh-CN",
+                "conversation_overrides": {
+                    "model": "opus-4.1",
+                    "permission": "yolo",
+                    "skill_ids": ["skill-a"],
+                    "disabled_builtin_skill_ids": ["builtin-a"],
+                    "mcp_ids": ["mcp-a"]
+                }
+            },
             "source": "aionui",
             "channel_chat_id": "user:123",
             "extra": { "workspace": "/project" }
@@ -277,6 +313,20 @@ mod tests {
         assert_eq!(req.r#type, AgentType::Acp);
         assert_eq!(req.name.as_deref(), Some("Code Review"));
         assert_eq!(req.model.unwrap().model, "claude-sonnet-4-20250514");
+        assert_eq!(
+            req.assistant,
+            Some(AssistantConversationRequest {
+                id: "assistant-1".into(),
+                locale: Some("zh-CN".into()),
+                conversation_overrides: Some(AssistantConversationOverridesRequest {
+                    model: Some("opus-4.1".into()),
+                    permission: Some("yolo".into()),
+                    skill_ids: Some(vec!["skill-a".into()]),
+                    disabled_builtin_skill_ids: Some(vec!["builtin-a".into()]),
+                    mcp_ids: Some(vec!["mcp-a".into()]),
+                }),
+            })
+        );
         assert_eq!(req.source, Some(ConversationSource::Aionui));
         assert_eq!(req.channel_chat_id.as_deref(), Some("user:123"));
         assert_eq!(req.extra["workspace"], "/project");
@@ -292,6 +342,7 @@ mod tests {
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.r#type, AgentType::Acp);
         assert!(req.name.is_none());
+        assert!(req.assistant.is_none());
         assert!(req.source.is_none());
         assert!(req.channel_chat_id.is_none());
     }

@@ -110,3 +110,30 @@ async fn health_check_has_security_headers() {
         "strict-origin-when-cross-origin"
     );
 }
+
+#[tokio::test]
+async fn office_proxy_routes_allow_same_origin_framing() {
+    // Regression for iOfficeAI/AionUi#3177: the global security headers
+    // middleware must not overwrite the office preview proxies' framing
+    // policy with DENY, or the preview iframe is blanked in browsers.
+    let app = build_app().await;
+
+    for uri in ["/api/ppt-proxy/59999", "/api/office-watch-proxy/59999"] {
+        let response = app
+            .clone()
+            .oneshot(build_request("GET", uri))
+            .await
+            .expect("request failed");
+
+        assert_eq!(
+            response.headers().get("x-frame-options").unwrap(),
+            "SAMEORIGIN",
+            "{uri} must stay frameable by the same-origin web UI"
+        );
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            "frame-ancestors 'self'",
+            "{uri} should carry the modern frame-ancestors policy"
+        );
+    }
+}

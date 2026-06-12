@@ -4,7 +4,7 @@ use aionui_api_types::{
     DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig, SpeechToTextConfig, SpeechToTextProvider,
 };
 use aionui_shell::{SttError, SttService};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn dummy_audio() -> Vec<u8> {
@@ -315,14 +315,16 @@ async fn st7b_deepgram_upstream_failure() {
 }
 
 // ---------------------------------------------------------------------------
-// ST-10: languageHint passed to OpenAI
+// ST-10: configured language overrides languageHint for OpenAI
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn st10_openai_language_hint_passed() {
+async fn st10_openai_config_language_overrides_language_hint() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/v1/audio/transcriptions"))
+        .and(body_string_contains("name=\"language\""))
+        .and(body_string_contains("\r\nen\r\n"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "你好世界" })))
         .mount(&mock_server)
         .await;
@@ -348,7 +350,116 @@ async fn st10_openai_language_hint_passed() {
         .unwrap();
 
     assert_eq!(result.text, "你好世界");
-    assert_eq!(result.language.as_deref(), Some("zh"));
+    assert_eq!(result.language.as_deref(), Some("en"));
+}
+
+#[tokio::test]
+async fn st10c_openai_language_hint_region_is_normalized() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .and(body_string_contains("name=\"language\""))
+        .and(body_string_contains("\r\nen\r\n"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "hello" })))
+        .mount(&mock_server)
+        .await;
+
+    let config = SpeechToTextConfig {
+        enabled: true,
+        provider: SpeechToTextProvider::Openai,
+        auto_send: None,
+        openai: Some(OpenAISpeechToTextConfig {
+            api_key: "sk-test".into(),
+            base_url: Some(mock_server.uri()),
+            model: "whisper-1".into(),
+            language: None,
+            prompt: None,
+            temperature: None,
+        }),
+        deepgram: None,
+    };
+
+    let result = stt_service()
+        .transcribe(
+            dummy_audio(),
+            "test.webm",
+            "audio/webm;codecs=opus",
+            Some("en-US"),
+            &config,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "hello");
+    assert_eq!(result.language.as_deref(), Some("en"));
+}
+
+#[tokio::test]
+async fn openai_base_url_with_v1_suffix_is_not_duplicated() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "ok" })))
+        .mount(&mock_server)
+        .await;
+
+    let config = SpeechToTextConfig {
+        enabled: true,
+        provider: SpeechToTextProvider::Openai,
+        auto_send: None,
+        openai: Some(OpenAISpeechToTextConfig {
+            api_key: "sk-test".into(),
+            base_url: Some(format!("{}/v1", mock_server.uri())),
+            model: "whisper-1".into(),
+            language: None,
+            prompt: None,
+            temperature: None,
+        }),
+        deepgram: None,
+    };
+
+    let result = stt_service()
+        .transcribe(dummy_audio(), "test.wav", "audio/wav", None, &config)
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "ok");
+}
+
+#[tokio::test]
+async fn openai_mime_type_codec_params_are_removed() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .and(body_string_contains("Content-Type: audio/webm\r\n"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "ok" })))
+        .mount(&mock_server)
+        .await;
+
+    let config = SpeechToTextConfig {
+        enabled: true,
+        provider: SpeechToTextProvider::Openai,
+        auto_send: None,
+        openai: Some(OpenAISpeechToTextConfig {
+            api_key: "sk-test".into(),
+            base_url: Some(mock_server.uri()),
+            model: "whisper-1".into(),
+            language: None,
+            prompt: None,
+            temperature: None,
+        }),
+        deepgram: None,
+    };
+
+    let result = stt_service()
+        .transcribe(dummy_audio(), "test.webm", "audio/webm;codecs=opus", None, &config)
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "ok");
 }
 
 // ---------------------------------------------------------------------------

@@ -18,6 +18,18 @@ use stderr_monitor::force_kill;
 /// Maximum stderr ring-buffer size in bytes.
 pub(super) const STDERR_BUFFER_MAX: usize = 8192;
 
+/// Trim `buf` from the front so it holds at most the last `max` bytes.
+///
+/// The raw cut point can land inside a multi-byte UTF-8 character, where
+/// `String::drain` would panic; rounding up to the next char boundary keeps
+/// the buffer valid and never exceeds `max` (issue #392).
+pub(super) fn trim_to_tail(buf: &mut String, max: usize) {
+    if buf.len() > max {
+        let cut = buf.ceil_char_boundary(buf.len() - max);
+        buf.drain(..cut);
+    }
+}
+
 pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AgentError> {
     if cwd.trim().is_empty() {
         return Err(AgentError::bad_request("Workspace directory is empty"));
@@ -236,6 +248,46 @@ pub(super) mod tests {
     pub(super) async fn spawn_sdk_test_process(config: CommandSpec) -> CliAgentProcess {
         let data_dir = tempfile::tempdir().unwrap();
         CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap()
+    }
+
+    // ── trim_to_tail ─────────────────────────────────────────────────
+
+    #[test]
+    fn trim_to_tail_does_not_panic_when_cut_lands_inside_multibyte_char() {
+        // "ab" (2 bytes) + "中中中" (9 bytes) = 11 bytes; max 8 puts the raw
+        // cut point at byte 3, inside the first '中' (bytes 2..5).
+        let mut buf = String::from("ab中中中");
+        trim_to_tail(&mut buf, 8);
+        assert_eq!(buf, "中中");
+        assert!(buf.len() <= 8);
+    }
+
+    #[test]
+    fn trim_to_tail_keeps_exactly_max_bytes_for_ascii() {
+        let mut buf = String::from("abcdefghij");
+        trim_to_tail(&mut buf, 8);
+        assert_eq!(buf, "cdefghij");
+    }
+
+    #[test]
+    fn trim_to_tail_is_noop_when_under_max() {
+        let mut buf = String::from("short");
+        trim_to_tail(&mut buf, 8);
+        assert_eq!(buf, "short");
+    }
+
+    #[test]
+    fn trim_to_tail_never_exceeds_max_with_emoji_flood() {
+        // Regression for the production panic: emoji-rich stderr lines pushed
+        // the buffer over STDERR_BUFFER_MAX with cut points off-boundary.
+        let mut buf = String::new();
+        for _ in 0..600 {
+            buf.push_str("⚠️ API call failed 🌐\n");
+        }
+        let original = buf.clone();
+        trim_to_tail(&mut buf, STDERR_BUFFER_MAX);
+        assert!(buf.len() <= STDERR_BUFFER_MAX);
+        assert!(original.ends_with(buf.as_str()));
     }
 
     // ── Lifecycle tests (apply to both modes) ────────────────────────

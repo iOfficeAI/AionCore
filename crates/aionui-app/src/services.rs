@@ -13,7 +13,8 @@ use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteConversationRepository,
+    IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteConversationRepository,
     SqliteMcpServerRepository, SqliteProviderRepository, SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
@@ -262,6 +263,15 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     )
     .with_runtime_state(deps.conversation_runtime_state);
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
+    service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
+        deps.database.pool().clone(),
+    )));
+    service.with_assistant_state_repo(Arc::new(SqliteAssistantOverlayRepository::new(
+        deps.database.pool().clone(),
+    )));
+    service.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(
+        deps.database.pool().clone(),
+    )));
     if let Some(hook) = deps.task_manager_delete_hook {
         service.with_delete_hook(hook);
     }

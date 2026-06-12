@@ -151,6 +151,7 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
                     r#type: request.agent_type,
                     name: Some(request.name),
                     model: request.top_level_model,
+                    assistant: None,
                     source: None,
                     channel_chat_id: None,
                     extra: request.extra,

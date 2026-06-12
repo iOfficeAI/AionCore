@@ -24,9 +24,11 @@ Only after exhausting the above — and explicitly documenting why each option i
 
 When planning or changing a critical path or hard-to-observe flow, evaluate whether logging needs to change. In implementation plans for such changes, briefly state whether logs will be added, existing observability is sufficient, or logs are intentionally unnecessary. Do not add logs for simple refactors, test-only changes, UI copy/style changes, or when existing tests, errors, metrics, or logs already provide enough observability.
 
-Add structured logs only when they help verify behavior during development or locate production issues later:
-- `debug` for development-only flow details and state transitions
-- `info` for low-volume production lifecycle boundaries and important state changes
+Add structured logs only when they help make production behavior diagnosable or provide extra development detail. Production normally runs at `info`, while development runs at `debug`; therefore, information needed to troubleshoot production issues must be available at `info`, `warn`, or `error`, not only `debug`.
+
+Use log levels as follows:
+- `debug` for high-frequency or detailed development-only flow details and state transitions
+- `info` for low-volume production-diagnostic lifecycle boundaries, important state changes, and non-sensitive correlation context
 - `warn` for malformed or unexpected data that is safely handled
 - `error` for contract violations or failed operations
 

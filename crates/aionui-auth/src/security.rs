@@ -1,5 +1,7 @@
 use axum::extract::Request;
-use axum::http::header::{HeaderValue, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS, X_XSS_PROTECTION};
+use axum::http::header::{
+    CONTENT_SECURITY_POLICY, HeaderValue, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS, X_XSS_PROTECTION,
+};
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -11,10 +13,17 @@ fn allows_embedding(path: &str) -> bool {
     )
 }
 
+/// Office preview proxies serve content loaded in same-origin iframes by
+/// the web UI; `DENY` here blanks the preview (iOfficeAI/AionUi#3177).
+fn allows_same_origin_embedding(path: &str) -> bool {
+    path.starts_with("/api/ppt-proxy/") || path.starts_with("/api/office-watch-proxy/")
+}
+
 /// Middleware that adds security response headers to every response.
 ///
 /// Headers set:
 /// - `X-Frame-Options: DENY` — prevent clickjacking on non-embeddable routes
+///   (`SAMEORIGIN` + `frame-ancestors 'self'` on office preview proxies)
 /// - `X-Content-Type-Options: nosniff` — prevent MIME sniffing
 /// - `X-XSS-Protection: 1; mode=block` — enable XSS filter
 /// - `Referrer-Policy: strict-origin-when-cross-origin` — limit referrer leakage
@@ -23,7 +32,15 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
 
-    if !allows_embedding(&path) {
+    if allows_same_origin_embedding(&path) {
+        headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN"));
+        // Append rather than insert: CSP allows multiple policies and all
+        // are enforced, so an upstream policy is never silently dropped.
+        headers.append(
+            CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors 'self'"),
+        );
+    } else if !allows_embedding(&path) {
         headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     }
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
@@ -86,6 +103,37 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         // Security headers still present even on error responses
         assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
+    }
+
+    #[tokio::test]
+    async fn office_proxy_routes_get_sameorigin_frame_headers() {
+        // Regression for iOfficeAI/AionUi#3177: the office preview proxies
+        // serve iframe content for the same-origin web UI; `DENY` blanks
+        // the preview iframe in browsers.
+        let app = Router::new()
+            .route("/api/ppt-proxy/{port}", get(|| async { "ok" }))
+            .route("/api/office-watch-proxy/{port}/{*path}", get(|| async { "ok" }))
+            .layer(middleware::from_fn(security_headers_middleware));
+
+        for uri in ["/api/ppt-proxy/41307", "/api/office-watch-proxy/41307/some/page"] {
+            let response = app
+                .clone()
+                .oneshot(axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.headers().get("x-frame-options").unwrap(),
+                "SAMEORIGIN",
+                "{uri} must stay frameable by the same-origin web UI"
+            );
+            assert_eq!(
+                response.headers().get("content-security-policy").unwrap(),
+                "frame-ancestors 'self'",
+                "{uri} should carry the modern frame-ancestors policy"
+            );
+            assert_eq!(response.headers().get("x-content-type-options").unwrap(), "nosniff");
+        }
     }
 
     #[tokio::test]

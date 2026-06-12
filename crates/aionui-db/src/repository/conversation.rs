@@ -2,7 +2,10 @@ use aionui_common::{PaginatedResult, TimestampMs};
 use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
-use crate::models::{ConversationArtifactRow, ConversationRow, MessageRow};
+use crate::models::{
+    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow,
+    UpsertConversationAssistantSnapshotParams,
+};
 
 /// Conversation + message data access abstraction.
 ///
@@ -52,6 +55,27 @@ pub trait IConversationRepository: Send + Sync {
     /// Lists conversations sharing the same `extra.workspace` value.
     /// The conversation identified by `conversation_id` is excluded.
     async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError>;
+
+    /// Returns the persisted assistant snapshot for a conversation, if any.
+    async fn get_assistant_snapshot(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<ConversationAssistantSnapshotRow>, DbError> {
+        Ok(None)
+    }
+
+    /// Inserts or updates a persisted assistant snapshot for a conversation.
+    async fn upsert_assistant_snapshot(
+        &self,
+        _params: &UpsertConversationAssistantSnapshotParams<'_>,
+    ) -> Result<Option<ConversationAssistantSnapshotRow>, DbError> {
+        Ok(None)
+    }
+
+    /// Deletes the assistant snapshot bound to a conversation.
+    async fn delete_assistant_snapshot(&self, _conversation_id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
 
     // ── Message operations ──────────────────────────────────────────
 

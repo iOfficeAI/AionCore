@@ -127,6 +127,7 @@ impl ConversationTurnOrchestrator {
             SendMessageData {
                 content: input.request.content,
                 msg_id: first_turn_msg_id.clone(),
+                turn_id: Some(turn_id.clone()),
                 files: input.request.files,
                 inject_skills: input.request.inject_skills,
             },
@@ -219,6 +220,7 @@ impl ConversationTurnOrchestrator {
                         SendMessageData {
                             content,
                             msg_id: next_turn_msg_id.clone(),
+                            turn_id: Some(turn_id.clone()),
                             files: vec![],
                             inject_skills: vec![],
                         },

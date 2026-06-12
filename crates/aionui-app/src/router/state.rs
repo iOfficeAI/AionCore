@@ -13,9 +13,11 @@ use aionui_channel::ChannelRouterState;
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState};
 use aionui_db::{
-    IAcpSessionRepository, IAgentMetadataRepository, IAssistantOverrideRepository, IAssistantRepository,
-    IConversationRepository, IProviderRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
+    IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
+    IProviderRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
+    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
     SqliteConversationRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
 };
 use aionui_extension::{
@@ -191,7 +193,10 @@ pub async fn build_module_states(
         "startup: extension registry initialized"
     );
 
-    let assistant = build_assistant_state(services, ext_state.registry.clone());
+    let assistant = build_assistant_state(services);
+    assistant.service.bootstrap_assistant_storage().await.map_err(|error| {
+        RouterBuildError::new("router.assistant.bootstrap", "failed to bootstrap assistant storage").with_source(error)
+    })?;
     let cron = build_cron_state(services);
     cron.cron_service.init().await;
     tracing::info!(
@@ -221,7 +226,7 @@ pub async fn build_module_states(
     );
 
     let pool = services.database.pool().clone();
-    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
@@ -239,7 +244,11 @@ pub async fn build_module_states(
     let states = ModuleStates {
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
-            build_conversation_state(services, Some(cron.cron_service.clone()))
+            build_conversation_state(
+                services,
+                Some(cron.cron_service.clone()),
+                Some(assistant.service.clone() as Arc<dyn AssistantRuleDispatcher>),
+            )
         }),
         remote_agent: build_module_state_phase(&boot, "remote_agent", || build_remote_agent_state(services)),
         agent: build_module_state_phase(&boot, "agent", || AgentRouterState {
@@ -280,15 +289,21 @@ pub async fn build_module_states(
 }
 
 /// Build the default `AssistantRouterState` from application services.
-pub fn build_assistant_state(services: &AppServices, extension_registry: ExtensionRegistry) -> AssistantRouterState {
+pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
     let pool = services.database.pool().clone();
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> =
+        Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
+    let state_repo: Arc<dyn IAssistantOverlayRepository> =
+        Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
+    let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
+        Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone()));
     let repo: Arc<dyn IAssistantRepository> = Arc::new(SqliteAssistantRepository::new(pool.clone()));
     let override_repo: Arc<dyn IAssistantOverrideRepository> =
         Arc::new(SqliteAssistantOverrideRepository::new(pool.clone()));
     // Used by `AssistantService::resolve_default_agent_type` to infer a
     // working `preset_agent_type` from the configured provider list when
     // the caller does not supply one (ELECTRON-1J1 / 1KV).
-    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let builtin = Arc::new(BuiltinAssistantRegistry::load());
     // Pin user_data_dir to the runtime-resolved data directory so dev /
     // packaged / multi-instance launches all keep their assistant rule files
@@ -296,11 +311,16 @@ pub fn build_assistant_state(services: &AppServices, extension_registry: Extensi
     // where dev wrote rules to the release `~/.aionui/` while the db lived
     // under `~/.aionui-dev/`).
     let service = Arc::new(AssistantService::new(
-        repo,
-        override_repo,
-        provider_repo,
-        builtin,
-        extension_registry,
+        pool,
+        aionui_assistant::service::AssistantServiceDeps {
+            definition_repo,
+            state_repo,
+            preference_repo,
+            repo,
+            override_repo,
+            provider_repo,
+            builtin,
+        },
         services.data_dir.clone(),
     ));
     AssistantRouterState { service }
@@ -328,8 +348,12 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
 pub fn build_conversation_state(
     services: &AppServices,
     cron_service: Option<Arc<aionui_cron::service::CronService>>,
+    assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
 ) -> ConversationRouterState {
     let conversation_service = services.conversation_service.clone();
+    if let Some(dispatcher) = assistant_dispatcher {
+        conversation_service.with_assistant_dispatcher(dispatcher);
+    }
     if let Some(cron_service) = cron_service {
         conversation_service.with_delete_hook(cron_service.clone());
         conversation_service.with_cron_service(Some(cron_service));
@@ -596,12 +620,10 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         services.database.pool().clone(),
     )));
 
-    let busy_guard = Arc::new(aionui_cron::busy_guard::CronBusyGuard::new());
     let executor = Arc::new(aionui_cron::executor::JobExecutor::new(
         services.worker_task_manager.clone(),
         conv_repo,
         Arc::new(conv_service.clone()),
-        busy_guard,
         services.work_dir.clone(),
         services.data_dir.clone(),
         services.event_bus.clone(),

@@ -242,6 +242,10 @@ pub enum AgentKillReason {
     /// The agent process must be torn down so it stops emitting stream events
     /// for a conversation row that no longer exists.
     ConversationDeleted,
+    /// User cancel was accepted but the ACP prompt did not drain before the
+    /// watchdog timeout. The stale ACP process is recycled while the user turn
+    /// is treated as a clean cancellation.
+    UserCancelTimeout,
 }
 
 /// Preview content type for document preview history.

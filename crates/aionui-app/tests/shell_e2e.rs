@@ -49,6 +49,29 @@ impl MultipartBuilder {
         self
     }
 
+    fn add_file_without_content_type(mut self, name: &str, filename: &str, data: &[u8]) -> Self {
+        self.parts
+            .extend_from_slice(format!("--{}\r\n", self.boundary).as_bytes());
+        self.parts.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n\r\n").as_bytes(),
+        );
+        self.parts.extend_from_slice(data);
+        self.parts.extend_from_slice(b"\r\n");
+        self
+    }
+
+    fn add_file_without_filename(mut self, name: &str, mime: &str, data: &[u8]) -> Self {
+        self.parts
+            .extend_from_slice(format!("--{}\r\n", self.boundary).as_bytes());
+        self.parts
+            .extend_from_slice(format!("Content-Disposition: form-data; name=\"{name}\"\r\n").as_bytes());
+        self.parts
+            .extend_from_slice(format!("Content-Type: {mime}\r\n\r\n").as_bytes());
+        self.parts.extend_from_slice(data);
+        self.parts.extend_from_slice(b"\r\n");
+        self
+    }
+
     fn build(mut self) -> (String, Vec<u8>) {
         self.parts
             .extend_from_slice(format!("--{}--\r\n", self.boundary).as_bytes());
@@ -70,13 +93,11 @@ fn multipart_request(uri: &str, content_type: &str, body: Vec<u8>, token: &str, 
 }
 
 async fn set_stt_config(app: &mut axum::Router, token: &str, csrf: &str, config: serde_json::Value) {
-    let req = json_with_token(
-        "PUT",
-        "/api/settings/client",
-        json!({ "speechToText": config }),
-        token,
-        csrf,
-    );
+    set_stt_config_at_key(app, token, csrf, "speechToText", config).await;
+}
+
+async fn set_stt_config_at_key(app: &mut axum::Router, token: &str, csrf: &str, key: &str, config: serde_json::Value) {
+    let req = json_with_token("PUT", "/api/settings/client", json!({ key: config }), token, csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
@@ -425,7 +446,7 @@ async fn st8_multipart_missing_filename() {
     .await;
 
     let (content_type, body) = MultipartBuilder::new()
-        .add_file("file", "test.wav", "audio/wav", b"fake audio data")
+        .add_file_without_filename("file", "audio/wav", b"fake audio data")
         .add_text("mimeType", "audio/wav")
         .build();
 
@@ -607,6 +628,54 @@ async fn st10_language_hint_passed() {
     assert_eq!(json["data"]["text"], "你好世界");
 }
 
+// ST-11: AionUI web frontend compatibility shape.
+#[tokio::test]
+async fn st11_web_frontend_tools_key_audio_part_headers_only() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "text": "web frontend" })))
+        .mount(&mock_server)
+        .await;
+
+    let (mut app, services) = build_app_with_noop_opener().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    set_stt_config_at_key(
+        &mut app,
+        &token,
+        &csrf,
+        "tools.speechToText",
+        json!({
+            "enabled": true,
+            "provider": "openai",
+            "openai": {
+                "api_key": "sk-test-key",
+                "base_url": mock_server.uri(),
+                "model": "whisper-1"
+            }
+        }),
+    )
+    .await;
+
+    let (content_type, body) = MultipartBuilder::new()
+        .add_file(
+            "audio",
+            "recording.webm",
+            "audio/webm;codecs=opus",
+            b"fake web audio data",
+        )
+        .add_text("languageHint", "en-US")
+        .build();
+
+    let req = multipart_request("/api/stt", &content_type, body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    assert_eq!(json["data"]["text"], "web frontend");
+}
+
 // ===========================================================================
 // C. Authentication
 // ===========================================================================
@@ -679,7 +748,7 @@ async fn st_multipart_missing_mimetype() {
     .await;
 
     let (content_type, body) = MultipartBuilder::new()
-        .add_file("file", "test.wav", "audio/wav", b"fake audio data")
+        .add_file_without_content_type("file", "test.wav", b"fake audio data")
         .add_text("fileName", "test.wav")
         .build();
 
