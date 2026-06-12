@@ -235,6 +235,7 @@ pub struct TeamRunPayload {
     pub status: TeamRunStatus,
     pub active_child_count: usize,
     pub pending_wake_count: usize,
+    pub starting_child_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1033,9 +1034,11 @@ mod tests {
             status: TeamRunStatus::Running,
             active_child_count: 1,
             pending_wake_count: 0,
+            starting_child_count: 2,
         };
 
         let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["starting_child_count"], 2);
         assert!(value.get("content").is_none());
         assert!(value.get("prompt").is_none());
         assert!(value.get("tool_input").is_none());
