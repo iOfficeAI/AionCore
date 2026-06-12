@@ -3,7 +3,10 @@ use sqlx::SqlitePool;
 use aionui_common::PaginatedResult;
 
 use crate::error::DbError;
-use crate::models::{ConversationArtifactRow, ConversationRow, MessageRow};
+use crate::models::{
+    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow,
+    UpsertConversationAssistantSnapshotParams,
+};
 use crate::repository::conversation::{
     ConversationFilters, ConversationRowUpdate, IConversationRepository, MessageRowUpdate, MessageSearchRow, SortOrder,
 };
@@ -266,6 +269,103 @@ impl IConversationRepository for SqliteConversationRepository {
         .await?;
 
         Ok(rows)
+    }
+
+    async fn get_assistant_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationAssistantSnapshotRow>, DbError> {
+        let row = sqlx::query_as::<_, ConversationAssistantSnapshotRow>(
+            "SELECT * FROM conversation_assistant_snapshots WHERE conversation_id = ?",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    async fn upsert_assistant_snapshot(
+        &self,
+        params: &UpsertConversationAssistantSnapshotParams<'_>,
+    ) -> Result<Option<ConversationAssistantSnapshotRow>, DbError> {
+        let now = aionui_common::now_ms();
+        sqlx::query(
+            "INSERT INTO conversation_assistant_snapshots (
+                conversation_id,
+                assistant_definition_id,
+                assistant_key,
+                assistant_source,
+                assistant_name,
+                assistant_avatar_type,
+                assistant_avatar_value,
+                agent_backend,
+                rules_content,
+                default_model_mode,
+                resolved_model_id,
+                default_permission_mode,
+                resolved_permission_value,
+                default_skills_mode,
+                resolved_skill_ids,
+                resolved_disabled_builtin_skill_ids,
+                default_mcps_mode,
+                resolved_mcp_ids,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(conversation_id) DO UPDATE SET
+                assistant_definition_id = excluded.assistant_definition_id,
+                assistant_key = excluded.assistant_key,
+                assistant_source = excluded.assistant_source,
+                assistant_name = excluded.assistant_name,
+                assistant_avatar_type = excluded.assistant_avatar_type,
+                assistant_avatar_value = excluded.assistant_avatar_value,
+                agent_backend = excluded.agent_backend,
+                rules_content = excluded.rules_content,
+                default_model_mode = excluded.default_model_mode,
+                resolved_model_id = excluded.resolved_model_id,
+                default_permission_mode = excluded.default_permission_mode,
+                resolved_permission_value = excluded.resolved_permission_value,
+                default_skills_mode = excluded.default_skills_mode,
+                resolved_skill_ids = excluded.resolved_skill_ids,
+                resolved_disabled_builtin_skill_ids = excluded.resolved_disabled_builtin_skill_ids,
+                default_mcps_mode = excluded.default_mcps_mode,
+                resolved_mcp_ids = excluded.resolved_mcp_ids,
+                updated_at = excluded.updated_at",
+        )
+        .bind(params.conversation_id)
+        .bind(params.assistant_definition_id)
+        .bind(params.assistant_key)
+        .bind(params.assistant_source)
+        .bind(params.assistant_name)
+        .bind(params.assistant_avatar_type)
+        .bind(params.assistant_avatar_value)
+        .bind(params.agent_backend)
+        .bind(params.rules_content)
+        .bind(params.default_model_mode)
+        .bind(params.resolved_model_id)
+        .bind(params.default_permission_mode)
+        .bind(params.resolved_permission_value)
+        .bind(params.default_skills_mode)
+        .bind(params.resolved_skill_ids)
+        .bind(params.resolved_disabled_builtin_skill_ids)
+        .bind(params.default_mcps_mode)
+        .bind(params.resolved_mcp_ids)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_assistant_snapshot(params.conversation_id).await
+    }
+
+    async fn delete_assistant_snapshot(&self, conversation_id: &str) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM conversation_assistant_snapshots WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     // ── Message operations ──────────────────────────────────────────

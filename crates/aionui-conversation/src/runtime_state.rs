@@ -236,11 +236,22 @@ impl ConversationRuntimeStateService {
         has_task: bool,
         pending_confirmations: usize,
     ) -> ConversationRuntimeSummary {
-        let active_turn_id = self.active_turn_id_for(conversation_id);
+        let (active_turn_id, cancelling) = self
+            .state
+            .lock()
+            .map(|state| {
+                (
+                    state.active_turns.get(conversation_id).cloned(),
+                    state.cancelling_conversations.contains(conversation_id),
+                )
+            })
+            .unwrap_or((None, false));
         let claimed = active_turn_id.is_some();
 
         let state = if pending_confirmations > 0 {
             ConversationRuntimeStateKind::WaitingConfirmation
+        } else if cancelling {
+            ConversationRuntimeStateKind::Cancelling
         } else if claimed && task_status != Some(ConversationStatus::Running) {
             ConversationRuntimeStateKind::Starting
         } else if claimed || task_status == Some(ConversationStatus::Running) {
@@ -496,6 +507,22 @@ mod tests {
         let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 1);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::WaitingConfirmation);
+        assert!(summary.is_processing);
+        assert!(!summary.can_send_message);
+    }
+
+    #[test]
+    fn cancelling_summary_keeps_processing_and_disables_send() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = state
+            .try_claim_turn("conv-1", "turn-a")
+            .expect("claim should be created");
+        state.mark_cancelling("conv-1");
+
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 0);
+
+        assert_eq!(summary.state, ConversationRuntimeStateKind::Cancelling);
+        assert_eq!(summary.turn_id.as_deref(), Some("turn-a"));
         assert!(summary.is_processing);
         assert!(!summary.can_send_message);
     }

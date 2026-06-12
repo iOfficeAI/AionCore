@@ -222,6 +222,7 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         info!(
             conversation_id = %self.runtime.conversation_id(),
             msg_id = %data.msg_id,
+            turn_id = data.turn_id.as_deref().unwrap_or("none"),
             "Aionrs send_message started"
         );
         self.runtime.bump_activity();

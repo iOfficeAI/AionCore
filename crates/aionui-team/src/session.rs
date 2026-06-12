@@ -465,6 +465,7 @@ impl TeamSession {
         let data = SendMessageData {
             content: input.first_message,
             msg_id,
+            turn_id: None,
             files: files.unwrap_or_default(),
             inject_skills: Vec::new(),
         };

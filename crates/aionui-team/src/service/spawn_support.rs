@@ -292,6 +292,7 @@ impl TeamSessionService {
             r#type: agent_type,
             name: Some(name.clone()),
             model: top_level_model,
+            assistant: None,
             source: None,
             channel_chat_id: None,
             extra,

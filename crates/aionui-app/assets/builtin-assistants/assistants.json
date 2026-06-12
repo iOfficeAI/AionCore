@@ -17,7 +17,7 @@
         "ru-RU": "Создаёт, редактирует и анализирует профессиональные документы Word с помощью officecli: отчёты, предложения, письма, служебные записки и другое.",
         "uk-UA": "Створюйте, редагуйте та аналізуйте професійні документи Word за допомогою officecli: звіти, пропозиції, листи, нотатки тощо."
       },
-      "avatar": "📝",
+      "avatar": "avatars/word-creator.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "officecli-docx"
@@ -70,7 +70,7 @@
         "ru-RU": "Создаёт, редактирует и анализирует профессиональные презентации PowerPoint с помощью officecli: выразительный дизайн, разнообразные макеты и сильная визуальная подача.",
         "uk-UA": "Створюйте, редагуйте та аналізуйте професійні презентації PowerPoint за допомогою officecli: виразний дизайн, різноманітні макети та візуальний вплив."
       },
-      "avatar": "📊",
+      "avatar": "avatars/ppt-creator.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "officecli-pptx"
@@ -123,7 +123,7 @@
         "ru-RU": "Создаёт, редактирует и анализирует профессиональные таблицы Excel с помощью officecli: финансовые модели, дашборды, трекеры и анализ данных.",
         "uk-UA": "Створюйте, редагуйте та аналізуйте професійні таблиці Excel за допомогою officecli: фінансові моделі, дашборди, трекери та аналіз даних."
       },
-      "avatar": "📈",
+      "avatar": "avatars/excel-creator.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "officecli-xlsx"
@@ -176,7 +176,7 @@
         "ru-RU": "Создаёт профессиональные презентации с анимацией Morph через officecli. Поддерживает разные визуальные стили и полный цикл от идеи до готовых слайдов.",
         "uk-UA": "Створюйте професійні презентації з анімацією Morph за допомогою officecli. Підтримує різні візуальні стилі та повний робочий процес від ідеї до готових слайдів."
       },
-      "avatar": "✨",
+      "avatar": "avatars/morph-ppt.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "morph-ppt"
@@ -225,7 +225,7 @@
         "en-US": "Turn a GLB 3D model into a cinematic Morph presentation. The model is the visual hero — close-up for details, bird's eye for structure, low angle for drama, with smooth Morph transitions between every shot. Note: 3D models and Morph transitions require Microsoft PowerPoint to display correctly.",
         "zh-CN": "把 GLB 3D 模型变成电影感 Morph 演示文稿。模型是视觉主角——特写看细节、俯视看结构、仰拍看气势，每页之间用 Morph 转场做流畅的镜头运动。注意：3D 模型和 Morph 转场效果需要在微软 PowerPoint 中打开才能正常显示。"
       },
-      "avatar": "🎬",
+      "avatar": "avatars/morph-ppt-3d.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "morph-ppt-3d",
@@ -269,7 +269,7 @@
         "ru-RU": "Создаёт инвесторские питч-деки, презентации запусков и корпоративные продажи: градиентный дизайн, графики, таблицы конкурентов, слайды команды и заметки спикера. Подходит для стадий от seed до Series A и выше.",
         "uk-UA": "Створюйте інвесторські пітч-деки, презентації продуктів та корпоративні продажі: градієнтний дизайн, графіки, таблиці конкурентів, слайди команди та нотатки доповідача. Підходить для стадій від Seed до Series A+."
       },
-      "avatar": "🎯",
+      "avatar": "avatars/pitch-deck-creator.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "officecli-pitch-deck"
@@ -322,7 +322,7 @@
         "ru-RU": "Преобразует CSV и табличные данные в аккуратные Excel-дашборды: KPI-карточки, графики с привязкой к данным, спарклайны и условное форматирование. Масштабирует сложность под объём данных - от краткой сводки до полноценной аналитической панели.",
         "uk-UA": "Перетворюйте CSV або табличні дані на професійні дашборди Excel: KPI-картки, графіки з прив'язкою до даних, спарклайни та умовне форматування. Автоматично масштабує складність під обсяг даних."
       },
-      "avatar": "📊",
+      "avatar": "avatars/dashboard-creator.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "officecli-data-dashboard"
@@ -375,7 +375,7 @@
         "ru-RU": "Создаёт академические статьи, научные работы и white paper со строгой структурой: нативное оглавление Word, формулы LaTeX в OMML, библиография в форматах APA/Physics/Chicago, сноски, многоколоночная вёрстка и стили под тип работы.",
         "uk-UA": "Створюйте структуровані академічні статті, наукові роботи та White Papers: зміст Word, формули LaTeX в OMML, бібліографія (APA/Physics/Chicago), виноски та багатоколонкова верстка."
       },
-      "avatar": "📚",
+      "avatar": "avatars/academic-paper.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "officecli-academic-paper"
@@ -428,7 +428,7 @@
         "ru-RU": "Строит финансовые модели на основе текстового запроса: три финансовые формы, DCF-оценка, cap table, сценарный анализ, таблицы чувствительности и долговые графики. Все значения выводятся через связные формульные цепочки от исходных предположений.",
         "uk-UA": "Будуйте фінансові моделі на основі формул за текстовим запитом: три фінансові форми, DCF-оцінка, Cap Tables, сценарний аналіз та графіки боргів."
       },
-      "avatar": "💰",
+      "avatar": "avatars/financial-model-creator.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "officecli-financial-model"
@@ -481,7 +481,7 @@
         "ru-RU": "Помогает установить, подключить и диагностировать визуализацию Star-Office-UI для предпросмотра в Aion.",
         "uk-UA": "Допомагає встановлювати, підключати та діагностувати візуалізацію Star-Office-UI для попереднього перегляду в Aion."
       },
-      "avatar": "📺",
+      "avatar": "avatars/star-office-helper.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "star-office-helper"
@@ -534,7 +534,7 @@
         "ru-RU": "Эксперт по установке, развёртыванию, настройке и устранению неполадок OpenClaw. Помогает пройти настройку, диагностирует проблемы и подсказывает безопасные практики.",
         "uk-UA": "Експертний посібник зі встановлення, розгортання, налаштування та усунення несправностей OpenClaw. Допомагає з налаштуванням та безпекою."
       },
-      "avatar": "🦞",
+      "avatar": "avatars/openclaw-setup.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "openclaw-setup",
@@ -588,7 +588,7 @@
         "ru-RU": "Автономный помощник для выполнения задач с работой с файлами, обработкой документов и многошаговым планированием.",
         "uk-UA": "Автономне виконання завдань з роботою з файлами, обробкою документів та багатокроковим плануванням робочих процесів."
       },
-      "avatar": "cowork.svg",
+      "avatar": "avatars/cowork.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "skill-creator",
@@ -627,8 +627,7 @@
           "Витягти та узагальнити ключову інформацію з усіх файлів PDF"
         ]
       },
-      "models": [],
-      "skill_file": "skills/cowork-skills.{locale}.md"
+      "models": []
     },
     {
       "id": "game-3d",
@@ -646,7 +645,7 @@
         "ru-RU": "Генерирует полноценную 3D-игру-платформер со сбором предметов в одном HTML-файле.",
         "uk-UA": "Генеруйте повноцінну 3D-гру-платформер зі збором предметів в одному HTML-файлі."
       },
-      "avatar": "🎮",
+      "avatar": "avatars/game-3d.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [],
       "custom_skill_names": [],
@@ -697,7 +696,7 @@
         "ru-RU": "Профессиональный UI/UX-помощник с 57 стилями, 95 цветовыми палитрами, 56 сочетаниями шрифтов и лучшими практиками для разных стеков.",
         "uk-UA": "Професійний UI/UX-помічник з 57 стилями, 95 кольоровими палітрами, 56 поєднаннями шрифтів та найкращими практиками для різних технологій."
       },
-      "avatar": "🎨",
+      "avatar": "avatars/ui-ux-pro-max.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [],
       "custom_skill_names": [],
@@ -748,7 +747,7 @@
         "ru-RU": "Файловое планирование в стиле Manus для сложных задач. Использует task_plan.md, findings.md и progress.md для сохранения устойчивого контекста.",
         "uk-UA": "Файлове планування в стилі Manus для складних завдань. Використовує task_plan.md, findings.md та progress.md для збереження контексту."
       },
-      "avatar": "📋",
+      "avatar": "avatars/planning-with-files.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [],
       "custom_skill_names": [],
@@ -799,7 +798,7 @@
         "ru-RU": "Коуч по личному развитию на основе фреймворка HUMAN 3.0: 4 квадранта (ум, тело, дух, призвание), 3 уровня и 3 фазы роста.",
         "uk-UA": "Коуч з особистого розвитку на основі фреймворка HUMAN 3.0: 4 квадранти (Розум/Тіло/Дух/Призвання), 3 рівні та 3 фази росту."
       },
-      "avatar": "🧭",
+      "avatar": "avatars/human-3-coach.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [],
       "custom_skill_names": [],
@@ -850,7 +849,7 @@
         "ru-RU": "Разворачивает запрос на найм в полноценное описание вакансии и изображения, а затем публикует это в соцсетях через коннекторы.",
         "uk-UA": "Розгортає запит на найм у повноцінний опис вакансії та зображення, а потім публікує це в соцмережах через конектори."
       },
-      "avatar": "📣",
+      "avatar": "avatars/social-job-publisher.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "xiaohongshu-recruiter",
@@ -886,8 +885,7 @@
           "Створити пост про вакансію для кількох платформ (LinkedIn, X)"
         ]
       },
-      "models": [],
-      "skill_file": "skills/social-job-publisher-skills.{locale}.md"
+      "models": []
     },
     {
       "id": "moltbook",
@@ -905,7 +903,7 @@
         "ru-RU": "Социальная сеть для AI-агентов: публикации, комментарии, голосования и создание сообществ.",
         "uk-UA": "Соціальна мережа для AI-агентів. Публікації, коментарі, голосування та створення спільнот."
       },
-      "avatar": "🦞",
+      "avatar": "avatars/moltbook.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "moltbook"
@@ -940,8 +938,7 @@
           "Перевірити нові особисті повідомлення"
         ]
       },
-      "models": [],
-      "skill_file": "skills/moltbook-skills.{locale}.md"
+      "models": []
     },
     {
       "id": "beautiful-mermaid",
@@ -959,7 +956,7 @@
         "ru-RU": "Создаёт блок-схемы, sequence-, state-, class- и ER-диаграммы с красивыми темами оформления.",
         "uk-UA": "Створюйте блок-схеми, діаграми послідовності, станів, класів та ER-діаграми з красивими темами оформлення."
       },
-      "avatar": "📈",
+      "avatar": "avatars/beautiful-mermaid.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "mermaid"
@@ -1012,7 +1009,7 @@
         "ru-RU": "Иммерсивный сюжетный ролевой режим. Можно начать тремя способами: описать персонажей словами, вставить PNG-изображения или открыть папку с карточками персонажей и лором мира.",
         "uk-UA": "Іммерсивний сюжетний рольовий режим. Можна почати трьома способами: описати персонажів словами, вставити PNG-зображення або відкрити папку з картками персонажів та лором світу."
       },
-      "avatar": "📖",
+      "avatar": "avatars/story-roleplay.jpg",
       "preset_agent_type": "aionrs",
       "enabled_skills": [
         "story-roleplay"

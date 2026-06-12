@@ -398,6 +398,11 @@ impl AcpAgentManager {
 }
 
 impl AcpAgentManager {
+    fn record_user_cancel_request(runtime: &AgentRuntime, session: &mut AcpSession) {
+        session.record_close_reason(Some(CloseReason::UserCancel));
+        runtime.bump_activity();
+    }
+
     pub(crate) async fn mode(&self) -> Result<aionui_api_types::AgentModeResponse, AgentError> {
         let desired = self
             .session
@@ -769,6 +774,12 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id, msg_id = %data.msg_id))]
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.bump_activity();
+        info!(
+            conversation_id = %self.params.conversation_id,
+            msg_id = %data.msg_id,
+            turn_id = data.turn_id.as_deref().unwrap_or("none"),
+            "ACP send_message started"
+        );
 
         match self.ensure_session_and_send(&data).await {
             Ok(PromptOutcome::Completed { session_id }) => {
@@ -856,24 +867,17 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
         }
         self.permission_router.cancel_all();
 
-        // Distinguish a deliberate user-cancel from a crash: the toast can
-        // say "Conversation cancelled" instead of a generic "session closed".
-        // We still emit Finish (not Error) here — cancel is a clean
-        // termination — but record the close reason so anyone consulting
-        // the aggregate state for diagnostics sees the canonical signal.
         {
             let mut session = self.session.write().await;
-            session.record_close_reason(Some(CloseReason::UserCancel));
+            Self::record_user_cancel_request(&self.runtime, &mut session);
         }
 
         info!(
             agent_type = "acp",
-            terminal_kind = "finish",
             source = "cancel_request",
             session_id = session_id.as_deref().unwrap_or("none"),
-            "ACP cancel emitting terminal finish"
+            "ACP cancel requested; waiting for prompt outcome before terminal finish"
         );
-        self.runtime.emit_finish(None);
 
         Ok(())
     }
@@ -921,15 +925,22 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
 
         self.permission_router.cancel_all();
 
-        // m1 fix: emit error with the kill reason so the status goes to
-        // Finished and subscribers see a terminal event. Idempotent.
-        // Source of truth for the toast text is `CloseReason::Killed`.
-        let close_reason = CloseReason::Killed { reason };
-        let message = close_reason.user_facing_message();
-        if let Ok(mut session) = self.session.try_write() {
-            session.record_close_reason(Some(close_reason));
+        if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
+            if let Ok(mut session) = self.session.try_write() {
+                session.record_close_reason(Some(CloseReason::UserCancel));
+            }
+            self.runtime.emit_finish(None);
+        } else {
+            // m1 fix: emit error with the kill reason so the status goes to
+            // Finished and subscribers see a terminal event. Idempotent.
+            // Source of truth for the toast text is `CloseReason::Killed`.
+            let close_reason = CloseReason::Killed { reason };
+            let message = close_reason.user_facing_message();
+            if let Ok(mut session) = self.session.try_write() {
+                session.record_close_reason(Some(close_reason));
+            }
+            self.runtime.emit_error(message);
         }
-        self.runtime.emit_error(message);
 
         Ok(())
     }
@@ -979,8 +990,10 @@ impl AcpAgentManager {
 #[cfg(test)]
 mod tests {
     use super::{exit_status_parts, user_facing_message};
+    use crate::agent_runtime::AgentRuntime;
     use crate::error::AgentError;
-    use crate::manager::acp::AcpSession;
+    use crate::manager::acp::{AcpAgentManager, AcpSession};
+    use crate::protocol::error::CloseReason;
     use agent_client_protocol::schema::AvailableCommand;
     use serde_json::json;
 
@@ -1028,6 +1041,20 @@ mod tests {
             user_facing_message(&err),
             "Internal error: API Error: Internal server error"
         );
+    }
+
+    #[tokio::test]
+    async fn acp_cancel_request_records_user_cancel_without_terminal_finish() {
+        let runtime = AgentRuntime::new("conv-1", "/tmp/workspace", 8);
+        let mut rx = runtime.subscribe();
+        let mut session = AcpSession::new(None, None, Default::default());
+
+        AcpAgentManager::record_user_cancel_request(&runtime, &mut session);
+
+        assert!(matches!(session.last_close_reason(), Some(CloseReason::UserCancel)));
+        assert_eq!(runtime.status(), None);
+        let res = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(res.is_err(), "cancel request must not emit a terminal event");
     }
 
     // ---- augment_with_stderr behavioral tests ------------------------------

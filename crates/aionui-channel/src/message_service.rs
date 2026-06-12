@@ -150,6 +150,7 @@ impl ChannelMessageService {
             r#type: agent_type,
             name: Some(name),
             model: top_level_model,
+            assistant: None,
             source: Some(source),
             channel_chat_id: session.chat_id.clone(),
             extra,
