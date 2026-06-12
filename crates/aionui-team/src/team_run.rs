@@ -4,7 +4,7 @@ use std::sync::Arc;
 use aionui_api_types::{TeamChildTurnPayload, TeamRunAckResponse, TeamRunPayload, TeamRunStatus, TeamRunTargetRole};
 use aionui_common::{TimestampMs, generate_id, now_ms};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
 use crate::events::{
@@ -93,6 +93,15 @@ impl TeamRunManager {
         let mut guard = self.state.lock().await;
         if let Some(active) = guard.as_ref().filter(|r| r.is_active()) {
             if allow_active_intervention {
+                debug!(
+                    team_id = %self.team_id,
+                    team_run_id = %active.team_run_id,
+                    target_slot_id = %target_slot_id,
+                    target_role = ?target_role,
+                    active_target_slot_id = %active.target_slot_id,
+                    active_target_role = ?active.target_role,
+                    "team_run active intervention accepted"
+                );
                 return Ok(active.ack(message_id));
             }
             return Err(TeamError::InvalidRequest("team run is already active".into()));
@@ -155,6 +164,13 @@ impl TeamRunManager {
         let mut guard = self.state.lock().await;
         if let Some(run) = guard.as_mut().filter(|r| r.is_active()) {
             run.pending_wake_count = run.pending_wake_count.saturating_add(1);
+            debug!(
+                team_id = %self.team_id,
+                team_run_id = %run.team_run_id,
+                pending_wake_count = run.pending_wake_count,
+                active_child_count = run.active_child_turns.len(),
+                "team_run pending wake recorded"
+            );
             self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, run.payload());
         }
     }
@@ -163,6 +179,13 @@ impl TeamRunManager {
         let mut guard = self.state.lock().await;
         if let Some(run) = guard.as_mut() {
             run.pending_wake_count = run.pending_wake_count.saturating_sub(1);
+            debug!(
+                team_id = %self.team_id,
+                team_run_id = %run.team_run_id,
+                pending_wake_count = run.pending_wake_count,
+                active_child_count = run.active_child_turns.len(),
+                "team_run wake consumed"
+            );
             self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, run.payload());
         }
     }
@@ -190,8 +213,9 @@ impl TeamRunManager {
             return;
         }
 
+        let first_child_for_run = run.started_at.is_none();
         run.status = TeamRunStatus::Running;
-        if run.started_at.is_none() {
+        if first_child_for_run {
             run.started_at = Some(now_ms());
         }
         run.pending_wake_count = run.pending_wake_count.saturating_sub(1);
@@ -200,6 +224,26 @@ impl TeamRunManager {
         let child_payload = child_payload(&run.team_id, &child, TeamRunStatus::Running);
         drop(guard);
 
+        if first_child_for_run {
+            info!(
+                team_id = %self.team_id,
+                team_run_id = %child.team_run_id,
+                target_slot_id = %run_payload.target_slot_id,
+                target_role = ?run_payload.target_role,
+                active_child_count = run_payload.active_child_count,
+                pending_wake_count = run_payload.pending_wake_count,
+                "team_run started"
+            );
+        }
+        debug!(
+            team_id = %self.team_id,
+            team_run_id = %child.team_run_id,
+            slot_id = %child.slot_id,
+            role = ?child.role,
+            conversation_id = %child.conversation_id,
+            turn_id = %child.turn_id,
+            "team_child_turn started"
+        );
         self.emitter.broadcast_team_run(TEAM_RUN_STARTED_EVENT, run_payload);
         self.emitter
             .broadcast_child_turn(TEAM_CHILD_TURN_STARTED_EVENT, child_payload);
@@ -222,6 +266,15 @@ impl TeamRunManager {
         let child_payload = child_payload(&run.team_id, &child, status.clone());
         match status {
             TeamRunStatus::Failed => {
+                warn!(
+                    team_id = %self.team_id,
+                    team_run_id = %run.team_run_id,
+                    slot_id = %child.slot_id,
+                    role = ?child.role,
+                    conversation_id = %child.conversation_id,
+                    turn_id = %child.turn_id,
+                    "team_child_turn failed"
+                );
                 run.status = TeamRunStatus::Failed;
                 run.completed_at = Some(now_ms());
                 let payload = run.payload();
@@ -229,10 +282,29 @@ impl TeamRunManager {
                 drop(guard);
                 self.emitter
                     .broadcast_child_turn(TEAM_CHILD_TURN_COMPLETED_EVENT, child_payload);
+                warn!(
+                    team_id = %payload.team_id,
+                    team_run_id = %payload.team_run_id,
+                    target_slot_id = %payload.target_slot_id,
+                    target_role = ?payload.target_role,
+                    active_child_count = payload.active_child_count,
+                    pending_wake_count = payload.pending_wake_count,
+                    "team_run failed"
+                );
                 self.emitter.broadcast_team_run(TEAM_RUN_FAILED_EVENT, payload.clone());
                 Some(payload)
             }
             _ => {
+                debug!(
+                    team_id = %self.team_id,
+                    team_run_id = %run.team_run_id,
+                    slot_id = %child.slot_id,
+                    role = ?child.role,
+                    conversation_id = %child.conversation_id,
+                    turn_id = %child.turn_id,
+                    status = ?status,
+                    "team_child_turn completed"
+                );
                 self.emitter
                     .broadcast_child_turn(TEAM_CHILD_TURN_COMPLETED_EVENT, child_payload);
                 let payload = maybe_complete_locked(run, &self.emitter);
@@ -266,6 +338,14 @@ impl TeamRunManager {
         run.status = TeamRunStatus::Cancelling;
         run.cancel_reason = reason;
         let payload = run.payload();
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %run.team_run_id,
+            target_slot_id = ?target_slot_id.as_deref(),
+            active_child_count = run.active_child_turns.len(),
+            pending_wake_count = run.pending_wake_count,
+            "team_run cancel requested"
+        );
         drop(guard);
 
         self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
@@ -277,6 +357,7 @@ impl TeamRunManager {
         let run = guard.as_mut()?;
         run.status = TeamRunStatus::Cancelled;
         run.cancelled_at = Some(now_ms());
+        let cancelled_child_count = run.active_child_turns.len();
         run.active_child_turns.clear();
         let team_run_id = run.team_run_id.clone();
         let payload = run.payload();
@@ -286,6 +367,8 @@ impl TeamRunManager {
         info!(
             team_id = %self.team_id,
             team_run_id = %team_run_id,
+            cancelled_child_count,
+            pending_wake_count = payload.pending_wake_count,
             "team_run cancelled"
         );
         self.emitter.broadcast_team_run(TEAM_RUN_CANCELLED_EVENT, payload);
@@ -302,6 +385,13 @@ impl TeamRunManager {
         *guard = None;
         drop(guard);
 
+        warn!(
+            team_id = %self.team_id,
+            team_run_id = %team_run_id,
+            active_child_count = payload.active_child_count,
+            pending_wake_count = payload.pending_wake_count,
+            "team_run failed"
+        );
         self.emitter.broadcast_team_run(TEAM_RUN_FAILED_EVENT, payload);
         Some(team_run_id)
     }
@@ -326,6 +416,15 @@ impl TeamRunManager {
         let payload = child_payload(&run.team_id, child, TeamRunStatus::Cancelled);
         drop(guard);
 
+        debug!(
+            team_id = %self.team_id,
+            team_run_id = %child.team_run_id,
+            slot_id = %child.slot_id,
+            role = ?child.role,
+            conversation_id = %child.conversation_id,
+            turn_id = %child.turn_id,
+            "team_child_turn cancelled"
+        );
         self.emitter
             .broadcast_child_turn(TEAM_CHILD_TURN_CANCELLED_EVENT, payload);
     }
@@ -362,6 +461,15 @@ fn maybe_complete_locked(run: &mut TeamRunRecord, emitter: &TeamEventEmitter) ->
     run.status = TeamRunStatus::Completed;
     run.completed_at = Some(now_ms());
     let payload = run.payload();
+    info!(
+        team_id = %payload.team_id,
+        team_run_id = %payload.team_run_id,
+        target_slot_id = %payload.target_slot_id,
+        target_role = ?payload.target_role,
+        active_child_count = payload.active_child_count,
+        pending_wake_count = payload.pending_wake_count,
+        "team_run completed"
+    );
     emitter.broadcast_team_run(TEAM_RUN_COMPLETED_EVENT, payload.clone());
     Some(payload)
 }

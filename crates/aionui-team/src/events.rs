@@ -5,6 +5,7 @@ use aionui_api_types::{
     TeamChildTurnPayload, TeamRunPayload, WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
+use tracing::debug;
 
 use crate::types::{TeamAgent, TeammateStatus};
 
@@ -95,6 +96,17 @@ impl TeamEventEmitter {
     }
 
     pub fn broadcast_team_run(&self, event_name: &'static str, payload: TeamRunPayload) {
+        debug!(
+            event_name = event_name,
+            team_id = %payload.team_id,
+            team_run_id = %payload.team_run_id,
+            target_slot_id = %payload.target_slot_id,
+            target_role = ?payload.target_role,
+            status = ?payload.status,
+            active_child_count = payload.active_child_count,
+            pending_wake_count = payload.pending_wake_count,
+            "team websocket event emitted"
+        );
         let event = WebSocketMessage::new(
             event_name,
             serde_json::to_value(payload).expect("serialize team run payload"),
@@ -103,6 +115,17 @@ impl TeamEventEmitter {
     }
 
     pub fn broadcast_child_turn(&self, event_name: &'static str, payload: TeamChildTurnPayload) {
+        debug!(
+            event_name = event_name,
+            team_id = %payload.team_id,
+            team_run_id = %payload.team_run_id,
+            slot_id = %payload.slot_id,
+            role = ?payload.role,
+            conversation_id = %payload.conversation_id,
+            turn_id = %payload.turn_id,
+            status = ?payload.status,
+            "team websocket event emitted"
+        );
         let event = WebSocketMessage::new(
             event_name,
             serde_json::to_value(payload).expect("serialize team child turn payload"),

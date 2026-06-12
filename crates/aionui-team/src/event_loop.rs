@@ -220,6 +220,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
 
     info!(
         team_id = %ctx.team_id,
+        team_run_id = ?input.team_run_id,
         slot_id = %ctx.slot_id,
         conversation_id = %input.conversation_id,
         "event loop: agent turn port call started"
@@ -229,6 +230,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
         Err(e) => {
             warn!(
                 team_id = %ctx.team_id,
+                team_run_id = ?input.team_run_id,
                 slot_id = %ctx.slot_id,
                 conversation_id = %input.conversation_id,
                 error = %e,
@@ -249,6 +251,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
     let turn_ok = outcome.status.is_success();
     info!(
         team_id = %ctx.team_id,
+        team_run_id = ?input.team_run_id,
         slot_id = %ctx.slot_id,
         conversation_id = %outcome.conversation_id,
         turn_id = %outcome.turn_id,

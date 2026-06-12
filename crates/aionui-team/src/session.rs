@@ -560,11 +560,14 @@ impl TeamSession {
         info!(
             team_id = %self.team.id,
             team_run_id,
+            agent_count = agent_ids.len(),
             marked_unread = marked,
             "team_run cancel drained unread mailbox rows"
         );
 
-        for child in self.team_run_manager.active_child_turns().await {
+        let active_child_turns = self.team_run_manager.active_child_turns().await;
+        let active_child_count = active_child_turns.len();
+        for child in active_child_turns {
             if let Err(err) = self
                 .cancellation_port
                 .cancel_agent_turn(&self.user_id, &child.conversation_id, &child.turn_id)
@@ -582,6 +585,13 @@ impl TeamSession {
         }
 
         self.team_run_manager.complete_cancelled().await;
+        info!(
+            team_id = %self.team.id,
+            team_run_id,
+            active_child_count,
+            marked_unread = marked,
+            "team_run cancel completed"
+        );
         Ok(())
     }
 
