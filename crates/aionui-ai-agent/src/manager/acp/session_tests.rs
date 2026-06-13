@@ -47,6 +47,25 @@ fn mark_opened_emits_once() {
 }
 
 #[test]
+fn config_set_guard_rejects_second_in_flight_update_and_releases() {
+    let mut session = AcpSession::new(None, None, Default::default());
+
+    let first = session.try_begin_config_set();
+    assert!(first.is_some());
+    assert!(session.try_begin_config_set().is_none());
+
+    session.end_config_set(first.unwrap());
+    assert!(session.try_begin_config_set().is_some());
+}
+
+#[test]
+fn config_options_snapshot_is_empty_without_real_or_legacy_catalog() {
+    let session = AcpSession::new(None, None, Default::default());
+    let snapshot = session.config_snapshot();
+    assert!(snapshot.options.is_empty());
+}
+
+#[test]
 fn set_desired_mode_emits_when_changed() {
     let mut session = make_session();
     assert!(session.set_desired_mode(ModeId::new("plan")));

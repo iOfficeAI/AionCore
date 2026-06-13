@@ -10,6 +10,7 @@ use super::agent_reconcile::ReconcileAction;
 use super::config_option_catalog::{
     derive_models_from_config_options, derive_modes_from_config_options, merge_config_options,
 };
+use super::config_options::ConfigSnapshot;
 use crate::protocol::error::CloseReason;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState, SessionId};
 
@@ -58,6 +59,7 @@ pub struct AcpSession {
     desired: Desired,
     observed: Observed,
     advertised: Advertised,
+    config_set_in_flight: bool,
     pending_events: Vec<AcpSessionEvent>,
     /// Whether `open_session_new` has just completed and the next prompt
     /// should receive preset_context / skill-index injection.
@@ -92,6 +94,9 @@ pub struct AcpSession {
     last_close_reason: Option<CloseReason>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigSetGuardToken;
+
 impl AcpSession {
     pub fn new(
         initial_mode: Option<ModeId>,
@@ -109,10 +114,25 @@ impl AcpSession {
             },
             observed: Observed::default(),
             advertised: Advertised::default(),
+            config_set_in_flight: false,
             pending_events: Vec::new(),
             pending_model_notice: None,
             last_close_reason: None,
         }
+    }
+}
+
+impl AcpSession {
+    pub fn try_begin_config_set(&mut self) -> Option<ConfigSetGuardToken> {
+        if self.config_set_in_flight {
+            return None;
+        }
+        self.config_set_in_flight = true;
+        Some(ConfigSetGuardToken)
+    }
+
+    pub fn end_config_set(&mut self, _token: ConfigSetGuardToken) {
+        self.config_set_in_flight = false;
     }
 }
 
@@ -347,6 +367,13 @@ impl AcpSession {
 
     pub fn config_options(&self) -> Option<&[SessionConfigOption]> {
         self.advertised.config_options.as_deref()
+    }
+
+    pub(crate) fn config_snapshot(&self) -> ConfigSnapshot {
+        if let Some(options) = self.advertised.config_options.clone() {
+            return ConfigSnapshot::from_real_options(options);
+        }
+        ConfigSnapshot::from_legacy_catalogs(self.advertised.modes.as_ref(), self.advertised.models.as_ref())
     }
 
     pub fn context_usage(&self) -> Option<&UsageUpdate> {
