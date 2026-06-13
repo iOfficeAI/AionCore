@@ -30,8 +30,16 @@ impl ShellService {
             let parent = path.parent().unwrap_or(&path);
             self.opener.run_command("explorer", &[&parent.to_string_lossy()]).await
         } else {
-            let parent = path.parent().unwrap_or(&path);
-            self.opener.run_command("xdg-open", &[&parent.to_string_lossy()]).await
+            // Linux: prefer the freedesktop D-Bus FileManager1.ShowItems method,
+            // which opens the file manager *and* highlights the target file. Fall
+            // back to opening the parent directory with `xdg-open` when `gdbus` is
+            // unavailable. Opening the file/dir directly via `xdg-open` is wrong
+            // here: it resolves the path's MIME handler, which on some desktops is
+            // a text editor rather than the file manager.
+            let gdbus_available = self.opener.is_tool_available("gdbus");
+            let (program, args) = linux_show_item_command(&path, gdbus_available);
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.opener.run_command(&program, &arg_refs).await
         }
     }
 
@@ -156,6 +164,45 @@ fn validate_directory_exists(dir_path: &str) -> Result<std::path::PathBuf, Shell
 
 fn build_windows_terminal_command(path: &str) -> String {
     format!(r#"pushd "{path}""#)
+}
+
+/// Build the `(program, args)` used to reveal `path` in the Linux file manager.
+///
+/// When `gdbus` is available we call `org.freedesktop.FileManager1.ShowItems`,
+/// which opens the file manager and highlights the file — mirroring Electron's
+/// native `shell.showItemInFolder` behavior. The parameters are passed as raw
+/// argv items (no shell), so GVariant literals like `['file:///x']` and the
+/// empty startup-id `''` reach `gdbus` verbatim.
+///
+/// Without `gdbus`, fall back to opening the parent directory with `xdg-open`
+/// (no highlight, but still the file manager rather than the file's handler).
+fn linux_show_item_command(path: &Path, gdbus_available: bool) -> (String, Vec<String>) {
+    if gdbus_available {
+        // `from_file_path` percent-encodes spaces and other reserved characters;
+        // fall back to a raw `file://` URI only if it rejects the path (it
+        // requires an absolute path — always true here since `path` is canonical).
+        let uri = reqwest::Url::from_file_path(path)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| format!("file://{}", path.to_string_lossy()));
+        (
+            "gdbus".to_owned(),
+            vec![
+                "call".to_owned(),
+                "--session".to_owned(),
+                "--dest".to_owned(),
+                "org.freedesktop.FileManager1".to_owned(),
+                "--object-path".to_owned(),
+                "/org/freedesktop/FileManager1".to_owned(),
+                "--method".to_owned(),
+                "org.freedesktop.FileManager1.ShowItems".to_owned(),
+                format!("['{uri}']"),
+                String::new(),
+            ],
+        )
+    } else {
+        let parent = path.parent().unwrap_or(path);
+        ("xdg-open".to_owned(), vec![parent.to_string_lossy().into_owned()])
+    }
 }
 
 fn validate_url(url: &str) -> Result<(), ShellError> {
@@ -312,6 +359,42 @@ mod tests {
         let svc = ShellService::new(Arc::new(NoopSystemOpener));
         let result = svc.show_item_in_folder("/nonexistent/path").await;
         assert!(matches!(result, Err(ShellError::FileNotFound(_))));
+    }
+
+    #[test]
+    fn linux_show_item_uses_filemanager1_when_gdbus_available() {
+        let path = Path::new("/home/user/Downloads/AionUi.deb");
+        let (program, args) = linux_show_item_command(path, true);
+        assert_eq!(program, "gdbus");
+        assert_eq!(args[0], "call");
+        assert!(args.iter().any(|a| a == "org.freedesktop.FileManager1"));
+        assert!(args.iter().any(|a| a == "org.freedesktop.FileManager1.ShowItems"));
+        // The file URI must target the file itself (so it gets highlighted),
+        // not the parent directory, wrapped as a GVariant array literal.
+        assert!(args.contains(&"['file:///home/user/Downloads/AionUi.deb']".to_owned()));
+        // Trailing empty startup-id GVariant string.
+        assert_eq!(args.last().unwrap(), "");
+    }
+
+    #[test]
+    fn linux_show_item_percent_encodes_spaces_in_uri() {
+        let path = Path::new("/home/user/My Downloads/AionUi.deb");
+        let (program, args) = linux_show_item_command(path, true);
+        assert_eq!(program, "gdbus");
+        assert!(
+            args.contains(&"['file:///home/user/My%20Downloads/AionUi.deb']".to_owned()),
+            "space must be percent-encoded, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn linux_show_item_falls_back_to_parent_dir_without_gdbus() {
+        let path = Path::new("/home/user/Downloads/AionUi.deb");
+        let (program, args) = linux_show_item_command(path, false);
+        assert_eq!(program, "xdg-open");
+        // Fallback opens the parent directory, never the file (whose MIME
+        // handler may be a text editor) — that was the original bug.
+        assert_eq!(args, vec!["/home/user/Downloads".to_owned()]);
     }
 
     #[tokio::test]
