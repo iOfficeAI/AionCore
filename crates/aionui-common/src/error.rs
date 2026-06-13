@@ -55,6 +55,14 @@ pub enum ApiError {
     #[error("Request timeout: {0}")]
     Timeout(String),
 
+    #[error("{message}")]
+    Coded {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+        details: Option<Value>,
+    },
+
     #[error("Unprocessable entity: {0}")]
     UnprocessableEntity(String),
 
@@ -85,6 +93,20 @@ struct ErrorBody {
 }
 
 impl ApiError {
+    pub fn coded(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+        details: impl Into<Option<Value>>,
+    ) -> Self {
+        Self::Coded {
+            status,
+            code,
+            message: message.into(),
+            details: details.into(),
+        }
+    }
+
     /// HTTP status code for this error variant.
     pub fn status_code(&self) -> StatusCode {
         match self {
@@ -101,6 +123,7 @@ impl ApiError {
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            Self::Coded { status, .. } => *status,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::ConversationArchived(_) => StatusCode::GONE,
             Self::WorkspacePathUnavailable(_) => StatusCode::BAD_REQUEST,
@@ -124,6 +147,7 @@ impl ApiError {
             Self::Internal(_) => "INTERNAL_ERROR",
             Self::BadGateway(_) => "BAD_GATEWAY",
             Self::Timeout(_) => "GATEWAY_TIMEOUT",
+            Self::Coded { code, .. } => code,
             Self::UnprocessableEntity(_) => "UNPROCESSABLE_ENTITY",
             Self::ConversationArchived(_) => "CONVERSATION_ARCHIVED",
             Self::WorkspacePathUnavailable(_) => "WORKSPACE_PATH_UNAVAILABLE",
@@ -136,6 +160,7 @@ impl ApiError {
     pub fn error_details(&self) -> Option<Value> {
         match self {
             Self::PathOutsideSandbox { field, operation, .. } => Some(path_outside_sandbox_details(*field, *operation)),
+            Self::Coded { details, .. } => details.clone(),
             Self::WorkspacePathUnavailable(path) => Some(workspace_path_details(path, "create")),
             Self::WorkspacePathRuntimeUnavailable(path) => Some(workspace_path_details(path, "runtime")),
             _ => None,
@@ -161,6 +186,7 @@ impl ApiError {
             Self::Internal(_) => "Internal server error.".to_owned(),
             Self::BadGateway(_) => "Upstream service unavailable.".to_owned(),
             Self::Timeout(_) => "Request timed out.".to_owned(),
+            Self::Coded { message, .. } => message.clone(),
             Self::UnprocessableEntity(message) => message.clone(),
             Self::ConversationArchived(message) => message.clone(),
             Self::WorkspacePathUnavailable(_) => "Workspace path is unavailable.".to_owned(),
@@ -342,6 +368,36 @@ mod tests {
             ApiError::WorkspacePathRuntimeUnavailable("x".into()).error_code(),
             "WORKSPACE_PATH_RUNTIME_UNAVAILABLE"
         );
+    }
+
+    #[test]
+    fn coded_api_error_has_custom_status_code_message_and_details() {
+        let err = ApiError::coded(
+            StatusCode::GATEWAY_TIMEOUT,
+            "confirmation_timeout",
+            "ACP runtime did not confirm the requested config option before timeout",
+            Some(json!({
+                "conversation_id": "conv-1",
+                "option_id": "mode",
+                "requested": "full-access",
+                "last_observed": "auto"
+            })),
+        );
+
+        assert_eq!(err.status_code(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(err.error_code(), "confirmation_timeout");
+        assert_eq!(
+            err.public_message(),
+            "ACP runtime did not confirm the requested config option before timeout"
+        );
+        assert_eq!(err.error_details().unwrap()["option_id"], "mode");
+    }
+
+    #[test]
+    fn existing_timeout_code_remains_unchanged() {
+        let err = ApiError::Timeout("slow".to_owned());
+        assert_eq!(err.status_code(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(err.error_code(), "GATEWAY_TIMEOUT");
     }
 
     #[test]

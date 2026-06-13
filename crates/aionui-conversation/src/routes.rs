@@ -38,6 +38,36 @@ impl From<ConversationError> for ApiError {
             ConversationError::RateLimited => ApiError::RateLimited,
             ConversationError::BadGateway { reason } => ApiError::BadGateway(reason),
             ConversationError::Timeout { reason } => ApiError::Timeout(reason),
+            ConversationError::ConfigConfirmationTimeout {
+                conversation_id,
+                option_id,
+                requested,
+                last_observed,
+            } => ApiError::coded(
+                StatusCode::GATEWAY_TIMEOUT,
+                "confirmation_timeout",
+                "ACP runtime did not confirm the requested config option before timeout",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "option_id": option_id,
+                    "requested": requested,
+                    "last_observed": last_observed,
+                })),
+            ),
+            ConversationError::ConfigUpdateInProgress {
+                conversation_id,
+                option_id,
+                requested,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "config_update_in_progress",
+                "ACP config update is already in progress",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "option_id": option_id,
+                    "requested": requested,
+                })),
+            ),
             ConversationError::Unprocessable { reason } => ApiError::UnprocessableEntity(reason),
             ConversationError::Internal { reason } => ApiError::Internal(reason),
             ConversationError::WorkspacePathUnavailable { path } => ApiError::WorkspacePathUnavailable(path),
