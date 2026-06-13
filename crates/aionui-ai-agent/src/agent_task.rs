@@ -24,7 +24,8 @@ use crate::protocol::send_error::AgentSendError;
 use crate::types::SendMessageData;
 
 use aionui_api_types::{
-    GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
+    GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionResponse,
+    SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -123,6 +124,20 @@ pub trait IMockAgent: IAgentTask {
     async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
         self.set_model(model_id).await?;
         self.get_model().await
+    }
+    async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+        Ok(GetConfigOptionsResponse {
+            config_options: Vec::new(),
+        })
+    }
+    async fn set_config_option(
+        &self,
+        _option_id: &str,
+        _value: &str,
+    ) -> Result<SetConfigOptionResponse, AgentError> {
+        Err(AgentError::bad_request(
+            "Config option switching is not supported for this mock",
+        ))
     }
     async fn get_usage(&self) -> Result<Option<serde_json::Value>, AgentError> {
         Ok(None)
@@ -372,6 +387,38 @@ impl AgentInstance {
             )),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.set_model_confirmed(model_id).await,
+        }
+    }
+
+    pub async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+        match self {
+            Self::Acp(m) => m.config_options().await,
+            Self::Aionrs(_) => Ok(GetConfigOptionsResponse {
+                config_options: Vec::new(),
+            }),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.get_config_options().await,
+        }
+    }
+
+    pub async fn set_config_option(
+        &self,
+        option_id: &str,
+        value: &str,
+    ) -> Result<SetConfigOptionResponse, AgentError> {
+        if option_id.trim().is_empty() {
+            return Err(AgentError::bad_request("option_id must not be empty"));
+        }
+        if value.trim().is_empty() {
+            return Err(AgentError::bad_request("value must not be empty"));
+        }
+        match self {
+            Self::Acp(m) => m.set_config_option_confirmed(option_id, value).await,
+            Self::Aionrs(_) => Err(AgentError::bad_request(
+                "Config option switching is not supported for this agent type",
+            )),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.set_config_option(option_id, value).await,
         }
     }
 
