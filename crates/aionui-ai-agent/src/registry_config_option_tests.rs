@@ -361,13 +361,11 @@ async fn apply_handshake_merges_partial_config_option_updates_before_persisting(
     assert_eq!(
         refreshed.handshake.available_models,
         Some(serde_json::json!({
-            "current_model_id": "gpt-5.5/medium",
-            "current_model_label": "GPT-5.5 (medium)",
+            "current_model_id": "gpt-5.5",
+            "current_model_label": "GPT-5.5",
             "available_models": [
-                {"id": "gpt-5.5/low", "label": "GPT-5.5 (low)"},
-                {"id": "gpt-5.5/medium", "label": "GPT-5.5 (medium)"},
-                {"id": "gpt-5.4/low", "label": "gpt-5.4 (low)"},
-                {"id": "gpt-5.4/medium", "label": "gpt-5.4 (medium)"}
+                {"id": "gpt-5.5", "label": "GPT-5.5"},
+                {"id": "gpt-5.4", "label": "gpt-5.4"}
             ]
         }))
     );
