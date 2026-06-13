@@ -12,7 +12,7 @@ use crate::manager::acp::AcpSession;
 use std::sync::Arc;
 
 /// Read/write slice handed to each hook. `session` is a mutable borrow
-/// so hooks can consume one-shot flags (e.g. `take_pending_model_notice`).
+/// so hooks can consume one-shot flags.
 pub struct PromptCtx<'a> {
     pub session: &'a mut AcpSession,
     pub params: &'a AcpSessionParams,

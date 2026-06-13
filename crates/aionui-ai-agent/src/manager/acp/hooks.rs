@@ -6,7 +6,6 @@
 //! and the prompt is returned in a gracefully-degraded form.
 
 use crate::capability::first_message_injector::{InjectionConfig, inject_first_message_prefix};
-use crate::capability::model_identity_reminder::render_model_identity_reminder;
 use crate::capability::prompt_pipeline::{PreSendHook, PromptCtx};
 use crate::protocol::events::AgentStreamEvent;
 use aionui_api_types::AcpPromptHookWarningPayload;
@@ -37,33 +36,6 @@ impl PreSendHook for SessionNewPreludeHook {
         // prompt. Wrap a catch_unwind-style boundary so once we add
         // explicit failure signalling, this hook stays the policy owner.
         inject_first_message_prefix(&prompt, ctx.skill_manager, config).await
-    }
-}
-
-#[derive(Default)]
-pub struct ModelIdentityReminderHook;
-
-#[async_trait::async_trait]
-impl PreSendHook for ModelIdentityReminderHook {
-    async fn pre_send(&self, ctx: &mut PromptCtx<'_>, prompt: String) -> String {
-        let Some(model) = ctx.session.take_pending_model_notice() else {
-            return prompt;
-        };
-
-        // Prefer the advertised human-readable label over the raw id.
-        let label = ctx
-            .session
-            .model_info()
-            .and_then(|m| {
-                m.available_models
-                    .iter()
-                    .find(|am| am.model_id.0.as_ref() == model.as_str())
-                    .map(|am| am.name.clone())
-            })
-            .unwrap_or_else(|| model.as_str().to_owned());
-
-        let reminder = render_model_identity_reminder(&label);
-        format!("{reminder}{prompt}")
     }
 }
 

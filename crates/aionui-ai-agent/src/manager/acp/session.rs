@@ -73,13 +73,6 @@ pub struct AcpSession {
     /// Starts `false` so resume paths, warmup-only flows, and aborted
     /// session/new attempts all correctly observe "no prelude pending".
     pending_session_new_prelude: bool,
-    /// Model id the next prompt should announce to the CLI via an
-    /// injected `<system-reminder>`. Written when the CLI bakes
-    /// model identity into its cached system prompt (see
-    /// `BehaviorPolicy::self_identity_sticky`) and `session/set_model`
-    /// therefore does not refresh the LLM's self-description.
-    /// Taken (drained) on the next prompt.
-    pending_model_notice: Option<ModelId>,
     /// Why the session most recently terminated, if at all.
     ///
     /// Lifecycle (see also `CloseReason` doc comment):
@@ -116,7 +109,6 @@ impl AcpSession {
             advertised: Advertised::default(),
             config_set_in_flight: false,
             pending_events: Vec::new(),
-            pending_model_notice: None,
             last_close_reason: None,
         }
     }
@@ -304,9 +296,6 @@ impl AcpSession {
             return None;
         }
         self.desired.model_id = None;
-        if self.pending_model_notice.as_ref() == Some(&model) {
-            self.pending_model_notice = None;
-        }
         Some(model)
     }
 
@@ -631,19 +620,6 @@ impl AcpSession {
     /// Consume and return all pending domain events.
     pub fn drain_events(&mut self) -> Vec<AcpSessionEvent> {
         std::mem::take(&mut self.pending_events)
-    }
-
-    /// Record the model id that the next prompt should announce to the
-    /// CLI via a `<system-reminder>`. See `pending_model_notice` for the
-    /// motivating invariant.
-    pub fn set_pending_model_notice(&mut self, model: ModelId) {
-        self.pending_model_notice = Some(model);
-    }
-
-    /// Drain the pending model notice (if any). Callers consume the
-    /// value before sending the next prompt so it is not re-injected.
-    pub fn take_pending_model_notice(&mut self) -> Option<ModelId> {
-        self.pending_model_notice.take()
     }
 
     // ─── Private helpers ───────────────────────────────────────────────

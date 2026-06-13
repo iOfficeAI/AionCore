@@ -2,7 +2,7 @@
 //!
 //! Unlike acp_agent_integration.rs, these tests do not exercise
 //! AcpAgentManager or the JSON-RPC protocol. They construct a
-//! PromptPipeline with the two built-in hooks and invoke
+//! PromptPipeline with the built-in hooks and invoke
 //! pre_send against a real PromptCtx, asserting the observable
 //! prompt transformation.
 
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use aionui_ai_agent::capability::prompt_pipeline::{PromptCtx, PromptPipeline};
 use aionui_ai_agent::factory::acp_assembler::{AcpSessionParams, WorkspaceInfo, assemble_acp_params};
-use aionui_ai_agent::manager::acp::{AcpSession, ModelIdentityReminderHook, SessionNewPreludeHook};
+use aionui_ai_agent::manager::acp::{AcpSession, SessionNewPreludeHook};
 use aionui_ai_agent::registry::AgentRegistry;
 use aionui_ai_agent::shared_kernel::ModelId;
 use aionui_ai_agent::{AcpBuildExtra, AcpSkillManager, AgentRuntime};
@@ -90,10 +90,7 @@ fn fixture_runtime() -> AgentRuntime {
 }
 
 fn make_pipeline() -> PromptPipeline {
-    PromptPipeline::new(vec![
-        Arc::new(SessionNewPreludeHook),
-        Arc::new(ModelIdentityReminderHook),
-    ])
+    PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)])
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -187,16 +184,13 @@ async fn resume_path_does_not_inject() {
     assert_eq!(out, "continue the story");
 }
 
-/// Pending model notice: reminder prepended, then drained so second call is clean.
 #[tokio::test(flavor = "current_thread")]
-async fn pending_model_notice_triggers_reminder_prepend() {
+async fn observed_model_change_does_not_inject_model_identity_reminder() {
     let params = fixture_params("claude", None, true).await;
     let skill_manager = fixture_skill_manager();
     let runtime = fixture_runtime();
     let mut session = AcpSession::new(None, None, HashMap::new());
-
-    // Simulate set_model reconciled successfully and stuck the notice.
-    session.set_pending_model_notice(ModelId::new("claude-opus-4"));
+    session.apply_observed_model(ModelId::new("claude-opus-4"));
 
     let pipeline = make_pipeline();
 
@@ -207,48 +201,11 @@ async fn pending_model_notice_triggers_reminder_prepend() {
         runtime: &runtime,
     };
 
-    let out = pipeline.pre_send(&mut ctx, "go".into()).await;
-    assert!(out.contains("<system-reminder>"), "reminder missing: {out}");
-    assert!(out.ends_with("go"), "user content must survive at the end: {out}");
+    let out = pipeline.pre_send(&mut ctx, "who are you?".to_owned()).await;
 
-    // Second call: notice already drained — no reminder.
-    let mut ctx2 = PromptCtx {
-        session: &mut session,
-        params: &params,
-        skill_manager: &skill_manager,
-        runtime: &runtime,
-    };
-    let out2 = pipeline.pre_send(&mut ctx2, "next".into()).await;
-    assert_eq!(out2, "next");
-}
-
-/// Both flags set: reminder (outermost) wraps the prelude block.
-#[tokio::test(flavor = "current_thread")]
-async fn both_flags_prepend_reminder_outermost() {
-    let params = fixture_params("claude", Some("Rule A"), true).await;
-    let skill_manager = fixture_skill_manager();
-    let runtime = fixture_runtime();
-    let mut session = AcpSession::new(None, None, HashMap::new());
-    session.mark_pending_session_new_prelude();
-    session.set_pending_model_notice(ModelId::new("claude-opus-4"));
-
-    let pipeline = make_pipeline();
-
-    let mut ctx = PromptCtx {
-        session: &mut session,
-        params: &params,
-        skill_manager: &skill_manager,
-        runtime: &runtime,
-    };
-
-    let out = pipeline.pre_send(&mut ctx, "hi".into()).await;
-    let reminder_idx = out.find("<system-reminder>").expect("reminder must be present");
-    let rules_idx = out.find("[Assistant Rules]").expect("rules block must be present");
-    assert!(
-        reminder_idx < rules_idx,
-        "reminder must sit outside (before) the assistant rules block:\n{out}"
-    );
-    assert!(out.ends_with("hi"));
+    assert_eq!(out, "who are you?");
+    assert!(!out.contains("<system-reminder>"));
+    assert!(!out.contains("claude-opus-4"));
 }
 
 /// Skeleton: unlock once inject_first_message_prefix surfaces errors.

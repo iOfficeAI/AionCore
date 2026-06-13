@@ -18,6 +18,6 @@ pub use agent::AcpAgentManager;
 pub use agent_event_tracker::AcpSessionEvent;
 pub use agent_reconcile::ReconcileAction;
 pub use catalog_forwarder::CatalogForwarder;
-pub use hooks::{ModelIdentityReminderHook, SessionNewPreludeHook};
+pub use hooks::SessionNewPreludeHook;
 pub use permission_router::PermissionRouter;
 pub use session::AcpSession;

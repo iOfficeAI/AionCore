@@ -5,9 +5,7 @@ use crate::capability::prompt_pipeline::PromptPipeline;
 use crate::capability::skill_manager::AcpSkillManager;
 use crate::error::AgentError;
 use crate::factory::acp_assembler::AcpSessionParams;
-use crate::manager::acp::{
-    AcpSession, AcpSessionEvent, ModelIdentityReminderHook, PermissionRouter, SessionNewPreludeHook,
-};
+use crate::manager::acp::{AcpSession, AcpSessionEvent, PermissionRouter, SessionNewPreludeHook};
 use crate::manager::process_registry::{register_session_process, unregister_agent_process};
 use crate::protocol::acp::AcpProtocol;
 use crate::protocol::error::{AcpError, CloseReason};
@@ -351,10 +349,7 @@ impl AcpAgentManager {
 
         let session = AcpSession::new(initial_mode, initial_model, initial_config);
 
-        let pipeline = PromptPipeline::new(vec![
-            Arc::new(SessionNewPreludeHook),
-            Arc::new(ModelIdentityReminderHook),
-        ]);
+        let pipeline = PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)]);
 
         let manager = Self {
             params,
@@ -842,11 +837,7 @@ impl AcpAgentManager {
             );
             return Err(AgentError::conflict("Active ACP session changed while applying model"));
         }
-        let model = ModelId::new(model_id);
-        session.confirm_model(model.clone());
-        if self.params.metadata.behavior_policy.self_identity_sticky {
-            session.set_pending_model_notice(model);
-        }
+        session.confirm_model(ModelId::new(model_id));
         let confirmed_model = session
             .model_info()
             .cloned()
@@ -957,7 +948,7 @@ impl AcpAgentManager {
     /// The prompt is passed through `self.pipeline.pre_send` before being
     /// forwarded to the CLI. Each hook in the pipeline reads one-shot flags
     /// on `AcpSession` (e.g. `pending_session_new_prelude`,
-    /// `pending_model_notice`) and prepends the appropriate block when set.
+    /// flags) and prepends the appropriate block when set.
     async fn ensure_session_and_send(&self, data: &SendMessageData) -> Result<PromptOutcome, AcpSendFailure> {
         let sid = self.ensure_session_opened().await.map_err(AcpSendFailure::from)?;
         self.runtime.reset_for_new_turn(ConversationStatus::Running);

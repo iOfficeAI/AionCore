@@ -92,12 +92,6 @@ impl AcpAgentManager {
                         );
                         continue;
                     }
-                    // SDK does not push a notification after a successful
-                    // set_mode — sync observed/advertised ourselves so the
-                    // next plan_reconcile is a no-op.
-                    let mut session = self.session.write().await;
-                    session.apply_observed_mode(ModeId::new(normalized));
-                    self.commit_session_changes(&mut session).await;
                 }
 
                 ReconcileAction::SetModel { model } => {
@@ -126,19 +120,10 @@ impl AcpAgentManager {
                         );
                         continue;
                     }
-                    // SDK does not push a CurrentModelUpdate notification —
-                    // sync observed/advertised ourselves.
-                    let mut session = self.session.write().await;
-                    let model_for_notice = model.clone();
-                    session.apply_observed_model(model);
-                    if self.params.metadata.behavior_policy.self_identity_sticky {
-                        session.set_pending_model_notice(model_for_notice);
-                    }
-                    self.commit_session_changes(&mut session).await;
                 }
 
                 ReconcileAction::SetConfigOption { key, value } => {
-                    if let Err(err) = self
+                    match self
                         .protocol
                         .set_config_option(SetSessionConfigOptionRequest::new(
                             SessionId::new(session_id),
@@ -147,31 +132,32 @@ impl AcpAgentManager {
                         ))
                         .await
                     {
-                        if is_acp_session_not_found(&err) {
-                            warn!(
+                        Ok(response) => {
+                            let mut session = self.session.write().await;
+                            session.apply_advertised_config_options(response.config_options);
+                            self.commit_session_changes(&mut session).await;
+                        }
+                        Err(err) => {
+                            if is_acp_session_not_found(&err) {
+                                warn!(
+                                    conversation_id = %self.params.conversation_id,
+                                    config_id = %key,
+                                    desired = %value,
+                                    error = %err,
+                                    "reconcile_session: set_config_option hit SessionNotFound; aborting reconcile"
+                                );
+                                return Err(err);
+                            }
+                            info!(
                                 conversation_id = %self.params.conversation_id,
                                 config_id = %key,
                                 desired = %value,
                                 error = %err,
-                                "reconcile_session: set_config_option hit SessionNotFound; aborting reconcile"
+                                "reconcile_session: set_config_option failed; skipping"
                             );
-                            return Err(err);
+                            continue;
                         }
-                        info!(
-                            conversation_id = %self.params.conversation_id,
-                            config_id = %key,
-                            desired = %value,
-                            error = %err,
-                            "reconcile_session: set_config_option failed; skipping"
-                        );
-                        continue;
                     }
-                    // Sync observed ourselves so the next plan_reconcile
-                    // does not replay this action. CLI does not push a
-                    // config-update notification after set_config_option.
-                    let mut session = self.session.write().await;
-                    session.apply_observed_config(key, value);
-                    self.commit_session_changes(&mut session).await;
                 }
             }
         }
@@ -182,6 +168,8 @@ impl AcpAgentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manager::acp::AcpSession;
+    use std::collections::HashMap;
 
     #[test]
     fn reconcile_action_equality() {
@@ -192,5 +180,24 @@ mod tests {
             mode: ModeId::new("plan"),
         };
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn reconcile_set_config_option_ack_must_not_be_modeled_as_observed_event() {
+        let mut session = AcpSession::new(
+            None,
+            None,
+            HashMap::from([(ConfigKey::new("reasoning_effort"), ConfigValue::new("high"))]),
+        );
+
+        session.apply_observed_config(ConfigKey::new("reasoning_effort"), ConfigValue::new("medium"));
+        session.drain_events();
+
+        let actions = session.plan_reconcile();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], ReconcileAction::SetConfigOption { .. }));
+
+        let events = session.drain_events();
+        assert!(events.is_empty());
     }
 }

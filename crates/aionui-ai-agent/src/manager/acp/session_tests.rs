@@ -810,21 +810,6 @@ fn apply_advertised_config_options_preserves_confirmed_explicit_model_when_curre
 }
 
 #[test]
-fn pending_model_notice_roundtrip_and_take_once() {
-    use crate::shared_kernel::ModelId;
-
-    let mut s = AcpSession::new(None, None, HashMap::new());
-    assert!(s.take_pending_model_notice().is_none(), "default is None");
-
-    s.set_pending_model_notice(ModelId::new("opus"));
-    let taken = s.take_pending_model_notice();
-    assert_eq!(taken.as_ref().map(|m| m.as_str()), Some("opus"));
-
-    // Take is destructive — the second take must see None.
-    assert!(s.take_pending_model_notice().is_none());
-}
-
-#[test]
 fn set_desired_mode_plus_plan_reconcile_produces_set_mode_action() {
     // Startup/recovery reconcile still turns pending intent into a
     // ReconcileAction::SetMode when desired and observed diverge.
