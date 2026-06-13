@@ -496,9 +496,9 @@ impl AcpAgentManager {
                 ConfigSetPathError::OptionNotFound => {
                     AgentError::bad_request(format!("Config option '{option_id}' is not available"))
                 }
-                ConfigSetPathError::ValueNotSelectable => {
-                    AgentError::bad_request(format!("Value '{value}' is not selectable for config option '{option_id}'"))
-                }
+                ConfigSetPathError::ValueNotSelectable => AgentError::bad_request(format!(
+                    "Value '{value}' is not selectable for config option '{option_id}'"
+                )),
             })?;
             if session.config_options().is_none() {
                 set_path = match option_id {
@@ -577,7 +577,10 @@ impl AcpAgentManager {
             }
             ConfigSetPath::LegacyMode => {
                 self.protocol
-                    .set_mode(SetSessionModeRequest::new(SessionId::new(session_id.clone()), value.to_owned()))
+                    .set_mode(SetSessionModeRequest::new(
+                        SessionId::new(session_id.clone()),
+                        value.to_owned(),
+                    ))
                     .await
                     .map_err(|err| {
                         warn!(

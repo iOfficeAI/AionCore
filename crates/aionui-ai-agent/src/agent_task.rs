@@ -130,11 +130,7 @@ pub trait IMockAgent: IAgentTask {
             config_options: Vec::new(),
         })
     }
-    async fn set_config_option(
-        &self,
-        _option_id: &str,
-        _value: &str,
-    ) -> Result<SetConfigOptionResponse, AgentError> {
+    async fn set_config_option(&self, _option_id: &str, _value: &str) -> Result<SetConfigOptionResponse, AgentError> {
         Err(AgentError::bad_request(
             "Config option switching is not supported for this mock",
         ))
@@ -401,11 +397,7 @@ impl AgentInstance {
         }
     }
 
-    pub async fn set_config_option(
-        &self,
-        option_id: &str,
-        value: &str,
-    ) -> Result<SetConfigOptionResponse, AgentError> {
+    pub async fn set_config_option(&self, option_id: &str, value: &str) -> Result<SetConfigOptionResponse, AgentError> {
         if option_id.trim().is_empty() {
             return Err(AgentError::bad_request("option_id must not be empty"));
         }

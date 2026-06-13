@@ -21,10 +21,7 @@ impl ConfigSnapshot {
         }
     }
 
-    pub(crate) fn from_legacy_catalogs(
-        modes: Option<&SessionModeState>,
-        models: Option<&SessionModelState>,
-    ) -> Self {
+    pub(crate) fn from_legacy_catalogs(modes: Option<&SessionModeState>, models: Option<&SessionModelState>) -> Self {
         let mut options = Vec::new();
         if let Some(modes) = modes {
             options.push(dto_from_modes(modes));

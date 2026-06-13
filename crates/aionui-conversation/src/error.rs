@@ -102,12 +102,8 @@ impl ConversationError {
             Self::RateLimited => AgentError::RateLimited,
             Self::BadGateway { reason } => AgentError::bad_gateway(reason.clone()),
             Self::Timeout { reason } => AgentError::timeout(reason.clone()),
-            Self::ConfigConfirmationTimeout { .. } => {
-                AgentError::timeout("ACP config option confirmation timed out")
-            }
-            Self::ConfigUpdateInProgress { .. } => {
-                AgentError::conflict("ACP config update is already in progress")
-            }
+            Self::ConfigConfirmationTimeout { .. } => AgentError::timeout("ACP config option confirmation timed out"),
+            Self::ConfigUpdateInProgress { .. } => AgentError::conflict("ACP config update is already in progress"),
             Self::Unprocessable { reason } => AgentError::bad_request(reason.clone()),
             Self::Internal { reason } => AgentError::internal(reason.clone()),
             Self::WorkspacePathUnavailable { path } => {
