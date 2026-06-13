@@ -648,7 +648,7 @@ fn apply_advertised_config_options_prefers_config_option_catalogs_over_existing_
 }
 
 #[test]
-fn apply_advertised_config_options_merges_partial_updates_and_derives_model_reasoning_variants() {
+fn apply_advertised_config_options_merges_partial_updates_and_keeps_model_reasoning_independent() {
     let mut session = make_session();
     session.apply_advertised_config_options(vec![
         SessionConfigOption::select(
@@ -710,10 +710,22 @@ fn apply_advertised_config_options_merges_partial_updates_and_derives_model_reas
     assert!(config_options.iter().any(|option| option.id.to_string() == "mode"));
 
     let models = session.model_info().expect("model catalog");
-    assert_eq!(models.current_model_id.to_string(), "gpt-5.5/medium");
-    assert_eq!(models.available_models.len(), 4);
-    assert_eq!(models.available_models[0].model_id.to_string(), "gpt-5.5/low");
-    assert_eq!(models.available_models[1].model_id.to_string(), "gpt-5.5/medium");
+    assert_eq!(models.current_model_id.to_string(), "gpt-5.5");
+    assert_eq!(models.available_models.len(), 2);
+    assert_eq!(models.available_models[0].model_id.to_string(), "gpt-5.5");
+    assert_eq!(models.available_models[1].model_id.to_string(), "gpt-5.4");
+    assert_eq!(
+        config_options
+            .iter()
+            .find(|option| option.id.to_string() == "reasoning_effort")
+            .and_then(|option| match &option.kind {
+                agent_client_protocol::schema::SessionConfigKind::Select(select) => {
+                    Some(select.current_value.to_string())
+                }
+                _ => None,
+            }),
+        Some("medium".to_owned())
+    );
 }
 
 #[test]
@@ -743,7 +755,7 @@ fn apply_advertised_config_options_preserves_confirmed_explicit_model_when_curre
     ]);
     session.drain_events();
 
-    session.confirm_model(ModelId::new("gpt-5.5/medium"));
+    session.confirm_model(ModelId::new("gpt-5.4"));
     session.drain_events();
 
     session.apply_advertised_config_options(vec![
@@ -772,10 +784,10 @@ fn apply_advertised_config_options_preserves_confirmed_explicit_model_when_curre
     let models = session.model_info().expect("model catalog");
     assert_eq!(
         models.current_model_id.to_string(),
-        "gpt-5.5/medium",
+        "gpt-5.4",
         "lagging config option current values must not overwrite an explicitly confirmed model"
     );
-    assert_eq!(models.available_models.len(), 4);
+    assert_eq!(models.available_models.len(), 2);
 }
 
 #[test]
