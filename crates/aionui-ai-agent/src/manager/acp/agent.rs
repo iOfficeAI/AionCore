@@ -675,6 +675,7 @@ impl AcpAgentManager {
             if snapshot.observed_matches(option_id, requested) {
                 tracing::info!(
                     conversation_id = %self.params.conversation_id,
+                    agent_backend = ?self.params.metadata.backend,
                     config_id = %option_id,
                     requested = %requested,
                     elapsed_ms = started.elapsed().as_millis(),
@@ -685,6 +686,7 @@ impl AcpAgentManager {
             if started.elapsed() >= timeout {
                 tracing::warn!(
                     conversation_id = %self.params.conversation_id,
+                    agent_backend = ?self.params.metadata.backend,
                     config_id = %option_id,
                     requested = %requested,
                     timeout_ms = timeout.as_millis(),
