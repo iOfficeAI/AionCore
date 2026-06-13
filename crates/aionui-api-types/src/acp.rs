@@ -76,6 +76,61 @@ pub struct GetModelInfoResponse {
     pub model_info: Option<ModelInfoPayload>,
 }
 
+/// A single select option inside an ACP config option.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpConfigSelectOptionDto {
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Frontend-facing ACP config option. Always serializes with snake_case field names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpConfigOptionDto {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(rename = "type")]
+    pub option_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_value: Option<String>,
+    #[serde(default)]
+    pub options: Vec<AcpConfigSelectOptionDto>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigOptionConfirmation {
+    Observed,
+    CommandAck,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SetConfigOptionRequest {
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetConfigOptionsResponse {
+    pub config_options: Vec<AcpConfigOptionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetConfigOptionResponse {
+    pub confirmation: ConfigOptionConfirmation,
+    pub config_options: Option<Vec<AcpConfigOptionDto>>,
+}
+
 /// Inner model info payload matching the frontend's `AcpModelInfo` type.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelInfoPayload {
@@ -216,6 +271,44 @@ mod tests {
         let json = json!({ "model_id": "claude-sonnet-4" });
         let req: SetModelRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.model_id, "claude-sonnet-4");
+    }
+
+    #[test]
+    fn config_options_response_serializes_snake_case() {
+        let resp = GetConfigOptionsResponse {
+            config_options: vec![AcpConfigOptionDto {
+                id: "reasoning_effort".to_owned(),
+                name: Some("Reasoning Effort".to_owned()),
+                label: None,
+                description: None,
+                category: Some("thought_level".to_owned()),
+                option_type: "select".to_owned(),
+                current_value: Some("high".to_owned()),
+                options: vec![AcpConfigSelectOptionDto {
+                    value: "high".to_owned(),
+                    name: Some("High".to_owned()),
+                    label: None,
+                    description: None,
+                }],
+            }],
+        };
+
+        let value = serde_json::to_value(resp).unwrap();
+        assert_eq!(value["config_options"][0]["current_value"], "high");
+        assert_eq!(value["config_options"][0]["type"], "select");
+        assert!(value["config_options"][0].get("currentValue").is_none());
+    }
+
+    #[test]
+    fn set_config_option_response_serializes_command_ack_without_snapshot() {
+        let resp = SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::CommandAck,
+            config_options: None,
+        };
+
+        let value = serde_json::to_value(resp).unwrap();
+        assert_eq!(value["confirmation"], "command_ack");
+        assert!(value["config_options"].is_null());
     }
 
     #[test]
