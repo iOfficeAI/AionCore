@@ -1498,7 +1498,7 @@ impl ConversationService {
                 "Rejected ACP runtime current-state write through conversation.extra"
             );
             return Err(ConversationError::BadRequest {
-                reason: "ACP runtime current mode/model must be changed via /mode or /model, not conversation.extra"
+                reason: "ACP runtime current mode/model must be changed via /config-options, not conversation.extra"
                     .into(),
             });
         }

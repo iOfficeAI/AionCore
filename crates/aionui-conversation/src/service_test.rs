@@ -13,8 +13,9 @@ use aionui_ai_agent::{AgentError, AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
-    AgentErrorCode, AgentModeResponse, ConversationArtifactKind, ConversationResponse, GetModelInfoResponse,
-    ModelInfoEntry, ModelInfoPayload, SetModeRequest, SetModelRequest,
+    AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
+    ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload,
+    SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
@@ -1568,6 +1569,9 @@ struct MockAgent {
     stopped: Mutex<bool>,
     mode: Mutex<String>,
     model_id: Mutex<String>,
+    config_options: Arc<Mutex<Vec<AcpConfigOptionDto>>>,
+    set_config_option_calls: Arc<Mutex<Vec<(String, String)>>>,
+    set_config_option_response: Arc<Mutex<Option<SetConfigOptionResponse>>>,
     keep_reported_model_on_set: bool,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
@@ -1604,6 +1608,9 @@ impl MockAgent {
             stopped: Mutex::new(false),
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
+            config_options: Arc::new(Mutex::new(Vec::new())),
+            set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
+            set_config_option_response: Arc::new(Mutex::new(None)),
             keep_reported_model_on_set: false,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
@@ -1620,6 +1627,9 @@ impl MockAgent {
             stopped: Mutex::new(false),
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
+            config_options: Arc::new(Mutex::new(Vec::new())),
+            set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
+            set_config_option_response: Arc::new(Mutex::new(None)),
             keep_reported_model_on_set: false,
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
@@ -1636,6 +1646,9 @@ impl MockAgent {
             stopped: Mutex::new(false),
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
+            config_options: Arc::new(Mutex::new(Vec::new())),
+            set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
+            set_config_option_response: Arc::new(Mutex::new(None)),
             keep_reported_model_on_set: false,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
@@ -1644,20 +1657,14 @@ impl MockAgent {
         }
     }
 
-    fn with_stale_reported_model_after_set(conversation_id: &str) -> Self {
-        let (event_tx, _) = broadcast::channel(64);
-        Self {
-            conversation_id: conversation_id.to_owned(),
-            event_tx,
-            stopped: Mutex::new(false),
-            mode: Mutex::new("default".to_owned()),
-            model_id: Mutex::new("model-a".to_owned()),
-            keep_reported_model_on_set: true,
-            confirmations: Mutex::new(vec![]),
-            approval_memory: Mutex::new(std::collections::HashMap::new()),
-            allow_direct_confirm: false,
-            workspace_override: None,
-        }
+    fn with_config_options(self, options: Vec<AcpConfigOptionDto>) -> Self {
+        *self.config_options.lock().unwrap() = options;
+        self
+    }
+
+    fn with_set_config_option_response(self, response: SetConfigOptionResponse) -> Self {
+        *self.set_config_option_response.lock().unwrap() = Some(response);
+        self
     }
 }
 
@@ -1760,6 +1767,26 @@ impl IMockAgent for MockAgent {
     async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
         self.set_model(model_id).await?;
         Ok(Self::build_model_response(model_id))
+    }
+
+    async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+        Ok(GetConfigOptionsResponse {
+            config_options: self.config_options.lock().unwrap().clone(),
+        })
+    }
+
+    async fn set_config_option(&self, option_id: &str, value: &str) -> Result<SetConfigOptionResponse, AgentError> {
+        self.set_config_option_calls
+            .lock()
+            .unwrap()
+            .push((option_id.to_owned(), value.to_owned()));
+        if let Some(response) = self.set_config_option_response.lock().unwrap().clone() {
+            return Ok(response);
+        }
+        Ok(SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::Observed,
+            config_options: Some(self.config_options.lock().unwrap().clone()),
+        })
     }
 }
 
@@ -2392,312 +2419,90 @@ async fn send_message_rejects_legacy_runtime_conversations_as_archived() {
 }
 
 #[tokio::test]
-async fn set_mode_returns_confirmed_mode_from_active_agent() {
+async fn get_config_options_returns_active_agent_snapshot() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+    let agent = MockAgent::new(&conv.id).with_config_options(vec![AcpConfigOptionDto {
+        id: "model".to_owned(),
+        name: Some("Model".to_owned()),
+        label: None,
+        description: None,
+        category: Some("model".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some("gpt-5.5".to_owned()),
+        options: Vec::new(),
+    }]);
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
 
-    let response = svc
-        .set_mode(
-            &conv.id,
-            SetModeRequest {
-                mode: "plan".to_owned(),
-            },
-        )
-        .await
-        .unwrap();
+    let result = svc.get_config_options(&conv.id).await.unwrap();
 
-    assert_eq!(response.mode, "plan");
-    assert!(response.initialized);
+    assert_eq!(result.config_options[0].id, "model");
+    assert_eq!(result.config_options[0].current_value.as_deref(), Some("gpt-5.5"));
 }
 
 #[tokio::test]
-async fn set_model_returns_confirmed_model_from_active_agent() {
+async fn set_config_option_returns_observed_confirmation() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
-
-    let response = svc
-        .set_model(
-            &conv.id,
-            SetModelRequest {
-                model_id: "model-b".to_owned(),
-            },
-        )
-        .await
-        .unwrap();
-
-    let model_info = response.model_info.expect("model info should be returned");
-    assert_eq!(model_info.current_model_id.as_deref(), Some("model-b"));
-    assert!(model_info.available_models.iter().any(|m| m.id == "model-b"));
-}
-
-#[tokio::test]
-async fn set_model_returns_confirmed_model_even_if_get_model_is_stale() {
-    let task_mgr = Arc::new(MockTaskManager::new());
-    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
-    let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let agent = Arc::new(MockAgent::with_stale_reported_model_after_set(&conv.id));
+    let agent = Arc::new(MockAgent::new(&conv.id).with_config_options(vec![AcpConfigOptionDto {
+        id: "reasoning_effort".to_owned(),
+        name: Some("Reasoning Effort".to_owned()),
+        label: None,
+        description: None,
+        category: Some("thought_level".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some("high".to_owned()),
+        options: Vec::new(),
+    }]));
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
 
-    let response = svc
-        .set_model(
+    let result = svc
+        .set_config_option(
             &conv.id,
-            SetModelRequest {
-                model_id: "model-b".to_owned(),
+            "reasoning_effort",
+            SetConfigOptionRequest {
+                value: "high".to_owned(),
             },
         )
         .await
         .unwrap();
 
-    let model_info = response.model_info.expect("model info should be returned");
+    assert_eq!(result.confirmation, ConfigOptionConfirmation::Observed);
     assert_eq!(
-        model_info.current_model_id.as_deref(),
-        Some("model-b"),
-        "set_model should return the confirmed model, not a stale get_model snapshot"
+        agent.set_config_option_calls.lock().unwrap().as_slice(),
+        &[("reasoning_effort".to_owned(), "high".to_owned())]
     );
-
-    let stale_model_info = agent
-        .get_model()
-        .await
-        .unwrap()
-        .model_info
-        .expect("mock agent should still report model info");
-    assert_eq!(stale_model_info.current_model_id.as_deref(), Some("model-a"));
 }
 
 #[tokio::test]
-async fn set_model_updates_assistant_preference_only_when_snapshot_model_mode_is_auto() {
+async fn command_ack_does_not_persist_assistant_preference_in_core_service() {
     let task_mgr = Arc::new(MockTaskManager::new());
-    let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
-        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
-
-    upsert_test_assistant_definition(
-        &definition_repo,
-        "asstdef_model_auto",
-        "assistant-model-auto",
-        "claude",
-        "auto",
-        "auto",
-    )
-    .await;
-    overlay_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_model_auto",
-            enabled: true,
-            sort_order: 0,
-            agent_backend_override: None,
-            last_used_at: None,
-        })
-        .await
-        .unwrap();
-    preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_model_auto",
-            last_model_id: Some("legacy-model"),
-            last_permission_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
-        .await
-        .unwrap();
-
-    let auto_conv = create_assistant_backed_conversation(&svc, "user_1", "acp", "claude", "assistant-model-auto").await;
-    task_mgr.insert_agent(
-        &auto_conv.id,
-        AgentInstance::Mock(Arc::new(MockAgent::new(&auto_conv.id))),
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(
+        MockAgent::new(&conv.id).with_set_config_option_response(SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::CommandAck,
+            config_options: None,
+        }),
     );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
 
-    let response = svc
-        .set_model(
-            &auto_conv.id,
-            SetModelRequest {
-                model_id: "model-b".to_owned(),
+    let result = svc
+        .set_config_option(
+            &conv.id,
+            "model",
+            SetConfigOptionRequest {
+                value: "gpt-5.5".to_owned(),
             },
         )
         .await
         .unwrap();
 
-    assert_eq!(
-        response
-            .model_info
-            .as_ref()
-            .and_then(|info| info.current_model_id.as_deref()),
-        Some("model-b")
-    );
-    let auto_pref = preference_repo.get("asstdef_model_auto").await.unwrap().unwrap();
-    assert_eq!(auto_pref.last_model_id.as_deref(), Some("model-b"));
-    let auto_snapshot = repo.get_assistant_snapshot(&auto_conv.id).await.unwrap().unwrap();
-    assert_eq!(auto_snapshot.resolved_model_id.as_deref(), Some("model-b"));
-
-    upsert_test_assistant_definition(
-        &definition_repo,
-        "asstdef_model_fixed",
-        "assistant-model-fixed",
-        "claude",
-        "fixed",
-        "auto",
-    )
-    .await;
-    overlay_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_model_fixed",
-            enabled: true,
-            sort_order: 0,
-            agent_backend_override: None,
-            last_used_at: None,
-        })
-        .await
-        .unwrap();
-    preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_model_fixed",
-            last_model_id: Some("legacy-fixed-model"),
-            last_permission_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
-        .await
-        .unwrap();
-
-    let fixed_conv =
-        create_assistant_backed_conversation(&svc, "user_1", "acp", "claude", "assistant-model-fixed").await;
-    task_mgr.insert_agent(
-        &fixed_conv.id,
-        AgentInstance::Mock(Arc::new(MockAgent::new(&fixed_conv.id))),
-    );
-
-    let _ = svc
-        .set_model(
-            &fixed_conv.id,
-            SetModelRequest {
-                model_id: "model-c".to_owned(),
-            },
-        )
-        .await
-        .unwrap();
-
-    let fixed_pref = preference_repo.get("asstdef_model_fixed").await.unwrap().unwrap();
-    assert_eq!(fixed_pref.last_model_id.as_deref(), Some("legacy-fixed-model"));
-    let fixed_snapshot = repo.get_assistant_snapshot(&fixed_conv.id).await.unwrap().unwrap();
-    assert_eq!(fixed_snapshot.resolved_model_id.as_deref(), Some("model-c"));
-}
-
-#[tokio::test]
-async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mode_is_auto() {
-    let task_mgr = Arc::new(MockTaskManager::new());
-    let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
-        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
-
-    upsert_test_assistant_definition(
-        &definition_repo,
-        "asstdef_mode_auto",
-        "assistant-mode-auto",
-        "claude",
-        "auto",
-        "auto",
-    )
-    .await;
-    overlay_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_mode_auto",
-            enabled: true,
-            sort_order: 0,
-            agent_backend_override: None,
-            last_used_at: None,
-        })
-        .await
-        .unwrap();
-    preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_mode_auto",
-            last_model_id: None,
-            last_permission_value: Some("legacy-mode"),
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
-        .await
-        .unwrap();
-
-    let auto_conv = create_assistant_backed_conversation(&svc, "user_1", "acp", "claude", "assistant-mode-auto").await;
-    task_mgr.insert_agent(
-        &auto_conv.id,
-        AgentInstance::Mock(Arc::new(MockAgent::new(&auto_conv.id))),
-    );
-
-    let response = svc
-        .set_mode(
-            &auto_conv.id,
-            SetModeRequest {
-                mode: "plan".to_owned(),
-            },
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.mode, "plan");
-    let auto_pref = preference_repo.get("asstdef_mode_auto").await.unwrap().unwrap();
-    assert_eq!(auto_pref.last_permission_value.as_deref(), Some("plan"));
-    let auto_snapshot = repo.get_assistant_snapshot(&auto_conv.id).await.unwrap().unwrap();
-    assert_eq!(auto_snapshot.resolved_permission_value.as_deref(), Some("plan"));
-
-    upsert_test_assistant_definition(
-        &definition_repo,
-        "asstdef_mode_fixed",
-        "assistant-mode-fixed",
-        "claude",
-        "auto",
-        "fixed",
-    )
-    .await;
-    overlay_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_mode_fixed",
-            enabled: true,
-            sort_order: 0,
-            agent_backend_override: None,
-            last_used_at: None,
-        })
-        .await
-        .unwrap();
-    preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_mode_fixed",
-            last_model_id: None,
-            last_permission_value: Some("legacy-fixed-mode"),
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
-        .await
-        .unwrap();
-
-    let fixed_conv =
-        create_assistant_backed_conversation(&svc, "user_1", "acp", "claude", "assistant-mode-fixed").await;
-    task_mgr.insert_agent(
-        &fixed_conv.id,
-        AgentInstance::Mock(Arc::new(MockAgent::new(&fixed_conv.id))),
-    );
-
-    let _ = svc
-        .set_mode(
-            &fixed_conv.id,
-            SetModeRequest {
-                mode: "acceptEdits".to_owned(),
-            },
-        )
-        .await
-        .unwrap();
-
-    let fixed_pref = preference_repo.get("asstdef_mode_fixed").await.unwrap().unwrap();
-    assert_eq!(fixed_pref.last_permission_value.as_deref(), Some("legacy-fixed-mode"));
-    let fixed_snapshot = repo.get_assistant_snapshot(&fixed_conv.id).await.unwrap().unwrap();
-    assert_eq!(fixed_snapshot.resolved_permission_value.as_deref(), Some("acceptEdits"));
+    assert_eq!(result.confirmation, ConfigOptionConfirmation::CommandAck);
+    let refreshed = svc.get("user_1", &conv.id).await.unwrap();
+    assert!(refreshed.extra.get("current_model_id").is_none());
 }
 
 #[tokio::test]
@@ -4503,7 +4308,7 @@ async fn update_rejects_acp_runtime_current_extra_fields() {
 
     match err {
         ConversationError::BadRequest { reason: msg } => {
-            assert!(msg.contains("/mode or /model"), "msg = {msg:?}")
+            assert!(msg.contains("/config-options"), "msg = {msg:?}")
         }
         other => panic!("expected BadRequest, got {other:?}"),
     }

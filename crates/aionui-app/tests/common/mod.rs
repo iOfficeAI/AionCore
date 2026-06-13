@@ -166,7 +166,54 @@ impl IAgentTask for NoopMockAgent {
 }
 
 #[async_trait::async_trait]
-impl IMockAgent for NoopMockAgent {}
+impl IMockAgent for NoopMockAgent {
+    async fn get_config_options(
+        &self,
+    ) -> Result<aionui_api_types::GetConfigOptionsResponse, aionui_ai_agent::AgentError> {
+        Ok(aionui_api_types::GetConfigOptionsResponse {
+            config_options: vec![aionui_api_types::AcpConfigOptionDto {
+                id: "model".to_owned(),
+                name: Some("Model".to_owned()),
+                label: None,
+                description: None,
+                category: Some("model".to_owned()),
+                option_type: "select".to_owned(),
+                current_value: Some("mock-model".to_owned()),
+                options: vec![aionui_api_types::AcpConfigSelectOptionDto {
+                    value: "mock-model".to_owned(),
+                    name: Some("Mock Model".to_owned()),
+                    label: Some("Mock Model".to_owned()),
+                    description: None,
+                }],
+            }],
+        })
+    }
+
+    async fn set_config_option(
+        &self,
+        _option_id: &str,
+        _value: &str,
+    ) -> Result<aionui_api_types::SetConfigOptionResponse, aionui_ai_agent::AgentError> {
+        Ok(aionui_api_types::SetConfigOptionResponse {
+            confirmation: aionui_api_types::ConfigOptionConfirmation::Observed,
+            config_options: Some(vec![aionui_api_types::AcpConfigOptionDto {
+                id: "model".to_owned(),
+                name: Some("Model".to_owned()),
+                label: None,
+                description: None,
+                category: Some("model".to_owned()),
+                option_type: "select".to_owned(),
+                current_value: Some("mock-model-updated".to_owned()),
+                options: vec![aionui_api_types::AcpConfigSelectOptionDto {
+                    value: "mock-model-updated".to_owned(),
+                    name: Some("Mock Model Updated".to_owned()),
+                    label: Some("Mock Model Updated".to_owned()),
+                    description: None,
+                }],
+            }]),
+        })
+    }
+}
 
 pub async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
