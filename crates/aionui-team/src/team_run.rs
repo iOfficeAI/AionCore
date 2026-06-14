@@ -1,7 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use aionui_api_types::{TeamChildTurnPayload, TeamRunAckResponse, TeamRunPayload, TeamRunStatus, TeamRunTargetRole};
+use aionui_api_types::{
+    TeamChildTurnPayload, TeamRunAckResponse, TeamRunPayload, TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload,
+};
 use aionui_common::{TimestampMs, generate_id, now_ms};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -85,6 +87,70 @@ impl TeamRunRecord {
         self.pending_wakes.get(slot_id).map(VecDeque::len).unwrap_or(0)
     }
 
+    fn starting_child_count_for_slot(&self, slot_id: &str) -> usize {
+        self.starting_reservations
+            .values()
+            .filter(|reservation| reservation.slot_id == slot_id)
+            .count()
+    }
+
+    fn role_for_slot(&self, slot_id: &str) -> Option<TeamRunTargetRole> {
+        self.active_child_turns
+            .get(slot_id)
+            .map(|child| child.role.clone())
+            .or_else(|| {
+                self.starting_reservations
+                    .values()
+                    .find(|reservation| reservation.slot_id == slot_id)
+                    .map(|reservation| reservation.role.clone())
+            })
+            .or_else(|| {
+                self.pending_wakes
+                    .get(slot_id)
+                    .and_then(|wakes| wakes.front())
+                    .map(|wake| wake.role.clone())
+            })
+    }
+
+    fn slot_work(&self) -> Vec<TeamSlotWorkPayload> {
+        let mut slot_ids = self
+            .pending_wakes
+            .keys()
+            .cloned()
+            .chain(
+                self.starting_reservations
+                    .values()
+                    .map(|reservation| reservation.slot_id.clone()),
+            )
+            .chain(self.active_child_turns.keys().cloned())
+            .collect::<Vec<_>>();
+        slot_ids.sort();
+        slot_ids.dedup();
+
+        slot_ids
+            .into_iter()
+            .filter_map(|slot_id| {
+                let role = self.role_for_slot(&slot_id)?;
+                Some(TeamSlotWorkPayload {
+                    pending_wake_count: self.pending_wake_count_for_slot(&slot_id),
+                    starting_child_count: self.starting_child_count_for_slot(&slot_id),
+                    active_turn_id: self
+                        .active_child_turns
+                        .get(&slot_id)
+                        .map(|child| child.turn_id.clone()),
+                    slot_id,
+                    role,
+                })
+            })
+            .collect()
+    }
+
+    fn slot_is_busy(&self, slot_id: &str) -> bool {
+        self.pending_wake_count_for_slot(slot_id) > 0
+            || self.starting_child_count_for_slot(slot_id) > 0
+            || self.active_child_turns.contains_key(slot_id)
+    }
+
     fn payload(&self) -> TeamRunPayload {
         TeamRunPayload {
             team_id: self.team_id.clone(),
@@ -95,15 +161,23 @@ impl TeamRunRecord {
             active_child_count: self.active_child_turns.len(),
             pending_wake_count: self.pending_wake_count(),
             starting_child_count: self.starting_reservations.len(),
+            slot_work: self.slot_work(),
         }
     }
 
-    fn ack(&self, message_id: Option<String>) -> TeamRunAckResponse {
+    fn ack(
+        &self,
+        accepted_slot_id: &str,
+        accepted_role: TeamRunTargetRole,
+        message_id: Option<String>,
+    ) -> TeamRunAckResponse {
         TeamRunAckResponse {
             team_run_id: self.team_run_id.clone(),
             team_id: self.team_id.clone(),
             target_slot_id: self.target_slot_id.clone(),
             target_role: self.target_role.clone(),
+            accepted_slot_id: accepted_slot_id.to_owned(),
+            accepted_role,
             status: self.status.clone(),
             message_id,
         }
@@ -140,6 +214,16 @@ impl TeamRunManager {
         let mut guard = self.state.lock().await;
         if let Some(active) = guard.as_ref().filter(|r| r.is_active()) {
             if allow_active_intervention {
+                if active.slot_is_busy(target_slot_id) {
+                    info!(
+                        team_id = %self.team_id,
+                        team_run_id = %active.team_run_id,
+                        target_slot_id,
+                        target_role = ?target_role,
+                        "team_run active intervention rejected because target slot is busy"
+                    );
+                    return Err(TeamError::SlotBusy(target_slot_id.to_owned()));
+                }
                 debug!(
                     team_id = %self.team_id,
                     team_run_id = %active.team_run_id,
@@ -149,7 +233,7 @@ impl TeamRunManager {
                     active_target_role = ?active.target_role,
                     "team_run active intervention accepted"
                 );
-                return Ok(active.ack(message_id));
+                return Ok(active.ack(target_slot_id, target_role, message_id));
             }
             return Err(TeamError::InvalidRequest("team run is already active".into()));
         }
@@ -164,7 +248,7 @@ impl TeamRunManager {
             team_run_id: generate_id(),
             team_id: self.team_id.clone(),
             target_slot_id: target_slot_id.to_owned(),
-            target_role,
+            target_role: target_role.clone(),
             status: TeamRunStatus::Accepted,
             started_at: None,
             completed_at: None,
@@ -174,7 +258,7 @@ impl TeamRunManager {
             starting_reservations: HashMap::new(),
             pending_wakes: HashMap::new(),
         };
-        let ack = record.ack(message_id);
+        let ack = record.ack(target_slot_id, target_role, message_id);
         let payload = record.payload();
         *guard = Some(record);
         drop(guard);
@@ -845,6 +929,154 @@ mod tests {
         (TeamRunManager::new("team-1".into(), emitter), bc)
     }
 
+    fn slot_work<'a>(
+        payload: &'a TeamRunPayload,
+        slot_id: &str,
+    ) -> &'a aionui_api_types::TeamSlotWorkPayload {
+        payload
+            .slot_work
+            .iter()
+            .find(|work| work.slot_id == slot_id)
+            .expect("slot work must exist")
+    }
+
+    #[tokio::test]
+    async fn run_payload_reports_pending_starting_and_active_work_by_slot() {
+        let (manager, bc) = manager();
+        let ack = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
+            .await
+            .unwrap();
+
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        manager
+            .record_pending_wake(
+                "worker",
+                TeamRunTargetRole::Teammate,
+                TeamWakeSource::McpSendMessage,
+            )
+            .await
+            .unwrap();
+        let worker_reservation = manager
+            .claim_wake_for_turn("worker", TeamRunTargetRole::Teammate, "conv-worker")
+            .await
+            .unwrap();
+        let lead_reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .unwrap();
+        manager
+            .record_child_started(
+                &lead_reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id.clone(),
+                    slot_id: "lead".into(),
+                    role: TeamRunTargetRole::Lead,
+                    conversation_id: "conv-lead".into(),
+                    turn_id: "turn-lead".into(),
+                },
+            )
+            .await;
+
+        let latest = bc.run_payloads().last().cloned().expect("run payload");
+        let lead = slot_work(&latest, "lead");
+        assert_eq!(lead.pending_wake_count, 0);
+        assert_eq!(lead.starting_child_count, 0);
+        assert_eq!(lead.active_turn_id.as_deref(), Some("turn-lead"));
+
+        let worker = slot_work(&latest, "worker");
+        assert_eq!(worker.pending_wake_count, 0);
+        assert_eq!(worker.starting_child_count, 1);
+        assert_eq!(worker.active_turn_id, None);
+        assert_eq!(worker_reservation.slot_id, "worker");
+    }
+
+    #[tokio::test]
+    async fn active_intervention_ack_uses_accepted_slot_without_changing_initial_target() {
+        let (manager, _) = manager();
+        let first = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
+            .await
+            .unwrap();
+
+        let second = manager
+            .accept_user_message("worker", TeamRunTargetRole::Teammate, true, Some("msg-2".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(second.team_run_id, first.team_run_id);
+        assert_eq!(second.target_slot_id, "lead");
+        assert_eq!(second.target_role, TeamRunTargetRole::Lead);
+        assert_eq!(second.accepted_slot_id, "worker");
+        assert_eq!(second.accepted_role, TeamRunTargetRole::Teammate);
+        assert_eq!(second.message_id.as_deref(), Some("msg-2"));
+    }
+
+    #[tokio::test]
+    async fn active_intervention_rejects_when_same_slot_has_pending_work() {
+        let (manager, _) = manager();
+        manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
+            .await
+            .unwrap();
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+
+        let err = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, true, None)
+            .await
+            .expect_err("same slot pending work must be busy");
+
+        assert!(matches!(err, TeamError::SlotBusy(slot_id) if slot_id == "lead"));
+    }
+
+    #[tokio::test]
+    async fn active_intervention_rejects_when_same_slot_has_starting_or_active_work() {
+        let (manager, _) = manager();
+        let ack = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
+            .await
+            .unwrap();
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .unwrap();
+
+        let starting_err = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, true, None)
+            .await
+            .expect_err("same slot starting work must be busy");
+        assert!(matches!(starting_err, TeamError::SlotBusy(slot_id) if slot_id == "lead"));
+
+        manager
+            .record_child_started(
+                &reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id,
+                    slot_id: "lead".into(),
+                    role: TeamRunTargetRole::Lead,
+                    conversation_id: "conv-lead".into(),
+                    turn_id: "turn-lead".into(),
+                },
+            )
+            .await;
+
+        let active_err = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, true, None)
+            .await
+            .expect_err("same slot active work must be busy");
+        assert!(matches!(active_err, TeamError::SlotBusy(slot_id) if slot_id == "lead"));
+    }
+
     #[tokio::test]
     async fn record_pending_wake_requires_active_run() {
         let (manager, _) = manager();
@@ -981,6 +1213,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(second.team_run_id, first.team_run_id);
+        assert_eq!(second.accepted_slot_id, "worker");
+        assert_eq!(second.accepted_role, TeamRunTargetRole::Teammate);
         assert_eq!(second.message_id.as_deref(), Some("msg-1"));
     }
 

@@ -42,6 +42,7 @@ impl From<TeamError> for ApiError {
             TeamError::AgentNotFound(msg) => ApiError::NotFound(msg),
             TeamError::TaskNotFound(msg) => ApiError::NotFound(msg),
             TeamError::InvalidRequest(msg) => ApiError::BadRequest(msg),
+            TeamError::SlotBusy(msg) => ApiError::BadRequest(format!("Team slot is busy: {msg}")),
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),

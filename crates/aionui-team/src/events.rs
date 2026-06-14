@@ -106,6 +106,7 @@ impl TeamEventEmitter {
             active_child_count = payload.active_child_count,
             pending_wake_count = payload.pending_wake_count,
             starting_child_count = payload.starting_child_count,
+            slot_work_count = payload.slot_work.len(),
             "team websocket event emitted"
         );
         let event = WebSocketMessage::new(
@@ -277,6 +278,7 @@ mod tests {
                 active_child_count: 0,
                 pending_wake_count: 1,
                 starting_child_count: 0,
+                slot_work: Vec::new(),
             },
         );
 
