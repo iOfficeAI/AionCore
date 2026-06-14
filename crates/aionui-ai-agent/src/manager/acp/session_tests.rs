@@ -835,9 +835,212 @@ fn set_desired_mode_plus_plan_reconcile_produces_set_mode_action() {
 }
 
 #[test]
+fn pending_model_seed_resolves_category_to_raw_config_key_and_suppresses_legacy_set_model() {
+    let mut session = AcpSession::new(None, Some(ModelId::new("openai/gpt-5")), HashMap::new());
+    session.seed_pending_startup_config(SessionConfigOptionCategory::Model, ConfigValue::new("openai/gpt-5"));
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "opencode/big-pickle",
+            vec![
+                SessionConfigSelectOption::new("opencode/big-pickle", "Big Pickle"),
+                SessionConfigSelectOption::new("openai/gpt-5", "GPT-5"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model),
+    ]);
+
+    let results = session.resolve_pending_startup_config_seeds();
+    assert_eq!(
+        results,
+        vec![PendingStartupConfigSeedResult::Applied {
+            category: SessionConfigOptionCategory::Model,
+            option_id: ConfigKey::new("model"),
+        }]
+    );
+
+    assert_eq!(
+        session.plan_reconcile(),
+        vec![ReconcileAction::SetConfigOption {
+            key: ConfigKey::new("model"),
+            value: ConfigValue::new("openai/gpt-5"),
+        }]
+    );
+}
+
+#[test]
+fn pending_mode_seed_resolves_category_to_raw_config_key_and_suppresses_legacy_set_mode() {
+    let mut session = AcpSession::new(Some(ModeId::new("build")), None, HashMap::new());
+    session.seed_pending_startup_config(SessionConfigOptionCategory::Mode, ConfigValue::new("build"));
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "default",
+            vec![
+                SessionConfigSelectOption::new("default", "Default"),
+                SessionConfigSelectOption::new("build", "Build"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Mode),
+    ]);
+
+    let results = session.resolve_pending_startup_config_seeds();
+    assert_eq!(
+        results,
+        vec![PendingStartupConfigSeedResult::Applied {
+            category: SessionConfigOptionCategory::Mode,
+            option_id: ConfigKey::new("mode"),
+        }]
+    );
+
+    assert_eq!(
+        session.plan_reconcile(),
+        vec![ReconcileAction::SetConfigOption {
+            key: ConfigKey::new("mode"),
+            value: ConfigValue::new("build"),
+        }]
+    );
+}
+
+#[test]
+fn pending_model_seed_falls_back_to_legacy_set_model_when_model_config_option_is_absent() {
+    let mut session = AcpSession::new(None, Some(ModelId::new("openai/gpt-5")), HashMap::new());
+    session.seed_pending_startup_config(SessionConfigOptionCategory::Model, ConfigValue::new("openai/gpt-5"));
+
+    session.apply_advertised_modes(SessionModeState::new("build".to_owned(), vec![]));
+
+    assert_eq!(
+        session.resolve_pending_startup_config_seeds(),
+        vec![PendingStartupConfigSeedResult::OptionNotAdvertised {
+            category: SessionConfigOptionCategory::Model,
+        }]
+    );
+
+    assert_eq!(
+        session.plan_reconcile(),
+        vec![ReconcileAction::SetModel {
+            model: ModelId::new("openai/gpt-5"),
+        }]
+    );
+}
+
+#[test]
+fn pending_mode_seed_falls_back_to_legacy_set_mode_when_mode_config_option_is_absent() {
+    let mut session = AcpSession::new(Some(ModeId::new("build")), None, HashMap::new());
+    session.seed_pending_startup_config(SessionConfigOptionCategory::Mode, ConfigValue::new("build"));
+
+    session.apply_advertised_models(SessionModelState::new("gpt-5".to_owned(), vec![]));
+
+    assert_eq!(
+        session.resolve_pending_startup_config_seeds(),
+        vec![PendingStartupConfigSeedResult::OptionNotAdvertised {
+            category: SessionConfigOptionCategory::Mode,
+        }]
+    );
+
+    assert_eq!(
+        session.plan_reconcile(),
+        vec![ReconcileAction::SetMode {
+            mode: ModeId::new("build"),
+        }]
+    );
+}
+
+#[test]
+fn pending_model_seed_is_dropped_without_legacy_fallback_when_model_config_option_rejects_value() {
+    let mut session = AcpSession::new(None, Some(ModelId::new("openai/gpt-5")), HashMap::new());
+    session.seed_pending_startup_config(SessionConfigOptionCategory::Model, ConfigValue::new("openai/gpt-5"));
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "opencode/big-pickle",
+            vec![SessionConfigSelectOption::new("opencode/big-pickle", "Big Pickle")],
+        )
+        .category(SessionConfigOptionCategory::Model),
+    ]);
+
+    assert_eq!(
+        session.resolve_pending_startup_config_seeds(),
+        vec![PendingStartupConfigSeedResult::ValueNotSelectable {
+            category: SessionConfigOptionCategory::Model,
+        }]
+    );
+    assert!(session.plan_reconcile().is_empty());
+}
+
+#[test]
+fn startup_model_seed_prevents_opencode_default_model_config_from_remaining_selected() {
+    let mut session = AcpSession::new(None, Some(ModelId::new("openai/gpt-5")), HashMap::new());
+    session.seed_pending_startup_config(SessionConfigOptionCategory::Model, ConfigValue::new("openai/gpt-5"));
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "opencode/big-pickle",
+            vec![
+                SessionConfigSelectOption::new("opencode/big-pickle", "OpenCode Big Pickle"),
+                SessionConfigSelectOption::new("openai/gpt-5", "OpenAI GPT-5"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "build",
+            vec![SessionConfigSelectOption::new("build", "Build")],
+        )
+        .category(SessionConfigOptionCategory::Mode),
+    ]);
+
+    session.resolve_pending_startup_config_seeds();
+
+    assert_eq!(
+        session.plan_reconcile(),
+        vec![ReconcileAction::SetConfigOption {
+            key: ConfigKey::new("model"),
+            value: ConfigValue::new("openai/gpt-5"),
+        }]
+    );
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "openai/gpt-5",
+            vec![
+                SessionConfigSelectOption::new("opencode/big-pickle", "OpenCode Big Pickle"),
+                SessionConfigSelectOption::new("openai/gpt-5", "OpenAI GPT-5"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model),
+    ]);
+
+    assert!(session.plan_reconcile().is_empty());
+    assert_eq!(
+        session
+            .config_options()
+            .and_then(|options| options.iter().find(|option| option.id.to_string() == "model"))
+            .and_then(|option| match &option.kind {
+                agent_client_protocol::schema::SessionConfigKind::Select(select) => {
+                    Some(select.current_value.to_string())
+                }
+                _ => None,
+            }),
+        Some("openai/gpt-5".to_owned())
+    );
+}
+
+#[test]
 fn pending_thought_level_seed_resolves_category_to_raw_config_key() {
     let mut session = AcpSession::new(None, None, HashMap::new());
-    session.seed_pending_thought_level(ConfigValue::new("high"));
+    session.seed_pending_startup_config(SessionConfigOptionCategory::ThoughtLevel, ConfigValue::new("high"));
 
     session.apply_advertised_config_options(vec![
         SessionConfigOption::select(
@@ -854,8 +1057,11 @@ fn pending_thought_level_seed_resolves_category_to_raw_config_key() {
     ]);
 
     assert_eq!(
-        session.resolve_pending_thought_level_seed(),
-        Some(PendingThoughtLevelSeedResult::Applied)
+        session.resolve_pending_startup_config_seeds(),
+        vec![PendingStartupConfigSeedResult::Applied {
+            category: SessionConfigOptionCategory::ThoughtLevel,
+            option_id: ConfigKey::new("reasoning_effort"),
+        }]
     );
 
     assert_eq!(
@@ -870,20 +1076,22 @@ fn pending_thought_level_seed_resolves_category_to_raw_config_key() {
 #[test]
 fn pending_thought_level_seed_is_dropped_when_option_is_unavailable() {
     let mut session = AcpSession::new(None, None, HashMap::new());
-    session.seed_pending_thought_level(ConfigValue::new("high"));
+    session.seed_pending_startup_config(SessionConfigOptionCategory::ThoughtLevel, ConfigValue::new("high"));
 
     assert_eq!(
-        session.resolve_pending_thought_level_seed(),
-        Some(PendingThoughtLevelSeedResult::OptionNotAdvertised)
+        session.resolve_pending_startup_config_seeds(),
+        vec![PendingStartupConfigSeedResult::OptionNotAdvertised {
+            category: SessionConfigOptionCategory::ThoughtLevel,
+        }]
     );
     assert!(session.plan_reconcile().is_empty());
-    assert!(session.resolve_pending_thought_level_seed().is_none());
+    assert!(session.resolve_pending_startup_config_seeds().is_empty());
 }
 
 #[test]
 fn pending_thought_level_seed_is_dropped_when_value_is_not_selectable() {
     let mut session = AcpSession::new(None, None, HashMap::new());
-    session.seed_pending_thought_level(ConfigValue::new("xhigh"));
+    session.seed_pending_startup_config(SessionConfigOptionCategory::ThoughtLevel, ConfigValue::new("xhigh"));
     session.apply_advertised_config_options(vec![
         SessionConfigOption::select(
             "effort",
@@ -899,8 +1107,10 @@ fn pending_thought_level_seed_is_dropped_when_value_is_not_selectable() {
     ]);
 
     assert_eq!(
-        session.resolve_pending_thought_level_seed(),
-        Some(PendingThoughtLevelSeedResult::ValueNotSelectable)
+        session.resolve_pending_startup_config_seeds(),
+        vec![PendingStartupConfigSeedResult::ValueNotSelectable {
+            category: SessionConfigOptionCategory::ThoughtLevel,
+        }]
     );
     assert!(session.plan_reconcile().is_empty());
 }
@@ -908,7 +1118,7 @@ fn pending_thought_level_seed_is_dropped_when_value_is_not_selectable() {
 #[test]
 fn pending_thought_level_seed_does_not_reconcile_when_observed_already_matches() {
     let mut session = AcpSession::new(None, None, HashMap::new());
-    session.seed_pending_thought_level(ConfigValue::new("high"));
+    session.seed_pending_startup_config(SessionConfigOptionCategory::ThoughtLevel, ConfigValue::new("high"));
     session.apply_advertised_config_options(vec![
         SessionConfigOption::select(
             "reasoning_effort",
@@ -920,8 +1130,11 @@ fn pending_thought_level_seed_does_not_reconcile_when_observed_already_matches()
     ]);
 
     assert_eq!(
-        session.resolve_pending_thought_level_seed(),
-        Some(PendingThoughtLevelSeedResult::Applied)
+        session.resolve_pending_startup_config_seeds(),
+        vec![PendingStartupConfigSeedResult::Applied {
+            category: SessionConfigOptionCategory::ThoughtLevel,
+            option_id: ConfigKey::new("reasoning_effort"),
+        }]
     );
     assert!(session.plan_reconcile().is_empty());
 }

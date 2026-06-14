@@ -15,8 +15,8 @@ use crate::registry::CatalogSender;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::{
-    AvailableCommand, CancelNotification, SessionId, SessionModelState, SessionNotification,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
+    AvailableCommand, CancelNotification, SessionConfigOptionCategory, SessionId, SessionModelState,
+    SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
 };
 use aionui_api_types::{
     AgentHandshake, ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionResponse,
@@ -107,17 +107,63 @@ fn initial_mode_from_params(params: &AcpSessionParams) -> Option<ModeId> {
         .map(ModeId::new)
 }
 
-fn initial_thought_level_seed(
-    extra_thought_level: Option<&str>,
+fn has_persisted_config_for_category(
     initial_config: &HashMap<ConfigKey, ConfigValue>,
-) -> Option<ConfigValue> {
-    if !initial_config.is_empty() {
-        return None;
+    category: &SessionConfigOptionCategory,
+) -> bool {
+    match category {
+        SessionConfigOptionCategory::Mode => initial_config.keys().any(|key| key.as_str() == "mode"),
+        SessionConfigOptionCategory::Model => initial_config.keys().any(|key| key.as_str() == "model"),
+        SessionConfigOptionCategory::ThoughtLevel => initial_config.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "thought_level" | "reasoning_effort" | "effort" | "thinking_budget" | "thinking"
+            )
+        }),
+        _ => false,
     }
-    extra_thought_level
+}
+
+fn seed_startup_config_preferences(
+    session: &mut AcpSession,
+    params: &AcpSessionParams,
+    initial_config: &HashMap<ConfigKey, ConfigValue>,
+) {
+    if let Some(mode) = params
+        .config
+        .session_mode
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ConfigValue::new)
+        .filter(|_| !has_persisted_config_for_category(initial_config, &SessionConfigOptionCategory::Mode))
+    {
+        session.seed_pending_startup_config(SessionConfigOptionCategory::Mode, ConfigValue::new(mode.to_owned()));
+    }
+
+    if let Some(model) = params
+        .config
+        .current_model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|_| !has_persisted_config_for_category(initial_config, &SessionConfigOptionCategory::Model))
+    {
+        session.seed_pending_startup_config(SessionConfigOptionCategory::Model, ConfigValue::new(model.to_owned()));
+    }
+
+    if let Some(thought_level) = params
+        .config
+        .thought_level
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|_| !has_persisted_config_for_category(initial_config, &SessionConfigOptionCategory::ThoughtLevel))
+    {
+        session.seed_pending_startup_config(
+            SessionConfigOptionCategory::ThoughtLevel,
+            ConfigValue::new(thought_level.to_owned()),
+        );
+    }
 }
 
 fn confirm_option_id(data: &Value) -> Option<String> {
@@ -361,11 +407,9 @@ impl AcpAgentManager {
             snapshot.map(|s| s.config_selections.clone()).unwrap_or_default(),
         );
 
-        let initial_thought_level = initial_thought_level_seed(params.config.thought_level.as_deref(), &initial_config);
+        let startup_config_seed_base = initial_config.clone();
         let mut session = AcpSession::new(initial_mode, initial_model, initial_config);
-        if let Some(value) = initial_thought_level {
-            session.seed_pending_thought_level(value);
-        }
+        seed_startup_config_preferences(&mut session, &params, &startup_config_seed_base);
 
         let pipeline = PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)]);
 
@@ -1270,7 +1314,7 @@ mod tests {
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::CloseReason;
     use crate::shared_kernel::{ConfigKey, ConfigValue};
-    use agent_client_protocol::schema::AvailableCommand;
+    use agent_client_protocol::schema::{AvailableCommand, SessionConfigOptionCategory};
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -1472,19 +1516,23 @@ mod tests {
     }
 
     #[test]
-    fn initial_thought_level_seed_uses_extra_when_no_persisted_config_exists() {
-        let seed = super::initial_thought_level_seed(Some(" high "), &Default::default());
+    fn persisted_thought_config_does_not_block_model_startup_seed_category() {
+        let persisted_config = HashMap::from([(ConfigKey::new("effort"), ConfigValue::new("medium"))]);
 
-        assert_eq!(seed.as_ref().map(|value| value.as_str()), Some("high"));
+        assert!(!super::has_persisted_config_for_category(
+            &persisted_config,
+            &SessionConfigOptionCategory::Model
+        ));
     }
 
     #[test]
-    fn initial_thought_level_seed_is_skipped_when_persisted_config_exists() {
+    fn persisted_thought_config_is_detected_by_known_raw_keys() {
         let persisted_config = HashMap::from([(ConfigKey::new("reasoning_effort"), ConfigValue::new("low"))]);
 
-        let seed = super::initial_thought_level_seed(Some("high"), &persisted_config);
-
-        assert!(seed.is_none());
+        assert!(super::has_persisted_config_for_category(
+            &persisted_config,
+            &SessionConfigOptionCategory::ThoughtLevel
+        ));
     }
 
     // Close-reason compositional tests live in `agent_close.rs` so that

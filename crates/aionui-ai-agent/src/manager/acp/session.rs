@@ -20,7 +20,7 @@ struct Desired {
     mode_id: Option<ModeId>,
     model_id: Option<ModelId>,
     config_selections: HashMap<ConfigKey, ConfigValue>,
-    pending_thought_level: Option<ConfigValue>,
+    pending_startup_config: Vec<PendingStartupConfigSeed>,
 }
 
 /// What the CLI last reported (ground truth from the backend).
@@ -91,11 +91,24 @@ pub struct AcpSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigSetGuardToken;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PendingThoughtLevelSeedResult {
-    Applied,
-    OptionNotAdvertised,
-    ValueNotSelectable,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingStartupConfigSeed {
+    category: SessionConfigOptionCategory,
+    value: ConfigValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingStartupConfigSeedResult {
+    Applied {
+        category: SessionConfigOptionCategory,
+        option_id: ConfigKey,
+    },
+    OptionNotAdvertised {
+        category: SessionConfigOptionCategory,
+    },
+    ValueNotSelectable {
+        category: SessionConfigOptionCategory,
+    },
 }
 
 impl AcpSession {
@@ -112,7 +125,7 @@ impl AcpSession {
                 mode_id: initial_mode,
                 model_id: initial_model,
                 config_selections,
-                pending_thought_level: None,
+                pending_startup_config: Vec::new(),
             },
             observed: Observed::default(),
             advertised: Advertised::default(),
@@ -333,37 +346,88 @@ impl AcpSession {
         }
     }
 
-    pub(crate) fn seed_pending_thought_level(&mut self, value: ConfigValue) {
+    pub(crate) fn seed_pending_startup_config(&mut self, category: SessionConfigOptionCategory, value: ConfigValue) {
         if value.as_str().is_empty() {
             return;
         }
-        self.desired.pending_thought_level = Some(value);
+        if self
+            .desired
+            .pending_startup_config
+            .iter()
+            .any(|seed| seed.category == category && seed.value == value)
+        {
+            return;
+        }
+        self.desired
+            .pending_startup_config
+            .push(PendingStartupConfigSeed { category, value });
     }
 
-    pub(crate) fn resolve_pending_thought_level_seed(&mut self) -> Option<PendingThoughtLevelSeedResult> {
-        let desired_value = self.desired.pending_thought_level.clone()?;
-        let Some(options) = self.advertised.config_options.as_ref() else {
-            self.desired.pending_thought_level = None;
-            return Some(PendingThoughtLevelSeedResult::OptionNotAdvertised);
-        };
-
-        let Some(option) = options
-            .iter()
-            .find(|option| option.category.as_ref() == Some(&SessionConfigOptionCategory::ThoughtLevel))
-        else {
-            self.desired.pending_thought_level = None;
-            return Some(PendingThoughtLevelSeedResult::OptionNotAdvertised);
-        };
-
-        if !select_option_contains_value(&option.kind, desired_value.as_str()) {
-            self.desired.pending_thought_level = None;
-            return Some(PendingThoughtLevelSeedResult::ValueNotSelectable);
+    pub(crate) fn resolve_pending_startup_config_seeds(&mut self) -> Vec<PendingStartupConfigSeedResult> {
+        let seeds = std::mem::take(&mut self.desired.pending_startup_config);
+        if seeds.is_empty() {
+            return Vec::new();
         }
 
-        let option_id = option.id.to_string();
-        self.desired.pending_thought_level = None;
-        self.set_desired_config(ConfigKey::new(option_id), desired_value);
-        Some(PendingThoughtLevelSeedResult::Applied)
+        let mut results = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let Some(options) = self.advertised.config_options.as_ref() else {
+                self.handle_unresolved_startup_config_seed(&seed, false);
+                results.push(PendingStartupConfigSeedResult::OptionNotAdvertised {
+                    category: seed.category,
+                });
+                continue;
+            };
+
+            let Some(option) = select_option_by_category(options, &seed.category) else {
+                self.handle_unresolved_startup_config_seed(&seed, false);
+                results.push(PendingStartupConfigSeedResult::OptionNotAdvertised {
+                    category: seed.category,
+                });
+                continue;
+            };
+
+            if !select_option_contains_value(&option.kind, seed.value.as_str()) {
+                self.handle_unresolved_startup_config_seed(&seed, true);
+                results.push(PendingStartupConfigSeedResult::ValueNotSelectable {
+                    category: seed.category,
+                });
+                continue;
+            }
+
+            let option_id = ConfigKey::new(option.id.to_string());
+            self.clear_legacy_desired_for_config_category(&seed.category);
+            self.set_desired_config(option_id.clone(), seed.value);
+            results.push(PendingStartupConfigSeedResult::Applied {
+                category: seed.category,
+                option_id,
+            });
+        }
+        results
+    }
+
+    fn clear_legacy_desired_for_config_category(&mut self, category: &SessionConfigOptionCategory) {
+        match category {
+            SessionConfigOptionCategory::Mode => {
+                self.desired.mode_id = None;
+            }
+            SessionConfigOptionCategory::Model => {
+                self.desired.model_id = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_unresolved_startup_config_seed(&mut self, seed: &PendingStartupConfigSeed, option_was_advertised: bool) {
+        match seed.category {
+            SessionConfigOptionCategory::Mode | SessionConfigOptionCategory::Model if !option_was_advertised => {
+                // Keep legacy desired mode/model so old ACP implementations still use set_mode/set_model.
+            }
+            SessionConfigOptionCategory::Mode | SessionConfigOptionCategory::Model => {
+                self.clear_legacy_desired_for_config_category(&seed.category);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -691,6 +755,13 @@ fn extract_config_current_value(kind: &SessionConfigKind) -> Option<String> {
         SessionConfigKind::Select(sel) => Some(sel.current_value.to_string()),
         _ => None,
     }
+}
+
+fn select_option_by_category<'a>(
+    options: &'a [SessionConfigOption],
+    category: &SessionConfigOptionCategory,
+) -> Option<&'a SessionConfigOption> {
+    options.iter().find(|option| option.category.as_ref() == Some(category))
 }
 
 fn select_option_contains_value(kind: &SessionConfigKind, value: &str) -> bool {
