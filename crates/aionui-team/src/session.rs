@@ -333,7 +333,7 @@ impl TeamSession {
         let lead_conv_id = self.scheduler.get_agent(&lead_slot_id).await?.conversation_id;
         let mut ack = self
             .team_run_manager
-            .accept_user_message(&lead_slot_id, TeamRunTargetRole::Lead, false, None)
+            .accept_user_message(&lead_slot_id, TeamRunTargetRole::Lead, true, None)
             .await?;
 
         let mailbox_message = match self
@@ -995,6 +995,7 @@ impl TeamSession {
 mod tests {
     use super::*;
     use crate::test_utils::MockTeamRepo;
+    use crate::team_run::ActiveChildTurn;
     use crate::types::{Team, TeamAgent, TeammateRole};
     use aionui_ai_agent::AgentError;
     use aionui_ai_agent::agent_task::AgentInstance;
@@ -1241,6 +1242,122 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn leader_message_reuses_active_run_when_leader_slot_is_free() {
+        let session = start_session().await;
+        let first = session
+            .send_message("First leader message", None)
+            .await
+            .expect("first leader send creates run");
+
+        session
+            .wake_agent_for_team_work("worker-1", TeamWakeSource::McpSendMessage)
+            .await
+            .expect("worker wake keeps run active");
+        session
+            .team_run_manager()
+            .record_empty_wake_observed("lead-1")
+            .await;
+
+        let second = session
+            .send_message("Second leader message", None)
+            .await
+            .expect("leader slot free should accept active-run intervention");
+
+        assert_eq!(second.team_run_id, first.team_run_id);
+        assert_eq!(second.target_slot_id, "lead-1");
+        assert_eq!(second.accepted_slot_id, "lead-1");
+        assert_eq!(second.accepted_role, TeamRunTargetRole::Lead);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn leader_message_rejects_when_leader_slot_is_busy() {
+        let session = start_session().await;
+        session
+            .send_message("First leader message", None)
+            .await
+            .expect("first leader send creates run");
+
+        let err = session
+            .send_message("Second leader message", None)
+            .await
+            .expect_err("leader pending wake must make leader slot busy");
+
+        assert!(matches!(err, TeamError::SlotBusy(slot_id) if slot_id == "lead-1"));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn cancelling_leader_child_does_not_cancel_active_teammate_child() {
+        let session = start_session().await;
+        let ack = session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("accept run");
+
+        let leader = ActiveChildTurn {
+            team_run_id: ack.team_run_id.clone(),
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            conversation_id: "c1".into(),
+            turn_id: "turn-lead".into(),
+        };
+        let worker = ActiveChildTurn {
+            team_run_id: ack.team_run_id.clone(),
+            slot_id: "worker-1".into(),
+            role: TeamRunTargetRole::Teammate,
+            conversation_id: "c2".into(),
+            turn_id: "turn-worker".into(),
+        };
+
+        session
+            .team_run_manager()
+            .record_pending_wake("lead-1", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let leader_reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("lead-1", TeamRunTargetRole::Lead, "c1")
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_child_started(&leader_reservation.reservation_id, leader)
+            .await;
+
+        session
+            .team_run_manager()
+            .record_pending_wake(
+                "worker-1",
+                TeamRunTargetRole::Teammate,
+                TeamWakeSource::McpSendMessage,
+            )
+            .await
+            .unwrap();
+        let worker_reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_child_started(&worker_reservation.reservation_id, worker)
+            .await;
+
+        session
+            .cancel_child_turn(&ack.team_run_id, "lead-1", Some("user stopped leader".into()))
+            .await
+            .expect("leader child cancel succeeds");
+
+        let active = session.team_run_manager().active_child_turns().await;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].slot_id, "worker-1");
+        assert_eq!(active[0].turn_id, "turn-worker");
+        session.stop();
     }
 
     #[tokio::test]
