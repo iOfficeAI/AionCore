@@ -12,7 +12,7 @@ use crate::protocol::error::{AcpError, CloseReason};
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::registry::CatalogSender;
-use crate::shared_kernel::{ModeId, ModelId, SessionId as DomainSessionId};
+use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::{
     AvailableCommand, CancelNotification, SessionId, SessionModelState, SessionNotification,
@@ -26,6 +26,7 @@ use aionui_common::{
     AgentKillReason, AgentType, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
@@ -104,6 +105,19 @@ fn initial_mode_from_params(params: &AcpSessionParams) -> Option<ModeId> {
         })
         .filter(|m| !m.is_empty())
         .map(ModeId::new)
+}
+
+fn initial_thought_level_seed(
+    extra_thought_level: Option<&str>,
+    initial_config: &HashMap<ConfigKey, ConfigValue>,
+) -> Option<ConfigValue> {
+    if !initial_config.is_empty() {
+        return None;
+    }
+    extra_thought_level
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ConfigValue::new)
 }
 
 fn confirm_option_id(data: &Value) -> Option<String> {
@@ -347,7 +361,11 @@ impl AcpAgentManager {
             snapshot.map(|s| s.config_selections.clone()).unwrap_or_default(),
         );
 
-        let session = AcpSession::new(initial_mode, initial_model, initial_config);
+        let initial_thought_level = initial_thought_level_seed(params.config.thought_level.as_deref(), &initial_config);
+        let mut session = AcpSession::new(initial_mode, initial_model, initial_config);
+        if let Some(value) = initial_thought_level {
+            session.seed_pending_thought_level(value);
+        }
 
         let pipeline = PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)]);
 
@@ -1251,8 +1269,10 @@ mod tests {
     use crate::error::AgentError;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::CloseReason;
+    use crate::shared_kernel::{ConfigKey, ConfigValue};
     use agent_client_protocol::schema::AvailableCommand;
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn exit_status_parts_handles_missing_status() {
@@ -1449,6 +1469,22 @@ mod tests {
             Some(aionui_api_types::SlashCommandCompletionBehavior::NeutralTipOnEmpty)
         );
         assert_eq!(matched.empty_turn_tip_code.as_deref(), None);
+    }
+
+    #[test]
+    fn initial_thought_level_seed_uses_extra_when_no_persisted_config_exists() {
+        let seed = super::initial_thought_level_seed(Some(" high "), &Default::default());
+
+        assert_eq!(seed.as_ref().map(|value| value.as_str()), Some("high"));
+    }
+
+    #[test]
+    fn initial_thought_level_seed_is_skipped_when_persisted_config_exists() {
+        let persisted_config = HashMap::from([(ConfigKey::new("reasoning_effort"), ConfigValue::new("low"))]);
+
+        let seed = super::initial_thought_level_seed(Some("high"), &persisted_config);
+
+        assert!(seed.is_none());
     }
 
     // Close-reason compositional tests live in `agent_close.rs` so that

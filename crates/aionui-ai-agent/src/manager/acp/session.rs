@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use agent_client_protocol::schema::{
-    AgentCapabilities, AuthMethod, AvailableCommand, SessionConfigKind, SessionConfigOption, SessionModeState,
-    SessionModelState, UsageUpdate,
+    AgentCapabilities, AuthMethod, AvailableCommand, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionModeState, SessionModelState, UsageUpdate,
 };
 
 use super::agent_event_tracker::AcpSessionEvent;
@@ -20,6 +20,7 @@ struct Desired {
     mode_id: Option<ModeId>,
     model_id: Option<ModelId>,
     config_selections: HashMap<ConfigKey, ConfigValue>,
+    pending_thought_level: Option<ConfigValue>,
 }
 
 /// What the CLI last reported (ground truth from the backend).
@@ -90,6 +91,13 @@ pub struct AcpSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigSetGuardToken;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingThoughtLevelSeedResult {
+    Applied,
+    OptionNotAdvertised,
+    ValueNotSelectable,
+}
+
 impl AcpSession {
     pub fn new(
         initial_mode: Option<ModeId>,
@@ -104,6 +112,7 @@ impl AcpSession {
                 mode_id: initial_mode,
                 model_id: initial_model,
                 config_selections,
+                pending_thought_level: None,
             },
             observed: Observed::default(),
             advertised: Advertised::default(),
@@ -322,6 +331,39 @@ impl AcpSession {
             self.pending_events
                 .push(AcpSessionEvent::DesiredConfigChanged { selections });
         }
+    }
+
+    pub(crate) fn seed_pending_thought_level(&mut self, value: ConfigValue) {
+        if value.as_str().is_empty() {
+            return;
+        }
+        self.desired.pending_thought_level = Some(value);
+    }
+
+    pub(crate) fn resolve_pending_thought_level_seed(&mut self) -> Option<PendingThoughtLevelSeedResult> {
+        let desired_value = self.desired.pending_thought_level.clone()?;
+        let Some(options) = self.advertised.config_options.as_ref() else {
+            self.desired.pending_thought_level = None;
+            return Some(PendingThoughtLevelSeedResult::OptionNotAdvertised);
+        };
+
+        let Some(option) = options
+            .iter()
+            .find(|option| option.category.as_ref() == Some(&SessionConfigOptionCategory::ThoughtLevel))
+        else {
+            self.desired.pending_thought_level = None;
+            return Some(PendingThoughtLevelSeedResult::OptionNotAdvertised);
+        };
+
+        if !select_option_contains_value(&option.kind, desired_value.as_str()) {
+            self.desired.pending_thought_level = None;
+            return Some(PendingThoughtLevelSeedResult::ValueNotSelectable);
+        }
+
+        let option_id = option.id.to_string();
+        self.desired.pending_thought_level = None;
+        self.set_desired_config(ConfigKey::new(option_id), desired_value);
+        Some(PendingThoughtLevelSeedResult::Applied)
     }
 }
 
@@ -648,6 +690,22 @@ fn extract_config_current_value(kind: &SessionConfigKind) -> Option<String> {
     match kind {
         SessionConfigKind::Select(sel) => Some(sel.current_value.to_string()),
         _ => None,
+    }
+}
+
+fn select_option_contains_value(kind: &SessionConfigKind, value: &str) -> bool {
+    match kind {
+        SessionConfigKind::Select(select) => match &select.options {
+            SessionConfigSelectOptions::Ungrouped(options) => {
+                options.iter().any(|option| option.value.to_string() == value)
+            }
+            SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .any(|option| option.value.to_string() == value),
+            _ => false,
+        },
+        _ => false,
     }
 }
 

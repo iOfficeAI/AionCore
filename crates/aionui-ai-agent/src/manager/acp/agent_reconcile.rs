@@ -2,6 +2,7 @@ use crate::manager::acp::AcpAgentManager;
 
 use crate::manager::acp::error_mapping::is_acp_session_not_found;
 use crate::manager::acp::mode_normalize::normalize_requested_mode;
+use crate::manager::acp::session::PendingThoughtLevelSeedResult;
 use crate::protocol::error::AcpError;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId};
 use agent_client_protocol::schema::{
@@ -39,12 +40,13 @@ impl AcpAgentManager {
     pub(super) async fn reconcile_session(&self, session_id: &str) -> Result<(), AcpError> {
         use crate::manager::acp::ReconcileAction;
 
-        let (invalid_mode, invalid_model, actions) = {
+        let (invalid_mode, invalid_model, thought_level_seed_result, actions) = {
             let mut session = self.session.write().await;
             let invalid_mode = session.clear_invalid_desired_mode();
             let invalid_model = session.clear_invalid_desired_model();
+            let thought_level_seed_result = session.resolve_pending_thought_level_seed();
             let actions = session.plan_reconcile();
-            (invalid_mode, invalid_model, actions)
+            (invalid_mode, invalid_model, thought_level_seed_result, actions)
         };
         if let Some(mode) = invalid_mode {
             warn!(
@@ -59,6 +61,29 @@ impl AcpAgentManager {
                 model_id = %model,
                 "reconcile_session: dropped unavailable desired model"
             );
+        }
+        if let Some(result) = thought_level_seed_result {
+            match result {
+                PendingThoughtLevelSeedResult::Applied => {}
+                PendingThoughtLevelSeedResult::OptionNotAdvertised => {
+                    warn!(
+                        conversation_id = %self.params.conversation_id,
+                        agent_backend = ?self.params.metadata.backend,
+                        category = "thought_level",
+                        reason = "option_not_advertised",
+                        "reconcile_session: dropped unavailable startup thought level seed"
+                    );
+                }
+                PendingThoughtLevelSeedResult::ValueNotSelectable => {
+                    warn!(
+                        conversation_id = %self.params.conversation_id,
+                        agent_backend = ?self.params.metadata.backend,
+                        category = "thought_level",
+                        reason = "value_not_selectable",
+                        "reconcile_session: dropped unavailable startup thought level seed"
+                    );
+                }
+            }
         }
         for action in actions {
             match action {

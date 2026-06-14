@@ -96,6 +96,13 @@ mod tests {
     }
 
     #[test]
+    fn acp_build_extra_accepts_thought_level_seed() {
+        let with_field = r#"{"backend":"codex","thought_level":"high"}"#;
+        let parsed: AcpBuildExtra = serde_json::from_str(with_field).unwrap();
+        assert_eq!(parsed.thought_level.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn acp_build_extra_missing_team_mcp_stdio_config_is_none() {
         let legacy = r#"{"backend":"claude","skills":["cron"]}"#;
         let parsed: AcpBuildExtra = serde_json::from_str(legacy).unwrap();

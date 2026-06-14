@@ -677,6 +677,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_extra_thought_level_is_exposed_as_typed_context() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "codex",
+                "thought_level": "high"
+            }),
+            None,
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.thought_level.as_deref(), Some("high"));
+        assert!(acp.session_snapshot.is_none());
+    }
+
+    #[tokio::test]
     async fn acp_team_extra_is_exposed_as_typed_context() {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-claude-test", "claude").await;

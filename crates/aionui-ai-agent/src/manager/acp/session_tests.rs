@@ -834,6 +834,98 @@ fn set_desired_mode_plus_plan_reconcile_produces_set_mode_action() {
     );
 }
 
+#[test]
+fn pending_thought_level_seed_resolves_category_to_raw_config_key() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.seed_pending_thought_level(ConfigValue::new("high"));
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            "medium",
+            vec![
+                SessionConfigSelectOption::new("low", "Low"),
+                SessionConfigSelectOption::new("medium", "Medium"),
+                SessionConfigSelectOption::new("high", "High"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+
+    assert_eq!(
+        session.resolve_pending_thought_level_seed(),
+        Some(PendingThoughtLevelSeedResult::Applied)
+    );
+
+    assert_eq!(
+        session.plan_reconcile(),
+        vec![ReconcileAction::SetConfigOption {
+            key: ConfigKey::new("reasoning_effort"),
+            value: ConfigValue::new("high"),
+        }]
+    );
+}
+
+#[test]
+fn pending_thought_level_seed_is_dropped_when_option_is_unavailable() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.seed_pending_thought_level(ConfigValue::new("high"));
+
+    assert_eq!(
+        session.resolve_pending_thought_level_seed(),
+        Some(PendingThoughtLevelSeedResult::OptionNotAdvertised)
+    );
+    assert!(session.plan_reconcile().is_empty());
+    assert!(session.resolve_pending_thought_level_seed().is_none());
+}
+
+#[test]
+fn pending_thought_level_seed_is_dropped_when_value_is_not_selectable() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.seed_pending_thought_level(ConfigValue::new("xhigh"));
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "effort",
+            "Effort",
+            "medium",
+            vec![
+                SessionConfigSelectOption::new("low", "Low"),
+                SessionConfigSelectOption::new("medium", "Medium"),
+                SessionConfigSelectOption::new("high", "High"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+
+    assert_eq!(
+        session.resolve_pending_thought_level_seed(),
+        Some(PendingThoughtLevelSeedResult::ValueNotSelectable)
+    );
+    assert!(session.plan_reconcile().is_empty());
+}
+
+#[test]
+fn pending_thought_level_seed_does_not_reconcile_when_observed_already_matches() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.seed_pending_thought_level(ConfigValue::new("high"));
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            "high",
+            vec![SessionConfigSelectOption::new("high", "High")],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+
+    assert_eq!(
+        session.resolve_pending_thought_level_seed(),
+        Some(PendingThoughtLevelSeedResult::Applied)
+    );
+    assert!(session.plan_reconcile().is_empty());
+}
+
 // Close-reason lifecycle tests live in `session_close_tests.rs` so
 // session.rs stays under the 1000-line per-file budget. The `#[path]`
 // attribute pulls them into this `tests` module's scope, so they
