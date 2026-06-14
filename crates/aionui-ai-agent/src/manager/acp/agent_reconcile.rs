@@ -8,7 +8,10 @@ use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId};
 use agent_client_protocol::schema::{
     SessionId, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest,
 };
+use std::collections::VecDeque;
 use tracing::{error, info, warn};
+
+const MAX_RECONCILE_ACTIONS: usize = 8;
 
 /// Actions the session driver must execute to align CLI state with user intent.
 ///
@@ -48,44 +51,20 @@ impl AcpAgentManager {
             let actions = session.plan_reconcile();
             (startup_config_seed_results, invalid_mode, invalid_model, actions)
         };
-        if let Some(mode) = invalid_mode {
-            warn!(
-                conversation_id = %self.params.conversation_id,
-                mode_id = %mode,
-                "reconcile_session: dropped unavailable desired mode"
-            );
-        }
-        if let Some(model) = invalid_model {
-            warn!(
-                conversation_id = %self.params.conversation_id,
-                model_id = %model,
-                "reconcile_session: dropped unavailable desired model"
-            );
-        }
-        for result in startup_config_seed_results {
-            match result {
-                PendingStartupConfigSeedResult::Applied { .. } => {}
-                PendingStartupConfigSeedResult::OptionNotAdvertised { category } => {
-                    warn!(
-                        conversation_id = %self.params.conversation_id,
-                        agent_backend = ?self.params.metadata.backend,
-                        category = ?category,
-                        reason = "option_not_advertised",
-                        "reconcile_session: startup config seed not applied"
-                    );
-                }
-                PendingStartupConfigSeedResult::ValueNotSelectable { category } => {
-                    warn!(
-                        conversation_id = %self.params.conversation_id,
-                        agent_backend = ?self.params.metadata.backend,
-                        category = ?category,
-                        reason = "value_not_selectable",
-                        "reconcile_session: startup config seed not applied"
-                    );
-                }
+        self.log_reconcile_session_plan_results(startup_config_seed_results, invalid_mode, invalid_model);
+        let mut actions: VecDeque<_> = actions.into();
+        let mut executed_actions = 0usize;
+        while let Some(action) = actions.pop_front() {
+            let executed_action = action.clone();
+            executed_actions += 1;
+            if executed_actions > MAX_RECONCILE_ACTIONS {
+                warn!(
+                    conversation_id = %self.params.conversation_id,
+                    max_actions = MAX_RECONCILE_ACTIONS,
+                    "reconcile_session: stopping after action limit"
+                );
+                break;
             }
-        }
-        for action in actions {
             match action {
                 ReconcileAction::SetMode { mode } => {
                     let normalized = normalize_requested_mode(&self.params.metadata, mode.as_str());
@@ -148,6 +127,13 @@ impl AcpAgentManager {
                 }
 
                 ReconcileAction::SetConfigOption { key, value } => {
+                    info!(
+                        conversation_id = %self.params.conversation_id,
+                        agent_backend = ?self.params.metadata.backend,
+                        config_id = %key,
+                        desired = %value,
+                        "acp_reconcile_config_option_requested"
+                    );
                     match self
                         .protocol
                         .set_config_option(SetSessionConfigOptionRequest::new(
@@ -158,9 +144,36 @@ impl AcpAgentManager {
                         .await
                     {
                         Ok(response) => {
-                            let mut session = self.session.write().await;
-                            session.apply_advertised_config_options(response.config_options);
-                            self.commit_session_changes(&mut session).await;
+                            info!(
+                                conversation_id = %self.params.conversation_id,
+                                agent_backend = ?self.params.metadata.backend,
+                                config_id = %key,
+                                desired = %value,
+                                "acp_reconcile_config_option_ack"
+                            );
+                            let (startup_config_seed_results, invalid_mode, invalid_model, followup_actions) = {
+                                let mut session = self.session.write().await;
+                                session.apply_advertised_config_options(response.config_options);
+                                let startup_config_seed_results = session.resolve_pending_startup_config_seeds();
+                                let invalid_mode = session.clear_invalid_desired_mode();
+                                let invalid_model = session.clear_invalid_desired_model();
+                                let followup_actions = session.plan_reconcile();
+                                self.commit_session_changes(&mut session).await;
+                                (
+                                    startup_config_seed_results,
+                                    invalid_mode,
+                                    invalid_model,
+                                    followup_actions,
+                                )
+                            };
+                            self.log_reconcile_session_plan_results(
+                                startup_config_seed_results,
+                                invalid_mode,
+                                invalid_model,
+                            );
+                            let mut followup_actions = followup_actions;
+                            followup_actions.retain(|candidate| candidate != &executed_action);
+                            actions = followup_actions.into();
                         }
                         Err(err) => {
                             if is_acp_session_not_found(&err) {
@@ -187,6 +200,51 @@ impl AcpAgentManager {
             }
         }
         Ok(())
+    }
+
+    fn log_reconcile_session_plan_results(
+        &self,
+        startup_config_seed_results: Vec<PendingStartupConfigSeedResult>,
+        invalid_mode: Option<ModeId>,
+        invalid_model: Option<ModelId>,
+    ) {
+        if let Some(mode) = invalid_mode {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                mode_id = %mode,
+                "reconcile_session: dropped unavailable desired mode"
+            );
+        }
+        if let Some(model) = invalid_model {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                model_id = %model,
+                "reconcile_session: dropped unavailable desired model"
+            );
+        }
+        for result in startup_config_seed_results {
+            match result {
+                PendingStartupConfigSeedResult::Applied { .. } => {}
+                PendingStartupConfigSeedResult::OptionNotAdvertised { category } => {
+                    warn!(
+                        conversation_id = %self.params.conversation_id,
+                        agent_backend = ?self.params.metadata.backend,
+                        category = ?category,
+                        reason = "option_not_advertised",
+                        "reconcile_session: startup config seed not applied"
+                    );
+                }
+                PendingStartupConfigSeedResult::ValueNotSelectable { category } => {
+                    warn!(
+                        conversation_id = %self.params.conversation_id,
+                        agent_backend = ?self.params.metadata.backend,
+                        category = ?category,
+                        reason = "value_not_selectable",
+                        "reconcile_session: startup config seed not applied"
+                    );
+                }
+            }
+        }
     }
 }
 

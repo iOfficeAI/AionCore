@@ -426,6 +426,9 @@ impl AcpSession {
             SessionConfigOptionCategory::Mode | SessionConfigOptionCategory::Model => {
                 self.clear_legacy_desired_for_config_category(&seed.category);
             }
+            SessionConfigOptionCategory::ThoughtLevel if !option_was_advertised => {
+                self.seed_pending_startup_config(seed.category.clone(), seed.value.clone());
+            }
             _ => {}
         }
     }
