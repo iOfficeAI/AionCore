@@ -866,6 +866,26 @@ impl TeamSessionService {
         entry.session.wake_agent_for_team_work(slot_id, source).await
     }
 
+    pub async fn send_agent_message_from_agent(
+        &self,
+        team_id: &str,
+        from_slot_id: &str,
+        to_slot_id: &str,
+        content: &str,
+    ) -> Result<(), TeamError> {
+        self.require_active_team_run_for_team_work(team_id).await?;
+        let session = {
+            let entry = self
+                .sessions
+                .get(team_id)
+                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+            Arc::clone(&entry.session)
+        };
+        session
+            .send_agent_message_from_agent(from_slot_id, to_slot_id, content)
+            .await
+    }
+
     pub(crate) fn notify_reserved_wake_for_team_work(
         &self,
         team_id: &str,

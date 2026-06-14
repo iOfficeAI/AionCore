@@ -451,6 +451,64 @@ impl TeamSession {
         Ok(ack)
     }
 
+    pub(crate) async fn send_agent_message_from_agent(
+        &self,
+        from_slot_id: &str,
+        to_slot_id: &str,
+        content: &str,
+    ) -> Result<(), TeamError> {
+        let to_agent = self.scheduler.get_agent(to_slot_id).await?;
+        let from_agent = self.scheduler.get_agent(from_slot_id).await?;
+
+        let mailbox_message = self
+            .mailbox
+            .write(
+                &self.team.id,
+                to_slot_id,
+                from_slot_id,
+                MailboxMessageType::Message,
+                content,
+                None,
+            )
+            .await?;
+
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        let request = TeamProjectionRequest {
+            team_id: self.team.id.clone(),
+            slot_id: to_slot_id.to_owned(),
+            conversation_id: to_agent.conversation_id.clone(),
+            source: TeamProjectionSource::Teammate {
+                from_slot_id: from_slot_id.to_owned(),
+                from_name: from_agent.name.clone(),
+                sender_backend: Some(from_agent.backend.clone()),
+                sender_conversation_id: Some(from_agent.conversation_id.clone()),
+            },
+            content: content.to_owned(),
+            files: Vec::new(),
+            visibility: crate::visibility::TeamVisibilityPolicy::teammate_message(),
+            dedupe_key: Some(teammate_dedupe_key(
+                &self.team.id,
+                &mailbox_message.id,
+                &to_agent.conversation_id,
+            )),
+        };
+
+        if let Err(err) = projection.project(request).await {
+            warn!(
+                team_id = %self.team.id,
+                from_slot_id,
+                to_slot_id,
+                conversation_id = %to_agent.conversation_id,
+                mailbox_message_id = %mailbox_message.id,
+                error = %err,
+                "team agent message immediate projection failed (non-fatal)"
+            );
+        }
+
+        self.wake_agent_for_team_work(to_slot_id, TeamWakeSource::McpSendMessage)
+            .await
+    }
+
     pub(crate) async fn wake_agent_for_team_work(
         &self,
         slot_id: &str,
@@ -1085,6 +1143,32 @@ mod tests {
         Arc::new(NoopProjectionStore)
     }
 
+    #[derive(Default)]
+    struct RecordingProjectionStore {
+        inserted: std::sync::Mutex<Vec<aionui_db::models::MessageRow>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TeamProjectionMessageStore for RecordingProjectionStore {
+        fn mint_message_id(&self) -> String {
+            "minted-message".into()
+        }
+
+        async fn find_projected_message(
+            &self,
+            _conversation_id: &str,
+            _msg_id: &str,
+            _msg_type: &str,
+        ) -> Result<Option<aionui_db::models::MessageRow>, TeamError> {
+            Ok(None)
+        }
+
+        async fn insert_projected_message(&self, row: &aionui_db::models::MessageRow) -> Result<(), TeamError> {
+            self.inserted.lock().unwrap().push(row.clone());
+            Ok(())
+        }
+    }
+
     /// RecordingBroadcaster used by the D29d-1 ratification test below to
     /// assert that `team.agentSpawned` is *not* emitted on failed spawns.
     #[derive(Default)]
@@ -1242,6 +1326,57 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn start_session_with_projection_store(
+        store: Arc<dyn TeamProjectionMessageStore>,
+    ) -> TeamSession {
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        TeamSession::start(
+            make_team(),
+            repo,
+            broadcaster,
+            backend_path(),
+            empty_task_manager(),
+            noop_turn_port(),
+            noop_cancellation_port(),
+            store,
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_send_message_projects_recipient_visible_bubble_immediately() {
+        let store = Arc::new(RecordingProjectionStore::default());
+        let session = start_session_with_projection_store(store.clone()).await;
+        session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("active run");
+
+        session
+            .send_agent_message_from_agent("lead-1", "worker-1", "Do the implementation")
+            .await
+            .expect("agent send succeeds");
+
+        let inserted = store.inserted.lock().unwrap();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].conversation_id, "c2");
+        assert_eq!(inserted[0].position.as_deref(), Some("left"));
+        assert!(
+            inserted[0]
+                .msg_id
+                .as_deref()
+                .unwrap_or_default()
+                .contains("team:t1:mailbox:"),
+            "projection must use mailbox-message dedupe key"
+        );
+        session.stop();
     }
 
     #[tokio::test]
