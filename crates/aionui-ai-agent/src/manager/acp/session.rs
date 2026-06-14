@@ -379,7 +379,7 @@ impl AcpSession {
                 continue;
             };
 
-            let Some(option) = select_option_by_category(options, &seed.category) else {
+            let Some(option) = select_option_for_startup_seed(options, &seed.category) else {
                 self.handle_unresolved_startup_config_seed(&seed, false);
                 results.push(PendingStartupConfigSeedResult::OptionNotAdvertised {
                     category: seed.category,
@@ -757,11 +757,35 @@ fn extract_config_current_value(kind: &SessionConfigKind) -> Option<String> {
     }
 }
 
-fn select_option_by_category<'a>(
+fn select_option_for_startup_seed<'a>(
     options: &'a [SessionConfigOption],
     category: &SessionConfigOptionCategory,
 ) -> Option<&'a SessionConfigOption> {
-    options.iter().find(|option| option.category.as_ref() == Some(category))
+    options
+        .iter()
+        .find(|option| option.category.as_ref() == Some(category))
+        .or_else(|| {
+            let aliases = config_option_aliases_for_category(category);
+            options.iter().find(|option| {
+                let option_id = option.id.to_string();
+                aliases.iter().any(|alias| *alias == option_id)
+            })
+        })
+}
+
+fn config_option_aliases_for_category(category: &SessionConfigOptionCategory) -> &'static [&'static str] {
+    match category {
+        SessionConfigOptionCategory::Mode => &["mode", "modes"],
+        SessionConfigOptionCategory::Model => &["model", "models"],
+        SessionConfigOptionCategory::ThoughtLevel => &[
+            "thought_level",
+            "reasoning_effort",
+            "effort",
+            "thinking_budget",
+            "thinking",
+        ],
+        _ => &[],
+    }
 }
 
 fn select_option_contains_value(kind: &SessionConfigKind, value: &str) -> bool {

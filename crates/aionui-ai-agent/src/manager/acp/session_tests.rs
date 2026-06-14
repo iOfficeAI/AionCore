@@ -1074,6 +1074,40 @@ fn pending_thought_level_seed_resolves_category_to_raw_config_key() {
 }
 
 #[test]
+fn pending_thought_level_seed_resolves_alias_when_category_is_missing() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.seed_pending_startup_config(SessionConfigOptionCategory::ThoughtLevel, ConfigValue::new("high"));
+
+    session.apply_advertised_config_options(vec![SessionConfigOption::select(
+        "effort",
+        "Effort",
+        "none",
+        vec![
+            SessionConfigSelectOption::new("none", "None"),
+            SessionConfigSelectOption::new("low", "Low"),
+            SessionConfigSelectOption::new("medium", "Medium"),
+            SessionConfigSelectOption::new("high", "High"),
+        ],
+    )]);
+
+    assert_eq!(
+        session.resolve_pending_startup_config_seeds(),
+        vec![PendingStartupConfigSeedResult::Applied {
+            category: SessionConfigOptionCategory::ThoughtLevel,
+            option_id: ConfigKey::new("effort"),
+        }]
+    );
+
+    assert_eq!(
+        session.plan_reconcile(),
+        vec![ReconcileAction::SetConfigOption {
+            key: ConfigKey::new("effort"),
+            value: ConfigValue::new("high"),
+        }]
+    );
+}
+
+#[test]
 fn pending_thought_level_seed_is_dropped_when_option_is_unavailable() {
     let mut session = AcpSession::new(None, None, HashMap::new());
     session.seed_pending_startup_config(SessionConfigOptionCategory::ThoughtLevel, ConfigValue::new("high"));
