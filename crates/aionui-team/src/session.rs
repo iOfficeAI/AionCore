@@ -1496,6 +1496,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_run_still_cancels_leader_and_teammate_children() {
+        let session = start_session().await;
+        let ack = session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("accept run");
+
+        session
+            .team_run_manager()
+            .record_pending_wake("lead-1", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let leader_reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("lead-1", TeamRunTargetRole::Lead, "c1")
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_child_started(
+                &leader_reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id.clone(),
+                    slot_id: "lead-1".into(),
+                    role: TeamRunTargetRole::Lead,
+                    conversation_id: "c1".into(),
+                    turn_id: "turn-lead".into(),
+                },
+            )
+            .await;
+
+        session
+            .team_run_manager()
+            .record_pending_wake(
+                "worker-1",
+                TeamRunTargetRole::Teammate,
+                TeamWakeSource::McpSendMessage,
+            )
+            .await
+            .unwrap();
+        let worker_reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_child_started(
+                &worker_reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id.clone(),
+                    slot_id: "worker-1".into(),
+                    role: TeamRunTargetRole::Teammate,
+                    conversation_id: "c2".into(),
+                    turn_id: "turn-worker".into(),
+                },
+            )
+            .await;
+
+        assert_eq!(session.team_run_manager().active_child_turns().await.len(), 2);
+
+        session
+            .cancel_run(&ack.team_run_id, None, Some("stop all".into()))
+            .await
+            .expect("stop-all run cancel succeeds");
+
+        assert!(
+            session.team_run_manager().active_child_turns().await.is_empty(),
+            "cancel_run remains the explicit stop-all capability"
+        );
+        session.stop();
+    }
+
+    #[tokio::test]
     async fn wake_agent_for_team_work_records_pending_wake_without_registered_loop() {
         let session = start_session().await;
         session
