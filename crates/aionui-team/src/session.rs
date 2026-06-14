@@ -1052,8 +1052,8 @@ impl TeamSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::MockTeamRepo;
     use crate::team_run::ActiveChildTurn;
+    use crate::test_utils::MockTeamRepo;
     use crate::types::{Team, TeamAgent, TeammateRole};
     use aionui_ai_agent::AgentError;
     use aionui_ai_agent::agent_task::AgentInstance;
@@ -1328,9 +1328,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn start_session_with_projection_store(
-        store: Arc<dyn TeamProjectionMessageStore>,
-    ) -> TeamSession {
+    async fn start_session_with_projection_store(store: Arc<dyn TeamProjectionMessageStore>) -> TeamSession {
         let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         TeamSession::start(
@@ -1391,10 +1389,7 @@ mod tests {
             .wake_agent_for_team_work("worker-1", TeamWakeSource::McpSendMessage)
             .await
             .expect("worker wake keeps run active");
-        session
-            .team_run_manager()
-            .record_empty_wake_observed("lead-1")
-            .await;
+        session.team_run_manager().record_empty_wake_observed("lead-1").await;
 
         let second = session
             .send_message("Second leader message", None)
@@ -1466,11 +1461,7 @@ mod tests {
 
         session
             .team_run_manager()
-            .record_pending_wake(
-                "worker-1",
-                TeamRunTargetRole::Teammate,
-                TeamWakeSource::McpSendMessage,
-            )
+            .record_pending_wake("worker-1", TeamRunTargetRole::Teammate, TeamWakeSource::McpSendMessage)
             .await
             .unwrap();
         let worker_reservation = session
@@ -1530,11 +1521,7 @@ mod tests {
 
         session
             .team_run_manager()
-            .record_pending_wake(
-                "worker-1",
-                TeamRunTargetRole::Teammate,
-                TeamWakeSource::McpSendMessage,
-            )
+            .record_pending_wake("worker-1", TeamRunTargetRole::Teammate, TeamWakeSource::McpSendMessage)
             .await
             .unwrap();
         let worker_reservation = session

@@ -134,10 +134,7 @@ impl TeamRunRecord {
                 Some(TeamSlotWorkPayload {
                     pending_wake_count: self.pending_wake_count_for_slot(&slot_id),
                     starting_child_count: self.starting_child_count_for_slot(&slot_id),
-                    active_turn_id: self
-                        .active_child_turns
-                        .get(&slot_id)
-                        .map(|child| child.turn_id.clone()),
+                    active_turn_id: self.active_child_turns.get(&slot_id).map(|child| child.turn_id.clone()),
                     slot_id,
                     role,
                 })
@@ -929,10 +926,7 @@ mod tests {
         (TeamRunManager::new("team-1".into(), emitter), bc)
     }
 
-    fn slot_work<'a>(
-        payload: &'a TeamRunPayload,
-        slot_id: &str,
-    ) -> &'a aionui_api_types::TeamSlotWorkPayload {
+    fn slot_work<'a>(payload: &'a TeamRunPayload, slot_id: &str) -> &'a aionui_api_types::TeamSlotWorkPayload {
         payload
             .slot_work
             .iter()
@@ -953,11 +947,7 @@ mod tests {
             .await
             .unwrap();
         manager
-            .record_pending_wake(
-                "worker",
-                TeamRunTargetRole::Teammate,
-                TeamWakeSource::McpSendMessage,
-            )
+            .record_pending_wake("worker", TeamRunTargetRole::Teammate, TeamWakeSource::McpSendMessage)
             .await
             .unwrap();
         let worker_reservation = manager
