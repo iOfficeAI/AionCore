@@ -1,7 +1,7 @@
 //! Assistant service — unified built-in + user assistant CRUD, state
 //! overlays, import, and source-dispatched rule/skill read/write helpers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -101,6 +101,7 @@ impl AssistantService {
     /// legacy mirror tables.
     pub async fn bootstrap_assistant_storage(&self) -> Result<(), AssistantError> {
         self.materialize_builtin_definitions().await?;
+        self.soft_delete_removed_builtin_definitions().await?;
         self.sync_legacy_user_assistants_to_new_tables().await?;
         self.sync_legacy_overrides_to_new_states().await?;
         self.rebuild_legacy_mirror_from_new_tables().await?;
@@ -167,6 +168,40 @@ impl AssistantService {
                 })
                 .await
                 .map_err(|e| AssistantError::Internal(format!("upsert builtin definition: {e}")))?;
+        }
+
+        Ok(())
+    }
+
+    async fn soft_delete_removed_builtin_definitions(&self) -> Result<(), AssistantError> {
+        let active_builtin_ids: HashSet<&str> = self.builtin.all().map(|builtin| builtin.id.as_str()).collect();
+
+        for definition in self
+            .definition_repo
+            .list()
+            .await
+            .map_err(|e| AssistantError::Internal(format!("list assistant definitions: {e}")))?
+        {
+            if definition.source != "builtin" {
+                continue;
+            }
+
+            let Some(source_ref) = definition.source_ref.as_deref() else {
+                self.definition_repo
+                    .soft_delete(&definition.definition_id, now_ms())
+                    .await
+                    .map_err(|e| AssistantError::Internal(format!("soft-delete builtin definition: {e}")))?;
+                continue;
+            };
+
+            if active_builtin_ids.contains(source_ref) {
+                continue;
+            }
+
+            self.definition_repo
+                .soft_delete(&definition.definition_id, now_ms())
+                .await
+                .map_err(|e| AssistantError::Internal(format!("soft-delete builtin definition: {e}")))?;
         }
 
         Ok(())
@@ -2153,6 +2188,33 @@ mod tests {
         assert!(!builtin_state.enabled);
         assert_eq!(builtin_state.sort_order, 9);
         assert_eq!(builtin_state.last_used_at, Some(1234));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_soft_deletes_builtin_removed_from_manifest() {
+        let mut fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
+
+        let original = fx.definition_repo.get_by_key("builtin-office").await.unwrap().unwrap();
+        fx.service.builtin = Arc::new(BuiltinAssistantRegistry::empty());
+
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+
+        assert!(fx.definition_repo.get_by_key("builtin-office").await.unwrap().is_none());
+        assert!(
+            fx.service
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .all(|assistant| assistant.id != "builtin-office")
+        );
+        assert!(
+            fx.definition_repo
+                .get_by_definition_id(&original.definition_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

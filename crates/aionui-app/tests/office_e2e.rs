@@ -3,13 +3,12 @@
 //! Covers test-plan items:
 //! - AU-1/AU-2: Unauthenticated access rejected
 //! - SH-1..SH-7: Snapshot CRUD (save, list, get-content, not-found, trim, isolation, target combos)
-//! - SO-1/SO-2: Star Office detection (no service available)
 //! - DC-1/DC-4/DC-9: Document conversion (Excel→JSON, file not found, invalid target)
 //! - RP-2/RP-4: Proxy SSRF protection (inactive port rejected)
 //! - WP-4: Word preview start when officecli not available
 //!
 //! Items requiring real officecli or mock HTTP backends (WP-1..3, WP-5..6, EP-1..2,
-//! PP-1..3, RP-1/RP-3, RP-5..7, SO-5..6, DC-5..8) are tested at the service
+//! PP-1..3, RP-1/RP-3, RP-5..7, DC-5..8) are tested at the service
 //! integration level in `aionui-office/tests/`.
 
 mod common;
@@ -23,9 +22,7 @@ use tower::ServiceExt;
 use common::{body_json, get_request, json_with_token, setup_and_login};
 
 use aionui_app::{AppConfig, AppServices, build_module_states, create_router_with_states};
-use aionui_office::{
-    ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService, StarOfficeDetector,
-};
+use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -96,14 +93,12 @@ fn build_test_office_state(data_dir: &std::path::Path, allowed_roots: Vec<std::p
     let wm = Arc::new(OfficecliWatchManager::new(spawner, bc));
 
     let snapshot = Arc::new(SnapshotService::new(data_dir));
-    let detector = Arc::new(StarOfficeDetector::new(reqwest::Client::new()));
     let conversion = Arc::new(ConversionService::new(None));
     let proxy = Arc::new(ProxyService::new(wm.clone()));
 
     OfficeRouterState {
         watch_manager: wm,
         snapshot_service: snapshot,
-        star_office_detector: detector,
         conversion_service: conversion,
         proxy_service: proxy,
         allowed_roots,
@@ -136,7 +131,6 @@ async fn au2_unauthenticated_all_office_endpoints() {
         "/api/ppt-preview/start",
         "/api/preview-history/list",
         "/api/preview-history/save",
-        "/api/star-office/detect",
         "/api/document/convert",
     ];
 
@@ -480,10 +474,10 @@ async fn sh7_target_field_combination_different_hash() {
     );
 }
 
-// ── SO-1: Star Office detect — no service available ─────────────────
+// ── SO-1: Star Office detect route removed ───────────────────────────
 
 #[tokio::test]
-async fn so1_detect_no_service() {
+async fn so1_detect_route_removed() {
     let (mut app, services, _tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
@@ -491,16 +485,13 @@ async fn so1_detect_no_service() {
     let req = json_with_token("POST", "/api/star-office/detect", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert!(json["data"]["url"].is_null());
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-// ── SO-2: Star Office detect with preferred URL ─────────────────────
+// ── SO-2: Star Office detect route removed with preferred URL ───────
 
 #[tokio::test]
-async fn so2_detect_with_preferred_url() {
+async fn so2_detect_route_removed_with_preferred_url() {
     let (mut app, services, _tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
@@ -508,10 +499,7 @@ async fn so2_detect_with_preferred_url() {
     let req = json_with_token("POST", "/api/star-office/detect", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert!(json["data"]["url"].is_null());
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 // ── DC-1: Excel → JSON ──────────────────────────────────────────────

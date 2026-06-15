@@ -31,8 +31,7 @@ use aionui_mcp::{
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
 };
 use aionui_office::{
-    ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService,
-    SnapshotService as OfficeSnapshotService, StarOfficeDetector,
+    ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
 };
 use aionui_realtime::{NoopMessageRouter, WsHandlerState};
 use aionui_shell::ShellRouterState;
@@ -670,14 +669,12 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
     let watch_manager = Arc::new(OfficecliWatchManager::new(spawner, services.event_bus.clone()));
 
     let snapshot_service = Arc::new(OfficeSnapshotService::new(data_dir));
-    let star_office_detector = Arc::new(StarOfficeDetector::new(reqwest::Client::new()));
     let conversion_service = Arc::new(ConversionService::with_data_dir(None, data_dir.to_path_buf()));
     let proxy_service = Arc::new(ProxyService::new(watch_manager.clone()));
 
     OfficeRouterState {
         watch_manager,
         snapshot_service,
-        star_office_detector,
         conversion_service,
         proxy_service,
         allowed_roots,
