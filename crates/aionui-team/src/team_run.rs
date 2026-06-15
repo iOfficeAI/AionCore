@@ -964,9 +964,7 @@ impl TeamRunManager {
         reason: Option<String>,
     ) -> Option<TeamRunPayload> {
         let mut guard = self.state.lock().await;
-        let Some(run) = guard.as_mut() else {
-            return None;
-        };
+        let run = guard.as_mut()?;
         let reason = reason.unwrap_or_else(|| "user_stop".into());
         let pending_count = run
             .pending_wakes
