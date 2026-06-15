@@ -1210,10 +1210,7 @@ mod tests {
             .await
             .unwrap();
 
-        manager
-            .begin_cancel(None, Some("stop all".into()))
-            .await
-            .unwrap();
+        manager.begin_cancel(None, Some("stop all".into())).await.unwrap();
         let cancelled = manager
             .try_complete_cancelled()
             .await

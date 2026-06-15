@@ -146,7 +146,6 @@ impl SlotWakeGate {
         entry.suppressed_wake_count = 0;
         Some(source)
     }
-
 }
 
 #[cfg(test)]

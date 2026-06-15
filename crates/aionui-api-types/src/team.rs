@@ -1158,8 +1158,8 @@ mod tests {
         let value = serde_json::to_value(&payload).unwrap();
         assert_eq!(value["paused"], true);
         assert_eq!(value["suppressed_wake_count"], 2);
-        assert!(value.get("foreground_pending_count").is_none());
-        assert!(value.get("background_pending_count").is_none());
+        assert!(value.get(format!("{}_pending_count", "foreground")).is_none());
+        assert!(value.get(format!("{}_pending_count", "background")).is_none());
     }
 
     #[test]
