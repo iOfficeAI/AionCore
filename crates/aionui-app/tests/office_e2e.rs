@@ -22,9 +22,7 @@ use tower::ServiceExt;
 use common::{body_json, get_request, json_with_token, setup_and_login};
 
 use aionui_app::{AppConfig, AppServices, build_module_states, create_router_with_states};
-use aionui_office::{
-    ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService,
-};
+use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 

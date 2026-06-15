@@ -2200,7 +2200,14 @@ mod tests {
         fx.service.bootstrap_assistant_storage().await.unwrap();
 
         assert!(fx.definition_repo.get_by_key("builtin-office").await.unwrap().is_none());
-        assert!(fx.service.list().await.unwrap().iter().all(|assistant| assistant.id != "builtin-office"));
+        assert!(
+            fx.service
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .all(|assistant| assistant.id != "builtin-office")
+        );
         assert!(
             fx.definition_repo
                 .get_by_definition_id(&original.definition_id)
