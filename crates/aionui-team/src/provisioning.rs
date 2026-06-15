@@ -3,6 +3,7 @@ use std::sync::Arc;
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{AddAgentRequest, TeamAgentInput};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
+use aionui_db::models::TeamRow;
 use aionui_db::{IProviderRepository, ITeamRepository, UpdateTeamParams};
 use async_trait::async_trait;
 use tracing::{info, warn};
@@ -210,11 +211,12 @@ impl TeamAgentProvisioner {
     pub(crate) async fn add_agent(
         &self,
         user_id: &str,
+        row: &TeamRow,
         team: &mut Team,
         req: AddAgentRequest,
-        workspace: &str,
     ) -> Result<TeamAgent, TeamError> {
         let role = TeammateRole::parse(&req.role).unwrap_or(TeammateRole::Teammate);
+        let workspace = self.workspace_resolver().resolve_for_new_agent(row, team).await?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
                 user_id: user_id.to_owned(),
@@ -224,7 +226,7 @@ impl TeamAgentProvisioner {
                 backend: req.backend,
                 model: req.model,
                 custom_agent_id: req.custom_agent_id,
-                workspace: Some(workspace.to_owned()),
+                workspace: Some(workspace),
             })
             .await?;
         team.agents.push(agent.clone());
@@ -247,6 +249,7 @@ impl TeamAgentProvisioner {
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
         let mut team = Team::from_row(&row)?;
+        let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
                 user_id: user_id.to_owned(),
@@ -256,7 +259,7 @@ impl TeamAgentProvisioner {
                 backend,
                 model,
                 custom_agent_id,
-                workspace: Some(row.workspace.clone()),
+                workspace: Some(workspace),
             })
             .await?;
         team.agents.push(agent.clone());

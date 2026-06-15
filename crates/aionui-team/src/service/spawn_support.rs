@@ -247,6 +247,9 @@ fn capitalize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::workspace_harness::{
+        force_team_workspace, setup_with_factory_metadata_team_repo_and_conversation_repo, single_agent_team_request,
+    };
 
     #[test]
     fn parse_agent_type_known_backends() {
@@ -277,5 +280,40 @@ mod tests {
     #[test]
     fn resolve_full_auto_mode_keeps_hermes_on_default() {
         assert_eq!(resolve_full_auto_mode("hermes"), "default");
+    }
+
+    #[tokio::test]
+    async fn persist_spawned_agent_uses_team_workspace_resolver() {
+        let (svc, team_repo, _, conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user1", single_agent_team_request("Spawn Legacy"))
+            .await
+            .unwrap();
+        let leader_workspace = conv_repo.get_extra(&created.agents[0].conversation_id).unwrap()["workspace"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        force_team_workspace(&team_repo, &created.id, "").await;
+
+        let spawned = svc
+            .persist_spawned_agent(
+                &created.id,
+                "user1",
+                "Spawned".into(),
+                "acp".into(),
+                "claude".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let got = svc.get_team("user1", &created.id).await.unwrap();
+        assert_eq!(got.workspace, leader_workspace);
+        let spawned_extra = conv_repo.get_extra(&spawned.conversation_id).unwrap();
+        assert_eq!(
+            spawned_extra.get("workspace").and_then(serde_json::Value::as_str),
+            Some(leader_workspace.as_str())
+        );
     }
 }

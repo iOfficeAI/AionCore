@@ -355,10 +355,7 @@ impl TeamSessionService {
             )));
         }
         let mut team = Team::from_row(&row)?;
-        let agent = self
-            .provisioner()
-            .add_agent(user_id, &mut team, req, &row.workspace)
-            .await?;
+        let agent = self.provisioner().add_agent(user_id, &row, &mut team, req).await?;
 
         if let Some(session) = self.sessions.get(team_id).map(|e| Arc::clone(&e.session)) {
             session.add_agent(&agent).await;
