@@ -16,6 +16,7 @@ pub mod routes;
 pub mod scheduler;
 pub mod service;
 pub mod session;
+mod slot_wake_gate;
 pub mod task_board;
 pub mod team_run;
 #[cfg(test)]

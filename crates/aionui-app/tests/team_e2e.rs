@@ -323,6 +323,28 @@ async fn team_api_rejects_cross_user_access() {
     }
 }
 
+#[tokio::test]
+async fn pause_team_slot_endpoint_requires_owned_team_and_active_run() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let lead_slot_id = data["agents"][0]["slot_id"].as_str().unwrap();
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/runs/not-a-run/agents/{lead_slot_id}/pause"),
+        json!({"reason": "user stopped"}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["success"].as_bool().is_some_and(|success| !success));
+}
+
 // TL-3: Each team contains full agents info
 #[tokio::test]
 async fn tl3_teams_contain_full_agent_info() {

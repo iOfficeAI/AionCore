@@ -823,6 +823,26 @@ impl TeamSessionService {
         session.cancel_child_turn(team_run_id, slot_id, reason).await
     }
 
+    pub async fn pause_slot_work(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        team_run_id: &str,
+        slot_id: &str,
+        reason: Option<String>,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        self.ensure_session_inner(team_id, false).await?;
+        let session = {
+            let entry = self
+                .sessions
+                .get(team_id)
+                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+            Arc::clone(&entry.session)
+        };
+        session.pause_slot_work(team_run_id, slot_id, reason).await
+    }
+
     pub async fn set_session_mode(&self, user_id: &str, team_id: &str, mode: &str) -> Result<(), TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
         let provisioner = self.provisioner();
@@ -858,12 +878,36 @@ impl TeamSessionService {
         team_id: &str,
         slot_id: &str,
         source: TeamWakeSource,
+        trigger_message_id: Option<String>,
     ) -> Result<(), TeamError> {
         let entry = self
             .sessions
             .get(team_id)
             .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-        entry.session.wake_agent_for_team_work(slot_id, source).await
+        entry
+            .session
+            .wake_agent_for_team_work(slot_id, source, trigger_message_id)
+            .await
+    }
+
+    pub async fn send_agent_message_from_agent(
+        &self,
+        team_id: &str,
+        from_slot_id: &str,
+        to_slot_id: &str,
+        content: &str,
+    ) -> Result<(), TeamError> {
+        self.require_active_team_run_for_team_work(team_id).await?;
+        let session = {
+            let entry = self
+                .sessions
+                .get(team_id)
+                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+            Arc::clone(&entry.session)
+        };
+        session
+            .send_agent_message_from_agent(from_slot_id, to_slot_id, content)
+            .await
     }
 
     pub(crate) fn notify_reserved_wake_for_team_work(

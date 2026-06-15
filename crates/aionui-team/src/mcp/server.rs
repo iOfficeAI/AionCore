@@ -551,15 +551,6 @@ async fn exec_send_message(
         .await
         .map_err(|e| e.to_string())?;
 
-    let action = crate::scheduler::SchedulerAction::SendMessage {
-        to: resolved_to.clone(),
-        message: input.message,
-    };
-    scheduler
-        .execute_action(caller_slot_id, &action)
-        .await
-        .map_err(|e| e.to_string())?;
-
     let targets = if resolved_to == "*" {
         scheduler
             .list_agents()
@@ -573,7 +564,7 @@ async fn exec_send_message(
     };
     for target in &targets {
         service
-            .wake_agent_for_team_work(team_id, target, TeamWakeSource::McpSendMessage)
+            .send_agent_message_from_agent(team_id, caller_slot_id, target, &input.message)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -767,7 +758,7 @@ async fn exec_shutdown_agent(
         .map_err(|e| e.to_string())?;
 
     service
-        .wake_agent_for_team_work(team_id, &target_slot_id, TeamWakeSource::McpShutdownRequest)
+        .wake_agent_for_team_work(team_id, &target_slot_id, TeamWakeSource::McpShutdownRequest, None)
         .await
         .map_err(|e| e.to_string())?;
 

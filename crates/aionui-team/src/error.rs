@@ -12,6 +12,9 @@ pub enum TeamError {
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error("Team slot is busy: {0}")]
+    SlotBusy(String),
+
     #[error("Leader-only action: {0}")]
     LeaderOnly(String),
 
@@ -52,5 +55,9 @@ mod tests {
         assert_eq!(TeamError::TeamNotFound("t1".into()).to_string(), "Team not found: t1");
         assert_eq!(TeamError::AgentNotFound("s1".into()).to_string(), "Agent not found: s1");
         assert_eq!(TeamError::TaskNotFound("tk1".into()).to_string(), "Task not found: tk1");
+        assert_eq!(
+            TeamError::SlotBusy("lead-1".into()).to_string(),
+            "Team slot is busy: lead-1"
+        );
     }
 }

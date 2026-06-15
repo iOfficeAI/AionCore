@@ -106,6 +106,7 @@ impl TeamAgentProvisioner {
                     &input.name,
                     &input.backend,
                     &input.model,
+                    input.custom_agent_id.as_deref(),
                     input.conversation_id.as_deref(),
                     shared_workspace,
                 )
@@ -258,6 +259,7 @@ impl TeamAgentProvisioner {
                 &input.name,
                 &input.backend,
                 &input.model,
+                input.custom_agent_id.as_deref(),
                 None,
                 input.workspace.as_deref(),
             )
@@ -286,11 +288,12 @@ impl TeamAgentProvisioner {
         name: &str,
         backend: &str,
         model: &str,
+        custom_agent_id: Option<&str>,
         existing_conversation_id: Option<&str>,
         workspace: Option<&str>,
     ) -> Result<String, TeamError> {
         let extra = self
-            .build_team_extra(team_id, slot_id, role, backend, model, workspace)
+            .build_team_extra(team_id, slot_id, role, backend, model, custom_agent_id, workspace)
             .await?;
         if let Some(existing_id) = existing_conversation_id {
             self.conversation_port
@@ -365,6 +368,7 @@ impl TeamAgentProvisioner {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_team_extra(
         &self,
         team_id: &str,
@@ -372,6 +376,7 @@ impl TeamAgentProvisioner {
         role: TeammateRole,
         backend: &str,
         model: &str,
+        custom_agent_id: Option<&str>,
         workspace: Option<&str>,
     ) -> Result<serde_json::Value, TeamError> {
         let mut extra = serde_json::json!({
@@ -383,6 +388,10 @@ impl TeamAgentProvisioner {
         });
         if parse_agent_type(backend)? != AgentType::Aionrs {
             extra["current_model_id"] = serde_json::Value::String(model.to_owned());
+        }
+        if let Some(custom_agent_id) = custom_agent_id {
+            extra["custom_agent_id"] = serde_json::Value::String(custom_agent_id.to_owned());
+            extra["preset_assistant_id"] = serde_json::Value::String(custom_agent_id.to_owned());
         }
         if let Some(workspace) = workspace {
             inherit_team_workspace(&mut extra, workspace);

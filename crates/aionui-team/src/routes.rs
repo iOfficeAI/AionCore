@@ -10,8 +10,8 @@ use axum::routing::{get, post};
 
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
-    RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, SetModeRequest,
-    TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
+    PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest,
+    SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -42,6 +42,7 @@ impl From<TeamError> for ApiError {
             TeamError::AgentNotFound(msg) => ApiError::NotFound(msg),
             TeamError::TaskNotFound(msg) => ApiError::NotFound(msg),
             TeamError::InvalidRequest(msg) => ApiError::BadRequest(msg),
+            TeamError::SlotBusy(msg) => ApiError::BadRequest(format!("Team slot is busy: {msg}")),
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
@@ -73,6 +74,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route(
             "/api/teams/{id}/runs/{team_run_id}/agents/{slot_id}/cancel",
             post(cancel_child_turn),
+        )
+        .route(
+            "/api/teams/{id}/runs/{team_run_id}/agents/{slot_id}/pause",
+            post(pause_slot_work),
         )
         .route("/api/teams/{id}/session", post(ensure_session).delete(stop_session))
         .route("/api/teams/{id}/session-mode", post(set_session_mode))
@@ -240,6 +245,20 @@ async fn cancel_child_turn(
     state
         .service
         .cancel_child_turn(&user.id, &params.id, &params.team_run_id, &params.slot_id, req.reason)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn pause_slot_work(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<RunAgentPathParams>,
+    body: Result<Json<PauseTeamSlotRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .service
+        .pause_slot_work(&user.id, &params.id, &params.team_run_id, &params.slot_id, req.reason)
         .await?;
     Ok(Json(ApiResponse::success()))
 }
