@@ -665,21 +665,30 @@ impl ConversationService {
             Vec::new()
         }
 
+        fn merge_string_lists(primary: &[String], secondary: &[String]) -> Vec<String> {
+            let mut merged = primary.to_vec();
+            for value in secondary {
+                if !merged.iter().any(|existing| existing == value) {
+                    merged.push(value.clone());
+                }
+            }
+            merged
+        }
+
         let (preset_enabled, exclude_auto_inject) = match extra.as_object_mut() {
             Some(obj) => {
-                let preset = assistant_snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.resolved_defaults.skill_ids.clone())
-                    .unwrap_or_else(|| take_string_array(obj, &["preset_enabled_skills", "enabled_skills"]));
-                let exclude = assistant_snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.resolved_defaults.disabled_builtin_skill_ids.clone())
-                    .unwrap_or_else(|| {
-                        take_string_array(obj, &["exclude_auto_inject_skills", "exclude_builtin_skills"])
-                    });
+                let extra_preset = take_string_array(obj, &["preset_enabled_skills", "enabled_skills"]);
+                let extra_exclude = take_string_array(obj, &["exclude_auto_inject_skills", "exclude_builtin_skills"]);
                 // Strip the stale cache field if a clone copied it in.
                 obj.remove("loaded_skills");
-                (preset, exclude)
+
+                match assistant_snapshot.as_ref() {
+                    Some(snapshot) => (
+                        merge_string_lists(&snapshot.resolved_defaults.skill_ids, &extra_preset),
+                        merge_string_lists(&snapshot.resolved_defaults.disabled_builtin_skill_ids, &extra_exclude),
+                    ),
+                    None => (extra_preset, extra_exclude),
+                }
             }
             None => (Vec::new(), Vec::new()),
         };

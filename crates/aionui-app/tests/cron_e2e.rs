@@ -11,7 +11,10 @@ use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
-use aionui_db::{ICronRepository, SqliteCronRepository};
+use aionui_db::{
+    CreateMcpServerParams, IConversationRepository, ICronRepository, IMcpServerRepository,
+    SqliteConversationRepository, SqliteCronRepository, SqliteMcpServerRepository,
+};
 
 use common::{
     body_json, build_app, build_app_with_mock_agents, delete_with_token, get_request, get_with_token, json_with_token,
@@ -608,6 +611,143 @@ async fn rn1b_run_now_returns_conflict_when_conversation_is_busy() {
     );
 
     drop(claim);
+}
+
+#[tokio::test]
+async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcps() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let mcp_repo = SqliteMcpServerRepository::new(services.database.pool().clone());
+    let fixed_mcp = mcp_repo
+        .create(CreateMcpServerParams {
+            name: "fixed-mcp",
+            description: None,
+            enabled: true,
+            transport_type: "http",
+            transport_config: r#"{"url":"https://example.invalid/fixed"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .expect("create fixed mcp");
+    let extra_mcp = mcp_repo
+        .create(CreateMcpServerParams {
+            name: "extra-mcp",
+            description: None,
+            enabled: true,
+            transport_type: "http",
+            transport_config: r#"{"url":"https://example.invalid/extra"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .expect("create extra mcp");
+
+    let create_assistant_req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "u-fixed-mcp",
+            "name": "Cron MCP Assistant",
+            "preset_agent_type": "codex",
+            "defaults": {
+                "mcps": {
+                    "mode": "fixed",
+                    "value": [fixed_mcp.id]
+                }
+            }
+        }),
+        &token,
+        &csrf,
+    );
+    let create_assistant_resp = app.clone().oneshot(create_assistant_req).await.unwrap();
+    assert_eq!(create_assistant_resp.status(), StatusCode::CREATED);
+
+    let create_job_req = json_with_token(
+        "POST",
+        "/api/cron/jobs",
+        json!({
+            "name": "Preset Assistant Cron",
+            "schedule": { "kind": "every", "every_ms": 60000, "description": "every minute" },
+            "message": "cron preset assistant message",
+            "conversation_id": "",
+            "agent_type": "acp",
+            "created_by": "user",
+            "execution_mode": "new_conversation",
+            "agent_config": {
+                "backend": "codex",
+                "name": "Cron MCP Assistant",
+                "is_preset": true,
+                "custom_agent_id": "u-fixed-mcp",
+                "preset_agent_type": "codex"
+            }
+        }),
+        &token,
+        &csrf,
+    );
+    let create_job_resp = app.clone().oneshot(create_job_req).await.unwrap();
+    assert_eq!(create_job_resp.status(), StatusCode::CREATED);
+    let create_job_body = body_json(create_job_resp).await;
+    let job_id = create_job_body["data"]["id"]
+        .as_str()
+        .expect("cron job id should be present");
+    let saved_skill_name = format!("cron-{job_id}");
+
+    let save_skill_req = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{job_id}/skill"),
+        json!({
+            "content": "---\nname: saved cron skill\ndescription: saved cron skill\n---\nUse the saved cron skill"
+        }),
+        &token,
+        &csrf,
+    );
+    let save_skill_resp = app.clone().oneshot(save_skill_req).await.unwrap();
+    assert_eq!(save_skill_resp.status(), StatusCode::OK);
+
+    let run_req = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{job_id}/run"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let run_resp = app.clone().oneshot(run_req).await.unwrap();
+    assert_eq!(run_resp.status(), StatusCode::OK);
+    let run_body = body_json(run_resp).await;
+    let conversation_id = run_body["data"]["conversation_id"]
+        .as_str()
+        .expect("run-now should return created conversation id");
+
+    let conversation_repo = SqliteConversationRepository::new(services.database.pool().clone());
+    let conversation = conversation_repo
+        .get(conversation_id)
+        .await
+        .expect("load conversation")
+        .expect("conversation should exist");
+    let extra: serde_json::Value =
+        serde_json::from_str(&conversation.extra).expect("conversation extra should be valid json");
+    assert_eq!(extra["preset_assistant_id"], "u-fixed-mcp");
+    assert_eq!(extra["mcp_server_ids"], json!([fixed_mcp.id]));
+    assert_eq!(extra["mcp_servers"], json!(["fixed-mcp"]));
+    assert!(
+        extra["skills"].as_array().is_some_and(|skills| {
+            skills.iter().all(|skill| skill != "cron") && skills.iter().any(|skill| skill == &saved_skill_name)
+        }),
+        "cron-created conversations must exclude builtin cron but keep the saved job skill"
+    );
+    assert_ne!(fixed_mcp.id, extra_mcp.id, "fixture should seed two distinct MCP rows");
+
+    let snapshot = conversation_repo
+        .get_assistant_snapshot(conversation_id)
+        .await
+        .expect("load assistant snapshot")
+        .expect("preset assistant cron conversation should persist snapshot");
+    assert_eq!(snapshot.assistant_key, "u-fixed-mcp");
+    assert_eq!(snapshot.resolved_mcp_ids, json!([fixed_mcp.id]).to_string());
 }
 
 #[tokio::test]

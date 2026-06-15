@@ -1124,6 +1124,44 @@ async fn tc_create_team_uses_custom_agent_id_icon_lookup() {
 }
 
 #[tokio::test]
+async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::with_rows(vec![
+        make_agent_metadata_row("2d23ff1c", "claude", "/api/assets/logos/ai-major/claude.svg"),
+    ]));
+    let (svc, _task_manager, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+
+    let resp = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: "claude".into(),
+                    model: "claude".into(),
+                    custom_agent_id: Some("2d23ff1c".into()),
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let row = conv_repo
+        .get(&resp.agents[0].conversation_id)
+        .await
+        .unwrap()
+        .expect("lead conversation row");
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+
+    assert_eq!(extra["custom_agent_id"], serde_json::json!("2d23ff1c"));
+    assert_eq!(extra["preset_assistant_id"], serde_json::json!("2d23ff1c"));
+}
+
+#[tokio::test]
 async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
     let svc = setup_with_metadata_rows(vec![make_agent_metadata_row(
         "8e1acf31",
