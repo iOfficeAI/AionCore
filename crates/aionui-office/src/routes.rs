@@ -9,9 +9,8 @@ use axum::routing::{get, post};
 use std::path::{Path as FsPath, PathBuf};
 
 use aionui_api_types::{
-    ApiResponse, DetectStarOfficeRequest, DocumentConversionRequest, GetSnapshotContentRequest, ListSnapshotsRequest,
-    PreviewSnapshotInfoDto, PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StarOfficeDetectResponse,
-    StartPreviewRequest, StopPreviewRequest,
+    ApiResponse, DocumentConversionRequest, GetSnapshotContentRequest, ListSnapshotsRequest, PreviewSnapshotInfoDto,
+    PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -62,7 +61,6 @@ pub fn office_routes(state: OfficeRouterState) -> Router {
         .route("/api/preview-history/list", post(list_snapshots))
         .route("/api/preview-history/save", post(save_snapshot))
         .route("/api/preview-history/get-content", post(get_snapshot_content))
-        .route("/api/star-office/detect", post(detect_star_office))
         .route("/api/document/convert", post(convert_document))
         .with_state(state)
 }
@@ -202,21 +200,6 @@ async fn get_snapshot_content(
     Ok(Json(ApiResponse::ok(result)))
 }
 
-// -- Star Office detection ------------------------------------------------
-
-async fn detect_star_office(
-    State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-    body: Result<Json<DetectStarOfficeRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<StarOfficeDetectResponse>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let url = state
-        .star_office_detector
-        .detect(req.preferred_url.as_deref(), req.force.unwrap_or(false), req.timeout_ms)
-        .await;
-    Ok(Json(ApiResponse::ok(StarOfficeDetectResponse { url })))
-}
-
 // -- Document conversion --------------------------------------------------
 
 async fn convert_document(
@@ -353,7 +336,6 @@ mod tests {
     use crate::error::OfficeError;
     use crate::proxy::{ProxyError, ProxyService};
     use crate::snapshot::SnapshotService;
-    use crate::star_office::StarOfficeDetector;
     use crate::state::OfficeRouterState;
     use crate::types::DocType;
     use crate::watch_manager::{OfficecliWatchManager, ProcessHandle, ProcessSpawner};
@@ -491,14 +473,12 @@ mod tests {
         let wm = Arc::new(OfficecliWatchManager::new(spawner, bc));
 
         let snapshot = Arc::new(SnapshotService::new(std::path::Path::new("/tmp/test")));
-        let detector = Arc::new(StarOfficeDetector::new(reqwest::Client::new()));
         let conversion = Arc::new(ConversionService::new(None));
         let proxy = Arc::new(ProxyService::new(wm.clone()));
 
         OfficeRouterState {
             watch_manager: wm,
             snapshot_service: snapshot,
-            star_office_detector: detector,
             conversion_service: conversion,
             proxy_service: proxy,
             allowed_roots: vec![std::env::temp_dir()],

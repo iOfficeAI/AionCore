@@ -376,7 +376,6 @@ pub struct CronRouterState {
 pub struct OfficeRouterState {
     pub watch_manager: Arc<OfficecliWatchManager>,
     pub snapshot_service: Arc<SnapshotService>,
-    pub star_office_detector: Arc<StarOfficeDetector>,
     pub conversion_service: Arc<ConversionService>,
     pub proxy_service: Arc<ProxyService>,
 }
