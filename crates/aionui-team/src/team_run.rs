@@ -970,11 +970,24 @@ impl TeamRunManager {
             .or_default()
             .push_back(PendingWake {
                 slot_id: slot_id.to_owned(),
-                role,
+                role: role.clone(),
                 source,
                 message_id: None,
             });
         let payload = run.payload();
+        let slot_work = payload.slot_work.iter().find(|work| work.slot_id == slot_id);
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %payload.team_run_id,
+            slot_id,
+            role = ?role,
+            released_wake_source = %source,
+            pending_wake_count = payload.pending_wake_count,
+            slot_pending_wake_count = slot_work.map(|work| work.pending_wake_count).unwrap_or_default(),
+            suppressed_wake_count = slot_work.map(|work| work.suppressed_wake_count).unwrap_or_default(),
+            background_pending_count = slot_work.map(|work| work.background_pending_count).unwrap_or_default(),
+            "team suppressed wake released"
+        );
         drop(guard);
         self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
         Some(source)
