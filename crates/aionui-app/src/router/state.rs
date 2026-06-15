@@ -618,6 +618,15 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     conv_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
     )));
+    conv_service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
+        services.database.pool().clone(),
+    )));
+    conv_service.with_assistant_state_repo(Arc::new(SqliteAssistantOverlayRepository::new(
+        services.database.pool().clone(),
+    )));
+    conv_service.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(
+        services.database.pool().clone(),
+    )));
 
     let executor = Arc::new(aionui_cron::executor::JobExecutor::new(
         services.worker_task_manager.clone(),

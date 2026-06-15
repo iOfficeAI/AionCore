@@ -59,6 +59,7 @@ struct Fixture {
 ///   `builtin-bare` with nothing referenced)
 /// - a temp user-data dir that `AssistantService` uses for user rule/skill/
 ///   avatar storage
+///
 /// Also logs in `admin` and hands back the session + CSRF tokens so tests
 /// can issue authenticated mutating requests.
 async fn fixture() -> Fixture {
