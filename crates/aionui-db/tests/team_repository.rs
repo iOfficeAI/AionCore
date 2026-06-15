@@ -179,6 +179,26 @@ async fn update_team_agents_json() {
 }
 
 #[tokio::test]
+async fn update_team_can_patch_workspace() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteTeamRepository::new(db.pool().clone());
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+
+    repo.update_team(
+        "t1",
+        &UpdateTeamParams {
+            workspace: Some("/tmp/aionui-team-shared-workspace".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let updated = repo.get_team("t1").await.unwrap().unwrap();
+    assert_eq!(updated.workspace, "/tmp/aionui-team-shared-workspace");
+}
+
+#[tokio::test]
 async fn update_nonexistent_team_returns_not_found() {
     let (repo, _db) = repo().await;
     let result = repo

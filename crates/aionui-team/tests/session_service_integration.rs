@@ -529,6 +529,9 @@ impl ITeamRepository for FullMockTeamRepo {
         if let Some(ref name) = params.name {
             team.name = name.clone();
         }
+        if let Some(ref workspace) = params.workspace {
+            team.workspace = workspace.clone();
+        }
         if let Some(ref agents) = params.agents {
             team.agents = agents.clone();
         }

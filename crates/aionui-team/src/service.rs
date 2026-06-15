@@ -313,8 +313,7 @@ impl TeamSessionService {
                 team_id,
                 &UpdateTeamParams {
                     name: Some(name.to_owned()),
-                    agents: None,
-                    lead_agent_id: None,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -380,9 +379,8 @@ impl TeamSessionService {
             .update_team(
                 team_id,
                 &UpdateTeamParams {
-                    name: None,
                     agents: Some(agents_json),
-                    lead_agent_id: None,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -425,9 +423,8 @@ impl TeamSessionService {
             .update_team(
                 team_id,
                 &UpdateTeamParams {
-                    name: None,
                     agents: Some(agents_json),
-                    lead_agent_id: None,
+                    ..Default::default()
                 },
             )
             .await?;
