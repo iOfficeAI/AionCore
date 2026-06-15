@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_ai_agent::{AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::{AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::ICronService;
 use crate::runtime_completion::RuntimeCompletionPublisher;
@@ -123,6 +123,10 @@ struct AssistantSnapshot {
     avatar_type: String,
     #[serde(default)]
     avatar: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    agent_source: Option<String>,
     agent_backend: String,
     rules: AssistantSnapshotRules,
     #[serde(default)]
@@ -248,6 +252,7 @@ pub struct ConversationService {
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
+    agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
 
     // Repos for conversation, acp_session and agent_metadata access.
@@ -314,6 +319,7 @@ impl ConversationService {
             assistant_state_repo: Arc::new(RwLock::new(None)),
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
+            agent_availability_feedback: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
 
             conversation_repo,
@@ -360,6 +366,12 @@ impl ConversationService {
     pub fn with_assistant_dispatcher(&self, dispatcher: Arc<dyn AssistantRuleDispatcher>) {
         if let Ok(mut guard) = self.assistant_dispatcher.write() {
             *guard = Some(dispatcher);
+        }
+    }
+
+    pub fn with_agent_availability_feedback(&self, feedback: Arc<dyn AgentAvailabilityFeedbackPort>) {
+        if let Ok(mut guard) = self.agent_availability_feedback.write() {
+            *guard = Some(feedback);
         }
     }
 
@@ -431,6 +443,13 @@ impl ConversationService {
 
     fn assistant_dispatcher(&self) -> Option<Arc<dyn AssistantRuleDispatcher>> {
         self.assistant_dispatcher
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    pub(crate) fn agent_availability_feedback(&self) -> Option<Arc<dyn AgentAvailabilityFeedbackPort>> {
+        self.agent_availability_feedback
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
@@ -629,6 +648,25 @@ impl ConversationService {
                 "preset_assistant_id".to_owned(),
                 serde_json::Value::String(snapshot.assistant_id.clone()),
             );
+            if !snapshot.agent_backend.is_empty() && !obj.contains_key("backend") {
+                obj.insert(
+                    "backend".to_owned(),
+                    serde_json::Value::String(snapshot.agent_backend.clone()),
+                );
+            }
+            if let Some(agent_id) = snapshot.agent_id.as_ref()
+                && !obj.contains_key("agent_id")
+            {
+                obj.insert("agent_id".to_owned(), serde_json::Value::String(agent_id.clone()));
+            }
+            if let Some(agent_source) = snapshot.agent_source.as_ref()
+                && !obj.contains_key("agent_source")
+            {
+                obj.insert(
+                    "agent_source".to_owned(),
+                    serde_json::Value::String(agent_source.clone()),
+                );
+            }
             if !snapshot.rules.content.is_empty() {
                 obj.insert(
                     "preset_context".to_owned(),
@@ -1089,6 +1127,18 @@ impl ConversationService {
             .as_ref()
             .and_then(|row| row.agent_backend_override.clone())
             .unwrap_or_else(|| definition.agent_backend.clone());
+        let generated_agent = if definition.source == "generated" {
+            match definition.source_ref.as_deref() {
+                Some(agent_id) => self
+                    .agent_metadata_repo
+                    .get(agent_id)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("agent_metadata lookup failed: {e}")))?,
+                None => None,
+            }
+        } else {
+            None
+        };
 
         Ok(Some(AssistantSnapshot {
             assistant_definition_id: definition.definition_id,
@@ -1097,6 +1147,8 @@ impl ConversationService {
             name: definition.name,
             avatar_type: definition.avatar_type,
             avatar: definition.avatar_value,
+            agent_id: generated_agent.as_ref().map(|row| row.id.clone()),
+            agent_source: generated_agent.as_ref().map(|row| row.agent_source.clone()),
             agent_backend,
             rules: AssistantSnapshotRules {
                 content: if rules_content.is_empty() {

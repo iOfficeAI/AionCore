@@ -11,7 +11,7 @@
 //! depend on the ACP protocol SDK — the ai-agent crate typed-decodes
 //! them when it needs to.
 
-use aionui_common::AgentType;
+use aionui_common::{AgentType, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -106,6 +106,30 @@ pub struct AgentHandshake {
     pub available_commands: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentManagementStatus {
+    Missing,
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSnapshotCheckStatus {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSnapshotCheckKind {
+    Startup,
+    Scheduled,
+    Manual,
+    Session,
+}
+
 /// The unified, decoded view of an `agent_metadata` row.
 ///
 /// Also the API response shape: `/api/agents` returns a list of these
@@ -176,8 +200,83 @@ pub struct AgentMetadata {
     #[serde(default)]
     pub team_capable: bool,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_status: Option<AgentSnapshotCheckStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_kind: Option<AgentSnapshotCheckKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_guidance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_latency_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_at: Option<TimestampMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<TimestampMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<TimestampMs>,
+
     #[serde(default)]
     pub handshake: AgentHandshake,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentManagementRow {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_i18n: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_i18n: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    pub agent_type: AgentType,
+    pub agent_source: AgentSource,
+    #[serde(default)]
+    pub agent_source_info: AgentSourceInfo,
+    pub enabled: bool,
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<AgentEnvEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_skills_dirs: Option<Vec<String>>,
+    #[serde(default)]
+    pub behavior_policy: BehaviorPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yolo_id: Option<String>,
+    pub sort_order: i64,
+    #[serde(default)]
+    pub team_capable: bool,
+    pub status: AgentManagementStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_status: Option<AgentSnapshotCheckStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_kind: Option<AgentSnapshotCheckKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_guidance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_latency_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_at: Option<TimestampMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<TimestampMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<TimestampMs>,
 }
 
 #[cfg(test)]
@@ -224,6 +323,15 @@ mod tests {
             yolo_id: None,
             sort_order: 3100,
             team_capable: true,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
             handshake: AgentHandshake::default(),
         };
         let v = serde_json::to_value(&meta).unwrap();
@@ -253,7 +361,14 @@ mod tests {
         assert_eq!(meta.agent_source, AgentSource::Custom);
         assert!(!meta.available);
         assert!(!meta.behavior_policy.supports_side_question);
+        assert!(meta.last_check_status.is_none());
         assert!(meta.handshake.agent_capabilities.is_none());
+    }
+
+    #[test]
+    fn agent_management_status_serializes_snake_case() {
+        let value = serde_json::to_value(AgentManagementStatus::Unavailable).unwrap();
+        assert_eq!(value, json!("unavailable"));
     }
 }
 

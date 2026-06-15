@@ -232,6 +232,7 @@ async fn fixture() -> Fixture {
             override_repo,
             provider_repo,
             builtin,
+            agent_catalog: None,
         },
         user_data_dir.clone(),
     ));

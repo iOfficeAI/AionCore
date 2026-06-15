@@ -28,6 +28,15 @@ fn probe_resolved_command_accepts_bare_npx_when_managed_runtime_is_supported() {
         yolo_id: None,
         sort_order: 0,
         team_capable: false,
+        last_check_status: None,
+        last_check_kind: None,
+        last_check_error_code: None,
+        last_check_error_message: None,
+        last_check_guidance: None,
+        last_check_latency_ms: None,
+        last_check_at: None,
+        last_success_at: None,
+        last_failure_at: None,
         handshake: AgentHandshake::default(),
     };
 
@@ -68,6 +77,15 @@ fn probe_resolved_command_requires_primary_binary_for_builtin_managed_claude() {
         yolo_id: None,
         sort_order: 0,
         team_capable: false,
+        last_check_status: None,
+        last_check_kind: None,
+        last_check_error_code: None,
+        last_check_error_message: None,
+        last_check_guidance: None,
+        last_check_latency_ms: None,
+        last_check_at: None,
+        last_success_at: None,
+        last_failure_at: None,
         handshake: AgentHandshake::default(),
     };
 
@@ -111,6 +129,15 @@ fn probe_resolved_command_requires_primary_binary_for_builtin_managed_codex() {
         yolo_id: None,
         sort_order: 0,
         team_capable: false,
+        last_check_status: None,
+        last_check_kind: None,
+        last_check_error_code: None,
+        last_check_error_message: None,
+        last_check_guidance: None,
+        last_check_latency_ms: None,
+        last_check_at: None,
+        last_success_at: None,
+        last_failure_at: None,
         handshake: AgentHandshake::default(),
     };
 

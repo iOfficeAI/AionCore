@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, RemoteAgentService};
-use aionui_assistant::{AssistantRouterState, AssistantService, BuiltinAssistantRegistry};
+use aionui_assistant::{
+    AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
+};
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
 use aionui_conversation::{ConversationRouterState, ConversationService};
@@ -234,6 +236,10 @@ pub async fn build_module_states(
         encryption_key,
         services.data_dir.clone(),
     );
+    agent_service.start_background_scheduler();
+    services
+        .conversation_service
+        .with_agent_availability_feedback(agent_service.availability_feedback_port());
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: agent service built");
 
     tracing::info!(
@@ -289,6 +295,19 @@ pub async fn build_module_states(
 
 /// Build the default `AssistantRouterState` from application services.
 pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
+    #[derive(Clone)]
+    struct RegistryAssistantAgentCatalog {
+        registry: Arc<aionui_ai_agent::AgentRegistry>,
+    }
+
+    #[async_trait::async_trait]
+    impl AssistantAgentCatalogPort for RegistryAssistantAgentCatalog {
+        async fn list_management_agents(&self) -> Result<Vec<aionui_api_types::AgentManagementRow>, AssistantError> {
+            self.registry.refresh_availability().await;
+            Ok(self.registry.list_management_rows().await)
+        }
+    }
+
     let pool = services.database.pool().clone();
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> =
         Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
@@ -319,6 +338,9 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
             override_repo,
             provider_repo,
             builtin,
+            agent_catalog: Some(Arc::new(RegistryAssistantAgentCatalog {
+                registry: services.agent_registry.clone(),
+            })),
         },
         services.data_dir.clone(),
     ));

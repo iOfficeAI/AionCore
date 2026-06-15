@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::AgentManagementStatus;
+
 // ---------------------------------------------------------------------------
 // Response + source enum
 // ---------------------------------------------------------------------------
@@ -16,6 +18,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum AssistantSource {
     Builtin,
+    Bare,
     User,
 }
 
@@ -55,6 +58,13 @@ pub struct AssistantResponse {
     pub models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<i64>,
+    pub agent_status: AgentManagementStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status_message: Option<String>,
+    pub team_selectable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_block_reason: Option<String>,
+    pub deletable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +183,13 @@ pub struct AssistantPreferencesResponse {
 pub struct AssistantDetailResponse {
     pub id: String,
     pub source: AssistantSource,
+    pub agent_status: AgentManagementStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status_message: Option<String>,
+    pub team_selectable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_block_reason: Option<String>,
+    pub deletable: bool,
     pub profile: AssistantProfileResponse,
     pub state: AssistantStateResponse,
     pub engine: AssistantEngineResponse,
@@ -301,6 +318,8 @@ mod tests {
     fn assistant_source_serializes_lowercase() {
         let json = serde_json::to_string(&AssistantSource::Builtin).unwrap();
         assert_eq!(json, "\"builtin\"");
+        let json = serde_json::to_string(&AssistantSource::Bare).unwrap();
+        assert_eq!(json, "\"bare\"");
         let json = serde_json::to_string(&AssistantSource::User).unwrap();
         assert_eq!(json, "\"user\"");
     }

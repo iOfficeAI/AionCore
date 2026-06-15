@@ -13,7 +13,8 @@ use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
-    AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+    AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
+    UpsertAgentMetadataParams,
 };
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IConversationRepository,
@@ -660,6 +661,13 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
         &self,
         _id: &str,
         _params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn update_availability_snapshot(
+        &self,
+        _id: &str,
+        _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }

@@ -17,7 +17,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_api_types::{AgentEnvEntry, AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};
+use aionui_api_types::{
+    AgentEnvEntry, AgentHandshake, AgentManagementRow, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind,
+    AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy,
+};
 use aionui_common::AgentType;
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
 use aionui_runtime::{
@@ -265,6 +268,55 @@ impl AgentRegistry {
         rows
     }
 
+    /// Management read model for settings surfaces that need to show
+    /// official/custom rows even when unavailable.
+    pub async fn list_management_rows(&self) -> Vec<AgentManagementRow> {
+        let mut rows: Vec<AgentManagementRow> = self
+            .by_id
+            .read()
+            .await
+            .values()
+            .cloned()
+            .map(|meta| {
+                let status = derive_management_status(&meta);
+                AgentManagementRow {
+                    id: meta.id,
+                    icon: meta.icon,
+                    name: meta.name,
+                    name_i18n: meta.name_i18n,
+                    description: meta.description,
+                    description_i18n: meta.description_i18n,
+                    backend: meta.backend,
+                    agent_type: meta.agent_type,
+                    agent_source: meta.agent_source,
+                    agent_source_info: meta.agent_source_info,
+                    enabled: meta.enabled,
+                    installed: meta.available,
+                    command: meta.command,
+                    args: meta.args,
+                    env: meta.env,
+                    native_skills_dirs: meta.native_skills_dirs,
+                    behavior_policy: meta.behavior_policy,
+                    yolo_id: meta.yolo_id,
+                    sort_order: meta.sort_order,
+                    team_capable: meta.team_capable,
+                    status,
+                    last_check_status: meta.last_check_status,
+                    last_check_kind: meta.last_check_kind,
+                    last_check_error_code: meta.last_check_error_code,
+                    last_check_error_message: meta.last_check_error_message,
+                    last_check_guidance: meta.last_check_guidance,
+                    last_check_latency_ms: meta.last_check_latency_ms,
+                    last_check_at: meta.last_check_at,
+                    last_success_at: meta.last_success_at,
+                    last_failure_at: meta.last_failure_at,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)));
+        rows
+    }
+
     /// Like [`Self::list_all_including_hidden`] but pairs every row
     /// with a freshly-computed availability reason so callers (the
     /// `doctor` command, diagnostic UIs) can explain *why* a row is
@@ -304,12 +356,13 @@ impl AgentRegistry {
     }
 }
 
-/// A catalog row is visible to callers when the user has it enabled
-/// and the spawn command was resolved at hydrate/refresh time. The
-/// second check is what keeps uninstalled CLIs (e.g. `cursor` when
-/// only `claude` is on PATH) off the pill bar.
+/// A catalog row is visible to conversation callers when the user has
+/// it enabled, the spawn command was resolved at hydrate/refresh time,
+/// and the latest known availability snapshot does not already mark it
+/// unavailable. This keeps both uninstalled CLIs and rows that most
+/// recently failed ACP/session admission out of `/api/agents`.
 fn is_visible(meta: &AgentMetadata) -> bool {
-    meta.enabled && meta.available
+    meta.enabled && matches!(derive_management_status(meta), AgentManagementStatus::Available)
 }
 
 /// Turn a DB row into the public `AgentMetadata`, probing the command
@@ -363,6 +416,15 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
         yolo_id: row.yolo_id,
         sort_order: row.sort_order,
         team_capable,
+        last_check_status: parse_last_check_status(row.last_check_status.as_deref()),
+        last_check_kind: parse_last_check_kind(row.last_check_kind.as_deref()),
+        last_check_error_code: row.last_check_error_code,
+        last_check_error_message: row.last_check_error_message,
+        last_check_guidance: row.last_check_guidance,
+        last_check_latency_ms: row.last_check_latency_ms,
+        last_check_at: row.last_check_at,
+        last_success_at: row.last_success_at,
+        last_failure_at: row.last_failure_at,
         handshake,
     };
 
@@ -473,6 +535,41 @@ fn parse_agent_type(raw: &str) -> Option<AgentType> {
 
 fn parse_agent_source(raw: &str) -> Option<AgentSource> {
     serde_json::from_value(Value::String(raw.to_owned())).ok()
+}
+
+fn parse_last_check_status(raw: Option<&str>) -> Option<AgentSnapshotCheckStatus> {
+    raw.and_then(|value| match value {
+        "available" => Some(AgentSnapshotCheckStatus::Available),
+        "unavailable" => Some(AgentSnapshotCheckStatus::Unavailable),
+        _ => {
+            warn!(value, "agent_metadata: unknown last_check_status");
+            None
+        }
+    })
+}
+
+fn parse_last_check_kind(raw: Option<&str>) -> Option<AgentSnapshotCheckKind> {
+    raw.and_then(|value| match value {
+        "startup" => Some(AgentSnapshotCheckKind::Startup),
+        "scheduled" => Some(AgentSnapshotCheckKind::Scheduled),
+        "manual" => Some(AgentSnapshotCheckKind::Manual),
+        "session" => Some(AgentSnapshotCheckKind::Session),
+        _ => {
+            warn!(value, "agent_metadata: unknown last_check_kind");
+            None
+        }
+    })
+}
+
+fn derive_management_status(meta: &AgentMetadata) -> AgentManagementStatus {
+    if !meta.available {
+        return AgentManagementStatus::Missing;
+    }
+
+    match meta.last_check_status {
+        Some(AgentSnapshotCheckStatus::Unavailable) => AgentManagementStatus::Unavailable,
+        _ => AgentManagementStatus::Available,
+    }
 }
 
 fn decode_json_field<T: serde::de::DeserializeOwned>(raw: Option<&str>, field: &str) -> Option<T> {

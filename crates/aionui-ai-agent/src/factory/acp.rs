@@ -677,6 +677,15 @@ mod tests {
             yolo_id: None,
             sort_order: 0,
             team_capable: false,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
             handshake: aionui_api_types::AgentHandshake::default(),
         };
 

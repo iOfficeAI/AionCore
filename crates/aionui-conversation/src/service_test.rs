@@ -9,7 +9,7 @@ use std::time::Duration;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentError, AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::{AgentAvailabilityFeedbackPort, AgentError, AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
@@ -34,8 +34,9 @@ use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
     SaveRuntimeStateParams, SortOrder, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, init_database_memory,
+    SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
+    init_database_memory,
 };
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
@@ -161,6 +162,30 @@ impl MockBroadcaster {
 impl EventBroadcaster for MockBroadcaster {
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
         self.events.lock().unwrap().push(event);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedAvailabilityFailure {
+    agent_id: String,
+    code: String,
+    message: String,
+}
+
+#[derive(Default)]
+struct RecordingAvailabilityFeedback {
+    failures: Mutex<Vec<RecordedAvailabilityFailure>>,
+}
+
+#[async_trait::async_trait]
+impl AgentAvailabilityFeedbackPort for RecordingAvailabilityFeedback {
+    async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
+        self.failures.lock().unwrap().push(RecordedAvailabilityFailure {
+            agent_id: agent_id.to_owned(),
+            code: code.to_owned(),
+            message: message.to_owned(),
+        });
+        Ok(())
     }
 }
 
@@ -572,6 +597,13 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
         &self,
         _id: &str,
         _params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn update_availability_snapshot(
+        &self,
+        _id: &str,
+        _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
@@ -3281,6 +3313,51 @@ async fn send_message_injects_send_error_when_runtime_terminal_missing() {
     let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
     assert_eq!(content["type"], "error");
     assert_eq!(content["error"]["code"], "USER_LLM_PROVIDER_AUTH_FAILED");
+}
+
+#[tokio::test]
+async fn send_message_records_agent_availability_feedback_on_send_failure() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let feedback = Arc::new(RecordingAvailabilityFeedback::default());
+    svc.with_agent_availability_feedback(feedback.clone());
+
+    let mut create_req = make_create_req();
+    create_req.name = Some("Feedback Conversation".into());
+    create_req.source = Some(ConversationSource::Aionui);
+    create_req.extra = json!({
+        "backend": "claude",
+        "agent_id": "agent-feedback-1",
+        "agent_source": "custom",
+        "workspace": ensure_test_workspace_path()
+    });
+
+    let conv = svc.create("user_1", create_req).await.unwrap();
+
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(&conv.id, vec![vec![]])
+            .with_status(None)
+            .with_send_error(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "provider returned 401 invalid api key",
+            ))),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let failures = feedback.failures.lock().unwrap().clone();
+    assert_eq!(
+        failures,
+        vec![RecordedAvailabilityFailure {
+            agent_id: "agent-feedback-1".into(),
+            code: "session_send_failed".into(),
+            message: "provider returned 401 invalid api key".into(),
+        }]
+    );
 }
 
 // ── stop_stream tests ───────────────────────────────────────────

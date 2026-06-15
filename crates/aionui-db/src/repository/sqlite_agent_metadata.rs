@@ -4,7 +4,9 @@ use aionui_common::now_ms;
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{AgentMetadataRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams};
+use crate::models::{
+    AgentMetadataRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+};
 use crate::repository::agent_metadata::IAgentMetadataRepository;
 
 #[derive(Clone, Debug)]
@@ -187,6 +189,47 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         .bind(id)
         .execute(&self.pool)
         .await?;
+
+        self.get(id).await
+    }
+
+    async fn update_availability_snapshot(
+        &self,
+        id: &str,
+        params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        let now = now_ms();
+        let result = sqlx::query(
+            "UPDATE agent_metadata SET \
+                last_check_status = ?, \
+                last_check_kind = ?, \
+                last_check_error_code = ?, \
+                last_check_error_message = ?, \
+                last_check_guidance = ?, \
+                last_check_latency_ms = ?, \
+                last_check_at = ?, \
+                last_success_at = ?, \
+                last_failure_at = ?, \
+                updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(params.last_check_status)
+        .bind(params.last_check_kind)
+        .bind(params.last_check_error_code)
+        .bind(params.last_check_error_message)
+        .bind(params.last_check_guidance)
+        .bind(params.last_check_latency_ms)
+        .bind(params.last_check_at)
+        .bind(params.last_success_at)
+        .bind(params.last_failure_at)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
 
         self.get(id).await
     }
@@ -429,6 +472,63 @@ mod tests {
         let row = repo.get("2d23ff1c").await.unwrap().unwrap();
         assert!(!row.enabled);
         assert!(!repo.set_enabled("missing", true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn update_availability_snapshot_persists_last_check_fields() {
+        let (repo, _db) = setup().await;
+        let row = repo
+            .upsert(&UpsertAgentMetadataParams {
+                id: "agent-claude",
+                icon: None,
+                name: "Claude Code",
+                name_i18n: None,
+                description: None,
+                description_i18n: None,
+                backend: Some("claude"),
+                agent_type: "acp",
+                agent_source: "builtin",
+                agent_source_info: None,
+                enabled: true,
+                command: Some("claude"),
+                args: None,
+                env: None,
+                native_skills_dirs: None,
+                behavior_policy: None,
+                yolo_id: None,
+                agent_capabilities: None,
+                auth_methods: None,
+                config_options: None,
+                available_modes: None,
+                available_models: None,
+                available_commands: None,
+                sort_order: 10,
+            })
+            .await
+            .unwrap();
+
+        repo.update_availability_snapshot(
+            &row.id,
+            &crate::models::UpdateAgentAvailabilitySnapshotParams {
+                last_check_status: Some("available"),
+                last_check_kind: Some("manual"),
+                last_check_error_code: None,
+                last_check_error_message: None,
+                last_check_guidance: None,
+                last_check_latency_ms: Some(180),
+                last_check_at: Some(1_750_000_000_000),
+                last_success_at: Some(1_750_000_000_000),
+                last_failure_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let refreshed = repo.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(refreshed.last_check_status.as_deref(), Some("available"));
+        assert_eq!(refreshed.last_check_kind.as_deref(), Some("manual"));
+        assert_eq!(refreshed.last_check_latency_ms, Some(180));
+        assert_eq!(refreshed.last_success_at, Some(1_750_000_000_000));
     }
 
     #[tokio::test]

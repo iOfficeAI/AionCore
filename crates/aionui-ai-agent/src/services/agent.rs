@@ -16,12 +16,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::{
-    AcpHealthCheckRequest, AcpHealthCheckResponse, AgentMetadata, ProviderHealthCheckRequest,
+    AcpHealthCheckRequest, AcpHealthCheckResponse, AgentManagementRow, AgentMetadata, ProviderHealthCheckRequest,
     ProviderHealthCheckResponse,
 };
 use aionui_db::IProviderRepository;
 use aionui_realtime::EventBroadcaster;
 
+use super::availability::{AgentAvailabilityFeedbackPort, AgentAvailabilityService};
 use super::provider_health::ProviderHealthCheckService;
 use crate::error::AgentError;
 use crate::registry::AgentRegistry;
@@ -31,6 +32,7 @@ pub struct AgentService {
     broadcaster: Arc<dyn EventBroadcaster>,
     data_dir: PathBuf,
     provider_health: ProviderHealthCheckService,
+    availability: AgentAvailabilityService,
 }
 
 impl AgentService {
@@ -42,11 +44,13 @@ impl AgentService {
         data_dir: PathBuf,
     ) -> Arc<Self> {
         let provider_health = ProviderHealthCheckService::new(provider_repo, encryption_key, data_dir.clone());
+        let availability = AgentAvailabilityService::new(registry.clone(), data_dir.clone());
         Arc::new(Self {
             registry,
             broadcaster,
             data_dir,
             provider_health,
+            availability,
         })
     }
 
@@ -64,6 +68,14 @@ impl AgentService {
 
     pub(crate) fn broadcaster(&self) -> &Arc<dyn EventBroadcaster> {
         &self.broadcaster
+    }
+
+    pub fn start_background_scheduler(&self) {
+        self.availability.start_background_scheduler();
+    }
+
+    pub fn availability_feedback_port(&self) -> Arc<dyn AgentAvailabilityFeedbackPort> {
+        Arc::new(self.availability.clone())
     }
 }
 
@@ -92,6 +104,14 @@ impl AgentService {
 
     pub async fn acp_health_check(&self, req: AcpHealthCheckRequest) -> Result<AcpHealthCheckResponse, AgentError> {
         Ok(crate::protocol::cli_detect::health_check(&self.registry, &req.backend).await)
+    }
+
+    pub async fn list_management_agents(&self) -> Result<Vec<AgentManagementRow>, AgentError> {
+        Ok(self.availability.list_management_rows().await)
+    }
+
+    pub async fn health_check_agent_by_id(&self, id: &str) -> Result<AgentManagementRow, AgentError> {
+        self.availability.run_manual_health_check(id).await
     }
 
     pub async fn provider_health_check(
