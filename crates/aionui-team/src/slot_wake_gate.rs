@@ -7,7 +7,7 @@ use crate::wake::{TeamWakeClass, TeamWakeSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WakeGateDecision {
-    Record,
+    Record { resumed_from_pause: bool },
     Suppress,
 }
 
@@ -15,7 +15,6 @@ pub(crate) enum WakeGateDecision {
 pub(crate) struct SlotWakeSnapshot {
     pub paused: bool,
     pub suppressed_wake_count: usize,
-    pub foreground_pending_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -27,7 +26,6 @@ struct PausedSlotState {
     #[allow(dead_code)]
     reason: String,
     suppressed_wake_count: usize,
-    foreground_pending_count: usize,
     last_suppressed_source: Option<TeamWakeSource>,
 }
 
@@ -46,7 +44,6 @@ impl SlotWakeGate {
             role_hint: role.clone(),
             reason: reason.clone(),
             suppressed_wake_count: 0,
-            foreground_pending_count: 0,
             last_suppressed_source: None,
         });
         entry.paused = true;
@@ -59,23 +56,30 @@ impl SlotWakeGate {
         &mut self,
         slot_id: &str,
         source: TeamWakeSource,
-        trigger_message_id: Option<String>,
+        _trigger_message_id: Option<String>,
     ) -> WakeGateDecision {
         if source.resumes_paused_slot() {
-            if let Some(entry) = self.slots.get_mut(slot_id) {
+            let resumed_from_pause = if let Some(entry) = self.slots.get_mut(slot_id) {
+                let was_paused = entry.paused;
                 entry.paused = false;
-                entry.foreground_pending_count += usize::from(trigger_message_id.is_some());
                 entry.reason = "resumed_by_user".into();
-            }
-            return WakeGateDecision::Record;
+                was_paused
+            } else {
+                false
+            };
+            return WakeGateDecision::Record { resumed_from_pause };
         }
 
         let Some(entry) = self.slots.get_mut(slot_id) else {
-            return WakeGateDecision::Record;
+            return WakeGateDecision::Record {
+                resumed_from_pause: false,
+            };
         };
 
         if source.bypasses_pause() {
-            return WakeGateDecision::Record;
+            return WakeGateDecision::Record {
+                resumed_from_pause: false,
+            };
         }
 
         match source.class() {
@@ -84,7 +88,9 @@ impl SlotWakeGate {
                 entry.last_suppressed_source = Some(source);
                 WakeGateDecision::Suppress
             }
-            TeamWakeClass::Foreground | TeamWakeClass::Lifecycle => WakeGateDecision::Record,
+            TeamWakeClass::Foreground | TeamWakeClass::Lifecycle => WakeGateDecision::Record {
+                resumed_from_pause: false,
+            },
         }
     }
 
@@ -94,7 +100,6 @@ impl SlotWakeGate {
             .map(|entry| SlotWakeSnapshot {
                 paused: entry.paused,
                 suppressed_wake_count: entry.suppressed_wake_count,
-                foreground_pending_count: entry.foreground_pending_count,
             })
             .unwrap_or_default()
     }
@@ -112,7 +117,7 @@ impl SlotWakeGate {
     pub(crate) fn has_retained_work(&self) -> bool {
         self.slots
             .values()
-            .any(|entry| entry.paused || entry.suppressed_wake_count > 0 || entry.foreground_pending_count > 0)
+            .any(|entry| entry.paused || entry.suppressed_wake_count > 0)
     }
 
     #[allow(dead_code)]
@@ -138,12 +143,6 @@ impl SlotWakeGate {
         Some(source)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn clear_foreground_pending(&mut self, slot_id: &str) {
-        if let Some(entry) = self.slots.get_mut(slot_id) {
-            entry.foreground_pending_count = 0;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -164,12 +163,17 @@ mod tests {
         assert_eq!(gate.snapshot_for_slot("lead-1").suppressed_wake_count, 1);
 
         let lifecycle = gate.before_wake("lead-1", TeamWakeSource::McpShutdownRequest, None);
-        assert_eq!(lifecycle, WakeGateDecision::Record);
+        assert_eq!(
+            lifecycle,
+            WakeGateDecision::Record {
+                resumed_from_pause: false
+            }
+        );
         assert!(gate.snapshot_for_slot("lead-1").paused);
     }
 
     #[test]
-    fn user_intervention_resumes_and_records_priority_wake() {
+    fn user_intervention_resumes_and_records_one_time_decision() {
         let mut gate = SlotWakeGate::default();
         gate.pause("worker-1", TeamRunTargetRole::Teammate, "user_stop");
         assert!(gate.snapshot_for_slot("worker-1").paused);
@@ -180,10 +184,14 @@ mod tests {
             Some("msg-user".to_owned()),
         );
 
-        assert_eq!(decision, WakeGateDecision::Record);
+        assert_eq!(
+            decision,
+            WakeGateDecision::Record {
+                resumed_from_pause: true
+            }
+        );
         let snapshot = gate.snapshot_for_slot("worker-1");
         assert!(!snapshot.paused);
-        assert_eq!(snapshot.foreground_pending_count, 1);
     }
 
     #[test]
@@ -200,7 +208,9 @@ mod tests {
         );
         assert_eq!(
             gate.before_wake("lead-1", TeamWakeSource::UserIntervention, Some("msg-user".into())),
-            WakeGateDecision::Record
+            WakeGateDecision::Record {
+                resumed_from_pause: true
+            }
         );
 
         let released = gate.release_suppressed_if_resumed("lead-1");

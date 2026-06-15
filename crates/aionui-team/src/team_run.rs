@@ -162,7 +162,6 @@ impl TeamRunRecord {
                     starting_child_count: self.starting_child_count_for_slot(&slot_id),
                     paused: gate.paused,
                     suppressed_wake_count: gate.suppressed_wake_count,
-                    foreground_pending_count: gate.foreground_pending_count,
                     active_turn_id: self.active_child_turns.get(&slot_id).map(|child| child.turn_id.clone()),
                     slot_id,
                     role,
@@ -419,12 +418,7 @@ impl TeamRunManager {
                 self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
                 Ok(WakeRecordDecision::Suppressed)
             }
-            WakeGateDecision::Record => {
-                let was_paused = run.slot_wake_gate.snapshot_for_slot(slot_id).foreground_pending_count > 0
-                    && matches!(
-                        wake_source,
-                        TeamWakeSource::UserMessage | TeamWakeSource::UserIntervention
-                    );
+            WakeGateDecision::Record { resumed_from_pause } => {
                 let pending = PendingWake {
                     slot_id: slot_id.to_owned(),
                     role: target_role.clone(),
@@ -437,7 +431,7 @@ impl TeamRunManager {
                     .push_back(pending);
                 let slot_pending_wake_count = run.pending_wake_count_for_slot(slot_id);
                 let payload = run.payload();
-                if was_paused {
+                if resumed_from_pause {
                     info!(
                         team_id = %self.team_id,
                         team_run_id = %run.team_run_id,
@@ -490,12 +484,6 @@ impl TeamRunManager {
         };
         if run.pending_wakes.get(slot_id).is_some_and(VecDeque::is_empty) {
             run.pending_wakes.remove(slot_id);
-        }
-        if matches!(
-            pending.source,
-            TeamWakeSource::UserMessage | TeamWakeSource::UserIntervention
-        ) {
-            run.slot_wake_gate.clear_foreground_pending(slot_id);
         }
         if pending.slot_id != slot_id {
             warn!(
@@ -1248,7 +1236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_intervention_resumes_paused_slot_and_records_foreground_pending() {
+    async fn user_intervention_resumes_paused_slot_and_records_pending_wake() {
         let (manager, bc) = manager();
         manager
             .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
@@ -1274,7 +1262,7 @@ mod tests {
         let lead = slot_work(&latest, "lead");
         assert!(!lead.paused);
         assert_eq!(lead.pending_wake_count, 1);
-        assert_eq!(lead.foreground_pending_count, 1);
+        assert_eq!(lead.suppressed_wake_count, 0);
     }
 
     #[tokio::test]
