@@ -24,6 +24,7 @@ pub(crate) mod test_utils;
 pub mod types;
 pub mod visibility;
 mod wake;
+mod workspace;
 
 pub use crash_detection::{CrashReason, detect_crash, is_rate_limited};
 pub use error::TeamError;

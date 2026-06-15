@@ -12,6 +12,7 @@ use crate::mcp::TeamMcpStdioConfig;
 use crate::service::inherit_team_workspace;
 use crate::service::spawn_support::{parse_agent_type, resolve_full_auto_mode};
 use crate::types::{Team, TeamAgent, TeammateRole};
+use crate::workspace::TeamWorkspaceResolver;
 
 #[derive(Clone)]
 pub struct TeamAgentProvisioner {
@@ -99,6 +100,10 @@ impl TeamAgentProvisioner {
             provider_repo,
             conversation_port,
         }
+    }
+
+    fn workspace_resolver(&self) -> TeamWorkspaceResolver {
+        TeamWorkspaceResolver::new(self.repo.clone(), self.conversation_port.clone())
     }
 
     pub(crate) async fn provision_initial_agents(

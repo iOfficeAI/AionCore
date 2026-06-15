@@ -9,9 +9,7 @@ use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GuideMcpConfig, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload,
     TeamResponse, TeamRunAckResponse, TeamRunTargetRole, WebSocketMessage,
 };
-use aionui_common::{
-    AgentKillReason, WorkspacePathValidationError, generate_id, now_ms, validate_workspace_path_availability,
-};
+use aionui_common::{AgentKillReason, generate_id, now_ms};
 use aionui_db::models::TeamRow;
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
 use aionui_realtime::EventBroadcaster;
@@ -29,6 +27,7 @@ use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort
 use crate::session::TeamSession;
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::wake::TeamWakeSource;
+use crate::workspace::validate_create_workspace_path;
 
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
     if !workspace.trim().is_empty() {
@@ -984,13 +983,4 @@ impl TeamSessionService {
             .wake_leader_after_recovery_message(source_slot_id, source)
             .await
     }
-}
-
-fn validate_create_workspace_path(workspace: &str) -> Result<String, TeamError> {
-    validate_workspace_path_availability(workspace).map_err(|error| match error {
-        WorkspacePathValidationError::Empty => TeamError::InvalidRequest("Workspace directory is empty".into()),
-        WorkspacePathValidationError::DoesNotExist(path)
-        | WorkspacePathValidationError::NotDirectory(path)
-        | WorkspacePathValidationError::NotAccessible { path, .. } => TeamError::WorkspacePathUnavailable(path),
-    })
 }
