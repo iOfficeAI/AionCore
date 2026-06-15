@@ -1125,9 +1125,12 @@ async fn tc_create_team_uses_custom_agent_id_icon_lookup() {
 
 #[tokio::test]
 async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra() {
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::with_rows(vec![
-        make_agent_metadata_row("2d23ff1c", "claude", "/api/assets/logos/ai-major/claude.svg"),
-    ]));
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
+        Arc::new(StubAgentMetadataRepo::with_rows(vec![make_agent_metadata_row(
+            "2d23ff1c",
+            "claude",
+            "/api/assets/logos/ai-major/claude.svg",
+        )]));
     let (svc, _task_manager, conv_repo) =
         setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
 

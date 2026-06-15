@@ -103,13 +103,13 @@ impl TeamAgentProvisioner {
                     team_id,
                     &slot_id,
                     role,
-                &input.name,
-                &input.backend,
-                &input.model,
-                input.custom_agent_id.as_deref(),
-                input.conversation_id.as_deref(),
-                shared_workspace,
-            )
+                    &input.name,
+                    &input.backend,
+                    &input.model,
+                    input.custom_agent_id.as_deref(),
+                    input.conversation_id.as_deref(),
+                    shared_workspace,
+                )
                 .await?;
             agents.push(TeamAgent {
                 slot_id,
@@ -368,6 +368,7 @@ impl TeamAgentProvisioner {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_team_extra(
         &self,
         team_id: &str,
