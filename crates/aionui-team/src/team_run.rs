@@ -813,6 +813,7 @@ impl TeamRunManager {
         run.status = TeamRunStatus::Cancelling;
         run.cancel_reason = reason;
         run.pending_wakes.clear();
+        run.slot_wake_gate.clear();
         for reservation in run.starting_reservations.values_mut() {
             reservation.state = StartingReservationState::Cancelling;
         }
@@ -1123,6 +1124,43 @@ mod tests {
             .iter()
             .find(|work| work.slot_id == slot_id)
             .expect("slot work must exist")
+    }
+
+    #[tokio::test]
+    async fn cancel_run_clears_paused_gate_and_reaches_cancelled_terminal() {
+        let (manager, bc) = manager();
+        manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
+            .await
+            .unwrap();
+        manager
+            .pause_slot_work("lead", Some("user stopped".into()))
+            .await
+            .unwrap();
+        manager
+            .record_or_suppress_wake(
+                "lead",
+                TeamRunTargetRole::Lead,
+                TeamWakeSource::InterruptedNotification,
+                None,
+            )
+            .await
+            .unwrap();
+
+        manager
+            .begin_cancel(None, Some("stop all".into()))
+            .await
+            .unwrap();
+        let cancelled = manager
+            .try_complete_cancelled()
+            .await
+            .expect("cancel should clear retained gate work");
+
+        assert_eq!(cancelled.status, TeamRunStatus::Cancelled);
+        assert_eq!(cancelled.pending_wake_count, 0);
+        assert_eq!(cancelled.slot_work.len(), 0);
+        assert_eq!(manager.active_run_id().await, None);
+        assert!(bc.names().contains(&TEAM_RUN_CANCELLED_EVENT.to_owned()));
     }
 
     #[tokio::test]

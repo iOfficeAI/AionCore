@@ -35,6 +35,10 @@ pub(crate) struct SlotWakeGate {
 }
 
 impl SlotWakeGate {
+    pub(crate) fn clear(&mut self) {
+        self.slots.clear();
+    }
+
     pub(crate) fn pause(&mut self, slot_id: &str, role: TeamRunTargetRole, reason: impl Into<String>) {
         let reason = reason.into();
         let now = now_ms();
