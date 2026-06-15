@@ -446,6 +446,65 @@ mod tests {
     }
 
     #[test]
+    fn codex_image_tool_update_omits_base64_without_saved_path() {
+        let large_png_base64 = format!("iVBORw0KGgo{}", "A".repeat(128 * 1024));
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "ig_no_path",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "call_id": "ig_no_path",
+                        "status": "generating",
+                        "result": large_png_base64
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+        let raw_output = &json["data"]["update"]["rawOutput"];
+
+        // Oversized base64 must be stripped even though Codex did not save the file.
+        assert!(raw_output.get("result").is_none());
+        assert_eq!(raw_output["result_omitted"], true);
+        // No saved_path means we cannot offer a path-based preview, so no image object.
+        assert!(raw_output.get("image").is_none());
+        // Without a saved image the status must pass through unchanged.
+        assert_eq!(json["data"]["update"]["status"], "in_progress");
+    }
+
+    #[test]
+    fn codex_image_tool_update_preserves_failed_status() {
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "ig_failed_image",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::Failed)
+                    .raw_output(json!({
+                        "call_id": "ig_failed_image",
+                        "status": "failed",
+                        "saved_path": "/Users/test/.codex/generated_images/session/ig_failed_image.png",
+                        "result": format!("iVBORw0KGgo{}", "A".repeat(128 * 1024))
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+
+        // A terminal `failed` status must never be rewritten to `completed`.
+        assert_eq!(json["data"]["update"]["status"], "failed");
+        assert_eq!(json["data"]["update"]["rawOutput"]["status"], "failed");
+        // The base64 payload is still stripped regardless of the failure.
+        assert!(json["data"]["update"]["rawOutput"].get("result").is_none());
+    }
+
+    #[test]
     fn permission_request_maps_to_snake_case_event_data() {
         let request = RequestPermissionRequest::new(
             "sess-1",

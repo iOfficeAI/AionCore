@@ -175,10 +175,15 @@ fn sanitize_inline_image_result(value: &mut serde_json::Value) {
     };
 
     let saved_path = obj.get("saved_path").and_then(|v| v.as_str()).map(str::to_owned);
+    // Strip any oversized inline-image `result` regardless of whether the image was
+    // saved to disk. Older codex versions and interrupted/failed generations may emit
+    // the multi-MB base64 without a `saved_path`; that payload must never reach the
+    // WebSocket broadcast or SQLite either. `saved_path` only decides whether we attach
+    // the structured `image { path, mime_type, source }` object below.
     let should_omit = obj
         .get("result")
         .and_then(|v| v.as_str())
-        .map(|result| saved_path.is_some() && is_probably_inline_image_result(result))
+        .map(is_probably_inline_image_result)
         .unwrap_or(false);
 
     if !should_omit {
@@ -235,16 +240,21 @@ fn normalize_tool_status(
     sdk_status: Option<&SdkToolCallStatus>,
     raw_output: Option<&serde_json::Value>,
 ) -> Option<AcpToolCallStatus> {
-    if raw_output
+    let image_saved = raw_output
         .and_then(|v| v.get("image"))
         .and_then(|v| v.get("path"))
         .and_then(|v| v.as_str())
-        .is_some()
-    {
-        return Some(AcpToolCallStatus::Completed);
-    }
+        .is_some();
 
-    sdk_status.map(map_sdk_tool_status)
+    // Only force `completed` when the image is on disk AND the agent did not already
+    // report a terminal status. Codex stalls by leaving the final event as
+    // `generating`/`in_progress`, but a genuine `failed` must be preserved as-is.
+    match (image_saved, sdk_status.map(map_sdk_tool_status)) {
+        (true, None | Some(AcpToolCallStatus::Pending | AcpToolCallStatus::InProgress)) => {
+            Some(AcpToolCallStatus::Completed)
+        }
+        (_, status) => status,
+    }
 }
 
 fn normalize_raw_output_status(raw_output: &mut Option<serde_json::Value>, status: Option<&AcpToolCallStatus>) {
