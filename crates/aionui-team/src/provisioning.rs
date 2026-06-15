@@ -44,6 +44,12 @@ pub struct TeamConversationCreateRequest {
     pub extra: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamConversationCreateResult {
+    pub conversation_id: String,
+    pub workspace: String,
+}
+
 pub struct TeamConversationAdoptRequest {
     pub conversation_id: String,
     pub extra: serde_json::Value,
@@ -51,9 +57,16 @@ pub struct TeamConversationAdoptRequest {
 
 #[async_trait]
 pub trait TeamConversationProvisioningPort: Send + Sync {
-    async fn create_team_conversation(&self, request: TeamConversationCreateRequest) -> Result<String, TeamError>;
+    async fn create_team_conversation(
+        &self,
+        request: TeamConversationCreateRequest,
+    ) -> Result<TeamConversationCreateResult, TeamError>;
 
     async fn adopt_team_conversation(&self, request: TeamConversationAdoptRequest) -> Result<(), TeamError>;
+
+    async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
+
+    async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError>;
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
 
@@ -332,7 +345,7 @@ impl TeamAgentProvisioner {
             extra["current_model_id"] = serde_json::Value::String(model.to_owned());
             (None, extra)
         };
-        let conv_id = self
+        let created = self
             .conversation_port
             .create_team_conversation(TeamConversationCreateRequest {
                 user_id: user_id.to_owned(),
@@ -342,6 +355,7 @@ impl TeamAgentProvisioner {
                 extra,
             })
             .await?;
+        let conv_id = created.conversation_id;
         info!(
             team_id,
             slot_id,

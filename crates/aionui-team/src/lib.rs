@@ -43,7 +43,8 @@ pub use ports::{
 
 pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 pub use provisioning::{
-    TeamAgentProvisioner, TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationProvisioningPort,
+    TeamAgentProvisioner, TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationCreateResult,
+    TeamConversationProvisioningPort,
 };
 pub use routes::{TeamRouterState, team_routes};
 pub use scheduler::{

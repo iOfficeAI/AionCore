@@ -327,6 +327,16 @@ impl ConversationService {
         self
     }
 
+    pub fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, ConversationError> {
+        let ws_path = self
+            .workspace_root
+            .join("conversations")
+            .join(format!("team-temp-{team_id}"));
+        std::fs::create_dir_all(&ws_path)
+            .map_err(|e| ConversationError::internal(format!("Failed to create Team temporary workspace: {e}")))?;
+        Ok(ws_path.to_string_lossy().into_owned())
+    }
+
     pub fn with_cron_service(&self, cron_service: Option<Arc<dyn ICronService>>) {
         if let Ok(mut guard) = self.cron_service.write() {
             *guard = cron_service;

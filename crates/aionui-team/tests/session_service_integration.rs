@@ -27,8 +27,8 @@ use aionui_team::ports::{
 };
 use aionui_team::session::SpawnAgentRequest;
 use aionui_team::{
-    TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationProvisioningPort,
-    TeamProjectionMessageStore,
+    TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationCreateResult,
+    TeamConversationProvisioningPort, TeamProjectionMessageStore,
 };
 use aionui_team::{TeamError, TeamSessionService};
 use common::MockTeamRepo;
@@ -223,11 +223,22 @@ fn noop_cancellation_port() -> Arc<dyn AgentTurnCancellationPort> {
 struct FakeConversationPorts {
     repo: Arc<MockConversationRepo>,
     broadcaster: Arc<dyn EventBroadcaster>,
+    workspace_root: std::path::PathBuf,
+    fail_team_temp_create: std::sync::atomic::AtomicBool,
+    fail_leader_workspace_patch: std::sync::atomic::AtomicBool,
 }
 
 impl FakeConversationPorts {
     fn new(repo: Arc<MockConversationRepo>, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
-        Self { repo, broadcaster }
+        let workspace_root =
+            std::env::temp_dir().join(format!("aionui-team-fake-workspaces-{}", aionui_common::generate_id()));
+        Self {
+            repo,
+            broadcaster,
+            workspace_root,
+            fail_team_temp_create: std::sync::atomic::AtomicBool::new(false),
+            fail_leader_workspace_patch: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
@@ -236,9 +247,22 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
     async fn create_team_conversation(
         &self,
         request: TeamConversationCreateRequest,
-    ) -> Result<String, aionui_team::TeamError> {
+    ) -> Result<TeamConversationCreateResult, aionui_team::TeamError> {
         let id = aionui_common::generate_id();
         let now = aionui_common::now_ms();
+        let workspace = request
+            .extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                let path = self.workspace_root.join("conversations").join(format!("acp-temp-{id}"));
+                std::fs::create_dir_all(&path).unwrap();
+                path.to_string_lossy().into_owned()
+            });
+        let mut extra = request.extra;
+        extra["workspace"] = serde_json::Value::String(workspace.clone());
         self.repo
             .create(&ConversationRow {
                 id: id.clone(),
@@ -249,7 +273,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 pinned_at: None,
                 source: None,
                 channel_chat_id: None,
-                extra: serde_json::to_string(&request.extra).unwrap(),
+                extra: serde_json::to_string(&extra).unwrap(),
                 model: request
                     .top_level_model
                     .map(|m| serde_json::to_string(&m).expect("serialize provider model")),
@@ -258,7 +282,10 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 updated_at: now,
             })
             .await?;
-        Ok(id)
+        Ok(TeamConversationCreateResult {
+            conversation_id: id,
+            workspace,
+        })
     }
 
     async fn adopt_team_conversation(
@@ -289,11 +316,46 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         Ok(())
     }
 
+    async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, aionui_team::TeamError> {
+        Ok(self.repo.get_extra(conversation_id).and_then(|extra| {
+            extra
+                .get("workspace")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }))
+    }
+
+    async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, aionui_team::TeamError> {
+        if self
+            .fail_team_temp_create
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(aionui_team::TeamError::InvalidRequest(
+                "failed to create Team temporary workspace for test".into(),
+            ));
+        }
+        let path = self
+            .workspace_root
+            .join("conversations")
+            .join(format!("team-temp-{team_id}"));
+        std::fs::create_dir_all(&path).unwrap();
+        Ok(path.to_string_lossy().into_owned())
+    }
+
     async fn patch_runtime_config(
         &self,
         conversation_id: &str,
         patch: serde_json::Value,
     ) -> Result<(), aionui_team::TeamError> {
+        if patch.get("workspace").is_some()
+            && self
+                .fail_leader_workspace_patch
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(aionui_team::TeamError::InvalidRequest(
+                "forced leader workspace patch failure".into(),
+            ));
+        }
         let mut extra = self
             .repo
             .get_extra(conversation_id)
