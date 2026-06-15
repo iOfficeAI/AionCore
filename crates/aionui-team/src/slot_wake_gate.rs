@@ -16,7 +16,6 @@ pub(crate) struct SlotWakeSnapshot {
     pub paused: bool,
     pub suppressed_wake_count: usize,
     pub foreground_pending_count: usize,
-    pub background_pending_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -29,7 +28,6 @@ struct PausedSlotState {
     reason: String,
     suppressed_wake_count: usize,
     foreground_pending_count: usize,
-    background_pending_count: usize,
     last_suppressed_source: Option<TeamWakeSource>,
 }
 
@@ -49,7 +47,6 @@ impl SlotWakeGate {
             reason: reason.clone(),
             suppressed_wake_count: 0,
             foreground_pending_count: 0,
-            background_pending_count: 0,
             last_suppressed_source: None,
         });
         entry.paused = true;
@@ -98,7 +95,6 @@ impl SlotWakeGate {
                 paused: entry.paused,
                 suppressed_wake_count: entry.suppressed_wake_count,
                 foreground_pending_count: entry.foreground_pending_count,
-                background_pending_count: entry.background_pending_count,
             })
             .unwrap_or_default()
     }
@@ -114,12 +110,9 @@ impl SlotWakeGate {
     }
 
     pub(crate) fn has_retained_work(&self) -> bool {
-        self.slots.values().any(|entry| {
-            entry.paused
-                || entry.suppressed_wake_count > 0
-                || entry.foreground_pending_count > 0
-                || entry.background_pending_count > 0
-        })
+        self.slots
+            .values()
+            .any(|entry| entry.paused || entry.suppressed_wake_count > 0 || entry.foreground_pending_count > 0)
     }
 
     #[allow(dead_code)]
@@ -142,7 +135,6 @@ impl SlotWakeGate {
         }
         let source = entry.last_suppressed_source.unwrap_or(TeamWakeSource::McpSendMessage);
         entry.suppressed_wake_count = 0;
-        entry.background_pending_count += 1;
         Some(source)
     }
 
@@ -215,6 +207,5 @@ mod tests {
         assert_eq!(released, Some(TeamWakeSource::IdleNotification));
         let snapshot = gate.snapshot_for_slot("lead-1");
         assert_eq!(snapshot.suppressed_wake_count, 0);
-        assert_eq!(snapshot.background_pending_count, 1);
     }
 }

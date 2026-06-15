@@ -163,7 +163,6 @@ impl TeamRunRecord {
                     paused: gate.paused,
                     suppressed_wake_count: gate.suppressed_wake_count,
                     foreground_pending_count: gate.foreground_pending_count,
-                    background_pending_count: gate.background_pending_count,
                     active_turn_id: self.active_child_turns.get(&slot_id).map(|child| child.turn_id.clone()),
                     slot_id,
                     role,
@@ -985,7 +984,6 @@ impl TeamRunManager {
             pending_wake_count = payload.pending_wake_count,
             slot_pending_wake_count = slot_work.map(|work| work.pending_wake_count).unwrap_or_default(),
             suppressed_wake_count = slot_work.map(|work| work.suppressed_wake_count).unwrap_or_default(),
-            background_pending_count = slot_work.map(|work| work.background_pending_count).unwrap_or_default(),
             "team suppressed wake released"
         );
         drop(guard);

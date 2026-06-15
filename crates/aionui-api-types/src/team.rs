@@ -246,8 +246,6 @@ pub struct TeamSlotWorkPayload {
     pub suppressed_wake_count: usize,
     #[serde(default)]
     pub foreground_pending_count: usize,
-    #[serde(default)]
-    pub background_pending_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<String>,
 }
@@ -1115,7 +1113,6 @@ mod tests {
                     paused: false,
                     suppressed_wake_count: 0,
                     foreground_pending_count: 0,
-                    background_pending_count: 0,
                     active_turn_id: Some("turn-lead".into()),
                 },
                 TeamSlotWorkPayload {
@@ -1126,7 +1123,6 @@ mod tests {
                     paused: false,
                     suppressed_wake_count: 0,
                     foreground_pending_count: 0,
-                    background_pending_count: 0,
                     active_turn_id: None,
                 },
             ],
@@ -1162,14 +1158,13 @@ mod tests {
             paused: true,
             suppressed_wake_count: 2,
             foreground_pending_count: 1,
-            background_pending_count: 2,
         };
 
         let value = serde_json::to_value(&payload).unwrap();
         assert_eq!(value["paused"], true);
         assert_eq!(value["suppressed_wake_count"], 2);
         assert_eq!(value["foreground_pending_count"], 1);
-        assert_eq!(value["background_pending_count"], 2);
+        assert!(value.get("background_pending_count").is_none());
     }
 
     #[test]
@@ -1185,7 +1180,6 @@ mod tests {
         assert!(!decoded.paused);
         assert_eq!(decoded.suppressed_wake_count, 0);
         assert_eq!(decoded.foreground_pending_count, 0);
-        assert_eq!(decoded.background_pending_count, 0);
     }
 
     #[test]
