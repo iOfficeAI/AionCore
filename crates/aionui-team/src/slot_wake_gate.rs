@@ -138,14 +138,24 @@ impl SlotWakeGate {
     }
 
     pub(crate) fn release_suppressed_if_resumed(&mut self, slot_id: &str) -> Option<TeamWakeSource> {
-        let entry = self.slots.get_mut(slot_id)?;
-        if entry.paused || entry.suppressed_wake_count == 0 {
-            return None;
+        let source = {
+            let entry = self.slots.get_mut(slot_id)?;
+            if entry.paused || entry.suppressed_wake_count == 0 {
+                return None;
+            }
+            let source = entry.last_suppressed_source.unwrap_or(TeamWakeSource::McpSendMessage);
+            entry.suppressed_wake_count = 0;
+            source
+        };
+        if self.slots.get(slot_id).is_some_and(should_prune) {
+            self.slots.remove(slot_id);
         }
-        let source = entry.last_suppressed_source.unwrap_or(TeamWakeSource::McpSendMessage);
-        entry.suppressed_wake_count = 0;
         Some(source)
     }
+}
+
+fn should_prune(entry: &PausedSlotState) -> bool {
+    !entry.paused && entry.suppressed_wake_count == 0
 }
 
 #[cfg(test)]
@@ -220,5 +230,26 @@ mod tests {
         assert_eq!(released, Some(TeamWakeSource::IdleNotification));
         let snapshot = gate.snapshot_for_slot("lead-1");
         assert_eq!(snapshot.suppressed_wake_count, 0);
+    }
+
+    #[test]
+    fn release_suppressed_removes_slot_when_no_retained_work_remains() {
+        let mut gate = SlotWakeGate::default();
+        gate.pause("lead-1", TeamRunTargetRole::Lead, "user stopped");
+        assert_eq!(
+            gate.before_wake("lead-1", TeamWakeSource::IdleNotification, None),
+            WakeGateDecision::Suppress
+        );
+        assert_eq!(
+            gate.before_wake("lead-1", TeamWakeSource::UserMessage, Some("msg-user".into())),
+            WakeGateDecision::Record {
+                resumed_from_pause: true
+            }
+        );
+
+        let released = gate.release_suppressed_if_resumed("lead-1");
+        assert_eq!(released, Some(TeamWakeSource::IdleNotification));
+        assert!(!gate.has_retained_work());
+        assert_eq!(gate.slot_ids().count(), 0, "empty resumed gate entry should be pruned");
     }
 }

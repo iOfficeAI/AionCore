@@ -1455,6 +1455,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resumed_user_message_releases_suppressed_wake_and_allows_completion() {
+        let (manager, bc) = manager();
+        let ack = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
+            .await
+            .unwrap();
+
+        manager
+            .pause_slot_work("lead", Some("user stopped".into()))
+            .await
+            .unwrap();
+        manager
+            .record_or_suppress_wake(
+                "lead",
+                TeamRunTargetRole::Lead,
+                TeamWakeSource::IdleNotification,
+                Some("idle-msg".into()),
+            )
+            .await
+            .unwrap();
+
+        manager
+            .record_or_suppress_wake(
+                "lead",
+                TeamRunTargetRole::Lead,
+                TeamWakeSource::UserMessage,
+                Some("user-msg".into()),
+            )
+            .await
+            .unwrap();
+
+        let user_reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .expect("foreground user message wake should run first");
+        assert_eq!(
+            manager
+                .record_child_started(
+                    &user_reservation.reservation_id,
+                    ActiveChildTurn {
+                        team_run_id: ack.team_run_id.clone(),
+                        slot_id: "lead".into(),
+                        role: TeamRunTargetRole::Lead,
+                        conversation_id: "conv-lead".into(),
+                        turn_id: "turn-user".into(),
+                    },
+                )
+                .await,
+            ChildStartDecision::Accepted
+        );
+        assert!(
+            manager
+                .record_child_completed("lead", "turn-user", TeamRunStatus::Completed)
+                .await
+                .is_none(),
+            "suppressed background wake should retain the run until released"
+        );
+
+        let source = manager
+            .release_suppressed_wake_if_resumed("lead", TeamRunTargetRole::Lead)
+            .await;
+        assert_eq!(source, Some(TeamWakeSource::IdleNotification));
+
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .expect("released suppressed wake should become pending wake");
+        assert_eq!(
+            manager
+                .record_child_started(
+                    &reservation.reservation_id,
+                    ActiveChildTurn {
+                        team_run_id: ack.team_run_id.clone(),
+                        slot_id: "lead".into(),
+                        role: TeamRunTargetRole::Lead,
+                        conversation_id: "conv-lead".into(),
+                        turn_id: "turn-background".into(),
+                    },
+                )
+                .await,
+            ChildStartDecision::Accepted
+        );
+        let completed = manager
+            .record_child_completed("lead", "turn-background", TeamRunStatus::Completed)
+            .await
+            .expect("run should complete after released background wake is consumed");
+
+        assert_eq!(completed.status, TeamRunStatus::Completed);
+        assert_eq!(completed.pending_wake_count, 0);
+        assert_eq!(completed.starting_child_count, 0);
+        assert_eq!(completed.active_child_count, 0);
+        assert_eq!(
+            completed.slot_work.len(),
+            0,
+            "gate state should not leave empty slot work"
+        );
+        assert!(bc.names().contains(&TEAM_RUN_COMPLETED_EVENT.to_owned()));
+    }
+
+    #[tokio::test]
     async fn active_intervention_ack_uses_accepted_slot_without_changing_initial_target() {
         let (manager, _) = manager();
         let first = manager

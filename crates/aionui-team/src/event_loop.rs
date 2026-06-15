@@ -424,7 +424,8 @@ async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, input: &crat
             .await;
         ctx.session.team_run_manager().maybe_complete().await;
     }
-    if matches!(input.wake_source, Some(TeamWakeSource::UserIntervention)) {
+    let should_release_suppressed_wake = input.wake_source.is_some_and(TeamWakeSource::resumes_paused_slot);
+    if should_release_suppressed_wake {
         let role = target_role_for(input.agent_role);
         if ctx
             .session

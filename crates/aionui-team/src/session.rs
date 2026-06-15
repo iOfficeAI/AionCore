@@ -620,6 +620,8 @@ impl TeamSession {
     /// - `from_agent_id == "user"`: user-originated messages are already
     ///   written to the conversation by the standard user-send path, and we
     ///   must not double-write them.
+    /// - `IdleNotification`: internal mailbox wake/prompt signal, not a
+    ///   teammate chat message.
     ///
     /// Failures per-message are logged and swallowed — the mailbox rows are
     /// already marked read, and we never let a conversation-write failure
@@ -634,6 +636,9 @@ impl TeamSession {
 
         for msg in &input.unread {
             if msg.from_agent_id == "user" {
+                continue;
+            }
+            if msg.msg_type == MailboxMessageType::IdleNotification {
                 continue;
             }
             let sender = agents.iter().find(|a| a.slot_id == msg.from_agent_id);
@@ -2467,6 +2472,66 @@ mod tests {
         // In unit tests, `service` is a dangling Weak — the mirror helper must
         // skip gracefully even for leader targets.
         session.mirror_unread_to_conversation(&input).await;
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn mirror_unread_to_conversation_skips_idle_notification_bubbles() {
+        let store = Arc::new(RecordingProjectionStore::default());
+        let session = start_session_with_projection_store(store.clone()).await;
+        session
+            .mailbox
+            .write(
+                "t1",
+                "lead-1",
+                "worker-1",
+                MailboxMessageType::IdleNotification,
+                "idle",
+                Some("idle"),
+            )
+            .await
+            .unwrap();
+
+        let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
+        assert_eq!(
+            input.unread.len(),
+            1,
+            "idle notification must still be delivered to wake payload"
+        );
+
+        session.mirror_unread_to_conversation(&input).await;
+
+        assert!(
+            store.inserted.lock().unwrap().is_empty(),
+            "idle notification must not become a visible chat bubble"
+        );
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn mirror_unread_to_conversation_still_projects_teammate_messages() {
+        let store = Arc::new(RecordingProjectionStore::default());
+        let session = start_session_with_projection_store(store.clone()).await;
+        session
+            .mailbox
+            .write(
+                "t1",
+                "lead-1",
+                "worker-1",
+                MailboxMessageType::Message,
+                "work is done",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
+        session.mirror_unread_to_conversation(&input).await;
+
+        let inserted = store.inserted.lock().unwrap();
+        assert_eq!(inserted.len(), 1, "normal teammate message must remain visible");
+        let content: serde_json::Value = serde_json::from_str(&inserted[0].content).unwrap();
+        assert_eq!(content["content"], "work is done");
         session.stop();
     }
 
