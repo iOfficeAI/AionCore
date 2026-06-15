@@ -203,13 +203,14 @@ impl TeamSessionService {
             .await?;
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;
+        let team_workspace = provisioned.team_workspace;
         let agents_json = serde_json::to_string(&agents)?;
 
         let row = TeamRow {
             id: team_id.clone(),
             user_id: user_id.to_owned(),
             name: req.name.clone(),
-            workspace: shared_workspace.clone().unwrap_or_default(),
+            workspace: team_workspace.clone(),
             workspace_mode: "shared".into(),
             agents: agents_json,
             lead_agent_id: lead_agent_id.clone(),
@@ -223,13 +224,23 @@ impl TeamSessionService {
         let team = Team {
             id: team_id,
             name: req.name,
+            workspace: team_workspace,
             agents,
             lead_agent_id,
             created_at: now,
             updated_at: now,
         };
 
-        info!(team_id = %team.id, "Team created");
+        info!(
+            team_id = %team.id,
+            workspace_source = if shared_workspace.is_some() {
+                "user_supplied"
+            } else {
+                "auto_from_leader"
+            },
+            agent_count = team.agents.len(),
+            "Team created"
+        );
 
         self.broadcast_team_created(&team.id, &team.name);
 

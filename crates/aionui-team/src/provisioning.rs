@@ -5,7 +5,7 @@ use aionui_api_types::{AddAgentRequest, TeamAgentInput};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::{IProviderRepository, ITeamRepository, UpdateTeamParams};
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::TeamError;
 use crate::mcp::TeamMcpStdioConfig;
@@ -23,6 +23,12 @@ pub struct TeamAgentProvisioner {
 pub(crate) struct InitialProvisioningResult {
     pub agents: Vec<TeamAgent>,
     pub lead_agent_id: Option<String>,
+    pub team_workspace: String,
+}
+
+struct ProvisionedConversation {
+    conversation_id: String,
+    workspace: Option<String>,
 }
 
 struct NewAgentProvisioning {
@@ -102,15 +108,56 @@ impl TeamAgentProvisioner {
         inputs: &[TeamAgentInput],
         shared_workspace: Option<&str>,
     ) -> Result<InitialProvisioningResult, TeamError> {
+        let Some((leader_input, teammate_inputs)) = inputs.split_first() else {
+            return Err(TeamError::InvalidRequest("at least one agent is required".into()));
+        };
+
+        let leader_slot_id = generate_id();
+        let leader_role = TeammateRole::Lead;
+        let leader_conversation = self
+            .create_or_adopt_conversation(
+                user_id,
+                team_id,
+                &leader_slot_id,
+                leader_role,
+                &leader_input.name,
+                &leader_input.backend,
+                &leader_input.model,
+                leader_input.conversation_id.as_deref(),
+                shared_workspace,
+            )
+            .await?;
+
+        let team_workspace = match shared_workspace {
+            Some(workspace) => workspace.to_owned(),
+            None => {
+                self.resolve_initial_leader_workspace(
+                    team_id,
+                    &leader_conversation.conversation_id,
+                    leader_conversation.workspace,
+                )
+                .await?
+            }
+        };
+
         let mut agents = Vec::with_capacity(inputs.len());
-        for (index, input) in inputs.iter().enumerate() {
+        agents.push(TeamAgent {
+            slot_id: leader_slot_id.clone(),
+            name: leader_input.name.clone(),
+            role: leader_role,
+            conversation_id: leader_conversation.conversation_id,
+            backend: leader_input.backend.clone(),
+            model: leader_input.model.clone(),
+            custom_agent_id: leader_input.custom_agent_id.clone(),
+            status: None,
+            conversation_type: None,
+            cli_path: None,
+        });
+
+        for input in teammate_inputs {
             let slot_id = generate_id();
-            let role = if index == 0 {
-                TeammateRole::Lead
-            } else {
-                TeammateRole::parse(&input.role).unwrap_or(TeammateRole::Teammate)
-            };
-            let conversation_id = self
+            let role = TeammateRole::parse(&input.role).unwrap_or(TeammateRole::Teammate);
+            let conversation = self
                 .create_or_adopt_conversation(
                     user_id,
                     team_id,
@@ -120,14 +167,14 @@ impl TeamAgentProvisioner {
                     &input.backend,
                     &input.model,
                     input.conversation_id.as_deref(),
-                    shared_workspace,
+                    Some(&team_workspace),
                 )
                 .await?;
             agents.push(TeamAgent {
                 slot_id,
                 name: input.name.clone(),
                 role,
-                conversation_id,
+                conversation_id: conversation.conversation_id,
                 backend: input.backend.clone(),
                 model: input.model.clone(),
                 custom_agent_id: input.custom_agent_id.clone(),
@@ -136,9 +183,23 @@ impl TeamAgentProvisioner {
                 cli_path: None,
             });
         }
-        let lead_agent_id = agents.first().map(|agent| agent.slot_id.clone());
-        info!(team_id, count = agents.len(), "Team agents provisioned");
-        Ok(InitialProvisioningResult { agents, lead_agent_id })
+
+        let lead_agent_id = Some(leader_slot_id);
+        info!(
+            team_id,
+            count = agents.len(),
+            workspace_source = if shared_workspace.is_some() {
+                "user_supplied"
+            } else {
+                "auto_from_leader"
+            },
+            "Team agents provisioned"
+        );
+        Ok(InitialProvisioningResult {
+            agents,
+            lead_agent_id,
+            team_workspace,
+        })
     }
 
     pub(crate) async fn add_agent(
@@ -262,7 +323,7 @@ impl TeamAgentProvisioner {
 
     async fn provision_new_agent(&self, input: NewAgentProvisioning) -> Result<TeamAgent, TeamError> {
         let slot_id = generate_id();
-        let conversation_id = self
+        let conversation = self
             .create_or_adopt_conversation(
                 &input.user_id,
                 &input.team_id,
@@ -279,7 +340,7 @@ impl TeamAgentProvisioner {
             slot_id,
             name: input.name,
             role: input.role,
-            conversation_id,
+            conversation_id: conversation.conversation_id,
             backend: input.backend,
             model: input.model,
             custom_agent_id: input.custom_agent_id,
@@ -301,7 +362,7 @@ impl TeamAgentProvisioner {
         model: &str,
         existing_conversation_id: Option<&str>,
         workspace: Option<&str>,
-    ) -> Result<String, TeamError> {
+    ) -> Result<ProvisionedConversation, TeamError> {
         let extra = self
             .build_team_extra(team_id, slot_id, role, backend, model, workspace)
             .await?;
@@ -319,7 +380,10 @@ impl TeamAgentProvisioner {
                 outcome = "adopted",
                 "Team agent provisioned"
             );
-            return Ok(existing_id.to_owned());
+            return Ok(ProvisionedConversation {
+                conversation_id: existing_id.to_owned(),
+                workspace: workspace.map(str::to_owned),
+            });
         }
 
         let agent_type = parse_agent_type(backend)?;
@@ -356,6 +420,7 @@ impl TeamAgentProvisioner {
             })
             .await?;
         let conv_id = created.conversation_id;
+        let resolved_workspace = created.workspace;
         info!(
             team_id,
             slot_id,
@@ -363,7 +428,50 @@ impl TeamAgentProvisioner {
             outcome = "created",
             "Team agent provisioned"
         );
-        Ok(conv_id)
+        Ok(ProvisionedConversation {
+            conversation_id: conv_id,
+            workspace: Some(resolved_workspace),
+        })
+    }
+
+    async fn resolve_initial_leader_workspace(
+        &self,
+        team_id: &str,
+        leader_conversation_id: &str,
+        created_workspace: Option<String>,
+    ) -> Result<String, TeamError> {
+        if let Some(workspace) = created_workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(workspace.to_owned());
+        }
+
+        if let Some(workspace) = self
+            .conversation_port
+            .conversation_workspace(leader_conversation_id)
+            .await?
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(workspace);
+        }
+
+        let workspace = self.conversation_port.create_team_temp_workspace(team_id).await?;
+        if let Err(e) = self
+            .conversation_port
+            .patch_runtime_config(leader_conversation_id, serde_json::json!({ "workspace": workspace }))
+            .await
+        {
+            warn!(
+                team_id,
+                conversation_id = %leader_conversation_id,
+                error = %e,
+                "failed to patch leader workspace during initial team provisioning"
+            );
+        }
+        Ok(workspace)
     }
 
     pub(crate) async fn patch_guide_mcp_config(

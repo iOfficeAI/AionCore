@@ -1413,6 +1413,7 @@ mod tests {
         Team {
             id: "t1".into(),
             name: "Test Team".into(),
+            workspace: "/tmp/test-team".into(),
             agents: vec![
                 TeamAgent {
                     slot_id: "lead-1".into(),

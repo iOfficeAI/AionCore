@@ -1156,6 +1156,74 @@ async fn tc1_create_team_with_multiple_agents() {
 }
 
 #[tokio::test]
+async fn create_team_with_workspace_writes_same_workspace_to_team_and_initial_agents() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+    let workspace_dir =
+        std::env::temp_dir().join(format!("aionui-team-user-workspace-{}", aionui_common::generate_id()));
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let workspace = workspace_dir.to_string_lossy().into_owned();
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Shared".into(),
+                agents: two_agent_input(),
+                workspace: Some(workspace.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let got = svc.get_team("user1", &created.id).await.unwrap();
+    assert_eq!(got.workspace, workspace);
+    for agent in &got.agents {
+        let extra = conv_repo.get_extra(&agent.conversation_id).unwrap();
+        assert_eq!(
+            extra.get("workspace").and_then(serde_json::Value::as_str),
+            Some(workspace.as_str())
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_team_without_workspace_uses_leader_auto_workspace_for_all_initial_agents() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Auto Shared".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let got = svc.get_team("user1", &created.id).await.unwrap();
+    assert!(!got.workspace.trim().is_empty(), "teams.workspace must be set");
+    assert!(
+        got.workspace.contains("/conversations/acp-temp-"),
+        "unexpected auto workspace: {}",
+        got.workspace
+    );
+
+    for agent in &got.agents {
+        let extra = conv_repo.get_extra(&agent.conversation_id).unwrap();
+        assert_eq!(
+            extra.get("workspace").and_then(serde_json::Value::as_str),
+            Some(got.workspace.as_str())
+        );
+    }
+}
+
+#[tokio::test]
 async fn tc_create_team_uses_custom_agent_id_icon_lookup() {
     let svc = setup_with_metadata_rows(vec![make_agent_metadata_row(
         "2d23ff1c",
