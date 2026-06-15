@@ -758,7 +758,7 @@ async fn exec_shutdown_agent(
         .map_err(|e| e.to_string())?;
 
     service
-        .wake_agent_for_team_work(team_id, &target_slot_id, TeamWakeSource::McpShutdownRequest)
+        .wake_agent_for_team_work(team_id, &target_slot_id, TeamWakeSource::McpShutdownRequest, None)
         .await
         .map_err(|e| e.to_string())?;
 

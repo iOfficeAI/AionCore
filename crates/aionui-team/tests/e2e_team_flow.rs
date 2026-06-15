@@ -38,7 +38,7 @@ use aionui_team::event_loop::AgentLoopContext;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnStarted, AgentTurnStatus,
+    AgentTurnSource, AgentTurnStarted, AgentTurnStatus,
 };
 use aionui_team::service::TeamSessionService;
 use aionui_team::{TeamAgent, TeamProjectionMessageStore, TeamSession, TeammateRole};
@@ -561,6 +561,28 @@ async fn setup_session_with_turn_recorder() -> (
     Arc<Mutex<Vec<SendMessageData>>>,
     Arc<Mutex<Vec<AgentTurnRequest>>>,
 ) {
+    setup_session_with_turn_recorder_inner(true).await
+}
+
+async fn setup_session_with_turn_recorder_without_loops() -> (
+    Arc<TeamSession>,
+    Arc<StubTaskManager>,
+    Arc<MockTeamRepo>,
+    Arc<Mutex<Vec<SendMessageData>>>,
+    Arc<Mutex<Vec<AgentTurnRequest>>>,
+) {
+    setup_session_with_turn_recorder_inner(false).await
+}
+
+async fn setup_session_with_turn_recorder_inner(
+    register_loops: bool,
+) -> (
+    Arc<TeamSession>,
+    Arc<StubTaskManager>,
+    Arc<MockTeamRepo>,
+    Arc<Mutex<Vec<SendMessageData>>>,
+    Arc<Mutex<Vec<AgentTurnRequest>>>,
+) {
     let repo = Arc::new(MockTeamRepo::new());
     let repo_dyn: Arc<dyn ITeamRepository> = repo.clone();
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
@@ -604,7 +626,9 @@ async fn setup_session_with_turn_recorder() -> (
     .expect("TeamSession::start failed");
 
     let session = Arc::new(session);
-    register_test_event_loops(&session);
+    if register_loops {
+        register_test_event_loops(&session);
+    }
 
     (session, task_manager, repo, sent, turn_requests)
 }
@@ -687,6 +711,16 @@ fn register_test_event_loops(session: &Arc<TeamSession>) {
         };
         registry.spawn(&agent.slot_id, ctx);
     }
+}
+
+async fn wait_until_turn_count(turn_requests: &Arc<Mutex<Vec<AgentTurnRequest>>>, expected: usize) {
+    for _ in 0..100 {
+        if turn_requests.lock().unwrap().len() >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {expected} turn requests");
 }
 
 // ===========================================================================
@@ -1448,6 +1482,56 @@ async fn s8b_worker_cannot_call_spawn_agent() {
 // ===========================================================================
 // Scenario 9: send_message via TeamSession (not MCP) — direct API path
 // ===========================================================================
+
+#[tokio::test]
+async fn s8_paused_slot_user_intervention_runs_first_then_releases_background_backlog() {
+    let (session, _task_manager, _repo, _sent, turn_requests) = setup_session_with_turn_recorder_without_loops().await;
+
+    let ack = session.send_message("start team", None).await.unwrap();
+    session
+        .pause_slot_work(&ack.team_run_id, "lead-1", Some("user stopped".into()))
+        .await
+        .unwrap();
+    session
+        .mailbox()
+        .write(
+            "e2e-team",
+            "lead-1",
+            "worker-1",
+            aionui_team::MailboxMessageType::Message,
+            "background backlog",
+            None,
+        )
+        .await
+        .unwrap();
+    let user_ack = session
+        .send_message_to_agent("lead-1", "user priority", None)
+        .await
+        .unwrap();
+
+    register_test_event_loops(&session);
+    session.event_loops().notify("lead-1");
+
+    wait_until_turn_count(&turn_requests, 1).await;
+    let first = turn_requests.lock().unwrap()[0].clone();
+    assert!(first.content.contains("user priority"));
+    assert!(!first.content.contains("background backlog"));
+    match first.source {
+        AgentTurnSource::Mailbox {
+            unread_message_ids,
+            unread_count,
+        } => {
+            assert_eq!(unread_count, 1);
+            assert_eq!(unread_message_ids, vec![user_ack.message_id.unwrap()]);
+        }
+    }
+
+    wait_until_turn_count(&turn_requests, 2).await;
+    let second = turn_requests.lock().unwrap()[1].clone();
+    assert!(second.content.contains("background backlog"));
+
+    session.stop();
+}
 
 /// Scenario 9: TeamSession::send_message writes to lead mailbox and
 /// triggers lead's RecordingAgent.send_message.

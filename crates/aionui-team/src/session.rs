@@ -21,7 +21,7 @@ use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payloa
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
-use crate::team_run::{ChildCancelTarget, TeamRunManager, target_role_for};
+use crate::team_run::{ChildCancelTarget, TeamRunManager, WakeRecordDecision, target_role_for};
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::wake::TeamWakeSource;
 
@@ -44,6 +44,8 @@ pub struct WakeInput {
     pub unread: Vec<crate::types::MailboxMessage>,
     /// Role of the wake target.
     pub agent_role: TeammateRole,
+    pub(crate) wake_source: Option<TeamWakeSource>,
+    pub(crate) trigger_message_id: Option<String>,
 }
 
 /// Input for [`TeamSession::spawn_agent`]. Populated by the lead agent when
@@ -215,11 +217,35 @@ impl TeamSession {
     pub async fn compute_wake_input(&self, slot_id: &str) -> Result<Option<WakeInput>, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
         let all_unread = self.mailbox.peek_unread(&self.team.id, slot_id).await?;
+        let next_wake = self.team_run_manager.peek_next_pending_wake(slot_id).await;
         // Filter out self-messages to prevent an agent from triggering itself.
-        let unread: Vec<_> = all_unread.into_iter().filter(|m| m.from_agent_id != slot_id).collect();
+        // User interventions consume only the triggering foreground message in
+        // this turn, leaving background backlog unread for follow-up drain.
+        let unread: Vec<_> = if matches!(
+            next_wake.as_ref().map(|wake| wake.source),
+            Some(TeamWakeSource::UserIntervention)
+        ) {
+            match next_wake.as_ref().and_then(|wake| wake.message_id.as_ref()) {
+                Some(message_id) => all_unread
+                    .into_iter()
+                    .filter(|m| m.id == *message_id && m.from_agent_id != slot_id)
+                    .collect(),
+                None => all_unread.into_iter().filter(|m| m.from_agent_id == "user").collect(),
+            }
+        } else {
+            all_unread.into_iter().filter(|m| m.from_agent_id != slot_id).collect()
+        };
         let tasks = self.scheduler.list_tasks().await?;
 
-        let wake_body = build_wake_payload(&agent, &tasks, &unread);
+        let mut wake_body = build_wake_payload(&agent, &tasks, &unread);
+        if matches!(
+            next_wake.as_ref().map(|wake| wake.source),
+            Some(TeamWakeSource::UserIntervention)
+        ) {
+            wake_body = format!(
+                "## Turn Context\n\nThis turn was triggered by a user intervention. Prioritize the user's message in this turn. Do not infer exact queue or backlog state from this notice.\n\n{wake_body}"
+            );
+        }
 
         let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
 
@@ -262,6 +288,8 @@ impl TeamSession {
             should_send,
             unread,
             agent_role: agent.role,
+            wake_source: next_wake.as_ref().map(|wake| wake.source),
+            trigger_message_id: next_wake.and_then(|wake| wake.message_id),
         }))
     }
 
@@ -376,8 +404,12 @@ impl TeamSession {
         }
 
         let _ = files;
-        self.wake_agent_for_team_work(&lead_slot_id, TeamWakeSource::UserMessage)
-            .await?;
+        self.wake_agent_for_team_work(
+            &lead_slot_id,
+            TeamWakeSource::UserMessage,
+            Some(mailbox_message.id.clone()),
+        )
+        .await?;
         Ok(ack)
     }
 
@@ -392,19 +424,15 @@ impl TeamSession {
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
-        let source = if self.team_run_manager.active_run_id().await.is_some() {
+        let has_active_run = self.team_run_manager.active_run_id().await.is_some();
+        let source = if has_active_run {
             TeamWakeSource::UserIntervention
         } else {
             TeamWakeSource::UserMessage
         };
         let mut ack = self
             .team_run_manager
-            .accept_user_message(
-                slot_id,
-                target_role_for(agent.role),
-                agent.role == TeammateRole::Teammate,
-                None,
-            )
+            .accept_user_message(slot_id, target_role_for(agent.role), has_active_run, None)
             .await?;
 
         let mailbox_message = match self
@@ -447,7 +475,8 @@ impl TeamSession {
         }
 
         let _ = files;
-        self.wake_agent_for_team_work(slot_id, source).await?;
+        self.wake_agent_for_team_work(slot_id, source, Some(mailbox_message.id.clone()))
+            .await?;
         Ok(ack)
     }
 
@@ -505,16 +534,26 @@ impl TeamSession {
             );
         }
 
-        self.wake_agent_for_team_work(to_slot_id, TeamWakeSource::McpSendMessage)
-            .await
+        self.wake_agent_for_team_work(
+            to_slot_id,
+            TeamWakeSource::McpSendMessage,
+            Some(mailbox_message.id.clone()),
+        )
+        .await
     }
 
     pub(crate) async fn wake_agent_for_team_work(
         &self,
         slot_id: &str,
         source: TeamWakeSource,
+        trigger_message_id: Option<String>,
     ) -> Result<(), TeamError> {
-        let target_role = self.reserve_wake_for_team_work(slot_id, source).await?;
+        let Some(target_role) = self
+            .reserve_wake_for_team_work(slot_id, source, trigger_message_id)
+            .await?
+        else {
+            return Ok(());
+        };
 
         if self.event_loops.has(slot_id) {
             self.notify_reserved_wake_for_team_work(slot_id, target_role, source);
@@ -535,13 +574,15 @@ impl TeamSession {
         &self,
         slot_id: &str,
         source: TeamWakeSource,
-    ) -> Result<TeamRunTargetRole, TeamError> {
+        trigger_message_id: Option<String>,
+    ) -> Result<Option<TeamRunTargetRole>, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
         let target_role = target_role_for(agent.role);
-        self.team_run_manager
-            .record_pending_wake(slot_id, target_role.clone(), source)
+        let decision = self
+            .team_run_manager
+            .record_or_suppress_wake(slot_id, target_role.clone(), source, trigger_message_id)
             .await?;
-        Ok(target_role)
+        Ok(matches!(decision, WakeRecordDecision::Recorded).then_some(target_role))
     }
 
     pub(crate) fn notify_reserved_wake_for_team_work(
@@ -757,10 +798,52 @@ impl TeamSession {
         Ok(())
     }
 
+    pub async fn pause_slot_work(
+        &self,
+        team_run_id: &str,
+        slot_id: &str,
+        reason: Option<String>,
+    ) -> Result<(), TeamError> {
+        let current_run_id = self
+            .team_run_manager
+            .current_run_id()
+            .await
+            .ok_or_else(|| TeamError::InvalidRequest("no active team run to pause".into()))?;
+        if current_run_id != team_run_id {
+            return Err(TeamError::InvalidRequest(format!(
+                "agent {slot_id} is not active in team run {team_run_id}"
+            )));
+        }
+
+        let outcome = self.team_run_manager.pause_slot_work(slot_id, reason.clone()).await?;
+
+        if let Some(target) = outcome.cancel_target {
+            match target {
+                ChildCancelTarget::Active(child) => {
+                    self.cancellation_port
+                        .cancel_agent_turn(&self.user_id, &child.conversation_id, &child.turn_id)
+                        .await
+                        .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
+                    self.team_run_manager.record_child_cancelled(&child).await;
+                    if child.role == TeamRunTargetRole::Teammate {
+                        self.notify_leader_child_interrupted(slot_id, reason).await?;
+                    }
+                }
+                ChildCancelTarget::Starting(reservation) => {
+                    if reservation.role == TeamRunTargetRole::Teammate {
+                        self.notify_leader_child_interrupted(slot_id, reason).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn notify_leader_child_interrupted(&self, slot_id: &str, reason: Option<String>) -> Result<(), TeamError> {
         if let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await {
             let content = reason.unwrap_or_else(|| format!("Agent {slot_id} was interrupted by the user."));
-            self.mailbox
+            let mailbox_message = self
+                .mailbox
                 .write(
                     &self.team.id,
                     &lead_slot_id,
@@ -770,8 +853,12 @@ impl TeamSession {
                     Some("Interrupted by user"),
                 )
                 .await?;
-            self.wake_agent_for_team_work(&lead_slot_id, TeamWakeSource::InterruptedNotification)
-                .await?;
+            self.wake_agent_for_team_work(
+                &lead_slot_id,
+                TeamWakeSource::InterruptedNotification,
+                Some(mailbox_message.id),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -785,7 +872,8 @@ impl TeamSession {
             return Err(TeamError::AgentNotFound("lead".into()));
         };
         let content = format!("Spawned teammate {failed_slot_id} failed to attach its runtime. Error: {error}");
-        self.mailbox
+        let mailbox_message = self
+            .mailbox
             .write(
                 &self.team.id,
                 &lead_slot_id,
@@ -795,8 +883,12 @@ impl TeamSession {
                 None,
             )
             .await?;
-        self.wake_agent_for_team_work(&lead_slot_id, TeamWakeSource::SpawnAttachFailure)
-            .await
+        self.wake_agent_for_team_work(
+            &lead_slot_id,
+            TeamWakeSource::SpawnAttachFailure,
+            Some(mailbox_message.id),
+        )
+        .await
     }
 
     pub(crate) async fn wake_leader_after_recovery_message(
@@ -808,7 +900,7 @@ impl TeamSession {
             return Err(TeamError::AgentNotFound("lead".into()));
         };
         if self.team_run_manager.active_run_id().await.is_some() {
-            return self.wake_agent_for_team_work(&lead_slot_id, source).await;
+            return self.wake_agent_for_team_work(&lead_slot_id, source, None).await;
         }
         info!(
             team_id = %self.team.id,
@@ -933,7 +1025,8 @@ impl TeamSession {
         // Step 6: welcome message. The mailbox write is the source of truth —
         // if the wake never fires (e.g. warmup raced), the next caller-triggered
         // wake will still drain this entry.
-        self.mailbox
+        let welcome_message = self
+            .mailbox
             .write(
                 &self.team.id,
                 &new_agent.slot_id,
@@ -945,8 +1038,13 @@ impl TeamSession {
             .await?;
 
         let spawn_welcome_role = self
-            .reserve_wake_for_team_work(&new_agent.slot_id, TeamWakeSource::SpawnWelcome)
-            .await?;
+            .reserve_wake_for_team_work(
+                &new_agent.slot_id,
+                TeamWakeSource::SpawnWelcome,
+                Some(welcome_message.id),
+            )
+            .await?
+            .ok_or_else(|| TeamError::InvalidRequest("spawn welcome wake was suppressed".into()))?;
         info!(
             team_id = %self.team.id,
             slot_id = %new_agent.slot_id,
@@ -1386,7 +1484,7 @@ mod tests {
             .expect("first leader send creates run");
 
         session
-            .wake_agent_for_team_work("worker-1", TeamWakeSource::McpSendMessage)
+            .wake_agent_for_team_work("worker-1", TeamWakeSource::McpSendMessage, None)
             .await
             .expect("worker wake keeps run active");
         session.team_run_manager().record_empty_wake_observed("lead-1").await;
@@ -1567,7 +1665,7 @@ mod tests {
             .expect("accept run");
 
         session
-            .wake_agent_for_team_work("worker-1", TeamWakeSource::McpSendMessage)
+            .wake_agent_for_team_work("worker-1", TeamWakeSource::McpSendMessage, None)
             .await
             .expect("pending wake is recorded even before loop registration");
 
@@ -1582,6 +1680,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paused_slot_suppresses_background_wake_and_keeps_mailbox_unread() {
+        let session = start_session().await;
+        let ack = session.send_message("start", None).await.unwrap();
+        session
+            .pause_slot_work(&ack.team_run_id, "lead-1", Some("user stopped".into()))
+            .await
+            .unwrap();
+
+        session
+            .send_agent_message_from_agent("worker-1", "lead-1", "background update")
+            .await
+            .unwrap();
+
+        let payload = session.team_run_manager().current_payload().await.expect("payload");
+        let lead = payload.slot_work.iter().find(|work| work.slot_id == "lead-1").unwrap();
+        assert!(lead.paused);
+        assert_eq!(lead.pending_wake_count, 0);
+        assert_eq!(lead.suppressed_wake_count, 2);
+
+        let unread = session
+            .mailbox()
+            .peek_unread(session.team_id(), "lead-1")
+            .await
+            .unwrap();
+        assert!(unread.iter().any(|msg| msg.content == "background update"));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn user_intervention_wake_input_prioritizes_only_user_message() {
+        let session = start_session().await;
+        let ack = session.send_message("start", None).await.unwrap();
+        session
+            .pause_slot_work(&ack.team_run_id, "lead-1", Some("user stopped".into()))
+            .await
+            .unwrap();
+        session
+            .send_agent_message_from_agent("worker-1", "lead-1", "old background")
+            .await
+            .unwrap();
+
+        let user_ack = session
+            .send_message_to_agent("lead-1", "please answer this first", None)
+            .await
+            .unwrap();
+
+        let input = session.compute_wake_input("lead-1").await.unwrap().expect("wake input");
+        assert_eq!(input.wake_source, Some(TeamWakeSource::UserIntervention));
+        assert_eq!(input.trigger_message_id, user_ack.message_id);
+        assert!(input.first_message.contains("## Turn Context"));
+        assert!(input.first_message.contains("Prioritize the user's message"));
+        assert!(input.first_message.contains("please answer this first"));
+        assert!(!input.first_message.contains("old background"));
+        assert_eq!(input.unread.len(), 1);
+        session.stop();
+    }
+
+    #[tokio::test]
     async fn reserved_spawn_welcome_survives_leader_empty_wake_until_teammate_registers() {
         let session = start_session().await;
         let ack = session
@@ -1591,9 +1747,10 @@ mod tests {
             .expect("accept run");
 
         let role = session
-            .reserve_wake_for_team_work("worker-1", TeamWakeSource::SpawnWelcome)
+            .reserve_wake_for_team_work("worker-1", TeamWakeSource::SpawnWelcome, None)
             .await
-            .expect("reserve spawn welcome");
+            .expect("reserve spawn welcome")
+            .expect("spawn welcome should be recorded");
         assert_eq!(role, TeamRunTargetRole::Teammate);
 
         assert!(
@@ -1624,7 +1781,7 @@ mod tests {
         let session = start_session().await;
 
         let err = session
-            .reserve_wake_for_team_work("worker-1", TeamWakeSource::SpawnWelcome)
+            .reserve_wake_for_team_work("worker-1", TeamWakeSource::SpawnWelcome, None)
             .await
             .expect_err("run-scoped reserve without active run must fail");
 
@@ -1641,7 +1798,7 @@ mod tests {
         let session = start_session().await;
 
         let err = session
-            .wake_agent_for_team_work("worker-1", TeamWakeSource::McpSendMessage)
+            .wake_agent_for_team_work("worker-1", TeamWakeSource::McpSendMessage, None)
             .await
             .expect_err("MCP work without active run must fail");
 

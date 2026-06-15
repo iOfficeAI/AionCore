@@ -215,6 +215,12 @@ pub struct CancelTeamChildTurnRequest {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PauseTeamSlotRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamRunAckResponse {
     pub team_run_id: String,
@@ -234,6 +240,14 @@ pub struct TeamSlotWorkPayload {
     pub role: TeamRunTargetRole,
     pub pending_wake_count: usize,
     pub starting_child_count: usize,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub suppressed_wake_count: usize,
+    #[serde(default)]
+    pub foreground_pending_count: usize,
+    #[serde(default)]
+    pub background_pending_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<String>,
 }
@@ -1098,6 +1112,10 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     pending_wake_count: 1,
                     starting_child_count: 0,
+                    paused: false,
+                    suppressed_wake_count: 0,
+                    foreground_pending_count: 0,
+                    background_pending_count: 0,
                     active_turn_id: Some("turn-lead".into()),
                 },
                 TeamSlotWorkPayload {
@@ -1105,6 +1123,10 @@ mod tests {
                     role: TeamRunTargetRole::Teammate,
                     pending_wake_count: 1,
                     starting_child_count: 1,
+                    paused: false,
+                    suppressed_wake_count: 0,
+                    foreground_pending_count: 0,
+                    background_pending_count: 0,
                     active_turn_id: None,
                 },
             ],
@@ -1127,6 +1149,43 @@ mod tests {
         }))
         .unwrap();
         assert!(decoded.slot_work.is_empty());
+    }
+
+    #[test]
+    fn team_slot_work_payload_includes_pause_fields_when_non_default() {
+        let payload = TeamSlotWorkPayload {
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            pending_wake_count: 0,
+            starting_child_count: 0,
+            active_turn_id: None,
+            paused: true,
+            suppressed_wake_count: 2,
+            foreground_pending_count: 1,
+            background_pending_count: 2,
+        };
+
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["paused"], true);
+        assert_eq!(value["suppressed_wake_count"], 2);
+        assert_eq!(value["foreground_pending_count"], 1);
+        assert_eq!(value["background_pending_count"], 2);
+    }
+
+    #[test]
+    fn team_slot_work_payload_defaults_pause_fields_for_old_payloads() {
+        let decoded: TeamSlotWorkPayload = serde_json::from_value(serde_json::json!({
+            "slot_id": "worker-1",
+            "role": "teammate",
+            "pending_wake_count": 0,
+            "starting_child_count": 0
+        }))
+        .unwrap();
+
+        assert!(!decoded.paused);
+        assert_eq!(decoded.suppressed_wake_count, 0);
+        assert_eq!(decoded.foreground_pending_count, 0);
+        assert_eq!(decoded.background_pending_count, 0);
     }
 
     #[test]
