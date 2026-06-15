@@ -820,11 +820,24 @@ impl TeamSession {
         if let Some(target) = outcome.cancel_target {
             match target {
                 ChildCancelTarget::Active(child) => {
-                    self.cancellation_port
+                    if let Err(err) = self
+                        .cancellation_port
                         .cancel_agent_turn(&self.user_id, &child.conversation_id, &child.turn_id)
                         .await
-                        .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
-                    self.team_run_manager.record_child_cancelled(&child).await;
+                    {
+                        warn!(
+                            team_id = %self.team.id,
+                            team_run_id = %outcome.team_run_id,
+                            slot_id = %child.slot_id,
+                            turn_id = %child.turn_id,
+                            error = %err,
+                            "team slot pause child turn cancel failed"
+                        );
+                        return Err(TeamError::InvalidRequest(err.to_string()));
+                    }
+                    self.team_run_manager
+                        .complete_pause_after_child_cancelled(&child, reason.clone())
+                        .await;
                     if child.role == TeamRunTargetRole::Teammate {
                         self.notify_leader_child_interrupted(slot_id, reason).await?;
                     }
@@ -1214,6 +1227,26 @@ mod tests {
         Arc::new(NoopCancellationPort)
     }
 
+    struct FailingCancellationPort;
+
+    #[async_trait::async_trait]
+    impl crate::ports::AgentTurnCancellationPort for FailingCancellationPort {
+        async fn cancel_agent_turn(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _turn_id: &str,
+        ) -> Result<(), crate::ports::AgentTurnExecutionError> {
+            Err(crate::ports::AgentTurnExecutionError::Failed {
+                reason: "cancel unavailable".into(),
+            })
+        }
+    }
+
+    fn failing_cancellation_port() -> Arc<dyn crate::ports::AgentTurnCancellationPort> {
+        Arc::new(FailingCancellationPort)
+    }
+
     #[derive(Default)]
     struct NoopProjectionStore;
 
@@ -1438,6 +1471,27 @@ mod tests {
             noop_turn_port(),
             noop_cancellation_port(),
             store,
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn start_session_with_cancellation_port(
+        cancellation_port: Arc<dyn crate::ports::AgentTurnCancellationPort>,
+    ) -> TeamSession {
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        TeamSession::start(
+            make_team(),
+            repo,
+            broadcaster,
+            backend_path(),
+            empty_task_manager(),
+            noop_turn_port(),
+            cancellation_port,
+            noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
         )
@@ -1676,6 +1730,117 @@ mod tests {
             .expect("wake should be claimable");
 
         assert_eq!(reservation.slot_id, "worker-1");
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn pause_active_child_cancel_success_marks_slot_paused_and_removes_child() {
+        let session = start_session().await;
+        let ack = session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_pending_wake("lead-1", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("lead-1", TeamRunTargetRole::Lead, "c1")
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_child_started(
+                &reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id.clone(),
+                    slot_id: "lead-1".into(),
+                    role: TeamRunTargetRole::Lead,
+                    conversation_id: "c1".into(),
+                    turn_id: "turn-lead".into(),
+                },
+            )
+            .await;
+        session
+            .team_run_manager()
+            .record_pending_wake("lead-1", TeamRunTargetRole::Lead, TeamWakeSource::McpSendMessage)
+            .await
+            .unwrap();
+
+        session
+            .pause_slot_work(&ack.team_run_id, "lead-1", Some("user stopped".into()))
+            .await
+            .unwrap();
+
+        let payload = session.team_run_manager().current_payload().await.unwrap();
+        let lead = payload
+            .slot_work
+            .iter()
+            .find(|work| work.slot_id == "lead-1")
+            .expect("lead slot work");
+        assert!(lead.paused);
+        assert_eq!(lead.pending_wake_count, 0);
+        assert_eq!(lead.suppressed_wake_count, 1);
+        assert_eq!(lead.active_turn_id, None);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn pause_active_child_cancel_error_keeps_child_and_does_not_pause_slot() {
+        let session = start_session_with_cancellation_port(failing_cancellation_port()).await;
+        let ack = session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_pending_wake("lead-1", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("lead-1", TeamRunTargetRole::Lead, "c1")
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_child_started(
+                &reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id.clone(),
+                    slot_id: "lead-1".into(),
+                    role: TeamRunTargetRole::Lead,
+                    conversation_id: "c1".into(),
+                    turn_id: "turn-lead".into(),
+                },
+            )
+            .await;
+        session
+            .team_run_manager()
+            .record_pending_wake("lead-1", TeamRunTargetRole::Lead, TeamWakeSource::McpSendMessage)
+            .await
+            .unwrap();
+
+        let err = session
+            .pause_slot_work(&ack.team_run_id, "lead-1", Some("user stopped".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TeamError::InvalidRequest(message) if message.contains("cancel unavailable")));
+
+        let payload = session.team_run_manager().current_payload().await.unwrap();
+        let lead = payload
+            .slot_work
+            .iter()
+            .find(|work| work.slot_id == "lead-1")
+            .expect("lead slot work");
+        assert!(!lead.paused);
+        assert_eq!(lead.pending_wake_count, 1);
+        assert_eq!(lead.suppressed_wake_count, 0);
+        assert_eq!(lead.active_turn_id.as_deref(), Some("turn-lead"));
         session.stop();
     }
 

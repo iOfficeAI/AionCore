@@ -336,22 +336,35 @@ impl TeamRunManager {
         let role = run
             .role_for_slot(slot_id)
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
-        let pending_count = run.pending_wakes.remove(slot_id).map(|wakes| wakes.len()).unwrap_or(0);
         let reason = reason.unwrap_or_else(|| "user_stop".into());
+
+        if let Some(child) = run.active_child_turns.get(slot_id).cloned() {
+            info!(
+                team_id = %self.team_id,
+                team_run_id = %run.team_run_id,
+                slot_id,
+                active_turn_id = %child.turn_id,
+                reason = %reason,
+                "team slot pause requested for active child"
+            );
+            return Ok(PauseSlotOutcome {
+                team_run_id: run.team_run_id.clone(),
+                cancel_target: Some(ChildCancelTarget::Active(child)),
+                payload: run.payload(),
+            });
+        }
+
+        let pending_count = run.pending_wakes.remove(slot_id).map(|wakes| wakes.len()).unwrap_or(0);
         run.slot_wake_gate.pause(slot_id, role, reason.clone());
         run.slot_wake_gate.add_suppressed(slot_id, pending_count);
 
-        let cancel_target = take_cancel_target_locked(run, slot_id);
-        let active_turn_id = match &cancel_target {
-            Some(ChildCancelTarget::Active(child)) => Some(child.turn_id.as_str()),
-            _ => None,
-        };
+        let cancel_target = take_starting_cancel_target_locked(run, slot_id);
         let payload = run.payload();
         info!(
             team_id = %self.team_id,
             team_run_id = %run.team_run_id,
             slot_id,
-            active_turn_id,
+            active_turn_id = Option::<&str>::None,
             pending_wake_count = pending_count,
             reason = %reason,
             "team slot paused"
@@ -945,6 +958,59 @@ impl TeamRunManager {
             .broadcast_child_turn(TEAM_CHILD_TURN_CANCELLED_EVENT, payload);
     }
 
+    pub async fn complete_pause_after_child_cancelled(
+        &self,
+        child: &ActiveChildTurn,
+        reason: Option<String>,
+    ) -> Option<TeamRunPayload> {
+        let mut guard = self.state.lock().await;
+        let Some(run) = guard.as_mut() else {
+            return None;
+        };
+        let reason = reason.unwrap_or_else(|| "user_stop".into());
+        let pending_count = run
+            .pending_wakes
+            .remove(&child.slot_id)
+            .map(|wakes| wakes.len())
+            .unwrap_or(0);
+        run.slot_wake_gate
+            .pause(&child.slot_id, child.role.clone(), reason.clone());
+        run.slot_wake_gate.add_suppressed(&child.slot_id, pending_count);
+        run.active_child_turns.remove(&child.slot_id);
+
+        let child_payload = child_payload(&run.team_id, child, TeamRunStatus::Cancelled);
+        let payload = run.payload();
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %child.team_run_id,
+            slot_id = %child.slot_id,
+            role = ?child.role,
+            conversation_id = %child.conversation_id,
+            turn_id = %child.turn_id,
+            pending_wake_count = pending_count,
+            reason = %reason,
+            "team slot paused"
+        );
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %child.team_run_id,
+            slot_id = %child.slot_id,
+            role = ?child.role,
+            conversation_id = %child.conversation_id,
+            turn_id = %child.turn_id,
+            active_child_count = payload.active_child_count,
+            pending_wake_count = payload.pending_wake_count,
+            starting_child_count = payload.starting_child_count,
+            "team_child_turn cancelled"
+        );
+        drop(guard);
+
+        self.emitter
+            .broadcast_child_turn(TEAM_CHILD_TURN_CANCELLED_EVENT, child_payload);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload.clone());
+        Some(payload)
+    }
+
     pub(crate) async fn release_suppressed_wake_if_resumed(
         &self,
         slot_id: &str,
@@ -1000,10 +1066,7 @@ fn child_payload(team_id: &str, child: &ActiveChildTurn, status: TeamRunStatus) 
     }
 }
 
-fn take_cancel_target_locked(run: &mut TeamRunRecord, slot_id: &str) -> Option<ChildCancelTarget> {
-    if let Some(child) = run.active_child_turns.remove(slot_id) {
-        return Some(ChildCancelTarget::Active(child));
-    }
+fn take_starting_cancel_target_locked(run: &mut TeamRunRecord, slot_id: &str) -> Option<ChildCancelTarget> {
     let reservation_id = run
         .starting_reservations
         .iter()
@@ -1211,6 +1274,99 @@ mod tests {
         assert_eq!(worker.starting_child_count, 1);
         assert_eq!(worker.active_turn_id, None);
         assert_eq!(worker_reservation.slot_id, "worker");
+    }
+
+    #[tokio::test]
+    async fn pause_active_child_prepares_cancel_without_mutating_gate_or_active_child() {
+        let (manager, bc) = manager();
+        let ack = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
+            .await
+            .unwrap();
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .unwrap();
+        manager
+            .record_child_started(
+                &reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id,
+                    slot_id: "lead".into(),
+                    role: TeamRunTargetRole::Lead,
+                    conversation_id: "conv-lead".into(),
+                    turn_id: "turn-lead".into(),
+                },
+            )
+            .await;
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::McpSendMessage)
+            .await
+            .unwrap();
+
+        let outcome = manager
+            .pause_slot_work("lead", Some("user stopped".into()))
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome.cancel_target, Some(ChildCancelTarget::Active(_))));
+        let latest = bc.run_payloads().last().cloned().expect("run payload");
+        let lead = slot_work(&latest, "lead");
+        assert!(!lead.paused);
+        assert_eq!(lead.pending_wake_count, 1);
+        assert_eq!(lead.suppressed_wake_count, 0);
+        assert_eq!(lead.active_turn_id.as_deref(), Some("turn-lead"));
+    }
+
+    #[tokio::test]
+    async fn complete_pause_after_active_child_cancel_marks_paused_moves_pending_and_removes_child() {
+        let (manager, bc) = manager();
+        let ack = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
+            .await
+            .unwrap();
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .unwrap();
+        let child = ActiveChildTurn {
+            team_run_id: ack.team_run_id,
+            slot_id: "lead".into(),
+            role: TeamRunTargetRole::Lead,
+            conversation_id: "conv-lead".into(),
+            turn_id: "turn-lead".into(),
+        };
+        manager
+            .record_child_started(&reservation.reservation_id, child.clone())
+            .await;
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::McpSendMessage)
+            .await
+            .unwrap();
+        manager
+            .pause_slot_work("lead", Some("user stopped".into()))
+            .await
+            .unwrap();
+
+        let payload = manager
+            .complete_pause_after_child_cancelled(&child, Some("user stopped".into()))
+            .await
+            .expect("pause completion payload");
+
+        let lead = slot_work(&payload, "lead");
+        assert!(lead.paused);
+        assert_eq!(lead.pending_wake_count, 0);
+        assert_eq!(lead.suppressed_wake_count, 1);
+        assert_eq!(lead.active_turn_id, None);
+        assert!(bc.names().contains(&TEAM_CHILD_TURN_CANCELLED_EVENT.to_owned()));
     }
 
     #[tokio::test]
