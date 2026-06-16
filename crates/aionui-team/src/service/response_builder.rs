@@ -10,6 +10,7 @@ impl TeamSessionService {
         Ok(TeamResponse {
             id: team.id.clone(),
             name: team.name.clone(),
+            workspace: team.workspace.clone(),
             agents,
             lead_agent_id: team.lead_agent_id.clone(),
             created_at: team.created_at,

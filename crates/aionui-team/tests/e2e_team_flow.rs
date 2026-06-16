@@ -604,6 +604,7 @@ async fn setup_session_with_turn_recorder_inner(
     let team = aionui_team::types::Team {
         id: "e2e-team".into(),
         name: "E2E Team".into(),
+        workspace: "/tmp/e2e-team".into(),
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
         created_at: 1000,
@@ -661,6 +662,7 @@ async fn setup_session_with_runtime_ports(
     let team = aionui_team::types::Team {
         id: "e2e-team".into(),
         name: "E2E Team".into(),
+        workspace: "/tmp/e2e-team".into(),
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
         created_at: 1000,

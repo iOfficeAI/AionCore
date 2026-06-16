@@ -70,6 +70,9 @@ impl ITeamRepository for SqliteTeamRepository {
         if params.name.is_some() {
             set_clauses.push("name = ?");
         }
+        if params.workspace.is_some() {
+            set_clauses.push("workspace = ?");
+        }
         if params.agents.is_some() {
             set_clauses.push("agents = ?");
         }
@@ -87,6 +90,9 @@ impl ITeamRepository for SqliteTeamRepository {
         let mut query = sqlx::query(&sql);
         if let Some(ref name) = params.name {
             query = query.bind(name);
+        }
+        if let Some(ref workspace) = params.workspace {
+            query = query.bind(workspace);
         }
         if let Some(ref agents) = params.agents {
             query = query.bind(agents);

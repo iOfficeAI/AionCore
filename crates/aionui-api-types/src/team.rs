@@ -305,6 +305,8 @@ pub struct TeamAgentResponse {
 pub struct TeamResponse {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub workspace: String,
     pub agents: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
@@ -656,6 +658,7 @@ mod tests {
         let team = TeamResponse {
             id: "team-1".into(),
             name: "Alpha".into(),
+            workspace: "/workspace/team-1".into(),
             agents: vec![TeamAgentResponse {
                 slot_id: "slot-1".into(),
                 name: "Lead".into(),
@@ -675,6 +678,7 @@ mod tests {
         let json = serde_json::to_value(&team).unwrap();
         assert_eq!(json["id"], "team-1");
         assert_eq!(json["name"], "Alpha");
+        assert_eq!(json["workspace"], "/workspace/team-1");
         assert_eq!(json["lead_agent_id"], "slot-1");
         assert_eq!(json["created_at"], 1700000000000_i64);
         assert_eq!(json["updated_at"], 1700001000000_i64);
@@ -687,6 +691,7 @@ mod tests {
         let team = TeamResponse {
             id: "team-2".into(),
             name: "Beta".into(),
+            workspace: String::new(),
             agents: vec![],
             lead_agent_id: None,
             created_at: 1700000000000,
@@ -787,6 +792,7 @@ mod tests {
         let team = TeamResponse {
             id: "team-1".into(),
             name: "Alpha".into(),
+            workspace: "/workspace/team-1".into(),
             agents: vec![
                 TeamAgentResponse {
                     slot_id: "s1".into(),

@@ -9,9 +9,7 @@ use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GuideMcpConfig, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload,
     TeamResponse, TeamRunAckResponse, TeamRunTargetRole, WebSocketMessage,
 };
-use aionui_common::{
-    AgentKillReason, WorkspacePathValidationError, generate_id, now_ms, validate_workspace_path_availability,
-};
+use aionui_common::{AgentKillReason, generate_id, now_ms};
 use aionui_db::models::TeamRow;
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
 use aionui_realtime::EventBroadcaster;
@@ -29,6 +27,7 @@ use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort
 use crate::session::TeamSession;
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::wake::TeamWakeSource;
+use crate::workspace::validate_create_workspace_path;
 
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
     if !workspace.trim().is_empty() {
@@ -203,13 +202,14 @@ impl TeamSessionService {
             .await?;
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;
+        let team_workspace = provisioned.team_workspace;
         let agents_json = serde_json::to_string(&agents)?;
 
         let row = TeamRow {
             id: team_id.clone(),
             user_id: user_id.to_owned(),
             name: req.name.clone(),
-            workspace: shared_workspace.clone().unwrap_or_default(),
+            workspace: team_workspace.clone(),
             workspace_mode: "shared".into(),
             agents: agents_json,
             lead_agent_id: lead_agent_id.clone(),
@@ -223,13 +223,23 @@ impl TeamSessionService {
         let team = Team {
             id: team_id,
             name: req.name,
+            workspace: team_workspace,
             agents,
             lead_agent_id,
             created_at: now,
             updated_at: now,
         };
 
-        info!(team_id = %team.id, "Team created");
+        info!(
+            team_id = %team.id,
+            workspace_source = if shared_workspace.is_some() {
+                "user_supplied"
+            } else {
+                "auto_from_leader"
+            },
+            agent_count = team.agents.len(),
+            "Team created"
+        );
 
         self.broadcast_team_created(&team.id, &team.name);
 
@@ -313,8 +323,7 @@ impl TeamSessionService {
                 team_id,
                 &UpdateTeamParams {
                     name: Some(name.to_owned()),
-                    agents: None,
-                    lead_agent_id: None,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -346,10 +355,7 @@ impl TeamSessionService {
             )));
         }
         let mut team = Team::from_row(&row)?;
-        let agent = self
-            .provisioner()
-            .add_agent(user_id, &mut team, req, &row.workspace)
-            .await?;
+        let agent = self.provisioner().add_agent(user_id, &row, &mut team, req).await?;
 
         if let Some(session) = self.sessions.get(team_id).map(|e| Arc::clone(&e.session)) {
             session.add_agent(&agent).await;
@@ -380,9 +386,8 @@ impl TeamSessionService {
             .update_team(
                 team_id,
                 &UpdateTeamParams {
-                    name: None,
                     agents: Some(agents_json),
-                    lead_agent_id: None,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -425,9 +430,8 @@ impl TeamSessionService {
             .update_team(
                 team_id,
                 &UpdateTeamParams {
-                    name: None,
                     agents: Some(agents_json),
-                    lead_agent_id: None,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -976,13 +980,4 @@ impl TeamSessionService {
             .wake_leader_after_recovery_message(source_slot_id, source)
             .await
     }
-}
-
-fn validate_create_workspace_path(workspace: &str) -> Result<String, TeamError> {
-    validate_workspace_path_availability(workspace).map_err(|error| match error {
-        WorkspacePathValidationError::Empty => TeamError::InvalidRequest("Workspace directory is empty".into()),
-        WorkspacePathValidationError::DoesNotExist(path)
-        | WorkspacePathValidationError::NotDirectory(path)
-        | WorkspacePathValidationError::NotAccessible { path, .. } => TeamError::WorkspacePathUnavailable(path),
-    })
 }

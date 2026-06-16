@@ -5,6 +5,7 @@ use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 #[derive(Debug, Clone, Default)]
 pub struct UpdateTeamParams {
     pub name: Option<String>,
+    pub workspace: Option<String>,
     pub agents: Option<String>,
     pub lead_agent_id: Option<String>,
 }

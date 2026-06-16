@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.1.30](https://github.com/iOfficeAI/AionCore/compare/v0.1.29...v0.1.30) (2026-06-15)
+
+
+### Features
+
+* **acp:** use observed config options for preferences ([#468](https://github.com/iOfficeAI/AionCore/issues/468)) ([fd2d5c2](https://github.com/iOfficeAI/AionCore/commit/fd2d5c2db10e80dc478ee88c2d1f787e91015eb1))
+* align team shared workspace resolution ([#475](https://github.com/iOfficeAI/AionCore/issues/475)) ([06b8e71](https://github.com/iOfficeAI/AionCore/commit/06b8e71572045ddac640bda38e2733dd9ad35f18))
+* **team:** support slot-scoped team pause and wake flow ([#472](https://github.com/iOfficeAI/AionCore/issues/472)) ([398b20f](https://github.com/iOfficeAI/AionCore/commit/398b20f2279fc7b042ae65cbbe5658be953e6f31))
+
+
+### Bug Fixes
+
+* **agent:** send non-empty clientInfo in ACP initialize handshake ([#471](https://github.com/iOfficeAI/AionCore/issues/471)) ([5a8df22](https://github.com/iOfficeAI/AionCore/commit/5a8df22fd9db4b77ec0c7e9870aec78db6d7bec7))
+* **agent:** wait for task shutdown during clear ([#446](https://github.com/iOfficeAI/AionCore/issues/446)) ([bea814e](https://github.com/iOfficeAI/AionCore/commit/bea814e08ddb96ccb5d09a8016e92d179a2f318a))
+* **assistant:** remove star office helper remnants ([#470](https://github.com/iOfficeAI/AionCore/issues/470)) ([eec23d9](https://github.com/iOfficeAI/AionCore/commit/eec23d9fed25765c43ca9f5f50df91cd53d01888))
+* **office:** fetch officecli installer from official mirror before GitHub ([#463](https://github.com/iOfficeAI/AionCore/issues/463)) ([08fbc6f](https://github.com/iOfficeAI/AionCore/commit/08fbc6f12d154d5419ae1b092a1a9352ee64250e))
+* preserve assistant snapshot and skill wiring for cron ([#473](https://github.com/iOfficeAI/AionCore/issues/473)) ([2d47d8c](https://github.com/iOfficeAI/AionCore/commit/2d47d8cca71c4d0fdc3d1c2b93916c03b8c3b42c))
+* **shell:** reveal file via FileManager1 D-Bus on Linux ([#466](https://github.com/iOfficeAI/AionCore/issues/466)) ([98c75ec](https://github.com/iOfficeAI/AionCore/commit/98c75ecc1bf20263f9bb682d8729d0924060f178))
+
 ## [0.1.29](https://github.com/iOfficeAI/AionCore/compare/v0.1.28...v0.1.29) (2026-06-12)
 
 

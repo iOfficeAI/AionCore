@@ -12,8 +12,8 @@ use aionui_realtime::EventBroadcaster;
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStarted, AgentTurnStatus, TeamConversationAdoptRequest, TeamConversationBindingLookup,
-    TeamConversationCreateRequest, TeamConversationLookupPort, TeamConversationProvisioningPort, TeamError,
-    TeamProjectionMessageStore,
+    TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationLookupPort,
+    TeamConversationProvisioningPort, TeamError, TeamProjectionMessageStore,
 };
 use async_trait::async_trait;
 
@@ -142,7 +142,10 @@ impl TeamProjectionMessageStore for TeamConversationAdapters {
 
 #[async_trait]
 impl TeamConversationProvisioningPort for TeamConversationAdapters {
-    async fn create_team_conversation(&self, request: TeamConversationCreateRequest) -> Result<String, TeamError> {
+    async fn create_team_conversation(
+        &self,
+        request: TeamConversationCreateRequest,
+    ) -> Result<TeamConversationCreateResult, TeamError> {
         let response = self
             .conversation_service
             .create(
@@ -159,7 +162,17 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             )
             .await
             .map_err(map_conversation_create_error)?;
-        Ok(response.id)
+        let workspace = response
+            .extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| TeamError::InvalidRequest("created team conversation did not resolve a workspace".into()))?
+            .to_owned();
+        Ok(TeamConversationCreateResult {
+            conversation_id: response.id,
+            workspace,
+        })
     }
 
     async fn adopt_team_conversation(&self, request: TeamConversationAdoptRequest) -> Result<(), TeamError> {
@@ -175,6 +188,25 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             }),
         ));
         Ok(())
+    }
+
+    async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
+        let Some(row) = self.conversation_repo.get(conversation_id).await? else {
+            return Ok(None);
+        };
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        Ok(extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned))
+    }
+
+    async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError> {
+        self.conversation_service
+            .create_team_temp_workspace(team_id)
+            .map_err(map_conversation_update_error)
     }
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError> {

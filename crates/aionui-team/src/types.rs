@@ -137,6 +137,7 @@ impl TeamAgent {
 pub struct Team {
     pub id: String,
     pub name: String,
+    pub workspace: String,
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
@@ -268,6 +269,7 @@ impl Team {
         Ok(Self {
             id: row.id.clone(),
             name: row.name.clone(),
+            workspace: row.workspace.clone(),
             agents,
             lead_agent_id: row.lead_agent_id.clone(),
             created_at: row.created_at,
@@ -279,6 +281,7 @@ impl Team {
         TeamResponse {
             id: self.id.clone(),
             name: self.name.clone(),
+            workspace: self.workspace.clone(),
             agents: self.agents.iter().map(|a| a.to_response()).collect(),
             lead_agent_id: self.lead_agent_id.clone(),
             created_at: self.created_at,
@@ -642,6 +645,7 @@ mod tests {
         let team = Team {
             id: "t1".into(),
             name: "Alpha".into(),
+            workspace: "/workspace/team".into(),
             agents: vec![TeamAgent {
                 slot_id: "s1".into(),
                 name: "Lead".into(),

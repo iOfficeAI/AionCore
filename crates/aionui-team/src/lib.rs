@@ -24,6 +24,7 @@ pub(crate) mod test_utils;
 pub mod types;
 pub mod visibility;
 mod wake;
+mod workspace;
 
 pub use crash_detection::{CrashReason, detect_crash, is_rate_limited};
 pub use error::TeamError;
@@ -43,7 +44,8 @@ pub use ports::{
 
 pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 pub use provisioning::{
-    TeamAgentProvisioner, TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationProvisioningPort,
+    TeamAgentProvisioner, TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationCreateResult,
+    TeamConversationProvisioningPort,
 };
 pub use routes::{TeamRouterState, team_routes};
 pub use scheduler::{
