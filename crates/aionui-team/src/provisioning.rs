@@ -172,7 +172,7 @@ impl TeamAgentProvisioner {
             conversation_id: leader_conversation.conversation_id,
             backend: leader_input.backend.clone(),
             model: leader_input.model.clone(),
-            custom_agent_id: Self::effective_assistant_id(
+            assistant_id: Self::effective_assistant_id(
                 leader_input.assistant_id.as_deref(),
                 leader_input.custom_agent_id.as_deref(),
             ),
@@ -206,7 +206,7 @@ impl TeamAgentProvisioner {
                 conversation_id: conversation.conversation_id,
                 backend: input.backend.clone(),
                 model: input.model.clone(),
-                custom_agent_id: Self::effective_assistant_id(
+                assistant_id: Self::effective_assistant_id(
                     input.assistant_id.as_deref(),
                     input.custom_agent_id.as_deref(),
                 ),
@@ -378,7 +378,7 @@ impl TeamAgentProvisioner {
             conversation_id: conversation.conversation_id,
             backend: input.backend,
             model: input.model,
-            custom_agent_id: input.assistant_id,
+            assistant_id: input.assistant_id,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -395,12 +395,12 @@ impl TeamAgentProvisioner {
         name: &str,
         backend: &str,
         model: &str,
-        custom_agent_id: Option<&str>,
+        assistant_id: Option<&str>,
         existing_conversation_id: Option<&str>,
         workspace: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
         let extra = self
-            .build_team_extra(team_id, slot_id, role, backend, model, custom_agent_id, workspace)
+            .build_team_extra(team_id, slot_id, role, backend, model, assistant_id, workspace)
             .await?;
         if let Some(existing_id) = existing_conversation_id {
             self.conversation_port
@@ -546,7 +546,6 @@ impl TeamAgentProvisioner {
         }
         if let Some(assistant_id) = assistant_id {
             extra["assistant_id"] = serde_json::Value::String(assistant_id.to_owned());
-            extra["custom_agent_id"] = serde_json::Value::String(assistant_id.to_owned());
             extra["preset_assistant_id"] = serde_json::Value::String(assistant_id.to_owned());
         }
         if let Some(workspace) = workspace {

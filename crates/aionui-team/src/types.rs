@@ -98,8 +98,15 @@ pub struct TeamAgent {
     pub backend: String,
     #[serde(default)]
     pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "customAgentId")]
-    pub custom_agent_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "assistant_id",
+        alias = "assistantId",
+        alias = "custom_agent_id",
+        alias = "customAgentId"
+    )]
+    pub assistant_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<TeammateStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "conversationType")]
@@ -122,8 +129,8 @@ impl TeamAgent {
             backend: self.backend.clone(),
             icon,
             model: self.model.clone(),
-            assistant_id: self.custom_agent_id.clone(),
-            custom_agent_id: self.custom_agent_id.clone(),
+            assistant_id: self.assistant_id.clone(),
+            custom_agent_id: self.assistant_id.clone(),
             status: self.status.map(|s| s.to_string()),
             pending_confirmations: 0,
         }
@@ -512,7 +519,7 @@ mod tests {
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: Some("custom-1".into()),
+            assistant_id: Some("custom-1".into()),
             status: Some(TeammateStatus::Working),
             conversation_type: None,
             cli_path: None,
@@ -522,6 +529,7 @@ mod tests {
         assert_eq!(resp.role, "lead");
         assert!(resp.icon.is_none());
         assert_eq!(resp.status.as_deref(), Some("working"));
+        assert_eq!(resp.assistant_id.as_deref(), Some("custom-1"));
         assert_eq!(resp.custom_agent_id.as_deref(), Some("custom-1"));
     }
 
@@ -534,7 +542,7 @@ mod tests {
             conversation_id: "c1".into(),
             backend: "claude".into(),
             model: "opus".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -554,7 +562,7 @@ mod tests {
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -573,7 +581,7 @@ mod tests {
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: Some("x".into()),
+            assistant_id: Some("x".into()),
             status: Some(TeammateStatus::Idle),
             conversation_type: None,
             cli_path: None,
@@ -581,7 +589,8 @@ mod tests {
         let val = serde_json::to_value(&agent).unwrap();
         assert!(val.get("slot_id").is_some());
         assert!(val.get("conversation_id").is_some());
-        assert!(val.get("custom_agent_id").is_some());
+        assert!(val.get("assistant_id").is_some());
+        assert!(val.get("custom_agent_id").is_none());
     }
 
     #[test]
@@ -602,6 +611,7 @@ mod tests {
         assert_eq!(agent.role, TeammateRole::Lead);
         assert_eq!(agent.status, Some(TeammateStatus::Working));
         assert_eq!(agent.conversation_type.as_deref(), Some("acp"));
+        assert_eq!(agent.assistant_id.as_deref(), Some("custom-1"));
     }
 
     // -- Team from_row --------------------------------------------------------
@@ -615,7 +625,7 @@ mod tests {
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -654,7 +664,7 @@ mod tests {
                 conversation_id: "c1".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
-                custom_agent_id: None,
+                assistant_id: None,
                 status: Some(TeammateStatus::Idle),
                 conversation_type: None,
                 cli_path: None,

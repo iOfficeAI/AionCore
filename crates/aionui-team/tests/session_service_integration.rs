@@ -1398,7 +1398,7 @@ async fn create_team_without_workspace_uses_leader_auto_workspace_for_all_initia
 }
 
 #[tokio::test]
-async fn tc_create_team_uses_custom_agent_id_icon_lookup() {
+async fn tc_create_team_uses_assistant_id_icon_lookup() {
     let svc = setup_with_metadata_rows(vec![make_agent_metadata_row(
         "2d23ff1c",
         "claude",
@@ -1470,7 +1470,6 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
     let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
 
     assert_eq!(extra["assistant_id"], serde_json::json!("2d23ff1c"));
-    assert_eq!(extra["custom_agent_id"], serde_json::json!("2d23ff1c"));
     assert_eq!(extra["preset_assistant_id"], serde_json::json!("2d23ff1c"));
 }
 

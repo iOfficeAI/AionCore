@@ -268,7 +268,7 @@ mod tests {
             conversation_id: format!("conv-{slot_id}"),
             backend: backend.into(),
             model: "default".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,

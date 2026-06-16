@@ -197,7 +197,7 @@ mod tests {
             conversation_id: "conv-2".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: Some(TeammateStatus::Idle),
             conversation_type: None,
             cli_path: None,

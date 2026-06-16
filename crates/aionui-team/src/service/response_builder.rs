@@ -36,8 +36,8 @@ impl TeamSessionService {
     }
 
     async fn resolve_agent_icon(&self, agent: &TeamAgent) -> Result<Option<String>, TeamError> {
-        if let Some(custom_agent_id) = agent.custom_agent_id.as_deref()
-            && let Some(row) = self.agent_metadata_repo.get(custom_agent_id).await?
+        if let Some(assistant_id) = agent.assistant_id.as_deref()
+            && let Some(row) = self.agent_metadata_repo.get(assistant_id).await?
             && row.icon.is_some()
         {
             return Ok(row.icon);

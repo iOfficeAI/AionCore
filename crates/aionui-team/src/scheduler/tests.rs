@@ -74,7 +74,7 @@ fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
         conversation_id: format!("conv-{slot_id}"),
         backend: "acp".into(),
         model: "claude".into(),
-        custom_agent_id: None,
+        assistant_id: None,
         status: None,
         conversation_type: None,
         cli_path: None,
