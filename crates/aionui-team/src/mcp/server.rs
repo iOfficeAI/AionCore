@@ -461,11 +461,12 @@ async fn exec_list_models(args: &Value, service: &Weak<TeamSessionService>) -> R
 
 async fn exec_describe_assistant(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, String> {
     let assistant_key = args
-        .get("custom_agent_id")
+        .get("assistant_id")
+        .or_else(|| args.get("custom_agent_id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Missing required field: custom_agent_id".to_owned())?;
+        .ok_or_else(|| "Missing required field: assistant_id".to_owned())?;
     let locale = args.get("locale").and_then(Value::as_str);
     let service = service
         .upgrade()
@@ -617,7 +618,7 @@ async fn exec_spawn_agent(
     let req = SpawnAgentRequest {
         name: requested_name.clone(),
         agent_type,
-        custom_agent_id: input.custom_agent_id,
+        assistant_id: input.assistant_id,
         model: input.model,
     };
 

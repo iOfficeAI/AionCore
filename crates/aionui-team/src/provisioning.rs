@@ -267,7 +267,7 @@ impl TeamAgentProvisioner {
         name: String,
         backend: String,
         model: String,
-        custom_agent_id: Option<String>,
+        assistant_id: Option<String>,
     ) -> Result<TeamAgent, TeamError> {
         let row = self
             .repo
@@ -284,7 +284,7 @@ impl TeamAgentProvisioner {
                 role: TeammateRole::Teammate,
                 backend,
                 model,
-                assistant_id: custom_agent_id,
+                assistant_id,
                 workspace: Some(workspace),
             })
             .await?;

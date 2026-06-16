@@ -54,7 +54,7 @@ pub struct WakeInput {
 pub struct SpawnAgentRequest {
     pub name: String,
     pub agent_type: Option<String>,
-    pub custom_agent_id: Option<String>,
+    pub assistant_id: Option<String>,
     pub model: Option<String>,
 }
 
@@ -1032,7 +1032,7 @@ impl TeamSession {
                 requested_name,
                 backend,
                 model,
-                req.custom_agent_id.clone(),
+                req.assistant_id.clone(),
             )
             .await?;
 
@@ -2297,7 +2297,7 @@ mod tests {
         SpawnAgentRequest {
             name: "Helper".into(),
             agent_type: None,
-            custom_agent_id: None,
+            assistant_id: None,
             model: None,
         }
     }
@@ -2751,7 +2751,7 @@ mod tests {
         SpawnAgentRequest {
             name: "Helper".into(),
             agent_type: agent_type.map(str::to_owned),
-            custom_agent_id: None,
+            assistant_id: None,
             model: None,
         }
     }

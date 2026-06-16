@@ -221,7 +221,7 @@ impl TeamSessionService {
         name: String,
         backend: String,
         model: String,
-        custom_agent_id: Option<String>,
+        assistant_id: Option<String>,
     ) -> Result<TeamAgent, TeamError> {
         let lock = self
             .add_agent_locks
@@ -231,7 +231,7 @@ impl TeamSessionService {
         let _guard = lock.lock().await;
 
         self.provisioner()
-            .persist_spawned_agent(user_id, team_id, name, backend, model, custom_agent_id)
+            .persist_spawned_agent(user_id, team_id, name, backend, model, assistant_id)
             .await
     }
 }

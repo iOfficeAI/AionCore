@@ -50,7 +50,7 @@ judge whether it fits the user's request. Use this when two or more presets look
 relevant from the one-line catalog in your system prompt.
 
 Only works on preset assistants listed in \"Available Preset Assistants for Spawning\".
-After confirming a match, call team_spawn_agent with the same custom_agent_id.";
+After confirming a match, call team_spawn_agent with the same assistant_id.";
 
 // ---------------------------------------------------------------------------
 // Tool descriptors (returned by tools/list)
@@ -86,7 +86,7 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
                     "name": { "type": "string", "description": "Agent display name" },
                     "agent_type": { "type": "string", "description": "Agent type/backend to use (e.g. \"claude\", \"codex\", \"codebuddy\", \"gemini\"). Query team_list_models first to see available options." },
                     "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be a valid model for the chosen agent_type. Query team_list_models to see available models." },
-                    "custom_agent_id": { "type": "string", "description": "Preset assistant ID to spawn (from the Available Preset Assistants catalog). When set, agent_type is derived from the preset's backend." },
+                    "assistant_id": { "type": "string", "description": "Preset assistant ID to spawn (from the Available Preset Assistants catalog). When set, agent_type is derived from the preset's backend." },
                     "backend": { "type": "string", "description": "Legacy alias for agent_type. Prefer agent_type." },
                     "role": { "type": "string", "description": "Agent role (default: 'teammate')" }
                 },
@@ -169,10 +169,10 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "custom_agent_id": { "type": "string", "description": "The preset assistant ID from the \"Available Preset Assistants\" catalog (e.g., \"word-creator\")." },
+                    "assistant_id": { "type": "string", "description": "The preset assistant ID from the \"Available Preset Assistants\" catalog (e.g., \"word-creator\")." },
                     "locale": { "type": "string", "description": "Locale like \"zh-CN\" or \"en-US\". Defaults to the user's current UI language when omitted." }
                 },
-                "required": ["custom_agent_id"]
+                "required": ["assistant_id"]
             }),
         },
         ToolDescriptor {
@@ -201,7 +201,7 @@ pub struct SendMessageInput {
 /// Arguments for the `team_spawn_agent` MCP tool call.
 ///
 /// The AionUi contract (`docs/teams/phase1/aionui-audit.md` §2.1) names the
-/// agent-type field `agent_type` and adds `custom_agent_id` + `model`. The
+/// agent-type field `agent_type` and adds `assistant_id` + `model`. The
 /// phase-1 Rust dispatch originally exposed `backend` (and `role`); those are
 /// preserved for back-compat and used as fallbacks when the modern fields
 /// are not provided — `backend` is treated as an alias for `agent_type`.
@@ -215,7 +215,8 @@ pub struct SpawnAgentInput {
     #[serde(default)]
     pub agent_type: Option<String>,
     #[serde(default)]
-    pub custom_agent_id: Option<String>,
+    #[serde(alias = "assistantId", alias = "custom_agent_id", alias = "customAgentId")]
+    pub assistant_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -514,8 +515,8 @@ mod tests {
             "schema must expose 'agent_type' field"
         );
         assert!(
-            props.contains_key("custom_agent_id"),
-            "schema must expose 'custom_agent_id' field"
+            props.contains_key("assistant_id"),
+            "schema must expose 'assistant_id' field"
         );
     }
 
@@ -699,8 +700,34 @@ mod tests {
         );
         assert!(
             desc.description
-                .contains("After confirming a match, call team_spawn_agent with the same custom_agent_id.")
+                .contains("After confirming a match, call team_spawn_agent with the same assistant_id.")
         );
+    }
+
+    #[test]
+    fn team_describe_assistant_schema_prefers_assistant_id() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_describe_assistant")
+            .unwrap();
+        let props = desc.input_schema["properties"].as_object().unwrap();
+        let required = desc.input_schema["required"].as_array().unwrap();
+        let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(props.contains_key("assistant_id"));
+        assert!(!props.contains_key("custom_agent_id"));
+        assert!(names.contains(&"assistant_id"));
+        assert!(!names.contains(&"custom_agent_id"));
+    }
+
+    #[test]
+    fn parse_spawn_agent_accepts_legacy_custom_agent_id_alias() {
+        let input: SpawnAgentInput = serde_json::from_value(json!({
+            "name": "Preset helper",
+            "backend": "claude",
+            "custom_agent_id": "word-creator",
+        }))
+        .unwrap();
+        assert_eq!(input.assistant_id.as_deref(), Some("word-creator"));
     }
 
     // ---- D4 handlers return non-error payloads ----
