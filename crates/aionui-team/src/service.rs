@@ -913,6 +913,23 @@ impl TeamSessionService {
             .await
     }
 
+    pub async fn shutdown_agent_in_session(
+        &self,
+        team_id: &str,
+        caller_slot_id: &str,
+        target_slot_id: &str,
+        reason: Option<String>,
+    ) -> Result<(), TeamError> {
+        let session = {
+            let entry = self
+                .sessions
+                .get(team_id)
+                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+            Arc::clone(&entry.session)
+        };
+        session.shutdown_agent(caller_slot_id, target_slot_id, reason).await
+    }
+
     pub(crate) fn notify_reserved_wake_for_team_work(
         &self,
         team_id: &str,

@@ -740,21 +740,7 @@ async fn exec_shutdown_agent(
         .upgrade()
         .ok_or_else(|| "Team service not available; cannot wake shutdown target".to_string())?;
     service
-        .require_active_team_run_for_team_work(team_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let action = crate::scheduler::SchedulerAction::ShutdownAgent {
-        slot_id: target_slot_id.clone(),
-        reason: input.reason,
-    };
-    scheduler
-        .execute_action(caller_slot_id, &action)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    service
-        .wake_agent_for_team_work(team_id, &target_slot_id, TeamWakeSource::McpShutdownRequest, None)
+        .shutdown_agent_in_session(team_id, caller_slot_id, &target_slot_id, input.reason)
         .await
         .map_err(|e| e.to_string())?;
 

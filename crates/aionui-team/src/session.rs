@@ -562,6 +562,66 @@ impl TeamSession {
         Ok(())
     }
 
+    pub(crate) async fn shutdown_agent(
+        &self,
+        caller_slot_id: &str,
+        target_slot_id: &str,
+        reason: Option<String>,
+    ) -> Result<(), TeamError> {
+        let caller = self.scheduler.get_agent(caller_slot_id).await?;
+        if caller.role != TeammateRole::Lead {
+            return Err(TeamError::LeaderOnly("team_shutdown_agent".into()));
+        }
+        let target = self.scheduler.get_agent(target_slot_id).await?;
+        if target.role == TeammateRole::Lead {
+            return Err(TeamError::InvalidRequest("cannot shutdown the team lead".into()));
+        }
+
+        let outcome = self
+            .team_run_manager
+            .acquire_run_scoped_wake(
+                target_slot_id,
+                target_role_for(target.role),
+                TeamWakeSource::McpShutdownRequest,
+            )
+            .await?;
+        let TeamRunWakeAcquireOutcome::Accepted(lease) = outcome else {
+            return Err(TeamError::InvalidRequest("shutdown wake was suppressed".into()));
+        };
+
+        let shutdown_message = match self
+            .scheduler
+            .request_shutdown_agent(caller_slot_id, target_slot_id, reason.as_deref())
+            .await
+        {
+            Ok(message) => message,
+            Err(err) => {
+                let _ = self
+                    .team_run_manager
+                    .abort_operation_lease(&lease.lease_id, "shutdown_scheduler_action_failed")
+                    .await;
+                return Err(err);
+            }
+        };
+
+        if shutdown_message.to_agent_id != target_slot_id {
+            let _ = self
+                .team_run_manager
+                .abort_operation_lease(&lease.lease_id, "shutdown_mailbox_target_mismatch")
+                .await;
+            return Err(TeamError::InvalidRequest(format!(
+                "shutdown mailbox target mismatch: expected {target_slot_id}, got {}",
+                shutdown_message.to_agent_id
+            )));
+        }
+
+        self.team_run_manager
+            .commit_operation_lease(&lease.lease_id, Some(shutdown_message.id.clone()))
+            .await?;
+        self.notify_reserved_wake_for_team_work(target_slot_id, lease.role.clone(), lease.wake_source);
+        Ok(())
+    }
+
     pub(crate) async fn wake_agent_for_team_work(
         &self,
         slot_id: &str,
@@ -2291,6 +2351,65 @@ mod tests {
         let session = start_session().await;
         let result = session.send_message_to_agent("nonexistent", "Hello", None).await;
         assert!(result.is_err());
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_active_run_does_not_write_mailbox() {
+        let session = start_session().await;
+
+        let err = session
+            .shutdown_agent("lead-1", "worker-1", Some("done".into()))
+            .await
+            .expect_err("shutdown is run-scoped");
+
+        assert!(matches!(
+            err,
+            TeamError::InvalidRequest(message)
+                if message == "no active team run for run-scoped wake"
+        ));
+        let unread = session.mailbox().peek_unread("t1", "worker-1").await.unwrap();
+        assert!(unread.is_empty());
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn shutdown_busy_target_is_accepted_as_lifecycle_wake() {
+        let session = start_session().await;
+        let ack = session.send_message("start", None).await.unwrap();
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("lead-1", TeamRunTargetRole::Lead, "c1")
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_child_started(
+                &reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id,
+                    slot_id: "lead-1".into(),
+                    role: TeamRunTargetRole::Lead,
+                    conversation_id: "c1".into(),
+                    turn_id: "turn-lead".into(),
+                },
+            )
+            .await;
+
+        session
+            .shutdown_agent("lead-1", "worker-1", Some("done".into()))
+            .await
+            .expect("shutdown lifecycle wake should be accepted");
+
+        let unread = session.mailbox().peek_unread("t1", "worker-1").await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].msg_type, MailboxMessageType::ShutdownRequest);
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await
+            .expect("shutdown wake should be pending");
+        assert_eq!(reservation.wake_source, TeamWakeSource::McpShutdownRequest);
         session.stop();
     }
 
