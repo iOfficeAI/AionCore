@@ -350,6 +350,14 @@ impl TeamRunManager {
         guard.as_ref().filter(|run| run.is_active()).map(TeamRunRecord::payload)
     }
 
+    pub(crate) async fn slot_work_for_slot(&self, slot_id: &str) -> Option<(String, TeamSlotWorkPayload)> {
+        let guard = self.state.lock().await;
+        let run = guard.as_ref().filter(|run| run.is_active())?;
+        let payload = run.payload();
+        let work = payload.slot_work.iter().find(|work| work.slot_id == slot_id).cloned()?;
+        Some((payload.team_run_id, work))
+    }
+
     pub async fn mark_slot_runtime_health(
         &self,
         slot_id: &str,

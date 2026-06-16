@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{TeamRunAckResponse, TeamRunTargetRole};
+use aionui_api_types::{
+    TeamRunAckResponse, TeamRunTargetRole, TeamSendMessageDelivery, TeamSendMessageReason,
+    TeamSendMessageTargetQueueState, TeamSlotRuntimeHealth, TeamSlotWorkPayload,
+};
 use aionui_common::AgentKillReason;
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
@@ -46,6 +49,13 @@ pub struct WakeInput {
     pub agent_role: TeammateRole,
     pub(crate) wake_source: Option<TeamWakeSource>,
     pub(crate) trigger_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentMessageQueueResult {
+    pub team_run_id: String,
+    pub delivery: TeamSendMessageDelivery,
+    pub target: TeamSendMessageTargetQueueState,
 }
 
 /// Input for [`TeamSession::spawn_agent`]. Populated by the lead agent when
@@ -485,7 +495,7 @@ impl TeamSession {
         from_slot_id: &str,
         to_slot_id: &str,
         content: &str,
-    ) -> Result<(), TeamError> {
+    ) -> Result<AgentMessageQueueResult, TeamError> {
         let to_agent = self.scheduler.get_agent(to_slot_id).await?;
         let from_agent = self.scheduler.get_agent(from_slot_id).await?;
 
@@ -534,12 +544,78 @@ impl TeamSession {
             );
         }
 
-        self.wake_agent_for_team_work(
-            to_slot_id,
-            TeamWakeSource::McpSendMessage,
-            Some(mailbox_message.id.clone()),
-        )
-        .await
+        let to_role = target_role_for(to_agent.role);
+        let decision = self
+            .team_run_manager
+            .record_or_suppress_wake(
+                to_slot_id,
+                to_role.clone(),
+                TeamWakeSource::McpSendMessage,
+                Some(mailbox_message.id.clone()),
+            )
+            .await?;
+        let target_event_loop_registered = self.event_loops.has(to_slot_id);
+        if matches!(decision, WakeRecordDecision::Recorded) && !target_event_loop_registered {
+            warn!(
+                team_id = %self.team.id,
+                slot_id = to_slot_id,
+                target_role = ?to_role,
+                wake_source = %TeamWakeSource::McpSendMessage,
+                "team wake recorded but event loop is not registered; pending wake retained"
+            );
+            self.team_run_manager
+                .mark_slot_runtime_health(to_slot_id, TeamSlotRuntimeHealth::Unhealthy)
+                .await;
+        }
+
+        let (team_run_id, work) = self
+            .team_run_manager
+            .slot_work_for_slot(to_slot_id)
+            .await
+            .ok_or_else(|| TeamError::InvalidRequest(format!("no active team run work for slot {to_slot_id}")))?;
+        let delivery = match decision {
+            WakeRecordDecision::Recorded => TeamSendMessageDelivery::WakeRecorded,
+            WakeRecordDecision::Suppressed => TeamSendMessageDelivery::WakeSuppressed,
+        };
+        let queue_state = classify_send_message_queue_state(
+            &work,
+            target_event_loop_registered || !matches!(delivery, TeamSendMessageDelivery::WakeRecorded),
+        );
+        let target = TeamSendMessageTargetQueueState {
+            slot_id: work.slot_id,
+            role: work.role,
+            queue_state,
+            pending_wake_count: work.pending_wake_count,
+            starting_child_count: work.starting_child_count,
+            active_turn_id: work.active_turn_id,
+            suppressed_wake_count: work.suppressed_wake_count,
+        };
+
+        info!(
+            team_id = %self.team.id,
+            team_run_id = %team_run_id,
+            caller_slot_id = from_slot_id,
+            target_slot_id = to_slot_id,
+            target_role = ?target.role,
+            wake_source = %TeamWakeSource::McpSendMessage,
+            message_id = %mailbox_message.id,
+            slot_pending_wake_count = target.pending_wake_count,
+            starting_child_count = target.starting_child_count,
+            active_turn_id = ?target.active_turn_id.as_deref(),
+            suppressed_wake_count = target.suppressed_wake_count,
+            reason = ?target.queue_state,
+            "team_agent_message_queued"
+        );
+
+        if matches!(decision, WakeRecordDecision::Recorded) && target_event_loop_registered {
+            self.notify_reserved_wake_for_team_work(to_slot_id, to_role, TeamWakeSource::McpSendMessage);
+        }
+
+        Ok(AgentMessageQueueResult {
+            team_run_id,
+            delivery,
+            target,
+        })
     }
 
     pub(crate) async fn wake_agent_for_team_work(
@@ -1165,16 +1241,39 @@ impl TeamSession {
     }
 }
 
+fn classify_send_message_queue_state(
+    work: &TeamSlotWorkPayload,
+    target_event_loop_registered: bool,
+) -> TeamSendMessageReason {
+    if matches!(work.runtime_health, Some(TeamSlotRuntimeHealth::Disconnected)) {
+        return TeamSendMessageReason::TargetDisconnected;
+    }
+    if !target_event_loop_registered || matches!(work.runtime_health, Some(TeamSlotRuntimeHealth::Unhealthy)) {
+        return TeamSendMessageReason::TargetUnhealthy;
+    }
+    if work.paused && work.suppressed_wake_count > 0 {
+        return TeamSendMessageReason::SuppressedByPause;
+    }
+    if work.active_turn_id.is_some() {
+        return TeamSendMessageReason::BehindActiveTurn;
+    }
+    if work.starting_child_count > 0 {
+        return TeamSendMessageReason::BehindStartingTurn;
+    }
+    TeamSendMessageReason::QueuedForIdle
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_loop::AgentLoopContext;
     use crate::team_run::ActiveChildTurn;
     use crate::test_utils::MockTeamRepo;
     use crate::types::{Team, TeamAgent, TeammateRole};
     use aionui_ai_agent::AgentError;
     use aionui_ai_agent::agent_task::AgentInstance;
     use aionui_ai_agent::types::BuildTaskOptions;
-    use aionui_api_types::WebSocketMessage;
+    use aionui_api_types::{TeamSendMessageDelivery, TeamSendMessageReason, WebSocketMessage};
     use aionui_common::{AgentKillReason, TimestampMs, now_ms};
     use std::sync::{Arc, Mutex};
 
@@ -1465,6 +1564,26 @@ mod tests {
         .unwrap()
     }
 
+    async fn start_session_arc() -> Arc<TeamSession> {
+        Arc::new(start_session().await)
+    }
+
+    fn register_test_event_loop(session: &Arc<TeamSession>, slot_id: &str) {
+        session.event_loops().spawn(
+            slot_id,
+            AgentLoopContext {
+                team_id: session.team_id().to_owned(),
+                slot_id: slot_id.to_owned(),
+                user_id: session.user_id().to_owned(),
+                session: session.clone(),
+                scheduler: session.scheduler().clone(),
+                mailbox: session.mailbox().clone(),
+                turn_port: session.turn_port().clone(),
+                registry: session.event_loops().clone(),
+            },
+        );
+    }
+
     async fn start_session_with_projection_store(store: Arc<dyn TeamProjectionMessageStore>) -> TeamSession {
         let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
@@ -1532,6 +1651,72 @@ mod tests {
                 .contains("team:t1:mailbox:"),
             "projection must use mailbox-message dedupe key"
         );
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn agent_message_to_idle_target_returns_queued_for_idle() {
+        let session = start_session_arc().await;
+        register_test_event_loop(&session, "worker-1");
+        let ack = session.send_message("start", None).await.unwrap();
+
+        let result = session
+            .send_agent_message_from_agent("lead-1", "worker-1", "Do the implementation")
+            .await
+            .unwrap();
+
+        assert_eq!(result.team_run_id, ack.team_run_id);
+        assert_eq!(result.delivery, TeamSendMessageDelivery::WakeRecorded);
+        assert_eq!(result.target.queue_state, TeamSendMessageReason::QueuedForIdle);
+        assert_eq!(result.target.pending_wake_count, 1);
+        session.event_loops().shutdown();
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn agent_message_to_active_target_returns_behind_active_turn() {
+        let session = start_session_arc().await;
+        register_test_event_loop(&session, "worker-1");
+        let ack = session
+            .team_run_manager()
+            .accept_user_message("worker-1", TeamRunTargetRole::Teammate, false, None)
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_pending_wake("worker-1", TeamRunTargetRole::Teammate, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "conv-worker")
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_child_started(
+                &reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id.clone(),
+                    slot_id: "worker-1".into(),
+                    role: TeamRunTargetRole::Teammate,
+                    conversation_id: "conv-worker".into(),
+                    turn_id: "turn-worker".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
+                },
+            )
+            .await;
+
+        let result = session
+            .send_agent_message_from_agent("lead-1", "worker-1", "Second item")
+            .await
+            .unwrap();
+
+        assert_eq!(result.target.queue_state, TeamSendMessageReason::BehindActiveTurn);
+        assert_eq!(result.target.pending_wake_count, 1);
+        assert_eq!(result.target.active_turn_id.as_deref(), Some("turn-worker"));
+        session.event_loops().shutdown();
         session.stop();
     }
 

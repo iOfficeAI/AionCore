@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
-use aionui_api_types::{TeamMcpPhase, TeamMcpStatusPayload, WebSocketMessage};
+use aionui_api_types::{
+    TeamMcpPhase, TeamMcpStatusPayload, TeamSendMessageQueuedResponse, TeamSendMessageStatus, WebSocketMessage,
+};
 use aionui_realtime::EventBroadcaster;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -12,7 +14,7 @@ use crate::error::TeamError;
 use crate::events::TEAM_MCP_STATUS_EVENT;
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
-use crate::session::SpawnAgentRequest;
+use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
 use crate::types::{TeammateRole, TeammateStatus};
 use crate::wake::TeamWakeSource;
 
@@ -562,14 +564,33 @@ async fn exec_send_message(
     } else {
         vec![resolved_to.clone()]
     };
+    let mut target_results = Vec::with_capacity(targets.len());
     for target in &targets {
-        service
+        let result = service
             .send_agent_message_from_agent(team_id, caller_slot_id, target, &input.message)
             .await
             .map_err(|e| e.to_string())?;
+        target_results.push(result);
     }
 
-    Ok(format!("Message sent to {}", input.to))
+    let response = build_send_message_queued_response(target_results)?;
+
+    serde_json::to_string(&response).map_err(|e| format!("Serialization error: {e}"))
+}
+
+fn build_send_message_queued_response(
+    target_results: Vec<AgentMessageQueueResult>,
+) -> Result<TeamSendMessageQueuedResponse, String> {
+    let first = target_results
+        .first()
+        .ok_or_else(|| "No message targets resolved".to_string())?;
+    Ok(TeamSendMessageQueuedResponse {
+        status: TeamSendMessageStatus::Queued,
+        delivery: first.delivery.clone(),
+        reason: first.target.queue_state.clone(),
+        team_run_id: first.team_run_id.clone(),
+        targets: target_results.into_iter().map(|result| result.target).collect(),
+    })
 }
 
 async fn exec_spawn_agent(
@@ -888,6 +909,35 @@ async fn http_mcp_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_api_types::{
+        TeamRunTargetRole, TeamSendMessageDelivery, TeamSendMessageReason, TeamSendMessageTargetQueueState,
+    };
+
+    #[test]
+    fn build_send_message_queued_response_serializes_json_contract() {
+        let response = build_send_message_queued_response(vec![AgentMessageQueueResult {
+            team_run_id: "run-1".into(),
+            delivery: TeamSendMessageDelivery::WakeRecorded,
+            target: TeamSendMessageTargetQueueState {
+                slot_id: "worker-1".into(),
+                role: TeamRunTargetRole::Teammate,
+                queue_state: TeamSendMessageReason::QueuedForIdle,
+                pending_wake_count: 1,
+                starting_child_count: 0,
+                active_turn_id: None,
+                suppressed_wake_count: 0,
+            },
+        }])
+        .unwrap();
+
+        let text = serde_json::to_string(&response).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).expect("team_send_message result must be JSON");
+        assert_eq!(payload["status"], "queued");
+        assert_eq!(payload["delivery"], "wake_recorded");
+        assert_eq!(payload["reason"], "queued_for_idle");
+        assert_eq!(payload["targets"][0]["slot_id"], "worker-1");
+        assert_eq!(payload["targets"][0]["queue_state"], "queued_for_idle");
+    }
 
     /// Non-Lead callers are rejected at the dispatch layer with the
     /// "Only Lead ..." phrasing. Service weak is never upgraded because

@@ -24,7 +24,7 @@ use crate::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, TeamConversationBindingLookup, TeamConversationLookupPort,
 };
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
-use crate::session::TeamSession;
+use crate::session::{AgentMessageQueueResult, TeamSession};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::wake::TeamWakeSource;
 use crate::workspace::validate_create_workspace_path;
@@ -894,13 +894,13 @@ impl TeamSessionService {
             .await
     }
 
-    pub async fn send_agent_message_from_agent(
+    pub(crate) async fn send_agent_message_from_agent(
         &self,
         team_id: &str,
         from_slot_id: &str,
         to_slot_id: &str,
         content: &str,
-    ) -> Result<(), TeamError> {
+    ) -> Result<AgentMessageQueueResult, TeamError> {
         self.require_active_team_run_for_team_work(team_id).await?;
         let session = {
             let entry = self
