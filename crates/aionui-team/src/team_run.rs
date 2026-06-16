@@ -6,7 +6,7 @@ use aionui_api_types::{
 };
 use aionui_common::{TimestampMs, generate_id, now_ms};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::TeamError;
 use crate::events::{
@@ -72,6 +72,27 @@ pub(crate) enum WakeRecordDecision {
     Suppressed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TeamRunOperationLease {
+    pub lease_id: String,
+    pub team_run_id: String,
+    pub slot_id: String,
+    pub role: TeamRunTargetRole,
+    pub wake_source: TeamWakeSource,
+    pub accepted_as_new_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveOperationLease {
+    lease: TeamRunOperationLease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TeamRunWakeAcquireOutcome {
+    Accepted(TeamRunOperationLease),
+    Suppressed,
+}
+
 #[derive(Debug, Clone)]
 pub struct PauseSlotOutcome {
     pub team_run_id: String,
@@ -100,6 +121,7 @@ struct TeamRunRecord {
     starting_reservations: HashMap<String, StartingChildReservation>,
     pending_wakes: HashMap<String, VecDeque<PendingWake>>,
     slot_wake_gate: SlotWakeGate,
+    active_operation_leases: HashMap<String, ActiveOperationLease>,
 }
 
 impl TeamRunRecord {
@@ -116,6 +138,10 @@ impl TeamRunRecord {
             .values()
             .filter(|reservation| reservation.slot_id == slot_id)
             .count()
+    }
+
+    fn active_operation_lease_count(&self) -> usize {
+        self.active_operation_leases.len()
     }
 
     fn role_for_slot(&self, slot_id: &str) -> Option<TeamRunTargetRole> {
@@ -219,6 +245,48 @@ impl TeamRunRecord {
     }
 }
 
+fn new_operation_lease(
+    run: &mut TeamRunRecord,
+    slot_id: &str,
+    role: TeamRunTargetRole,
+    wake_source: TeamWakeSource,
+    accepted_as_new_run: bool,
+) -> TeamRunOperationLease {
+    let lease = TeamRunOperationLease {
+        lease_id: generate_id(),
+        team_run_id: run.team_run_id.clone(),
+        slot_id: slot_id.to_owned(),
+        role,
+        wake_source,
+        accepted_as_new_run,
+    };
+    run.active_operation_leases.insert(
+        lease.lease_id.clone(),
+        ActiveOperationLease {
+            lease: lease.clone(),
+        },
+    );
+    lease
+}
+
+fn push_pending_wake_locked(
+    run: &mut TeamRunRecord,
+    slot_id: String,
+    role: TeamRunTargetRole,
+    source: TeamWakeSource,
+    message_id: Option<String>,
+) {
+    run.pending_wakes
+        .entry(slot_id.clone())
+        .or_default()
+        .push_back(PendingWake {
+            slot_id,
+            role,
+            source,
+            message_id,
+        });
+}
+
 #[derive(Clone)]
 pub struct TeamRunManager {
     team_id: String,
@@ -289,6 +357,7 @@ impl TeamRunManager {
             starting_reservations: HashMap::new(),
             pending_wakes: HashMap::new(),
             slot_wake_gate: SlotWakeGate::default(),
+            active_operation_leases: HashMap::new(),
         };
         let ack = record.ack(target_slot_id, target_role, message_id);
         let payload = record.payload();
@@ -304,6 +373,189 @@ impl TeamRunManager {
         );
         self.emitter.broadcast_team_run(TEAM_RUN_ACCEPTED_EVENT, payload);
         Ok(ack)
+    }
+
+    pub(crate) async fn acquire_user_message_wake(
+        &self,
+        slot_id: &str,
+        role: TeamRunTargetRole,
+    ) -> Result<(TeamRunAckResponse, TeamRunOperationLease), TeamError> {
+        let mut guard = self.state.lock().await;
+
+        if let Some(run) = guard.as_mut().filter(|r| r.is_active()) {
+            if run.active_child_turns.contains_key(slot_id) || run.starting_child_count_for_slot(slot_id) > 0 {
+                info!(
+                    team_id = %self.team_id,
+                    team_run_id = %run.team_run_id,
+                    slot_id,
+                    role = ?role,
+                    "team_run user wake acquire rejected because slot is busy"
+                );
+                return Err(TeamError::SlotBusy(slot_id.to_owned()));
+            }
+
+            let source = TeamWakeSource::UserIntervention;
+            let _ = run.slot_wake_gate.before_wake(slot_id, source, None);
+            let lease = new_operation_lease(run, slot_id, role.clone(), source, false);
+            let ack = run.ack(slot_id, role, None);
+            info!(
+                team_id = %self.team_id,
+                team_run_id = %lease.team_run_id,
+                lease_id = %lease.lease_id,
+                slot_id = %lease.slot_id,
+                wake_source = %lease.wake_source,
+                accepted_as_new_run = lease.accepted_as_new_run,
+                "team_run operation lease acquired"
+            );
+            return Ok((ack, lease));
+        }
+
+        if let Some(cancelling) = guard.as_ref().filter(|r| matches!(r.status, TeamRunStatus::Cancelling)) {
+            return Err(TeamError::InvalidRequest(format!(
+                "team run {} is cancelling",
+                cancelling.team_run_id
+            )));
+        }
+
+        let mut record = TeamRunRecord {
+            team_run_id: generate_id(),
+            team_id: self.team_id.clone(),
+            target_slot_id: slot_id.to_owned(),
+            target_role: role.clone(),
+            status: TeamRunStatus::Accepted,
+            started_at: None,
+            completed_at: None,
+            cancelled_at: None,
+            cancel_reason: None,
+            active_child_turns: HashMap::new(),
+            starting_reservations: HashMap::new(),
+            pending_wakes: HashMap::new(),
+            slot_wake_gate: SlotWakeGate::default(),
+            active_operation_leases: HashMap::new(),
+        };
+        let lease = new_operation_lease(
+            &mut record,
+            slot_id,
+            role.clone(),
+            TeamWakeSource::UserMessage,
+            true,
+        );
+        let ack = record.ack(slot_id, role, None);
+        let payload = record.payload();
+        *guard = Some(record);
+        drop(guard);
+
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %ack.team_run_id,
+            target_slot_id = %ack.target_slot_id,
+            target_role = ?ack.target_role,
+            "team_run accepted"
+        );
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %lease.team_run_id,
+            lease_id = %lease.lease_id,
+            slot_id = %lease.slot_id,
+            wake_source = %lease.wake_source,
+            accepted_as_new_run = lease.accepted_as_new_run,
+            "team_run operation lease acquired"
+        );
+        self.emitter.broadcast_team_run(TEAM_RUN_ACCEPTED_EVENT, payload);
+        Ok((ack, lease))
+    }
+
+    pub(crate) async fn commit_operation_lease(
+        &self,
+        lease_id: &str,
+        trigger_message_id: Option<String>,
+    ) -> Result<(), TeamError> {
+        let mut guard = self.state.lock().await;
+        let Some(run) = guard.as_mut().filter(|r| r.is_active()) else {
+            error!(
+                team_id = %self.team_id,
+                lease_id,
+                "team_run operation lease commit failed because no active run exists"
+            );
+            return Err(TeamError::InvalidRequest(format!(
+                "team run operation lease missing: {lease_id}"
+            )));
+        };
+        let Some(active) = run.active_operation_leases.remove(lease_id) else {
+            error!(
+                team_id = %self.team_id,
+                team_run_id = %run.team_run_id,
+                lease_id,
+                "team_run operation lease commit failed because lease is missing"
+            );
+            return Err(TeamError::InvalidRequest(format!(
+                "team run operation lease missing: {lease_id}"
+            )));
+        };
+
+        let lease = active.lease;
+        push_pending_wake_locked(
+            run,
+            lease.slot_id.clone(),
+            lease.role.clone(),
+            lease.wake_source,
+            trigger_message_id,
+        );
+        let payload = run.payload();
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %run.team_run_id,
+            lease_id = %lease.lease_id,
+            slot_id = %lease.slot_id,
+            wake_source = %lease.wake_source,
+            pending_wake_count = payload.pending_wake_count,
+            active_operation_lease_count = run.active_operation_lease_count(),
+            "team_run operation lease committed"
+        );
+        drop(guard);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
+        Ok(())
+    }
+
+    pub(crate) async fn abort_operation_lease(&self, lease_id: &str, reason: &str) -> Result<(), TeamError> {
+        let mut guard = self.state.lock().await;
+        let Some(run) = guard.as_mut().filter(|r| r.is_active()) else {
+            error!(
+                team_id = %self.team_id,
+                lease_id,
+                reason,
+                "team_run operation lease abort failed because no active run exists"
+            );
+            return Err(TeamError::InvalidRequest(format!(
+                "team run operation lease missing: {lease_id}"
+            )));
+        };
+        let Some(active) = run.active_operation_leases.remove(lease_id) else {
+            error!(
+                team_id = %self.team_id,
+                team_run_id = %run.team_run_id,
+                lease_id,
+                reason,
+                "team_run operation lease abort failed because lease is missing"
+            );
+            return Err(TeamError::InvalidRequest(format!(
+                "team run operation lease missing: {lease_id}"
+            )));
+        };
+        let payload = run.payload();
+        warn!(
+            team_id = %self.team_id,
+            team_run_id = %run.team_run_id,
+            lease_id = %active.lease.lease_id,
+            slot_id = %active.lease.slot_id,
+            wake_source = %active.lease.wake_source,
+            reason,
+            active_operation_lease_count = run.active_operation_lease_count(),
+            "team_run operation lease aborted"
+        );
+        drop(guard);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
+        Ok(())
     }
 
     pub async fn active_run_id(&self) -> Option<String> {
@@ -1124,6 +1376,7 @@ fn maybe_complete_locked(run: &mut TeamRunRecord, emitter: &TeamEventEmitter) ->
     if run.pending_wake_count() > 0
         || !run.starting_reservations.is_empty()
         || !run.active_child_turns.is_empty()
+        || run.active_operation_lease_count() > 0
         || run.has_retained_wake_gate_work()
     {
         emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, run.payload());
@@ -1157,6 +1410,7 @@ fn maybe_cancelled_locked(run: &mut TeamRunRecord, emitter: &TeamEventEmitter) -
     if run.pending_wake_count() > 0
         || !run.starting_reservations.is_empty()
         || !run.active_child_turns.is_empty()
+        || run.active_operation_lease_count() > 0
         || run.has_retained_wake_gate_work()
     {
         emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, run.payload());
@@ -1233,6 +1487,79 @@ mod tests {
             .iter()
             .find(|work| work.slot_id == slot_id)
             .expect("slot work must exist")
+    }
+
+    #[tokio::test]
+    async fn lease_keeps_run_active_until_commit() {
+        let (manager, _bc) = manager();
+        let (ack, lease) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect("user message should create run and lease");
+
+        assert_eq!(lease.team_run_id, ack.team_run_id);
+        assert_eq!(lease.slot_id, "lead");
+        assert_eq!(lease.wake_source, TeamWakeSource::UserMessage);
+        assert!(lease.accepted_as_new_run);
+
+        let completed = manager.maybe_complete().await;
+        assert!(completed.is_none(), "active lease must retain the run");
+        assert_eq!(
+            manager.active_run_id().await.as_deref(),
+            Some(ack.team_run_id.as_str())
+        );
+
+        manager
+            .commit_operation_lease(&lease.lease_id, Some("mailbox-1".into()))
+            .await
+            .expect("commit should convert lease to pending wake");
+
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .expect("committed wake should be claimable");
+        assert_eq!(reservation.message_id.as_deref(), Some("mailbox-1"));
+    }
+
+    #[tokio::test]
+    async fn abort_lease_releases_completion_hold() {
+        let (manager, _bc) = manager();
+        let (ack, lease) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect("user message should create run and lease");
+
+        manager
+            .abort_operation_lease(&lease.lease_id, "mailbox_write_failed")
+            .await
+            .expect("abort should remove lease");
+
+        let completed = manager
+            .maybe_complete()
+            .await
+            .expect("run should complete after aborted only lease");
+        assert_eq!(completed.team_run_id, ack.team_run_id);
+        assert_eq!(completed.status, TeamRunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn commit_missing_lease_returns_internal_consistency_error() {
+        let (manager, _bc) = manager();
+        manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect("create active run");
+
+        let err = manager
+            .commit_operation_lease("missing-lease", Some("mailbox-1".into()))
+            .await
+            .expect_err("missing lease is a contract violation");
+
+        assert!(matches!(
+            err,
+            TeamError::InvalidRequest(message)
+                if message == "team run operation lease missing: missing-lease"
+        ));
     }
 
     #[tokio::test]
