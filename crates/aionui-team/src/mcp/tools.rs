@@ -21,25 +21,27 @@ Use this only when one of the following is true:
 Before calling this tool in the normal planning flow:
 - Start with one short sentence explaining why additional teammates would help
 - Tell the user which teammate(s) you recommend
-- Present the proposal as a table with: name, responsibility, recommended agent type/backend, and recommended model
-- Include each teammate's responsibility, recommended agent type/backend, and model
-- Ask whether to create them as proposed or change any names, responsibilities, or agent types
+- Present the proposal as a table with: name, responsibility, recommended assistant or backend, and recommended model
+- Include each teammate's responsibility, recommended assistant or backend, and model
+- Ask whether to create them as proposed or change any names, responsibilities, or assistant choices
 - In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well
 - Do NOT call this tool in that same turn; wait for explicit approval in a later user message
+
+When a preset assistant is a good fit, prefer passing assistant_id. Use agent_type/backend only as a compatibility fallback when no preset assistant fits the requested role.
 
 When calling this tool, provide the model parameter if a specific model was recommended and approved.
 
 The new agent will be created and added to the team. You can then assign tasks and send messages to it."#;
 
 /// Description for `team_list_models` — verbatim from team-prompts.md §5.2.
-pub const TEAM_LIST_MODELS_DESCRIPTION: &str = "Query available models for team agent types. Returns the real-time model list that matches the frontend model selector.
+pub const TEAM_LIST_MODELS_DESCRIPTION: &str = "Query available models for assistant backends. Returns the real-time model list that matches the frontend model selector.
 
 Use this to:
-- Check what models are available before spawning an agent with a specific model
-- See all available agent types and their models at once
-- Verify a model ID is valid for a given agent type
+- Check what models are available before spawning an assistant-backed teammate with a specific model
+- See all available backends and their models at once
+- Verify a model ID is valid for the backend behind a chosen assistant or fallback backend
 
-Pass agent_type to query a specific backend, or omit it to see all.";
+Pass agent_type to query a specific backend, or omit it to see all backends.";
 
 /// Description for `team_describe_assistant` — verbatim from team-prompts.md §5.2.
 pub const TEAM_DESCRIBE_ASSISTANT_DESCRIPTION: &str =
@@ -84,10 +86,10 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Agent display name" },
-                    "agent_type": { "type": "string", "description": "Agent type/backend to use (e.g. \"claude\", \"codex\", \"codebuddy\", \"gemini\"). Query team_list_models first to see available options." },
-                    "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be a valid model for the chosen agent_type. Query team_list_models to see available models." },
-                    "assistant_id": { "type": "string", "description": "Preset assistant ID to spawn (from the Available Preset Assistants catalog). When set, agent_type is derived from the preset's backend." },
-                    "backend": { "type": "string", "description": "Legacy alias for agent_type. Prefer agent_type." },
+                    "agent_type": { "type": "string", "description": "Fallback backend to use (e.g. \"claude\", \"codex\", \"codebuddy\", \"gemini\") when no preset assistant fits. Query team_list_models first to see available options." },
+                    "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be valid for the chosen assistant backend or fallback agent_type. Query team_list_models to see available models." },
+                    "assistant_id": { "type": "string", "description": "Preferred preset assistant ID to spawn (from the Available Preset Assistants catalog). When set, agent_type is derived from the preset's backend." },
+                    "backend": { "type": "string", "description": "Legacy alias for agent_type. Prefer assistant_id first, then agent_type." },
                     "role": { "type": "string", "description": "Agent role (default: 'teammate')" }
                 },
                 "required": ["name"]
@@ -181,7 +183,7 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "agent_type": { "type": "string", "description": "Agent type/backend to query (e.g. \"gemini\", \"claude\", \"codex\"). Shows all when omitted." }
+                    "agent_type": { "type": "string", "description": "Backend to query (e.g. \"gemini\", \"claude\", \"codex\"). Shows all backends when omitted." }
                 }
             }),
         },
@@ -668,7 +670,7 @@ mod tests {
         assert!(result.unwrap_err().contains("handled directly by server"));
     }
 
-    // ---- D4 descriptor text matches team-prompts.md §5.2 verbatim ----
+    // ---- D4 descriptor text remains aligned with assistant-first MCP contract ----
 
     #[test]
     fn team_list_models_descriptor_text_matches() {
@@ -679,11 +681,11 @@ mod tests {
         assert_eq!(desc.description, TEAM_LIST_MODELS_DESCRIPTION);
         assert!(
             desc.description
-                .starts_with("Query available models for team agent types.")
+                .starts_with("Query available models for assistant backends.")
         );
         assert!(
             desc.description
-                .contains("Pass agent_type to query a specific backend, or omit it to see all.")
+                .contains("Pass agent_type to query a specific backend, or omit it to see all backends.")
         );
     }
 
@@ -728,6 +730,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.assistant_id.as_deref(), Some("word-creator"));
+    }
+
+    #[test]
+    fn team_spawn_agent_schema_prefers_assistant_id_over_agent_type() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_spawn_agent")
+            .unwrap();
+        let props = desc.input_schema["properties"].as_object().unwrap();
+        let assistant_desc = props["assistant_id"]["description"].as_str().unwrap();
+        let agent_type_desc = props["agent_type"]["description"].as_str().unwrap();
+        let backend_desc = props["backend"]["description"].as_str().unwrap();
+        assert!(assistant_desc.starts_with("Preferred preset assistant ID"));
+        assert!(agent_type_desc.starts_with("Fallback backend to use"));
+        assert!(backend_desc.contains("Prefer assistant_id first"));
     }
 
     // ---- D4 handlers return non-error payloads ----
