@@ -1175,7 +1175,7 @@ mod tests {
     use aionui_ai_agent::agent_task::AgentInstance;
     use aionui_ai_agent::types::BuildTaskOptions;
     use aionui_api_types::WebSocketMessage;
-    use aionui_common::{AgentKillReason, TimestampMs};
+    use aionui_common::{AgentKillReason, TimestampMs, now_ms};
     use std::sync::{Arc, Mutex};
 
     struct NullBroadcaster;
@@ -1593,6 +1593,8 @@ mod tests {
             role: TeamRunTargetRole::Lead,
             conversation_id: "c1".into(),
             turn_id: "turn-lead".into(),
+            started_at_ms: now_ms(),
+            last_slow_notified_at_ms: None,
         };
         let worker = ActiveChildTurn {
             team_run_id: ack.team_run_id.clone(),
@@ -1600,6 +1602,8 @@ mod tests {
             role: TeamRunTargetRole::Teammate,
             conversation_id: "c2".into(),
             turn_id: "turn-worker".into(),
+            started_at_ms: now_ms(),
+            last_slow_notified_at_ms: None,
         };
 
         session
@@ -1673,6 +1677,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "c1".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1697,6 +1703,8 @@ mod tests {
                     role: TeamRunTargetRole::Teammate,
                     conversation_id: "c2".into(),
                     turn_id: "turn-worker".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1767,6 +1775,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "c1".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1822,6 +1832,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "c1".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;

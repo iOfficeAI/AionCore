@@ -2,7 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use aionui_api_types::{
-    TeamChildTurnPayload, TeamRunAckResponse, TeamRunPayload, TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload,
+    TeamChildTurnPayload, TeamRunAckResponse, TeamRunPayload, TeamRunStatus, TeamRunTargetRole, TeamSlotRuntimeHealth,
+    TeamSlotWorkPayload,
 };
 use aionui_common::{TimestampMs, generate_id, now_ms};
 use tokio::sync::Mutex;
@@ -18,6 +19,9 @@ use crate::slot_wake_gate::{SlotWakeGate, WakeGateDecision};
 use crate::types::TeammateRole;
 use crate::wake::TeamWakeSource;
 
+const ACTIVE_CHILD_SLOW_THRESHOLD_MS: u64 = 10 * 60 * 1000;
+const ACTIVE_CHILD_SLOW_REPEAT_MS: u64 = 10 * 60 * 1000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveChildTurn {
     pub team_run_id: String,
@@ -25,6 +29,8 @@ pub struct ActiveChildTurn {
     pub role: TeamRunTargetRole,
     pub conversation_id: String,
     pub turn_id: String,
+    pub started_at_ms: TimestampMs,
+    pub last_slow_notified_at_ms: Option<TimestampMs>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +103,7 @@ struct TeamRunRecord {
     active_child_turns: HashMap<String, ActiveChildTurn>,
     starting_reservations: HashMap<String, StartingChildReservation>,
     pending_wakes: HashMap<String, VecDeque<PendingWake>>,
+    slot_runtime_health: HashMap<String, TeamSlotRuntimeHealth>,
     slot_wake_gate: SlotWakeGate,
 }
 
@@ -137,6 +144,7 @@ impl TeamRunRecord {
     }
 
     fn slot_work(&self) -> Vec<TeamSlotWorkPayload> {
+        let now = now_ms();
         let mut slot_ids = self
             .pending_wakes
             .keys()
@@ -147,6 +155,7 @@ impl TeamRunRecord {
                     .map(|reservation| reservation.slot_id.clone()),
             )
             .chain(self.active_child_turns.keys().cloned())
+            .chain(self.slot_runtime_health.keys().cloned())
             .chain(self.slot_wake_gate.slot_ids().cloned())
             .collect::<Vec<_>>();
         slot_ids.sort();
@@ -157,12 +166,25 @@ impl TeamRunRecord {
             .filter_map(|slot_id| {
                 let role = self.role_for_slot(&slot_id)?;
                 let gate = self.slot_wake_gate.snapshot_for_slot(&slot_id);
+                let active_child = self.active_child_turns.get(&slot_id);
+                let active_elapsed_ms = active_child.map(|child| {
+                    child
+                        .last_slow_notified_at_ms
+                        .unwrap_or(now)
+                        .saturating_sub(child.started_at_ms)
+                        .max(0) as u64
+                });
                 Some(TeamSlotWorkPayload {
                     pending_wake_count: self.pending_wake_count_for_slot(&slot_id),
                     starting_child_count: self.starting_child_count_for_slot(&slot_id),
                     paused: gate.paused,
                     suppressed_wake_count: gate.suppressed_wake_count,
-                    active_turn_id: self.active_child_turns.get(&slot_id).map(|child| child.turn_id.clone()),
+                    active_turn_id: active_child.map(|child| child.turn_id.clone()),
+                    active_turn_started_at_ms: active_child.map(|child| child.started_at_ms),
+                    active_turn_elapsed_ms: active_elapsed_ms,
+                    active_turn_slow: active_elapsed_ms.map(|elapsed| elapsed >= ACTIVE_CHILD_SLOW_THRESHOLD_MS),
+                    active_turn_slow_threshold_ms: active_child.map(|_| ACTIVE_CHILD_SLOW_THRESHOLD_MS),
+                    runtime_health: self.slot_runtime_health.get(&slot_id).cloned(),
                     slot_id,
                     role,
                 })
@@ -286,6 +308,7 @@ impl TeamRunManager {
             active_child_turns: HashMap::new(),
             starting_reservations: HashMap::new(),
             pending_wakes: HashMap::new(),
+            slot_runtime_health: HashMap::new(),
             slot_wake_gate: SlotWakeGate::default(),
         };
         let ack = record.ack(target_slot_id, target_role, message_id);
@@ -324,7 +347,63 @@ impl TeamRunManager {
 
     pub async fn current_payload(&self) -> Option<TeamRunPayload> {
         let guard = self.state.lock().await;
-        guard.as_ref().map(TeamRunRecord::payload)
+        guard.as_ref().filter(|run| run.is_active()).map(TeamRunRecord::payload)
+    }
+
+    pub async fn mark_slot_runtime_health(
+        &self,
+        slot_id: &str,
+        health: TeamSlotRuntimeHealth,
+    ) -> Option<TeamRunPayload> {
+        let mut guard = self.state.lock().await;
+        let run = guard.as_mut().filter(|run| run.is_active())?;
+        run.slot_runtime_health.insert(slot_id.to_owned(), health);
+        let payload = run.payload();
+        drop(guard);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload.clone());
+        Some(payload)
+    }
+
+    pub async fn observe_slow_child_turns(&self, now: TimestampMs) -> Option<TeamRunPayload> {
+        let mut guard = self.state.lock().await;
+        let run = guard.as_mut().filter(|run| run.is_active())?;
+        let mut observed = false;
+
+        for child in run.active_child_turns.values_mut() {
+            let elapsed_ms = now.saturating_sub(child.started_at_ms).max(0) as u64;
+            if elapsed_ms < ACTIVE_CHILD_SLOW_THRESHOLD_MS {
+                continue;
+            }
+            let due = child
+                .last_slow_notified_at_ms
+                .map(|last| now.saturating_sub(last).max(0) as u64 >= ACTIVE_CHILD_SLOW_REPEAT_MS)
+                .unwrap_or(true);
+            if !due {
+                continue;
+            }
+            child.last_slow_notified_at_ms = Some(now);
+            observed = true;
+            info!(
+                team_id = %self.team_id,
+                team_run_id = %child.team_run_id,
+                slot_id = %child.slot_id,
+                role = ?child.role,
+                conversation_id = %child.conversation_id,
+                turn_id = %child.turn_id,
+                elapsed_ms,
+                slow_threshold_ms = ACTIVE_CHILD_SLOW_THRESHOLD_MS,
+                "team_child_turn slow"
+            );
+        }
+
+        if !observed {
+            return None;
+        }
+
+        let payload = run.payload();
+        drop(guard);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload.clone());
+        Some(payload)
     }
 
     pub async fn pause_slot_work(&self, slot_id: &str, reason: Option<String>) -> Result<PauseSlotOutcome, TeamError> {
@@ -498,6 +577,7 @@ impl TeamRunManager {
         if run.pending_wakes.get(slot_id).is_some_and(VecDeque::is_empty) {
             run.pending_wakes.remove(slot_id);
         }
+        run.slot_runtime_health.remove(slot_id);
         if pending.slot_id != slot_id {
             warn!(
                 team_id = %self.team_id,
@@ -1188,6 +1268,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_slot_work_includes_backend_slow_fields_after_threshold() {
+        let (manager, _rx) = manager();
+        let ack = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, true, Some("msg-1".into()))
+            .await
+            .unwrap();
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .unwrap();
+
+        let child = ActiveChildTurn {
+            team_run_id: ack.team_run_id.clone(),
+            slot_id: "lead".into(),
+            role: TeamRunTargetRole::Lead,
+            conversation_id: "conv-lead".into(),
+            turn_id: "turn-lead".into(),
+            started_at_ms: 10_000,
+            last_slow_notified_at_ms: None,
+        };
+        manager.record_child_started(&reservation.reservation_id, child).await;
+
+        manager.observe_slow_child_turns(610_001).await;
+        let payload = manager.current_payload().await.unwrap();
+        let lead = slot_work(&payload, "lead");
+
+        assert_eq!(lead.active_turn_started_at_ms, Some(10_000));
+        assert_eq!(lead.active_turn_elapsed_ms, Some(600_001));
+        assert_eq!(lead.active_turn_slow, Some(true));
+        assert_eq!(lead.active_turn_slow_threshold_ms, Some(600_000));
+        assert_eq!(lead.runtime_health, None);
+    }
+
+    #[tokio::test]
+    async fn slow_observation_is_rate_limited_per_active_child() {
+        let (manager, _rx) = manager();
+        let ack = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, true, Some("msg-1".into()))
+            .await
+            .unwrap();
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .unwrap();
+
+        let child = ActiveChildTurn {
+            team_run_id: ack.team_run_id.clone(),
+            slot_id: "lead".into(),
+            role: TeamRunTargetRole::Lead,
+            conversation_id: "conv-lead".into(),
+            turn_id: "turn-lead".into(),
+            started_at_ms: 0,
+            last_slow_notified_at_ms: None,
+        };
+        manager.record_child_started(&reservation.reservation_id, child).await;
+
+        assert!(manager.observe_slow_child_turns(600_001).await.is_some());
+        assert!(manager.observe_slow_child_turns(900_000).await.is_none());
+        assert!(manager.observe_slow_child_turns(1_200_001).await.is_some());
+    }
+
+    #[tokio::test]
     async fn cancel_run_clears_paused_gate_and_reaches_cancelled_terminal() {
         let (manager, bc) = manager();
         manager
@@ -1254,6 +1404,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv-lead".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1295,6 +1447,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv-lead".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1338,6 +1492,8 @@ mod tests {
             role: TeamRunTargetRole::Lead,
             conversation_id: "conv-lead".into(),
             turn_id: "turn-lead".into(),
+            started_at_ms: now_ms(),
+            last_slow_notified_at_ms: None,
         };
         manager
             .record_child_started(&reservation.reservation_id, child.clone())
@@ -1500,6 +1656,8 @@ mod tests {
                         role: TeamRunTargetRole::Lead,
                         conversation_id: "conv-lead".into(),
                         turn_id: "turn-user".into(),
+                        started_at_ms: now_ms(),
+                        last_slow_notified_at_ms: None,
                     },
                 )
                 .await,
@@ -1532,6 +1690,8 @@ mod tests {
                         role: TeamRunTargetRole::Lead,
                         conversation_id: "conv-lead".into(),
                         turn_id: "turn-background".into(),
+                        started_at_ms: now_ms(),
+                        last_slow_notified_at_ms: None,
                     },
                 )
                 .await,
@@ -1626,6 +1786,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv-lead".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1803,6 +1965,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv".into(),
                     turn_id: "turn".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1867,6 +2031,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv".into(),
                     turn_id: "turn".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1905,6 +2071,8 @@ mod tests {
                         role: TeamRunTargetRole::Lead,
                         conversation_id: "conv".into(),
                         turn_id: "turn".into(),
+                        started_at_ms: now_ms(),
+                        last_slow_notified_at_ms: None,
                     },
                 )
                 .await,
@@ -1979,6 +2147,8 @@ mod tests {
                     role: TeamRunTargetRole::Teammate,
                     conversation_id: "conv-worker".into(),
                     turn_id: "turn-worker".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -2015,6 +2185,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv".into(),
                     turn_id: "late-turn".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;

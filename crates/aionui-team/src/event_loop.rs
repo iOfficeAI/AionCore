@@ -267,6 +267,8 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                     role: started.role,
                     conversation_id: started.conversation_id,
                     turn_id: started.turn_id,
+                    started_at_ms: aionui_common::now_ms(),
+                    last_slow_notified_at_ms: None,
                 };
                 match team_run_manager
                     .record_child_started(&reservation_id, child.clone())
