@@ -45,6 +45,8 @@ pub struct CronAgentConfigDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_preset: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset_agent_type: Option<String>,
@@ -374,6 +376,7 @@ mod tests {
             "name": "Claude Agent",
             "cli_path": "/usr/bin/claude",
             "is_preset": true,
+            "assistant_id": "assistant-1",
             "custom_agent_id": "agent-1",
             "preset_agent_type": "claude",
             "mode": "auto",
@@ -386,6 +389,7 @@ mod tests {
         assert_eq!(c.name, "Claude Agent");
         assert_eq!(c.cli_path.as_deref(), Some("/usr/bin/claude"));
         assert_eq!(c.is_preset, Some(true));
+        assert_eq!(c.assistant_id.as_deref(), Some("assistant-1"));
         assert_eq!(c.custom_agent_id.as_deref(), Some("agent-1"));
         assert_eq!(c.model_id.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(c.config_options.as_ref().unwrap()["key"], "value");
@@ -409,6 +413,7 @@ mod tests {
             name: "Test".into(),
             cli_path: None,
             is_preset: None,
+            assistant_id: None,
             custom_agent_id: None,
             preset_agent_type: None,
             mode: None,
@@ -429,6 +434,7 @@ mod tests {
             name: "Agent".into(),
             cli_path: Some("/bin/x".into()),
             is_preset: Some(false),
+            assistant_id: Some("assistant-1".into()),
             custom_agent_id: Some("c1".into()),
             preset_agent_type: None,
             mode: Some("plan".into()),
@@ -472,6 +478,7 @@ mod tests {
                     name: "Claude".into(),
                     cli_path: None,
                     is_preset: None,
+                    assistant_id: None,
                     custom_agent_id: None,
                     preset_agent_type: None,
                     mode: None,

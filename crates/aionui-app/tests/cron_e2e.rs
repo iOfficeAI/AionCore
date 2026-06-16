@@ -681,7 +681,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
                 "backend": "codex",
                 "name": "Cron MCP Assistant",
                 "is_preset": true,
-                "custom_agent_id": "u-fixed-mcp",
+                "assistant_id": "u-fixed-mcp",
                 "preset_agent_type": "codex"
             }
         }),
@@ -730,6 +730,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
         .expect("conversation should exist");
     let extra: serde_json::Value =
         serde_json::from_str(&conversation.extra).expect("conversation extra should be valid json");
+    assert_eq!(extra["assistant_id"], "u-fixed-mcp");
     assert_eq!(extra["preset_assistant_id"], "u-fixed-mcp");
     assert_eq!(extra["mcp_server_ids"], json!([fixed_mcp.id]));
     assert_eq!(extra["mcp_servers"], json!(["fixed-mcp"]));

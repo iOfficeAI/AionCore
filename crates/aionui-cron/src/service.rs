@@ -82,6 +82,7 @@ impl CronService {
             name: c.name,
             cli_path: c.cli_path,
             is_preset: c.is_preset,
+            assistant_id: c.assistant_id,
             custom_agent_id: c.custom_agent_id,
             preset_agent_type: c.preset_agent_type,
             mode: c.mode,
@@ -166,6 +167,7 @@ impl CronService {
                 name: config_dto.name.clone(),
                 cli_path: config_dto.cli_path.clone(),
                 is_preset: config_dto.is_preset,
+                assistant_id: config_dto.assistant_id.clone(),
                 custom_agent_id: config_dto.custom_agent_id.clone(),
                 preset_agent_type: config_dto.preset_agent_type.clone(),
                 mode: config_dto.mode.clone(),
@@ -1056,6 +1058,7 @@ fn build_agent_config_from_conversation(
     };
 
     let preset_assistant_id = get_string(&extra, &["preset_assistant_id", "presetAssistantId"]);
+    let assistant_id = get_string(&extra, &["assistant_id", "assistantId"]).or_else(|| preset_assistant_id.clone());
     let custom_agent_id = get_string(&extra, &["custom_agent_id", "customAgentId"]).or(preset_assistant_id.clone());
     let is_preset = preset_assistant_id.as_ref().map(|_| true);
     let preset_agent_type = if preset_assistant_id.is_some() {
@@ -1082,6 +1085,7 @@ fn build_agent_config_from_conversation(
                 .map(ToOwned::to_owned)
         }),
         is_preset,
+        assistant_id,
         custom_agent_id,
         preset_agent_type,
         mode: Some(full_auto_mode),
@@ -1211,6 +1215,7 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
             name: c.name.clone(),
             cli_path: c.cli_path.clone(),
             is_preset: c.is_preset,
+            assistant_id: c.assistant_id.clone(),
             custom_agent_id: c.custom_agent_id.clone(),
             preset_agent_type: c.preset_agent_type.clone(),
             mode: c.mode.clone(),
@@ -1333,6 +1338,7 @@ mod tests {
             name: "provider".into(),
             cli_path: None,
             is_preset: None,
+            assistant_id: None,
             custom_agent_id: None,
             preset_agent_type: None,
             mode: None,

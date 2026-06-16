@@ -132,6 +132,8 @@ pub struct CronAgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_preset: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset_agent_type: Option<String>,
@@ -334,6 +336,7 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
         name: c.name.clone(),
         cli_path: c.cli_path.clone(),
         is_preset: c.is_preset,
+        assistant_id: c.assistant_id.clone(),
         custom_agent_id: c.custom_agent_id.clone(),
         preset_agent_type: c.preset_agent_type.clone(),
         mode: c.mode.clone(),
@@ -587,6 +590,7 @@ mod tests {
                 name: "Claude".into(),
                 cli_path: None,
                 is_preset: None,
+                assistant_id: None,
                 custom_agent_id: None,
                 preset_agent_type: None,
                 mode: None,

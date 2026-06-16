@@ -1054,6 +1054,12 @@ async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[Str
         if !config.name.is_empty() {
             extra.insert("agent_name".to_owned(), serde_json::Value::String(config.name.clone()));
         }
+        if let Some(assistant_id) = &config.assistant_id {
+            extra.insert(
+                "assistant_id".to_owned(),
+                serde_json::Value::String(assistant_id.clone()),
+            );
+        }
         if let Some(custom_agent_id) = &config.custom_agent_id {
             extra.insert(
                 "custom_agent_id".to_owned(),
@@ -1123,6 +1129,18 @@ async fn build_conversation_extra(
         }
         if !config.name.is_empty() {
             extra.insert("agent_name".to_owned(), serde_json::Value::String(config.name.clone()));
+        }
+        if let Some(assistant_id) = &config.assistant_id {
+            extra.insert(
+                "assistant_id".to_owned(),
+                serde_json::Value::String(assistant_id.clone()),
+            );
+            if config.is_preset.unwrap_or(false) {
+                extra.insert(
+                    "preset_assistant_id".to_owned(),
+                    serde_json::Value::String(assistant_id.clone()),
+                );
+            }
         }
         if let Some(custom_agent_id) = &config.custom_agent_id {
             extra.insert(
@@ -1256,6 +1274,7 @@ mod tests {
                 name: "Claude".into(),
                 cli_path: Some("/usr/bin/claude".into()),
                 is_preset: None,
+                assistant_id: Some("assistant-sample".into()),
                 custom_agent_id: None,
                 preset_agent_type: None,
                 mode: None,
@@ -1542,6 +1561,7 @@ mod tests {
                 name: "OpenAI".into(),
                 cli_path: None,
                 is_preset: None,
+                assistant_id: None,
                 custom_agent_id: None,
                 preset_agent_type: None,
                 mode: None,
@@ -1565,6 +1585,7 @@ mod tests {
                 name: "OpenAI".into(),
                 cli_path: None,
                 is_preset: None,
+                assistant_id: None,
                 custom_agent_id: None,
                 preset_agent_type: None,
                 mode: None,
@@ -1600,6 +1621,7 @@ mod tests {
                 name: "Bogus".into(),
                 cli_path: None,
                 is_preset: None,
+                assistant_id: None,
                 custom_agent_id: None,
                 preset_agent_type: None,
                 mode: None,
@@ -1630,6 +1652,7 @@ mod tests {
         assert_eq!(extra["backend"], "acp");
         assert_eq!(extra["cli_path"], "/usr/bin/claude");
         assert_eq!(extra["agent_name"], "Claude");
+        assert_eq!(extra["assistant_id"], "assistant-sample");
         assert_eq!(extra["skills"], serde_json::json!(["cron-cron_test1"]));
     }
 
@@ -1691,6 +1714,22 @@ mod tests {
 
         assert_eq!(extra["exclude_auto_inject_skills"], serde_json::json!(["cron"]));
         assert_eq!(extra["preset_enabled_skills"], serde_json::json!(["cron-cron_test1"]));
+    }
+
+    #[tokio::test]
+    async fn build_conversation_extra_writes_assistant_identity_for_preset_jobs() {
+        let registry = hydrated_registry().await;
+        let mut job = sample_job();
+        let config = job.agent_config.as_mut().expect("sample job should carry config");
+        config.assistant_id = Some("assistant-preset".into());
+        config.is_preset = Some(true);
+        config.custom_agent_id = None;
+
+        let extra = build_conversation_extra(&registry, &job, None).await;
+
+        assert_eq!(extra["assistant_id"], "assistant-preset");
+        assert_eq!(extra["preset_assistant_id"], "assistant-preset");
+        assert!(extra.get("custom_agent_id").is_none());
     }
 
     #[tokio::test]
@@ -2979,6 +3018,13 @@ mod tests {
             &self,
             _id: &str,
             _params: &aionui_db::models::UpdateAgentHandshakeParams<'_>,
+        ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            Ok(None)
+        }
+        async fn update_availability_snapshot(
+            &self,
+            _id: &str,
+            _params: &aionui_db::models::UpdateAgentAvailabilitySnapshotParams<'_>,
         ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(None)
         }
