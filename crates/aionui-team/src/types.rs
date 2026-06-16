@@ -122,6 +122,7 @@ impl TeamAgent {
             backend: self.backend.clone(),
             icon,
             model: self.model.clone(),
+            assistant_id: self.custom_agent_id.clone(),
             custom_agent_id: self.custom_agent_id.clone(),
             status: self.status.map(|s| s.to_string()),
             pending_confirmations: 0,

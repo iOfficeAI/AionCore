@@ -1,3 +1,4 @@
+mod describe_support;
 mod response_builder;
 pub(crate) mod spawn_support;
 
@@ -11,7 +12,10 @@ use aionui_api_types::{
 };
 use aionui_common::{AgentKillReason, generate_id, now_ms};
 use aionui_db::models::TeamRow;
-use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
+use aionui_db::{
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
+    ITeamRepository, UpdateTeamParams,
+};
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use tracing::{info, warn};
@@ -42,6 +46,8 @@ struct SessionEntry {
 pub struct TeamSessionService {
     repo: Arc<dyn ITeamRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
     provider_repo: Arc<dyn IProviderRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
     projection_store: Arc<dyn TeamProjectionMessageStore>,
@@ -73,10 +79,11 @@ pub struct TeamSessionService {
 }
 
 impl TeamSessionService {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<dyn ITeamRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
         conversation_port: Arc<dyn TeamConversationProvisioningPort>,
         projection_store: Arc<dyn TeamProjectionMessageStore>,
@@ -91,6 +98,8 @@ impl TeamSessionService {
         Arc::new_cyclic(|weak| Self {
             repo,
             agent_metadata_repo,
+            assistant_definition_repo,
+            assistant_overlay_repo,
             provider_repo,
             conversation_port,
             projection_store,

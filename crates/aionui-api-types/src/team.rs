@@ -21,6 +21,8 @@ pub struct TeamAgentInput {
     pub backend: String,
     pub model: String,
     #[serde(default)]
+    pub assistant_id: Option<String>,
+    #[serde(default)]
     pub custom_agent_id: Option<String>,
     /// Adopt an existing conversation instead of creating a new one.
     /// When present the conversation's `extra` is updated with `teamId`
@@ -61,6 +63,8 @@ pub struct AddAgentRequest {
     pub role: String,
     pub backend: String,
     pub model: String,
+    #[serde(default)]
+    pub assistant_id: Option<String>,
     #[serde(default)]
     pub custom_agent_id: Option<String>,
 }
@@ -291,6 +295,8 @@ pub struct TeamAgentResponse {
     pub icon: Option<String>,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_agent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -433,7 +439,7 @@ mod tests {
                     "role": "lead",
                     "backend": "acp",
                     "model": "claude",
-                    "custom_agent_id": "agent-x"
+                    "assistant_id": "assistant-x"
                 },
                 {
                     "name": "Worker",
@@ -450,8 +456,9 @@ mod tests {
         assert_eq!(req.agents[0].role, "lead");
         assert_eq!(req.agents[0].backend, "acp");
         assert_eq!(req.agents[0].model, "claude");
-        assert_eq!(req.agents[0].custom_agent_id.as_deref(), Some("agent-x"));
+        assert_eq!(req.agents[0].assistant_id.as_deref(), Some("assistant-x"));
         assert_eq!(req.agents[1].name, "Worker");
+        assert!(req.agents[1].assistant_id.is_none());
         assert!(req.agents[1].custom_agent_id.is_none());
     }
 
@@ -547,6 +554,19 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_add_agent_request_with_assistant_id() {
+        let raw = json!({
+            "name": "Custom",
+            "role": "teammate",
+            "backend": "acp",
+            "model": "claude",
+            "assistant_id": "assistant-1"
+        });
+        let req: AddAgentRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.assistant_id.as_deref(), Some("assistant-1"));
+    }
+
+    #[test]
     fn deserialize_add_agent_request_missing_name() {
         let raw = json!({ "role": "teammate", "backend": "acp", "model": "claude" });
         let result = serde_json::from_value::<AddAgentRequest>(raw);
@@ -616,6 +636,7 @@ mod tests {
             backend: "acp".into(),
             icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
             model: "claude".into(),
+            assistant_id: Some("assistant-x".into()),
             custom_agent_id: Some("agent-x".into()),
             status: Some("idle".into()),
             pending_confirmations: 2,
@@ -628,6 +649,7 @@ mod tests {
         assert_eq!(json["backend"], "acp");
         assert_eq!(json["icon"], "/api/assets/logos/ai-major/claude.svg");
         assert_eq!(json["model"], "claude");
+        assert_eq!(json["assistant_id"], "assistant-x");
         assert_eq!(json["custom_agent_id"], "agent-x");
         assert_eq!(json["status"], "idle");
         assert_eq!(json["pending_confirmations"], 2);
@@ -643,6 +665,7 @@ mod tests {
             backend: "acp".into(),
             icon: None,
             model: "claude".into(),
+            assistant_id: None,
             custom_agent_id: None,
             status: None,
             pending_confirmations: 0,
@@ -667,6 +690,7 @@ mod tests {
                 backend: "acp".into(),
                 icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
                 model: "claude".into(),
+                assistant_id: Some("assistant-x".into()),
                 custom_agent_id: None,
                 status: None,
                 pending_confirmations: 0,
@@ -729,6 +753,7 @@ mod tests {
                 backend: "claude".into(),
                 icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
                 model: "opus".into(),
+                assistant_id: None,
                 custom_agent_id: None,
                 status: Some("idle".into()),
                 pending_confirmations: 0,
@@ -778,6 +803,7 @@ mod tests {
             backend: "acp".into(),
             icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
             model: "claude".into(),
+            assistant_id: Some("custom-1".into()),
             custom_agent_id: Some("custom-1".into()),
             status: Some("working".into()),
             pending_confirmations: 1,
@@ -802,6 +828,7 @@ mod tests {
                     backend: "acp".into(),
                     icon: None,
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                     status: None,
                     pending_confirmations: 0,
@@ -814,6 +841,7 @@ mod tests {
                     backend: "acp".into(),
                     icon: Some("/api/assets/logos/tools/coding/codex.svg".into()),
                     model: "claude".into(),
+                    assistant_id: Some("x".into()),
                     custom_agent_id: Some("x".into()),
                     status: Some("idle".into()),
                     pending_confirmations: 3,
@@ -852,6 +880,7 @@ mod tests {
                 backend: "claude".into(),
                 icon: None,
                 model: "sonnet".into(),
+                assistant_id: None,
                 custom_agent_id: None,
                 status: None,
                 pending_confirmations: 0,

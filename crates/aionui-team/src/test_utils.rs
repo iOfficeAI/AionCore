@@ -196,12 +196,14 @@ pub(crate) mod workspace_harness {
     use aionui_api_types::{CreateTeamRequest, WebSocketMessage};
     use aionui_common::{AgentKillReason, PaginatedResult, now_ms};
     use aionui_db::models::{
-        AgentMetadataRow, ConversationRow, MessageRow, TeamRow, TeamTaskRow, UpdateAgentHandshakeParams,
-        UpsertAgentMetadataParams,
+        AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow, TeamRow,
+        TeamTaskRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
+        UpsertAssistantOverlayParams,
     };
     use aionui_db::{
-        ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IConversationRepository,
-        IProviderRepository, ITeamRepository, MessageRowUpdate, MessageSearchRow, SortOrder, UpdateTeamParams,
+        ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
+        IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessageRowUpdate,
+        MessageSearchRow, SortOrder, UpdateTeamParams,
     };
     use aionui_realtime::EventBroadcaster;
     use async_trait::async_trait;
@@ -733,11 +735,76 @@ pub(crate) mod workspace_harness {
             Ok(None)
         }
 
+        async fn update_availability_snapshot(
+            &self,
+            _id: &str,
+            _params: &aionui_db::models::UpdateAgentAvailabilitySnapshotParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+
         async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
             Ok(false)
         }
 
         async fn delete(&self, _id: &str) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    struct EmptyAssistantDefinitionRepo;
+
+    #[async_trait]
+    impl IAssistantDefinitionRepository for EmptyAssistantDefinitionRepo {
+        async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn get_by_key(&self, _assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn get_by_definition_id(&self, _definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn get_by_source_ref(
+            &self,
+            _source: &str,
+            _source_ref: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn upsert(
+            &self,
+            _params: &UpsertAssistantDefinitionParams<'_>,
+        ) -> Result<AssistantDefinitionRow, DbError> {
+            Err(DbError::Init("not implemented".into()))
+        }
+
+        async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    struct EmptyAssistantOverlayRepo;
+
+    #[async_trait]
+    impl IAssistantOverlayRepository for EmptyAssistantOverlayRepo {
+        async fn get(&self, _definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
+            Err(DbError::Init("not implemented".into()))
+        }
+
+        async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
             Ok(false)
         }
     }
@@ -830,6 +897,8 @@ pub(crate) mod workspace_harness {
         let svc = TeamSessionService::new(
             team_repo_dyn,
             Arc::new(EmptyAgentMetadataRepo),
+            Arc::new(EmptyAssistantDefinitionRepo),
+            Arc::new(EmptyAssistantOverlayRepo),
             Arc::new(EmptyProviderRepo),
             conversation_port,
             projection_store,
@@ -864,6 +933,7 @@ pub(crate) mod workspace_harness {
                 role: "lead".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
+                assistant_id: None,
                 custom_agent_id: None,
                 conversation_id: None,
             }],

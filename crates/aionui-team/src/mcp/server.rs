@@ -22,7 +22,7 @@ use super::protocol::{
 };
 use super::tools::{
     RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskUpdateInput,
-    all_tool_descriptors, handle_team_describe_assistant, handle_team_list_models,
+    all_tool_descriptors, handle_team_list_models,
 };
 
 // ---------------------------------------------------------------------------
@@ -444,7 +444,7 @@ pub(crate) async fn dispatch_tool(
             exec_shutdown_agent(arguments, scheduler, service, team_id, caller_slot_id, caller_role).await
         }
         "team_list_models" => exec_list_models(arguments, service).await,
-        "team_describe_assistant" => exec_describe_assistant(arguments).await,
+        "team_describe_assistant" => exec_describe_assistant(arguments, service).await,
         _ => Err(format!("Unknown tool: {tool_name}")),
     }
 }
@@ -459,8 +459,22 @@ async fn exec_list_models(args: &Value, service: &Weak<TeamSessionService>) -> R
     serde_json::to_string_pretty(&value).map_err(|e| format!("Serialization error: {e}"))
 }
 
-async fn exec_describe_assistant(args: &Value) -> Result<String, String> {
-    Ok(handle_team_describe_assistant(args))
+async fn exec_describe_assistant(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, String> {
+    let assistant_key = args
+        .get("custom_agent_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Missing required field: custom_agent_id".to_owned())?;
+    let locale = args.get("locale").and_then(Value::as_str);
+    let service = service
+        .upgrade()
+        .ok_or_else(|| "Team service not available".to_owned())?;
+
+    service
+        .describe_assistant(assistant_key, locale)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------

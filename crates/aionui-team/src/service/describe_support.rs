@@ -1,0 +1,116 @@
+use std::collections::HashMap;
+use std::fmt::Write;
+
+use crate::error::TeamError;
+use crate::service::TeamSessionService;
+use aionui_db::models::{AssistantDefinitionRow, AssistantOverlayRow};
+
+impl TeamSessionService {
+    pub(crate) async fn describe_assistant(
+        &self,
+        assistant_key: &str,
+        locale: Option<&str>,
+    ) -> Result<String, TeamError> {
+        let definition = self
+            .assistant_definition_repo
+            .get_by_key(assistant_key)
+            .await?
+            .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_key}")))?;
+        let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+
+        Ok(render_assistant_description(
+            &definition,
+            overlay.as_ref(),
+            locale.unwrap_or("en-US"),
+        ))
+    }
+}
+
+fn render_assistant_description(
+    definition: &AssistantDefinitionRow,
+    overlay: Option<&AssistantOverlayRow>,
+    locale: &str,
+) -> String {
+    let effective_backend = overlay
+        .and_then(|row| row.agent_backend_override.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(definition.agent_backend.as_str());
+    let name_map = decode_str_map(&definition.name_i18n);
+    let description_map = decode_str_map(&definition.description_i18n);
+    let prompts_map = decode_list_map(&definition.recommended_prompts_i18n);
+
+    let name = localized_text(&name_map, &definition.name, locale);
+    let description = localized_optional_text(&description_map, definition.description.as_deref(), locale)
+        .unwrap_or_else(|| "No description available.".to_owned());
+    let example_tasks = localized_list(&prompts_map, &definition.recommended_prompts, locale).unwrap_or_default();
+    let skills = decode_string_list(&definition.default_skill_ids)
+        .into_iter()
+        .chain(decode_string_list(&definition.custom_skill_names))
+        .collect::<Vec<_>>();
+
+    let mut out = String::new();
+    let _ = writeln!(out, "# {} (`{}`)", name, definition.assistant_key);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Backend: {effective_backend}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Description");
+    let _ = writeln!(out, "{description}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Skills");
+    if skills.is_empty() {
+        let _ = writeln!(out, "- None");
+    } else {
+        for skill in skills {
+            let _ = writeln!(out, "- {skill}");
+        }
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Example tasks");
+    if example_tasks.is_empty() {
+        let _ = writeln!(out, "- None");
+    } else {
+        for task in example_tasks {
+            let _ = writeln!(out, "- {task}");
+        }
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Use `team_spawn_agent` with `custom_agent_id=\"{}\"`.",
+        definition.assistant_key
+    );
+    out.trim_end().to_owned()
+}
+
+fn decode_str_map(raw: &str) -> HashMap<String, String> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn decode_list_map(raw: &str) -> HashMap<String, Vec<String>> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn decode_string_list(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+}
+
+fn localized_text(map: &HashMap<String, String>, fallback: &str, locale: &str) -> String {
+    map.get(locale)
+        .or_else(|| map.get("en-US"))
+        .cloned()
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn localized_optional_text(map: &HashMap<String, String>, fallback: Option<&str>, locale: &str) -> Option<String> {
+    map.get(locale)
+        .or_else(|| map.get("en-US"))
+        .cloned()
+        .or_else(|| fallback.map(str::to_owned))
+}
+
+fn localized_list(map: &HashMap<String, Vec<String>>, fallback_raw: &str, locale: &str) -> Option<Vec<String>> {
+    map.get(locale).or_else(|| map.get("en-US")).cloned().or_else(|| {
+        let fallback = decode_string_list(fallback_raw);
+        if fallback.is_empty() { None } else { Some(fallback) }
+    })
+}

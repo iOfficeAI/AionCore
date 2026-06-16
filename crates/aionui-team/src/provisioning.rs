@@ -40,7 +40,7 @@ struct NewAgentProvisioning {
     role: TeammateRole,
     backend: String,
     model: String,
-    custom_agent_id: Option<String>,
+    assistant_id: Option<String>,
     workspace: Option<String>,
 }
 
@@ -91,6 +91,19 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 }
 
 impl TeamAgentProvisioner {
+    fn effective_assistant_id(assistant_id: Option<&str>, custom_agent_id: Option<&str>) -> Option<String> {
+        assistant_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                custom_agent_id
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+    }
+
     pub(crate) fn new(
         repo: Arc<dyn ITeamRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
@@ -129,7 +142,11 @@ impl TeamAgentProvisioner {
                 &leader_input.name,
                 &leader_input.backend,
                 &leader_input.model,
-                leader_input.custom_agent_id.as_deref(),
+                Self::effective_assistant_id(
+                    leader_input.assistant_id.as_deref(),
+                    leader_input.custom_agent_id.as_deref(),
+                )
+                .as_deref(),
                 leader_input.conversation_id.as_deref(),
                 shared_workspace,
             )
@@ -155,7 +172,10 @@ impl TeamAgentProvisioner {
             conversation_id: leader_conversation.conversation_id,
             backend: leader_input.backend.clone(),
             model: leader_input.model.clone(),
-            custom_agent_id: leader_input.custom_agent_id.clone(),
+            custom_agent_id: Self::effective_assistant_id(
+                leader_input.assistant_id.as_deref(),
+                leader_input.custom_agent_id.as_deref(),
+            ),
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -173,7 +193,8 @@ impl TeamAgentProvisioner {
                     &input.name,
                     &input.backend,
                     &input.model,
-                    input.custom_agent_id.as_deref(),
+                    Self::effective_assistant_id(input.assistant_id.as_deref(), input.custom_agent_id.as_deref())
+                        .as_deref(),
                     input.conversation_id.as_deref(),
                     Some(&team_workspace),
                 )
@@ -185,7 +206,10 @@ impl TeamAgentProvisioner {
                 conversation_id: conversation.conversation_id,
                 backend: input.backend.clone(),
                 model: input.model.clone(),
-                custom_agent_id: input.custom_agent_id.clone(),
+                custom_agent_id: Self::effective_assistant_id(
+                    input.assistant_id.as_deref(),
+                    input.custom_agent_id.as_deref(),
+                ),
                 status: None,
                 conversation_type: None,
                 cli_path: None,
@@ -227,7 +251,7 @@ impl TeamAgentProvisioner {
                 role,
                 backend: req.backend,
                 model: req.model,
-                custom_agent_id: req.custom_agent_id,
+                assistant_id: Self::effective_assistant_id(req.assistant_id.as_deref(), req.custom_agent_id.as_deref()),
                 workspace: Some(workspace),
             })
             .await?;
@@ -260,7 +284,7 @@ impl TeamAgentProvisioner {
                 role: TeammateRole::Teammate,
                 backend,
                 model,
-                custom_agent_id,
+                assistant_id: custom_agent_id,
                 workspace: Some(workspace),
             })
             .await?;
@@ -342,7 +366,7 @@ impl TeamAgentProvisioner {
                 &input.name,
                 &input.backend,
                 &input.model,
-                input.custom_agent_id.as_deref(),
+                input.assistant_id.as_deref(),
                 None,
                 input.workspace.as_deref(),
             )
@@ -354,7 +378,7 @@ impl TeamAgentProvisioner {
             conversation_id: conversation.conversation_id,
             backend: input.backend,
             model: input.model,
-            custom_agent_id: input.custom_agent_id,
+            custom_agent_id: input.assistant_id,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -507,7 +531,7 @@ impl TeamAgentProvisioner {
         role: TeammateRole,
         backend: &str,
         model: &str,
-        custom_agent_id: Option<&str>,
+        assistant_id: Option<&str>,
         workspace: Option<&str>,
     ) -> Result<serde_json::Value, TeamError> {
         let mut extra = serde_json::json!({
@@ -520,9 +544,10 @@ impl TeamAgentProvisioner {
         if parse_agent_type(backend)? != AgentType::Aionrs {
             extra["current_model_id"] = serde_json::Value::String(model.to_owned());
         }
-        if let Some(custom_agent_id) = custom_agent_id {
-            extra["custom_agent_id"] = serde_json::Value::String(custom_agent_id.to_owned());
-            extra["preset_assistant_id"] = serde_json::Value::String(custom_agent_id.to_owned());
+        if let Some(assistant_id) = assistant_id {
+            extra["assistant_id"] = serde_json::Value::String(assistant_id.to_owned());
+            extra["custom_agent_id"] = serde_json::Value::String(assistant_id.to_owned());
+            extra["preset_assistant_id"] = serde_json::Value::String(assistant_id.to_owned());
         }
         if let Some(workspace) = workspace {
             inherit_team_workspace(&mut extra, workspace);

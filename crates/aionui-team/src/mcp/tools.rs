@@ -452,12 +452,6 @@ pub fn build_list_models_from_rows(
     json!({ "agent_types": agent_types })
 }
 
-/// Phase-1 minimal `team_describe_assistant` handler. Backend has no preset
-/// assistants wired yet, so every call returns the not-found text.
-pub fn handle_team_describe_assistant(_args: &Value) -> String {
-    "Preset assistant not found".to_owned()
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -828,6 +822,15 @@ mod tests {
             available_models: Some(available_models.to_owned()),
             available_commands: None,
             sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -954,11 +957,5 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(models, vec!["gemini-3.1-pro-preview", "gpt-5.4", "gpt-5.2"]);
-    }
-
-    #[test]
-    fn team_describe_assistant_handler_returns_non_error() {
-        let text = handle_team_describe_assistant(&json!({"custom_agent_id": "unknown"}));
-        assert_eq!(text, "Preset assistant not found");
     }
 }

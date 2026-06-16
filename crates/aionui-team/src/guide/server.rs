@@ -247,6 +247,7 @@ async fn exec_create_team(
             role: "leader".to_owned(),
             backend: backend.clone(),
             model: model.clone(),
+            assistant_id: None,
             custom_agent_id: None,
             conversation_id: caller_conversation_id,
         }],

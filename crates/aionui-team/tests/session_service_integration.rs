@@ -13,12 +13,14 @@ use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
-    AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
-    UpsertAgentMetadataParams,
+    AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow,
+    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
 };
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IConversationRepository,
-    IProviderRepository, ITeamRepository, MessageRowUpdate, MessageSearchRow, SortOrder,
+    ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
+    IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessageRowUpdate,
+    MessageSearchRow, SortOrder,
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -1021,6 +1023,60 @@ impl IProviderRepository for EmptyProviderRepo {
     }
 }
 
+struct EmptyAssistantDefinitionRepo;
+
+#[async_trait::async_trait]
+impl IAssistantDefinitionRepository for EmptyAssistantDefinitionRepo {
+    async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        Ok(vec![])
+    }
+
+    async fn get_by_key(&self, _assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn get_by_definition_id(&self, _definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn get_by_source_ref(
+        &self,
+        _source: &str,
+        _source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn upsert(&self, _params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
+        Err(DbError::Init("not implemented".into()))
+    }
+
+    async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+        Ok(false)
+    }
+}
+
+struct EmptyAssistantOverlayRepo;
+
+#[async_trait::async_trait]
+impl IAssistantOverlayRepository for EmptyAssistantOverlayRepo {
+    async fn get(&self, _definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
+        Ok(vec![])
+    }
+
+    async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
+        Err(DbError::Init("not implemented".into()))
+    }
+
+    async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
+}
+
 fn setup_with_factory(factory: AgentFactory) -> (Arc<TeamSessionService>, Arc<CountingTaskManager>) {
     setup_with_factory_and_metadata(factory, Arc::new(StubAgentMetadataRepo::empty()))
 }
@@ -1070,6 +1126,8 @@ fn setup_with_factory_metadata_team_repo_and_conversation_repo(
     let svc = TeamSessionService::new(
         team_repo_dyn,
         agent_metadata_repo,
+        Arc::new(EmptyAssistantDefinitionRepo),
+        Arc::new(EmptyAssistantOverlayRepo),
         provider_repo,
         conversation_port,
         projection_store,
@@ -1107,6 +1165,8 @@ fn setup_with_ports_team_repo_and_conversation_repo(
     let svc = TeamSessionService::new(
         team_repo_dyn,
         agent_metadata_repo,
+        Arc::new(EmptyAssistantDefinitionRepo),
+        Arc::new(EmptyAssistantOverlayRepo),
         provider_repo,
         conversation_port,
         projection_store,
@@ -1141,6 +1201,8 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
     let svc = TeamSessionService::new(
         team_repo,
         agent_metadata_repo,
+        Arc::new(EmptyAssistantDefinitionRepo),
+        Arc::new(EmptyAssistantOverlayRepo),
         provider_repo,
         conversation_port,
         projection_store,
@@ -1181,6 +1243,15 @@ fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadata
         available_models: None,
         available_commands: None,
         sort_order: 0,
+        last_check_status: None,
+        last_check_kind: None,
+        last_check_error_code: None,
+        last_check_error_message: None,
+        last_check_guidance: None,
+        last_check_latency_ms: None,
+        last_check_at: None,
+        last_success_at: None,
+        last_failure_at: None,
         created_at: 0,
         updated_at: 0,
     }
@@ -1198,6 +1269,7 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
             role: "lead".into(),
             backend: "acp".into(),
             model: "claude".into(),
+            assistant_id: None,
             custom_agent_id: None,
             conversation_id: None,
         },
@@ -1206,6 +1278,7 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
             role: "teammate".into(),
             backend: "acp".into(),
             model: "claude".into(),
+            assistant_id: None,
             custom_agent_id: None,
             conversation_id: None,
         },
@@ -1342,6 +1415,7 @@ async fn tc_create_team_uses_custom_agent_id_icon_lookup() {
                     role: "lead".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: Some("2d23ff1c".into()),
                     conversation_id: None,
                 }],
@@ -1378,6 +1452,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
                     role: "lead".into(),
                     backend: "claude".into(),
                     model: "claude".into(),
+                    assistant_id: Some("2d23ff1c".into()),
                     custom_agent_id: Some("2d23ff1c".into()),
                     conversation_id: None,
                 }],
@@ -1394,6 +1469,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
         .expect("lead conversation row");
     let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
 
+    assert_eq!(extra["assistant_id"], serde_json::json!("2d23ff1c"));
     assert_eq!(extra["custom_agent_id"], serde_json::json!("2d23ff1c"));
     assert_eq!(extra["preset_assistant_id"], serde_json::json!("2d23ff1c"));
 }
@@ -1416,6 +1492,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
                     role: "lead".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                     conversation_id: None,
                 }],
@@ -1434,6 +1511,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
                 role: "teammate".into(),
                 backend: "acp".into(),
                 model: "codex".into(),
+                assistant_id: None,
                 custom_agent_id: None,
             },
         )
@@ -1456,6 +1534,7 @@ async fn tc2_create_single_agent_team() {
                     role: "lead".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                     conversation_id: None,
                 }],
@@ -1483,6 +1562,7 @@ async fn tc4_first_agent_is_lead() {
                         role: "teammate".into(),
                         backend: "acp".into(),
                         model: "claude".into(),
+                        assistant_id: None,
                         custom_agent_id: None,
                         conversation_id: None,
                     },
@@ -1491,6 +1571,7 @@ async fn tc4_first_agent_is_lead() {
                         role: "teammate".into(),
                         backend: "acp".into(),
                         model: "claude".into(),
+                        assistant_id: None,
                         custom_agent_id: None,
                         conversation_id: None,
                     },
@@ -1622,6 +1703,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
                     role: "lead".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                     conversation_id: None,
                 }],
@@ -1794,6 +1876,7 @@ async fn aa1_add_agent_to_team() {
                     role: "lead".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                     conversation_id: None,
                 }],
@@ -1812,6 +1895,7 @@ async fn aa1_add_agent_to_team() {
                 role: "teammate".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
+                assistant_id: None,
                 custom_agent_id: None,
             },
         )
@@ -1844,6 +1928,7 @@ async fn aa_add_agent_inherits_team_workspace() {
                     role: "lead".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                     conversation_id: None,
                 }],
@@ -1862,6 +1947,7 @@ async fn aa_add_agent_inherits_team_workspace() {
                 role: "teammate".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
+                assistant_id: None,
                 custom_agent_id: None,
             },
         )
@@ -1890,6 +1976,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
                     role: "lead".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                     conversation_id: None,
                 }],
@@ -1914,6 +2001,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
                 role: "teammate".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
+                assistant_id: None,
                 custom_agent_id: None,
             },
         )
@@ -1944,6 +2032,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
                     role: "lead".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                     conversation_id: None,
                 }],
@@ -1970,6 +2059,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
                 role: "teammate".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
+                assistant_id: None,
                 custom_agent_id: None,
             },
         )
@@ -2005,6 +2095,7 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
                     role: "lead".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                     conversation_id: None,
                 }],
@@ -2027,6 +2118,7 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
                 role: "teammate".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
+                assistant_id: None,
                 custom_agent_id: None,
             },
         )
@@ -2055,6 +2147,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
                     role: "lead".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                     conversation_id: None,
                 }],
@@ -2084,6 +2177,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
                 role: "teammate".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
+                assistant_id: None,
                 custom_agent_id: None,
             },
         )
@@ -2147,6 +2241,7 @@ async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
                 role: "teammate".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
+                assistant_id: None,
                 custom_agent_id: None,
             },
         )
@@ -2182,6 +2277,7 @@ async fn aa4_add_agent_to_nonexistent_team() {
                 role: "teammate".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
+                assistant_id: None,
                 custom_agent_id: None,
             },
         )
@@ -2839,6 +2935,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                     role: "lead".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                     conversation_id: None,
                 }],
@@ -2860,6 +2957,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                     role: "teammate".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                 },
             )
@@ -2878,6 +2976,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                     role: "teammate".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
+                    assistant_id: None,
                     custom_agent_id: None,
                 },
             )

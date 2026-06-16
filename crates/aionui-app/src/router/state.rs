@@ -488,7 +488,9 @@ pub async fn build_channel_state(
         Arc::new(SqliteClientPreferenceRepository::new(pref_pool));
     let channel_settings = Arc::new(
         aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo).with_assistant_repos(
-            Arc::new(SqliteAssistantDefinitionRepository::new(services.database.pool().clone())),
+            Arc::new(SqliteAssistantDefinitionRepository::new(
+                services.database.pool().clone(),
+            )),
             Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
         ),
     );
@@ -605,6 +607,10 @@ pub fn build_team_state(
     let service = TeamSessionService::new(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
+        Arc::new(SqliteAssistantDefinitionRepository::new(
+            services.database.pool().clone(),
+        )),
+        Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
         Arc::new(SqliteProviderRepository::new(services.database.pool().clone())),
         conversation_port,
         projection_store,
