@@ -359,9 +359,9 @@ impl TeamSession {
             .ok_or_else(|| TeamError::AgentNotFound("no lead agent in team".into()))?;
 
         let lead_conv_id = self.scheduler.get_agent(&lead_slot_id).await?.conversation_id;
-        let mut ack = self
+        let (mut ack, lease) = self
             .team_run_manager
-            .accept_user_message(&lead_slot_id, TeamRunTargetRole::Lead, true, None)
+            .acquire_user_message_wake(&lead_slot_id, TeamRunTargetRole::Lead)
             .await?;
 
         let mailbox_message = match self
@@ -379,7 +379,10 @@ impl TeamSession {
         {
             Ok(message) => message,
             Err(err) => {
-                self.team_run_manager.complete_failed().await;
+                let _ = self
+                    .team_run_manager
+                    .abort_operation_lease(&lease.lease_id, "mailbox_write_failed")
+                    .await;
                 return Err(err);
             }
         };
@@ -404,12 +407,10 @@ impl TeamSession {
         }
 
         let _ = files;
-        self.wake_agent_for_team_work(
-            &lead_slot_id,
-            TeamWakeSource::UserMessage,
-            Some(mailbox_message.id.clone()),
-        )
-        .await?;
+        self.team_run_manager
+            .commit_operation_lease(&lease.lease_id, Some(mailbox_message.id.clone()))
+            .await?;
+        self.notify_reserved_wake_for_team_work(&lead_slot_id, lease.role.clone(), lease.wake_source);
         Ok(ack)
     }
 
@@ -424,15 +425,9 @@ impl TeamSession {
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
-        let has_active_run = self.team_run_manager.active_run_id().await.is_some();
-        let source = if has_active_run {
-            TeamWakeSource::UserIntervention
-        } else {
-            TeamWakeSource::UserMessage
-        };
-        let mut ack = self
+        let (mut ack, lease) = self
             .team_run_manager
-            .accept_user_message(slot_id, target_role_for(agent.role), has_active_run, None)
+            .acquire_user_message_wake(slot_id, target_role_for(agent.role))
             .await?;
 
         let mailbox_message = match self
@@ -450,7 +445,10 @@ impl TeamSession {
         {
             Ok(message) => message,
             Err(err) => {
-                self.team_run_manager.complete_failed().await;
+                let _ = self
+                    .team_run_manager
+                    .abort_operation_lease(&lease.lease_id, "mailbox_write_failed")
+                    .await;
                 return Err(err);
             }
         };
@@ -475,8 +473,10 @@ impl TeamSession {
         }
 
         let _ = files;
-        self.wake_agent_for_team_work(slot_id, source, Some(mailbox_message.id.clone()))
+        self.team_run_manager
+            .commit_operation_lease(&lease.lease_id, Some(mailbox_message.id.clone()))
             .await?;
+        self.notify_reserved_wake_for_team_work(slot_id, lease.role.clone(), lease.wake_source);
         Ok(ack)
     }
 
@@ -1174,7 +1174,7 @@ mod tests {
     use aionui_ai_agent::AgentError;
     use aionui_ai_agent::agent_task::AgentInstance;
     use aionui_ai_agent::types::BuildTaskOptions;
-    use aionui_api_types::WebSocketMessage;
+    use aionui_api_types::{TeamRunStatus, WebSocketMessage};
     use aionui_common::{AgentKillReason, TimestampMs};
     use std::sync::{Arc, Mutex};
 
@@ -1302,6 +1302,64 @@ mod tests {
         async fn insert_projected_message(&self, row: &aionui_db::models::MessageRow) -> Result<(), TeamError> {
             self.inserted.lock().unwrap().push(row.clone());
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CompletingProjectionStore {
+        manager: Mutex<Option<Arc<TeamRunManager>>>,
+    }
+
+    impl CompletingProjectionStore {
+        fn set_manager(&self, manager: Arc<TeamRunManager>) {
+            *self.manager.lock().unwrap() = Some(manager);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TeamProjectionMessageStore for CompletingProjectionStore {
+        fn mint_message_id(&self) -> String {
+            "projection-completes-run".into()
+        }
+
+        async fn find_projected_message(
+            &self,
+            _conversation_id: &str,
+            _msg_id: &str,
+            _msg_type: &str,
+        ) -> Result<Option<aionui_db::models::MessageRow>, TeamError> {
+            Ok(None)
+        }
+
+        async fn insert_projected_message(&self, _row: &aionui_db::models::MessageRow) -> Result<(), TeamError> {
+            let manager = self.manager.lock().unwrap().clone();
+            if let Some(manager) = manager {
+                manager.maybe_complete().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingProjectionStore;
+
+    #[async_trait::async_trait]
+    impl TeamProjectionMessageStore for FailingProjectionStore {
+        fn mint_message_id(&self) -> String {
+            "projection-fails".into()
+        }
+
+        async fn find_projected_message(
+            &self,
+            _conversation_id: &str,
+            _msg_id: &str,
+            _msg_type: &str,
+        ) -> Result<Option<aionui_db::models::MessageRow>, TeamError> {
+            Ok(None)
+        }
+
+        async fn insert_projected_message(&self, _row: &aionui_db::models::MessageRow) -> Result<(), TeamError> {
+            Err(TeamError::InvalidRequest("projection failed for test".into()))
         }
     }
 
@@ -1467,6 +1525,27 @@ mod tests {
 
     async fn start_session_with_projection_store(store: Arc<dyn TeamProjectionMessageStore>) -> TeamSession {
         let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        TeamSession::start(
+            make_team(),
+            repo,
+            broadcaster,
+            backend_path(),
+            empty_task_manager(),
+            noop_turn_port(),
+            noop_cancellation_port(),
+            store,
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn start_session_with_repo_and_projection_store(
+        repo: Arc<dyn ITeamRepository>,
+        store: Arc<dyn TeamProjectionMessageStore>,
+    ) -> TeamSession {
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         TeamSession::start(
             make_team(),
@@ -2533,6 +2612,73 @@ mod tests {
         assert_eq!(inserted.len(), 1, "normal teammate message must remain visible");
         let content: serde_json::Value = serde_json::from_str(&inserted[0].content).unwrap();
         assert_eq!(content["content"], "work is done");
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn send_message_to_agent_survives_completion_between_projection_and_commit() {
+        let store = Arc::new(CompletingProjectionStore::default());
+        let session = start_session_with_projection_store(store.clone()).await;
+        store.set_manager(session.team_run_manager().clone());
+        session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("active run before user intervention");
+
+        let ack = session
+            .send_message_to_agent("worker-1", "race window message", None)
+            .await
+            .expect("lease should retain run while projection completes it");
+
+        assert_eq!(ack.accepted_slot_id, "worker-1");
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await
+            .expect("committed user intervention should be pending");
+        assert_eq!(reservation.message_id, ack.message_id);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn send_message_projection_failure_still_commits_wake() {
+        let session = start_session_with_projection_store(Arc::new(FailingProjectionStore)).await;
+
+        let ack = session
+            .send_message_to_agent("worker-1", "projection can fail", None)
+            .await
+            .expect("projection failure is non-fatal");
+
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await
+            .expect("wake should still be committed");
+        assert_eq!(reservation.message_id, ack.message_id);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn send_message_mailbox_failure_aborts_lease_and_allows_completion() {
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::with_message_write_failure());
+        let session = start_session_with_repo_and_projection_store(repo, noop_projection_store()).await;
+
+        let err = session
+            .send_message("mailbox fails", None)
+            .await
+            .expect_err("mailbox write failure must be returned");
+        assert!(
+            err.to_string().contains("forced mailbox write failure"),
+            "unexpected error: {err}"
+        );
+
+        let completed = session
+            .team_run_manager()
+            .maybe_complete()
+            .await
+            .expect("aborted lease should allow empty run to complete");
+        assert_eq!(completed.status, TeamRunStatus::Completed);
         session.stop();
     }
 
