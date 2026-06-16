@@ -252,24 +252,14 @@ impl TeamSession {
         let first_message = if needs_role_prompt {
             let role_prompt = match agent.role {
                 TeammateRole::Lead => {
-                    let available_agent_types = match self.service.upgrade() {
-                        Some(svc) => svc.list_team_capable_backends().await,
-                        None => crate::guide::capability::TEAM_CAPABLE_BACKENDS
-                            .iter()
-                            .map(|b| {
-                                let mut c = b.chars();
-                                let display = match c.next() {
-                                    None => String::new(),
-                                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                                };
-                                (b.to_string(), display)
-                            })
-                            .collect(),
+                    let available_assistants = match self.service.upgrade() {
+                        Some(svc) => svc.list_team_selectable_assistants().await,
+                        None => Vec::new(),
                     };
                     build_lead_prompt(
                         &self.team.name,
                         &self.scheduler.list_agents().await,
-                        &available_agent_types,
+                        &available_assistants,
                     )
                 }
                 TeammateRole::Teammate => build_teammate_prompt(&agent, &self.team.name),
@@ -992,6 +982,26 @@ impl TeamSession {
         let existing = self.scheduler.list_agents().await;
         if existing.iter().any(|a| normalize_name(&a.name) == normalized) {
             return Err(TeamError::DuplicateAgentName(requested_name));
+        }
+
+        if req.assistant_id.is_none() {
+            let candidate_backend = req
+                .agent_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(caller.backend.as_str())
+                .to_owned();
+
+            if crate::service::spawn_support::parse_agent_type(&candidate_backend).is_err() {
+                return Err(TeamError::BackendNotAllowed(candidate_backend));
+            }
+
+            if !crate::guide::capability::TEAM_CAPABLE_BACKENDS.contains(&candidate_backend.as_str())
+                && self.service.upgrade().is_none()
+            {
+                return Err(TeamError::BackendNotAllowed(candidate_backend));
+            }
         }
 
         let service = self

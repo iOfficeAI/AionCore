@@ -2,6 +2,10 @@ use super::*;
 use aionui_api_types::BehaviorPolicy;
 use aionui_common::AgentType;
 use aionui_common::constants::{TEAM_CAPABLE_BACKENDS, has_mcp_capability};
+use aionui_db::models::AssistantOverlayRow;
+use std::collections::HashMap;
+
+use crate::prompts::AvailableAssistant;
 
 /// Known ACP vendor labels. Kept in lockstep with the `agent_metadata`
 /// seed in `005_agent_metadata.sql` — a caller hitting an unknown
@@ -138,61 +142,87 @@ impl TeamSessionService {
         has_mcp_capability(caps.as_ref())
     }
 
-    /// Return all backends currently team-capable (hard whitelist + behavior_policy + dynamically detected).
-    /// Used to build the Lead prompt's `available_agent_types` list.
-    pub(crate) async fn list_team_capable_backends(&self) -> Vec<(String, String)> {
-        let Ok(rows) = self.agent_metadata_repo.list_all().await else {
-            return TEAM_CAPABLE_BACKENDS
-                .iter()
-                .map(|b| (b.to_string(), capitalize(b)))
-                .collect();
+    /// Return all enabled assistants that can currently participate in team mode.
+    /// This is the assistant-first candidate source for the leader prompt.
+    pub(crate) async fn list_team_selectable_assistants(&self) -> Vec<AvailableAssistant> {
+        let Ok(definitions) = self.assistant_definition_repo.list().await else {
+            return Vec::new();
         };
-        let mut result: Vec<(String, String)> = Vec::new();
-        for row in &rows {
-            if !row.enabled {
+        let Ok(overlays) = self.assistant_overlay_repo.list().await else {
+            return Vec::new();
+        };
+        let Ok(agent_rows) = self.agent_metadata_repo.list_all().await else {
+            return Vec::new();
+        };
+
+        let overlay_by_definition: HashMap<&str, &AssistantOverlayRow> =
+            overlays.iter().map(|row| (row.definition_id.as_str(), row)).collect();
+
+        let mut assistants: Vec<(i32, AvailableAssistant)> = Vec::new();
+
+        for definition in &definitions {
+            let Some(source) = (match definition.source.as_str() {
+                "builtin" | "generated" | "user" => Some(definition.source.as_str()),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let overlay = overlay_by_definition.get(definition.definition_id.as_str()).copied();
+            let enabled = overlay.is_none_or(|row| row.enabled);
+            if !enabled {
                 continue;
             }
-            // Use backend if present, otherwise agent_type as identifier
-            let key = match row.backend.as_deref() {
-                Some(b) => b.to_string(),
-                None => row.agent_type.clone(),
+
+            let effective_backend = overlay
+                .and_then(|row| row.agent_backend_override.as_deref())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(definition.agent_backend.as_str());
+
+            let agent_row = if source == "generated" {
+                definition
+                    .source_ref
+                    .as_deref()
+                    .and_then(|source_ref| agent_rows.iter().find(|row| row.id == source_ref))
+            } else {
+                agent_rows
+                    .iter()
+                    .find(|row| row.backend.as_deref() == Some(effective_backend) && row.agent_source != "custom")
+                    .or_else(|| {
+                        agent_rows
+                            .iter()
+                            .find(|row| row.backend.as_deref() == Some(effective_backend))
+                    })
             };
 
-            // Check behavior_policy.supports_team (covers agents with backend=NULL like aionrs)
-            let bp_supports = row
-                .behavior_policy
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<BehaviorPolicy>(s).ok())
-                .is_some_and(|bp| bp.supports_team);
-            if bp_supports {
-                result.push((key, row.name.clone()));
+            let is_available = agent_row.is_some_and(|row| row.last_check_status.as_deref() != Some("unavailable"));
+            let is_team_capable = self.is_backend_team_capable(effective_backend).await;
+            if !(is_available && is_team_capable) {
                 continue;
             }
 
-            // Hard whitelist (only works when backend is present)
-            if let Some(backend) = row.backend.as_deref()
-                && TEAM_CAPABLE_BACKENDS.contains(&backend)
-            {
-                result.push((key, row.name.clone()));
-                continue;
-            }
+            let mut skills = decode_string_list(&definition.default_skill_ids);
+            skills.extend(decode_string_list(&definition.custom_skill_names));
 
-            // Dynamic MCP detection
-            let caps = row
-                .agent_capabilities
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-            if has_mcp_capability(caps.as_ref()) {
-                result.push((key, row.name.clone()));
-            }
+            assistants.push((
+                overlay.map(|row| row.sort_order).unwrap_or(i32::MAX),
+                AvailableAssistant {
+                    assistant_id: definition.assistant_key.clone(),
+                    name: definition.name.clone(),
+                    backend: effective_backend.to_owned(),
+                    description: definition.description.clone().unwrap_or_default(),
+                    skills,
+                },
+            ));
         }
-        // Ensure hard whitelist entries are present even if not in DB
-        for &b in TEAM_CAPABLE_BACKENDS {
-            if !result.iter().any(|(bk, _)| bk == b) {
-                result.push((b.to_string(), capitalize(b)));
-            }
-        }
-        result
+
+        assistants.sort_by(|(left_order, left), (right_order, right)| {
+            left_order
+                .cmp(right_order)
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.assistant_id.cmp(&right.assistant_id))
+        });
+
+        assistants.into_iter().map(|(_, assistant)| assistant).collect()
     }
 
     /// Return the `team_list_models` response built from DB rows.
@@ -293,12 +323,8 @@ impl TeamSessionService {
     }
 }
 
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
+fn decode_string_list(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
 #[cfg(test)]
