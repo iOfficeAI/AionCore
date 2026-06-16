@@ -174,7 +174,11 @@ fn sanitize_inline_image_result(value: &mut serde_json::Value) {
         return;
     };
 
-    let saved_path = obj.get("saved_path").and_then(|v| v.as_str()).map(str::to_owned);
+    let saved_path = obj
+        .get("saved_path")
+        .and_then(|v| v.as_str())
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
     // Strip any oversized inline-image `result` regardless of whether the image was
     // saved to disk. Older codex versions and interrupted/failed generations may emit
     // the multi-MB base64 without a `saved_path`; that payload must never reach the
@@ -187,6 +191,11 @@ fn sanitize_inline_image_result(value: &mut serde_json::Value) {
         .unwrap_or(false);
 
     if !should_omit {
+        if obj.get("image").is_none()
+            && let Some(path) = saved_path.as_deref().filter(|path| is_probably_image_path(path))
+        {
+            insert_image_output(obj, path);
+        }
         return;
     }
 
@@ -203,15 +212,7 @@ fn sanitize_inline_image_result(value: &mut serde_json::Value) {
     );
 
     if let Some(path) = saved_path {
-        let mime_type = mime_type_from_image_path(&path);
-        obj.insert(
-            "image".to_owned(),
-            serde_json::json!({
-                "path": path,
-                "mime_type": mime_type,
-                "source": "codex_image_generation"
-            }),
-        );
+        insert_image_output(obj, &path);
     }
 }
 
@@ -236,6 +237,27 @@ fn mime_type_from_image_path(path: &str) -> &'static str {
     }
 }
 
+fn is_probably_image_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".gif")
+}
+
+fn insert_image_output(obj: &mut serde_json::Map<String, serde_json::Value>, path: &str) {
+    let mime_type = mime_type_from_image_path(path);
+    obj.insert(
+        "image".to_owned(),
+        serde_json::json!({
+            "path": path,
+            "mime_type": mime_type,
+            "source": "codex_image_generation"
+        }),
+    );
+}
+
 fn normalize_tool_status(
     sdk_status: Option<&SdkToolCallStatus>,
     raw_output: Option<&serde_json::Value>,
@@ -244,6 +266,7 @@ fn normalize_tool_status(
         .and_then(|v| v.get("image"))
         .and_then(|v| v.get("path"))
         .and_then(|v| v.as_str())
+        .filter(|path| !path.is_empty())
         .is_some();
 
     // Only force `completed` when the image is on disk AND the agent did not already

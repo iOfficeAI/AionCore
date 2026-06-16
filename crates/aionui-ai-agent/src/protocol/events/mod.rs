@@ -505,6 +505,59 @@ mod tests {
     }
 
     #[test]
+    fn codex_image_tool_update_completes_saved_image_path_without_inline_result() {
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "ig_path_only",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "call_id": "ig_path_only",
+                        "status": "generating",
+                        "saved_path": "/Users/test/.codex/generated_images/session/ig_path_only.png"
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+
+        assert_eq!(json["data"]["update"]["status"], "completed");
+        assert_eq!(json["data"]["update"]["rawOutput"]["status"], "completed");
+        assert_eq!(
+            json["data"]["update"]["rawOutput"]["image"]["path"],
+            "/Users/test/.codex/generated_images/session/ig_path_only.png"
+        );
+    }
+
+    #[test]
+    fn codex_tool_update_keeps_non_image_saved_path_in_progress() {
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "text_result_path",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "call_id": "text_result_path",
+                        "status": "generating",
+                        "saved_path": "/tmp/result.txt"
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+
+        assert_eq!(json["data"]["update"]["status"], "in_progress");
+        assert_eq!(json["data"]["update"]["rawOutput"]["status"], "generating");
+        assert!(json["data"]["update"]["rawOutput"].get("image").is_none());
+    }
+
+    #[test]
     fn permission_request_maps_to_snake_case_event_data() {
         let request = RequestPermissionRequest::new(
             "sess-1",
