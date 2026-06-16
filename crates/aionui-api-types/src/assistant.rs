@@ -346,6 +346,11 @@ mod tests {
             prompts_i18n: HashMap::new(),
             models: vec![],
             last_used_at: Some(1_234),
+            agent_status: AgentManagementStatus::Available,
+            agent_status_message: None,
+            team_selectable: true,
+            team_block_reason: None,
+            deletable: true,
         };
 
         let json = serde_json::to_value(&resp).unwrap();
