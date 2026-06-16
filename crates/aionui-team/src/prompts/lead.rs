@@ -24,7 +24,7 @@ const PLACEHOLDER_WORKSPACE_SECTION: &str = "${workspaceSection}";
 const PLACEHOLDER_PRESET_FORMATTING_STEP_RULE: &str = "${presetFormattingStepRule}";
 const PLACEHOLDER_PRESET_FORMATTING_IMPORTANT_RULE: &str = "${presetFormattingImportantRule}";
 
-/// A generic agent type (CLI backend) that the leader may spawn.
+/// A generic backend fallback that the leader may spawn when no preset assistant fits.
 /// Phase1 shape per interface-contracts §5 (line 211).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableAgentType {
@@ -57,7 +57,7 @@ pub struct LeadPromptParams<'a> {
 ///
 /// Placeholders replaced (mirrors AionUi `leadPrompt.ts`):
 /// - `${teammateList}` — bullet list of teammates or an empty-team fallback sentence
-/// - `${availableTypesSection}` — `## Available Agent Types for Spawning` section, or `""`
+/// - `${availableTypesSection}` — `## Available Generic Backends for Spawning` section, or `""`
 /// - `${availableAssistantsSection}` — `## Available Preset Assistants for Spawning` section, or `""`
 /// - `${workspaceSection}` — `## Team Workspace` section, or `""`
 /// - `${presetFormattingStepRule}` — phase1 emits `""` (presets not surfaced in phase1)
@@ -112,14 +112,16 @@ fn render_available_types_section(agent_types: &[AvailableAgentType]) -> String 
     if agent_types.is_empty() {
         return String::new();
     }
-    let mut out = String::from("\n\n## Available Agent Types for Spawning\n");
+    let mut out = String::from("\n\n## Available Generic Backends for Spawning\n");
     for (idx, t) in agent_types.iter().enumerate() {
         if idx > 0 {
             out.push('\n');
         }
         let _ = write!(out, "- `{}` — {}", t.agent_type, t.display_name);
     }
-    out.push_str("\n\nUse `team_list_models` to query available models for each agent type before spawning.");
+    out.push_str(
+        "\n\nUse `team_list_models` to query available models for each backend before spawning.",
+    );
     out
 }
 
@@ -163,7 +165,7 @@ fn render_available_assistants_section(assistants: &[AvailableAssistant]) -> Str
          candidate to see its full description, skills, and example tasks, then choose the best \
          fit.\n\
          3. If no preset matches the task, fall back to a generic CLI agent from the \
-         \"Available Agent Types\" section.\n\n\
+         \"Available Generic Backends\" section.\n\n\
          Pass the preset's ID as `assistant_id` to `team_spawn_agent`. The `agent_type` is \
          derived from the preset's backend and does not need to be specified.",
     );
@@ -312,10 +314,10 @@ mod tests {
                 display_name: "code generation specialist".into(),
             },
         ]);
-        assert!(got.starts_with("\n\n## Available Agent Types for Spawning\n"));
+        assert!(got.starts_with("\n\n## Available Generic Backends for Spawning\n"));
         assert!(got.contains("- `claude` — general-purpose AI assistant"));
         assert!(got.contains("- `codex` — code generation specialist"));
-        assert!(got.contains("Use `team_list_models`"));
+        assert!(got.contains("Use `team_list_models` to query available models for each backend before spawning."));
     }
 
     #[test]
@@ -422,7 +424,7 @@ mod tests {
         assert!(!out.contains("${"), "unsubstituted placeholder:\n{out}");
         assert!(out.contains("## Your Teammates"));
         assert!(out.contains("- Worker1 (claude, status: unknown)"));
-        assert!(out.contains("## Available Agent Types for Spawning"));
+        assert!(out.contains("## Available Generic Backends for Spawning"));
         assert!(!out.contains("## Available Preset Assistants for Spawning"));
         assert!(out.contains("## Team Workspace"));
         assert!(out.contains("STEP:END"));
