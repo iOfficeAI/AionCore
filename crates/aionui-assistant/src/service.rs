@@ -254,21 +254,43 @@ impl AssistantService {
         };
 
         let rows = agent_catalog.list_management_agents().await?;
-        for row in rows.iter().filter(|row| {
-            row.enabled
-                && row.agent_type.supports_new_conversation()
-                && matches!(row.status, AgentManagementStatus::Available)
-        }) {
-            if self
-                .definition_repo
-                .get_by_source_ref("generated", &row.id)
-                .await
-                .map_err(|e| AssistantError::Internal(format!("get generated assistant by source_ref: {e}")))?
-                .is_some()
-            {
-                continue;
-            }
+        let definitions = self.definition_repo.list().await.map_err(|e| {
+            AssistantError::Internal(format!("list assistant definitions for generated reconcile: {e}"))
+        })?;
+        let generated_source_refs: HashSet<String> = definitions
+            .iter()
+            .filter(|definition| definition.source == "generated")
+            .filter_map(|definition| definition.source_ref.clone())
+            .collect();
+        let has_existing_generated = !generated_source_refs.is_empty();
+        let existing_min_sort_order = self
+            .state_repo
+            .list()
+            .await
+            .map_err(|e| AssistantError::Internal(format!("list assistant overlays for generated reconcile: {e}")))?
+            .into_iter()
+            .map(|state| state.sort_order)
+            .min()
+            .unwrap_or_default()
+            .min(0);
+        let generated_rows: Vec<&AgentManagementRow> = rows
+            .iter()
+            .filter(|row| {
+                row.enabled
+                    && row.agent_type.supports_new_conversation()
+                    && matches!(row.status, AgentManagementStatus::Available)
+            })
+            .collect();
+        let missing_generated_count = generated_rows
+            .iter()
+            .filter(|row| !generated_source_refs.contains(&row.id))
+            .count();
 
+        for (missing_index, row) in generated_rows
+            .into_iter()
+            .filter(|row| !generated_source_refs.contains(&row.id))
+            .enumerate()
+        {
             let assistant_key = format!("bare:{}", row.id);
             let (definition_id, assistant_key) = self
                 .resolve_definition_identity("generated", Some(&row.id), &assistant_key)
@@ -318,11 +340,16 @@ impl AssistantService {
                 .map_err(|e| AssistantError::Internal(format!("get generated assistant overlay: {e}")))?
                 .is_none()
             {
+                let initial_generated_sort_order = if !has_existing_generated && missing_generated_count > 0 {
+                    existing_min_sort_order as i64 - missing_generated_count as i64 + missing_index as i64
+                } else {
+                    row.sort_order
+                };
                 self.state_repo
                     .upsert(&UpsertAssistantOverlayParams {
                         definition_id: &definition_id,
                         enabled: true,
-                        sort_order: row.sort_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                        sort_order: initial_generated_sort_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
                         agent_backend_override: None,
                         last_used_at: None,
                     })
@@ -2490,6 +2517,81 @@ mod tests {
         assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Available);
         assert!(bare.team_selectable);
         assert!(!bare.deletable);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_places_new_bare_assistants_before_existing_assistants() {
+        let fx = fixture_with_options(FixtureOpts {
+            builtins: vec![mk_builtin("builtin-office", "Office")],
+            agent_rows: vec![
+                mk_agent_row(
+                    "agent-claude",
+                    "claude",
+                    aionui_api_types::AgentManagementStatus::Available,
+                ),
+                mk_agent_row(
+                    "agent-codex",
+                    "codex",
+                    aionui_api_types::AgentManagementStatus::Available,
+                ),
+            ],
+            ..Default::default()
+        })
+        .await;
+
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "Mine".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        let list = fx.service.list().await.unwrap();
+        let ordered_ids: Vec<&str> = list.iter().map(|assistant| assistant.id.as_str()).collect();
+
+        assert_eq!(ordered_ids[0..2], ["bare:agent-claude", "bare:agent-codex"]);
+        assert!(ordered_ids[2..].contains(&"builtin-office"));
+        assert!(ordered_ids[2..].contains(&"u1"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_generated_assistants_preserves_existing_user_sort_order() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Available,
+            )],
+            ..Default::default()
+        })
+        .await;
+
+        let first = fx.service.list().await.unwrap();
+        let bare = first
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-claude")
+            .expect("bare assistant should exist after first reconcile");
+        assert_eq!(bare.sort_order, -1);
+
+        fx.service
+            .set_state(
+                "bare:agent-claude",
+                SetAssistantStateRequest {
+                    sort_order: Some(9000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let second = fx.service.list().await.unwrap();
+        let bare_after_reconcile = second
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-claude")
+            .expect("bare assistant should still exist");
+        assert_eq!(bare_after_reconcile.sort_order, 9000);
     }
 
     #[tokio::test]
