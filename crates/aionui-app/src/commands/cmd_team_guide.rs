@@ -501,11 +501,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_tool_create_team_object_success_returns_success_text() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "teamId": "team-1",
+                "name": "Dev Team",
+                "route": "/team/team-1",
+                "status": "team_created",
+                "next_step": "Team was created and the Team page is open. End this solo turn now.",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server = guide_server_for_port(mock_server.address().port());
+        let result = server
+            .forward_tool("aion_create_team", &json!({"summary": "redacted"}))
+            .await;
+
+        assert_ne!(result.is_error, Some(true));
+        let text = first_text(&result);
+        assert!(text.contains("team_created"));
+        assert!(text.contains("team-1"));
+        assert!(text.contains("End this solo turn now"));
+    }
+
+    #[tokio::test]
+    async fn forward_tool_create_team_malformed_object_remains_unexpected() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "Dev Team",
+                "route": "/team/team-1",
+                "status": "team_created",
+                "next_step": "Team was created and the Team page is open. End this solo turn now.",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server = guide_server_for_port(mock_server.address().port());
+        let result = server
+            .forward_tool("aion_create_team", &json!({"summary": "redacted"}))
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(first_text(&result), "unexpected local guide tool response");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["code"],
+            "MCP_TOOL_RESPONSE_UNEXPECTED"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_tool_create_team_legacy_result_body_remains_unexpected() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "legacy create-team success",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server = guide_server_for_port(mock_server.address().port());
+        let result = server
+            .forward_tool("aion_create_team", &json!({"summary": "redacted"}))
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(first_text(&result), "unexpected local guide tool response");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["code"],
+            "MCP_TOOL_RESPONSE_UNEXPECTED"
+        );
+    }
+
+    #[tokio::test]
     async fn forward_tool_unexpected_2xx_body_returns_unexpected_without_echoing_body() {
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tool"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("unexpected raw body with team-secret-789"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "teamId": "team-secret-789",
+                "route": "/team/team-secret-789",
+                "status": "team_created",
+                "next_step": "Team was created and the Team page is open. End this solo turn now.",
+            })))
             .mount(&mock_server)
             .await;
 
@@ -520,7 +603,7 @@ mod tests {
         );
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("team-secret-789"));
-        assert!(!serialized.contains("unexpected raw body"));
+        assert!(!serialized.contains("team_created"));
     }
 
     #[tokio::test]
@@ -599,8 +682,8 @@ impl GuideServer {
                     match resp.text().await {
                         Ok(text) => {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if let Some(result) = v.get("result").and_then(|r| r.as_str()) {
-                                    return tool_success(result.to_owned());
+                                if let Some(result) = parse_tool_success_text(tool_name, &v) {
+                                    return tool_success(result);
                                 }
                                 if v.get("error").is_some() {
                                     return tool_error(
@@ -693,4 +776,26 @@ fn extract_nested_code(value: &serde_json::Value, path: &[&str]) -> Option<serde
         serde_json::Value::String(_) | serde_json::Value::Number(_) => Some(current.clone()),
         _ => None,
     }
+}
+
+fn parse_tool_success_text(tool_name: &str, value: &serde_json::Value) -> Option<String> {
+    if tool_name == "aion_create_team" {
+        return is_create_team_success_body(value).then(|| serde_json::to_string(value).ok())?;
+    }
+
+    if let Some(result) = value.get("result").and_then(|result| result.as_str()) {
+        return Some(result.to_owned());
+    }
+
+    None
+}
+
+fn is_create_team_success_body(value: &serde_json::Value) -> bool {
+    value.get("status").and_then(|status| status.as_str()) == Some("team_created")
+        && value.get("teamId").and_then(|team_id| team_id.as_str()).is_some()
+        && value.get("route").and_then(|route| route.as_str()).is_some()
+        && value
+            .get("next_step")
+            .and_then(|next_step| next_step.as_str())
+            .is_some()
 }
