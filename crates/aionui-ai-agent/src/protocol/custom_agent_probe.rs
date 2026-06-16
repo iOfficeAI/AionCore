@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use aionui_api_types::TryConnectCustomAgentResponse;
 use aionui_common::{CommandSpec, EnvVar};
-use aionui_runtime::{NodeRuntimeProgressReporter, ensure_runtime_command_with_reporter};
+use aionui_runtime::{NodeRuntimeProgressReporter, ResolvedCommand, ensure_runtime_command_with_reporter};
 use tokio::sync::{broadcast, mpsc};
 use tracing::debug;
 
@@ -69,7 +69,7 @@ fn first_token(command: &str) -> &str {
 }
 
 async fn acp_initialize(
-    resolved: aionui_runtime::ResolvedCommand,
+    resolved: ResolvedCommand,
     args: &[String],
     env: &HashMap<String, String>,
     data_dir: &Path,
@@ -100,6 +100,10 @@ async fn acp_initialize(
         cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
     };
 
+    acp_initialize_command_spec(spec, data_dir).await
+}
+
+pub(crate) async fn acp_initialize_command_spec(spec: CommandSpec, data_dir: &Path) -> Result<(), String> {
     let proc = CliAgentProcess::spawn_for_sdk(spec, data_dir)
         .await
         .map_err(|e| format!("spawn failed: {e}"))?;

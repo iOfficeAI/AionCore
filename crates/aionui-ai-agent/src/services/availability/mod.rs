@@ -7,10 +7,15 @@ use std::sync::{
 use std::time::Instant;
 
 use aionui_api_types::{
-    AgentManagementRow, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, TryConnectCustomAgentResponse,
+    AgentManagementRow, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
+    TryConnectCustomAgentResponse,
 };
 use aionui_common::now_ms;
+use aionui_common::{CommandSpec, EnvVar};
 use aionui_db::UpdateAgentAvailabilitySnapshotParams;
+use aionui_runtime::{
+    ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, resolve_command_path,
+};
 use tokio::time::{Duration, sleep};
 
 use crate::error::AgentError;
@@ -183,7 +188,24 @@ async fn run_probe(
     let started_at = now_ms();
     let start = Instant::now();
 
-    let (status, error_code, error_message) = if let Some(command) = meta.command.as_deref() {
+    let (status, error_code, error_message) = if meta.agent_source == AgentSource::Builtin
+        && let Some(backend) = meta.backend.as_deref()
+        && let Some(tool) = ManagedAcpToolId::from_backend(backend)
+    {
+        match try_connect_builtin_managed_agent(meta, data_dir, tool).await {
+            TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Available, None, None),
+            TryConnectCustomAgentResponse::FailCli { error } => (
+                AgentSnapshotCheckStatus::Unavailable,
+                Some("command_not_found".to_owned()),
+                Some(error),
+            ),
+            TryConnectCustomAgentResponse::FailAcp { error } => (
+                AgentSnapshotCheckStatus::Unavailable,
+                Some("acp_init_failed".to_owned()),
+                Some(error),
+            ),
+        }
+    } else if let Some(command) = meta.command.as_deref() {
         let env: HashMap<String, String> = meta
             .env
             .iter()
@@ -238,6 +260,76 @@ async fn run_probe(
     }
 }
 
+async fn try_connect_builtin_managed_agent(
+    meta: &AgentMetadata,
+    data_dir: &std::path::Path,
+    tool: ManagedAcpToolId,
+) -> TryConnectCustomAgentResponse {
+    if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
+        && resolve_command_path(primary).is_none()
+    {
+        return TryConnectCustomAgentResponse::FailCli {
+            error: format!("`{primary}` not found on PATH"),
+        };
+    }
+
+    let node_runtime = match ensure_node_runtime_with_reporter(None).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return TryConnectCustomAgentResponse::FailCli {
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let managed_tool = match ensure_managed_acp_tool_with_reporter(tool, None).await {
+        Ok(tool) => tool,
+        Err(error) => {
+            return TryConnectCustomAgentResponse::FailCli {
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let resolved = managed_tool.command(&node_runtime);
+    let mut env: Vec<EnvVar> = meta
+        .env
+        .iter()
+        .map(|entry| EnvVar {
+            name: entry.name.clone(),
+            value: entry.value.clone(),
+        })
+        .collect();
+    env.extend(resolved.env.iter().map(|(name, value)| EnvVar {
+        name: name.to_string_lossy().into_owned(),
+        value: value.to_string_lossy().into_owned(),
+    }));
+
+    let spec = CommandSpec {
+        command: resolved.program,
+        args: resolved
+            .args_prefix
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+        env,
+        cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+    };
+
+    match tokio::time::timeout(
+        Duration::from_secs(35),
+        custom_agent_probe::acp_initialize_command_spec(spec, data_dir),
+    )
+    .await
+    {
+        Ok(Ok(())) => TryConnectCustomAgentResponse::Success,
+        Ok(Err(error)) => TryConnectCustomAgentResponse::FailAcp { error },
+        Err(_) => TryConnectCustomAgentResponse::FailAcp {
+            error: "ACP initialize did not complete within 35s".to_owned(),
+        },
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
     async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
@@ -249,13 +341,17 @@ impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
 mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
-    use aionui_api_types::{AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus};
+    use aionui_api_types::{
+        AgentHandshake, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
+        AgentSource, AgentSourceInfo, BehaviorPolicy,
+    };
+    use aionui_common::AgentType;
     use aionui_db::{
         IAgentMetadataRepository, SqliteAgentMetadataRepository, UpsertAgentMetadataParams, init_database_memory,
     };
     use tokio::time::Duration;
 
-    use super::AgentAvailabilityService;
+    use super::{AgentAvailabilityService, run_probe};
     use crate::registry::AgentRegistry;
 
     #[tokio::test]
@@ -389,5 +485,75 @@ mod tests {
         assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Scheduled));
         assert!(row.last_check_status.is_some());
         assert!(row.last_check_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn managed_builtin_probe_checks_primary_binary_before_running_bridge_command() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+
+        let meta = AgentMetadata {
+            id: "agent-managed-builtin".into(),
+            icon: None,
+            name: "Claude Code".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("claude".into()),
+            agent_type: AgentType::Acp,
+            agent_source: AgentSource::Builtin,
+            agent_source_info: AgentSourceInfo {
+                binary_name: Some("definitely-missing-claude-cli".into()),
+                bridge_binary: Some("bun".into()),
+                hub_package_id: None,
+                version: None,
+            },
+            enabled: true,
+            available: true,
+            command: Some("bun".into()),
+            resolved_command: None,
+            args: vec![
+                "x".into(),
+                "--bun".into(),
+                "@agentclientprotocol/claude-agent-acp@0.39.0".into(),
+            ],
+            env: vec![],
+            native_skills_dirs: Some(vec![".claude/skills".into()]),
+            behavior_policy: BehaviorPolicy::default(),
+            yolo_id: Some("bypassPermissions".into()),
+            sort_order: 3100,
+            team_capable: true,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            handshake: AgentHandshake::default(),
+        };
+
+        let snapshot = run_probe(
+            &registry,
+            &meta,
+            std::env::temp_dir().as_path(),
+            AgentSnapshotCheckKind::Manual,
+        )
+        .await;
+
+        assert_eq!(snapshot.status, "unavailable");
+        assert_eq!(snapshot.error_code.as_deref(), Some("command_not_found"));
+        assert!(
+            snapshot
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("definitely-missing-claude-cli")),
+            "expected missing primary binary message, got {:?}",
+            snapshot.error_message
+        );
     }
 }
