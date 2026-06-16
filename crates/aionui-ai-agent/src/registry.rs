@@ -279,6 +279,7 @@ impl AgentRegistry {
             .cloned()
             .map(|meta| {
                 let status = derive_management_status(&meta);
+                let diagnostics = derive_management_diagnostics(&meta, status);
                 AgentManagementRow {
                     id: meta.id,
                     icon: meta.icon,
@@ -303,9 +304,9 @@ impl AgentRegistry {
                     status,
                     last_check_status: meta.last_check_status,
                     last_check_kind: meta.last_check_kind,
-                    last_check_error_code: meta.last_check_error_code,
-                    last_check_error_message: meta.last_check_error_message,
-                    last_check_guidance: meta.last_check_guidance,
+                    last_check_error_code: diagnostics.error_code,
+                    last_check_error_message: diagnostics.error_message,
+                    last_check_guidance: diagnostics.guidance,
                     last_check_latency_ms: meta.last_check_latency_ms,
                     last_check_at: meta.last_check_at,
                     last_success_at: meta.last_success_at,
@@ -569,6 +570,97 @@ fn derive_management_status(meta: &AgentMetadata) -> AgentManagementStatus {
     match meta.last_check_status {
         Some(AgentSnapshotCheckStatus::Unavailable) => AgentManagementStatus::Unavailable,
         _ => AgentManagementStatus::Available,
+    }
+}
+
+struct ManagementDiagnostics {
+    error_code: Option<String>,
+    error_message: Option<String>,
+    guidance: Option<String>,
+}
+
+fn derive_management_diagnostics(meta: &AgentMetadata, status: AgentManagementStatus) -> ManagementDiagnostics {
+    let derived_reason = if matches!(status, AgentManagementStatus::Missing) {
+        probe_resolved_command(meta).err()
+    } else {
+        None
+    };
+
+    let error_code = meta
+        .last_check_error_code
+        .clone()
+        .or_else(|| derived_reason.as_ref().map(unavailable_reason_code));
+    let error_message = meta
+        .last_check_error_message
+        .clone()
+        .or_else(|| derived_reason.as_ref().map(|reason| reason.to_string()));
+    let guidance = meta.last_check_guidance.clone().or_else(|| {
+        if let Some(reason) = derived_reason.as_ref() {
+            Some(guidance_for_unavailable_reason(reason))
+        } else {
+            error_code
+                .as_deref()
+                .map(guidance_for_snapshot_error_code)
+                .filter(|guidance| !guidance.is_empty())
+                .map(str::to_owned)
+        }
+    });
+
+    ManagementDiagnostics {
+        error_code,
+        error_message,
+        guidance,
+    }
+}
+
+fn unavailable_reason_code(reason: &UnavailableReason) -> String {
+    match reason {
+        UnavailableReason::Disabled => "disabled",
+        UnavailableReason::NoCommand => "no_command",
+        UnavailableReason::BridgeMissing { .. } => "bridge_missing",
+        UnavailableReason::PrimaryMissing { .. } => "primary_missing",
+        UnavailableReason::CommandMissing { .. } => "command_missing",
+        UnavailableReason::ManagedRuntimeUnavailable { .. } => "managed_runtime_unavailable",
+    }
+    .to_owned()
+}
+
+fn guidance_for_unavailable_reason(reason: &UnavailableReason) -> String {
+    match reason {
+        UnavailableReason::Disabled => "Enable this agent to make it available again.".to_owned(),
+        UnavailableReason::NoCommand => {
+            "Configure a spawn command for this agent, then run Test Connection again.".to_owned()
+        }
+        UnavailableReason::BridgeMissing { bridge } => {
+            format!("Install `{bridge}` and make sure it is available on PATH, then run Test Connection again.")
+        }
+        UnavailableReason::PrimaryMissing { binary } => {
+            format!("Install `{binary}` and make sure it is available on PATH, then run Test Connection again.")
+        }
+        UnavailableReason::CommandMissing { command } => {
+            format!("Install `{command}` and make sure it is available on PATH, then run Test Connection again.")
+        }
+        UnavailableReason::ManagedRuntimeUnavailable { resource, .. } => {
+            format!("Repair or reinstall the managed `{resource}` runtime, then run Test Connection again.")
+        }
+    }
+}
+
+pub(crate) fn guidance_for_snapshot_error_code(error_code: &str) -> &'static str {
+    match error_code {
+        "command_not_found" => {
+            "Install the required CLI and make sure it is available on PATH, then run Test Connection again."
+        }
+        "acp_init_failed" => {
+            "The CLI was found, but ACP initialization failed. Complete sign-in or setup in the CLI, then run Test Connection again."
+        }
+        "health_check_failed" => {
+            "Open the CLI once to finish any first-run setup or sign-in flow, then run Test Connection again."
+        }
+        "session_send_failed" => {
+            "Fix the provider credentials or network issue that caused the last session failure, then start a new conversation."
+        }
+        _ => "",
     }
 }
 

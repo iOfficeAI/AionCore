@@ -20,7 +20,7 @@ use tokio::time::{Duration, sleep};
 
 use crate::error::AgentError;
 use crate::protocol::{cli_detect, custom_agent_probe};
-use crate::registry::AgentRegistry;
+use crate::registry::{AgentRegistry, guidance_for_snapshot_error_code};
 
 const DEFAULT_STARTUP_DELAY: Duration = Duration::from_secs(15);
 const DEFAULT_SCHEDULED_INTERVAL: Duration = Duration::from_secs(300);
@@ -155,7 +155,10 @@ impl AgentAvailabilityService {
             last_check_kind: Some(snapshot.kind),
             last_check_error_code: snapshot.error_code.as_deref(),
             last_check_error_message: snapshot.error_message.as_deref(),
-            last_check_guidance: None,
+            last_check_guidance: snapshot.error_code.as_deref().and_then(|code| {
+                let guidance = guidance_for_snapshot_error_code(code);
+                (!guidance.is_empty()).then_some(guidance)
+            }),
             last_check_latency_ms: Some(snapshot.latency_ms),
             last_check_at: Some(snapshot.checked_at),
             last_success_at: if snapshot.status == "available" {
@@ -415,6 +418,12 @@ mod tests {
         assert_eq!(
             row.last_check_error_message.as_deref(),
             Some("provider returned 401 invalid api key")
+        );
+        assert_eq!(
+            row.last_check_guidance.as_deref(),
+            Some(
+                "Fix the provider credentials or network issue that caused the last session failure, then start a new conversation."
+            )
         );
         assert!(row.last_failure_at.is_some());
     }

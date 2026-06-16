@@ -1,4 +1,8 @@
 use super::*;
+use aionui_db::{
+    IAgentMetadataRepository, SqliteAgentMetadataRepository, UpsertAgentMetadataParams, init_database_memory,
+};
+use std::sync::Arc;
 
 #[test]
 fn probe_resolved_command_accepts_bare_npx_when_managed_runtime_is_supported() {
@@ -146,4 +150,62 @@ fn probe_resolved_command_requires_primary_binary_for_builtin_managed_codex() {
         reason,
         UnavailableReason::PrimaryMissing { binary } if binary == "definitely-missing-codex-cli"
     ));
+}
+
+#[tokio::test]
+async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+    repo.upsert(&UpsertAgentMetadataParams {
+        id: "agent-missing-cli",
+        icon: None,
+        name: "Missing CLI Agent",
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: Some("custom".into()),
+        agent_type: "acp",
+        agent_source: "custom",
+        agent_source_info: Some(r#"{"binary_name":"definitely-missing-cli"}"#),
+        enabled: true,
+        command: Some("definitely-missing-cli"),
+        args: Some("[]"),
+        env: Some("[]"),
+        native_skills_dirs: None,
+        behavior_policy: None,
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 100,
+    })
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    let row = registry
+        .list_management_rows()
+        .await
+        .into_iter()
+        .find(|item| item.id == "agent-missing-cli")
+        .unwrap();
+
+    assert_eq!(row.status, AgentManagementStatus::Missing);
+    assert_eq!(row.last_check_error_code.as_deref(), Some("command_missing"));
+    assert!(
+        row.last_check_error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("definitely-missing-cli"))
+    );
+    assert!(
+        row.last_check_guidance
+            .as_deref()
+            .is_some_and(|guidance| guidance.contains("PATH"))
+    );
 }
