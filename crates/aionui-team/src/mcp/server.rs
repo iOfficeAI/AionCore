@@ -546,10 +546,6 @@ async fn exec_send_message(
     let service = service
         .upgrade()
         .ok_or_else(|| "Team service not available; cannot wake target".to_string())?;
-    service
-        .require_active_team_run_for_team_work(team_id)
-        .await
-        .map_err(|e| e.to_string())?;
 
     let targets = if resolved_to == "*" {
         scheduler

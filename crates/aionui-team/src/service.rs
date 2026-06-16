@@ -901,7 +901,6 @@ impl TeamSessionService {
         to_slot_id: &str,
         content: &str,
     ) -> Result<(), TeamError> {
-        self.require_active_team_run_for_team_work(team_id).await?;
         let session = {
             let entry = self
                 .sessions

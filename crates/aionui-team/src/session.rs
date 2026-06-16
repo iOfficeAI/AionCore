@@ -21,7 +21,7 @@ use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payloa
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
-use crate::team_run::{ChildCancelTarget, TeamRunManager, WakeRecordDecision, target_role_for};
+use crate::team_run::{ChildCancelTarget, TeamRunManager, TeamRunWakeAcquireOutcome, WakeRecordDecision, target_role_for};
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::wake::TeamWakeSource;
 
@@ -488,8 +488,19 @@ impl TeamSession {
     ) -> Result<(), TeamError> {
         let to_agent = self.scheduler.get_agent(to_slot_id).await?;
         let from_agent = self.scheduler.get_agent(from_slot_id).await?;
+        let outcome = self
+            .team_run_manager
+            .acquire_run_scoped_wake(
+                to_slot_id,
+                target_role_for(to_agent.role),
+                TeamWakeSource::McpSendMessage,
+            )
+            .await?;
+        let TeamRunWakeAcquireOutcome::Accepted(lease) = outcome else {
+            return Ok(());
+        };
 
-        let mailbox_message = self
+        let mailbox_message = match self
             .mailbox
             .write(
                 &self.team.id,
@@ -499,7 +510,17 @@ impl TeamSession {
                 content,
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(message) => message,
+            Err(err) => {
+                let _ = self
+                    .team_run_manager
+                    .abort_operation_lease(&lease.lease_id, "mailbox_write_failed")
+                    .await;
+                return Err(err);
+            }
+        };
 
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest {
@@ -534,12 +555,11 @@ impl TeamSession {
             );
         }
 
-        self.wake_agent_for_team_work(
-            to_slot_id,
-            TeamWakeSource::McpSendMessage,
-            Some(mailbox_message.id.clone()),
-        )
-        .await
+        self.team_run_manager
+            .commit_operation_lease(&lease.lease_id, Some(mailbox_message.id.clone()))
+            .await?;
+        self.notify_reserved_wake_for_team_work(to_slot_id, lease.role.clone(), lease.wake_source);
+        Ok(())
     }
 
     pub(crate) async fn wake_agent_for_team_work(
@@ -1615,6 +1635,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_send_message_survives_completion_between_projection_and_commit() {
+        let store = Arc::new(CompletingProjectionStore::default());
+        let session = start_session_with_projection_store(store.clone()).await;
+        store.set_manager(session.team_run_manager().clone());
+        session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("active run before agent message");
+
+        session
+            .send_agent_message_from_agent("lead-1", "worker-1", "lease protected")
+            .await
+            .expect("agent message lease should retain run while projection completes it");
+
+        let unread = session
+            .mailbox()
+            .peek_unread(session.team_id(), "worker-1")
+            .await
+            .unwrap();
+        assert!(unread.iter().any(|msg| msg.content == "lease protected"));
+        session.stop();
+    }
+
+    #[tokio::test]
     async fn leader_message_reuses_active_run_when_leader_slot_is_free() {
         let session = start_session().await;
         let first = session
@@ -1641,19 +1686,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leader_message_rejects_when_leader_slot_is_busy() {
+    async fn leader_message_queues_when_leader_slot_has_pending_wake() {
         let session = start_session().await;
-        session
+        let first = session
             .send_message("First leader message", None)
             .await
             .expect("first leader send creates run");
 
-        let err = session
+        let second = session
             .send_message("Second leader message", None)
             .await
-            .expect_err("leader pending wake must make leader slot busy");
+            .expect("leader pending wake should accept additional foreground message");
 
-        assert!(matches!(err, TeamError::SlotBusy(slot_id) if slot_id == "lead-1"));
+        assert_eq!(second.team_run_id, first.team_run_id);
+        let payload = session.team_run_manager().current_payload().await.unwrap();
+        assert_eq!(payload.pending_wake_count, 2);
         session.stop();
     }
 
@@ -1930,7 +1977,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paused_slot_suppresses_background_wake_and_keeps_mailbox_unread() {
+    async fn paused_slot_suppresses_mcp_send_without_mailbox_write() {
         let session = start_session().await;
         let ack = session.send_message("start", None).await.unwrap();
         session
@@ -1954,7 +2001,10 @@ mod tests {
             .peek_unread(session.team_id(), "lead-1")
             .await
             .unwrap();
-        assert!(unread.iter().any(|msg| msg.content == "background update"));
+        assert!(
+            unread.iter().all(|msg| msg.content != "background update"),
+            "suppressed acquire must not write mailbox"
+        );
         session.stop();
     }
 
