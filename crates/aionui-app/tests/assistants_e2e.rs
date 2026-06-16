@@ -53,7 +53,13 @@ struct Fixture {
     _ext_tmp: TempDir,
 }
 
-async fn insert_generated_bare_assistant(fx: &Fixture, assistant_key: &str, source_ref: &str, backend: &str, name: &str) {
+async fn insert_generated_bare_assistant(
+    fx: &Fixture,
+    assistant_key: &str,
+    source_ref: &str,
+    backend: &str,
+    name: &str,
+) {
     let pool = fx.services.database.pool().clone();
     let definition_repo = SqliteAssistantDefinitionRepository::new(pool.clone());
     let overlay_repo = SqliteAssistantOverlayRepository::new(pool);
@@ -540,7 +546,10 @@ async fn get_detail_generated_assistant_exposes_bare_runtime_fields() {
     let resp = fx
         .app
         .clone()
-        .oneshot(get_with_token("/api/assistants/bare:agent-droid?locale=en-US", &fx.token))
+        .oneshot(get_with_token(
+            "/api/assistants/bare:agent-droid?locale=en-US",
+            &fx.token,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
