@@ -189,7 +189,6 @@ impl TeamSessionService {
         caller_slot_id: &str,
         req: crate::session::SpawnAgentRequest,
     ) -> Result<TeamAgent, TeamError> {
-        self.require_active_team_run_for_team_work(team_id).await?;
         let entry = self
             .sessions
             .get(team_id)
@@ -218,6 +217,7 @@ impl TeamSessionService {
         &self,
         team_id: &str,
         user_id: &str,
+        slot_id: String,
         name: String,
         backend: String,
         model: String,
@@ -231,7 +231,7 @@ impl TeamSessionService {
         let _guard = lock.lock().await;
 
         self.provisioner()
-            .persist_spawned_agent(user_id, team_id, name, backend, model, custom_agent_id)
+            .persist_spawned_agent(user_id, team_id, slot_id, name, backend, model, custom_agent_id)
             .await
     }
 }
@@ -300,6 +300,7 @@ mod tests {
             .persist_spawned_agent(
                 &created.id,
                 "user1",
+                "spawn-slot-1".into(),
                 "Spawned".into(),
                 "acp".into(),
                 "claude".into(),

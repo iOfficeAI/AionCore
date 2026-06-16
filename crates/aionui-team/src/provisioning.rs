@@ -36,6 +36,7 @@ struct ProvisionedConversation {
 struct NewAgentProvisioning {
     user_id: String,
     team_id: String,
+    slot_id: String,
     name: String,
     role: TeammateRole,
     backend: String,
@@ -223,6 +224,7 @@ impl TeamAgentProvisioner {
             .provision_new_agent(NewAgentProvisioning {
                 user_id: user_id.to_owned(),
                 team_id: team.id.clone(),
+                slot_id: generate_id(),
                 name: req.name,
                 role,
                 backend: req.backend,
@@ -240,6 +242,7 @@ impl TeamAgentProvisioner {
         &self,
         user_id: &str,
         team_id: &str,
+        slot_id: String,
         name: String,
         backend: String,
         model: String,
@@ -256,6 +259,7 @@ impl TeamAgentProvisioner {
             .provision_new_agent(NewAgentProvisioning {
                 user_id: user_id.to_owned(),
                 team_id: team_id.to_owned(),
+                slot_id,
                 name,
                 role: TeammateRole::Teammate,
                 backend,
@@ -332,12 +336,11 @@ impl TeamAgentProvisioner {
     }
 
     async fn provision_new_agent(&self, input: NewAgentProvisioning) -> Result<TeamAgent, TeamError> {
-        let slot_id = generate_id();
         let conversation = self
             .create_or_adopt_conversation(
                 &input.user_id,
                 &input.team_id,
-                &slot_id,
+                &input.slot_id,
                 input.role,
                 &input.name,
                 &input.backend,
@@ -348,7 +351,7 @@ impl TeamAgentProvisioner {
             )
             .await?;
         Ok(TeamAgent {
-            slot_id,
+            slot_id: input.slot_id,
             name: input.name,
             role: input.role,
             conversation_id: conversation.conversation_id,

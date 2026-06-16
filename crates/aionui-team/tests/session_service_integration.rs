@@ -570,6 +570,8 @@ struct FullMockTeamRepo {
     inner: MockTeamRepo,
     teams: std::sync::Mutex<Vec<aionui_db::models::TeamRow>>,
     fail_workspace_update: std::sync::Mutex<bool>,
+    fail_agent_update: std::sync::Mutex<bool>,
+    fail_message_writes: std::sync::Mutex<bool>,
 }
 
 impl FullMockTeamRepo {
@@ -578,11 +580,21 @@ impl FullMockTeamRepo {
             inner: MockTeamRepo::new(),
             teams: std::sync::Mutex::new(Vec::new()),
             fail_workspace_update: std::sync::Mutex::new(false),
+            fail_agent_update: std::sync::Mutex::new(false),
+            fail_message_writes: std::sync::Mutex::new(false),
         }
     }
 
     fn fail_workspace_update(&self) {
         *self.fail_workspace_update.lock().unwrap() = true;
+    }
+
+    fn fail_agent_updates(&self) {
+        *self.fail_agent_update.lock().unwrap() = true;
+    }
+
+    fn fail_message_writes(&self) {
+        *self.fail_message_writes.lock().unwrap() = true;
     }
 }
 
@@ -612,6 +624,9 @@ impl ITeamRepository for FullMockTeamRepo {
         if params.workspace.is_some() && *self.fail_workspace_update.lock().unwrap() {
             return Err(DbError::Init("forced workspace writeback failure".into()));
         }
+        if params.agents.is_some() && *self.fail_agent_update.lock().unwrap() {
+            return Err(DbError::Init("forced agent update failure".into()));
+        }
         let mut teams = self.teams.lock().unwrap();
         let team = teams
             .iter_mut()
@@ -638,6 +653,9 @@ impl ITeamRepository for FullMockTeamRepo {
     }
 
     async fn write_message(&self, row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
+        if *self.fail_message_writes.lock().unwrap() {
+            return Err(DbError::Init("forced mailbox write failure".into()));
+        }
         self.inner.write_message(row).await
     }
     async fn read_unread_and_mark(
@@ -2338,6 +2356,94 @@ async fn spawn_agent_in_session_rejects_without_active_team_run_before_persistin
         after.agents.len(),
         created.agents.len(),
         "failed spawn must not persist a partial teammate"
+    );
+}
+
+#[tokio::test]
+async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
+    let (svc, team_repo, _, _) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.send_message("user1", &created.id, "start active run", None)
+        .await
+        .expect("active run");
+    team_repo.fail_agent_updates();
+
+    let lead_slot_id = created.lead_agent_id.clone().unwrap();
+    let req = SpawnAgentRequest {
+        name: "Helper".into(),
+        agent_type: Some("claude".into()),
+        custom_agent_id: None,
+        model: Some("claude-sonnet-4".into()),
+    };
+
+    let err = svc
+        .spawn_agent_in_session(&created.id, &lead_slot_id, req)
+        .await
+        .expect_err("forced agent persistence failure should fail spawn");
+    assert!(err.to_string().contains("forced agent update failure"));
+
+    let after = svc.get_team("user1", &created.id).await.unwrap();
+    assert!(
+        after.agents.iter().all(|agent| agent.name != "Helper"),
+        "failed spawn must not persist helper after aborted spawn lease"
+    );
+}
+
+#[tokio::test]
+async fn spawn_agent_in_session_compensates_when_welcome_mailbox_write_fails() {
+    let (svc, team_repo, _, _) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.send_message("user1", &created.id, "start active run", None)
+        .await
+        .expect("active run");
+    team_repo.fail_message_writes();
+
+    let lead_slot_id = created.lead_agent_id.clone().unwrap();
+    let req = SpawnAgentRequest {
+        name: "Helper".into(),
+        agent_type: Some("claude".into()),
+        custom_agent_id: None,
+        model: Some("claude-sonnet-4".into()),
+    };
+
+    let err = svc
+        .spawn_agent_in_session(&created.id, &lead_slot_id, req)
+        .await
+        .expect_err("welcome mailbox write failure should fail spawn");
+    assert!(err.to_string().contains("forced mailbox write failure"));
+
+    let after = svc.get_team("user1", &created.id).await.unwrap();
+    assert!(
+        after.agents.iter().all(|agent| agent.name != "Helper"),
+        "compensation must remove persisted helper after welcome write failure"
     );
 }
 

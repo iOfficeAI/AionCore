@@ -3,7 +3,7 @@ use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{TeamRunAckResponse, TeamRunTargetRole};
-use aionui_common::AgentKillReason;
+use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
 use tracing::{info, warn};
@@ -1105,16 +1105,40 @@ impl TeamSession {
                 .await
                 .unwrap_or_else(|| caller.model.clone()),
         };
-        let new_agent = service
+        let new_slot_id = generate_id();
+        let outcome = self
+            .team_run_manager
+            .acquire_run_scoped_wake(
+                &new_slot_id,
+                TeamRunTargetRole::Teammate,
+                TeamWakeSource::SpawnWelcome,
+            )
+            .await?;
+        let TeamRunWakeAcquireOutcome::Accepted(lease) = outcome else {
+            return Err(TeamError::InvalidRequest("spawn welcome wake was suppressed".into()));
+        };
+
+        let new_agent = match service
             .persist_spawned_agent(
                 &self.team.id,
                 &self.user_id,
+                new_slot_id.clone(),
                 requested_name,
                 backend,
                 model,
                 req.custom_agent_id.clone(),
             )
-            .await?;
+            .await
+        {
+            Ok(agent) => agent,
+            Err(err) => {
+                let _ = self
+                    .team_run_manager
+                    .abort_operation_lease(&lease.lease_id, "spawn_persistence_failed")
+                    .await;
+                return Err(err);
+            }
+        };
 
         // Step 5: attach to the in-memory scheduler so wake-from-lead finds
         // the new slot immediately.
@@ -1123,7 +1147,7 @@ impl TeamSession {
         // Step 6: welcome message. The mailbox write is the source of truth —
         // if the wake never fires (e.g. warmup raced), the next caller-triggered
         // wake will still drain this entry.
-        let welcome_message = self
+        let welcome_message = match self
             .mailbox
             .write(
                 &self.team.id,
@@ -1133,21 +1157,34 @@ impl TeamSession {
                 "You have been spawned as a teammate. Read your mailbox and wait for instructions.",
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(message) => message,
+            Err(err) => {
+                if let Some(service) = self.service.upgrade() {
+                    let _ = service
+                        .remove_agent(&self.user_id, &self.team.id, &new_agent.slot_id)
+                        .await;
+                } else {
+                    let _ = self.scheduler.remove_agent(&new_agent.slot_id).await;
+                }
+                let _ = self
+                    .team_run_manager
+                    .abort_operation_lease(&lease.lease_id, "spawn_welcome_mailbox_write_failed")
+                    .await;
+                return Err(err);
+            }
+        };
 
-        let spawn_welcome_role = self
-            .reserve_wake_for_team_work(
-                &new_agent.slot_id,
-                TeamWakeSource::SpawnWelcome,
-                Some(welcome_message.id),
-            )
-            .await?
-            .ok_or_else(|| TeamError::InvalidRequest("spawn welcome wake was suppressed".into()))?;
+        self.team_run_manager
+            .commit_operation_lease(&lease.lease_id, Some(welcome_message.id.clone()))
+            .await?;
+        let spawn_welcome_role = lease.role.clone();
         info!(
             team_id = %self.team.id,
             slot_id = %new_agent.slot_id,
             target_role = ?spawn_welcome_role,
-            wake_source = %TeamWakeSource::SpawnWelcome,
+            wake_source = %lease.wake_source,
             "spawn welcome wake reserved before runtime attach"
         );
 
