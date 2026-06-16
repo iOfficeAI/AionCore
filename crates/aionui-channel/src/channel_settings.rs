@@ -88,11 +88,7 @@ impl ChannelSettingsService {
             }
 
             if let Some(at) = setting.agent_type.as_deref() {
-                let backend = if at == "acp" {
-                    setting.backend.clone()
-                } else {
-                    None
-                };
+                let backend = if at == "acp" { setting.backend.clone() } else { None };
 
                 debug!(platform = %platform, agent_type = %at, backend = ?backend, "resolved channel agent config (new format)");
 
@@ -181,7 +177,8 @@ impl ChannelSettingsService {
         platform: PluginType,
         assistant: &ChannelAssistantSetting,
     ) -> Result<(), ChannelError> {
-        let payload = serde_json::to_string(assistant).map_err(ChannelError::Json)?;
+        let normalized = normalize_channel_assistant_setting_for_write(assistant);
+        let payload = serde_json::to_string(&normalized).map_err(ChannelError::Json)?;
         let key = agent_key(platform);
         self.pref_repo.upsert_batch(&[(&key, payload.as_str())]).await?;
         Ok(())
@@ -259,6 +256,29 @@ fn parse_channel_assistant_setting(value: &str) -> Option<ChannelAssistantSettin
         agent_type: parsed["agent_type"].as_str().map(|s| s.to_owned()),
         name: parsed["name"].as_str().map(|s| s.to_owned()),
     })
+}
+
+fn normalize_channel_assistant_setting_for_write(assistant: &ChannelAssistantSetting) -> ChannelAssistantSetting {
+    let assistant_id = assistant
+        .assistant_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            assistant
+                .custom_agent_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+        });
+
+    ChannelAssistantSetting {
+        assistant_id,
+        custom_agent_id: None,
+        backend: None,
+        agent_type: None,
+        name: assistant.name.clone(),
+    }
 }
 
 fn parse_channel_model_setting(value: &str) -> Option<ChannelDefaultModelSetting> {
@@ -392,11 +412,7 @@ mod tests {
         }
 
         async fn get_by_definition_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
-            Ok(self
-                .rows
-                .iter()
-                .find(|row| row.definition_id == definition_id)
-                .cloned())
+            Ok(self.rows.iter().find(|row| row.definition_id == definition_id).cloned())
         }
 
         async fn get_by_source_ref(
@@ -430,11 +446,7 @@ mod tests {
     #[async_trait::async_trait]
     impl IAssistantOverlayRepository for MockAssistantOverlayRepo {
         async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
-            Ok(self
-                .rows
-                .iter()
-                .find(|row| row.definition_id == definition_id)
-                .cloned())
+            Ok(self.rows.iter().find(|row| row.definition_id == definition_id).cloned())
         }
 
         async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
@@ -624,8 +636,7 @@ mod tests {
         let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(MockAssistantDefinitionRepo {
             rows: vec![make_definition("bare-claude", "claude")],
         });
-        let overlay_repo: Arc<dyn IAssistantOverlayRepository> =
-            Arc::new(MockAssistantOverlayRepo { rows: vec![] });
+        let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
         let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
 
         let config = svc.get_agent_config(PluginType::Telegram).await.unwrap();
@@ -687,6 +698,62 @@ mod tests {
 
         let config = svc.get_model_config(PluginType::Telegram).await.unwrap();
         assert!(config.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_assistant_setting_persists_assistant_only_payload() {
+        let repo = Arc::new(MockPrefRepo::new());
+        let svc = ChannelSettingsService::new(repo.clone());
+
+        svc.set_assistant_setting(
+            PluginType::Telegram,
+            &ChannelAssistantSetting {
+                assistant_id: Some("assistant-1".into()),
+                custom_agent_id: Some("legacy-custom".into()),
+                backend: Some("claude".into()),
+                agent_type: Some("acp".into()),
+                name: Some("Claude".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = repo.get_by_keys(&["assistant.telegram.agent"]).await.unwrap();
+        let payload = serde_json::from_str::<serde_json::Value>(&stored[0].value).unwrap();
+
+        assert_eq!(payload["assistant_id"], "assistant-1");
+        assert_eq!(payload["name"], "Claude");
+        assert!(payload.get("custom_agent_id").is_none());
+        assert!(payload.get("backend").is_none());
+        assert!(payload.get("agent_type").is_none());
+    }
+
+    #[tokio::test]
+    async fn set_assistant_setting_promotes_legacy_custom_agent_id() {
+        let repo = Arc::new(MockPrefRepo::new());
+        let svc = ChannelSettingsService::new(repo.clone());
+
+        svc.set_assistant_setting(
+            PluginType::Lark,
+            &ChannelAssistantSetting {
+                assistant_id: None,
+                custom_agent_id: Some("legacy-custom".into()),
+                backend: Some("codex".into()),
+                agent_type: Some("acp".into()),
+                name: Some("Codex".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = repo.get_by_keys(&["assistant.lark.agent"]).await.unwrap();
+        let payload = serde_json::from_str::<serde_json::Value>(&stored[0].value).unwrap();
+
+        assert_eq!(payload["assistant_id"], "legacy-custom");
+        assert_eq!(payload["name"], "Codex");
+        assert!(payload.get("custom_agent_id").is_none());
+        assert!(payload.get("backend").is_none());
+        assert!(payload.get("agent_type").is_none());
     }
 
     // ── resolved_model_to_provider ────────────────────────────────────
