@@ -1445,6 +1445,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_acp_image_tool_call_update_persists_finish_without_base64() {
+        use aionui_ai_agent::protocol::events::tool_call::{
+            AcpToolCallEventData, AcpToolCallKind, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
+            AcpToolCallUpdateData,
+        };
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
+            session_id: "sess-1".into(),
+            update: AcpToolCallUpdateData {
+                session_update: AcpToolCallSessionUpdateKind::ToolCall,
+                tool_call_id: "ig_test_image".into(),
+                status: Some(AcpToolCallStatus::InProgress),
+                title: Some("Image generation".into()),
+                kind: Some(AcpToolCallKind::Execute),
+                raw_input: Some(json!({"prompt": "一只小猫"})),
+                raw_output: None,
+                content: None,
+                locations: None,
+            },
+            meta: None,
+        }))
+        .unwrap();
+
+        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
+            session_id: "sess-1".into(),
+            update: AcpToolCallUpdateData {
+                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
+                tool_call_id: "ig_test_image".into(),
+                status: Some(AcpToolCallStatus::Completed),
+                title: None,
+                kind: Some(AcpToolCallKind::Execute),
+                raw_input: None,
+                raw_output: Some(json!({
+                    "saved_path": "/Users/test/.codex/generated_images/session/ig_test_image.png",
+                    "image": {
+                        "path": "/Users/test/.codex/generated_images/session/ig_test_image.png",
+                        "mime_type": "image/png",
+                        "source": "codex_image_generation"
+                    },
+                    "result_omitted": true,
+                    "result_omitted_reason": "image_base64",
+                    "result_bytes": 131_083
+                })),
+                content: None,
+                locations: None,
+            },
+            meta: None,
+        }))
+        .unwrap();
+
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let updates = repo.take_updates();
+        let acp_update = updates.iter().find(|(id, _)| id == "ig_test_image");
+        assert!(acp_update.is_some());
+        let (_, upd) = acp_update.unwrap();
+        assert_eq!(upd.status, Some(Some("finish".to_owned())));
+
+        let content = upd.content.as_deref().unwrap();
+        assert!(!content.contains("iVBORw0KGgo"));
+        assert!(content.contains("result_omitted"));
+
+        let merged: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_eq!(
+            merged["update"]["raw_output"]["image"]["path"],
+            "/Users/test/.codex/generated_images/session/ig_test_image.png"
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_group_persists_message() {
         use aionui_ai_agent::protocol::events::tool_call::{ToolCallStatus, ToolGroupEntry};
 

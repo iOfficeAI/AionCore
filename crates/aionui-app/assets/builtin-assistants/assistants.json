@@ -1045,6 +1045,65 @@
         ]
       },
       "models": []
+    },
+    {
+      "id": "aionui-assistant",
+      "name": "AionUi Assistant",
+      "name_i18n": {
+        "en-US": "AionUi Assistant",
+        "zh-CN": "AionUi 助手",
+        "ru-RU": "Помощник AionUi",
+        "uk-UA": "Помічник AionUi"
+      },
+      "description": "Configure and diagnose AionUi itself: create and edit assistants, attach skills, manage MCP servers and LLM providers, and troubleshoot stuck conversations, failing models, or scheduled tasks.",
+      "description_i18n": {
+        "en-US": "Configure and diagnose AionUi itself: create and edit assistants, attach skills, manage MCP servers and LLM providers, and troubleshoot stuck conversations, failing models, or scheduled tasks.",
+        "zh-CN": "配置和诊断 AionUi 本身:创建和编辑助手、绑定技能、管理 MCP 服务器与 LLM 模型,排查卡住的会话、失败的模型调用或定时任务。",
+        "ru-RU": "Настройка и диагностика самого AionUi: создание и редактирование ассистентов, подключение навыков, управление серверами MCP и провайдерами LLM, устранение зависших разговоров, сбоев моделей и проблем с задачами по расписанию.",
+        "uk-UA": "Налаштування та діагностика самого AionUi: створення й редагування асистентів, підключення навичок, керування серверами MCP та провайдерами LLM, усунення зависань розмов, збоїв моделей і проблем із запланованими завданнями."
+      },
+      "avatar": "avatars/aionui-assistant.jpg",
+      "preset_agent_type": "aionrs",
+      "enabled_skills": [
+        "aionui-config",
+        "aionui-troubleshooting"
+      ],
+      "custom_skill_names": [],
+      "disabled_builtin_skills": [],
+      "rule_file": "rules/aionui-assistant.{locale}.md",
+      "prompts": [
+        "Add a new LLM provider and API key, then set it as the default model",
+        "A conversation is stuck — please diagnose what's wrong",
+        "Create a new assistant and attach a skill to it",
+        "Something seems off with AionUi — give me an overview of its health"
+      ],
+      "prompts_i18n": {
+        "en-US": [
+          "Add a new LLM provider and API key, then set it as the default model",
+          "A conversation is stuck — please diagnose what's wrong",
+          "Create a new assistant and attach a skill to it",
+          "Something seems off with AionUi — give me an overview of its health"
+        ],
+        "zh-CN": [
+          "添加一个新的 LLM 模型和 API Key,并设为默认模型",
+          "有个会话卡住了,帮我诊断哪里出了问题",
+          "创建一个新助手,并给它绑定一个技能",
+          "AionUi 好像有点不对劲,帮我看看整体健康状况"
+        ],
+        "ru-RU": [
+          "Добавь нового провайдера LLM и API-ключ, затем сделай его моделью по умолчанию",
+          "Разговор завис — пожалуйста, диагностируй, что не так",
+          "Создай нового ассистента и подключи к нему навык",
+          "С AionUi что-то не так — дай обзор его состояния"
+        ],
+        "uk-UA": [
+          "Додай нового провайдера LLM та API-ключ, потім зроби його моделлю за замовчуванням",
+          "Розмова зависла — будь ласка, діагностуй, що не так",
+          "Створи нового асистента й підключи до нього навичку",
+          "З AionUi щось не так — дай огляд його стану"
+        ]
+      },
+      "models": []
     }
   ]
 }
