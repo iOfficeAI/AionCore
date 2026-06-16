@@ -92,38 +92,44 @@ impl CliAgentProcess {
         }
     }
 
-    /// Gracefully terminate the subprocess.
+    /// Gracefully terminate the subprocess **and any descendants in its
+    /// process group**.
     ///
     /// 1. Close stdin
-    /// 2. Wait up to `grace_period` for the process to exit on its own
-    /// 3. If still running after grace period, send SIGKILL
+    /// 2. Wait up to `grace_period` for the leader to exit on its own
+    /// 3. SIGKILL the whole process group regardless of whether the leader
+    ///    has already exited — wrapper CLIs (`npm exec ...`) routinely fork
+    ///    a grandchild (`openclaw-acp`) that survives leader exit, and only
+    ///    a group-wide kill reaps it
     pub async fn kill(&self, grace_period: Duration) -> Result<(), AgentError> {
         // Close stdin first to signal the child
         self.close_stdin().await;
 
-        // Wait for graceful exit within the grace period
+        // Wait up to the grace period for the leader to exit on its own.
+        // Even if it does, we still issue a group-wide SIGKILL below — the
+        // leader exiting tells us nothing about its grandchildren.
         let mut rx = self.exit_rx.clone();
-        let exited = tokio::time::timeout(grace_period, async {
-            // If already exited, return immediately
+        let _ = tokio::time::timeout(grace_period, async {
             if rx.borrow().is_some() {
                 return;
             }
-            // Wait for state change
             let _ = rx.changed().await;
         })
         .await;
 
-        if exited.is_ok() && self.exit_rx.borrow().is_some() {
-            debug!(pid = self.pid, "CLI process exited gracefully");
-            return Ok(());
+        // Always sweep the process group. `force_kill` treats ESRCH as
+        // success, so this is idempotent when the leader (and group) are
+        // already gone.
+        if self.exit_rx.borrow().is_some() {
+            debug!(pid = self.pid, "CLI leader already exited; sweeping process group");
+        } else {
+            warn!(pid = self.pid, "Grace period expired, sending SIGKILL");
         }
-
-        // Force kill
-        warn!(pid = self.pid, "Grace period expired, sending SIGKILL");
         force_kill(self.pid, self.process_group_id)?;
 
         // Wait for the exit monitor to observe process termination so callers
-        // do not race a still-live child after force-kill returns.
+        // do not race a still-live leader after force-kill returns. Skip the
+        // wait if the leader had already exited before our sweep.
         let mut rx = self.exit_rx.clone();
         tokio::time::timeout(Duration::from_secs(5), async {
             if rx.borrow().is_some() {
