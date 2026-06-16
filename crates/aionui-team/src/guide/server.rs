@@ -169,6 +169,14 @@ async fn handle_tool_request(
 // Tool implementations
 // ---------------------------------------------------------------------------
 
+fn build_create_team_handoff_next_step(summary: &str) -> String {
+    format!(
+        "Team was created and the Team page is open. End this solo turn now. \
+         Do not call any `team_*` tools from this solo turn. Tell the user to continue from the Team page; \
+         their next message there will start the first formal `TeamRun`. Task summary: {summary}"
+    )
+}
+
 async fn exec_create_team(
     request_body: &serde_json::Value,
     args: &serde_json::Value,
@@ -268,11 +276,7 @@ async fn exec_create_team(
         "name": team.name,
         "route": route,
         "status": "team_created",
-        "next_step": format!(
-            "You are now the team Leader. Your team tools (team_spawn_agent, team_send_message, etc.) are now active. \
-             Immediately proceed to spawn teammates as planned. Task summary: {}",
-            params.summary
-        )
+        "next_step": build_create_team_handoff_next_step(&params.summary)
     })
 }
 
@@ -383,6 +387,29 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[test]
+    fn create_team_next_step_tells_solo_agent_to_end_turn() {
+        let next_step = build_create_team_handoff_next_step("Build a research and implementation team");
+
+        assert!(next_step.contains("Team was created and the Team page is open."));
+        assert!(next_step.contains("End this solo turn now."));
+        assert!(next_step.contains("Do not call any `team_*` tools from this solo turn."));
+        assert!(next_step.contains("their next message there will start the first formal `TeamRun`."));
+        assert!(next_step.contains("Task summary: Build a research and implementation team"));
+        assert!(
+            !next_step.contains("team_spawn_agent"),
+            "next_step must not name spawn as an immediately available action"
+        );
+        assert!(
+            !next_step.contains("team_send_message"),
+            "next_step must not name send_message as an immediately available action"
+        );
+        assert!(
+            !next_step.contains("tools are now active"),
+            "next_step must not claim Team tools are active immediately after creation"
+        );
+    }
 
     #[tokio::test]
     async fn start_returns_positive_port_and_token() {
