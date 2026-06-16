@@ -134,7 +134,7 @@ Step 10: 分配任务 → team_send_message
 
 ```
 1. 扫描 preset 的描述和 skills
-   └─ 明确匹配 → 直接 team_spawn_agent(custom_agent_id=preset_id)
+   └─ 明确匹配 → 直接 team_spawn_agent(assistant_id=preset_id)
 2. 两个以上可能匹配
    └─ 调 team_describe_assistant 对比后选最佳
 3. 无匹配
@@ -342,8 +342,8 @@ The new agent will be created and added to the team. You can then assign tasks a
 **Schema**：
 ```
 name: string — Name for the new teammate (e.g., "researcher", "developer", "tester")
-agent_type: string (optional) — Agent type/backend to use for the new teammate. Must be one of the types listed in "Available Agent Types for Spawning". Defaults to the leader type when omitted. Ignored when custom_agent_id is set.
-custom_agent_id: string (optional) — Preset assistant ID from "Available Preset Assistants for Spawning" (e.g., "builtin-word-creator"). When set, the teammate inherits that preset's rules and skills; agent_type is derived from the preset.
+agent_type: string (optional) — Agent type/backend to use for the new teammate. Must be one of the types listed in "Available Agent Types for Spawning". Defaults to the leader type when omitted. Ignored when assistant_id is set.
+assistant_id: string (optional) — Preset assistant ID from "Available Preset Assistants for Spawning" (e.g., "builtin-word-creator"). When set, the teammate inherits that preset's rules and skills; agent_type is derived from the preset.
 model: string (optional) — Model ID to use for this agent (e.g. "claude-sonnet-4", "gemini-2.5-pro"). Defaults to the backend's preferred model when omitted.
 ```
 
@@ -452,12 +452,12 @@ judge whether it fits the user's request. Use this when two or more presets look
 relevant from the one-line catalog in your system prompt.
 
 Only works on preset assistants listed in "Available Preset Assistants for Spawning".
-After confirming a match, call team_spawn_agent with the same custom_agent_id.
+After confirming a match, call team_spawn_agent with the same assistant_id.
 ```
 
 **Schema**：
 ```
-custom_agent_id: string — The preset assistant ID from the "Available Preset Assistants" catalog (e.g., "word-creator").
+assistant_id: string — The preset assistant ID from the "Available Preset Assistants" catalog (e.g., "word-creator").
 locale: string (optional) — Locale like "zh-CN" or "en-US". Defaults to the user's current UI language when omitted.
 ```
 

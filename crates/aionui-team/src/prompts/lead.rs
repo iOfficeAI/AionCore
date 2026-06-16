@@ -32,11 +32,11 @@ pub struct AvailableAgentType {
     pub display_name: String,
 }
 
-/// A preset assistant the leader may spawn via `custom_agent_id`.
+/// A preset assistant the leader may spawn via `assistant_id`.
 /// Phase1 shape per interface-contracts §5 (lines 212-218).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableAssistant {
-    pub custom_agent_id: String,
+    pub assistant_id: String,
     pub name: String,
     pub backend: String,
     pub description: String,
@@ -151,7 +151,7 @@ fn render_available_assistants_section(assistants: &[AvailableAssistant]) -> Str
         let _ = write!(
             out,
             "- `{}` ({}, backend: {}){}{}",
-            a.custom_agent_id, a.name, a.backend, desc, skills,
+            a.assistant_id, a.name, a.backend, desc, skills,
         );
     }
     out.push_str(
@@ -164,7 +164,7 @@ fn render_available_assistants_section(assistants: &[AvailableAssistant]) -> Str
          fit.\n\
          3. If no preset matches the task, fall back to a generic CLI agent from the \
          \"Available Agent Types\" section.\n\n\
-         Pass the preset's ID as `custom_agent_id` to `team_spawn_agent`. The `agent_type` is \
+         Pass the preset's ID as `assistant_id` to `team_spawn_agent`. The `agent_type` is \
          derived from the preset's backend and does not need to be specified.",
     );
     out
@@ -230,7 +230,7 @@ mod tests {
             display_name: "general-purpose AI assistant".into(),
         }];
         let assistants = vec![AvailableAssistant {
-            custom_agent_id: "word-creator".into(),
+            assistant_id: "word-creator".into(),
             name: "Word Creator".into(),
             backend: "claude".into(),
             description: "Drafts Word documents".into(),
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn available_assistants_section_includes_skills_and_how_to_pick() {
         let got = render_available_assistants_section(&[AvailableAssistant {
-            custom_agent_id: "word-creator".into(),
+            assistant_id: "word-creator".into(),
             name: "Word Creator".into(),
             backend: "claude".into(),
             description: "Drafts Word documents".into(),
@@ -336,6 +336,8 @@ mod tests {
         assert!(got.contains("- `word-creator` (Word Creator, backend: claude) — Drafts Word documents"));
         assert!(got.contains("skills: docx, formatting"));
         assert!(got.contains("### How to pick a preset"));
+        assert!(got.contains("Pass the preset's ID as `assistant_id`"));
+        assert!(!got.contains("custom_agent_id"));
     }
 
     #[test]
