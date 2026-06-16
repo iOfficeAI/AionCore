@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
-use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
+use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, SendMessageRequest};
 use aionui_common::{AgentType, ConversationSource};
 use aionui_conversation::ConversationService;
 use aionui_db::models::AssistantSessionRow;
@@ -128,6 +128,7 @@ impl ChannelMessageService {
         let agent_type = parse_agent_type(&session.agent_type)?;
 
         let agent_config = self.settings.get_agent_config(platform).await?;
+        let assistant_setting = self.settings.get_assistant_setting(platform).await?;
         let model_config = self.settings.get_model_config(platform).await?;
         let model = resolved_model_to_provider(model_config.as_ref());
         let mut extra = Self::build_channel_extra(agent_config.backend.as_deref());
@@ -150,7 +151,13 @@ impl ChannelMessageService {
             r#type: agent_type,
             name: Some(name),
             model: top_level_model,
-            assistant: None,
+            assistant: assistant_setting
+                .and_then(|setting| setting.assistant_id)
+                .map(|assistant_id| AssistantConversationRequest {
+                    id: assistant_id,
+                    locale: None,
+                    conversation_overrides: None,
+                }),
             source: Some(source),
             channel_chat_id: session.chat_id.clone(),
             extra,

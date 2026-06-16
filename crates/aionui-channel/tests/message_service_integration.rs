@@ -12,9 +12,12 @@ use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs}
 use aionui_conversation::ConversationService;
 use aionui_conversation::skill_resolver::{ResolvedAgentSkill, SkillResolver};
 use aionui_db::models::AssistantSessionRow;
+use aionui_db::models::UpsertAssistantDefinitionParams;
 use aionui_db::{
-    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteClientPreferenceRepository,
-    SqliteConversationRepository, init_database_memory,
+    IAssistantDefinitionRepository, IClientPreferenceRepository, IConversationRepository, SqliteAcpSessionRepository,
+    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantPreferenceRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
+    init_database_memory,
 };
 use aionui_realtime::EventBroadcaster;
 use async_trait::async_trait;
@@ -177,6 +180,44 @@ impl IWorkerTaskManager for RecordingTaskManager {
     }
 }
 
+fn bare_assistant_definition_params<'a>(
+    definition_id: &'a str,
+    assistant_key: &'a str,
+    agent_backend: &'a str,
+) -> UpsertAssistantDefinitionParams<'a> {
+    UpsertAssistantDefinitionParams {
+        definition_id,
+        assistant_key,
+        source: "generated",
+        owner_type: "system",
+        source_ref: Some(assistant_key),
+        source_version: None,
+        source_hash: None,
+        name: assistant_key,
+        name_i18n: "{}",
+        description: Some("Channel bare assistant"),
+        description_i18n: "{}",
+        avatar_type: "emoji",
+        avatar_value: Some("🤖"),
+        agent_backend,
+        rule_resource_type: "inline",
+        rule_resource_ref: None,
+        rule_inline_content: Some(""),
+        recommended_prompts: "[]",
+        recommended_prompts_i18n: "{}",
+        default_model_mode: "auto",
+        default_model_value: None,
+        default_permission_mode: "auto",
+        default_permission_value: None,
+        default_skills_mode: "auto",
+        default_skill_ids: "[]",
+        custom_skill_names: "[]",
+        default_disabled_builtin_skill_ids: "[]",
+        default_mcps_mode: "auto",
+        default_mcp_ids: "[]",
+    }
+}
+
 #[tokio::test]
 async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
     let db = init_database_memory().await.unwrap();
@@ -228,4 +269,82 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
         );
         assert!(task_manager.get_task(&result.conversation_id).is_some());
     }
+}
+
+#[tokio::test]
+async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool().clone();
+
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::new());
+    let conversation_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
+    let conversation_repo_trait: Arc<dyn IConversationRepository> = conversation_repo.clone();
+    let conversation_svc = Arc::new(ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(TestBroadcaster::new()),
+        Arc::new(NoopSkillResolver),
+        Arc::clone(&task_manager),
+        conversation_repo_trait,
+        Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
+        Arc::new(SqliteAcpSessionRepository::new(pool.clone())),
+    ));
+
+    let pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
+    let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
+    let overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
+    let assistant_preference_repo = Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone()));
+    conversation_svc.with_assistant_definition_repo(definition_repo.clone());
+    conversation_svc.with_assistant_state_repo(overlay_repo.clone());
+    conversation_svc.with_assistant_preference_repo(assistant_preference_repo);
+    definition_repo
+        .upsert(&bare_assistant_definition_params(
+            "asstdef-channel-claude",
+            "bare-claude",
+            "claude",
+        ))
+        .await
+        .unwrap();
+    pref_repo
+        .upsert_batch(&[(
+            "assistant.telegram.agent",
+            r#"{"assistant_id":"bare-claude","name":"Claude"}"#,
+        )])
+        .await
+        .unwrap();
+
+    let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
+    let message_svc = ChannelMessageService::new(
+        conversation_svc,
+        Arc::clone(&task_manager),
+        settings,
+        "system_default_user".to_owned(),
+    );
+
+    let session = AssistantSessionRow {
+        id: "session-assisted".to_owned(),
+        user_id: "channel-user-1".to_owned(),
+        agent_type: "acp".to_owned(),
+        conversation_id: None,
+        workspace: None,
+        chat_id: Some("7088048016".to_owned()),
+        created_at: 1,
+        last_activity: 1,
+    };
+
+    let result = message_svc
+        .send_to_agent(&session, "hello", PluginType::Telegram)
+        .await
+        .unwrap();
+
+    let snapshot = conversation_repo
+        .get_assistant_snapshot(&result.conversation_id)
+        .await
+        .unwrap();
+    assert!(
+        snapshot.is_some(),
+        "channel-created conversation should persist an assistant snapshot when the platform is bound to an assistant"
+    );
+    let snapshot = snapshot.unwrap();
+    assert_eq!(snapshot.assistant_key, "bare-claude");
+    assert_eq!(snapshot.agent_backend, "claude");
 }

@@ -172,6 +172,21 @@ impl ChannelSettingsService {
         })
     }
 
+    pub async fn get_assistant_setting(
+        &self,
+        platform: PluginType,
+    ) -> Result<Option<ChannelAssistantSetting>, ChannelError> {
+        let key = agent_key(platform);
+        let prefs = self.pref_repo.get_by_keys(&[&key]).await?;
+
+        let Some(pref) = prefs.into_iter().next() else {
+            return Ok(None);
+        };
+
+        Ok(parse_channel_assistant_setting(&pref.value)
+            .map(|assistant| normalize_channel_assistant_setting_for_write(&assistant)))
+    }
+
     pub async fn set_assistant_setting(
         &self,
         platform: PluginType,
