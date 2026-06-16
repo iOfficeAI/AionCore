@@ -40,6 +40,8 @@ pub struct StartingChildReservation {
     pub slot_id: String,
     pub role: TeamRunTargetRole,
     pub conversation_id: String,
+    pub(crate) wake_source: TeamWakeSource,
+    pub(crate) message_id: Option<String>,
     pub state: StartingReservationState,
 }
 
@@ -525,6 +527,8 @@ impl TeamRunManager {
             slot_id: pending.slot_id.clone(),
             role,
             conversation_id: conversation_id.to_owned(),
+            wake_source: pending.source,
+            message_id: pending.message_id.clone(),
             state: StartingReservationState::Starting,
         };
         run.starting_reservations
@@ -546,6 +550,50 @@ impl TeamRunManager {
         drop(guard);
         self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
         Some(reservation)
+    }
+
+    pub async fn retry_child_start_later(&self, reservation_id: &str, reason: &str) -> Option<TeamRunPayload> {
+        let mut guard = self.state.lock().await;
+        let run = guard.as_mut().filter(|run| run.is_active())?;
+        let reservation = match run.starting_reservations.remove(reservation_id) {
+            Some(reservation) => reservation,
+            None => {
+                warn!(
+                    team_id = %self.team_id,
+                    reservation_id,
+                    error = %reason,
+                    "team_run reservation retry ignored because reservation is missing"
+                );
+                return None;
+            }
+        };
+
+        let pending = PendingWake {
+            slot_id: reservation.slot_id.clone(),
+            role: reservation.role,
+            source: reservation.wake_source,
+            message_id: reservation.message_id.clone(),
+        };
+        run.pending_wakes
+            .entry(reservation.slot_id.clone())
+            .or_default()
+            .push_front(pending);
+        let payload = run.payload();
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %run.team_run_id,
+            reservation_id = %reservation.reservation_id,
+            slot_id = %reservation.slot_id,
+            error = %reason,
+            slot_pending_wake_count = run.pending_wake_count_for_slot(&reservation.slot_id),
+            pending_wake_count = payload.pending_wake_count,
+            starting_child_count = payload.starting_child_count,
+            active_child_count = payload.active_child_count,
+            "team_run reservation deferred for retry"
+        );
+        drop(guard);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload.clone());
+        Some(payload)
     }
 
     pub(crate) async fn peek_next_pending_wake(&self, slot_id: &str) -> Option<PendingWakeView> {

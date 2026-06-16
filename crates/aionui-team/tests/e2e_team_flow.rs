@@ -21,6 +21,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -117,6 +118,50 @@ impl AgentTurnExecutionPort for ErrorBeforeStartTurnPort {
     async fn run_agent_turn(&self, _request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
         Err(AgentTurnExecutionError::Failed {
             reason: "failed before start".into(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct SkippedOnceThenSuccessTurnPort {
+    attempts: AtomicUsize,
+    requests: Arc<Mutex<Vec<AgentTurnRequest>>>,
+}
+
+impl SkippedOnceThenSuccessTurnPort {
+    fn requests(&self) -> Arc<Mutex<Vec<AgentTurnRequest>>> {
+        self.requests.clone()
+    }
+}
+
+#[async_trait]
+impl AgentTurnExecutionPort for SkippedOnceThenSuccessTurnPort {
+    async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().unwrap().push(request.clone());
+        if attempt == 0 {
+            return Err(AgentTurnExecutionError::Skipped {
+                reason: format!("conversation {} is already running", request.conversation_id),
+            });
+        }
+
+        let turn_id = format!("turn-retry-{attempt}");
+        if let (Some(team_run_id), Some(on_started)) = (request.team_run_id.clone(), request.on_started.as_ref()) {
+            on_started(AgentTurnStarted {
+                team_run_id,
+                slot_id: request.slot_id.clone(),
+                role: request.role.clone(),
+                conversation_id: request.conversation_id.clone(),
+                turn_id: turn_id.clone(),
+            })
+            .await;
+        }
+
+        Ok(AgentTurnOutcome {
+            conversation_id: request.conversation_id,
+            turn_id,
+            status: AgentTurnStatus::Completed,
+            runtime: None,
         })
     }
 }
@@ -696,6 +741,16 @@ async fn wait_for_event(broadcaster: &RecordingBroadcaster, name: &str) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("timed out waiting for event {name}");
+}
+
+async fn wait_for_turn_request_count(requests: &Arc<Mutex<Vec<AgentTurnRequest>>>, count: usize) {
+    for _ in 0..100 {
+        if requests.lock().unwrap().len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {count} turn requests");
 }
 
 fn register_test_event_loops(session: &Arc<TeamSession>) {
@@ -1589,6 +1644,39 @@ async fn s9b_event_loop_fails_run_when_turn_errors_before_started() {
 
     wait_for_event(&broadcaster, "team.runFailed").await;
     assert_eq!(session.team_run_manager().active_run_id().await, None);
+
+    session.stop();
+}
+
+#[tokio::test]
+async fn s9b_retryable_busy_before_start_retains_team_run_for_retry() {
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let turn_port = Arc::new(SkippedOnceThenSuccessTurnPort::default());
+    let requests = turn_port.requests();
+    let session =
+        setup_session_with_runtime_ports(turn_port, Arc::new(NoopCancellationPort), broadcaster.clone()).await;
+
+    session
+        .send_message("user input to team", None)
+        .await
+        .expect("send_message must succeed");
+
+    wait_for_turn_request_count(&requests, 2).await;
+    let request_log = requests.lock().unwrap();
+    let first_team_run_id = request_log[0]
+        .team_run_id
+        .as_deref()
+        .expect("first attempt should belong to TeamRun");
+    let second_team_run_id = request_log[1]
+        .team_run_id
+        .as_deref()
+        .expect("retry must still belong to TeamRun");
+    assert_eq!(second_team_run_id, first_team_run_id);
+    assert_eq!(
+        session.team_run_manager().active_run_id().await,
+        None,
+        "run should complete after the retry succeeds"
+    );
 
     session.stop();
 }
