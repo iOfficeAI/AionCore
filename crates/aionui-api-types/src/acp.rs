@@ -19,22 +19,6 @@ pub struct DetectCliResponse {
     pub path: Option<String>,
 }
 
-/// Request body for ACP health check.
-#[derive(Debug, Deserialize)]
-pub struct AcpHealthCheckRequest {
-    pub backend: String,
-}
-
-/// Response for ACP health check.
-#[derive(Debug, Serialize)]
-pub struct AcpHealthCheckResponse {
-    pub available: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latency: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 /// Response for ACP environment variables.
 #[derive(Debug, Serialize)]
 pub struct AcpEnvResponse {
@@ -232,31 +216,6 @@ mod tests {
         let resp = DetectCliResponse { path: None };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("path").is_none());
-    }
-
-    #[test]
-    fn health_check_response_available() {
-        let resp = AcpHealthCheckResponse {
-            available: true,
-            latency: Some(120),
-            error: None,
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["available"], true);
-        assert_eq!(json["latency"], 120);
-        assert!(json.get("error").is_none());
-    }
-
-    #[test]
-    fn health_check_response_unavailable() {
-        let resp = AcpHealthCheckResponse {
-            available: false,
-            latency: None,
-            error: Some("CLI not found".into()),
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["available"], false);
-        assert_eq!(json["error"], "CLI not found");
     }
 
     #[test]

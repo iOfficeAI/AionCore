@@ -2,30 +2,33 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::registry::AgentRegistry;
-use aionui_api_types::{AcpHealthCheckResponse, AgentMetadata};
+use aionui_api_types::AgentMetadata;
 use aionui_runtime::resolve_command_path;
+
+pub(crate) struct CliHealthCheckResult {
+    pub available: bool,
+    pub error: Option<String>,
+}
 
 /// Perform a health check for an ACP backend.
 ///
-/// Checks CLI availability and measures detection latency.
-pub(crate) async fn health_check(registry: &Arc<AgentRegistry>, backend: &str) -> AcpHealthCheckResponse {
+/// Checks CLI availability and returns an availability/error pair.
+pub(crate) async fn health_check(registry: &Arc<AgentRegistry>, backend: &str) -> CliHealthCheckResult {
     let start = Instant::now();
 
     let Some(meta) = registry.find_builtin_by_backend(backend).await else {
-        return AcpHealthCheckResponse {
+        return CliHealthCheckResult {
             available: false,
-            latency: None,
             error: Some(format!("No agent_metadata row for backend '{backend}'")),
         };
     };
 
     let path = probe_command(&meta);
-    let latency_ms = start.elapsed().as_millis() as u64;
+    let _latency_ms = start.elapsed().as_millis() as u64;
     let available = path.is_some();
 
-    AcpHealthCheckResponse {
+    CliHealthCheckResult {
         available,
-        latency: Some(latency_ms),
         error: if available {
             None
         } else {

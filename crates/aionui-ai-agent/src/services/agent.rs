@@ -15,10 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_api_types::{
-    AcpHealthCheckRequest, AcpHealthCheckResponse, AgentManagementRow, AgentMetadata, ProviderHealthCheckRequest,
-    ProviderHealthCheckResponse,
-};
+use aionui_api_types::{AgentManagementRow, AgentMetadata, ProviderHealthCheckRequest, ProviderHealthCheckResponse};
 use aionui_db::IProviderRepository;
 use aionui_realtime::EventBroadcaster;
 
@@ -100,10 +97,6 @@ impl AgentService {
             .into_iter()
             .filter(|agent| agent.agent_type.supports_new_conversation())
             .collect())
-    }
-
-    pub async fn acp_health_check(&self, req: AcpHealthCheckRequest) -> Result<AcpHealthCheckResponse, AgentError> {
-        Ok(crate::protocol::cli_detect::health_check(&self.registry, &req.backend).await)
     }
 
     pub async fn list_management_agents(&self) -> Result<Vec<AgentManagementRow>, AgentError> {

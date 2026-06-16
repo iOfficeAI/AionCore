@@ -1,6 +1,6 @@
 //! E2E integration tests for ACP management routes.
 //!
-//! Tests cover: agents list, agents/refresh, agents/test, health-check,
+//! Tests cover: agents list, agents/refresh, agents/test,
 //! and session-bound routes (mode/model).
 
 mod common;
@@ -69,51 +69,6 @@ async fn test_custom_agent_nonexistent_command() {
     let json = common::body_json(resp).await;
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["step"], "fail_cli");
-}
-
-#[tokio::test]
-async fn health_check_returns_status() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-
-    let req = json_with_token(
-        "POST",
-        "/api/agents/health-check",
-        json!({ "backend": "claude" }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = body_json(resp).await;
-    assert_eq!(body["success"], true);
-    // available is a boolean
-    assert!(body["data"]["available"].is_boolean());
-    // latency should be present
-    assert!(body["data"]["latency"].is_number());
-}
-
-#[tokio::test]
-async fn health_check_unknown_backend_reports_unavailable() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-
-    // Same rationale as `detect_cli_unknown_backend_returns_null_path`:
-    // unknown backends are valid at the request layer and surface as
-    // `available: false` with an error string.
-    let req = json_with_token(
-        "POST",
-        "/api/agents/health-check",
-        json!({ "backend": "iFlow" }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await;
-    assert_eq!(body["success"], true);
-    assert_eq!(body["data"]["available"], false);
 }
 
 #[tokio::test]
