@@ -618,6 +618,7 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeStateSaveCall {
     conversation_id: String,
+    current_mode_id: Option<Option<String>>,
     current_model_id: Option<Option<String>>,
 }
 
@@ -671,6 +672,7 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
     ) -> Result<bool, DbError> {
         self.runtime_state_saves.lock().unwrap().push(RuntimeStateSaveCall {
             conversation_id: conversation_id.to_owned(),
+            current_mode_id: params.current_mode_id.map(|outer| outer.map(ToOwned::to_owned)),
             current_model_id: params.current_model_id.map(|outer| outer.map(ToOwned::to_owned)),
         });
         Ok(true)
@@ -4083,6 +4085,8 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     assert_eq!(resp.extra["assistant_id"], json!("preset-1"));
     assert_eq!(resp.extra["preset_assistant_id"], json!("preset-1"));
     assert_eq!(resp.extra["preset_context"], json!("assistant rule body"));
+    assert_eq!(resp.extra["session_mode"], json!("workspace-write"));
+    assert_eq!(resp.extra["current_mode_id"], json!("workspace-write"));
     assert_eq!(resp.extra["current_model_id"], json!("new-model"));
     assert_eq!(resp.extra["skills"], json!(["cron", "pdf"]));
     assert!(resp.extra.get("assistant_snapshot").is_none());

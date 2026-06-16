@@ -695,6 +695,17 @@ impl ConversationService {
                     serde_json::Value::String(model_id.clone()),
                 );
             }
+            if let Some(permission) = snapshot.resolved_defaults.permission.as_ref() {
+                if !obj.contains_key("session_mode") {
+                    obj.insert("session_mode".to_owned(), serde_json::Value::String(permission.clone()));
+                }
+                if matches!(req.r#type, AgentType::Acp) && !obj.contains_key("current_mode_id") {
+                    obj.insert(
+                        "current_mode_id".to_owned(),
+                        serde_json::Value::String(permission.clone()),
+                    );
+                }
+            }
         }
 
         // Consume transient skill-shaping inputs and freeze the initial

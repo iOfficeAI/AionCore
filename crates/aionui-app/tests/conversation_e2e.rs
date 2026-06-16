@@ -239,6 +239,8 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
     assert_eq!(data["extra"]["assistant_id"], "u1");
     assert_eq!(data["extra"]["preset_assistant_id"], "u1");
     assert_eq!(data["extra"]["preset_context"], "assistant snapshot rule");
+    assert_eq!(data["extra"]["session_mode"], "workspace-write");
+    assert_eq!(data["extra"]["current_mode_id"], "workspace-write");
     assert_eq!(data["extra"]["current_model_id"], "override-model");
     assert!(data["extra"].get("assistant_snapshot").is_none());
     assert!(
