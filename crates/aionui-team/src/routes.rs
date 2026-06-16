@@ -42,7 +42,7 @@ impl From<TeamError> for ApiError {
             TeamError::AgentNotFound(msg) => ApiError::NotFound(msg),
             TeamError::TaskNotFound(msg) => ApiError::NotFound(msg),
             TeamError::InvalidRequest(msg) => ApiError::BadRequest(msg),
-            TeamError::SlotBusy(msg) => ApiError::BadRequest(format!("Team slot is busy: {msg}")),
+            TeamError::SlotBusy(msg) => ApiError::Conflict(format!("Team slot is busy: {msg}")),
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
@@ -324,6 +324,12 @@ mod tests {
     fn invalid_request_maps_to_bad_request() {
         let err: ApiError = TeamError::InvalidRequest("empty agents".into()).into();
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn slot_busy_maps_to_conflict() {
+        let api_error: ApiError = TeamError::SlotBusy("lead-1".into()).into();
+        assert_eq!(api_error.status_code(), StatusCode::CONFLICT);
     }
 
     #[test]
