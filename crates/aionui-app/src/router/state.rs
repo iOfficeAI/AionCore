@@ -486,7 +486,12 @@ pub async fn build_channel_state(
     let pref_pool = services.database.pool().clone();
     let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
         Arc::new(SqliteClientPreferenceRepository::new(pref_pool));
-    let channel_settings = Arc::new(aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo));
+    let channel_settings = Arc::new(
+        aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo).with_assistant_repos(
+            Arc::new(SqliteAssistantDefinitionRepository::new(services.database.pool().clone())),
+            Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
+        ),
+    );
 
     // Build orchestrator dependencies
     let action_executor = Arc::new(aionui_channel::action::ActionExecutor::new(

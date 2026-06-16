@@ -2,13 +2,12 @@ use std::sync::Arc;
 
 use aionui_api_types::{ChannelAssistantSetting, ChannelDefaultModelSetting, ChannelPlatformSettingsResponse};
 use aionui_common::ProviderWithModel;
-use aionui_db::IClientPreferenceRepository;
+use aionui_db::{IAssistantDefinitionRepository, IAssistantOverlayRepository, IClientPreferenceRepository};
 use tracing::debug;
 
 use crate::error::ChannelError;
 use crate::types::PluginType;
 
-const DEFAULT_BACKEND: &str = "aionrs";
 const DEFAULT_AGENT_TYPE: &str = "aionrs";
 
 /// Per-plugin agent/model configuration read from `client_preferences`.
@@ -18,6 +17,8 @@ const DEFAULT_AGENT_TYPE: &str = "aionrs";
 /// - `assistant.{platform}.defaultModel` → JSON `{"id":"provider_id","use_model":"model_name"}`
 pub struct ChannelSettingsService {
     pref_repo: Arc<dyn IClientPreferenceRepository>,
+    assistant_definition_repo: Option<Arc<dyn IAssistantDefinitionRepository>>,
+    assistant_overlay_repo: Option<Arc<dyn IAssistantOverlayRepository>>,
 }
 
 /// Resolved agent configuration for a channel platform.
@@ -40,7 +41,21 @@ pub struct ResolvedModelConfig {
 
 impl ChannelSettingsService {
     pub fn new(pref_repo: Arc<dyn IClientPreferenceRepository>) -> Self {
-        Self { pref_repo }
+        Self {
+            pref_repo,
+            assistant_definition_repo: None,
+            assistant_overlay_repo: None,
+        }
+    }
+
+    pub fn with_assistant_repos(
+        mut self,
+        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    ) -> Self {
+        self.assistant_definition_repo = Some(assistant_definition_repo);
+        self.assistant_overlay_repo = Some(assistant_overlay_repo);
+        self
     }
 
     /// Reads the agent configuration for a platform from `client_preferences`.
@@ -58,30 +73,52 @@ impl ChannelSettingsService {
             return Ok(default_agent_config());
         };
 
-        let parsed: serde_json::Value = serde_json::from_str(&pref.value).unwrap_or_default();
+        if let Some(setting) = parse_channel_assistant_setting(&pref.value) {
+            if let Some(assistant_id) = setting.assistant_id.as_deref()
+                && let Some(resolved) = self.resolve_assistant_agent_config(assistant_id).await?
+            {
+                debug!(
+                    platform = %platform,
+                    assistant_id,
+                    agent_type = %resolved.agent_type,
+                    backend = ?resolved.backend,
+                    "resolved channel agent config from assistant identity"
+                );
+                return Ok(resolved);
+            }
 
-        if let Some(at) = parsed["agent_type"].as_str() {
-            let backend = if at == "acp" {
-                parsed["backend"].as_str().map(|s| s.to_owned())
-            } else {
-                None
-            };
+            if let Some(at) = setting.agent_type.as_deref() {
+                let backend = if at == "acp" {
+                    setting.backend.clone()
+                } else {
+                    None
+                };
 
-            debug!(platform = %platform, agent_type = %at, backend = ?backend, "resolved channel agent config (new format)");
+                debug!(platform = %platform, agent_type = %at, backend = ?backend, "resolved channel agent config (new format)");
 
-            return Ok(ResolvedAgentConfig {
-                agent_type: at.to_owned(),
-                backend,
-            });
+                return Ok(ResolvedAgentConfig {
+                    agent_type: at.to_owned(),
+                    backend,
+                });
+            }
+
+            if let Some(raw_backend) = setting.backend.as_deref() {
+                let raw_backend = raw_backend.to_owned();
+                let agent_type = backend_to_agent_type(&raw_backend);
+                let backend = if agent_type == "acp" { Some(raw_backend) } else { None };
+
+                debug!(
+                    platform = %platform,
+                    agent_type = %agent_type,
+                    backend = ?backend,
+                    "resolved channel agent config (legacy format)"
+                );
+
+                return Ok(ResolvedAgentConfig { agent_type, backend });
+            }
         }
 
-        let raw_backend = parsed["backend"].as_str().unwrap_or(DEFAULT_BACKEND).to_owned();
-        let agent_type = backend_to_agent_type(&raw_backend);
-        let backend = if agent_type == "acp" { Some(raw_backend) } else { None };
-
-        debug!(platform = %platform, agent_type = %agent_type, backend = ?backend, "resolved channel agent config (legacy format)");
-
-        Ok(ResolvedAgentConfig { agent_type, backend })
+        Ok(default_agent_config())
     }
 
     /// Reads the model configuration for a platform from `client_preferences`.
@@ -159,6 +196,31 @@ impl ChannelSettingsService {
         let key = model_key(platform);
         self.pref_repo.upsert_batch(&[(&key, payload.as_str())]).await?;
         Ok(())
+    }
+
+    async fn resolve_assistant_agent_config(
+        &self,
+        assistant_id: &str,
+    ) -> Result<Option<ResolvedAgentConfig>, ChannelError> {
+        let (Some(definition_repo), Some(overlay_repo)) =
+            (&self.assistant_definition_repo, &self.assistant_overlay_repo)
+        else {
+            return Ok(None);
+        };
+
+        let Some(definition) = definition_repo.get_by_key(assistant_id).await? else {
+            return Ok(None);
+        };
+
+        let agent_backend = overlay_repo
+            .get(&definition.definition_id)
+            .await?
+            .and_then(|row| row.agent_backend_override)
+            .unwrap_or(definition.agent_backend);
+        let agent_type = backend_to_agent_type(&agent_backend);
+        let backend = if agent_type == "acp" { Some(agent_backend) } else { None };
+
+        Ok(Some(ResolvedAgentConfig { agent_type, backend }))
     }
 }
 
@@ -244,7 +306,11 @@ pub fn resolved_model_to_provider(model: Option<&ResolvedModelConfig>) -> Provid
 mod tests {
     use super::*;
     use aionui_db::DbError;
-    use aionui_db::models::ClientPreference;
+    use aionui_db::models::{
+        AssistantDefinitionRow, AssistantOverlayRow, ClientPreference, UpsertAssistantDefinitionParams,
+        UpsertAssistantOverlayParams,
+    };
+    use aionui_db::{IAssistantDefinitionRepository, IAssistantOverlayRepository};
     use std::sync::Mutex;
 
     struct MockPrefRepo {
@@ -308,6 +374,128 @@ mod tests {
             let mut data = self.data.lock().unwrap();
             data.retain(|(k, _)| !keys.contains(&k.as_str()));
             Ok(())
+        }
+    }
+
+    struct MockAssistantDefinitionRepo {
+        rows: Vec<AssistantDefinitionRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl IAssistantDefinitionRepository for MockAssistantDefinitionRepo {
+        async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn get_by_key(&self, assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(self.rows.iter().find(|row| row.assistant_key == assistant_key).cloned())
+        }
+
+        async fn get_by_definition_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.definition_id == definition_id)
+                .cloned())
+        }
+
+        async fn get_by_source_ref(
+            &self,
+            source: &str,
+            source_ref: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.source == source && row.source_ref.as_deref() == Some(source_ref))
+                .cloned())
+        }
+
+        async fn upsert(
+            &self,
+            _params: &UpsertAssistantDefinitionParams<'_>,
+        ) -> Result<AssistantDefinitionRow, DbError> {
+            panic!("unused in channel settings tests")
+        }
+
+        async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+            panic!("unused in channel settings tests")
+        }
+    }
+
+    struct MockAssistantOverlayRepo {
+        rows: Vec<AssistantOverlayRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl IAssistantOverlayRepository for MockAssistantOverlayRepo {
+        async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.definition_id == definition_id)
+                .cloned())
+        }
+
+        async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
+            panic!("unused in channel settings tests")
+        }
+
+        async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
+            panic!("unused in channel settings tests")
+        }
+    }
+
+    fn make_definition(assistant_key: &str, agent_backend: &str) -> AssistantDefinitionRow {
+        AssistantDefinitionRow {
+            definition_id: format!("def-{assistant_key}"),
+            assistant_key: assistant_key.to_owned(),
+            source: "generated".to_owned(),
+            owner_type: "system".to_owned(),
+            source_ref: Some(assistant_key.to_owned()),
+            source_version: None,
+            source_hash: None,
+            name: assistant_key.to_owned(),
+            name_i18n: "{}".to_owned(),
+            description: None,
+            description_i18n: "{}".to_owned(),
+            avatar_type: "emoji".to_owned(),
+            avatar_value: None,
+            agent_backend: agent_backend.to_owned(),
+            rule_resource_type: "inline".to_owned(),
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]".to_owned(),
+            recommended_prompts_i18n: "{}".to_owned(),
+            default_model_mode: "auto".to_owned(),
+            default_model_value: None,
+            default_permission_mode: "auto".to_owned(),
+            default_permission_value: None,
+            default_skills_mode: "auto".to_owned(),
+            default_skill_ids: "[]".to_owned(),
+            custom_skill_names: "[]".to_owned(),
+            default_disabled_builtin_skill_ids: "[]".to_owned(),
+            default_mcps_mode: "auto".to_owned(),
+            default_mcp_ids: "[]".to_owned(),
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        }
+    }
+
+    fn make_overlay(definition_id: &str, agent_backend_override: &str) -> AssistantOverlayRow {
+        AssistantOverlayRow {
+            definition_id: definition_id.to_owned(),
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: Some(agent_backend_override.to_owned()),
+            last_used_at: None,
+            created_at: 0,
+            updated_at: 0,
         }
     }
 
@@ -425,6 +613,44 @@ mod tests {
         let config = svc.get_agent_config(PluginType::Weixin).await.unwrap();
         assert_eq!(config.agent_type, "openclaw-gateway");
         assert!(config.backend.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_config_resolves_backend_from_assistant_identity() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.telegram.agent",
+            r#"{"assistant_id":"bare-claude","name":"Claude"}"#,
+        )]));
+        let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(MockAssistantDefinitionRepo {
+            rows: vec![make_definition("bare-claude", "claude")],
+        });
+        let overlay_repo: Arc<dyn IAssistantOverlayRepository> =
+            Arc::new(MockAssistantOverlayRepo { rows: vec![] });
+        let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
+
+        let config = svc.get_agent_config(PluginType::Telegram).await.unwrap();
+        assert_eq!(config.agent_type, "acp");
+        assert_eq!(config.backend.as_deref(), Some("claude"));
+    }
+
+    #[tokio::test]
+    async fn agent_config_prefers_overlay_backend_for_assistant_identity() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.telegram.agent",
+            r#"{"assistant_id":"bare-claude","name":"Claude"}"#,
+        )]));
+        let definition = make_definition("bare-claude", "claude");
+        let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(MockAssistantDefinitionRepo {
+            rows: vec![definition.clone()],
+        });
+        let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(MockAssistantOverlayRepo {
+            rows: vec![make_overlay(&definition.definition_id, "codex")],
+        });
+        let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
+
+        let config = svc.get_agent_config(PluginType::Telegram).await.unwrap();
+        assert_eq!(config.agent_type, "acp");
+        assert_eq!(config.backend.as_deref(), Some("codex"));
     }
 
     // ── get_model_config ──────────────────────────────────────────────
