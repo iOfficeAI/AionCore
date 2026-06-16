@@ -55,11 +55,11 @@ If case 2 applies, ask at most once whether the user wants to bring in a Team. K
    | Tester | Write and run tests | {agent_type} | (model from list) |
 4. **Output the table as a normal text message and END YOUR TURN.** Do NOT call `aion_create_team` or any other tool (including ask_user) in this turn. Wait for the user to reply in their next message with explicit confirmation (e.g. \"ok\", \"go ahead\", \"确认\") before proceeding.
 5. After user confirms → call `aion_create_team`. The summary MUST include both the goal and the confirmed team configuration. (The system automatically sets the correct agent type — you do NOT need to pass agentType.)
-6. After `aion_create_team` returns → you ARE now the team Leader. The system navigates to the team page automatically. **Immediately** use `team_spawn_agent` to create each teammate from the confirmed configuration table. Then use `team_send_message` to assign initial tasks to each spawned teammate. Do NOT end your turn until all teammates are spawned and tasked.
+6. After `aion_create_team` returns → the Team has been created, the current conversation has been bound as Leader, and the system navigates to the Team page automatically. **Do NOT call `team_spawn_agent`, `team_send_message`, or any other `team_*` tool in this solo turn.** Output a brief handoff telling the user to continue from the Team page, then END YOUR TURN. The user's next message from the Team page will start the first formal `TeamRun`.
 7. User declines or wants changes → adjust or proceed solo. Do not mention Team again unless the user asks.
 
 ### Tool constraint
-Before team creation: use **only** `aion_create_team` and `aion_list_models`. After `aion_create_team` succeeds: use team tools (`team_spawn_agent`, `team_send_message`, `team_members`, `team_task_create`, etc.) to manage your team.";
+Before team creation: use **only** `aion_create_team` and `aion_list_models`. After `aion_create_team` succeeds: do not call any `team_*` tools in this solo turn. Team tools are only for normal Team runtime after the Team page accepts the user's first Team message and an active `TeamRun` exists.";
 
 /// Build the Team Guide prompt for a solo agent.
 ///
@@ -128,12 +128,38 @@ If case 2 applies, ask at most once whether the user wants to bring in a Team. K
 | Tester | Write and run tests | claude | (model from list) |\n\
 4. **Output the table as a normal text message and END YOUR TURN.** Do NOT call `aion_create_team` or any other tool (including ask_user) in this turn. Wait for the user to reply in their next message with explicit confirmation (e.g. \"ok\", \"go ahead\", \"确认\") before proceeding.\n\
 5. After user confirms → call `aion_create_team`. The summary MUST include both the goal and the confirmed team configuration. (The system automatically sets the correct agent type — you do NOT need to pass agentType.)\n\
-6. After `aion_create_team` returns → you ARE now the team Leader. The system navigates to the team page automatically. **Immediately** use `team_spawn_agent` to create each teammate from the confirmed configuration table. Then use `team_send_message` to assign initial tasks to each spawned teammate. Do NOT end your turn until all teammates are spawned and tasked.\n\
+6. After `aion_create_team` returns → the Team has been created, the current conversation has been bound as Leader, and the system navigates to the Team page automatically. **Do NOT call `team_spawn_agent`, `team_send_message`, or any other `team_*` tool in this solo turn.** Output a brief handoff telling the user to continue from the Team page, then END YOUR TURN. The user's next message from the Team page will start the first formal `TeamRun`.\n\
 7. User declines or wants changes → adjust or proceed solo. Do not mention Team again unless the user asks.\n\
 \n\
 ### Tool constraint\n\
-Before team creation: use **only** `aion_create_team` and `aion_list_models`. After `aion_create_team` succeeds: use team tools (`team_spawn_agent`, `team_send_message`, `team_members`, `team_task_create`, etc.) to manage your team.";
+Before team creation: use **only** `aion_create_team` and `aion_list_models`. After `aion_create_team` succeeds: do not call any `team_*` tools in this solo turn. Team tools are only for normal Team runtime after the Team page accepts the user's first Team message and an active `TeamRun` exists.";
         assert_eq!(prompt, expected);
+    }
+
+    #[test]
+    fn team_guide_prompt_hands_off_after_create_team() {
+        let prompt = build_team_guide_prompt("claude", None);
+
+        assert!(prompt.contains(
+            "After `aion_create_team` returns → the Team has been created, the current conversation has been bound as Leader, and the system navigates to the Team page automatically."
+        ));
+        assert!(prompt.contains(
+            "Do NOT call `team_spawn_agent`, `team_send_message`, or any other `team_*` tool in this solo turn."
+        ));
+        assert!(prompt.contains(
+            "The user's next message from the Team page will start the first formal `TeamRun`."
+        ));
+        assert!(prompt.contains(
+            "After `aion_create_team` succeeds: do not call any `team_*` tools in this solo turn."
+        ));
+        assert!(
+            !prompt.contains("Your team tools (team_spawn_agent, team_send_message, etc.) are now active."),
+            "prompt must not claim Team tools are active immediately after creation"
+        );
+        assert!(
+            !prompt.contains("Immediately proceed to spawn teammates as planned"),
+            "prompt must not ask the solo agent to spawn teammates in the same solo turn"
+        );
     }
 
     #[test]
