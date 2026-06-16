@@ -826,7 +826,12 @@ impl AssistantService {
                     .map_err(|e| AssistantError::Internal(format!("rebuild legacy mirror: {e}")))?;
                 return self.get(id).await;
             }
-            AssistantSource::Bare | AssistantSource::User => {}
+            AssistantSource::Bare => {
+                return Err(AssistantError::Forbidden(
+                    "Generated assistants cannot be edited".into(),
+                ));
+            }
+            AssistantSource::User => {}
         }
 
         let serialized = SerializedFields::from_update(&req)?;
@@ -1288,7 +1293,10 @@ impl AssistantService {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot write rule for built-in assistant".into(),
             )),
-            AssistantSource::Bare | AssistantSource::User => {
+            AssistantSource::Bare => Err(AssistantError::Forbidden(
+                "Cannot write rule for generated assistant".into(),
+            )),
+            AssistantSource::User => {
                 let path = self.user_rule_path(id, locale);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
@@ -1306,7 +1314,10 @@ impl AssistantService {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot delete rule for built-in assistant".into(),
             )),
-            AssistantSource::Bare | AssistantSource::User => Ok(remove_assistant_md_files(&self.user_rules_dir(), id)),
+            AssistantSource::Bare => Err(AssistantError::Forbidden(
+                "Cannot delete rule for generated assistant".into(),
+            )),
+            AssistantSource::User => Ok(remove_assistant_md_files(&self.user_rules_dir(), id)),
         }
     }
 
@@ -1325,7 +1336,10 @@ impl AssistantService {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot write skill for built-in assistant".into(),
             )),
-            AssistantSource::Bare | AssistantSource::User => {
+            AssistantSource::Bare => Err(AssistantError::Forbidden(
+                "Cannot write skill for generated assistant".into(),
+            )),
+            AssistantSource::User => {
                 let path = self.user_skill_path(id, locale);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
@@ -1342,7 +1356,10 @@ impl AssistantService {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot delete skill for built-in assistant".into(),
             )),
-            AssistantSource::Bare | AssistantSource::User => Ok(remove_assistant_md_files(&self.user_skills_dir(), id)),
+            AssistantSource::Bare => Err(AssistantError::Forbidden(
+                "Cannot delete skill for generated assistant".into(),
+            )),
+            AssistantSource::User => Ok(remove_assistant_md_files(&self.user_skills_dir(), id)),
         }
     }
 
@@ -2828,6 +2845,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_bare_rejects() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Available,
+            )],
+            ..Default::default()
+        })
+        .await;
+
+        let err = fx
+            .service
+            .update(
+                "bare:agent-claude",
+                UpdateAssistantRequest {
+                    name: Some("Nope".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AssistantError::Forbidden(_)));
+    }
+
+    #[tokio::test]
     async fn update_builtin_changing_agent_without_defaults_clears_model_and_permission() {
         let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
         fx.service
@@ -3394,6 +3437,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AssistantError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn write_rule_bare_rejects() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Available,
+            )],
+            ..Default::default()
+        })
+        .await;
+        let err = fx
+            .service
+            .write_rule("bare:agent-claude", Some("en-US"), "x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AssistantError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_rule_bare_rejects() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Available,
+            )],
+            ..Default::default()
+        })
+        .await;
+        let err = fx.service.delete_rule("bare:agent-claude").await.unwrap_err();
+        assert!(matches!(err, AssistantError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn write_skill_bare_rejects() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Available,
+            )],
+            ..Default::default()
+        })
+        .await;
+        let err = fx
+            .service
+            .write_skill("bare:agent-claude", Some("en-US"), "x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AssistantError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_skill_bare_rejects() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Available,
+            )],
+            ..Default::default()
+        })
+        .await;
+        let err = fx.service.delete_skill("bare:agent-claude").await.unwrap_err();
+        assert!(matches!(err, AssistantError::Forbidden(_)));
     }
 
     #[tokio::test]
