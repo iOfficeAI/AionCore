@@ -53,6 +53,57 @@ struct Fixture {
     _ext_tmp: TempDir,
 }
 
+async fn insert_generated_bare_assistant(fx: &Fixture, assistant_key: &str, source_ref: &str, backend: &str, name: &str) {
+    let pool = fx.services.database.pool().clone();
+    let definition_repo = SqliteAssistantDefinitionRepository::new(pool.clone());
+    let overlay_repo = SqliteAssistantOverlayRepository::new(pool);
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            definition_id: &format!("asstdef-{assistant_key}"),
+            assistant_key,
+            source: "generated",
+            owner_type: "system",
+            source_ref: Some(source_ref),
+            source_version: None,
+            source_hash: None,
+            name,
+            name_i18n: "{}",
+            description: None,
+            description_i18n: "{}",
+            avatar_type: "none",
+            avatar_value: None,
+            agent_backend: backend,
+            rule_resource_type: "none",
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: &format!("asstdef-{assistant_key}"),
+            enabled: true,
+            sort_order: 5,
+            agent_backend_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+}
+
 /// Build the whole app with:
 /// - a manifest at `{builtin_tmp}/assets/assistants.json` registering two
 ///   built-ins (`builtin-office` with rule/skill/avatar files on disk, and
@@ -317,6 +368,36 @@ async fn list_builtin_file_avatar_is_served_via_assistant_avatar_route() {
 }
 
 #[tokio::test]
+async fn list_generated_assistant_exposes_bare_runtime_fields() {
+    let fx = fixture().await;
+    insert_generated_bare_assistant(&fx, "bare:agent-droid", "agent-droid", "droid", "Droid").await;
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let list = json["data"].as_array().unwrap();
+    let bare = list
+        .iter()
+        .find(|assistant| assistant["id"] == "bare:agent-droid")
+        .expect("generated bare assistant missing from assistant list");
+
+    assert_eq!(bare["source"], "bare");
+    assert_eq!(bare["deletable"], false);
+    assert_eq!(bare["agent_status"], "missing");
+    assert_eq!(bare["agent_status_message"], Value::Null);
+    assert_eq!(bare["team_selectable"], false);
+    assert_eq!(
+        bare["team_block_reason"],
+        "This assistant's agent could not be resolved."
+    );
+}
+
+#[tokio::test]
 async fn list_requires_auth() {
     let fx = fixture().await;
     let req = axum::http::Request::builder()
@@ -449,6 +530,34 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
     assert_eq!(data["capabilities"]["custom_skill_names"], json!(["custom-note"]));
     assert_eq!(data["preferences"]["last_permission_value"], "workspace-write");
     assert_eq!(data["preferences"]["last_skill_ids"], json!(["pref-skill"]));
+}
+
+#[tokio::test]
+async fn get_detail_generated_assistant_exposes_bare_runtime_fields() {
+    let fx = fixture().await;
+    insert_generated_bare_assistant(&fx, "bare:agent-droid", "agent-droid", "droid", "Droid").await;
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants/bare:agent-droid?locale=en-US", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let data = &json["data"];
+    assert_eq!(data["id"], "bare:agent-droid");
+    assert_eq!(data["source"], "bare");
+    assert_eq!(data["deletable"], false);
+    assert_eq!(data["agent_status"], "missing");
+    assert_eq!(data["agent_status_message"], Value::Null);
+    assert_eq!(data["team_selectable"], false);
+    assert_eq!(
+        data["team_block_reason"],
+        "This assistant's agent could not be resolved."
+    );
+    assert_eq!(data["engine"]["agent_backend"], "droid");
 }
 
 // ===========================================================================
