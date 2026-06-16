@@ -146,12 +146,10 @@ Before team creation: use **only** `aion_create_team` and `aion_list_models`. Af
         assert!(prompt.contains(
             "Do NOT call `team_spawn_agent`, `team_send_message`, or any other `team_*` tool in this solo turn."
         ));
-        assert!(prompt.contains(
-            "The user's next message from the Team page will start the first formal `TeamRun`."
-        ));
-        assert!(prompt.contains(
-            "After `aion_create_team` succeeds: do not call any `team_*` tools in this solo turn."
-        ));
+        assert!(prompt.contains("The user's next message from the Team page will start the first formal `TeamRun`."));
+        assert!(
+            prompt.contains("After `aion_create_team` succeeds: do not call any `team_*` tools in this solo turn.")
+        );
         assert!(
             !prompt.contains("Your team tools (team_spawn_agent, team_send_message, etc.) are now active."),
             "prompt must not claim Team tools are active immediately after creation"

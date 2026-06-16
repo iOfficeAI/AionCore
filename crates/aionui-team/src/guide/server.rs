@@ -177,6 +177,26 @@ fn build_create_team_handoff_next_step(summary: &str) -> String {
     )
 }
 
+const NO_ACTIVE_TEAM_RUN_FOR_RUN_SCOPED_WAKE: &str = "no active team run for run-scoped wake";
+const GUIDE_NO_ACTIVE_TEAM_RUN_HANDOFF_ERROR: &str =
+    "Team was created, but no TeamRun is active yet. End this solo turn and continue from the Team page.";
+
+fn is_run_scoped_guide_team_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "team_send_message"
+            | "team_spawn_agent"
+            | "team_task_create"
+            | "team_task_update"
+            | "team_rename_agent"
+            | "team_shutdown_agent"
+    )
+}
+
+fn guide_no_active_team_run_handoff_response() -> serde_json::Value {
+    serde_json::json!({ "error": GUIDE_NO_ACTIVE_TEAM_RUN_HANDOFF_ERROR })
+}
+
 async fn exec_create_team(
     request_body: &serde_json::Value,
     args: &serde_json::Value,
@@ -322,6 +342,29 @@ async fn exec_team_tool(
         }
     };
 
+    if is_run_scoped_guide_team_tool(tool_name) {
+        match svc.require_active_team_run_for_team_work(&team_id).await {
+            Ok(()) => {}
+            Err(crate::TeamError::InvalidRequest(message)) if message == NO_ACTIVE_TEAM_RUN_FOR_RUN_SCOPED_WAKE => {
+                warn!(
+                    tool = tool_name,
+                    team_id = %team_id,
+                    "Guide HTTP: run-scoped team tool refused because no active TeamRun exists"
+                );
+                return guide_no_active_team_run_handoff_response();
+            }
+            Err(error) => {
+                warn!(
+                    tool = tool_name,
+                    team_id = %team_id,
+                    error = %error,
+                    "Guide HTTP: active TeamRun check failed before forwarding team tool"
+                );
+                return serde_json::json!({"error": error.to_string()});
+            }
+        }
+    }
+
     let svc_weak = Arc::downgrade(&svc);
     let result = crate::mcp::server::dispatch_tool(
         tool_name,
@@ -409,6 +452,50 @@ mod tests {
             !next_step.contains("tools are now active"),
             "next_step must not claim Team tools are active immediately after creation"
         );
+    }
+
+    #[test]
+    fn run_scoped_guide_team_tools_are_classified_for_handoff_guard() {
+        for tool_name in [
+            "team_send_message",
+            "team_spawn_agent",
+            "team_task_create",
+            "team_task_update",
+            "team_rename_agent",
+            "team_shutdown_agent",
+        ] {
+            assert!(
+                is_run_scoped_guide_team_tool(tool_name),
+                "{tool_name} should require an active TeamRun in the Guide forwarding path"
+            );
+        }
+
+        for tool_name in [
+            "team_members",
+            "team_task_list",
+            "team_list_models",
+            "team_describe_assistant",
+        ] {
+            assert!(
+                !is_run_scoped_guide_team_tool(tool_name),
+                "{tool_name} is read-only/catalog-style and should not use the run-scoped handoff guard"
+            );
+        }
+    }
+
+    #[test]
+    fn guide_no_active_team_run_handoff_error_is_clear() {
+        let response = guide_no_active_team_run_handoff_response();
+        let error = response
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("error string");
+
+        assert_eq!(
+            error,
+            "Team was created, but no TeamRun is active yet. End this solo turn and continue from the Team page."
+        );
+        assert!(!error.contains("no active team run for run-scoped wake"));
     }
 
     #[tokio::test]
