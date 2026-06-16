@@ -9,7 +9,7 @@ Diagnose a running AionUi installation by reading its **project-level** data:
 the aioncore REST API, the unified SQLite store, and the aioncore log files.
 
 This is **engine-agnostic**. AionUi runs conversations on several backends
-(`acp`/claude, `aionrs`, `gemini`, `openclaw-gateway`), but troubleshooting goes
+(`acp`/claude, `aionrs`, `gemini`), but troubleshooting goes
 through AionUi's own data — the `conversations` API, the unified `messages`
 table, provider health, crons, teams, MCP — so the same checks work no matter
 which engine a conversation uses. Do **not** reach into engine-specific
@@ -39,10 +39,10 @@ python3 scripts/aion_diag.py discover
   "pid": 86716,
   "base_url": "http://127.0.0.1:58188",
   "port": 58188,
-  "log_dir": "/Users/veryliu/Library/Logs/AionUi",
-  "data_dir": "/Users/veryliu/.aionui",
+  "log_dir": "/Users/you/Library/Logs/AionUi",
+  "data_dir": "/Users/you/.aionui",
   "version": "2.1.18",
-  "db_path": "/Users/veryliu/.aionui/aionui-backend.db"
+  "db_path": "/Users/you/.aionui/aionui-backend.db"
 }
 ```
 
