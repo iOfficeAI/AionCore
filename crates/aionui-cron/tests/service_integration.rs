@@ -677,6 +677,33 @@ async fn cj1_create_cron_job() {
 }
 
 #[tokio::test]
+async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
+    let (svc, _, _) = setup().await;
+    let mut req = make_create_req("Assistant Only Create", every_60s());
+    req.agent_config = Some(aionui_api_types::CronAgentConfigDto {
+        backend: "claude".into(),
+        name: "Helper".into(),
+        cli_path: None,
+        is_preset: Some(true),
+        assistant_id: Some("assistant-1".into()),
+        custom_agent_id: Some("legacy-assistant".into()),
+        preset_agent_type: Some("claude".into()),
+        mode: Some("default".into()),
+        model_id: Some("claude-sonnet-4".into()),
+        config_options: None,
+        workspace: None,
+    });
+
+    let job = svc.add_job(req).await.unwrap();
+    let config = job.agent_config.expect("agent config");
+
+    assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
+    assert!(config.custom_agent_id.is_none());
+    assert!(config.preset_agent_type.is_none());
+    assert!(config.is_preset.is_none());
+}
+
+#[tokio::test]
 async fn create_job_rejects_deprecated_agent_types() {
     let (svc, _, _) = setup().await;
 
@@ -827,6 +854,47 @@ async fn cj8_update_job() {
     let events = bc.take_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "cron.job-updated");
+}
+
+#[tokio::test]
+async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
+    let (svc, _, _) = setup().await;
+    let created = svc
+        .add_job(make_create_req("Assistant Only Update", every_60s()))
+        .await
+        .unwrap();
+
+    let req = UpdateCronJobRequest {
+        name: None,
+        description: None,
+        enabled: None,
+        schedule: None,
+        message: None,
+        execution_mode: None,
+        agent_config: Some(aionui_api_types::CronAgentConfigDto {
+            backend: "claude".into(),
+            name: "Helper".into(),
+            cli_path: None,
+            is_preset: Some(true),
+            assistant_id: Some("assistant-1".into()),
+            custom_agent_id: Some("legacy-assistant".into()),
+            preset_agent_type: Some("claude".into()),
+            mode: Some("default".into()),
+            model_id: Some("claude-sonnet-4".into()),
+            config_options: None,
+            workspace: None,
+        }),
+        conversation_title: None,
+        max_retries: None,
+    };
+
+    let updated = svc.update_job(&created.id, req).await.unwrap();
+    let config = updated.agent_config.expect("agent config");
+
+    assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
+    assert!(config.custom_agent_id.is_none());
+    assert!(config.preset_agent_type.is_none());
+    assert!(config.is_preset.is_none());
 }
 
 // ── CJ-9: Update schedule type ────────────────────────────────────

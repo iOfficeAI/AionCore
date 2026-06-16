@@ -77,19 +77,22 @@ impl CronService {
         let created_by = CreatedBy::from_str(&req.created_by)?;
         let message = req.message.or(req.prompt).unwrap_or_default();
 
-        let agent_config = req.agent_config.map(|c| CronAgentConfig {
-            backend: c.backend,
-            name: c.name,
-            cli_path: c.cli_path,
-            is_preset: c.is_preset,
-            assistant_id: c.assistant_id,
-            custom_agent_id: c.custom_agent_id,
-            preset_agent_type: c.preset_agent_type,
-            mode: c.mode,
-            model_id: c.model_id,
-            config_options: c.config_options,
-            workspace: c.workspace,
-        });
+        let agent_config = req
+            .agent_config
+            .map(sanitize_agent_config_dto)
+            .map(|c| CronAgentConfig {
+                backend: c.backend,
+                name: c.name,
+                cli_path: c.cli_path,
+                is_preset: c.is_preset,
+                assistant_id: c.assistant_id,
+                custom_agent_id: c.custom_agent_id,
+                preset_agent_type: c.preset_agent_type,
+                mode: c.mode,
+                model_id: c.model_id,
+                config_options: c.config_options,
+                workspace: c.workspace,
+            });
 
         let now = now_ms();
         let next_run_at = compute_next_run(&schedule, now);
@@ -161,7 +164,8 @@ impl CronService {
             job.execution_mode = parse_execution_mode(Some(mode_str))?;
         }
         if let Some(config_dto) = &req.agent_config {
-            validate_aionrs_agent_config(&job.agent_type, Some(config_dto))?;
+            let config_dto = sanitize_agent_config_dto(config_dto.clone());
+            validate_aionrs_agent_config(&job.agent_type, Some(&config_dto))?;
             job.agent_config = Some(CronAgentConfig {
                 backend: config_dto.backend.clone(),
                 name: config_dto.name.clone(),
@@ -1210,6 +1214,7 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
     };
 
     let agent_config = req.agent_config.as_ref().map(|c| {
+        let c = sanitize_agent_config_dto(c.clone());
         let config = CronAgentConfig {
             backend: c.backend.clone(),
             name: c.name.clone(),
@@ -1252,6 +1257,19 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
         run_count: None,
         retry_count: None,
     }
+}
+
+fn sanitize_agent_config_dto(mut config: aionui_api_types::CronAgentConfigDto) -> aionui_api_types::CronAgentConfigDto {
+    let has_assistant_id = config
+        .assistant_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if has_assistant_id {
+        config.custom_agent_id = None;
+        config.preset_agent_type = None;
+        config.is_preset = None;
+    }
+    config
 }
 
 fn schedule_from_dto_with_existing_timezone(dto: &CronScheduleDto, existing: &CronSchedule) -> CronSchedule {
@@ -1382,6 +1400,53 @@ mod tests {
         assert!(validate_aionrs_agent_config("claude", Some(&cfg)).is_ok());
     }
 
+    #[test]
+    fn sanitize_agent_config_dto_clears_legacy_ids_when_assistant_id_present() {
+        let config = aionui_api_types::CronAgentConfigDto {
+            backend: "claude".into(),
+            name: "Helper".into(),
+            cli_path: None,
+            is_preset: Some(true),
+            assistant_id: Some("assistant-1".into()),
+            custom_agent_id: Some("legacy-assistant".into()),
+            preset_agent_type: Some("claude".into()),
+            mode: Some("default".into()),
+            model_id: Some("claude-sonnet-4".into()),
+            config_options: None,
+            workspace: None,
+        };
+
+        let sanitized = sanitize_agent_config_dto(config);
+
+        assert_eq!(sanitized.assistant_id.as_deref(), Some("assistant-1"));
+        assert!(sanitized.custom_agent_id.is_none());
+        assert!(sanitized.preset_agent_type.is_none());
+        assert!(sanitized.is_preset.is_none());
+    }
+
+    #[test]
+    fn sanitize_agent_config_dto_keeps_legacy_ids_without_assistant_id() {
+        let config = aionui_api_types::CronAgentConfigDto {
+            backend: "claude".into(),
+            name: "Helper".into(),
+            cli_path: None,
+            is_preset: Some(true),
+            assistant_id: None,
+            custom_agent_id: Some("legacy-assistant".into()),
+            preset_agent_type: Some("claude".into()),
+            mode: Some("default".into()),
+            model_id: Some("claude-sonnet-4".into()),
+            config_options: None,
+            workspace: None,
+        };
+
+        let sanitized = sanitize_agent_config_dto(config);
+
+        assert_eq!(sanitized.custom_agent_id.as_deref(), Some("legacy-assistant"));
+        assert_eq!(sanitized.preset_agent_type.as_deref(), Some("claude"));
+        assert_eq!(sanitized.is_preset, Some(true));
+    }
+
     // -- parse_execution_mode -------------------------------------------------
 
     #[test]
@@ -1491,6 +1556,43 @@ mod tests {
         assert_eq!(params.schedule_kind.as_deref(), Some("cron"));
         assert_eq!(params.schedule_value.as_deref(), Some("0 0 9 * * *"));
         assert!(params.next_run_at.is_some());
+    }
+
+    #[test]
+    fn build_update_params_strips_legacy_ids_when_assistant_id_present() {
+        let job = sample_job();
+        let req = UpdateCronJobRequest {
+            name: None,
+            description: None,
+            enabled: None,
+            schedule: None,
+            message: None,
+            execution_mode: None,
+            agent_config: Some(aionui_api_types::CronAgentConfigDto {
+                backend: "claude".into(),
+                name: "Helper".into(),
+                cli_path: None,
+                is_preset: Some(true),
+                assistant_id: Some("assistant-1".into()),
+                custom_agent_id: Some("legacy-assistant".into()),
+                preset_agent_type: Some("claude".into()),
+                mode: Some("default".into()),
+                model_id: Some("claude-sonnet-4".into()),
+                config_options: None,
+                workspace: None,
+            }),
+            conversation_title: None,
+            max_retries: None,
+        };
+
+        let params = build_update_params(&job, &req);
+        let config_json = params.agent_config.flatten().expect("agent config json");
+        let config: CronAgentConfig = serde_json::from_str(&config_json).expect("parse cron config");
+
+        assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
+        assert!(config.custom_agent_id.is_none());
+        assert!(config.preset_agent_type.is_none());
+        assert!(config.is_preset.is_none());
     }
 
     #[test]
