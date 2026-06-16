@@ -994,37 +994,34 @@ impl TeamSession {
             return Err(TeamError::DuplicateAgentName(requested_name));
         }
 
-        // Step 3: backend capability check. Hard whitelist passes immediately;
+        let service = self
+            .service
+            .upgrade()
+            .ok_or_else(|| TeamError::InvalidRequest("spawn_agent requires a live TeamSessionService".into()))?;
+
+        // Step 3: resolve the effective assistant/backend/model target before
+        // capability checks. Assistant spawns derive backend from the preset
+        // identity rather than inheriting the caller backend.
+        let (backend, model) = service
+            .resolve_spawn_backend_and_model(
+                req.assistant_id.as_deref(),
+                req.agent_type.as_deref(),
+                req.model.as_deref(),
+                caller.backend.as_str(),
+                caller.model.as_str(),
+            )
+            .await?;
+
+        // Step 4: backend capability check. Hard whitelist passes immediately;
         // otherwise query persisted agent_capabilities for MCP support.
-        let backend = req
-            .agent_type
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(caller.backend.as_str())
-            .to_owned();
         if !crate::guide::capability::TEAM_CAPABLE_BACKENDS.contains(&backend.as_str()) {
-            let capable = match self.service.upgrade() {
-                Some(svc) => svc.is_backend_team_capable(&backend).await,
-                None => false,
-            };
+            let capable = service.is_backend_team_capable(&backend).await;
             if !capable {
                 return Err(TeamError::BackendNotAllowed(backend));
             }
         }
 
-        // Step 4: DB side-effects (new conversation + persisted agent slot).
-        let service = self
-            .service
-            .upgrade()
-            .ok_or_else(|| TeamError::InvalidRequest("spawn_agent requires a live TeamSessionService".into()))?;
-        let model = match req.model.as_deref().filter(|m| !m.is_empty()) {
-            Some(m) => m.to_owned(),
-            None => service
-                .default_model_for_backend(&backend)
-                .await
-                .unwrap_or_else(|| caller.model.clone()),
-        };
+        // Step 5: DB side-effects (new conversation + persisted agent slot).
         let new_agent = service
             .persist_spawned_agent(
                 &self.team.id,

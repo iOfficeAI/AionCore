@@ -59,6 +59,60 @@ pub(crate) fn resolve_full_auto_mode(backend: &str) -> &'static str {
 }
 
 impl TeamSessionService {
+    pub(crate) async fn resolve_spawn_backend_and_model(
+        &self,
+        assistant_id: Option<&str>,
+        requested_backend: Option<&str>,
+        requested_model: Option<&str>,
+        fallback_backend: &str,
+        fallback_model: &str,
+    ) -> Result<(String, String), TeamError> {
+        if let Some(assistant_key) = assistant_id.map(str::trim).filter(|value| !value.is_empty()) {
+            let definition = self
+                .assistant_definition_repo
+                .get_by_key(assistant_key)
+                .await?
+                .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_key}")))?;
+            let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+            let backend = overlay
+                .as_ref()
+                .and_then(|row| row.agent_backend_override.as_deref())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(definition.agent_backend.as_str())
+                .to_owned();
+            let requested_model = requested_model
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let fixed_model = (definition.default_model_mode == "fixed")
+                .then(|| definition.default_model_value.clone())
+                .flatten()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+            let backend_default_model = self.default_model_for_backend(&backend).await;
+            let model = requested_model
+                .or(fixed_model)
+                .or(backend_default_model)
+                .unwrap_or_else(|| fallback_model.to_owned());
+            return Ok((backend, model));
+        }
+
+        let backend = requested_backend
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback_backend)
+            .to_owned();
+        let requested_model = requested_model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let backend_default_model = self.default_model_for_backend(&backend).await;
+        let model = requested_model
+            .or(backend_default_model)
+            .unwrap_or_else(|| fallback_model.to_owned());
+        Ok((backend, model))
+    }
+
     /// Check if a backend is allowed to participate in team mode.
     /// Hard whitelist passes immediately; then checks behavior_policy.supports_team;
     /// finally queries persisted `agent_capabilities` for MCP transport declarations.
@@ -167,6 +221,9 @@ impl TeamSessionService {
     }
 
     pub(crate) async fn default_model_for_backend(&self, backend: &str) -> Option<String> {
+        if backend == "aionrs" {
+            return self.collect_provider_models().await.into_iter().next();
+        }
         let row = self.agent_metadata_repo.find_builtin_by_backend(backend).await.ok()??;
         let json: serde_json::Value = serde_json::from_str(row.available_models.as_deref()?).ok()?;
         if let Some(id) = json.get("current_model_id").and_then(|v| v.as_str())
@@ -250,6 +307,123 @@ mod tests {
     use crate::test_utils::workspace_harness::{
         force_team_workspace, setup_with_factory_metadata_team_repo_and_conversation_repo, single_agent_team_request,
     };
+    use aionui_db::models::{AssistantDefinitionRow, AssistantOverlayRow, Provider};
+    use aionui_db::{
+        DbError, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
+        UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    };
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct SingleAssistantDefinitionRepo {
+        row: AssistantDefinitionRow,
+    }
+
+    #[async_trait::async_trait]
+    impl IAssistantDefinitionRepository for SingleAssistantDefinitionRepo {
+        async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+            Ok(vec![self.row.clone()])
+        }
+
+        async fn get_by_key(&self, assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok((self.row.assistant_key == assistant_key).then_some(self.row.clone()))
+        }
+
+        async fn get_by_definition_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+        }
+
+        async fn get_by_source_ref(
+            &self,
+            _source: &str,
+            _source_ref: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn upsert(
+            &self,
+            _params: &UpsertAssistantDefinitionParams<'_>,
+        ) -> Result<AssistantDefinitionRow, DbError> {
+            Err(DbError::Init("not implemented".into()))
+        }
+
+        async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    #[derive(Clone)]
+    struct SingleAssistantOverlayRepo {
+        row: AssistantOverlayRow,
+    }
+
+    #[async_trait::async_trait]
+    impl IAssistantOverlayRepository for SingleAssistantOverlayRepo {
+        async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+            Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+        }
+
+        async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
+            Ok(vec![self.row.clone()])
+        }
+
+        async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
+            Err(DbError::Init("not implemented".into()))
+        }
+
+        async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    struct SingleProviderRepo {
+        rows: Vec<Provider>,
+    }
+
+    #[async_trait::async_trait]
+    impl IProviderRepository for SingleProviderRepo {
+        async fn list(&self) -> Result<Vec<Provider>, DbError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn find_by_id(&self, _id: &str) -> Result<Option<Provider>, DbError> {
+            Ok(None)
+        }
+
+        async fn create(&self, _params: aionui_db::CreateProviderParams<'_>) -> Result<Provider, DbError> {
+            Err(DbError::NotFound("not implemented".into()))
+        }
+
+        async fn update(&self, _id: &str, _params: aionui_db::UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+            Err(DbError::NotFound("not implemented".into()))
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+            Err(DbError::NotFound("not implemented".into()))
+        }
+    }
+
+    fn provider_row(id: &str, models: &[&str]) -> Provider {
+        Provider {
+            id: id.into(),
+            platform: "openai".into(),
+            name: id.into(),
+            base_url: "https://example.com".into(),
+            api_key_encrypted: String::new(),
+            models: serde_json::to_string(models).unwrap(),
+            enabled: true,
+            capabilities: "[]".into(),
+            context_limit: None,
+            model_protocols: None,
+            model_enabled: None,
+            model_health: None,
+            bedrock_config: None,
+            is_full_url: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
 
     #[test]
     fn parse_agent_type_known_backends() {
@@ -315,5 +489,81 @@ mod tests {
             spawned_extra.get("workspace").and_then(serde_json::Value::as_str),
             Some(leader_workspace.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_spawn_backend_and_model_prefers_assistant_identity_over_caller_backend() {
+        let (svc, _, _, _) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let svc = TeamSessionService::new(
+            svc.repo.clone(),
+            svc.agent_metadata_repo.clone(),
+            Arc::new(SingleAssistantDefinitionRepo {
+                row: AssistantDefinitionRow {
+                    definition_id: "def-1".into(),
+                    assistant_key: "word-creator".into(),
+                    source: "builtin".into(),
+                    owner_type: "system".into(),
+                    source_ref: Some("word-creator".into()),
+                    source_version: None,
+                    source_hash: None,
+                    name: "Word Creator".into(),
+                    name_i18n: "{}".into(),
+                    description: None,
+                    description_i18n: "{}".into(),
+                    avatar_type: "emoji".into(),
+                    avatar_value: None,
+                    agent_backend: "aionrs".into(),
+                    rule_resource_type: "inline".into(),
+                    rule_resource_ref: None,
+                    rule_inline_content: None,
+                    recommended_prompts: "[]".into(),
+                    recommended_prompts_i18n: "{}".into(),
+                    default_model_mode: "auto".into(),
+                    default_model_value: None,
+                    default_permission_mode: "auto".into(),
+                    default_permission_value: None,
+                    default_skills_mode: "auto".into(),
+                    default_skill_ids: "[]".into(),
+                    custom_skill_names: "[]".into(),
+                    default_disabled_builtin_skill_ids: "[]".into(),
+                    default_mcps_mode: "auto".into(),
+                    default_mcp_ids: "[]".into(),
+                    created_at: 0,
+                    updated_at: 0,
+                    deleted_at: None,
+                },
+            }),
+            Arc::new(SingleAssistantOverlayRepo {
+                row: AssistantOverlayRow {
+                    definition_id: "def-1".into(),
+                    enabled: true,
+                    sort_order: 0,
+                    agent_backend_override: None,
+                    last_used_at: None,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            }),
+            Arc::new(SingleProviderRepo {
+                rows: vec![provider_row("openai", &["gpt-5-mini"])],
+            }),
+            svc.conversation_port.clone(),
+            svc.projection_store.clone(),
+            svc.lookup_port.clone(),
+            svc.broadcaster.clone(),
+            svc.task_manager.clone(),
+            svc.turn_port.clone(),
+            svc.cancellation_port.clone(),
+            svc.backend_binary_path.clone(),
+            None,
+        );
+
+        let (backend, model) = svc
+            .resolve_spawn_backend_and_model(Some("word-creator"), None, None, "gemini", "gemini-2.5-pro")
+            .await
+            .unwrap();
+
+        assert_eq!(backend, "aionrs");
+        assert_eq!(model, "gpt-5-mini");
     }
 }

@@ -76,7 +76,7 @@ fn render_assistant_description(
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Use `team_spawn_agent` with `custom_agent_id=\"{}\"`.",
+        "Use `team_spawn_agent` with `assistant_id=\"{}\"`.",
         definition.assistant_key
     );
     out.trim_end().to_owned()
