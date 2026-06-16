@@ -1077,6 +1077,64 @@ impl IAssistantOverlayRepository for EmptyAssistantOverlayRepo {
     }
 }
 
+struct SingleAssistantDefinitionRepo {
+    row: AssistantDefinitionRow,
+}
+
+#[async_trait::async_trait]
+impl IAssistantDefinitionRepository for SingleAssistantDefinitionRepo {
+    async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        Ok(vec![self.row.clone()])
+    }
+
+    async fn get_by_key(&self, assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok((self.row.assistant_key == assistant_key).then_some(self.row.clone()))
+    }
+
+    async fn get_by_definition_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+    }
+
+    async fn get_by_source_ref(
+        &self,
+        _source: &str,
+        _source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn upsert(&self, _params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
+        Err(DbError::Init("not implemented".into()))
+    }
+
+    async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+        Ok(false)
+    }
+}
+
+struct SingleAssistantOverlayRepo {
+    row: AssistantOverlayRow,
+}
+
+#[async_trait::async_trait]
+impl IAssistantOverlayRepository for SingleAssistantOverlayRepo {
+    async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+        Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+    }
+
+    async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
+        Ok(vec![self.row.clone()])
+    }
+
+    async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
+        Err(DbError::Init("not implemented".into()))
+    }
+
+    async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
+}
+
 fn setup_with_factory(factory: AgentFactory) -> (Arc<TeamSessionService>, Arc<CountingTaskManager>) {
     setup_with_factory_and_metadata(factory, Arc::new(StubAgentMetadataRepo::empty()))
 }
@@ -1128,6 +1186,48 @@ fn setup_with_factory_metadata_team_repo_and_conversation_repo(
         agent_metadata_repo,
         Arc::new(EmptyAssistantDefinitionRepo),
         Arc::new(EmptyAssistantOverlayRepo),
+        provider_repo,
+        conversation_port,
+        projection_store,
+        lookup_port,
+        broadcaster,
+        task_manager_dyn,
+        noop_turn_port(),
+        noop_cancellation_port(),
+        backend_binary_path,
+        None,
+    );
+    (svc, team_repo, task_manager, conv_repo)
+}
+
+fn setup_with_factory_metadata_assistants_and_conversation_repo(
+    factory: AgentFactory,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<CountingTaskManager>,
+    Arc<MockConversationRepo>,
+) {
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone(), broadcaster.clone()));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
+    let task_manager = Arc::new(CountingTaskManager::new(factory));
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
+    let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let svc = TeamSessionService::new(
+        team_repo_dyn,
+        agent_metadata_repo,
+        assistant_definition_repo,
+        assistant_overlay_repo,
         provider_repo,
         conversation_port,
         projection_store,
@@ -1474,6 +1574,94 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
 }
 
 #[tokio::test]
+async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+        row: AssistantDefinitionRow {
+            definition_id: "def-team-lead".into(),
+            assistant_key: "assistant-lead".into(),
+            source: "user".into(),
+            owner_type: "user".into(),
+            source_ref: None,
+            source_version: None,
+            source_hash: None,
+            name: "Lead Assistant".into(),
+            name_i18n: "{}".into(),
+            description: None,
+            description_i18n: "{}".into(),
+            avatar_type: "emoji".into(),
+            avatar_value: Some("🤖".into()),
+            agent_backend: "claude".into(),
+            rule_resource_type: "inline".into(),
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]".into(),
+            recommended_prompts_i18n: "{}".into(),
+            default_model_mode: "auto".into(),
+            default_model_value: None,
+            default_permission_mode: "auto".into(),
+            default_permission_value: None,
+            default_skills_mode: "auto".into(),
+            default_skill_ids: "[]".into(),
+            custom_skill_names: "[]".into(),
+            default_disabled_builtin_skill_ids: "[]".into(),
+            default_mcps_mode: "auto".into(),
+            default_mcp_ids: "[]".into(),
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        },
+    });
+    let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
+        row: AssistantOverlayRow {
+            definition_id: "def-team-lead".into(),
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: Some("codex".into()),
+            last_used_at: None,
+            created_at: 0,
+            updated_at: 0,
+        },
+    });
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_with_factory_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        agent_metadata_repo,
+        definition_repo,
+        overlay_repo,
+    );
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Assistant Lead".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: String::new(),
+                    model: "gpt-5".into(),
+                    assistant_id: Some("assistant-lead".into()),
+                    custom_agent_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(created.agents[0].backend, "codex");
+    let extra = conv_repo
+        .get_extra(&created.agents[0].conversation_id)
+        .expect("lead conversation extra");
+    assert_eq!(extra.get("backend").and_then(serde_json::Value::as_str), Some("codex"));
+    assert_eq!(
+        extra.get("assistant_id").and_then(serde_json::Value::as_str),
+        Some("assistant-lead")
+    );
+}
+
+#[tokio::test]
 async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
     let svc = setup_with_metadata_rows(vec![make_agent_metadata_row(
         "8e1acf31",
@@ -1518,6 +1706,103 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
         .unwrap();
 
     assert_eq!(added.icon.as_deref(), Some("/api/assets/logos/tools/coding/codex.svg"));
+}
+
+#[tokio::test]
+async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+        row: AssistantDefinitionRow {
+            definition_id: "def-team-worker".into(),
+            assistant_key: "assistant-worker".into(),
+            source: "user".into(),
+            owner_type: "user".into(),
+            source_ref: None,
+            source_version: None,
+            source_hash: None,
+            name: "Worker Assistant".into(),
+            name_i18n: "{}".into(),
+            description: None,
+            description_i18n: "{}".into(),
+            avatar_type: "emoji".into(),
+            avatar_value: Some("🤖".into()),
+            agent_backend: "claude".into(),
+            rule_resource_type: "inline".into(),
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]".into(),
+            recommended_prompts_i18n: "{}".into(),
+            default_model_mode: "auto".into(),
+            default_model_value: None,
+            default_permission_mode: "auto".into(),
+            default_permission_value: None,
+            default_skills_mode: "auto".into(),
+            default_skill_ids: "[]".into(),
+            custom_skill_names: "[]".into(),
+            default_disabled_builtin_skill_ids: "[]".into(),
+            default_mcps_mode: "auto".into(),
+            default_mcp_ids: "[]".into(),
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        },
+    });
+    let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
+        row: AssistantOverlayRow {
+            definition_id: "def-team-worker".into(),
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: Some("codex".into()),
+            last_used_at: None,
+            created_at: 0,
+            updated_at: 0,
+        },
+    });
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        agent_metadata_repo,
+        definition_repo,
+        overlay_repo,
+    );
+
+    let team = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: "claude".into(),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    custom_agent_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let added = svc
+        .add_agent(
+            "user1",
+            &team.id,
+            AddAgentRequest {
+                name: "Worker".into(),
+                role: "teammate".into(),
+                backend: String::new(),
+                model: "gpt-5".into(),
+                assistant_id: Some("assistant-worker".into()),
+                custom_agent_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(added.backend, "codex");
+    assert_eq!(added.assistant_id.as_deref(), Some("assistant-worker"));
 }
 
 #[tokio::test]

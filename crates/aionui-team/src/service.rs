@@ -120,6 +120,8 @@ impl TeamSessionService {
     pub(crate) fn provisioner(&self) -> TeamAgentProvisioner {
         TeamAgentProvisioner::new(
             self.repo.clone(),
+            self.assistant_definition_repo.clone(),
+            self.assistant_overlay_repo.clone(),
             self.provider_repo.clone(),
             self.conversation_port.clone(),
         )

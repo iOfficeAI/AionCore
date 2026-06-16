@@ -18,6 +18,7 @@ use crate::TeamMcpStdioConfig;
 pub struct TeamAgentInput {
     pub name: String,
     pub role: String,
+    #[serde(default)]
     pub backend: String,
     pub model: String,
     #[serde(default)]
@@ -61,6 +62,7 @@ pub struct RenameTeamRequest {
 pub struct AddAgentRequest {
     pub name: String,
     pub role: String,
+    #[serde(default)]
     pub backend: String,
     pub model: String,
     #[serde(default)]
@@ -488,6 +490,19 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_team_agent_input_allows_missing_backend_when_assistant_id_present() {
+        let raw = json!({
+            "name": "Lead",
+            "role": "lead",
+            "model": "claude",
+            "assistant_id": "assistant-x"
+        });
+        let input: TeamAgentInput = serde_json::from_value(raw).unwrap();
+        assert_eq!(input.backend, "");
+        assert_eq!(input.assistant_id.as_deref(), Some("assistant-x"));
+    }
+
+    #[test]
     fn deserialize_create_team_request_empty_agents() {
         let raw = json!({ "name": "Empty", "agents": [] });
         let req: CreateTeamRequest = serde_json::from_value(raw).unwrap();
@@ -576,8 +591,21 @@ mod tests {
     #[test]
     fn deserialize_add_agent_request_missing_backend() {
         let raw = json!({ "name": "X", "role": "teammate", "model": "claude" });
-        let result = serde_json::from_value::<AddAgentRequest>(raw);
-        assert!(result.is_err());
+        let req = serde_json::from_value::<AddAgentRequest>(raw).unwrap();
+        assert_eq!(req.backend, "");
+    }
+
+    #[test]
+    fn deserialize_add_agent_request_allows_missing_backend_when_assistant_id_present() {
+        let raw = json!({
+            "name": "X",
+            "role": "teammate",
+            "model": "claude",
+            "assistant_id": "assistant-1"
+        });
+        let req = serde_json::from_value::<AddAgentRequest>(raw).unwrap();
+        assert_eq!(req.backend, "");
+        assert_eq!(req.assistant_id.as_deref(), Some("assistant-1"));
     }
 
     #[test]

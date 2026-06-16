@@ -4,7 +4,9 @@ use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{AddAgentRequest, TeamAgentInput};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::TeamRow;
-use aionui_db::{IProviderRepository, ITeamRepository, UpdateTeamParams};
+use aionui_db::{
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository, ITeamRepository, UpdateTeamParams,
+};
 use async_trait::async_trait;
 use tracing::{info, warn};
 
@@ -18,6 +20,8 @@ use crate::workspace::TeamWorkspaceResolver;
 #[derive(Clone)]
 pub struct TeamAgentProvisioner {
     repo: Arc<dyn ITeamRepository>,
+    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
     provider_repo: Arc<dyn IProviderRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
 }
@@ -106,11 +110,15 @@ impl TeamAgentProvisioner {
 
     pub(crate) fn new(
         repo: Arc<dyn ITeamRepository>,
+        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
         conversation_port: Arc<dyn TeamConversationProvisioningPort>,
     ) -> Self {
         Self {
             repo,
+            assistant_definition_repo,
+            assistant_overlay_repo,
             provider_repo,
             conversation_port,
         }
@@ -133,6 +141,13 @@ impl TeamAgentProvisioner {
 
         let leader_slot_id = generate_id();
         let leader_role = TeammateRole::Lead;
+        let leader_assistant_id = Self::effective_assistant_id(
+            leader_input.assistant_id.as_deref(),
+            leader_input.custom_agent_id.as_deref(),
+        );
+        let leader_backend = self
+            .resolve_requested_backend(leader_input.backend.as_str(), leader_assistant_id.as_deref())
+            .await?;
         let leader_conversation = self
             .create_or_adopt_conversation(
                 user_id,
@@ -140,13 +155,9 @@ impl TeamAgentProvisioner {
                 &leader_slot_id,
                 leader_role,
                 &leader_input.name,
-                &leader_input.backend,
+                &leader_backend,
                 &leader_input.model,
-                Self::effective_assistant_id(
-                    leader_input.assistant_id.as_deref(),
-                    leader_input.custom_agent_id.as_deref(),
-                )
-                .as_deref(),
+                leader_assistant_id.as_deref(),
                 leader_input.conversation_id.as_deref(),
                 shared_workspace,
             )
@@ -170,12 +181,9 @@ impl TeamAgentProvisioner {
             name: leader_input.name.clone(),
             role: leader_role,
             conversation_id: leader_conversation.conversation_id,
-            backend: leader_input.backend.clone(),
+            backend: leader_backend,
             model: leader_input.model.clone(),
-            assistant_id: Self::effective_assistant_id(
-                leader_input.assistant_id.as_deref(),
-                leader_input.custom_agent_id.as_deref(),
-            ),
+            assistant_id: leader_assistant_id,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -184,6 +192,11 @@ impl TeamAgentProvisioner {
         for input in teammate_inputs {
             let slot_id = generate_id();
             let role = TeammateRole::parse(&input.role).unwrap_or(TeammateRole::Teammate);
+            let assistant_id =
+                Self::effective_assistant_id(input.assistant_id.as_deref(), input.custom_agent_id.as_deref());
+            let backend = self
+                .resolve_requested_backend(input.backend.as_str(), assistant_id.as_deref())
+                .await?;
             let conversation = self
                 .create_or_adopt_conversation(
                     user_id,
@@ -191,10 +204,9 @@ impl TeamAgentProvisioner {
                     &slot_id,
                     role,
                     &input.name,
-                    &input.backend,
+                    &backend,
                     &input.model,
-                    Self::effective_assistant_id(input.assistant_id.as_deref(), input.custom_agent_id.as_deref())
-                        .as_deref(),
+                    assistant_id.as_deref(),
                     input.conversation_id.as_deref(),
                     Some(&team_workspace),
                 )
@@ -204,12 +216,9 @@ impl TeamAgentProvisioner {
                 name: input.name.clone(),
                 role,
                 conversation_id: conversation.conversation_id,
-                backend: input.backend.clone(),
+                backend,
                 model: input.model.clone(),
-                assistant_id: Self::effective_assistant_id(
-                    input.assistant_id.as_deref(),
-                    input.custom_agent_id.as_deref(),
-                ),
+                assistant_id,
                 status: None,
                 conversation_type: None,
                 cli_path: None,
@@ -243,21 +252,53 @@ impl TeamAgentProvisioner {
     ) -> Result<TeamAgent, TeamError> {
         let role = TeammateRole::parse(&req.role).unwrap_or(TeammateRole::Teammate);
         let workspace = self.workspace_resolver().resolve_for_new_agent(row, team).await?;
+        let assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref(), req.custom_agent_id.as_deref());
+        let backend = self
+            .resolve_requested_backend(req.backend.as_str(), assistant_id.as_deref())
+            .await?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
                 user_id: user_id.to_owned(),
                 team_id: team.id.clone(),
                 name: req.name,
                 role,
-                backend: req.backend,
+                backend,
                 model: req.model,
-                assistant_id: Self::effective_assistant_id(req.assistant_id.as_deref(), req.custom_agent_id.as_deref()),
+                assistant_id,
                 workspace: Some(workspace),
             })
             .await?;
         team.agents.push(agent.clone());
         self.persist_agents(&team.id, &team.agents).await?;
         Ok(agent)
+    }
+
+    async fn resolve_requested_backend(
+        &self,
+        requested_backend: &str,
+        assistant_id: Option<&str>,
+    ) -> Result<String, TeamError> {
+        let requested_backend = requested_backend.trim();
+        if !requested_backend.is_empty() {
+            return Ok(requested_backend.to_owned());
+        }
+
+        let Some(assistant_key) = assistant_id.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Err(TeamError::InvalidRequest(
+                "backend is required when assistant_id is absent".into(),
+            ));
+        };
+
+        let definition = self
+            .assistant_definition_repo
+            .get_by_key(assistant_key)
+            .await?
+            .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_key}")))?;
+        let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+        Ok(overlay
+            .and_then(|row| row.agent_backend_override)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(definition.agent_backend))
     }
 
     pub(crate) async fn persist_spawned_agent(
