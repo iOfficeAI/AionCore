@@ -5,7 +5,7 @@ use std::time::Duration;
 use aionui_ai_agent::task_manager::IWorkerTaskManager;
 use aionui_ai_agent::types::SendMessageData;
 use aionui_ai_agent::{AgentRegistry, AgentStreamEvent};
-use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
+use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, SendMessageRequest};
 use aionui_common::{
     AgentType, ProviderWithModel, WorkspacePathValidationError, now_ms, validate_workspace_path_availability,
 };
@@ -435,7 +435,7 @@ impl JobExecutor {
             r#type: agent_type,
             name: Some(job.name.clone()),
             model,
-            assistant: None,
+            assistant: build_assistant_request(job),
             source: None,
             channel_chat_id: None,
             extra,
@@ -1095,6 +1095,28 @@ fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> Strin
     }
 }
 
+fn build_assistant_request(job: &CronJob) -> Option<AssistantConversationRequest> {
+    let config = job.agent_config.as_ref()?;
+    let assistant_id = config
+        .assistant_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            config
+                .custom_agent_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+        })?;
+
+    Some(AssistantConversationRequest {
+        id: assistant_id,
+        locale: None,
+        conversation_overrides: None,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SavedSkillContext {
     name: String,
@@ -1129,30 +1151,6 @@ async fn build_conversation_extra(
         }
         if !config.name.is_empty() {
             extra.insert("agent_name".to_owned(), serde_json::Value::String(config.name.clone()));
-        }
-        if let Some(assistant_id) = &config.assistant_id {
-            extra.insert(
-                "assistant_id".to_owned(),
-                serde_json::Value::String(assistant_id.clone()),
-            );
-            if config.is_preset.unwrap_or(false) {
-                extra.insert(
-                    "preset_assistant_id".to_owned(),
-                    serde_json::Value::String(assistant_id.clone()),
-                );
-            }
-        }
-        if let Some(custom_agent_id) = &config.custom_agent_id {
-            extra.insert(
-                "custom_agent_id".to_owned(),
-                serde_json::Value::String(custom_agent_id.clone()),
-            );
-            if config.is_preset.unwrap_or(false) {
-                extra.insert(
-                    "preset_assistant_id".to_owned(),
-                    serde_json::Value::String(custom_agent_id.clone()),
-                );
-            }
         }
         if let Some(mode) = &config.mode {
             extra.insert("session_mode".to_owned(), serde_json::Value::String(mode.clone()));
@@ -1717,7 +1715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_conversation_extra_writes_assistant_identity_for_preset_jobs() {
+    async fn build_conversation_extra_omits_legacy_assistant_identity_fields_for_new_conversations() {
         let registry = hydrated_registry().await;
         let mut job = sample_job();
         let config = job.agent_config.as_mut().expect("sample job should carry config");
@@ -1727,9 +1725,23 @@ mod tests {
 
         let extra = build_conversation_extra(&registry, &job, None).await;
 
-        assert_eq!(extra["assistant_id"], "assistant-preset");
-        assert_eq!(extra["preset_assistant_id"], "assistant-preset");
+        assert!(extra.get("assistant_id").is_none());
+        assert!(extra.get("preset_assistant_id").is_none());
         assert!(extra.get("custom_agent_id").is_none());
+    }
+
+    #[test]
+    fn build_assistant_request_uses_legacy_custom_agent_id_when_assistant_id_missing() {
+        let mut job = sample_job();
+        let config = job.agent_config.as_mut().expect("sample job should carry config");
+        config.assistant_id = None;
+        config.custom_agent_id = Some("custom-assistant".into());
+
+        let assistant = build_assistant_request(&job).expect("legacy custom assistant should map to request");
+
+        assert_eq!(assistant.id, "custom-assistant");
+        assert!(assistant.locale.is_none());
+        assert!(assistant.conversation_overrides.is_none());
     }
 
     #[tokio::test]
