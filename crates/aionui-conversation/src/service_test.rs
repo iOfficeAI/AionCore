@@ -4083,8 +4083,9 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     let resp = svc.create("user-1", req).await.unwrap();
 
     assert_eq!(resp.extra["assistant_id"], json!("preset-1"));
-    assert_eq!(resp.extra["preset_assistant_id"], json!("preset-1"));
-    assert_eq!(resp.extra["preset_context"], json!("assistant rule body"));
+    assert!(resp.extra.get("preset_assistant_id").is_none());
+    assert!(resp.extra.get("preset_context").is_none());
+    assert!(resp.extra.get("preset_rules").is_none());
     assert_eq!(resp.extra["session_mode"], json!("workspace-write"));
     assert_eq!(resp.extra["current_mode_id"], json!("workspace-write"));
     assert_eq!(resp.extra["current_model_id"], json!("new-model"));

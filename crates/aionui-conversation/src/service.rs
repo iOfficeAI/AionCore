@@ -654,10 +654,6 @@ impl ConversationService {
                 "assistant_id".to_owned(),
                 serde_json::Value::String(snapshot.assistant_id.clone()),
             );
-            obj.insert(
-                "preset_assistant_id".to_owned(),
-                serde_json::Value::String(snapshot.assistant_id.clone()),
-            );
             if !snapshot.agent_backend.is_empty() && !obj.contains_key("backend") {
                 obj.insert(
                     "backend".to_owned(),
@@ -675,16 +671,6 @@ impl ConversationService {
                 obj.insert(
                     "agent_source".to_owned(),
                     serde_json::Value::String(agent_source.clone()),
-                );
-            }
-            if !snapshot.rules.content.is_empty() {
-                obj.insert(
-                    "preset_context".to_owned(),
-                    serde_json::Value::String(snapshot.rules.content.clone()),
-                );
-                obj.insert(
-                    "preset_rules".to_owned(),
-                    serde_json::Value::String(snapshot.rules.content.clone()),
                 );
             }
             if let Some(model_id) = snapshot.resolved_defaults.model.as_ref()

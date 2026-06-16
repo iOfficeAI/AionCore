@@ -224,9 +224,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
                     "mcp_ids": ["override-mcp"]
                 }
             },
-            "extra": {
-                "preset_assistant_id": "u1"
-            }
+            "extra": {}
         }),
         &token,
         &csrf,
@@ -237,8 +235,9 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
     let json = body_json(resp).await;
     let data = &json["data"];
     assert_eq!(data["extra"]["assistant_id"], "u1");
-    assert_eq!(data["extra"]["preset_assistant_id"], "u1");
-    assert_eq!(data["extra"]["preset_context"], "assistant snapshot rule");
+    assert!(data["extra"].get("preset_assistant_id").is_none());
+    assert!(data["extra"].get("preset_context").is_none());
+    assert!(data["extra"].get("preset_rules").is_none());
     assert_eq!(data["extra"]["session_mode"], "workspace-write");
     assert_eq!(data["extra"]["current_mode_id"], "workspace-write");
     assert_eq!(data["extra"]["current_model_id"], "override-model");
