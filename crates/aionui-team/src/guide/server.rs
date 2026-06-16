@@ -179,7 +179,7 @@ fn build_create_team_handoff_next_step(summary: &str) -> String {
 
 const NO_ACTIVE_TEAM_RUN_FOR_RUN_SCOPED_WAKE: &str = "no active team run for run-scoped wake";
 const GUIDE_NO_ACTIVE_TEAM_RUN_HANDOFF_ERROR: &str =
-    "Team was created, but no TeamRun is active yet. End this solo turn and continue from the Team page.";
+    "Team was created, but no TeamRun is active yet. Open the team chat and continue from there.";
 
 fn is_run_scoped_guide_team_tool(tool_name: &str) -> bool {
     matches!(
@@ -493,9 +493,21 @@ mod tests {
 
         assert_eq!(
             error,
-            "Team was created, but no TeamRun is active yet. End this solo turn and continue from the Team page."
+            "Team was created, but no TeamRun is active yet. Open the team chat and continue from there."
         );
         assert!(!error.contains("no active team run for run-scoped wake"));
+    }
+
+    #[test]
+    fn guide_handoff_guard_is_not_a_correctness_api() {
+        assert!(is_run_scoped_guide_team_tool("team_send_message"));
+        let response = guide_no_active_team_run_handoff_response();
+        let text = serde_json::to_string(&response).unwrap();
+        assert!(text.contains("Open the team chat"));
+        assert!(
+            !text.contains("correctness"),
+            "guide handoff text must stay user-facing and not document concurrency guarantees"
+        );
     }
 
     #[tokio::test]

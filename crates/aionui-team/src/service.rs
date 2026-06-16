@@ -877,23 +877,6 @@ impl TeamSessionService {
         Ok(())
     }
 
-    pub(crate) async fn wake_agent_for_team_work(
-        &self,
-        team_id: &str,
-        slot_id: &str,
-        source: TeamWakeSource,
-        trigger_message_id: Option<String>,
-    ) -> Result<(), TeamError> {
-        let entry = self
-            .sessions
-            .get(team_id)
-            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-        entry
-            .session
-            .wake_agent_for_team_work(slot_id, source, trigger_message_id)
-            .await
-    }
-
     pub async fn send_agent_message_from_agent(
         &self,
         team_id: &str,
@@ -952,6 +935,10 @@ impl TeamSessionService {
             .notify_reserved_wake_for_team_work(slot_id, target_role, source);
     }
 
+    /// Friendly pre-check used by Guide MCP to return handoff copy before invoking
+    /// run-scoped team tools. This is not a concurrency guarantee; any operation
+    /// that writes mailbox, projection, scheduler, spawn, shutdown, or wake state
+    /// must still acquire a TeamRun operation lease in TeamSession/TeamRunManager.
     pub(crate) async fn require_active_team_run_for_team_work(&self, team_id: &str) -> Result<(), TeamError> {
         let entry = self
             .sessions

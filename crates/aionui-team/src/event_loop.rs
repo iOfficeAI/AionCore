@@ -402,7 +402,7 @@ async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, input: &crat
             if wake_target != ctx.slot_id
                 && let Err(e) = ctx
                     .session
-                    .wake_agent_for_team_work(&wake_target, TeamWakeSource::IdleNotification, None)
+                    .scheduler_wake_agent_for_team_work(&wake_target, TeamWakeSource::IdleNotification)
                     .await
             {
                 warn!(

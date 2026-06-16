@@ -45,6 +45,16 @@ struct NewAgentProvisioning {
     workspace: Option<String>,
 }
 
+pub(crate) struct PersistSpawnedAgentRequest {
+    pub user_id: String,
+    pub team_id: String,
+    pub slot_id: String,
+    pub name: String,
+    pub backend: String,
+    pub model: String,
+    pub custom_agent_id: Option<String>,
+}
+
 pub struct TeamConversationCreateRequest {
     pub user_id: String,
     pub agent_type: AgentType,
@@ -238,38 +248,29 @@ impl TeamAgentProvisioner {
         Ok(agent)
     }
 
-    pub(crate) async fn persist_spawned_agent(
-        &self,
-        user_id: &str,
-        team_id: &str,
-        slot_id: String,
-        name: String,
-        backend: String,
-        model: String,
-        custom_agent_id: Option<String>,
-    ) -> Result<TeamAgent, TeamError> {
+    pub(crate) async fn persist_spawned_agent(&self, req: PersistSpawnedAgentRequest) -> Result<TeamAgent, TeamError> {
         let row = self
             .repo
-            .get_team(team_id)
+            .get_team(&req.team_id)
             .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+            .ok_or_else(|| TeamError::TeamNotFound(req.team_id.clone()))?;
         let mut team = Team::from_row(&row)?;
         let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
-                user_id: user_id.to_owned(),
-                team_id: team_id.to_owned(),
-                slot_id,
-                name,
+                user_id: req.user_id,
+                team_id: req.team_id.clone(),
+                slot_id: req.slot_id,
+                name: req.name,
                 role: TeammateRole::Teammate,
-                backend,
-                model,
-                custom_agent_id,
+                backend: req.backend,
+                model: req.model,
+                custom_agent_id: req.custom_agent_id,
                 workspace: Some(workspace),
             })
             .await?;
         team.agents.push(agent.clone());
-        self.persist_agents(team_id, &team.agents).await?;
+        self.persist_agents(&req.team_id, &team.agents).await?;
         Ok(agent)
     }
 

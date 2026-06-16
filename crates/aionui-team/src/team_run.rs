@@ -14,7 +14,9 @@ use crate::events::{
     TEAM_RUN_ACCEPTED_EVENT, TEAM_RUN_CANCELLED_EVENT, TEAM_RUN_COMPLETED_EVENT, TEAM_RUN_FAILED_EVENT,
     TEAM_RUN_STARTED_EVENT, TEAM_RUN_UPDATED_EVENT, TeamEventEmitter,
 };
-use crate::slot_wake_gate::{SlotWakeGate, WakeGateDecision};
+use crate::slot_wake_gate::SlotWakeGate;
+#[cfg(test)]
+use crate::slot_wake_gate::WakeGateDecision;
 use crate::types::TeammateRole;
 use crate::wake::TeamWakeSource;
 
@@ -66,6 +68,7 @@ pub enum ChildCancelTarget {
     Starting(StartingChildReservation),
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WakeRecordDecision {
     Recorded,
@@ -180,13 +183,12 @@ impl TeamRunRecord {
     }
 
     fn has_spawn_welcome_for_slot(&self, slot_id: &str) -> bool {
-        self.pending_wakes.get(slot_id).is_some_and(|wakes| {
-            wakes
-                .iter()
-                .any(|wake| wake.source == TeamWakeSource::SpawnWelcome)
-        }) || self.active_operation_leases.values().any(|active| {
-            active.lease.slot_id == slot_id && active.lease.wake_source == TeamWakeSource::SpawnWelcome
-        })
+        self.pending_wakes
+            .get(slot_id)
+            .is_some_and(|wakes| wakes.iter().any(|wake| wake.source == TeamWakeSource::SpawnWelcome))
+            || self.active_operation_leases.values().any(|active| {
+                active.lease.slot_id == slot_id && active.lease.wake_source == TeamWakeSource::SpawnWelcome
+            })
     }
 
     fn role_for_slot(&self, slot_id: &str) -> Option<TeamRunTargetRole> {
@@ -305,12 +307,8 @@ fn new_operation_lease(
         wake_source,
         accepted_as_new_run,
     };
-    run.active_operation_leases.insert(
-        lease.lease_id.clone(),
-        ActiveOperationLease {
-            lease: lease.clone(),
-        },
-    );
+    run.active_operation_leases
+        .insert(lease.lease_id.clone(), ActiveOperationLease { lease: lease.clone() });
     lease
 }
 
@@ -363,12 +361,8 @@ fn acquire_policy(
         }
         TeamWakeSource::McpShutdownRequest => AcquirePolicyDecision::Accept,
         TeamWakeSource::IdleNotification | TeamWakeSource::InterruptedNotification => match slot_state {
-            TeamRunSlotState::Idle if intent == TeamRunWakeIntent::SchedulerWakeTarget => {
-                AcquirePolicyDecision::Accept
-            }
-            TeamRunSlotState::Idle => {
-                AcquirePolicyDecision::Suppress("background_notification_without_wake_target")
-            }
+            TeamRunSlotState::Idle if intent == TeamRunWakeIntent::SchedulerWakeTarget => AcquirePolicyDecision::Accept,
+            TeamRunSlotState::Idle => AcquirePolicyDecision::Suppress("background_notification_without_wake_target"),
             TeamRunSlotState::Busy | TeamRunSlotState::Pending | TeamRunSlotState::Paused => {
                 AcquirePolicyDecision::Suppress("background_notification_deduped")
             }
@@ -531,13 +525,7 @@ impl TeamRunManager {
             slot_wake_gate: SlotWakeGate::default(),
             active_operation_leases: HashMap::new(),
         };
-        let lease = new_operation_lease(
-            &mut record,
-            slot_id,
-            role.clone(),
-            TeamWakeSource::UserMessage,
-            true,
-        );
+        let lease = new_operation_lease(&mut record, slot_id, role.clone(), TeamWakeSource::UserMessage, true);
         let ack = record.ack(slot_id, role, None);
         let payload = record.payload();
         *guard = Some(record);
@@ -678,12 +666,7 @@ impl TeamRunManager {
         };
 
         let slot_state = run.slot_run_state(slot_id);
-        let decision = acquire_policy(
-            source,
-            slot_state,
-            run.has_spawn_welcome_for_slot(slot_id),
-            intent,
-        );
+        let decision = acquire_policy(source, slot_state, run.has_spawn_welcome_for_slot(slot_id), intent);
         match decision {
             AcquirePolicyDecision::RejectSlotBusy => Err(TeamError::SlotBusy(slot_id.to_owned())),
             AcquirePolicyDecision::RejectInvalid(message) => Err(TeamError::InvalidRequest(message.into())),
@@ -827,6 +810,7 @@ impl TeamRunManager {
             .map(|_| ())
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_or_suppress_wake(
         &self,
         slot_id: &str,
@@ -1686,10 +1670,7 @@ mod tests {
 
         let completed = manager.maybe_complete().await;
         assert!(completed.is_none(), "active lease must retain the run");
-        assert_eq!(
-            manager.active_run_id().await.as_deref(),
-            Some(ack.team_run_id.as_str())
-        );
+        assert_eq!(manager.active_run_id().await.as_deref(), Some(ack.team_run_id.as_str()));
 
         manager
             .commit_operation_lease(&lease.lease_id, Some("mailbox-1".into()))
@@ -1749,11 +1730,7 @@ mod tests {
         let (manager, _bc) = manager();
 
         let err = manager
-            .acquire_run_scoped_wake(
-                "worker",
-                TeamRunTargetRole::Teammate,
-                TeamWakeSource::McpSendMessage,
-            )
+            .acquire_run_scoped_wake("worker", TeamRunTargetRole::Teammate, TeamWakeSource::McpSendMessage)
             .await
             .expect_err("run-scoped wake must need active run");
 
@@ -1888,10 +1865,7 @@ mod tests {
             .await
             .expect("paused background wake suppresses cleanly");
         assert_eq!(outcome, TeamRunWakeAcquireOutcome::Suppressed);
-        assert_eq!(
-            manager.active_run_id().await.as_deref(),
-            Some(ack.team_run_id.as_str())
-        );
+        assert_eq!(manager.active_run_id().await.as_deref(), Some(ack.team_run_id.as_str()));
     }
 
     #[tokio::test]
@@ -1903,11 +1877,7 @@ mod tests {
             .unwrap();
 
         let first = manager
-            .acquire_run_scoped_wake(
-                "new-worker",
-                TeamRunTargetRole::Teammate,
-                TeamWakeSource::SpawnWelcome,
-            )
+            .acquire_run_scoped_wake("new-worker", TeamRunTargetRole::Teammate, TeamWakeSource::SpawnWelcome)
             .await
             .unwrap();
         let TeamRunWakeAcquireOutcome::Accepted(first) = first else {
@@ -1919,11 +1889,7 @@ mod tests {
             .unwrap();
 
         let second = manager
-            .acquire_run_scoped_wake(
-                "new-worker",
-                TeamRunTargetRole::Teammate,
-                TeamWakeSource::SpawnWelcome,
-            )
+            .acquire_run_scoped_wake("new-worker", TeamRunTargetRole::Teammate, TeamWakeSource::SpawnWelcome)
             .await
             .unwrap();
         assert_eq!(second, TeamRunWakeAcquireOutcome::Suppressed);
@@ -1938,11 +1904,7 @@ mod tests {
             .unwrap();
 
         let outcome = manager
-            .acquire_run_scoped_wake(
-                "worker",
-                TeamRunTargetRole::Teammate,
-                TeamWakeSource::IdleNotification,
-            )
+            .acquire_run_scoped_wake("worker", TeamRunTargetRole::Teammate, TeamWakeSource::IdleNotification)
             .await
             .expect("generic idle notification should suppress cleanly");
 
@@ -1958,11 +1920,7 @@ mod tests {
             .unwrap();
 
         let outcome = manager
-            .acquire_scheduler_wake(
-                "worker",
-                TeamRunTargetRole::Teammate,
-                TeamWakeSource::IdleNotification,
-            )
+            .acquire_scheduler_wake("worker", TeamRunTargetRole::Teammate, TeamWakeSource::IdleNotification)
             .await
             .expect("scheduler-produced wake target should be accepted");
         let TeamRunWakeAcquireOutcome::Accepted(lease) = outcome else {
