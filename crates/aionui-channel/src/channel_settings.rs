@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use aionui_api_types::{ChannelAssistantSetting, ChannelDefaultModelSetting, ChannelPlatformSettingsResponse};
 use aionui_common::ProviderWithModel;
 use aionui_db::IClientPreferenceRepository;
 use tracing::debug;
@@ -111,6 +112,54 @@ impl ChannelSettingsService {
             use_model,
         }))
     }
+
+    pub async fn get_platform_settings(
+        &self,
+        platform: PluginType,
+    ) -> Result<ChannelPlatformSettingsResponse, ChannelError> {
+        let key_agent = agent_key(platform);
+        let key_model = model_key(platform);
+        let prefs = self.pref_repo.get_by_keys(&[&key_agent, &key_model]).await?;
+
+        let mut assistant = None;
+        let mut default_model = None;
+
+        for pref in prefs {
+            if pref.key == key_agent {
+                assistant = parse_channel_assistant_setting(&pref.value);
+            } else if pref.key == key_model {
+                default_model = parse_channel_model_setting(&pref.value);
+            }
+        }
+
+        Ok(ChannelPlatformSettingsResponse {
+            platform: platform.to_string(),
+            assistant,
+            default_model,
+        })
+    }
+
+    pub async fn set_assistant_setting(
+        &self,
+        platform: PluginType,
+        assistant: &ChannelAssistantSetting,
+    ) -> Result<(), ChannelError> {
+        let payload = serde_json::to_string(assistant).map_err(ChannelError::Json)?;
+        let key = agent_key(platform);
+        self.pref_repo.upsert_batch(&[(&key, payload.as_str())]).await?;
+        Ok(())
+    }
+
+    pub async fn set_model_setting(
+        &self,
+        platform: PluginType,
+        model: &ChannelDefaultModelSetting,
+    ) -> Result<(), ChannelError> {
+        let payload = serde_json::to_string(model).map_err(ChannelError::Json)?;
+        let key = model_key(platform);
+        self.pref_repo.upsert_batch(&[(&key, payload.as_str())]).await?;
+        Ok(())
+    }
 }
 
 fn agent_key(platform: PluginType) -> String {
@@ -126,6 +175,35 @@ fn default_agent_config() -> ResolvedAgentConfig {
         agent_type: DEFAULT_AGENT_TYPE.to_owned(),
         backend: None,
     }
+}
+
+fn parse_channel_assistant_setting(value: &str) -> Option<ChannelAssistantSetting> {
+    let parsed: serde_json::Value = serde_json::from_str(value).ok()?;
+
+    if let Some(raw) = parsed.as_str() {
+        return Some(ChannelAssistantSetting {
+            assistant_id: None,
+            custom_agent_id: None,
+            backend: Some(raw.to_owned()),
+            agent_type: Some(backend_to_agent_type(raw)),
+            name: None,
+        });
+    }
+
+    Some(ChannelAssistantSetting {
+        assistant_id: parsed["assistant_id"].as_str().map(|s| s.to_owned()),
+        custom_agent_id: parsed["custom_agent_id"].as_str().map(|s| s.to_owned()),
+        backend: parsed["backend"].as_str().map(|s| s.to_owned()),
+        agent_type: parsed["agent_type"].as_str().map(|s| s.to_owned()),
+        name: parsed["name"].as_str().map(|s| s.to_owned()),
+    })
+}
+
+fn parse_channel_model_setting(value: &str) -> Option<ChannelDefaultModelSetting> {
+    let parsed: serde_json::Value = serde_json::from_str(value).ok()?;
+    let id = parsed["id"].as_str()?.to_owned();
+    let use_model = parsed["use_model"].as_str()?.to_owned();
+    Some(ChannelDefaultModelSetting { id, use_model })
 }
 
 /// Maps a backend identifier to the corresponding `AgentType` serde name.

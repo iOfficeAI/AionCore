@@ -87,6 +87,41 @@ pub struct SyncChannelSettingsRequest {
     pub platform: String,
 }
 
+/// Assistant binding for a channel platform.
+///
+/// Stored as backend-owned business data and used to resolve which assistant
+/// should handle new inbound channel conversations for a given platform.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelAssistantSetting {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Default model reference for a channel platform.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelDefaultModelSetting {
+    pub id: String,
+    pub use_model: String,
+}
+
+/// Aggregated settings payload for one channel platform.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelPlatformSettingsResponse {
+    pub platform: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant: Option<ChannelAssistantSetting>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<ChannelDefaultModelSetting>,
+}
+
 // ---------------------------------------------------------------------------
 // E. Plugin management — Response DTOs
 // ---------------------------------------------------------------------------

@@ -313,6 +313,92 @@ async fn get_sessions_empty() {
 // §5 Settings sync
 // ===========================================================================
 
+#[tokio::test]
+async fn get_channel_settings_returns_empty_payload_by_default() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = get_with_token("/api/channel/settings/telegram", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert!(json["success"].as_bool().unwrap());
+    assert_eq!(json["data"]["platform"], "telegram");
+    assert!(json["data"]["assistant"].is_null());
+    assert!(json["data"]["default_model"].is_null());
+}
+
+#[tokio::test]
+async fn put_channel_assistant_setting_persists_binding() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "PUT",
+        "/api/channel/settings/telegram/assistant",
+        json!({
+            "assistant_id": "bare-claude",
+            "custom_agent_id": "bare-claude",
+            "backend": "claude",
+            "agent_type": "acp",
+            "name": "Claude",
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = get_with_token("/api/channel/settings/telegram", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["data"]["assistant"],
+        json!({
+            "assistant_id": "bare-claude",
+            "custom_agent_id": "bare-claude",
+            "backend": "claude",
+            "agent_type": "acp",
+            "name": "Claude",
+        })
+    );
+}
+
+#[tokio::test]
+async fn put_channel_default_model_setting_persists_model_ref() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "PUT",
+        "/api/channel/settings/lark/default-model",
+        json!({
+            "id": "provider-1",
+            "use_model": "gemini-2.5-pro",
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = get_with_token("/api/channel/settings/lark", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["data"]["default_model"],
+        json!({
+            "id": "provider-1",
+            "use_model": "gemini-2.5-pro",
+        })
+    );
+}
+
 // SS-1: Sync valid platform clears sessions
 #[tokio::test]
 async fn sync_settings_valid() {
