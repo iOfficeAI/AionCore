@@ -5,6 +5,7 @@ use std::{
 
 use aionui_api_types::{ConversationRuntimeStateKind, ConversationRuntimeSummary};
 use aionui_common::ConversationStatus;
+use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::ConversationError;
@@ -12,6 +13,7 @@ use crate::ConversationError;
 #[derive(Debug, Default)]
 pub struct ConversationRuntimeStateService {
     state: Mutex<ConversationRuntimeState>,
+    release_notify: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +112,16 @@ impl ConversationRuntimeStateService {
             .lock()
             .ok()
             .and_then(|state| state.active_turns.get(conversation_id).cloned())
+    }
+
+    pub async fn wait_until_unclaimed(&self, conversation_id: &str) {
+        loop {
+            let notified = self.release_notify.notified();
+            if !self.is_claimed(conversation_id) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn mark_deleting(&self, conversation_id: &str) -> bool {
@@ -305,6 +317,8 @@ impl ConversationRuntimeStateService {
                     deleting = was_deleting,
                     "conversation runtime turn claim released"
                 );
+                drop(state);
+                self.release_notify.notify_waiters();
                 was_deleting
             }
             Err(_) => {
@@ -415,6 +429,39 @@ mod tests {
 
         assert!(!state.is_claimed("conv-1"));
         assert!(state.try_claim_turn("conv-1", "turn-2").is_ok());
+    }
+
+    #[tokio::test]
+    async fn wait_until_unclaimed_completes_after_active_claim_releases() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let mut claim = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect("claim should be created");
+
+        let waiter = {
+            let state = state.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                state.wait_until_unclaimed("conv-1").await;
+                let _ = tx.send(());
+            });
+            rx
+        };
+        tokio::pin!(waiter);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err(),
+            "waiter must stay pending while the claim is active"
+        );
+
+        let _ = claim.release();
+        assert!(!state.is_claimed("conv-1"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter)
+            .await
+            .expect("waiter should finish after release")
+            .expect("waiter task should send completion");
     }
 
     #[test]

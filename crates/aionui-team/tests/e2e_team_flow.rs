@@ -21,7 +21,6 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -123,45 +122,22 @@ impl AgentTurnExecutionPort for ErrorBeforeStartTurnPort {
 }
 
 #[derive(Default)]
-struct SkippedOnceThenSuccessTurnPort {
-    attempts: AtomicUsize,
+struct SkippedBusyTurnPort {
     requests: Arc<Mutex<Vec<AgentTurnRequest>>>,
 }
 
-impl SkippedOnceThenSuccessTurnPort {
+impl SkippedBusyTurnPort {
     fn requests(&self) -> Arc<Mutex<Vec<AgentTurnRequest>>> {
         self.requests.clone()
     }
 }
 
 #[async_trait]
-impl AgentTurnExecutionPort for SkippedOnceThenSuccessTurnPort {
+impl AgentTurnExecutionPort for SkippedBusyTurnPort {
     async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
-        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
         self.requests.lock().unwrap().push(request.clone());
-        if attempt == 0 {
-            return Err(AgentTurnExecutionError::Skipped {
-                reason: format!("conversation {} is already running", request.conversation_id),
-            });
-        }
-
-        let turn_id = format!("turn-retry-{attempt}");
-        if let (Some(team_run_id), Some(on_started)) = (request.team_run_id.clone(), request.on_started.as_ref()) {
-            on_started(AgentTurnStarted {
-                team_run_id,
-                slot_id: request.slot_id.clone(),
-                role: request.role.clone(),
-                conversation_id: request.conversation_id.clone(),
-                turn_id: turn_id.clone(),
-            })
-            .await;
-        }
-
-        Ok(AgentTurnOutcome {
-            conversation_id: request.conversation_id,
-            turn_id,
-            status: AgentTurnStatus::Completed,
-            runtime: None,
+        Err(AgentTurnExecutionError::Skipped {
+            reason: format!("conversation {} is already running", request.conversation_id),
         })
     }
 }
@@ -1649,9 +1625,9 @@ async fn s9b_event_loop_fails_run_when_turn_errors_before_started() {
 }
 
 #[tokio::test]
-async fn s9b_retryable_busy_before_start_retains_team_run_for_retry() {
+async fn s9b_retryable_busy_before_start_retains_team_run_without_timer_retry() {
     let broadcaster = Arc::new(RecordingBroadcaster::new());
-    let turn_port = Arc::new(SkippedOnceThenSuccessTurnPort::default());
+    let turn_port = Arc::new(SkippedBusyTurnPort::default());
     let requests = turn_port.requests();
     let session =
         setup_session_with_runtime_ports(turn_port, Arc::new(NoopCancellationPort), broadcaster.clone()).await;
@@ -1661,22 +1637,34 @@ async fn s9b_retryable_busy_before_start_retains_team_run_for_retry() {
         .await
         .expect("send_message must succeed");
 
-    wait_for_turn_request_count(&requests, 2).await;
+    wait_for_turn_request_count(&requests, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
     let request_log = requests.lock().unwrap();
     let first_team_run_id = request_log[0]
         .team_run_id
         .as_deref()
-        .expect("first attempt should belong to TeamRun");
-    let second_team_run_id = request_log[1]
-        .team_run_id
-        .as_deref()
-        .expect("retry must still belong to TeamRun");
-    assert_eq!(second_team_run_id, first_team_run_id);
+        .expect("first attempt should belong to TeamRun")
+        .to_owned();
+    assert_eq!(
+        request_log.len(),
+        1,
+        "Team event loop should not use a timer to retry retryable busy skips"
+    );
+    drop(request_log);
+
     assert_eq!(
         session.team_run_manager().active_run_id().await,
-        None,
-        "run should complete after the retry succeeds"
+        Some(first_team_run_id.clone()),
+        "run should remain active for a state-driven retry"
     );
+    let payload = session
+        .team_run_manager()
+        .current_payload()
+        .await
+        .expect("retryable busy skip should keep the active run");
+    assert_eq!(payload.team_run_id, first_team_run_id);
+    assert_eq!(payload.pending_wake_count, 1);
+    assert_eq!(payload.starting_child_count, 0);
 
     session.stop();
 }

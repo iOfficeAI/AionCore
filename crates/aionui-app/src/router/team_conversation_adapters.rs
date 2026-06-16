@@ -16,6 +16,7 @@ use aionui_team::{
     TeamConversationProvisioningPort, TeamError, TeamProjectionMessageStore,
 };
 use async_trait::async_trait;
+use tracing::info;
 
 pub struct TeamConversationAdapters {
     conversation_service: ConversationService,
@@ -73,18 +74,42 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
                 >
         });
 
-        let outcome = self
-            .conversation_service
-            .run_agent_turn(ConversationAgentTurnRequest {
-                user_id: request.user_id,
-                conversation_id: request.conversation_id,
-                content: request.content,
-                files: request.files,
-                inject_skills: Vec::new(),
-                on_started,
-            })
-            .await
-            .map_err(map_conversation_turn_error)?;
+        let conversation_id = request.conversation_id.clone();
+        let outcome = loop {
+            match self
+                .conversation_service
+                .run_agent_turn(ConversationAgentTurnRequest {
+                    user_id: request.user_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    content: request.content.clone(),
+                    files: request.files.clone(),
+                    inject_skills: Vec::new(),
+                    on_started: on_started.clone(),
+                })
+                .await
+            {
+                Ok(outcome) => break outcome,
+                Err(error) if is_retryable_conversation_busy(&error) => {
+                    info!(
+                        conversation_id = %conversation_id,
+                        team_run_id = ?request.team_run_id,
+                        slot_id = %request.slot_id,
+                        "team conversation turn waiting for active conversation turn to release"
+                    );
+                    self.conversation_service
+                        .runtime_state()
+                        .wait_until_unclaimed(&conversation_id)
+                        .await;
+                    info!(
+                        conversation_id = %conversation_id,
+                        team_run_id = ?request.team_run_id,
+                        slot_id = %request.slot_id,
+                        "team conversation turn retrying after active conversation turn released"
+                    );
+                }
+                Err(error) => return Err(map_conversation_turn_error(error)),
+            }
+        };
 
         Ok(AgentTurnOutcome {
             conversation_id: outcome.conversation_id,
@@ -273,6 +298,10 @@ impl TeamConversationLookupPort for TeamConversationAdapters {
                 .map(str::to_owned),
         }))
     }
+}
+
+fn is_retryable_conversation_busy(error: &ConversationError) -> bool {
+    matches!(error, ConversationError::Busy { reason } if reason.contains("already running"))
 }
 
 fn map_conversation_create_error(error: ConversationError) -> TeamError {

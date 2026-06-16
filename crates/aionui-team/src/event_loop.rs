@@ -346,8 +346,6 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                         .retry_child_start_later(&reservation.reservation_id, &e.to_string())
                         .await;
                     let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    ctx.registry.notify(&ctx.slot_id);
                     return None;
                 } else {
                     ctx.session
