@@ -123,9 +123,11 @@ impl TeamAgent {
     pub fn to_response_with_icon(&self, icon: Option<String>) -> TeamAgentResponse {
         TeamAgentResponse {
             slot_id: self.slot_id.clone(),
+            assistant_name: self.name.clone(),
             name: self.name.clone(),
             role: self.role.to_string(),
             conversation_id: self.conversation_id.clone(),
+            assistant_backend: self.backend.clone(),
             backend: self.backend.clone(),
             icon,
             model: self.model.clone(),

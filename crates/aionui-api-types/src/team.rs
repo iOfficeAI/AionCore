@@ -330,9 +330,13 @@ pub struct TeamChildTurnPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TeamAgentResponse {
     pub slot_id: String,
+    #[serde(default)]
+    pub assistant_name: String,
     pub name: String,
     pub role: String,
     pub conversation_id: String,
+    #[serde(default)]
+    pub assistant_backend: String,
     pub backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
@@ -752,9 +756,11 @@ mod tests {
     fn serialize_team_agent_response_snake_case() {
         let agent = TeamAgentResponse {
             slot_id: "slot-1".into(),
+            assistant_name: "Lead Agent".into(),
             name: "Lead Agent".into(),
             role: "lead".into(),
             conversation_id: "conv-1".into(),
+            assistant_backend: "acp".into(),
             backend: "acp".into(),
             icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
             model: "claude".into(),
@@ -764,9 +770,11 @@ mod tests {
         };
         let json = serde_json::to_value(&agent).unwrap();
         assert_eq!(json["slot_id"], "slot-1");
+        assert_eq!(json["assistant_name"], "Lead Agent");
         assert_eq!(json["name"], "Lead Agent");
         assert_eq!(json["role"], "lead");
         assert_eq!(json["conversation_id"], "conv-1");
+        assert_eq!(json["assistant_backend"], "acp");
         assert_eq!(json["backend"], "acp");
         assert_eq!(json["icon"], "/api/assets/logos/ai-major/claude.svg");
         assert_eq!(json["model"], "claude");
@@ -780,9 +788,11 @@ mod tests {
     fn serialize_team_agent_response_optional_fields_omitted() {
         let agent = TeamAgentResponse {
             slot_id: "slot-2".into(),
+            assistant_name: "Worker".into(),
             name: "Worker".into(),
             role: "teammate".into(),
             conversation_id: "conv-2".into(),
+            assistant_backend: "acp".into(),
             backend: "acp".into(),
             icon: None,
             model: "claude".into(),
@@ -804,9 +814,11 @@ mod tests {
             workspace: "/workspace/team-1".into(),
             agents: vec![TeamAgentResponse {
                 slot_id: "slot-1".into(),
+                assistant_name: "Lead".into(),
                 name: "Lead".into(),
                 role: "lead".into(),
                 conversation_id: "conv-1".into(),
+                assistant_backend: "acp".into(),
                 backend: "acp".into(),
                 icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
                 model: "claude".into(),
@@ -866,9 +878,11 @@ mod tests {
             team_id: "team-1".into(),
             agent: TeamAgentResponse {
                 slot_id: "slot-3".into(),
+                assistant_name: "Dynamic Worker".into(),
                 name: "Dynamic Worker".into(),
                 role: "teammate".into(),
                 conversation_id: "conv-3".into(),
+                assistant_backend: "claude".into(),
                 backend: "claude".into(),
                 icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
                 model: "opus".into(),
@@ -915,9 +929,11 @@ mod tests {
     fn team_agent_response_roundtrip() {
         let agent = TeamAgentResponse {
             slot_id: "slot-1".into(),
+            assistant_name: "Agent".into(),
             name: "Agent".into(),
             role: "lead".into(),
             conversation_id: "conv-1".into(),
+            assistant_backend: "acp".into(),
             backend: "acp".into(),
             icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
             model: "claude".into(),
@@ -939,9 +955,11 @@ mod tests {
             agents: vec![
                 TeamAgentResponse {
                     slot_id: "s1".into(),
+                    assistant_name: "Lead".into(),
                     name: "Lead".into(),
                     role: "lead".into(),
                     conversation_id: "c1".into(),
+                    assistant_backend: "acp".into(),
                     backend: "acp".into(),
                     icon: None,
                     model: "claude".into(),
@@ -951,9 +969,11 @@ mod tests {
                 },
                 TeamAgentResponse {
                     slot_id: "s2".into(),
+                    assistant_name: "Worker".into(),
                     name: "Worker".into(),
                     role: "teammate".into(),
                     conversation_id: "c2".into(),
+                    assistant_backend: "acp".into(),
                     backend: "acp".into(),
                     icon: Some("/api/assets/logos/tools/coding/codex.svg".into()),
                     model: "claude".into(),
@@ -989,9 +1009,11 @@ mod tests {
             team_id: "t1".into(),
             agent: TeamAgentResponse {
                 slot_id: "s3".into(),
+                assistant_name: "New".into(),
                 name: "New".into(),
                 role: "teammate".into(),
                 conversation_id: "c3".into(),
+                assistant_backend: "claude".into(),
                 backend: "claude".into(),
                 icon: None,
                 model: "sonnet".into(),
