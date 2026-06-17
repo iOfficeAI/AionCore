@@ -14,6 +14,7 @@ pub(crate) enum TeamWakeSource {
     CrashNotification,
     InactivityTimeout,
     ShutdownRejected,
+    RecoveryDrain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +39,7 @@ impl TeamWakeSource {
             Self::CrashNotification => "crash_notification",
             Self::InactivityTimeout => "inactivity_timeout",
             Self::ShutdownRejected => "shutdown_rejected",
+            Self::RecoveryDrain => "recovery_drain",
         }
     }
 
@@ -45,9 +47,11 @@ impl TeamWakeSource {
         match self {
             Self::UserMessage | Self::UserIntervention => TeamWakeClass::Foreground,
             Self::McpSendMessage | Self::IdleNotification | Self::InterruptedNotification => TeamWakeClass::Background,
-            Self::CrashNotification | Self::InactivityTimeout | Self::SpawnAttachFailure | Self::ShutdownRejected => {
-                TeamWakeClass::SystemRecovery
-            }
+            Self::CrashNotification
+            | Self::InactivityTimeout
+            | Self::SpawnAttachFailure
+            | Self::ShutdownRejected
+            | Self::RecoveryDrain => TeamWakeClass::SystemRecovery,
             Self::SpawnWelcome | Self::McpShutdownRequest => TeamWakeClass::Lifecycle,
         }
     }
