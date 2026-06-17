@@ -336,7 +336,7 @@ async fn ts3_send_message_to_nonexistent_agent() {
 }
 
 #[tokio::test]
-async fn ts_shutdown_approved_intercepted() {
+async fn team_send_message_shutdown_approved_intercepted() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
 
@@ -357,7 +357,7 @@ async fn ts_shutdown_approved_intercepted() {
 }
 
 #[tokio::test]
-async fn ts_shutdown_rejected_intercepted() {
+async fn team_send_message_shutdown_rejected_intercepted() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
 
@@ -377,7 +377,7 @@ async fn ts_shutdown_rejected_intercepted() {
 }
 
 #[tokio::test]
-async fn ts_regular_message_rejects_without_live_team_run_service() {
+async fn team_send_message_regular_message_rejects_without_live_team_run_service() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
 

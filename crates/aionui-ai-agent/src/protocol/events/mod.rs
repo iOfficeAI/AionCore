@@ -329,6 +329,235 @@ mod tests {
     }
 
     #[test]
+    fn codex_image_tool_update_omits_base64_result() {
+        let large_png_base64 = format!("iVBORw0KGgo{}", "A".repeat(128 * 1024));
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "ig_test_image",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "call_id": "ig_test_image",
+                        "status": "generating",
+                        "saved_path": "/Users/test/.codex/generated_images/session/ig_test_image.png",
+                        "revised_prompt": "一只小猫",
+                        "result": large_png_base64
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+        let raw_output = &json["data"]["update"]["rawOutput"];
+
+        assert_eq!(
+            raw_output["saved_path"],
+            "/Users/test/.codex/generated_images/session/ig_test_image.png"
+        );
+        assert_eq!(
+            raw_output["image"]["path"],
+            "/Users/test/.codex/generated_images/session/ig_test_image.png"
+        );
+        assert_eq!(raw_output["result_omitted"], true);
+        assert!(raw_output.get("result").is_none());
+    }
+
+    #[test]
+    fn codex_image_tool_update_with_saved_path_is_completed() {
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "ig_done_image",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "call_id": "ig_done_image",
+                        "status": "generating",
+                        "saved_path": "/Users/test/.codex/generated_images/session/ig_done_image.png",
+                        "result": format!("iVBORw0KGgo{}", "A".repeat(128 * 1024))
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+
+        assert_eq!(json["data"]["update"]["status"], "completed");
+        assert_eq!(json["data"]["update"]["rawOutput"]["status"], "completed");
+    }
+
+    #[test]
+    fn codex_image_tool_update_keeps_small_text_result_in_progress() {
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "small-result",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "status": "generating",
+                        "saved_path": "/tmp/result.txt",
+                        "result": "not an inline image"
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        let json = serde_json::to_value(&events[0]).unwrap();
+        let raw_output = &json["data"]["update"]["rawOutput"];
+
+        assert_eq!(json["data"]["update"]["status"], "in_progress");
+        assert_eq!(raw_output["result"], "not an inline image");
+        assert!(raw_output.get("image").is_none());
+        assert!(raw_output.get("result_omitted").is_none());
+    }
+
+    #[test]
+    fn codex_image_tool_update_detects_image_mime_types_from_saved_path() {
+        let cases = [
+            ("photo.jpg", "image/jpeg", "/9j/"),
+            ("photo.webp", "image/webp", "UklGR"),
+            ("photo.gif", "image/gif", "data:image/gif;base64,"),
+            ("photo.bin", "image/png", "iVBORw0KGgo"),
+        ];
+
+        for (file_name, expected_mime, prefix) in cases {
+            let saved_path = format!("/Users/test/.codex/generated_images/session/{file_name}");
+            let notif = SessionNotification::new(
+                "sess-1",
+                SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                    "ig_mime",
+                    ToolCallUpdateFields::new().raw_output(json!({
+                        "saved_path": saved_path,
+                        "result": format!("{prefix}{}", "A".repeat(128 * 1024))
+                    })),
+                )),
+            );
+
+            let events = session_notification_to_events(&notif);
+            let json = serde_json::to_value(&events[0]).unwrap();
+
+            assert_eq!(json["data"]["update"]["rawOutput"]["image"]["mime_type"], expected_mime);
+            assert!(json["data"]["update"]["rawOutput"].get("result").is_none());
+        }
+    }
+
+    #[test]
+    fn codex_image_tool_update_omits_base64_without_saved_path() {
+        let large_png_base64 = format!("iVBORw0KGgo{}", "A".repeat(128 * 1024));
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "ig_no_path",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "call_id": "ig_no_path",
+                        "status": "generating",
+                        "result": large_png_base64
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+        let raw_output = &json["data"]["update"]["rawOutput"];
+
+        // Oversized base64 must be stripped even though Codex did not save the file.
+        assert!(raw_output.get("result").is_none());
+        assert_eq!(raw_output["result_omitted"], true);
+        // No saved_path means we cannot offer a path-based preview, so no image object.
+        assert!(raw_output.get("image").is_none());
+        // Without a saved image the status must pass through unchanged.
+        assert_eq!(json["data"]["update"]["status"], "in_progress");
+    }
+
+    #[test]
+    fn codex_image_tool_update_preserves_failed_status() {
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "ig_failed_image",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::Failed)
+                    .raw_output(json!({
+                        "call_id": "ig_failed_image",
+                        "status": "failed",
+                        "saved_path": "/Users/test/.codex/generated_images/session/ig_failed_image.png",
+                        "result": format!("iVBORw0KGgo{}", "A".repeat(128 * 1024))
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+
+        // A terminal `failed` status must never be rewritten to `completed`.
+        assert_eq!(json["data"]["update"]["status"], "failed");
+        assert_eq!(json["data"]["update"]["rawOutput"]["status"], "failed");
+        // The base64 payload is still stripped regardless of the failure.
+        assert!(json["data"]["update"]["rawOutput"].get("result").is_none());
+    }
+
+    #[test]
+    fn codex_image_tool_update_completes_saved_image_path_without_inline_result() {
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "ig_path_only",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "call_id": "ig_path_only",
+                        "status": "generating",
+                        "saved_path": "/Users/test/.codex/generated_images/session/ig_path_only.png"
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+
+        assert_eq!(json["data"]["update"]["status"], "completed");
+        assert_eq!(json["data"]["update"]["rawOutput"]["status"], "completed");
+        assert_eq!(
+            json["data"]["update"]["rawOutput"]["image"]["path"],
+            "/Users/test/.codex/generated_images/session/ig_path_only.png"
+        );
+    }
+
+    #[test]
+    fn codex_tool_update_keeps_non_image_saved_path_in_progress() {
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "text_result_path",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::InProgress)
+                    .raw_output(json!({
+                        "call_id": "text_result_path",
+                        "status": "generating",
+                        "saved_path": "/tmp/result.txt"
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_value(&events[0]).unwrap();
+
+        assert_eq!(json["data"]["update"]["status"], "in_progress");
+        assert_eq!(json["data"]["update"]["rawOutput"]["status"], "generating");
+        assert!(json["data"]["update"]["rawOutput"].get("image").is_none());
+    }
+
+    #[test]
     fn permission_request_maps_to_snake_case_event_data() {
         let request = RequestPermissionRequest::new(
             "sess-1",

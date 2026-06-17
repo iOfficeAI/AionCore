@@ -24,7 +24,7 @@ use crate::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, TeamConversationBindingLookup, TeamConversationLookupPort,
 };
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
-use crate::session::TeamSession;
+use crate::session::{AgentMessageQueueResult, TeamSession};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::wake::TeamWakeSource;
 use crate::workspace::validate_create_workspace_path;
@@ -37,6 +37,7 @@ pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &
 
 struct SessionEntry {
     session: Arc<TeamSession>,
+    slow_monitor_handle: tokio::task::JoinHandle<()>,
 }
 
 pub struct TeamSessionService {
@@ -544,8 +545,10 @@ impl TeamSessionService {
         // Spawn per-agent event loops
         self.spawn_event_loops(&session, &user_id, &agents_snapshot);
 
+        let slow_monitor_handle = Self::spawn_slow_monitor(session.clone());
         let entry = SessionEntry {
             session: session.clone(),
+            slow_monitor_handle,
         };
         self.sessions.insert(team_id.to_owned(), entry);
 
@@ -594,6 +597,17 @@ impl TeamSessionService {
             serde_json::to_value(payload).expect("serialize mcp status payload"),
         );
         self.broadcaster.broadcast(event);
+    }
+
+    fn spawn_slow_monitor(session: Arc<TeamSession>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                session.team_run_manager().observe_slow_child_turns(now_ms()).await;
+            }
+        })
     }
 
     fn broadcast_team_created(&self, team_id: &str, team_name: &str) {
@@ -735,6 +749,14 @@ impl TeamSessionService {
         self.sessions.get(team_id).map(|e| e.session.scheduler().clone())
     }
 
+    #[cfg(test)]
+    fn session_has_slow_monitor(&self, team_id: &str) -> bool {
+        self.sessions
+            .get(team_id)
+            .map(|entry| !entry.slow_monitor_handle.is_finished())
+            .unwrap_or(false)
+    }
+
     pub async fn stop_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.stop_session_unchecked(team_id);
@@ -743,6 +765,7 @@ impl TeamSessionService {
 
     fn stop_session_unchecked(&self, team_id: &str) {
         if let Some((_, entry)) = self.sessions.remove(team_id) {
+            entry.slow_monitor_handle.abort();
             entry.session.event_loops().shutdown();
             entry.session.stop();
         }
@@ -877,13 +900,14 @@ impl TeamSessionService {
         Ok(())
     }
 
-    pub async fn send_agent_message_from_agent(
+    pub(crate) async fn send_agent_message_from_agent(
         &self,
         team_id: &str,
         from_slot_id: &str,
         to_slot_id: &str,
         content: &str,
-    ) -> Result<(), TeamError> {
+    ) -> Result<AgentMessageQueueResult, TeamError> {
+        self.require_active_team_run_for_team_work(team_id).await?;
         let session = {
             let entry = self
                 .sessions
@@ -982,5 +1006,26 @@ impl TeamSessionService {
             .session
             .wake_leader_after_recovery_message(source_slot_id, source)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_utils::workspace_harness::{
+        setup_with_factory_metadata_team_repo_and_conversation_repo, single_agent_team_request,
+    };
+
+    #[tokio::test]
+    async fn session_has_slow_monitor() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Slow Monitor"))
+            .await
+            .unwrap();
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        assert!(svc.session_has_slow_monitor(&created.id));
+        svc.stop_session("user-test", &created.id).await.unwrap();
     }
 }

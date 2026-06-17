@@ -298,14 +298,14 @@ impl AgentSendError {
             ),
             AcpError::NotConnected => Self::new(
                 "AionUI lost its Agent protocol connection",
-                AgentErrorCode::AionuiInternalError,
-                AgentErrorOwnership::Aionui,
+                AgentErrorCode::UserAgentDisconnected,
+                AgentErrorOwnership::UserAgent,
                 Some(detail),
                 true,
-                true,
+                false,
                 resolution(
-                    AgentErrorResolutionKind::SendFeedback,
-                    Some(AgentErrorResolutionTarget::Feedback),
+                    AgentErrorResolutionKind::ReconnectAgent,
+                    Some(AgentErrorResolutionTarget::AgentSettings),
                 ),
             ),
             AcpError::AgentInternal { .. } => unknown_upstream_error(detail),
@@ -1180,6 +1180,27 @@ mod tests {
 
         assert_eq!(err.stream_error().retryable, Some(true));
         assert_eq!(err.stream_error().feedback_recommended, Some(false));
+    }
+
+    #[test]
+    fn not_connected_maps_to_user_agent_disconnected() {
+        let disconnected = AgentSendError::from(AcpError::NotConnected);
+        assert_eq!(
+            disconnected.stream_error.code,
+            Some(AgentErrorCode::UserAgentDisconnected)
+        );
+        assert_eq!(
+            disconnected.stream_error.ownership,
+            Some(AgentErrorOwnership::UserAgent)
+        );
+        assert_eq!(
+            disconnected
+                .stream_error
+                .resolution
+                .as_ref()
+                .map(|resolution| resolution.kind),
+            Some(AgentErrorResolutionKind::ReconnectAgent)
+        );
     }
 
     #[test]

@@ -235,6 +235,13 @@ pub struct TeamRunAckResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamSlotRuntimeHealth {
+    Disconnected,
+    Unhealthy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamSlotWorkPayload {
     pub slot_id: String,
     pub role: TeamRunTargetRole,
@@ -246,6 +253,16 @@ pub struct TeamSlotWorkPayload {
     pub suppressed_wake_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_started_at_ms: Option<TimestampMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_slow: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_slow_threshold_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_health: Option<TeamSlotRuntimeHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -271,6 +288,57 @@ pub struct TeamChildTurnPayload {
     pub conversation_id: String,
     pub turn_id: String,
     pub status: TeamRunStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamSendMessageStatus {
+    Queued,
+    Rejected,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamSendMessageDelivery {
+    WakeRecorded,
+    WakeSuppressed,
+    NotRecorded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamSendMessageReason {
+    QueuedForIdle,
+    BehindStartingTurn,
+    BehindActiveTurn,
+    SuppressedByPause,
+    NoActiveTeamRun,
+    TargetNotFound,
+    TargetDisconnected,
+    TargetUnhealthy,
+    InternalError,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamSendMessageTargetQueueState {
+    pub slot_id: String,
+    pub role: TeamRunTargetRole,
+    pub queue_state: TeamSendMessageReason,
+    pub pending_wake_count: usize,
+    pub starting_child_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_id: Option<String>,
+    pub suppressed_wake_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamSendMessageQueuedResponse {
+    pub status: TeamSendMessageStatus,
+    pub delivery: TeamSendMessageDelivery,
+    pub reason: TeamSendMessageReason,
+    pub team_run_id: String,
+    pub targets: Vec<TeamSendMessageTargetQueueState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,6 +1185,11 @@ mod tests {
                     paused: false,
                     suppressed_wake_count: 0,
                     active_turn_id: Some("turn-lead".into()),
+                    active_turn_started_at_ms: None,
+                    active_turn_elapsed_ms: None,
+                    active_turn_slow: None,
+                    active_turn_slow_threshold_ms: None,
+                    runtime_health: None,
                 },
                 TeamSlotWorkPayload {
                     slot_id: "worker-1".into(),
@@ -1126,6 +1199,11 @@ mod tests {
                     paused: false,
                     suppressed_wake_count: 0,
                     active_turn_id: None,
+                    active_turn_started_at_ms: None,
+                    active_turn_elapsed_ms: None,
+                    active_turn_slow: None,
+                    active_turn_slow_threshold_ms: None,
+                    runtime_health: None,
                 },
             ],
         };
@@ -1159,6 +1237,11 @@ mod tests {
             active_turn_id: None,
             paused: true,
             suppressed_wake_count: 2,
+            active_turn_started_at_ms: None,
+            active_turn_elapsed_ms: None,
+            active_turn_slow: None,
+            active_turn_slow_threshold_ms: None,
+            runtime_health: None,
         };
 
         let value = serde_json::to_value(&payload).unwrap();
@@ -1166,6 +1249,58 @@ mod tests {
         assert_eq!(value["suppressed_wake_count"], 2);
         assert!(value.get(format!("{}_pending_count", "foreground")).is_none());
         assert!(value.get(format!("{}_pending_count", "background")).is_none());
+    }
+
+    #[test]
+    fn team_slot_work_payload_serializes_active_turn_slow_fields() {
+        let payload = TeamSlotWorkPayload {
+            slot_id: "worker-1".into(),
+            role: TeamRunTargetRole::Teammate,
+            pending_wake_count: 0,
+            starting_child_count: 0,
+            paused: false,
+            suppressed_wake_count: 0,
+            active_turn_id: Some("turn-worker".into()),
+            active_turn_started_at_ms: Some(1_000),
+            active_turn_elapsed_ms: Some(600_001),
+            active_turn_slow: Some(true),
+            active_turn_slow_threshold_ms: Some(600_000),
+            runtime_health: Some(TeamSlotRuntimeHealth::Unhealthy),
+        };
+
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(value["active_turn_started_at_ms"], 1_000);
+        assert_eq!(value["active_turn_elapsed_ms"], 600_001);
+        assert_eq!(value["active_turn_slow"], true);
+        assert_eq!(value["active_turn_slow_threshold_ms"], 600_000);
+        assert_eq!(value["runtime_health"], "unhealthy");
+    }
+
+    #[test]
+    fn team_send_message_queued_response_serializes_stable_contract() {
+        let response = TeamSendMessageQueuedResponse {
+            status: TeamSendMessageStatus::Queued,
+            delivery: TeamSendMessageDelivery::WakeRecorded,
+            reason: TeamSendMessageReason::BehindActiveTurn,
+            team_run_id: "run-1".into(),
+            targets: vec![TeamSendMessageTargetQueueState {
+                slot_id: "worker-1".into(),
+                role: TeamRunTargetRole::Teammate,
+                queue_state: TeamSendMessageReason::BehindActiveTurn,
+                pending_wake_count: 1,
+                starting_child_count: 0,
+                active_turn_id: Some("turn-worker".into()),
+                suppressed_wake_count: 0,
+            }],
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+
+        assert_eq!(value["status"], "queued");
+        assert_eq!(value["delivery"], "wake_recorded");
+        assert_eq!(value["reason"], "behind_active_turn");
+        assert_eq!(value["targets"][0]["queue_state"], "behind_active_turn");
     }
 
     #[test]
