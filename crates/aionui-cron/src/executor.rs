@@ -1129,6 +1129,7 @@ async fn build_conversation_extra(
     job: &CronJob,
     saved_skill: Option<&SavedSkillContext>,
 ) -> serde_json::Value {
+    let assistant_backed = build_assistant_request(job).is_some();
     let mut extra = serde_json::Map::new();
     extra.insert("cron_job_id".to_owned(), serde_json::Value::String(job.id.clone()));
     extra.insert("cronJobId".to_owned(), serde_json::Value::String(job.id.clone()));
@@ -1144,13 +1145,15 @@ async fn build_conversation_extra(
         );
     }
 
-    inject_agent_identity(&mut extra, registry, job).await;
+    if !assistant_backed {
+        inject_agent_identity(&mut extra, registry, job).await;
+    }
 
     if let Some(config) = &job.agent_config {
         if let Some(cli_path) = &config.cli_path {
             extra.insert("cli_path".to_owned(), serde_json::Value::String(cli_path.clone()));
         }
-        if !config.name.is_empty() {
+        if !assistant_backed && !config.name.is_empty() {
             extra.insert("agent_name".to_owned(), serde_json::Value::String(config.name.clone()));
         }
         if let Some(mode) = &config.mode {
@@ -1716,9 +1719,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_conversation_extra_omits_legacy_assistant_identity_fields_for_new_conversations() {
+    async fn build_conversation_extra_omits_legacy_agent_identity_fields_for_assistant_backed_new_conversations() {
         let registry = hydrated_registry().await;
         let mut job = sample_job();
+        job.execution_mode = ExecutionMode::NewConversation;
         let config = job.agent_config.as_mut().expect("sample job should carry config");
         config.assistant_id = Some("assistant-preset".into());
         config.is_preset = Some(true);
@@ -1729,6 +1733,9 @@ mod tests {
         assert!(extra.get("assistant_id").is_none());
         assert!(extra.get("preset_assistant_id").is_none());
         assert!(extra.get("custom_agent_id").is_none());
+        assert!(extra.get("backend").is_none());
+        assert!(extra.get("agent_id").is_none());
+        assert!(extra.get("agent_name").is_none());
     }
 
     #[test]
