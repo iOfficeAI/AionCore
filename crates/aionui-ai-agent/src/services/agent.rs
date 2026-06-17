@@ -15,7 +15,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_api_types::{AgentManagementRow, AgentMetadata, ProviderHealthCheckRequest, ProviderHealthCheckResponse};
+use aionui_api_types::{
+    AgentLogoEntry, AgentManagementRow, AgentMetadata, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
+};
 use aionui_db::IProviderRepository;
 use aionui_realtime::EventBroadcaster;
 
@@ -101,6 +103,30 @@ impl AgentService {
 
     pub async fn list_management_agents(&self) -> Result<Vec<AgentManagementRow>, AgentError> {
         Ok(self.availability.list_management_rows().await)
+    }
+
+    /// Backend → logo URL catalog for business surfaces.
+    ///
+    /// Business pages (guid, team, cron, conversation lists) must render
+    /// an agent logo from a backend identifier alone, without owning a
+    /// hardcoded path map. This projects every known agent row — including
+    /// user-disabled or currently-missing ones, so historical conversations
+    /// still resolve a logo — down to its `backend` and stored `icon` URL.
+    pub async fn list_agent_logos(&self) -> Result<Vec<AgentLogoEntry>, AgentError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut entries = Vec::new();
+        for agent in self.registry.list_all_including_hidden().await {
+            let (Some(backend), Some(logo)) = (agent.backend, agent.icon) else {
+                continue;
+            };
+            if backend.is_empty() || logo.is_empty() {
+                continue;
+            }
+            if seen.insert(backend.clone()) {
+                entries.push(AgentLogoEntry { backend, logo });
+            }
+        }
+        Ok(entries)
     }
 
     pub async fn health_check_agent_by_id(&self, id: &str) -> Result<AgentManagementRow, AgentError> {

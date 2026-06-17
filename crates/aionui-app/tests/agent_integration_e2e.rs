@@ -328,6 +328,104 @@ async fn agents_endpoint_handles_openclaw_as_acp_backend() {
     );
 }
 
+#[tokio::test]
+async fn agent_logos_endpoint_returns_backend_to_logo_catalog() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+
+    let req = get_with_token("/api/agents/logos", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    let entries = body["data"].as_array().expect("data should be array");
+
+    let logo_for = |backend: &str| -> Option<String> {
+        entries
+            .iter()
+            .find(|entry| entry["backend"].as_str() == Some(backend))
+            .and_then(|entry| entry["logo"].as_str())
+            .map(str::to_owned)
+    };
+
+    // Seeded builtin agents project their stored icon URL.
+    assert_eq!(
+        logo_for("claude").as_deref(),
+        Some("/api/assets/logos/ai-major/claude.svg")
+    );
+    assert_eq!(
+        logo_for("codex").as_deref(),
+        Some("/api/assets/logos/tools/coding/codex.svg")
+    );
+
+    // Every entry carries a non-empty backend + logo, and backends are unique.
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        let backend = entry["backend"].as_str().expect("backend present");
+        let logo = entry["logo"].as_str().expect("logo present");
+        assert!(!backend.is_empty(), "backend must not be empty");
+        assert!(!logo.is_empty(), "logo must not be empty");
+        assert!(seen.insert(backend.to_owned()), "backend {backend} duplicated in catalog");
+    }
+}
+
+#[tokio::test]
+async fn agent_logos_endpoint_includes_disabled_and_missing_rows() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+
+    // A custom/internal row that would be hidden from /api/agents (no command
+    // on PATH) must still contribute its logo so historical conversations
+    // referencing it can render an icon.
+    services
+        .agent_registry
+        .repo_handle()
+        .upsert(&UpsertAgentMetadataParams {
+            id: "logo-only-row",
+            icon: Some("/api/assets/logos/brand/aion.svg"),
+            name: "Logo Only",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("logo-only-backend"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some("{}"),
+            enabled: false,
+            command: None,
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: Some("{}"),
+            yolo_id: Some("yolo"),
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 1,
+        })
+        .await
+        .unwrap();
+    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+
+    let req = get_with_token("/api/agents/logos", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    let entries = body["data"].as_array().expect("data should be array");
+    let entry = entries
+        .iter()
+        .find(|entry| entry["backend"].as_str() == Some("logo-only-backend"));
+    assert!(
+        entry.is_some(),
+        "disabled row with an icon must still appear in the logo catalog"
+    );
+    assert_eq!(entry.unwrap()["logo"], "/api/assets/logos/brand/aion.svg");
+}
+
 // ── Message flow with mock agent ────────────────────────────────
 
 #[tokio::test]

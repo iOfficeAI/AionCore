@@ -14,9 +14,9 @@ use axum::extract::{Extension, Json, Path, State};
 use axum::routing::{get, patch, post, put};
 
 use aionui_api_types::{
-    AgentManagementRow, AgentMetadata, ApiResponse, CustomAgentUpsertRequest, DeleteCustomAgentResponse,
-    ProviderHealthCheckRequest, ProviderHealthCheckResponse, SetEnabledRequest, TryConnectCustomAgentRequest,
-    TryConnectCustomAgentResponse,
+    AgentLogoEntry, AgentManagementRow, AgentMetadata, ApiResponse, CustomAgentUpsertRequest,
+    DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse, SetEnabledRequest,
+    TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -27,6 +27,7 @@ use crate::routes::state::AgentRouterState;
 pub fn agent_routes(state: AgentRouterState) -> Router {
     Router::new()
         .route("/api/agents", get(list_agents))
+        .route("/api/agents/logos", get(list_agent_logos))
         .route("/api/agents/management", get(list_management_agents))
         .route("/api/agents/refresh", post(refresh_agents))
         .route("/api/agents/{id}/health-check", post(health_check_by_id))
@@ -53,6 +54,15 @@ async fn refresh_agents(
 ) -> Result<Json<ApiResponse<Vec<AgentMetadata>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state.service.refresh_agents().await.map_err(agent_error_to_api_error)?,
+    )))
+}
+
+async fn list_agent_logos(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<AgentLogoEntry>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.list_agent_logos().await.map_err(agent_error_to_api_error)?,
     )))
 }
 

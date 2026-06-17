@@ -130,6 +130,16 @@ pub enum AgentSnapshotCheckKind {
     Session,
 }
 
+/// A single `backend → logo URL` pair in the agent logo catalog.
+///
+/// Returned by `GET /api/agents/logos` so business surfaces can resolve
+/// an agent logo from a backend identifier without owning a path map.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentLogoEntry {
+    pub backend: String,
+    pub logo: String,
+}
+
 /// The unified, decoded view of an `agent_metadata` row.
 ///
 /// Also the API response shape: `/api/agents` returns a list of these
