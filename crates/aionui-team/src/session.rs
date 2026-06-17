@@ -248,6 +248,19 @@ impl TeamSession {
         } else {
             all_unread.into_iter().filter(|m| m.from_agent_id != slot_id).collect()
         };
+        let active_team_run_id = self.team_run_manager.active_run_id().await;
+        if !unread.is_empty() && (active_team_run_id.is_none() || next_wake.is_none()) {
+            warn!(
+                team_id = %self.team.id,
+                slot_id,
+                unread_count = unread.len(),
+                has_active_team_run = active_team_run_id.is_some(),
+                has_pending_wake = next_wake.is_some(),
+                reason = "unowned_mailbox_backlog",
+                "team wake input skipped because unread mailbox is not owned by a TeamRun wake"
+            );
+            return Ok(None);
+        }
         let tasks = self.scheduler.list_tasks().await?;
 
         let mut wake_body = build_wake_payload(&agent, &tasks, &unread);
@@ -295,7 +308,7 @@ impl TeamSession {
         let should_send = !unread.is_empty();
 
         Ok(Some(WakeInput {
-            team_run_id: self.team_run_manager.active_run_id().await,
+            team_run_id: active_team_run_id,
             conversation_id: agent.conversation_id,
             first_message,
             should_send,
@@ -1428,13 +1441,15 @@ fn classify_send_message_queue_state(
 mod tests {
     use super::*;
     use crate::event_loop::AgentLoopContext;
-    use crate::team_run::ActiveChildTurn;
+    use crate::team_run::{ActiveChildTurn, RecoveryWakeCandidate};
     use crate::test_utils::MockTeamRepo;
     use crate::types::{Team, TeamAgent, TeammateRole};
     use aionui_ai_agent::AgentError;
     use aionui_ai_agent::agent_task::AgentInstance;
     use aionui_ai_agent::types::BuildTaskOptions;
-    use aionui_api_types::{TeamRunStatus, TeamSendMessageDelivery, TeamSendMessageReason, WebSocketMessage};
+    use aionui_api_types::{
+        TeamRunStatus, TeamRunTargetRole, TeamSendMessageDelivery, TeamSendMessageReason, WebSocketMessage,
+    };
     use aionui_common::{AgentKillReason, TimestampMs, now_ms};
     use std::sync::{Arc, Mutex};
 
@@ -1785,6 +1800,18 @@ mod tests {
 
     async fn start_session_arc() -> Arc<TeamSession> {
         Arc::new(start_session().await)
+    }
+
+    async fn record_recovery_wake(session: &TeamSession, slot_id: &str, role: TeamRunTargetRole, unread_count: usize) {
+        session
+            .team_run_manager()
+            .recover_mailbox_backlog(vec![RecoveryWakeCandidate {
+                slot_id: slot_id.to_owned(),
+                role,
+                unread_count,
+            }])
+            .await
+            .expect("recovery wake");
     }
 
     fn register_test_event_loop(session: &Arc<TeamSession>, slot_id: &str) {
@@ -2854,6 +2881,7 @@ mod tests {
             .write("t1", "lead-1", "user", MailboxMessageType::Message, "kick off", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
 
@@ -2876,6 +2904,7 @@ mod tests {
             .write("t1", "worker-1", "user", MailboxMessageType::Message, "do X", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "worker-1", TeamRunTargetRole::Teammate, 1).await;
 
         let input = session
             .compute_wake_input("worker-1")
@@ -2907,6 +2936,7 @@ mod tests {
             .write("t1", "lead-1", "user", MailboxMessageType::Message, "follow-up", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
 
@@ -2931,6 +2961,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compute_wake_input_refuses_unowned_mailbox_backlog() {
+        let session = start_session().await;
+        let lead = session.scheduler().find_lead_slot_id().await.expect("lead");
+        session
+            .mailbox()
+            .write(
+                session.team_id(),
+                &lead,
+                "worker-1",
+                MailboxMessageType::Message,
+                "recover this",
+                None,
+            )
+            .await
+            .expect("mailbox write");
+
+        let input = session
+            .compute_wake_input(&lead)
+            .await
+            .expect("compute should not fail");
+
+        assert!(input.is_none(), "unowned unread mailbox must not start a turn");
+    }
+
+    #[tokio::test]
+    async fn compute_wake_input_accepts_recovery_pending_wake() {
+        let session = start_session().await;
+        let lead = session.scheduler().find_lead_slot_id().await.expect("lead");
+        session
+            .mailbox()
+            .write(
+                session.team_id(),
+                &lead,
+                "worker-1",
+                MailboxMessageType::Message,
+                "recover this",
+                None,
+            )
+            .await
+            .expect("mailbox write");
+        session
+            .team_run_manager()
+            .recover_mailbox_backlog(vec![RecoveryWakeCandidate {
+                slot_id: lead.clone(),
+                role: TeamRunTargetRole::Lead,
+                unread_count: 1,
+            }])
+            .await
+            .expect("recovery run");
+
+        let input = session
+            .compute_wake_input(&lead)
+            .await
+            .expect("compute")
+            .expect("owned wake input");
+
+        assert!(input.team_run_id.is_some());
+        assert!(input.should_send);
+        assert_eq!(input.wake_source, Some(TeamWakeSource::RecoveryDrain));
+        assert!(input.trigger_message_id.is_none());
+        assert_eq!(input.unread.len(), 1);
+    }
+
+    #[tokio::test]
     async fn compute_wake_input_returns_unread_rows_and_role_for_teammate() {
         let session = start_session().await;
         session
@@ -2950,6 +3044,7 @@ mod tests {
             .write("t1", "worker-1", "user", MailboxMessageType::Message, "from user", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "worker-1", TeamRunTargetRole::Teammate, 2).await;
 
         let input = session
             .compute_wake_input("worker-1")
@@ -2972,6 +3067,7 @@ mod tests {
             .write("t1", "lead-1", "user", MailboxMessageType::Message, "hi lead", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
 
