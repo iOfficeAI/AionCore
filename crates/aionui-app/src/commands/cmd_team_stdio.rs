@@ -129,18 +129,12 @@ struct SendMessageParams {
 struct SpawnAgentParams {
     /// Agent display name.
     name: String,
-    /// AI backend type: "claude" or "codex". Default when omitted.
-    #[serde(default)]
-    agent_type: Option<String>,
     /// Model override for the new agent.
     #[serde(default)]
     model: Option<String>,
-    /// Preset assistant identifier.
-    #[serde(default)]
-    custom_agent_id: Option<String>,
-    /// Legacy backend field (prefer agent_type).
-    #[serde(default)]
-    backend: Option<String>,
+    /// Assistant identifier from the available assistants catalog.
+    #[serde(default, alias = "custom_agent_id")]
+    assistant_id: Option<String>,
     /// Agent role (default: "teammate").
     #[serde(default)]
     role: Option<String>,
@@ -205,8 +199,9 @@ struct ListModelsParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct DescribeAssistantParams {
-    /// The preset assistant ID from the "Available Preset Assistants" catalog.
-    custom_agent_id: String,
+    /// The assistant ID from the "Available Assistants" catalog.
+    #[serde(alias = "custom_agent_id")]
+    assistant_id: String,
     /// Locale for the description (e.g. "en", "zh"). Default when omitted.
     #[serde(default)]
     locale: Option<String>,
@@ -232,17 +227,15 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_spawn_agent",
-        description = "Create a new teammate agent to join the team.\n\nUse this only when one of the following is true:\n- The user explicitly approved the proposed teammate lineup in a previous message\n- The user explicitly instructed you to create a specific teammate immediately\n\nBefore calling this tool in the normal planning flow:\n- Start with one short sentence explaining why additional teammates would help\n- Tell the user which teammate(s) you recommend\n- Present the proposal as a table with: name, responsibility, recommended agent type/backend, and recommended model\n- Include each teammate's responsibility, recommended agent type/backend, and model\n- Ask whether to create them as proposed or change any names, responsibilities, or agent types\n- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well\n- Do NOT call this tool in that same turn; wait for explicit approval in a later user message\n\nWhen calling this tool, provide the model parameter if a specific model was recommended and approved.\n\nThe new agent will be created and added to the team. You can then assign tasks and send messages to it."
+        description = "Create a new teammate agent to join the team.\n\nUse this only when one of the following is true:\n- The user explicitly approved the proposed teammate lineup in a previous message\n- The user explicitly instructed you to create a specific teammate immediately\n\nBefore calling this tool in the normal planning flow:\n- Start with one short sentence explaining why additional teammates would help\n- Tell the user which teammate(s) you recommend\n- Present the proposal as a table with: name, responsibility, recommended assistant, and recommended model\n- Include each teammate's responsibility, recommended assistant, and model\n- Ask whether to create them as proposed or change any names, responsibilities, or assistant choices\n- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well\n- Do NOT call this tool in that same turn; wait for explicit approval in a later user message\n\nWhen calling this tool, provide the assistant_id parameter and a model only if a specific model was recommended and approved.\n\nThe new agent will be created and added to the team. You can then assign tasks and send messages to it."
     )]
     async fn spawn_agent(&self, Parameters(params): Parameters<SpawnAgentParams>) -> CallToolResult {
         self.forward_to_tcp(
             "team_spawn_agent",
             &serde_json::json!({
                 "name": params.name,
-                "agent_type": params.agent_type,
                 "model": params.model,
-                "custom_agent_id": params.custom_agent_id,
-                "backend": params.backend,
+                "assistant_id": params.assistant_id,
                 "role": params.role,
             }),
         )
@@ -329,12 +322,12 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_describe_assistant",
-        description = "Get detailed information about a preset assistant before spawning it as a teammate.\n\nReturns the preset's full description, enabled skills, and example tasks so you can\njudge whether it fits the user's request. Use this when two or more presets look\nrelevant from the one-line catalog in your system prompt.\n\nOnly works on preset assistants listed in \"Available Preset Assistants for Spawning\".\nAfter confirming a match, call team_spawn_agent with the same custom_agent_id."
+        description = "Get detailed information about an assistant before spawning it as a teammate.\n\nReturns the assistant's full description, enabled skills, and example tasks so you can\njudge whether it fits the user's request. Use this when two or more assistants look\nrelevant from the one-line catalog in your system prompt.\n\nOnly works on assistants listed in \"Available Assistants for Spawning\".\nAfter confirming a match, call team_spawn_agent with the same assistant_id."
     )]
     async fn describe_assistant(&self, Parameters(params): Parameters<DescribeAssistantParams>) -> CallToolResult {
         self.forward_to_tcp(
             "team_describe_assistant",
-            &serde_json::json!({ "custom_agent_id": params.custom_agent_id, "locale": params.locale }),
+            &serde_json::json!({ "assistant_id": params.assistant_id, "locale": params.locale }),
         )
         .await
     }

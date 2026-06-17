@@ -153,12 +153,9 @@ struct SendMessageParams {
 struct SpawnAgentParams {
     /// Name for the new teammate agent.
     name: String,
-    /// AI backend type: "claude" or "codex". Default when omitted.
-    #[serde(default)]
-    agent_type: Option<String>,
-    /// Preset assistant identifier.
-    #[serde(default)]
-    custom_agent_id: Option<String>,
+    /// Assistant identifier from the available assistants catalog.
+    #[serde(default, alias = "custom_agent_id")]
+    assistant_id: Option<String>,
     /// Model override for the new agent.
     #[serde(default)]
     model: Option<String>,
@@ -223,8 +220,9 @@ struct TeamListModelsParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct DescribeAssistantParams {
-    /// Preset assistant identifier to look up.
-    custom_agent_id: String,
+    /// Assistant identifier to look up.
+    #[serde(alias = "custom_agent_id")]
+    assistant_id: String,
     /// Locale for the description (e.g. "en", "zh"). Default when omitted.
     #[serde(default)]
     locale: Option<String>,
@@ -279,15 +277,14 @@ impl GuideServer {
 
     #[tool(
         name = "team_spawn_agent",
-        description = "Create a new teammate agent to join the team. Leader only."
+        description = "Create a new teammate agent from an assistant in the available assistants catalog. Leader only."
     )]
     async fn team_spawn_agent(&self, Parameters(params): Parameters<SpawnAgentParams>) -> CallToolResult {
         self.forward_tool(
             "team_spawn_agent",
             &serde_json::json!({
                 "name": params.name,
-                "agent_type": params.agent_type,
-                "custom_agent_id": params.custom_agent_id,
+                "assistant_id": params.assistant_id,
                 "model": params.model,
             }),
         )
@@ -382,13 +379,13 @@ impl GuideServer {
 
     #[tool(
         name = "team_describe_assistant",
-        description = "Get detailed information about a preset assistant before spawning."
+        description = "Get detailed information about an assistant before spawning it as a teammate."
     )]
     async fn team_describe_assistant(&self, Parameters(params): Parameters<DescribeAssistantParams>) -> CallToolResult {
         self.forward_tool(
             "team_describe_assistant",
             &serde_json::json!({
-                "custom_agent_id": params.custom_agent_id,
+                "assistant_id": params.assistant_id,
                 "locale": params.locale,
             }),
         )
