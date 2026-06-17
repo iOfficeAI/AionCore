@@ -131,7 +131,11 @@ impl ChannelMessageService {
         let model_config = self.settings.get_model_config(platform).await?;
         let agent_type = parse_agent_type(&agent_config.agent_type)?;
         let model = resolved_model_to_provider(model_config.as_ref());
-        let mut extra = Self::build_channel_extra(agent_config.backend.as_deref());
+        let mut extra = Self::build_channel_extra(if assistant_id.is_some() {
+            None
+        } else {
+            agent_config.backend.as_deref()
+        });
         let name = channel_conversation_name(
             platform,
             &agent_config.agent_type,

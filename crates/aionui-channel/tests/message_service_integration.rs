@@ -14,10 +14,10 @@ use aionui_conversation::skill_resolver::{ResolvedAgentSkill, SkillResolver};
 use aionui_db::models::AssistantSessionRow;
 use aionui_db::models::UpsertAssistantDefinitionParams;
 use aionui_db::{
-    IAssistantDefinitionRepository, IClientPreferenceRepository, IConversationRepository, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    init_database_memory,
+    IAcpSessionRepository, IAssistantDefinitionRepository, IClientPreferenceRepository, IConversationRepository,
+    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteClientPreferenceRepository,
+    SqliteConversationRepository, init_database_memory,
 };
 use aionui_realtime::EventBroadcaster;
 use async_trait::async_trait;
@@ -279,6 +279,7 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::new());
     let conversation_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
     let conversation_repo_trait: Arc<dyn IConversationRepository> = conversation_repo.clone();
+    let acp_session_repo = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
     let conversation_svc = Arc::new(ConversationService::new(
         std::env::temp_dir(),
         Arc::new(TestBroadcaster::new()),
@@ -286,7 +287,7 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
         Arc::clone(&task_manager),
         conversation_repo_trait,
         Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
-        Arc::new(SqliteAcpSessionRepository::new(pool.clone())),
+        acp_session_repo.clone(),
     ));
 
     let pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
@@ -347,6 +348,18 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
     let snapshot = snapshot.unwrap();
     let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
     assert_eq!(conversation.r#type, AgentType::Acp.serde_name());
+    let extra: serde_json::Value = serde_json::from_str(&conversation.extra).unwrap();
+    assert!(
+        extra.get("backend").is_none(),
+        "assistant-bound channel conversations should not persist legacy extra.backend"
+    );
+    let session_row = acp_session_repo
+        .get(&result.conversation_id)
+        .await
+        .unwrap()
+        .expect("acp_session row should exist for ACP assistant conversations");
+    assert_eq!(session_row.agent_backend, "claude");
+    assert!(!session_row.agent_id.is_empty());
     assert_eq!(snapshot.assistant_key, "bare-claude");
     assert_eq!(snapshot.agent_backend, "claude");
 }

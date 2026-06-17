@@ -704,12 +704,29 @@ impl ConversationService {
             extra["workspace"] = serde_json::Value::String(workspace.clone());
         }
 
+        let assistant_backend = assistant_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.agent_backend.clone())
+            .filter(|backend| !backend.is_empty());
+        let effective_backend = extra
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .filter(|backend| !backend.is_empty())
+            .map(str::to_owned)
+            .or(assistant_backend);
+
         let auto_provisioned_workspace = if user_supplied_workspace.is_none() {
             // Per-conversation temp workspaces live under
             // `{data_dir}/conversations/{label}-temp-{id}/`. The label lets
             // operators eyeball the agent type; the conversation id keeps
             // the mapping back to the DB row unique.
-            let label = conversation_label(&effective_type, extra.get("backend"));
+            let label = conversation_label(
+                &effective_type,
+                effective_backend
+                    .as_ref()
+                    .map(|backend| serde_json::Value::String(backend.clone()))
+                    .as_ref(),
+            );
             let ws_path = self
                 .workspace_root
                 .join("conversations")
@@ -735,12 +752,6 @@ impl ConversationService {
                 "assistant_id".to_owned(),
                 serde_json::Value::String(snapshot.assistant_id.clone()),
             );
-            if !snapshot.agent_backend.is_empty() && !obj.contains_key("backend") {
-                obj.insert(
-                    "backend".to_owned(),
-                    serde_json::Value::String(snapshot.agent_backend.clone()),
-                );
-            }
             if let Some(agent_id) = snapshot.agent_id.as_ref()
                 && !obj.contains_key("agent_id")
             {
@@ -829,8 +840,15 @@ impl ConversationService {
         if let Some(ws_path) = auto_provisioned_workspace.as_ref()
             && !is_custom_workspace
             && !initial_skills.is_empty()
-            && let Some(rel_dirs) =
-                native_skills_dirs(&self.agent_metadata_repo, &effective_type, extra.get("backend")).await
+            && let Some(rel_dirs) = native_skills_dirs(
+                &self.agent_metadata_repo,
+                &effective_type,
+                effective_backend
+                    .as_ref()
+                    .map(|backend| serde_json::Value::String(backend.clone()))
+                    .as_ref(),
+            )
+            .await
         {
             let resolved = self.skill_resolver.resolve_skills(&initial_skills).await;
             if !resolved.is_empty() {
@@ -1029,7 +1047,8 @@ impl ConversationService {
         // conversation_id). Other agent types have no session-level
         // state so we only create it for ACP.
         if effective_type == AgentType::Acp {
-            self.create_acp_session_row(&id, &extra).await?;
+            self.create_acp_session_row(&id, &extra, assistant_snapshot.as_ref())
+                .await?;
         }
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {
@@ -1062,6 +1081,7 @@ impl ConversationService {
         &self,
         conversation_id: &str,
         extra: &serde_json::Value,
+        assistant_snapshot: Option<&AssistantSnapshot>,
     ) -> Result<(), ConversationError> {
         debug!("Creating acp_session row");
 
@@ -1071,8 +1091,17 @@ impl ConversationService {
         // frontend always posts agent_id for picked rows, but older
         // payloads may only carry `backend`, so we resolve defensively.
         let agent_id_from_extra = extra.get("agent_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-        let backend = extra.get("backend").and_then(|v| v.as_str()).unwrap_or_default();
-        let agent_source = extra.get("agent_source").and_then(|v| v.as_str()).unwrap_or("builtin");
+        let backend = extra
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .filter(|value| !value.is_empty())
+            .or_else(|| assistant_snapshot.map(|snapshot| snapshot.agent_backend.as_str()))
+            .unwrap_or_default();
+        let agent_source = extra
+            .get("agent_source")
+            .and_then(|v| v.as_str())
+            .or_else(|| assistant_snapshot.and_then(|snapshot| snapshot.agent_source.as_deref()))
+            .unwrap_or("builtin");
 
         // Fallback: older clients (electron main, legacy webhooks) only
         // post `backend` without `agent_id`. Resolve the builtin row for
@@ -1080,7 +1109,9 @@ impl ConversationService {
         // reference. Non-builtin agents must provide `agent_id`
         // explicitly — custom/extension rows have no unique lookup key
         // from `(backend, agent_source)` alone.
-        let resolved_agent_id = match agent_id_from_extra {
+        let resolved_agent_id = match agent_id_from_extra
+            .or_else(|| assistant_snapshot.and_then(|snapshot| snapshot.agent_id.as_deref()))
+        {
             Some(id) => id.to_owned(),
             None if !backend.is_empty() && agent_source == "builtin" => self
                 .agent_metadata_repo
