@@ -708,12 +708,13 @@ impl ConversationService {
             .as_ref()
             .map(|snapshot| snapshot.agent_backend.clone())
             .filter(|backend| !backend.is_empty());
-        let effective_backend = extra
-            .get("backend")
-            .and_then(|v| v.as_str())
-            .filter(|backend| !backend.is_empty())
-            .map(str::to_owned)
-            .or(assistant_backend);
+        let effective_backend = assistant_backend.or_else(|| {
+            extra
+                .get("backend")
+                .and_then(|v| v.as_str())
+                .filter(|backend| !backend.is_empty())
+                .map(str::to_owned)
+        });
 
         let auto_provisioned_workspace = if user_supplied_workspace.is_none() {
             // Per-conversation temp workspaces live under
@@ -757,7 +758,7 @@ impl ConversationService {
             // helpers. Persisting them here keeps one source of truth —
             // the assistant — while preserving the contract those
             // downstreams already depend on.
-            if !snapshot.agent_backend.is_empty() && !obj.contains_key("backend") {
+            if !snapshot.agent_backend.is_empty() {
                 obj.insert(
                     "backend".to_owned(),
                     serde_json::Value::String(snapshot.agent_backend.clone()),
@@ -765,18 +766,20 @@ impl ConversationService {
             }
             if let Some(agent_id) = snapshot.agent_id.as_ref()
                 && !agent_id.is_empty()
-                && !obj.contains_key("agent_id")
             {
                 obj.insert("agent_id".to_owned(), serde_json::Value::String(agent_id.clone()));
+            } else {
+                obj.remove("agent_id");
             }
             if let Some(agent_source) = snapshot.agent_source.as_ref()
                 && !agent_source.is_empty()
-                && !obj.contains_key("agent_source")
             {
                 obj.insert(
                     "agent_source".to_owned(),
                     serde_json::Value::String(agent_source.clone()),
                 );
+            } else {
+                obj.remove("agent_source");
             }
             if let Some(model_id) = snapshot.resolved_defaults.model.as_ref()
                 && !obj.contains_key("current_model_id")
@@ -1104,16 +1107,20 @@ impl ConversationService {
         // frontend always posts agent_id for picked rows, but older
         // payloads may only carry `backend`, so we resolve defensively.
         let agent_id_from_extra = extra.get("agent_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-        let backend = extra
-            .get("backend")
-            .and_then(|v| v.as_str())
+        let backend = assistant_snapshot
+            .map(|snapshot| snapshot.agent_backend.as_str())
             .filter(|value| !value.is_empty())
-            .or_else(|| assistant_snapshot.map(|snapshot| snapshot.agent_backend.as_str()))
+            .or_else(|| {
+                extra
+                    .get("backend")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+            })
             .unwrap_or_default();
-        let agent_source = extra
-            .get("agent_source")
-            .and_then(|v| v.as_str())
-            .or_else(|| assistant_snapshot.and_then(|snapshot| snapshot.agent_source.as_deref()))
+        let agent_source = assistant_snapshot
+            .and_then(|snapshot| snapshot.agent_source.as_deref())
+            .filter(|value| !value.is_empty())
+            .or_else(|| extra.get("agent_source").and_then(|v| v.as_str()))
             .unwrap_or("builtin");
 
         // Fallback: older clients (electron main, legacy webhooks) only
@@ -1122,8 +1129,10 @@ impl ConversationService {
         // reference. Non-builtin agents must provide `agent_id`
         // explicitly — custom/extension rows have no unique lookup key
         // from `(backend, agent_source)` alone.
-        let resolved_agent_id = match agent_id_from_extra
-            .or_else(|| assistant_snapshot.and_then(|snapshot| snapshot.agent_id.as_deref()))
+        let resolved_agent_id = match assistant_snapshot
+            .and_then(|snapshot| snapshot.agent_id.as_deref())
+            .filter(|id| !id.is_empty())
+            .or(agent_id_from_extra)
         {
             Some(id) => id.to_owned(),
             None if !backend.is_empty() && agent_source == "builtin" => self

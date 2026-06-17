@@ -624,13 +624,26 @@ struct RuntimeStateSaveCall {
 
 #[derive(Default)]
 struct StubAcpSessionRepo {
+    create_calls: Mutex<Vec<CreateAcpSessionCall>>,
     runtime_state_saves: Mutex<Vec<RuntimeStateSaveCall>>,
 }
 
 impl StubAcpSessionRepo {
+    fn create_calls(&self) -> Vec<CreateAcpSessionCall> {
+        self.create_calls.lock().unwrap().clone()
+    }
+
     fn runtime_state_saves(&self) -> Vec<RuntimeStateSaveCall> {
         self.runtime_state_saves.lock().unwrap().clone()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateAcpSessionCall {
+    conversation_id: String,
+    agent_backend: String,
+    agent_source: String,
+    agent_id: String,
 }
 
 #[async_trait::async_trait]
@@ -638,14 +651,20 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
     async fn get(&self, _conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
         Ok(None)
     }
-    async fn create(&self, _params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
+    async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
+        self.create_calls.lock().unwrap().push(CreateAcpSessionCall {
+            conversation_id: params.conversation_id.to_owned(),
+            agent_backend: params.agent_backend.to_owned(),
+            agent_source: params.agent_source.to_owned(),
+            agent_id: params.agent_id.to_owned(),
+        });
         // Return a synthetic row so `ConversationService::create` can
         // succeed for ACP conversations in unit tests.
         Ok(AcpSessionRow {
-            conversation_id: "stub".into(),
-            agent_backend: "stub".into(),
-            agent_source: "stub".into(),
-            agent_id: "stub".into(),
+            conversation_id: params.conversation_id.to_owned(),
+            agent_backend: params.agent_backend.to_owned(),
+            agent_source: params.agent_source.to_owned(),
+            agent_id: params.agent_id.to_owned(),
             session_id: None,
             session_status: "idle".into(),
             session_config: "{}".into(),
@@ -791,6 +810,43 @@ async fn make_service_with_assistant_support(
     svc.with_assistant_dispatcher(dispatcher);
 
     (svc, broadcaster, repo, definition_repo, state_repo, preference_repo)
+}
+
+async fn make_service_with_assistant_support_and_acp_session_repo(
+    skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
+    dispatcher: Arc<dyn AssistantRuleDispatcher>,
+    acp_session_repo: Arc<StubAcpSessionRepo>,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<SqliteAssistantDefinitionRepository>,
+    Arc<SqliteAssistantOverlayRepository>,
+    Arc<dyn IAssistantPreferenceRepository>,
+    Arc<StubAcpSessionRepo>,
+) {
+    let (svc, broadcaster, repo, _task_mgr) =
+        make_service_with_resolver_and_acp_session_repo(skill_resolver, acp_session_repo.clone());
+    let db = init_database_memory().await.unwrap();
+    let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
+    let state_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
+    let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
+        Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone()));
+
+    svc.with_assistant_definition_repo(definition_repo.clone());
+    svc.with_assistant_state_repo(state_repo.clone());
+    svc.with_assistant_preference_repo(preference_repo.clone());
+    svc.with_assistant_dispatcher(dispatcher);
+
+    (
+        svc,
+        broadcaster,
+        repo,
+        definition_repo,
+        state_repo,
+        preference_repo,
+        acp_session_repo,
+    )
 }
 
 fn make_create_req() -> CreateConversationRequest {
@@ -4254,6 +4310,68 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             backend: "codex".into(),
         })
     );
+}
+
+#[tokio::test]
+async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let acp_repo = Arc::new(StubAcpSessionRepo::default());
+    let (svc, _broadcaster, _repo, definition_repo, overlay_repo, _preference_repo, acp_repo) =
+        make_service_with_assistant_support_and_acp_session_repo(resolver, dispatcher, acp_repo).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_snapshot_identity",
+        "preset-snapshot-identity",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_snapshot_identity",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "assistant": {
+            "id": "preset-snapshot-identity",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude",
+            "agent_source": "custom",
+            "agent_id": "legacy-custom-agent"
+        },
+    }))
+    .unwrap();
+
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(
+        resp.assistant.as_ref().map(|assistant| assistant.backend.as_str()),
+        Some("codex")
+    );
+    assert_eq!(resp.extra["backend"], json!("codex"));
+    assert!(resp.extra.get("agent_id").is_none());
+
+    let create_calls = acp_repo.create_calls();
+    assert_eq!(create_calls.len(), 1);
+    assert_eq!(create_calls[0].agent_backend, "codex");
+    assert_eq!(create_calls[0].agent_source, "builtin");
+    assert_ne!(create_calls[0].agent_id, "legacy-custom-agent");
 }
 
 #[tokio::test]
