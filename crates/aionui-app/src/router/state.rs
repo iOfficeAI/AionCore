@@ -500,7 +500,6 @@ pub async fn build_channel_state(
         Arc::clone(&pairing_service),
         Arc::clone(&session_manager),
         Arc::clone(&channel_settings),
-        "acp",
     ));
 
     let conv_repo: Arc<dyn aionui_db::IConversationRepository> = Arc::new(

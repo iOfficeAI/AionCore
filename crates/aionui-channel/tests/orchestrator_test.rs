@@ -45,7 +45,7 @@ async fn unauthorized_user_gets_pairing_response() {
 
     let pairing = Arc::new(PairingService::new(repo.clone(), bus));
     let session_mgr = Arc::new(SessionManager::new(repo));
-    let executor = Arc::new(ActionExecutor::new(pairing, Arc::clone(&session_mgr), settings, "acp"));
+    let executor = Arc::new(ActionExecutor::new(pairing, Arc::clone(&session_mgr), settings));
 
     let msg = make_text_message("unknown_user", "chat_1", "hello");
     let result = executor.handle_incoming_message(&msg).await.unwrap();

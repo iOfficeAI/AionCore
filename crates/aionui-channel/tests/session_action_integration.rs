@@ -57,7 +57,7 @@ async fn setup() -> (
     let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
         Arc::new(aionui_db::SqliteClientPreferenceRepository::new(db.pool().clone()));
     let settings = Arc::new(ChannelSettingsService::new(pref_repo));
-    let executor = ActionExecutor::new(pairing_arc, session_mgr_arc, settings, "gemini");
+    let executor = ActionExecutor::new(pairing_arc, session_mgr_arc, settings);
 
     // Keep db alive
     std::mem::forget(db);
