@@ -295,6 +295,36 @@ impl IConversationRepository for StubConvRepo {
                 created_at: 1000,
                 updated_at: 1000,
             }
+        } else if id == "conv_mode_stale_backend" {
+            aionui_db::models::ConversationRow {
+                id: id.into(),
+                user_id: "u1".into(),
+                name: "Gemini Stale Backend Chat".into(),
+                r#type: "acp".into(),
+                model: Some(
+                    serde_json::json!({
+                        "provider_id": "gemini",
+                        "model": "gemini-2.5-pro",
+                        "use_model": "gemini-2.5-pro"
+                    })
+                    .to_string(),
+                ),
+                status: Some("active".into()),
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::json!({
+                    "backend": "claude",
+                    "agent_name": "Gemini",
+                    "workspace": ensure_named_workspace_path("aionui-cron-service-stale-backend-workspace"),
+                    "session_mode": "yolo",
+                    "current_model_id": "gemini-2.5-pro"
+                })
+                .to_string(),
+                pinned: false,
+                pinned_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            }
         } else if id == "conv_mode_aionrs" {
             aionui_db::models::ConversationRow {
                 id: id.into(),
@@ -1614,6 +1644,37 @@ async fn icron_service_create_job_inherits_conversation_mode_and_backend() {
         config.workspace.as_deref(),
         Some(ensure_named_workspace_path("aionui-cron-service-gemini-workspace").as_str())
     );
+}
+
+#[tokio::test]
+async fn icron_service_create_job_prefers_model_provider_over_stale_extra_backend() {
+    let (svc, _, _) = setup().await;
+
+    use aionui_conversation::response_middleware::ICronService;
+
+    let params = CronCreateParams {
+        name: "Agent Job".into(),
+        schedule: "0 */10 * * * *".into(),
+        schedule_description: "every 10 min".into(),
+        message: "do agent work".into(),
+    };
+
+    let result = ICronService::create_job(&svc, "user_1", "conv_mode_stale_backend", &params).await;
+    assert!(result.success);
+
+    let jobs = svc
+        .list_jobs(&ListCronJobsQuery {
+            conversation_id: Some("conv_mode_stale_backend".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+
+    let job = &jobs[0];
+    let config = job.agent_config.as_ref().expect("agent config should be copied");
+    assert_eq!(job.agent_type, "acp");
+    assert_eq!(config.backend, "gemini");
+    assert_eq!(config.model_id.as_deref(), Some("gemini-2.5-pro"));
 }
 
 #[tokio::test]

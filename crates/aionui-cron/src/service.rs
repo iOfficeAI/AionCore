@@ -1090,12 +1090,10 @@ fn build_agent_config_from_conversation(
             .or_else(|| get_string(&extra, &["backend"]))
             .unwrap_or_else(|| "aionrs".to_owned())
     } else {
-        get_string(&extra, &["backend"])
-            .or_else(|| {
-                model
-                    .map(|value| value.provider_id.clone())
-                    .filter(|value| !value.is_empty())
-            })
+        model
+            .map(|value| value.provider_id.clone())
+            .filter(|value| !value.is_empty())
+            .or_else(|| get_string(&extra, &["backend"]))
             .unwrap_or_else(|| row.r#type.clone())
     };
 
