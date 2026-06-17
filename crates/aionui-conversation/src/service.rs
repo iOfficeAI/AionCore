@@ -748,23 +748,6 @@ impl ConversationService {
         if let Some(snapshot) = assistant_snapshot.as_ref()
             && let Some(obj) = extra.as_object_mut()
         {
-            obj.insert(
-                "assistant_id".to_owned(),
-                serde_json::Value::String(snapshot.assistant_id.clone()),
-            );
-            if let Some(agent_id) = snapshot.agent_id.as_ref()
-                && !obj.contains_key("agent_id")
-            {
-                obj.insert("agent_id".to_owned(), serde_json::Value::String(agent_id.clone()));
-            }
-            if let Some(agent_source) = snapshot.agent_source.as_ref()
-                && !obj.contains_key("agent_source")
-            {
-                obj.insert(
-                    "agent_source".to_owned(),
-                    serde_json::Value::String(agent_source.clone()),
-                );
-            }
             if let Some(model_id) = snapshot.resolved_defaults.model.as_ref()
                 && !obj.contains_key("current_model_id")
             {

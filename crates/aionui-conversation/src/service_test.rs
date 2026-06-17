@@ -4192,7 +4192,9 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             backend: "codex".into(),
         })
     );
-    assert_eq!(resp.extra["assistant_id"], json!("preset-1"));
+    assert!(resp.extra.get("assistant_id").is_none());
+    assert!(resp.extra.get("agent_id").is_none());
+    assert!(resp.extra.get("agent_source").is_none());
     assert!(resp.extra.get("preset_assistant_id").is_none());
     assert!(resp.extra.get("preset_context").is_none());
     assert!(resp.extra.get("preset_rules").is_none());
