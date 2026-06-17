@@ -339,9 +339,6 @@ async fn put_channel_assistant_setting_persists_binding() {
         "/api/channel/settings/telegram/assistant",
         json!({
             "assistant_id": "bare-claude",
-            "custom_agent_id": "bare-claude",
-            "backend": "claude",
-            "agent_type": "acp",
             "name": "Claude",
         }),
         &token,
@@ -359,9 +356,6 @@ async fn put_channel_assistant_setting_persists_binding() {
         json["data"]["assistant"],
         json!({
             "assistant_id": "bare-claude",
-            "custom_agent_id": "bare-claude",
-            "backend": "claude",
-            "agent_type": "acp",
             "name": "Claude",
         })
     );
