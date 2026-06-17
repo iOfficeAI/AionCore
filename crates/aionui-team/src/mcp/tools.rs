@@ -45,13 +45,13 @@ Pass agent_type to query a specific backend, or omit it to see all backends.";
 
 /// Description for `team_describe_assistant` — verbatim from team-prompts.md §5.2.
 pub const TEAM_DESCRIBE_ASSISTANT_DESCRIPTION: &str =
-    "Get detailed information about a preset assistant before spawning it as a teammate.
+    "Get detailed information about an assistant before spawning it as a teammate.
 
-Returns the preset's full description, enabled skills, and example tasks so you can
-judge whether it fits the user's request. Use this when two or more presets look
+Returns the assistant's full description, enabled skills, and example tasks so you can
+judge whether it fits the user's request. Use this when two or more assistants look
 relevant from the one-line catalog in your system prompt.
 
-Only works on preset assistants listed in \"Available Preset Assistants for Spawning\".
+Only works on assistants listed in \"Available Assistants for Spawning\".
 After confirming a match, call team_spawn_agent with the same assistant_id.";
 
 // ---------------------------------------------------------------------------
@@ -86,9 +86,9 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Agent display name" },
-                    "agent_type": { "type": "string", "description": "Fallback backend to use (e.g. \"claude\", \"codex\", \"codebuddy\", \"gemini\") when no preset assistant fits. Query team_list_models first to see available options." },
+                    "agent_type": { "type": "string", "description": "Fallback backend to use (e.g. \"claude\", \"codex\", \"codebuddy\", \"gemini\") when no assistant fits. Query team_list_models first to see available options." },
                     "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be valid for the chosen assistant backend or fallback agent_type. Query team_list_models to see available models." },
-                    "assistant_id": { "type": "string", "description": "Preferred preset assistant ID to spawn (from the Available Preset Assistants catalog). When set, agent_type is derived from the preset's backend." },
+                    "assistant_id": { "type": "string", "description": "Preferred assistant ID to spawn (from the Available Assistants catalog). When set, agent_type is derived from the assistant's backend." },
                     "backend": { "type": "string", "description": "Legacy alias for agent_type. Prefer assistant_id first, then agent_type." },
                     "role": { "type": "string", "description": "Agent role (default: 'teammate')" }
                 },
@@ -171,7 +171,7 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "assistant_id": { "type": "string", "description": "The preset assistant ID from the \"Available Preset Assistants\" catalog (e.g., \"word-creator\")." },
+                    "assistant_id": { "type": "string", "description": "The assistant ID from the available assistants catalog (e.g., \"word-creator\")." },
                     "locale": { "type": "string", "description": "Locale like \"zh-CN\" or \"en-US\". Defaults to the user's current UI language when omitted." }
                 },
                 "required": ["assistant_id"]
@@ -742,7 +742,7 @@ mod tests {
         let assistant_desc = props["assistant_id"]["description"].as_str().unwrap();
         let agent_type_desc = props["agent_type"]["description"].as_str().unwrap();
         let backend_desc = props["backend"]["description"].as_str().unwrap();
-        assert!(assistant_desc.starts_with("Preferred preset assistant ID"));
+        assert!(assistant_desc.starts_with("Preferred assistant ID"));
         assert!(agent_type_desc.starts_with("Fallback backend to use"));
         assert!(backend_desc.contains("Prefer assistant_id first"));
     }
@@ -758,6 +758,21 @@ mod tests {
                 .contains("recommended assistant, and recommended model")
         );
         assert!(!desc.description.contains("recommended assistant or backend"));
+    }
+
+    #[test]
+    fn team_describe_assistant_description_uses_assistant_only_wording() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_describe_assistant")
+            .unwrap();
+        let props = desc.input_schema["properties"].as_object().unwrap();
+        let assistant_desc = props["assistant_id"]["description"].as_str().unwrap();
+        assert!(desc.description.contains("Get detailed information about an assistant"));
+        assert!(!desc.description.contains("preset assistant"));
+        assert!(!desc.description.contains("Available Preset Assistants"));
+        assert!(assistant_desc.starts_with("The assistant ID from the available assistants catalog"));
+        assert!(!assistant_desc.contains("preset assistant ID"));
     }
 
     // ---- D4 handlers return non-error payloads ----
