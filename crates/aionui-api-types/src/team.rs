@@ -201,6 +201,13 @@ pub enum TeamRunStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamRunSource {
+    UserMessage,
+    RecoveryDrain,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CancelTeamRunRequest {
     #[serde(default)]
@@ -225,6 +232,8 @@ pub struct PauseTeamSlotRequest {
 pub struct TeamRunAckResponse {
     pub team_run_id: String,
     pub team_id: String,
+    pub source: TeamRunSource,
+    pub has_user_intervention: bool,
     pub target_slot_id: String,
     pub target_role: TeamRunTargetRole,
     pub accepted_slot_id: String,
@@ -269,6 +278,8 @@ pub struct TeamSlotWorkPayload {
 pub struct TeamRunPayload {
     pub team_id: String,
     pub team_run_id: String,
+    pub source: TeamRunSource,
+    pub has_user_intervention: bool,
     pub target_slot_id: String,
     pub target_role: TeamRunTargetRole,
     pub status: TeamRunStatus,
@@ -1110,6 +1121,8 @@ mod tests {
         let ack = TeamRunAckResponse {
             team_run_id: "trun-1".into(),
             team_id: "team-1".into(),
+            source: TeamRunSource::UserMessage,
+            has_user_intervention: true,
             target_slot_id: "lead-1".into(),
             target_role: TeamRunTargetRole::Lead,
             accepted_slot_id: "lead-1".into(),
@@ -1129,6 +1142,8 @@ mod tests {
         let ack = TeamRunAckResponse {
             team_run_id: "trun-1".into(),
             team_id: "team-1".into(),
+            source: TeamRunSource::UserMessage,
+            has_user_intervention: true,
             target_slot_id: "lead-1".into(),
             target_role: TeamRunTargetRole::Lead,
             accepted_slot_id: "worker-1".into(),
@@ -1145,10 +1160,63 @@ mod tests {
     }
 
     #[test]
+    fn team_run_source_serializes_snake_case() {
+        let user = serde_json::to_value(TeamRunSource::UserMessage).unwrap();
+        let recovery = serde_json::to_value(TeamRunSource::RecoveryDrain).unwrap();
+
+        assert_eq!(user, serde_json::json!("user_message"));
+        assert_eq!(recovery, serde_json::json!("recovery_drain"));
+    }
+
+    #[test]
+    fn team_run_payload_serializes_source_metadata() {
+        let payload = TeamRunPayload {
+            team_id: "team-1".into(),
+            team_run_id: "run-1".into(),
+            source: TeamRunSource::RecoveryDrain,
+            has_user_intervention: false,
+            target_slot_id: "lead-1".into(),
+            target_role: TeamRunTargetRole::Lead,
+            status: TeamRunStatus::Accepted,
+            active_child_count: 0,
+            pending_wake_count: 1,
+            starting_child_count: 0,
+            slot_work: vec![],
+        };
+
+        let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(json["source"], "recovery_drain");
+        assert_eq!(json["has_user_intervention"], false);
+    }
+
+    #[test]
+    fn team_run_ack_serializes_source_metadata() {
+        let ack = TeamRunAckResponse {
+            team_run_id: "run-1".into(),
+            team_id: "team-1".into(),
+            source: TeamRunSource::UserMessage,
+            has_user_intervention: true,
+            target_slot_id: "lead-1".into(),
+            target_role: TeamRunTargetRole::Lead,
+            accepted_slot_id: "lead-1".into(),
+            accepted_role: TeamRunTargetRole::Lead,
+            status: TeamRunStatus::Accepted,
+            message_id: Some("mailbox-1".into()),
+        };
+
+        let json = serde_json::to_value(ack).unwrap();
+        assert_eq!(json["source"], "user_message");
+        assert_eq!(json["has_user_intervention"], true);
+        assert_eq!(json["message_id"], "mailbox-1");
+    }
+
+    #[test]
     fn team_run_payload_omits_sensitive_content() {
         let payload = TeamRunPayload {
             team_id: "team-1".into(),
             team_run_id: "trun-1".into(),
+            source: TeamRunSource::UserMessage,
+            has_user_intervention: true,
             target_slot_id: "worker-1".into(),
             target_role: TeamRunTargetRole::Teammate,
             status: TeamRunStatus::Running,
@@ -1170,6 +1238,8 @@ mod tests {
         let payload = TeamRunPayload {
             team_id: "team-1".into(),
             team_run_id: "trun-1".into(),
+            source: TeamRunSource::UserMessage,
+            has_user_intervention: true,
             target_slot_id: "lead-1".into(),
             target_role: TeamRunTargetRole::Lead,
             status: TeamRunStatus::Running,
@@ -1216,6 +1286,8 @@ mod tests {
         let decoded: TeamRunPayload = serde_json::from_value(serde_json::json!({
             "team_id": "team-1",
             "team_run_id": "trun-1",
+            "source": "user_message",
+            "has_user_intervention": true,
             "target_slot_id": "lead-1",
             "target_role": "lead",
             "status": "running",
