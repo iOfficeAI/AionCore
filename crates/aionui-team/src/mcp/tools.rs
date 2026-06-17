@@ -306,16 +306,16 @@ pub fn parse_tool_call(
 // ---------------------------------------------------------------------------
 
 /// Phase-1 minimal `team_list_models` handler. Returns a hard-coded
-/// agent-type → models mapping. Used as fallback when DB is unavailable.
+/// backend → models mapping. Used as fallback when DB is unavailable.
 pub fn handle_team_list_models(_args: &Value) -> Value {
     json!({
-        "agent_types": [
+        "backends": [
             {
-                "type": "claude",
+                "backend": "claude",
                 "models": ["claude-sonnet-4", "claude-opus-4"]
             },
             {
-                "type": "codex",
+                "backend": "codex",
                 "models": ["codex-mini-latest"]
             }
         ]
@@ -334,7 +334,7 @@ pub fn build_list_models_from_rows(
     use aionui_api_types::BehaviorPolicy;
     use aionui_common::constants::is_team_capable;
 
-    let mut agent_types: Vec<Value> = Vec::new();
+    let mut backends: Vec<Value> = Vec::new();
 
     for row in rows {
         if !row.enabled {
@@ -372,8 +372,8 @@ pub fn build_list_models_from_rows(
 
         // For internal agents (aionrs), use provider models
         if is_internal && !provider_models.is_empty() {
-            agent_types.push(json!({
-                "type": key,
+            backends.push(json!({
+                "backend": key,
                 "models": provider_models,
             }));
             continue;
@@ -413,13 +413,13 @@ pub fn build_list_models_from_rows(
             })
             .unwrap_or_default();
 
-        agent_types.push(json!({
-            "type": key,
+        backends.push(json!({
+            "backend": key,
             "models": models,
         }));
     }
 
-    json!({ "agent_types": agent_types })
+    json!({ "backends": backends })
 }
 
 // ---------------------------------------------------------------------------
@@ -751,14 +751,14 @@ mod tests {
     #[test]
     fn team_list_models_handler_returns_non_error() {
         let value = handle_team_list_models(&json!({}));
-        let agent_types = value
-            .get("agent_types")
+        let backends = value
+            .get("backends")
             .and_then(|v| v.as_array())
-            .expect("agent_types array missing");
-        assert!(!agent_types.is_empty());
-        let types: Vec<&str> = agent_types
+            .expect("backends array missing");
+        assert!(!backends.is_empty());
+        let types: Vec<&str> = backends
             .iter()
-            .filter_map(|e| e.get("type").and_then(|v| v.as_str()))
+            .filter_map(|e| e.get("backend").and_then(|v| v.as_str()))
             .collect();
         assert!(types.contains(&"claude"));
         assert!(types.contains(&"codex"));
@@ -772,11 +772,11 @@ mod tests {
             make_agent_row("disabled-one", false, r#"[{"id":"m1","name":"M1"}]"#),
         ];
         let value = build_list_models_from_rows(&rows, None, &[]);
-        let types: Vec<&str> = value["agent_types"]
+        let types: Vec<&str> = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|e| e["type"].as_str())
+            .filter_map(|e| e["backend"].as_str())
             .collect();
         assert!(types.contains(&"claude"));
         assert!(types.contains(&"codebuddy"));
@@ -791,11 +791,11 @@ mod tests {
             r#"[{"id":"claude-opus-4","name":"Opus 4"},{"id":"claude-sonnet-4","name":"Sonnet 4"}]"#,
         )];
         let value = build_list_models_from_rows(&rows, None, &[]);
-        let claude_entry = value["agent_types"]
+        let claude_entry = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["type"].as_str() == Some("claude"))
+            .find(|e| e["backend"].as_str() == Some("claude"))
             .expect("claude entry");
         let models: Vec<&str> = claude_entry["models"]
             .as_array()
@@ -813,11 +813,11 @@ mod tests {
             make_agent_row("codebuddy", true, r#"[{"id":"cb-pro","name":"Pro"}]"#),
         ];
         let value = build_list_models_from_rows(&rows, Some("codebuddy"), &[]);
-        let types: Vec<&str> = value["agent_types"]
+        let types: Vec<&str> = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|e| e["type"].as_str())
+            .filter_map(|e| e["backend"].as_str())
             .collect();
         assert_eq!(types, vec!["codebuddy"]);
     }
@@ -829,11 +829,11 @@ mod tests {
             make_agent_row_no_models("gemini", true),
         ];
         let value = build_list_models_from_rows(&rows, None, &[]);
-        let types: Vec<&str> = value["agent_types"]
+        let types: Vec<&str> = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|e| e["type"].as_str())
+            .filter_map(|e| e["backend"].as_str())
             .collect();
         // gemini has no available_models in DB → should still appear but with empty models
         assert!(types.contains(&"gemini"));
@@ -907,11 +907,11 @@ mod tests {
             aionrs_row,
         ];
         let value = build_list_models_from_rows(&rows, None, &[]);
-        let types: Vec<&str> = value["agent_types"]
+        let types: Vec<&str> = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|e| e["type"].as_str())
+            .filter_map(|e| e["backend"].as_str())
             .collect();
         assert!(types.contains(&"claude"));
         assert!(
@@ -934,11 +934,11 @@ mod tests {
         ];
         // Filter by "aionrs" should only return aionrs
         let value = build_list_models_from_rows(&rows, Some("aionrs"), &[]);
-        let types: Vec<&str> = value["agent_types"]
+        let types: Vec<&str> = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|e| e["type"].as_str())
+            .filter_map(|e| e["backend"].as_str())
             .collect();
         assert_eq!(types, vec!["aionrs"]);
     }
@@ -948,11 +948,11 @@ mod tests {
         let model_info_json = r#"{"current_model_id":"DeepSeek-V3.2","current_model_label":"DeepSeek-V3.2","available_models":[{"id":"GLM-5.0","label":"GLM-5.0"},{"id":"GLM-5.0-Turbo","label":"GLM-5.0-Turbo"},{"id":"DeepSeek-V3.2","label":"DeepSeek-V3.2"}]}"#;
         let rows = vec![make_agent_row("codebuddy", true, model_info_json)];
         let value = build_list_models_from_rows(&rows, None, &[]);
-        let cb_entry = value["agent_types"]
+        let cb_entry = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["type"].as_str() == Some("codebuddy"))
+            .find(|e| e["backend"].as_str() == Some("codebuddy"))
             .expect("codebuddy entry");
         let models: Vec<&str> = cb_entry["models"]
             .as_array()
@@ -987,11 +987,11 @@ mod tests {
             aionrs_row,
         ];
         let value = build_list_models_from_rows(&rows, None, &provider_models);
-        let aionrs_entry = value["agent_types"]
+        let aionrs_entry = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["type"].as_str() == Some("aionrs"))
+            .find(|e| e["backend"].as_str() == Some("aionrs"))
             .expect("aionrs entry");
         let models: Vec<&str> = aionrs_entry["models"]
             .as_array()

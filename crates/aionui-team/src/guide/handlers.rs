@@ -62,9 +62,9 @@ pub fn parse_create_team_args(args: &Value, caller_workspace: Option<&str>) -> R
 /// option regardless of the spawn whitelist.
 pub fn handle_aion_list_models() -> Value {
     let mut base = handle_team_list_models(&Value::Null);
-    if let Some(agent_types) = base.get_mut("agent_types").and_then(Value::as_array_mut) {
-        agent_types.push(json!({
-            "type": "gemini",
+    if let Some(backends) = base.get_mut("backends").and_then(Value::as_array_mut) {
+        backends.push(json!({
+            "backend": "gemini",
             "models": ["gemini-2.5-pro", "gemini-2.5-flash"]
         }));
     }
@@ -157,13 +157,13 @@ mod tests {
     }
 
     #[test]
-    fn returns_agent_types_array() {
+    fn returns_backends_array() {
         let value = handle_aion_list_models();
         let types = value
-            .get("agent_types")
+            .get("backends")
             .and_then(Value::as_array)
-            .expect("agent_types must be an array");
-        let names: Vec<&str> = types.iter().filter_map(|t| t.get("type")?.as_str()).collect();
+            .expect("backends must be an array");
+        let names: Vec<&str> = types.iter().filter_map(|t| t.get("backend")?.as_str()).collect();
         assert!(names.contains(&"claude"));
         assert!(names.contains(&"codex"));
         assert!(names.contains(&"gemini"));
@@ -172,10 +172,10 @@ mod tests {
     #[test]
     fn every_entry_has_models_list() {
         let value = handle_aion_list_models();
-        for entry in value["agent_types"].as_array().unwrap() {
+        for entry in value["backends"].as_array().unwrap() {
             let models = entry["models"].as_array().expect("models must be array");
             assert!(!models.is_empty(), "models list must not be empty");
-            assert!(entry["type"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
+            assert!(entry["backend"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
         }
     }
 
@@ -191,9 +191,9 @@ mod tests {
     }
 
     fn find_entry<'a>(value: &'a Value, backend: &str) -> Option<&'a Value> {
-        value["agent_types"]
+        value["backends"]
             .as_array()?
             .iter()
-            .find(|entry| entry["type"].as_str() == Some(backend))
+            .find(|entry| entry["backend"].as_str() == Some(backend))
     }
 }
