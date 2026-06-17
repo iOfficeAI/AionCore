@@ -587,7 +587,6 @@ impl TeamAgentProvisioner {
         }
         if let Some(assistant_id) = assistant_id {
             extra["assistant_id"] = serde_json::Value::String(assistant_id.to_owned());
-            extra["preset_assistant_id"] = serde_json::Value::String(assistant_id.to_owned());
         }
         if let Some(workspace) = workspace {
             inherit_team_workspace(&mut extra, workspace);

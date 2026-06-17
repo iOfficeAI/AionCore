@@ -1570,7 +1570,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
     let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
 
     assert_eq!(extra["assistant_id"], serde_json::json!("2d23ff1c"));
-    assert_eq!(extra["preset_assistant_id"], serde_json::json!("2d23ff1c"));
+    assert!(extra.get("preset_assistant_id").is_none());
 }
 
 #[tokio::test]
