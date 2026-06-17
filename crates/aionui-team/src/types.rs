@@ -130,7 +130,6 @@ impl TeamAgent {
             icon,
             model: self.model.clone(),
             assistant_id: self.assistant_id.clone(),
-            custom_agent_id: None,
             status: self.status.map(|s| s.to_string()),
             pending_confirmations: 0,
         }
@@ -530,7 +529,6 @@ mod tests {
         assert!(resp.icon.is_none());
         assert_eq!(resp.status.as_deref(), Some("working"));
         assert_eq!(resp.assistant_id.as_deref(), Some("custom-1"));
-        assert!(resp.custom_agent_id.is_none());
     }
 
     #[test]

@@ -96,17 +96,11 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 }
 
 impl TeamAgentProvisioner {
-    fn effective_assistant_id(assistant_id: Option<&str>, custom_agent_id: Option<&str>) -> Option<String> {
+    fn effective_assistant_id(assistant_id: Option<&str>) -> Option<String> {
         assistant_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .or_else(|| {
-                custom_agent_id
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned)
-            })
     }
 
     pub(crate) fn new(
@@ -142,10 +136,7 @@ impl TeamAgentProvisioner {
 
         let leader_slot_id = generate_id();
         let leader_role = TeammateRole::Lead;
-        let leader_assistant_id = Self::effective_assistant_id(
-            leader_input.assistant_id.as_deref(),
-            leader_input.custom_agent_id.as_deref(),
-        );
+        let leader_assistant_id = Self::effective_assistant_id(leader_input.assistant_id.as_deref());
         let leader_backend = self
             .resolve_requested_backend(leader_input.backend.as_deref(), leader_assistant_id.as_deref())
             .await?;
@@ -193,8 +184,7 @@ impl TeamAgentProvisioner {
         for input in teammate_inputs {
             let slot_id = generate_id();
             let role = TeammateRole::parse(&input.role).unwrap_or(TeammateRole::Teammate);
-            let assistant_id =
-                Self::effective_assistant_id(input.assistant_id.as_deref(), input.custom_agent_id.as_deref());
+            let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
             let backend = self
                 .resolve_requested_backend(input.backend.as_deref(), assistant_id.as_deref())
                 .await?;
@@ -253,7 +243,7 @@ impl TeamAgentProvisioner {
     ) -> Result<TeamAgent, TeamError> {
         let role = TeammateRole::parse(&req.role).unwrap_or(TeammateRole::Teammate);
         let workspace = self.workspace_resolver().resolve_for_new_agent(row, team).await?;
-        let assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref(), req.custom_agent_id.as_deref());
+        let assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref());
         let backend = self
             .resolve_requested_backend(req.backend.as_deref(), assistant_id.as_deref())
             .await?;

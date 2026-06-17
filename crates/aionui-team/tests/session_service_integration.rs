@@ -1370,7 +1370,6 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
             backend: Some("acp".into()),
             model: "claude".into(),
             assistant_id: None,
-            custom_agent_id: None,
             conversation_id: None,
         },
         TeamAgentInput {
@@ -1379,7 +1378,6 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
             backend: Some("acp".into()),
             model: "claude".into(),
             assistant_id: None,
-            custom_agent_id: None,
             conversation_id: None,
         },
     ]
@@ -1515,8 +1513,7 @@ async fn tc_create_team_uses_assistant_id_icon_lookup() {
                     role: "lead".into(),
                     backend: Some("acp".into()),
                     model: "claude".into(),
-                    assistant_id: None,
-                    custom_agent_id: Some("2d23ff1c".into()),
+                    assistant_id: Some("2d23ff1c".into()),
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -1553,7 +1550,6 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
                     backend: Some("claude".into()),
                     model: "claude".into(),
                     assistant_id: Some("2d23ff1c".into()),
-                    custom_agent_id: Some("2d23ff1c".into()),
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -1641,7 +1637,6 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
                     backend: Some(String::new()),
                     model: "gpt-5".into(),
                     assistant_id: Some("assistant-lead".into()),
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -1680,7 +1675,6 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -1699,7 +1693,6 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
                 backend: Some("acp".into()),
                 model: "codex".into(),
                 assistant_id: None,
-                custom_agent_id: None,
             },
         )
         .await
@@ -1776,7 +1769,6 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
                     backend: Some("claude".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -1795,7 +1787,6 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
                 backend: Some(String::new()),
                 model: "gpt-5".into(),
                 assistant_id: Some("assistant-worker".into()),
-                custom_agent_id: None,
             },
         )
         .await
@@ -1819,7 +1810,6 @@ async fn tc2_create_single_agent_team() {
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -1847,7 +1837,6 @@ async fn tc4_first_agent_is_lead() {
                         backend: Some("acp".into()),
                         model: "claude".into(),
                         assistant_id: None,
-                        custom_agent_id: None,
                         conversation_id: None,
                     },
                     TeamAgentInput {
@@ -1856,7 +1845,6 @@ async fn tc4_first_agent_is_lead() {
                         backend: Some("acp".into()),
                         model: "claude".into(),
                         assistant_id: None,
-                        custom_agent_id: None,
                         conversation_id: None,
                     },
                 ],
@@ -1988,7 +1976,6 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -2161,7 +2148,6 @@ async fn aa1_add_agent_to_team() {
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -2180,7 +2166,6 @@ async fn aa1_add_agent_to_team() {
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
-                custom_agent_id: None,
             },
         )
         .await
@@ -2213,7 +2198,6 @@ async fn aa_add_agent_inherits_team_workspace() {
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: Some(workspace.clone()),
@@ -2232,7 +2216,6 @@ async fn aa_add_agent_inherits_team_workspace() {
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
-                custom_agent_id: None,
             },
         )
         .await
@@ -2261,7 +2244,6 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -2286,7 +2268,6 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
-                custom_agent_id: None,
             },
         )
         .await
@@ -2317,7 +2298,6 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -2344,7 +2324,6 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
-                custom_agent_id: None,
             },
         )
         .await
@@ -2380,7 +2359,6 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -2403,7 +2381,6 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
-                custom_agent_id: None,
             },
         )
         .await
@@ -2432,7 +2409,6 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -2462,7 +2438,6 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
-                custom_agent_id: None,
             },
         )
         .await
@@ -2526,7 +2501,6 @@ async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
-                custom_agent_id: None,
             },
         )
         .await
@@ -2562,7 +2536,6 @@ async fn aa4_add_agent_to_nonexistent_team() {
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
-                custom_agent_id: None,
             },
         )
         .await;
@@ -3220,7 +3193,6 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -3242,7 +3214,6 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                 },
             )
             .await
@@ -3261,7 +3232,6 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
-                    custom_agent_id: None,
                 },
             )
             .await

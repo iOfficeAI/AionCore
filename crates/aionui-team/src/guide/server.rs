@@ -248,7 +248,6 @@ async fn exec_create_team(
             backend: Some(backend.clone()),
             model: model.clone(),
             assistant_id: None,
-            custom_agent_id: None,
             conversation_id: caller_conversation_id,
         }],
         workspace: None,

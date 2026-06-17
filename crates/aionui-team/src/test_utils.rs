@@ -934,7 +934,6 @@ pub(crate) mod workspace_harness {
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
-                custom_agent_id: None,
                 conversation_id: None,
             }],
             workspace: None,
