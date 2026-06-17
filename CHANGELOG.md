@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.31](https://github.com/iOfficeAI/AionCore/compare/v0.1.30...v0.1.31) (2026-06-17)
+
+
+### Features
+
+* **assistant:** add built-in AionUi self-management assistant ([#474](https://github.com/iOfficeAI/AionCore/issues/474)) ([eea941e](https://github.com/iOfficeAI/AionCore/commit/eea941e344b9dd11338393078c63bddcc532137e))
+* **assistant:** expand AionUi assistant into a butler with remote-access ([#481](https://github.com/iOfficeAI/AionCore/issues/481)) ([794c21a](https://github.com/iOfficeAI/AionCore/commit/794c21a589ef24de6f3fa03a628bb47e7958d6fe))
+* enforce TeamRun ownership for agent turns ([#483](https://github.com/iOfficeAI/AionCore/issues/483)) ([4cc168a](https://github.com/iOfficeAI/AionCore/commit/4cc168a57c07879310d9e4fe8b8050735f35155a))
+* **team:** support queued team_send_message semantics ([#479](https://github.com/iOfficeAI/AionCore/issues/479)) ([a57a079](https://github.com/iOfficeAI/AionCore/commit/a57a079136cbe8a5fafa0ff4d8660bbfa28a07c5))
+
+
+### Bug Fixes
+
+* **acp:** persist runtime model and mode into assistant preferences ([#482](https://github.com/iOfficeAI/AionCore/issues/482)) ([b9bcad9](https://github.com/iOfficeAI/AionCore/commit/b9bcad9d2deb94281a084c4b43a9f09c477444ed))
+* harden ACP image path handling ([#477](https://github.com/iOfficeAI/AionCore/issues/477)) ([c79b5a8](https://github.com/iOfficeAI/AionCore/commit/c79b5a8a010fee82219579873a062bcca5c71fc2))
+* **team:** retry handoff turns after runtime release ([#480](https://github.com/iOfficeAI/AionCore/issues/480)) ([77d252f](https://github.com/iOfficeAI/AionCore/commit/77d252fdd7e43c740043bc3f7963a06a1461fec8))
+
 ## [0.1.30](https://github.com/iOfficeAI/AionCore/compare/v0.1.29...v0.1.30) (2026-06-15)
 
 
