@@ -162,8 +162,9 @@ impl ChannelSettingsService {
 
         for pref in prefs {
             if pref.key == key_agent {
-                assistant =
-                    parse_channel_assistant_setting(&pref.value).map(normalize_channel_assistant_setting_for_response);
+                if let Some(parsed) = parse_channel_assistant_setting(&pref.value) {
+                    assistant = Some(self.normalize_channel_assistant_setting_for_response(parsed).await?);
+                }
             } else if pref.key == key_model {
                 default_model = parse_channel_model_setting(&pref.value);
             }
@@ -187,7 +188,13 @@ impl ChannelSettingsService {
             return Ok(None);
         };
 
-        Ok(parse_channel_assistant_setting(&pref.value).map(normalize_channel_assistant_setting_for_response))
+        let parsed = if let Some(assistant) = parse_channel_assistant_setting(&pref.value) {
+            Some(self.normalize_channel_assistant_setting_for_response(assistant).await?)
+        } else {
+            None
+        };
+
+        Ok(parsed)
     }
 
     pub async fn set_assistant_setting(
@@ -237,6 +244,70 @@ impl ChannelSettingsService {
 
         Ok(Some(ResolvedAgentConfig { agent_type, backend }))
     }
+
+    async fn resolve_assistant_identity_for_legacy_binding(
+        &self,
+        assistant: &ChannelAssistantSettingResponse,
+    ) -> Result<Option<String>, ChannelError> {
+        let (Some(definition_repo), Some(_overlay_repo)) =
+            (&self.assistant_definition_repo, &self.assistant_overlay_repo)
+        else {
+            return Ok(None);
+        };
+
+        let legacy_backend = assistant
+            .backend
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| assistant.agent_type.as_deref().filter(|value| !value.trim().is_empty()));
+
+        let Some(legacy_backend) = legacy_backend else {
+            return Ok(None);
+        };
+
+        let definitions = definition_repo.list().await?;
+
+        Ok(definitions
+            .into_iter()
+            .find(|definition| definition.source == "generated" && definition.agent_backend == legacy_backend)
+            .map(|definition| definition.assistant_key))
+    }
+
+    async fn normalize_channel_assistant_setting_for_response(
+        &self,
+        assistant: ChannelAssistantSettingResponse,
+    ) -> Result<ChannelAssistantSettingResponse, ChannelError> {
+        let assistant_id = assistant
+            .assistant_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                assistant
+                    .custom_agent_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToOwned::to_owned)
+            });
+
+        let canonical_assistant_id = if assistant_id.is_some() {
+            assistant_id
+        } else {
+            self.resolve_assistant_identity_for_legacy_binding(&assistant).await?
+        };
+
+        if canonical_assistant_id.is_some() {
+            Ok(ChannelAssistantSettingResponse {
+                assistant_id: canonical_assistant_id,
+                custom_agent_id: None,
+                backend: None,
+                agent_type: None,
+                name: assistant.name,
+            })
+        } else {
+            Ok(assistant)
+        }
+    }
 }
 
 fn agent_key(platform: PluginType) -> String {
@@ -285,35 +356,6 @@ fn normalize_channel_assistant_setting_for_write(
         backend: None,
         agent_type: None,
         name: assistant.name.clone(),
-    }
-}
-
-fn normalize_channel_assistant_setting_for_response(
-    assistant: ChannelAssistantSettingResponse,
-) -> ChannelAssistantSettingResponse {
-    let assistant_id = assistant
-        .assistant_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            assistant
-                .custom_agent_id
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .map(ToOwned::to_owned)
-        });
-
-    if assistant_id.is_some() {
-        ChannelAssistantSettingResponse {
-            assistant_id,
-            custom_agent_id: None,
-            backend: None,
-            agent_type: None,
-            name: assistant.name,
-        }
-    } else {
-        assistant
     }
 }
 
@@ -821,6 +863,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_assistant_setting_canonicalizes_backend_only_legacy_response_when_assistant_repos_exist() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.lark.agent",
+            r#"{"backend":"codex","name":"Codex"}"#,
+        )]));
+        let definition_repo = Arc::new(MockAssistantDefinitionRepo {
+            rows: vec![make_definition("bare-codex", "codex")],
+        });
+        let overlay_repo = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
+        let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
+
+        let setting = svc.get_assistant_setting(PluginType::Lark).await.unwrap().unwrap();
+
+        assert_eq!(setting.assistant_id.as_deref(), Some("bare-codex"));
+        assert!(setting.custom_agent_id.is_none());
+        assert!(setting.backend.is_none());
+        assert!(setting.agent_type.is_none());
+        assert_eq!(setting.name.as_deref(), Some("Codex"));
+    }
+
+    #[tokio::test]
     async fn get_platform_settings_promotes_legacy_custom_agent_id_in_response() {
         let repo = Arc::new(MockPrefRepo::with_data(vec![(
             "assistant.telegram.agent",
@@ -832,6 +895,28 @@ mod tests {
         let assistant = settings.assistant.expect("assistant settings");
 
         assert_eq!(assistant.assistant_id.as_deref(), Some("legacy-custom"));
+        assert!(assistant.custom_agent_id.is_none());
+        assert!(assistant.backend.is_none());
+        assert!(assistant.agent_type.is_none());
+        assert_eq!(assistant.name.as_deref(), Some("Codex"));
+    }
+
+    #[tokio::test]
+    async fn get_platform_settings_canonicalizes_backend_only_legacy_response_when_assistant_repos_exist() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.telegram.agent",
+            r#"{"backend":"codex","name":"Codex"}"#,
+        )]));
+        let definition_repo = Arc::new(MockAssistantDefinitionRepo {
+            rows: vec![make_definition("bare-codex", "codex")],
+        });
+        let overlay_repo = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
+        let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
+
+        let settings = svc.get_platform_settings(PluginType::Telegram).await.unwrap();
+        let assistant = settings.assistant.expect("assistant settings");
+
+        assert_eq!(assistant.assistant_id.as_deref(), Some("bare-codex"));
         assert!(assistant.custom_agent_id.is_none());
         assert!(assistant.backend.is_none());
         assert!(assistant.agent_type.is_none());
