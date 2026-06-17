@@ -266,16 +266,17 @@ mod tests {
         let assistants = default_assistants();
         let prompt = build_lead_prompt("Alpha", &[], &assistants);
 
-        assert!(prompt.contains("## Available Preset Assistants for Spawning"));
-        assert!(prompt.contains("- `word-creator` (Word Creator, backend: claude) — Drafts Word documents"));
+        assert!(prompt.contains("## Available Assistants for Spawning"));
+        assert!(prompt.contains("- `word-creator` (Word Creator) — Drafts Word documents"));
         assert!(prompt.contains("skills: docx, formatting"));
-        assert!(prompt.contains("Pass the preset's ID as `assistant_id`"));
+        assert!(prompt.contains("Pass the assistant's ID as `assistant_id`"));
+        assert!(!prompt.contains("backend: claude"));
     }
 
     #[test]
     fn lead_prompt_omits_available_assistants_section_when_empty() {
         let prompt = build_lead_prompt("Alpha", &[], &[]);
-        assert!(!prompt.contains("## Available Preset Assistants for Spawning"));
+        assert!(!prompt.contains("## Available Assistants for Spawning"));
     }
 
     #[test]
@@ -295,6 +296,8 @@ mod tests {
             !prompt.contains("${"),
             "unsubstituted template placeholder leaked:\n{prompt}"
         );
+        assert!(!prompt.contains("assistant or backend"));
+        assert!(!prompt.contains("Available Generic Backends"));
     }
 
     // -- Teammate prompt ------------------------------------------------------

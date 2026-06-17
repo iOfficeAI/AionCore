@@ -21,13 +21,13 @@ Use this only when one of the following is true:
 Before calling this tool in the normal planning flow:
 - Start with one short sentence explaining why additional teammates would help
 - Tell the user which teammate(s) you recommend
-- Present the proposal as a table with: name, responsibility, recommended assistant or backend, and recommended model
-- Include each teammate's responsibility, recommended assistant or backend, and model
+- Present the proposal as a table with: name, responsibility, recommended assistant, and recommended model
+- Include each teammate's responsibility, recommended assistant, and model
 - Ask whether to create them as proposed or change any names, responsibilities, or assistant choices
 - In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well
 - Do NOT call this tool in that same turn; wait for explicit approval in a later user message
 
-When a preset assistant is a good fit, prefer passing assistant_id. Use agent_type/backend only as a compatibility fallback when no preset assistant fits the requested role.
+When an assistant is a good fit, prefer passing assistant_id. The legacy agent_type/backend fields remain available only for compatibility with older flows.
 
 When calling this tool, provide the model parameter if a specific model was recommended and approved.
 
@@ -745,6 +745,19 @@ mod tests {
         assert!(assistant_desc.starts_with("Preferred preset assistant ID"));
         assert!(agent_type_desc.starts_with("Fallback backend to use"));
         assert!(backend_desc.contains("Prefer assistant_id first"));
+    }
+
+    #[test]
+    fn team_spawn_agent_description_uses_assistant_first_staffing_language() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_spawn_agent")
+            .unwrap();
+        assert!(
+            desc.description
+                .contains("recommended assistant, and recommended model")
+        );
+        assert!(!desc.description.contains("recommended assistant or backend"));
     }
 
     // ---- D4 handlers return non-error payloads ----

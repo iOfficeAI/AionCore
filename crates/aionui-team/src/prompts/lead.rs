@@ -24,8 +24,11 @@ const PLACEHOLDER_WORKSPACE_SECTION: &str = "${workspaceSection}";
 const PLACEHOLDER_PRESET_FORMATTING_STEP_RULE: &str = "${presetFormattingStepRule}";
 const PLACEHOLDER_PRESET_FORMATTING_IMPORTANT_RULE: &str = "${presetFormattingImportantRule}";
 
-/// A generic backend fallback that the leader may spawn when no preset assistant fits.
-/// Phase1 shape per interface-contracts §5 (line 211).
+/// Legacy backend fallback metadata.
+///
+/// Phase 2 no longer surfaces generic backends in user-facing staffing prompts, but
+/// the struct remains for compatibility with older call sites and tests that may
+/// still construct the params object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableAgentType {
     pub agent_type: String,
@@ -57,8 +60,8 @@ pub struct LeadPromptParams<'a> {
 ///
 /// Placeholders replaced (mirrors AionUi `leadPrompt.ts`):
 /// - `${teammateList}` — bullet list of teammates or an empty-team fallback sentence
-/// - `${availableTypesSection}` — `## Available Generic Backends for Spawning` section, or `""`
-/// - `${availableAssistantsSection}` — `## Available Preset Assistants for Spawning` section, or `""`
+/// - `${availableTypesSection}` — phase 2 emits `""` (generic backends are not surfaced)
+/// - `${availableAssistantsSection}` — `## Available Assistants for Spawning` section, or `""`
 /// - `${workspaceSection}` — `## Team Workspace` section, or `""`
 /// - `${presetFormattingStepRule}` — phase1 emits `""` (presets not surfaced in phase1)
 /// - `${presetFormattingImportantRule}` — phase1 emits `""` (presets not surfaced in phase1)
@@ -109,31 +112,19 @@ fn render_teammate_list(teammates: &[TeamAgent], renamed_agents: &HashMap<String
 }
 
 fn render_available_types_section(agent_types: &[AvailableAgentType]) -> String {
-    if agent_types.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from("\n\n## Available Generic Backends for Spawning\n");
-    for (idx, t) in agent_types.iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-        let _ = write!(out, "- `{}` — {}", t.agent_type, t.display_name);
-    }
-    out.push_str(
-        "\n\nUse `team_list_models` to query available models for each backend before spawning.",
-    );
-    out
+    let _ = agent_types;
+    String::new()
 }
 
 fn render_available_assistants_section(assistants: &[AvailableAssistant]) -> String {
     if assistants.is_empty() {
         return String::new();
     }
-    let mut out = String::from("\n\n## Available Preset Assistants for Spawning\n");
+    let mut out = String::from("\n\n## Available Assistants for Spawning\n");
     out.push_str(
-        "These are user-configured assistants with pre-loaded rules and skills for specific \
-         domains (writing, research, PPT building, etc.). When a task matches a preset's \
-         specialty, prefer spawning the preset over a generic CLI agent — you get its domain \
+        "These are available assistants with pre-loaded rules and skills for specific \
+         domains (writing, research, PPT building, etc.). When a task matches an assistant's \
+         specialty, prefer spawning that assistant — you get its domain \
          expertise automatically.\n\n",
     );
     for (idx, a) in assistants.iter().enumerate() {
@@ -150,24 +141,20 @@ fn render_available_assistants_section(assistants: &[AvailableAssistant]) -> Str
         } else {
             format!("\n   skills: {}", a.skills.join(", "))
         };
-        let _ = write!(
-            out,
-            "- `{}` ({}, backend: {}){}{}",
-            a.assistant_id, a.name, a.backend, desc, skills,
-        );
+        let _ = write!(out, "- `{}` ({}){}{}", a.assistant_id, a.name, desc, skills,);
     }
     out.push_str(
-        "\n\n### How to pick a preset\n\
+        "\n\n### How to pick an assistant\n\
          1. Scan the one-line descriptions and skills above. If one clearly matches the user's \
          domain (e.g. \"quarterly Word report\" → `word-creator`), spawn it directly with \
          `team_spawn_agent`.\n\
-         2. If two or more presets seem relevant, call `team_describe_assistant` on each \
+         2. If two or more assistants seem relevant, call `team_describe_assistant` on each \
          candidate to see its full description, skills, and example tasks, then choose the best \
          fit.\n\
-         3. If no preset matches the task, fall back to a generic CLI agent from the \
-         \"Available Generic Backends\" section.\n\n\
-         Pass the preset's ID as `assistant_id` to `team_spawn_agent`. The `agent_type` is \
-         derived from the preset's backend and does not need to be specified.",
+         3. If no assistant is an obvious fit, choose the assistant whose domain and backing \
+         capabilities best match the work.\n\n\
+         Pass the assistant's ID as `assistant_id` to `team_spawn_agent`. The runtime backend \
+         is derived automatically and does not need to be specified.",
     );
     out
 }
@@ -303,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn available_types_section_includes_backtick_ids_and_model_query_hint() {
+    fn available_types_section_is_hidden_for_assistant_only_team_prompts() {
         let got = render_available_types_section(&[
             AvailableAgentType {
                 agent_type: "claude".into(),
@@ -314,10 +301,7 @@ mod tests {
                 display_name: "code generation specialist".into(),
             },
         ]);
-        assert!(got.starts_with("\n\n## Available Generic Backends for Spawning\n"));
-        assert!(got.contains("- `claude` — general-purpose AI assistant"));
-        assert!(got.contains("- `codex` — code generation specialist"));
-        assert!(got.contains("Use `team_list_models` to query available models for each backend before spawning."));
+        assert_eq!(got, "");
     }
 
     #[test]
@@ -334,11 +318,13 @@ mod tests {
             description: "Drafts Word documents".into(),
             skills: vec!["docx".into(), "formatting".into()],
         }]);
-        assert!(got.contains("## Available Preset Assistants for Spawning"));
-        assert!(got.contains("- `word-creator` (Word Creator, backend: claude) — Drafts Word documents"));
+        assert!(got.contains("## Available Assistants for Spawning"));
+        assert!(got.contains("- `word-creator` (Word Creator) — Drafts Word documents"));
         assert!(got.contains("skills: docx, formatting"));
-        assert!(got.contains("### How to pick a preset"));
-        assert!(got.contains("Pass the preset's ID as `assistant_id`"));
+        assert!(got.contains("### How to pick an assistant"));
+        assert!(got.contains("Pass the assistant's ID as `assistant_id`"));
+        assert!(!got.contains("backend: claude"));
+        assert!(!got.contains("Generic Backends"));
         assert!(!got.contains("custom_agent_id"));
     }
 
@@ -399,10 +385,7 @@ mod tests {
         let params = LeadPromptParams {
             team_name: "Beta",
             teammates: std::slice::from_ref(&t),
-            available_agent_types: &[AvailableAgentType {
-                agent_type: "claude".into(),
-                display_name: "general-purpose AI assistant".into(),
-            }],
+            available_agent_types: &[],
             available_assistants: &[],
             renamed_agents: &renamed,
             team_workspace: Some("/tmp/team-ws"),
@@ -424,7 +407,8 @@ mod tests {
         assert!(!out.contains("${"), "unsubstituted placeholder:\n{out}");
         assert!(out.contains("## Your Teammates"));
         assert!(out.contains("- Worker1 (claude, status: unknown)"));
-        assert!(out.contains("## Available Generic Backends for Spawning"));
+        assert!(!out.contains("## Available Generic Backends for Spawning"));
+        assert!(!out.contains("assistant or backend"));
         assert!(!out.contains("## Available Preset Assistants for Spawning"));
         assert!(out.contains("## Team Workspace"));
         assert!(out.contains("STEP:END"));
