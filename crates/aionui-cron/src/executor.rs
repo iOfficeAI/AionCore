@@ -430,12 +430,13 @@ impl JobExecutor {
         let user_id = self.resolve_conversation_owner_user_id(job).await?;
 
         let extra = build_conversation_extra(&self.agent_registry, job, saved_skill).await;
+        let assistant = build_assistant_request(job);
 
         let req = CreateConversationRequest {
-            r#type: agent_type,
+            r#type: if assistant.is_some() { None } else { Some(agent_type) },
             name: Some(job.name.clone()),
             model,
-            assistant: build_assistant_request(job),
+            assistant,
             source: None,
             channel_chat_id: None,
             extra,

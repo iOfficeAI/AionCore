@@ -127,6 +127,7 @@ impl ChannelMessageService {
         let source = platform_to_source(platform);
         let agent_config = self.settings.get_agent_config(platform).await?;
         let assistant_setting = self.settings.get_assistant_setting(platform).await?;
+        let assistant_id = assistant_setting.and_then(|setting| setting.assistant_id);
         let model_config = self.settings.get_model_config(platform).await?;
         let agent_type = parse_agent_type(&agent_config.agent_type)?;
         let model = resolved_model_to_provider(model_config.as_ref());
@@ -147,16 +148,14 @@ impl ChannelMessageService {
         };
 
         let req = CreateConversationRequest {
-            r#type: agent_type,
+            r#type: if assistant_id.is_some() { None } else { Some(agent_type) },
             name: Some(name),
             model: top_level_model,
-            assistant: assistant_setting
-                .and_then(|setting| setting.assistant_id)
-                .map(|assistant_id| AssistantConversationRequest {
-                    id: assistant_id,
-                    locale: None,
-                    conversation_overrides: None,
-                }),
+            assistant: assistant_id.map(|assistant_id| AssistantConversationRequest {
+                id: assistant_id,
+                locale: None,
+                conversation_overrides: None,
+            }),
             source: Some(source),
             channel_chat_id: session.chat_id.clone(),
             extra,

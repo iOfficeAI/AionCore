@@ -854,13 +854,12 @@ async fn upsert_test_assistant_definition(
 async fn create_assistant_backed_conversation(
     svc: &ConversationService,
     user_id: &str,
-    conversation_type: &str,
+    conversation_type: Option<&str>,
     backend: &str,
     assistant_id: &str,
 ) -> ConversationResponse {
     let workspace = ensure_test_workspace_path();
     let mut payload = json!({
-        "type": conversation_type,
         "name": "assistant conversation",
         "assistant": {
             "id": assistant_id,
@@ -872,7 +871,11 @@ async fn create_assistant_backed_conversation(
         }
     });
 
-    if conversation_type == "aionrs" {
+    if let Some(conversation_type) = conversation_type {
+        payload["type"] = json!(conversation_type);
+    }
+
+    if conversation_type == Some("aionrs") {
         payload["model"] = json!({
             "provider_id": "provider-1",
             "model": "model-a",
@@ -952,7 +955,7 @@ async fn create_rejects_deprecated_agent_types_for_new_conversations() {
         AgentType::Remote,
     ] {
         let mut req = make_create_req();
-        req.r#type = agent_type;
+        req.r#type = Some(agent_type);
         req.model = None;
         req.extra = json!({
             "workspace": ensure_test_workspace_path()
@@ -1067,6 +1070,103 @@ async fn create_stores_model_as_json() {
     let model = resp.model.unwrap();
     assert_eq!(model.provider_id, "p1");
     assert_eq!(model.model, "m1");
+}
+
+#[tokio::test]
+async fn create_derives_aionrs_type_from_assistant_backend_when_type_is_missing() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_aionrs_missing_type",
+        "assistant-aionrs-missing-type",
+        "aionrs",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_aionrs_missing_type",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-aionrs-missing-type",
+            "locale": "en-US"
+        },
+        "model": {
+            "provider_id": "provider-1",
+            "model": "model-a",
+            "use_model": "model-a"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.r#type, AgentType::Aionrs);
+    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn create_derives_acp_type_from_assistant_backend_when_type_is_missing() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_acp_missing_type",
+        "assistant-acp-missing-type",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_acp_missing_type",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-acp-missing-type",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.r#type, AgentType::Acp);
+    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
 }
 
 // ── Get tests ──────────────────────────────────────────────────────
@@ -2577,7 +2677,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .unwrap();
 
     let auto_conv =
-        create_assistant_backed_conversation(&svc, "user_1", "aionrs", "aionrs", "assistant-aionrs-auto").await;
+        create_assistant_backed_conversation(&svc, "user_1", Some("aionrs"), "aionrs", "assistant-aionrs-auto").await;
     let updated = svc
         .update(
             "user_1",
@@ -2638,7 +2738,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .unwrap();
 
     let fixed_conv =
-        create_assistant_backed_conversation(&svc, "user_1", "aionrs", "aionrs", "assistant-aionrs-fixed").await;
+        create_assistant_backed_conversation(&svc, "user_1", Some("aionrs"), "aionrs", "assistant-aionrs-fixed").await;
     let _ = svc
         .update(
             "user_1",

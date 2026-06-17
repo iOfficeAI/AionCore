@@ -55,6 +55,26 @@ pub(crate) const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
 const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
+const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+const ACP_VENDOR_LABELS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "qwen",
+    "codebuddy",
+    "droid",
+    "goose",
+    "auggie",
+    "kimi",
+    "opencode",
+    "copilot",
+    "qoder",
+    "vibe",
+    "cursor",
+    "kiro",
+    "hermes",
+    "snow",
+];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct AssistantConversationOverrides {
@@ -164,6 +184,51 @@ fn assistant_snapshot_modes<'a>(
             snapshot.default_modes.permission.as_str()
         },
     }
+}
+
+fn parse_supported_agent_type_from_backend(backend: &str) -> Result<AgentType, ConversationError> {
+    if ACP_VENDOR_LABELS.contains(&backend) {
+        return Ok(AgentType::Acp);
+    }
+
+    let quoted = format!("\"{backend}\"");
+    if let Ok(agent_type) = serde_json::from_str::<AgentType>(&quoted) {
+        if agent_type.is_deprecated_runtime() {
+            return Err(ConversationError::BadRequest {
+                reason: DEPRECATED_AGENT_TYPE_MESSAGE.into(),
+            });
+        }
+        return Ok(agent_type);
+    }
+
+    Err(ConversationError::BadRequest {
+        reason: format!("unsupported assistant backend: {backend}"),
+    })
+}
+
+fn resolve_create_agent_type(
+    explicit_type: Option<AgentType>,
+    assistant_snapshot: Option<&AssistantSnapshot>,
+) -> Result<AgentType, ConversationError> {
+    if let Some(snapshot) = assistant_snapshot {
+        let derived = parse_supported_agent_type_from_backend(snapshot.agent_backend.trim())?;
+        if let Some(explicit) = explicit_type
+            && explicit != derived
+        {
+            warn!(
+                explicit_type = explicit.serde_name(),
+                derived_type = derived.serde_name(),
+                backend = snapshot.agent_backend,
+                assistant_id = snapshot.assistant_id,
+                "assistant-backed create request carried a mismatched explicit type; using assistant-derived type"
+            );
+        }
+        return Ok(derived);
+    }
+
+    explicit_type.ok_or_else(|| ConversationError::BadRequest {
+        reason: "Either `type` or `assistant.id` is required when creating a conversation.".into(),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -548,7 +613,7 @@ impl ConversationService {
     ///
     /// Generates a UUID v7, sets status to `pending`, defaults source
     /// to `aionui`, and broadcasts `conversation.listChanged(created)`.
-    #[tracing::instrument(skip_all, fields(user_id = %user_id, agent_type = ?req.r#type))]
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, req_type = ?req.r#type))]
     pub async fn create(
         &self,
         user_id: &str,
@@ -558,14 +623,43 @@ impl ConversationService {
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
-        if !req.r#type.supports_new_conversation() {
+        let mut extra = req.extra;
+
+        let assistant_id = req
+            .assistant
+            .as_ref()
+            .map(|assistant| assistant.id.clone())
+            .or_else(|| {
+                extra
+                    .as_object()
+                    .and_then(|obj| obj.get("preset_assistant_id"))
+                    .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            });
+        let assistant_locale = req.assistant.as_ref().and_then(|assistant| assistant.locale.clone());
+        let assistant_overrides = req
+            .assistant
+            .clone()
+            .and_then(|assistant| assistant.conversation_overrides)
+            .map(AssistantConversationOverrides::from)
+            .unwrap_or_default();
+        let assistant_snapshot = match assistant_id.as_deref() {
+            Some(id) => {
+                self.resolve_assistant_snapshot(id, assistant_locale.as_deref(), &assistant_overrides, &extra)
+                    .await?
+            }
+            None => None,
+        };
+        let explicit_type = req.r#type;
+        let effective_type = resolve_create_agent_type(explicit_type, assistant_snapshot.as_ref())?;
+
+        if !effective_type.supports_new_conversation() {
             info!(
-                agent_type = req.r#type.serde_name(),
+                agent_type = effective_type.serde_name(),
                 source = ?source,
                 "Rejected deprecated agent type for new conversation"
             );
             return Err(ConversationError::BadRequest {
-                reason: "This agent type is no longer supported for new conversations.".into(),
+                reason: DEPRECATED_AGENT_TYPE_MESSAGE.into(),
             });
         }
 
@@ -573,21 +667,19 @@ impl ConversationService {
         // carry model/mode via `extra` (see spec 2026-05-12). Reject early so
         // clients that still ship the legacy shape get a loud 400 instead of
         // a silent write to a column nobody reads.
-        if req.r#type != AgentType::Aionrs && req.model.is_some() {
+        if effective_type != AgentType::Aionrs && req.model.is_some() {
             return Err(ConversationError::BadRequest {
                 reason: format!(
                     "top-level `model` is only accepted for aionrs conversations; pass model via `extra` for {}",
-                    req.r#type.serde_name()
+                    effective_type.serde_name()
                 ),
             });
         }
 
-        let mut extra = req.extra;
-
         // aionrs source-of-truth rule: top-level `model` wins. If an older client
         // still packs `extra.model`, strip it before persist so the stored row
         // has a single canonical model representation.
-        if req.r#type == AgentType::Aionrs
+        if effective_type == AgentType::Aionrs
             && let Some(obj) = extra.as_object_mut()
             && obj.remove("model").is_some()
         {
@@ -617,7 +709,7 @@ impl ConversationService {
             // `{data_dir}/conversations/{label}-temp-{id}/`. The label lets
             // operators eyeball the agent type; the conversation id keeps
             // the mapping back to the DB row unique.
-            let label = conversation_label(&req.r#type, extra.get("backend"));
+            let label = conversation_label(&effective_type, extra.get("backend"));
             let ws_path = self
                 .workspace_root
                 .join("conversations")
@@ -636,30 +728,6 @@ impl ConversationService {
             obj.remove("custom_workspace");
         }
 
-        let assistant_id = req
-            .assistant
-            .as_ref()
-            .map(|assistant| assistant.id.clone())
-            .or_else(|| {
-                extra
-                    .as_object()
-                    .and_then(|obj| obj.get("preset_assistant_id"))
-                    .and_then(|value| value.as_str().map(ToOwned::to_owned))
-            });
-        let assistant_locale = req.assistant.as_ref().and_then(|assistant| assistant.locale.clone());
-        let assistant_overrides = req
-            .assistant
-            .clone()
-            .and_then(|assistant| assistant.conversation_overrides)
-            .map(AssistantConversationOverrides::from)
-            .unwrap_or_default();
-        let assistant_snapshot = match assistant_id.as_deref() {
-            Some(id) => {
-                self.resolve_assistant_snapshot(id, assistant_locale.as_deref(), &assistant_overrides, &extra)
-                    .await?
-            }
-            None => None,
-        };
         if let Some(snapshot) = assistant_snapshot.as_ref()
             && let Some(obj) = extra.as_object_mut()
         {
@@ -698,7 +766,7 @@ impl ConversationService {
                 if !obj.contains_key("session_mode") {
                     obj.insert("session_mode".to_owned(), serde_json::Value::String(permission.clone()));
                 }
-                if matches!(req.r#type, AgentType::Acp) && !obj.contains_key("current_mode_id") {
+                if matches!(effective_type, AgentType::Acp) && !obj.contains_key("current_mode_id") {
                     obj.insert(
                         "current_mode_id".to_owned(),
                         serde_json::Value::String(permission.clone()),
@@ -762,7 +830,7 @@ impl ConversationService {
             && !is_custom_workspace
             && !initial_skills.is_empty()
             && let Some(rel_dirs) =
-                native_skills_dirs(&self.agent_metadata_repo, &req.r#type, extra.get("backend")).await
+                native_skills_dirs(&self.agent_metadata_repo, &effective_type, extra.get("backend")).await
         {
             let resolved = self.skill_resolver.resolve_skills(&initial_skills).await;
             if !resolved.is_empty() {
@@ -814,7 +882,7 @@ impl ConversationService {
             None => None,
         };
 
-        let mcp_support = self.resolve_mcp_support_policy(&req.r#type, &extra).await?;
+        let mcp_support = self.resolve_mcp_support_policy(&effective_type, &extra).await?;
         let mut selected_row_ids: Vec<String> = Vec::new();
         let mut selected_mcp_names: Vec<String> = Vec::new();
         let mut selected_mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
@@ -899,7 +967,7 @@ impl ConversationService {
             id: id.clone(),
             user_id: user_id.to_owned(),
             name: req.name.unwrap_or_default(),
-            r#type: enum_to_db(&req.r#type)?,
+            r#type: enum_to_db(&effective_type)?,
             extra: serde_json::to_string(&extra)
                 .map_err(|e| ConversationError::internal(format!("Failed to serialize extra: {e}")))?,
             model: req
@@ -960,7 +1028,7 @@ impl ConversationService {
         // ACP conversations own one `acp_session` row (1:1 by
         // conversation_id). Other agent types have no session-level
         // state so we only create it for ACP.
-        if req.r#type == AgentType::Acp {
+        if effective_type == AgentType::Acp {
             self.create_acp_session_row(&id, &extra).await?;
         }
 

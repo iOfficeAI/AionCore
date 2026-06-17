@@ -51,7 +51,8 @@ pub struct AssistantConversationRequest {
 /// Body for `POST /api/conversations`.
 #[derive(Debug, Deserialize)]
 pub struct CreateConversationRequest {
-    pub r#type: AgentType,
+    #[serde(default)]
+    pub r#type: Option<AgentType>,
     pub name: Option<String>,
     pub model: Option<ProviderWithModel>,
     pub assistant: Option<AssistantConversationRequest>,
@@ -321,7 +322,7 @@ mod tests {
             "extra": { "workspace": "/project" }
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.r#type, AgentType::Acp);
+        assert_eq!(req.r#type, Some(AgentType::Acp));
         assert_eq!(req.name.as_deref(), Some("Code Review"));
         assert_eq!(req.model.unwrap().model, "claude-sonnet-4-20250514");
         assert_eq!(
@@ -351,7 +352,7 @@ mod tests {
             "extra": {}
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.r#type, AgentType::Acp);
+        assert_eq!(req.r#type, Some(AgentType::Acp));
         assert!(req.name.is_none());
         assert!(req.assistant.is_none());
         assert!(req.source.is_none());
@@ -365,17 +366,29 @@ mod tests {
             "extra": {}
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.r#type, AgentType::Acp);
+        assert_eq!(req.r#type, Some(AgentType::Acp));
         assert!(req.model.is_none());
     }
 
     #[test]
-    fn deserialize_create_request_missing_type() {
+    fn deserialize_create_request_missing_type_without_assistant() {
         let raw = json!({
             "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         });
-        assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());
+        let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.r#type.is_none());
+    }
+
+    #[test]
+    fn deserialize_create_request_missing_type_with_assistant() {
+        let raw = json!({
+            "assistant": { "id": "assistant-1" },
+            "extra": {}
+        });
+        let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.r#type.is_none());
+        assert_eq!(req.assistant.unwrap().id, "assistant-1");
     }
 
     #[test]
@@ -453,7 +466,7 @@ mod tests {
             }
         });
         let req: CloneConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.conversation.r#type, AgentType::Acp);
+        assert_eq!(req.conversation.r#type, Some(AgentType::Acp));
     }
 
     // ── ListConversationsQuery ──────────────────────────────────────

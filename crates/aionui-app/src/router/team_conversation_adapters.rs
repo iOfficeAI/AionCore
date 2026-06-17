@@ -151,7 +151,11 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .create(
                 &request.user_id,
                 CreateConversationRequest {
-                    r#type: request.agent_type,
+                    r#type: if request.assistant_id.is_some() {
+                        None
+                    } else {
+                        Some(request.agent_type)
+                    },
                     name: Some(request.name),
                     model: request.top_level_model,
                     assistant: request.assistant_id.map(|assistant_id| AssistantConversationRequest {
