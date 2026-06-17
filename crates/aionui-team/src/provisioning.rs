@@ -271,27 +271,26 @@ impl TeamAgentProvisioner {
         requested_backend: Option<&str>,
         assistant_id: Option<&str>,
     ) -> Result<String, TeamError> {
-        let requested_backend = requested_backend.map(str::trim).filter(|value| !value.is_empty());
-        if let Some(requested_backend) = requested_backend {
-            return Ok(requested_backend.to_owned());
+        let assistant_key = assistant_id.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(assistant_key) = assistant_key {
+            let definition = self
+                .assistant_definition_repo
+                .get_by_key(assistant_key)
+                .await?
+                .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_key}")))?;
+            let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+            return Ok(overlay
+                .and_then(|row| row.agent_backend_override)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(definition.agent_backend));
         }
 
-        let Some(assistant_key) = assistant_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        let Some(requested_backend) = requested_backend.map(str::trim).filter(|value| !value.is_empty()) else {
             return Err(TeamError::InvalidRequest(
                 "backend is required when assistant_id is absent".into(),
             ));
         };
-
-        let definition = self
-            .assistant_definition_repo
-            .get_by_key(assistant_key)
-            .await?
-            .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_key}")))?;
-        let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
-        Ok(overlay
-            .and_then(|row| row.agent_backend_override)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(definition.agent_backend))
+        Ok(requested_backend.to_owned())
     }
 
     pub(crate) async fn persist_spawned_agent(
