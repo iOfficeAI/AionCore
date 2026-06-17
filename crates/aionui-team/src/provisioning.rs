@@ -53,6 +53,7 @@ pub struct TeamConversationCreateRequest {
     pub agent_type: AgentType,
     pub name: String,
     pub top_level_model: Option<ProviderWithModel>,
+    pub assistant_id: Option<String>,
     pub extra: serde_json::Value,
 }
 
@@ -493,6 +494,7 @@ impl TeamAgentProvisioner {
                 agent_type,
                 name: name.to_owned(),
                 top_level_model,
+                assistant_id: assistant_id.map(str::to_owned),
                 extra,
             })
             .await?;

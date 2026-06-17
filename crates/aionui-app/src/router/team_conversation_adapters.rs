@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{CreateConversationRequest, WebSocketMessage};
+use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, WebSocketMessage};
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
     ConversationService,
@@ -154,7 +154,11 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
                     r#type: request.agent_type,
                     name: Some(request.name),
                     model: request.top_level_model,
-                    assistant: None,
+                    assistant: request.assistant_id.map(|assistant_id| AssistantConversationRequest {
+                        id: assistant_id,
+                        locale: None,
+                        conversation_overrides: None,
+                    }),
                     source: None,
                     channel_chat_id: None,
                     extra: request.extra,
