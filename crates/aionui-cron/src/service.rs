@@ -1264,6 +1264,19 @@ fn sanitize_agent_config_dto(mut config: aionui_api_types::CronAgentConfigDto) -
         .assistant_id
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
+    if !has_assistant_id
+        && let Some(legacy_assistant_id) = config
+            .custom_agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        config.assistant_id = Some(legacy_assistant_id.to_owned());
+    }
+    let has_assistant_id = config
+        .assistant_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
     if has_assistant_id {
         config.custom_agent_id = None;
         config.preset_agent_type = None;
@@ -1425,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_agent_config_dto_keeps_legacy_ids_without_assistant_id() {
+    fn sanitize_agent_config_dto_promotes_legacy_custom_agent_id_without_assistant_id() {
         let config = aionui_api_types::CronAgentConfigDto {
             backend: "claude".into(),
             name: "Helper".into(),
@@ -1442,9 +1455,10 @@ mod tests {
 
         let sanitized = sanitize_agent_config_dto(config);
 
-        assert_eq!(sanitized.custom_agent_id.as_deref(), Some("legacy-assistant"));
-        assert_eq!(sanitized.preset_agent_type.as_deref(), Some("claude"));
-        assert_eq!(sanitized.is_preset, Some(true));
+        assert_eq!(sanitized.assistant_id.as_deref(), Some("legacy-assistant"));
+        assert!(sanitized.custom_agent_id.is_none());
+        assert!(sanitized.preset_agent_type.is_none());
+        assert!(sanitized.is_preset.is_none());
     }
 
     // -- parse_execution_mode -------------------------------------------------
@@ -1590,6 +1604,43 @@ mod tests {
         let config: CronAgentConfig = serde_json::from_str(&config_json).expect("parse cron config");
 
         assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
+        assert!(config.custom_agent_id.is_none());
+        assert!(config.preset_agent_type.is_none());
+        assert!(config.is_preset.is_none());
+    }
+
+    #[test]
+    fn build_update_params_promotes_legacy_custom_agent_id_without_assistant_id() {
+        let job = sample_job();
+        let req = UpdateCronJobRequest {
+            name: None,
+            description: None,
+            enabled: None,
+            schedule: None,
+            message: None,
+            execution_mode: None,
+            agent_config: Some(aionui_api_types::CronAgentConfigDto {
+                backend: "claude".into(),
+                name: "Helper".into(),
+                cli_path: None,
+                is_preset: Some(true),
+                assistant_id: None,
+                custom_agent_id: Some("legacy-assistant".into()),
+                preset_agent_type: Some("claude".into()),
+                mode: Some("default".into()),
+                model_id: Some("claude-sonnet-4".into()),
+                config_options: None,
+                workspace: None,
+            }),
+            conversation_title: None,
+            max_retries: None,
+        };
+
+        let params = build_update_params(&job, &req);
+        let config_json = params.agent_config.flatten().expect("agent config json");
+        let config: CronAgentConfig = serde_json::from_str(&config_json).expect("parse cron config");
+
+        assert_eq!(config.assistant_id.as_deref(), Some("legacy-assistant"));
         assert!(config.custom_agent_id.is_none());
         assert!(config.preset_agent_type.is_none());
         assert!(config.is_preset.is_none());
