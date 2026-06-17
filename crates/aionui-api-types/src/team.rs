@@ -665,7 +665,7 @@ mod tests {
             icon: Some("/api/assets/logos/ai-major/claude.svg".into()),
             model: "claude".into(),
             assistant_id: Some("assistant-x".into()),
-            custom_agent_id: Some("agent-x".into()),
+            custom_agent_id: None,
             status: Some("idle".into()),
             pending_confirmations: 2,
         };
@@ -678,7 +678,7 @@ mod tests {
         assert_eq!(json["icon"], "/api/assets/logos/ai-major/claude.svg");
         assert_eq!(json["model"], "claude");
         assert_eq!(json["assistant_id"], "assistant-x");
-        assert_eq!(json["custom_agent_id"], "agent-x");
+        assert!(json.get("custom_agent_id").is_none());
         assert_eq!(json["status"], "idle");
         assert_eq!(json["pending_confirmations"], 2);
     }
