@@ -84,10 +84,10 @@ impl CronService {
                 backend: c.backend,
                 name: c.name,
                 cli_path: c.cli_path,
-                is_preset: c.is_preset,
+                is_preset: None,
                 assistant_id: c.assistant_id,
-                custom_agent_id: c.custom_agent_id,
-                preset_agent_type: c.preset_agent_type,
+                custom_agent_id: None,
+                preset_agent_type: None,
                 mode: c.mode,
                 model_id: c.model_id,
                 config_options: c.config_options,
@@ -170,10 +170,10 @@ impl CronService {
                 backend: config_dto.backend.clone(),
                 name: config_dto.name.clone(),
                 cli_path: config_dto.cli_path.clone(),
-                is_preset: config_dto.is_preset,
+                is_preset: None,
                 assistant_id: config_dto.assistant_id.clone(),
-                custom_agent_id: config_dto.custom_agent_id.clone(),
-                preset_agent_type: config_dto.preset_agent_type.clone(),
+                custom_agent_id: None,
+                preset_agent_type: None,
                 mode: config_dto.mode.clone(),
                 model_id: config_dto.model_id.clone(),
                 config_options: config_dto.config_options.clone(),
@@ -1035,7 +1035,7 @@ impl aionui_conversation::response_middleware::ICronService for CronService {
 
 fn build_agent_config_from_conversation(
     row: &aionui_db::models::ConversationRow,
-) -> (String, Option<aionui_api_types::CronAgentConfigDto>) {
+) -> (String, Option<aionui_api_types::CronAgentConfigWriteDto>) {
     let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
     // Both interactive `send_message` and the cron executor parse
     // `conversation.model` via the same helper. Keeping the cron-side
@@ -1062,14 +1062,7 @@ fn build_agent_config_from_conversation(
     };
 
     let preset_assistant_id = get_string(&extra, &["preset_assistant_id", "presetAssistantId"]);
-    let assistant_id = get_string(&extra, &["assistant_id", "assistantId"]).or_else(|| preset_assistant_id.clone());
-    let custom_agent_id = get_string(&extra, &["custom_agent_id", "customAgentId"]).or(preset_assistant_id.clone());
-    let is_preset = preset_assistant_id.as_ref().map(|_| true);
-    let preset_agent_type = if preset_assistant_id.is_some() {
-        Some(backend.clone())
-    } else {
-        None
-    };
+    let assistant_id = get_string(&extra, &["assistant_id", "assistantId"]).or(preset_assistant_id);
 
     let agent_type_enum = serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok();
     // Backend is now the vendor label (e.g. "claude"); pass through as
@@ -1078,7 +1071,7 @@ fn build_agent_config_from_conversation(
         .unwrap_or(AgentType::Acp)
         .full_auto_mode_id(Some(backend.as_str()))
         .to_owned();
-    let agent_config = aionui_api_types::CronAgentConfigDto {
+    let agent_config = aionui_api_types::CronAgentConfigWriteDto {
         backend,
         name: get_string(&extra, &["agent_name", "agentName"]).unwrap_or_else(|| row.name.clone()),
         cli_path: get_string(&extra, &["cli_path", "cliPath"]).or_else(|| {
@@ -1088,10 +1081,7 @@ fn build_agent_config_from_conversation(
                 .and_then(|value| value.as_str())
                 .map(ToOwned::to_owned)
         }),
-        is_preset,
         assistant_id,
-        custom_agent_id,
-        preset_agent_type,
         mode: Some(full_auto_mode),
         model_id: get_string(&extra, &["current_model_id", "currentModelId"]).or_else(|| {
             model.and_then(|value| {
@@ -1126,7 +1116,7 @@ fn get_string(extra: &serde_json::Value, keys: &[&str]) -> Option<String> {
 /// Reject add/update requests that would produce an invalid aionrs job.
 fn validate_aionrs_agent_config(
     agent_type: &str,
-    agent_config: Option<&aionui_api_types::CronAgentConfigDto>,
+    agent_config: Option<&aionui_api_types::CronAgentConfigWriteDto>,
 ) -> Result<(), CronError> {
     if agent_type != "aionrs" {
         return Ok(());
@@ -1219,10 +1209,10 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
             backend: c.backend.clone(),
             name: c.name.clone(),
             cli_path: c.cli_path.clone(),
-            is_preset: c.is_preset,
+            is_preset: None,
             assistant_id: c.assistant_id.clone(),
-            custom_agent_id: c.custom_agent_id.clone(),
-            preset_agent_type: c.preset_agent_type.clone(),
+            custom_agent_id: None,
+            preset_agent_type: None,
             mode: c.mode.clone(),
             model_id: c.model_id.clone(),
             config_options: c.config_options.clone(),
@@ -1259,20 +1249,17 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
     }
 }
 
-fn sanitize_agent_config_dto(mut config: aionui_api_types::CronAgentConfigDto) -> aionui_api_types::CronAgentConfigDto {
-    let has_assistant_id = config
-        .assistant_id
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty());
-    if has_assistant_id {
-        config.custom_agent_id = None;
-        config.preset_agent_type = None;
-        config.is_preset = None;
-        return config;
+fn sanitize_agent_config_dto(
+    mut config: aionui_api_types::CronAgentConfigWriteDto,
+) -> aionui_api_types::CronAgentConfigWriteDto {
+    if let Some(value) = config.assistant_id.as_mut() {
+        let trimmed = value.trim().to_owned();
+        if trimmed.is_empty() {
+            config.assistant_id = None;
+        } else {
+            *value = trimmed;
+        }
     }
-    config.custom_agent_id = None;
-    config.preset_agent_type = None;
-    config.is_preset = None;
     config
 }
 
@@ -1354,15 +1341,12 @@ mod tests {
 
     // -- validate_aionrs_agent_config ----------------------------------------
 
-    fn agent_cfg_dto(backend: &str) -> aionui_api_types::CronAgentConfigDto {
-        aionui_api_types::CronAgentConfigDto {
+    fn agent_cfg_dto(backend: &str) -> aionui_api_types::CronAgentConfigWriteDto {
+        aionui_api_types::CronAgentConfigWriteDto {
             backend: backend.to_owned(),
             name: "provider".into(),
             cli_path: None,
-            is_preset: None,
             assistant_id: None,
-            custom_agent_id: None,
-            preset_agent_type: None,
             mode: None,
             model_id: Some("gpt-4o".into()),
             config_options: None,
@@ -1406,14 +1390,11 @@ mod tests {
 
     #[test]
     fn sanitize_agent_config_dto_clears_legacy_ids_when_assistant_id_present() {
-        let config = aionui_api_types::CronAgentConfigDto {
+        let config = aionui_api_types::CronAgentConfigWriteDto {
             backend: "claude".into(),
             name: "Helper".into(),
             cli_path: None,
-            is_preset: Some(true),
             assistant_id: Some("assistant-1".into()),
-            custom_agent_id: Some("legacy-assistant".into()),
-            preset_agent_type: Some("claude".into()),
             mode: Some("default".into()),
             model_id: Some("claude-sonnet-4".into()),
             config_options: None,
@@ -1423,33 +1404,23 @@ mod tests {
         let sanitized = sanitize_agent_config_dto(config);
 
         assert_eq!(sanitized.assistant_id.as_deref(), Some("assistant-1"));
-        assert!(sanitized.custom_agent_id.is_none());
-        assert!(sanitized.preset_agent_type.is_none());
-        assert!(sanitized.is_preset.is_none());
     }
 
     #[test]
     fn sanitize_agent_config_dto_drops_legacy_custom_agent_id_without_assistant_id() {
-        let config = aionui_api_types::CronAgentConfigDto {
-            backend: "claude".into(),
-            name: "Helper".into(),
-            cli_path: None,
-            is_preset: Some(true),
-            assistant_id: None,
-            custom_agent_id: Some("legacy-assistant".into()),
-            preset_agent_type: Some("claude".into()),
-            mode: Some("default".into()),
-            model_id: Some("claude-sonnet-4".into()),
-            config_options: None,
-            workspace: None,
-        };
+        let config = serde_json::from_value::<aionui_api_types::CronAgentConfigWriteDto>(serde_json::json!({
+            "backend": "claude",
+            "name": "Helper",
+            "custom_agent_id": "legacy-assistant",
+            "preset_agent_type": "claude",
+            "mode": "default",
+            "model_id": "claude-sonnet-4",
+        }))
+        .expect("legacy fields should deserialize as ignored unknown fields");
 
         let sanitized = sanitize_agent_config_dto(config);
 
         assert!(sanitized.assistant_id.is_none());
-        assert!(sanitized.custom_agent_id.is_none());
-        assert!(sanitized.preset_agent_type.is_none());
-        assert!(sanitized.is_preset.is_none());
     }
 
     // -- parse_execution_mode -------------------------------------------------
@@ -1573,14 +1544,11 @@ mod tests {
             schedule: None,
             message: None,
             execution_mode: None,
-            agent_config: Some(aionui_api_types::CronAgentConfigDto {
+            agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
                 backend: "claude".into(),
                 name: "Helper".into(),
                 cli_path: None,
-                is_preset: Some(true),
                 assistant_id: Some("assistant-1".into()),
-                custom_agent_id: Some("legacy-assistant".into()),
-                preset_agent_type: Some("claude".into()),
                 mode: Some("default".into()),
                 model_id: Some("claude-sonnet-4".into()),
                 config_options: None,
@@ -1610,19 +1578,17 @@ mod tests {
             schedule: None,
             message: None,
             execution_mode: None,
-            agent_config: Some(aionui_api_types::CronAgentConfigDto {
-                backend: "claude".into(),
-                name: "Helper".into(),
-                cli_path: None,
-                is_preset: Some(true),
-                assistant_id: None,
-                custom_agent_id: Some("legacy-assistant".into()),
-                preset_agent_type: Some("claude".into()),
-                mode: Some("default".into()),
-                model_id: Some("claude-sonnet-4".into()),
-                config_options: None,
-                workspace: None,
-            }),
+            agent_config: Some(
+                serde_json::from_value::<aionui_api_types::CronAgentConfigWriteDto>(serde_json::json!({
+                    "backend": "claude",
+                    "name": "Helper",
+                    "custom_agent_id": "legacy-assistant",
+                    "preset_agent_type": "claude",
+                    "mode": "default",
+                    "model_id": "claude-sonnet-4",
+                }))
+                .expect("legacy fields should deserialize as ignored unknown fields"),
+            ),
             conversation_title: None,
             max_retries: None,
         };

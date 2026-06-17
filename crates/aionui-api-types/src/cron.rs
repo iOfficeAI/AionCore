@@ -60,6 +60,24 @@ pub struct CronAgentConfigDto {
     pub workspace: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CronAgentConfigWriteDto {
+    pub backend: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // C. CronJob response — nested structure matching API Spec
 // ---------------------------------------------------------------------------
@@ -141,7 +159,7 @@ pub struct CreateCronJobRequest {
     #[serde(default)]
     pub execution_mode: Option<String>,
     #[serde(default)]
-    pub agent_config: Option<CronAgentConfigDto>,
+    pub agent_config: Option<CronAgentConfigWriteDto>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -159,7 +177,7 @@ pub struct UpdateCronJobRequest {
     #[serde(default)]
     pub execution_mode: Option<String>,
     #[serde(default)]
-    pub agent_config: Option<CronAgentConfigDto>,
+    pub agent_config: Option<CronAgentConfigWriteDto>,
     #[serde(default)]
     pub conversation_title: Option<String>,
     #[serde(default)]
