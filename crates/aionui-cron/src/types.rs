@@ -331,18 +331,29 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
         },
     };
 
-    let agent_config_dto = job.agent_config.as_ref().map(|c| CronAgentConfigDto {
-        backend: c.backend.clone(),
-        name: c.name.clone(),
-        cli_path: c.cli_path.clone(),
-        is_preset: c.is_preset,
-        assistant_id: c.assistant_id.clone(),
-        custom_agent_id: c.custom_agent_id.clone(),
-        preset_agent_type: c.preset_agent_type.clone(),
-        mode: c.mode.clone(),
-        model_id: c.model_id.clone(),
-        config_options: c.config_options.clone(),
-        workspace: c.workspace.clone(),
+    let agent_config_dto = job.agent_config.as_ref().map(|c| {
+        let assistant_backed = c.assistant_id.is_some();
+        CronAgentConfigDto {
+            backend: c.backend.clone(),
+            name: c.name.clone(),
+            cli_path: if assistant_backed { None } else { c.cli_path.clone() },
+            is_preset: if assistant_backed { None } else { c.is_preset },
+            assistant_id: c.assistant_id.clone(),
+            custom_agent_id: if assistant_backed {
+                None
+            } else {
+                c.custom_agent_id.clone()
+            },
+            preset_agent_type: if assistant_backed {
+                None
+            } else {
+                c.preset_agent_type.clone()
+            },
+            mode: c.mode.clone(),
+            model_id: c.model_id.clone(),
+            config_options: c.config_options.clone(),
+            workspace: c.workspace.clone(),
+        }
     });
 
     CronJobResponse {
@@ -813,6 +824,45 @@ mod tests {
         };
         let resp = cron_job_to_response(&job);
         assert!(resp.metadata.agent_config.is_none());
+    }
+
+    #[test]
+    fn domain_to_dto_strips_legacy_agent_fields_for_assistant_backed_jobs() {
+        let job = CronJob {
+            agent_config: Some(CronAgentConfig {
+                backend: "codex".into(),
+                name: "文件规划助手".into(),
+                cli_path: Some("/tmp/codex".into()),
+                is_preset: Some(true),
+                assistant_id: Some("assistant-1".into()),
+                custom_agent_id: Some("legacy-assistant".into()),
+                preset_agent_type: Some("codex".into()),
+                mode: Some("full-access".into()),
+                model_id: Some("gpt-5-codex".into()),
+                config_options: Some(HashMap::from([("sandbox_mode".into(), "workspace-write".into())])),
+                workspace: Some("/tmp/project".into()),
+            }),
+            ..sample_job()
+        };
+
+        let resp = cron_job_to_response(&job);
+        let config = resp.metadata.agent_config.expect("assistant config should be present");
+
+        assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
+        assert!(config.cli_path.is_none());
+        assert!(config.is_preset.is_none());
+        assert!(config.custom_agent_id.is_none());
+        assert!(config.preset_agent_type.is_none());
+        assert_eq!(config.mode.as_deref(), Some("full-access"));
+        assert_eq!(config.model_id.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(
+            config
+                .config_options
+                .as_ref()
+                .and_then(|options| options.get("sandbox_mode")),
+            Some(&"workspace-write".to_owned())
+        );
+        assert_eq!(config.workspace.as_deref(), Some("/tmp/project"));
     }
 
     #[test]
