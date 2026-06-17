@@ -55,7 +55,7 @@ If case 2 applies, ask at most once whether the user wants to bring in a Team. K
    | Tester | Write and run tests | {agent_type} | (model from list) |
 4. **Output the table as a normal text message and END YOUR TURN.** Do NOT call `aion_create_team` or any other tool (including ask_user) in this turn. Wait for the user to reply in their next message with explicit confirmation (e.g. \"ok\", \"go ahead\", \"确认\") before proceeding.
 5. After user confirms → call `aion_create_team`. The summary MUST include both the goal and the confirmed team configuration. (The system automatically sets the correct agent type — you do NOT need to pass agentType.)
-6. After `aion_create_team` returns → the Team has been created, the current conversation has been bound as Leader, and the system navigates to the Team page automatically. **Do NOT call `team_spawn_agent`, `team_send_message`, or any other `team_*` tool in this solo turn.** Output a brief handoff telling the user to continue from the Team page, then END YOUR TURN. The user's next message from the Team page will start the first formal `TeamRun`.
+6. After `aion_create_team` returns → the Team has been created and the current conversation has been bound as Leader. **Do NOT call `team_spawn_agent`, `team_send_message`, or any other `team_*` tool in this solo turn.** Output only one brief user-facing handoff in the user's language. It should mean: the Team is ready, send the next message, and I will continue from there. Then END YOUR TURN. Do not mention the Team page, solo turn, `team_*` tools, `TeamRun`, or internal tool state in the user-facing handoff.
 7. User declines or wants changes → adjust or proceed solo. Do not mention Team again unless the user asks.
 
 ### Tool constraint
@@ -128,7 +128,7 @@ If case 2 applies, ask at most once whether the user wants to bring in a Team. K
 | Tester | Write and run tests | claude | (model from list) |\n\
 4. **Output the table as a normal text message and END YOUR TURN.** Do NOT call `aion_create_team` or any other tool (including ask_user) in this turn. Wait for the user to reply in their next message with explicit confirmation (e.g. \"ok\", \"go ahead\", \"确认\") before proceeding.\n\
 5. After user confirms → call `aion_create_team`. The summary MUST include both the goal and the confirmed team configuration. (The system automatically sets the correct agent type — you do NOT need to pass agentType.)\n\
-6. After `aion_create_team` returns → the Team has been created, the current conversation has been bound as Leader, and the system navigates to the Team page automatically. **Do NOT call `team_spawn_agent`, `team_send_message`, or any other `team_*` tool in this solo turn.** Output a brief handoff telling the user to continue from the Team page, then END YOUR TURN. The user's next message from the Team page will start the first formal `TeamRun`.\n\
+6. After `aion_create_team` returns → the Team has been created and the current conversation has been bound as Leader. **Do NOT call `team_spawn_agent`, `team_send_message`, or any other `team_*` tool in this solo turn.** Output only one brief user-facing handoff in the user's language. It should mean: the Team is ready, send the next message, and I will continue from there. Then END YOUR TURN. Do not mention the Team page, solo turn, `team_*` tools, `TeamRun`, or internal tool state in the user-facing handoff.\n\
 7. User declines or wants changes → adjust or proceed solo. Do not mention Team again unless the user asks.\n\
 \n\
 ### Tool constraint\n\
@@ -141,12 +141,17 @@ Before team creation: use **only** `aion_create_team` and `aion_list_models`. Af
         let prompt = build_team_guide_prompt("claude", None);
 
         assert!(prompt.contains(
-            "After `aion_create_team` returns → the Team has been created, the current conversation has been bound as Leader, and the system navigates to the Team page automatically."
+            "After `aion_create_team` returns → the Team has been created and the current conversation has been bound as Leader."
         ));
         assert!(prompt.contains(
             "Do NOT call `team_spawn_agent`, `team_send_message`, or any other `team_*` tool in this solo turn."
         ));
-        assert!(prompt.contains("The user's next message from the Team page will start the first formal `TeamRun`."));
+        assert!(prompt.contains(
+            "Output only one brief user-facing handoff in the user's language. It should mean: the Team is ready, send the next message, and I will continue from there."
+        ));
+        assert!(prompt.contains(
+            "Do not mention the Team page, solo turn, `team_*` tools, `TeamRun`, or internal tool state in the user-facing handoff."
+        ));
         assert!(
             prompt.contains("After `aion_create_team` succeeds: do not call any `team_*` tools in this solo turn.")
         );

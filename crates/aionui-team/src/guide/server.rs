@@ -171,9 +171,11 @@ async fn handle_tool_request(
 
 fn build_create_team_handoff_next_step(summary: &str) -> String {
     format!(
-        "Team was created and the Team page is open. End this solo turn now. \
-         Do not call any `team_*` tools from this solo turn. Tell the user to continue from the Team page; \
-         their next message there will start the first formal `TeamRun`. Task summary: {summary}"
+        "Team was created and the UI has switched to the team conversation. End this solo turn now. \
+         Do not call any `team_*` tools from this solo turn. Reply to the user only with one short \
+         handoff in their language. It should mean: the Team is ready, send the next message, and I will continue from there. \
+         Do not mention the Team page, solo turn, `team_*` tools, `TeamRun`, or internal tool state. \
+         Task summary: {summary}"
     )
 }
 
@@ -435,10 +437,17 @@ mod tests {
     fn create_team_next_step_tells_solo_agent_to_end_turn() {
         let next_step = build_create_team_handoff_next_step("Build a research and implementation team");
 
-        assert!(next_step.contains("Team was created and the Team page is open."));
+        assert!(next_step.contains("Team was created and the UI has switched to the team conversation."));
         assert!(next_step.contains("End this solo turn now."));
         assert!(next_step.contains("Do not call any `team_*` tools from this solo turn."));
-        assert!(next_step.contains("their next message there will start the first formal `TeamRun`."));
+        assert!(next_step.contains(
+            "Reply to the user only with one short handoff in their language. It should mean: the Team is ready, send the next message, and I will continue from there."
+        ));
+        assert!(
+            next_step.contains(
+                "Do not mention the Team page, solo turn, `team_*` tools, `TeamRun`, or internal tool state."
+            )
+        );
         assert!(next_step.contains("Task summary: Build a research and implementation team"));
         assert!(
             !next_step.contains("team_spawn_agent"),
