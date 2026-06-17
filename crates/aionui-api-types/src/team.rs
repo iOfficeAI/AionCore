@@ -1,5 +1,5 @@
 use aionui_common::TimestampMs;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::TeamMcpStdioConfig;
 
@@ -39,6 +39,7 @@ pub struct TeamAgentInput {
 #[derive(Debug, Deserialize)]
 pub struct CreateTeamRequest {
     pub name: String,
+    #[serde(alias = "assistants")]
     pub agents: Vec<TeamAgentInput>,
     #[serde(default)]
     pub workspace: Option<String>,
@@ -58,17 +59,64 @@ pub struct RenameTeamRequest {
 ///
 /// Adds a new agent to an existing team. A conversation is
 /// created automatically for the new agent.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct AddAgentRequest {
     pub name: String,
     pub role: String,
-    #[serde(default)]
     pub backend: Option<String>,
     pub model: String,
-    #[serde(default)]
     pub assistant_id: Option<String>,
-    #[serde(default)]
     pub custom_agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddAgentRequestCompat {
+    #[serde(default)]
+    assistant: Option<TeamAgentInput>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    assistant_id: Option<String>,
+    #[serde(default)]
+    custom_agent_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for AddAgentRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = AddAgentRequestCompat::deserialize(deserializer)?;
+        if let Some(assistant) = raw.assistant {
+            return Ok(Self {
+                name: assistant.name,
+                role: assistant.role,
+                backend: assistant.backend,
+                model: assistant.model,
+                assistant_id: assistant.assistant_id,
+                custom_agent_id: assistant.custom_agent_id,
+            });
+        }
+
+        let name = raw.name.ok_or_else(|| serde::de::Error::missing_field("name"))?;
+        let role = raw.role.ok_or_else(|| serde::de::Error::missing_field("role"))?;
+        let model = raw.model.ok_or_else(|| serde::de::Error::missing_field("model"))?;
+
+        Ok(Self {
+            name,
+            role,
+            backend: raw.backend,
+            model,
+            assistant_id: raw.assistant_id,
+            custom_agent_id: raw.custom_agent_id,
+        })
+    }
 }
 
 /// Request body for `PATCH /api/teams/:id/agents/:slotId/name`.
@@ -465,6 +513,27 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_create_team_request_from_assistants_field() {
+        let raw = json!({
+            "name": "Team Alpha",
+            "assistants": [
+                {
+                    "name": "Lead",
+                    "role": "lead",
+                    "model": "claude",
+                    "assistant_id": "assistant-x"
+                }
+            ]
+        });
+        let req: CreateTeamRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.name, "Team Alpha");
+        assert_eq!(req.agents.len(), 1);
+        assert_eq!(req.agents[0].name, "Lead");
+        assert_eq!(req.agents[0].assistant_id.as_deref(), Some("assistant-x"));
+        assert!(req.agents[0].backend.is_none());
+    }
+
+    #[test]
     fn deserialize_team_agent_input_with_conversation_id() {
         let raw = json!({
             "name": "Lead",
@@ -579,6 +648,24 @@ mod tests {
         });
         let req: AddAgentRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.assistant_id.as_deref(), Some("assistant-1"));
+    }
+
+    #[test]
+    fn deserialize_add_agent_request_from_assistant_field() {
+        let raw = json!({
+            "assistant": {
+                "name": "Helper",
+                "role": "teammate",
+                "model": "claude",
+                "assistant_id": "assistant-1"
+            }
+        });
+        let req: AddAgentRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.name, "Helper");
+        assert_eq!(req.role, "teammate");
+        assert_eq!(req.model, "claude");
+        assert_eq!(req.assistant_id.as_deref(), Some("assistant-1"));
+        assert!(req.backend.is_none());
     }
 
     #[test]
