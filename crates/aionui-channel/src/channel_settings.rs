@@ -162,7 +162,8 @@ impl ChannelSettingsService {
 
         for pref in prefs {
             if pref.key == key_agent {
-                assistant = parse_channel_assistant_setting(&pref.value);
+                assistant =
+                    parse_channel_assistant_setting(&pref.value).map(normalize_channel_assistant_setting_for_response);
             } else if pref.key == key_model {
                 default_model = parse_channel_model_setting(&pref.value);
             }
@@ -817,6 +818,24 @@ mod tests {
         assert_eq!(setting.backend.as_deref(), Some("codex"));
         assert!(setting.agent_type.is_none());
         assert_eq!(setting.name.as_deref(), Some("Codex"));
+    }
+
+    #[tokio::test]
+    async fn get_platform_settings_promotes_legacy_custom_agent_id_in_response() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.telegram.agent",
+            r#"{"custom_agent_id":"legacy-custom","name":"Codex"}"#,
+        )]));
+        let svc = ChannelSettingsService::new(repo);
+
+        let settings = svc.get_platform_settings(PluginType::Telegram).await.unwrap();
+        let assistant = settings.assistant.expect("assistant settings");
+
+        assert_eq!(assistant.assistant_id.as_deref(), Some("legacy-custom"));
+        assert!(assistant.custom_agent_id.is_none());
+        assert!(assistant.backend.is_none());
+        assert!(assistant.agent_type.is_none());
+        assert_eq!(assistant.name.as_deref(), Some("Codex"));
     }
 
     // ── resolved_model_to_provider ────────────────────────────────────
