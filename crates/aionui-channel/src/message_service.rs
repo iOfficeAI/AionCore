@@ -125,16 +125,15 @@ impl ChannelMessageService {
         platform: PluginType,
     ) -> Result<String, ChannelError> {
         let source = platform_to_source(platform);
-        let agent_type = parse_agent_type(&session.agent_type)?;
-
         let agent_config = self.settings.get_agent_config(platform).await?;
         let assistant_setting = self.settings.get_assistant_setting(platform).await?;
         let model_config = self.settings.get_model_config(platform).await?;
+        let agent_type = parse_agent_type(&agent_config.agent_type)?;
         let model = resolved_model_to_provider(model_config.as_ref());
         let mut extra = Self::build_channel_extra(agent_config.backend.as_deref());
         let name = channel_conversation_name(
             platform,
-            &session.agent_type,
+            &agent_config.agent_type,
             agent_config.backend.as_deref(),
             session.chat_id.as_deref(),
         );

@@ -323,7 +323,7 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
     let session = AssistantSessionRow {
         id: "session-assisted".to_owned(),
         user_id: "channel-user-1".to_owned(),
-        agent_type: "acp".to_owned(),
+        agent_type: "aionrs".to_owned(),
         conversation_id: None,
         workspace: None,
         chat_id: Some("7088048016".to_owned()),
@@ -345,6 +345,8 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
         "channel-created conversation should persist an assistant snapshot when the platform is bound to an assistant"
     );
     let snapshot = snapshot.unwrap();
+    let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
+    assert_eq!(conversation.r#type, AgentType::Acp.serde_name());
     assert_eq!(snapshot.assistant_key, "bare-claude");
     assert_eq!(snapshot.agent_backend, "claude");
 }
