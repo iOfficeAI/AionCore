@@ -1264,24 +1264,15 @@ fn sanitize_agent_config_dto(mut config: aionui_api_types::CronAgentConfigDto) -
         .assistant_id
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
-    if !has_assistant_id
-        && let Some(legacy_assistant_id) = config
-            .custom_agent_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    {
-        config.assistant_id = Some(legacy_assistant_id.to_owned());
-    }
-    let has_assistant_id = config
-        .assistant_id
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty());
     if has_assistant_id {
         config.custom_agent_id = None;
         config.preset_agent_type = None;
         config.is_preset = None;
+        return config;
     }
+    config.custom_agent_id = None;
+    config.preset_agent_type = None;
+    config.is_preset = None;
     config
 }
 
@@ -1438,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_agent_config_dto_promotes_legacy_custom_agent_id_without_assistant_id() {
+    fn sanitize_agent_config_dto_drops_legacy_custom_agent_id_without_assistant_id() {
         let config = aionui_api_types::CronAgentConfigDto {
             backend: "claude".into(),
             name: "Helper".into(),
@@ -1455,7 +1446,7 @@ mod tests {
 
         let sanitized = sanitize_agent_config_dto(config);
 
-        assert_eq!(sanitized.assistant_id.as_deref(), Some("legacy-assistant"));
+        assert!(sanitized.assistant_id.is_none());
         assert!(sanitized.custom_agent_id.is_none());
         assert!(sanitized.preset_agent_type.is_none());
         assert!(sanitized.is_preset.is_none());
@@ -1610,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn build_update_params_promotes_legacy_custom_agent_id_without_assistant_id() {
+    fn build_update_params_drops_legacy_custom_agent_id_without_assistant_id() {
         let job = sample_job();
         let req = UpdateCronJobRequest {
             name: None,
@@ -1640,7 +1631,7 @@ mod tests {
         let config_json = params.agent_config.flatten().expect("agent config json");
         let config: CronAgentConfig = serde_json::from_str(&config_json).expect("parse cron config");
 
-        assert_eq!(config.assistant_id.as_deref(), Some("legacy-assistant"));
+        assert!(config.assistant_id.is_none());
         assert!(config.custom_agent_id.is_none());
         assert!(config.preset_agent_type.is_none());
         assert!(config.is_preset.is_none());
