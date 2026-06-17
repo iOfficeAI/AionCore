@@ -460,9 +460,11 @@ async fn exec_list_models(args: &Value, service: &Weak<TeamSessionService>) -> R
 }
 
 async fn exec_describe_assistant(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, String> {
+    if args.get("custom_agent_id").is_some() {
+        return Err("custom_agent_id is no longer accepted; use assistant_id".to_owned());
+    }
     let assistant_key = args
         .get("assistant_id")
-        .or_else(|| args.get("custom_agent_id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -601,16 +603,20 @@ async fn exec_spawn_agent(
     if caller_role != TeammateRole::Lead {
         return Err("Only Lead can spawn agents".into());
     }
+    if args.get("backend").is_some() {
+        return Err("backend is no longer accepted; use agent_type".into());
+    }
+
     let input: SpawnAgentInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
 
     // Requested name — normalization / emptiness / uniqueness live in
     // `TeamSession::spawn_agent` so we do not double-validate here.
     let requested_name = input.name.clone();
 
-    // `agent_type` is the AionUi-spec field name; `backend` is the legacy
-    // phase-1 alias. Either (or neither — session then inherits from the
-    // caller) is accepted.
-    let agent_type = input.agent_type.or(input.backend);
+    // `agent_type` is the AionUi-spec fallback backend field. Assistant-first
+    // callers should prefer `assistant_id`; `agent_type` only remains for
+    // flows that intentionally spawn without an assistant.
+    let agent_type = input.agent_type;
 
     // Dynamic capability check happens in `TeamSession::spawn_agent` which
     // queries both the hard whitelist and persisted MCP capabilities.
@@ -954,22 +960,15 @@ mod tests {
         );
     }
 
-    /// The dispatch layer must accept both the new `agent_type` field and
-    /// the legacy `backend` alias so existing phase-1 callers (that still
-    /// send `backend`) do not regress.
     #[tokio::test]
-    async fn exec_spawn_agent_accepts_legacy_backend_alias() {
+    async fn exec_spawn_agent_rejects_legacy_backend_alias() {
         let service: Weak<TeamSessionService> = Weak::new();
-        // Use `backend` (legacy) instead of `agent_type` — parsing must succeed
-        // and we must reach the service-upgrade step (and then fail because
-        // Weak::new cannot upgrade). If `backend` were rejected at parse time
-        // the error would be "Invalid params".
         let args = json!({ "name": "Helper", "backend": "claude" });
         let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
-        let err = result.expect_err("dead Weak<TeamSessionService> must not succeed");
+        let err = result.expect_err("legacy backend alias must be rejected");
         assert!(
-            err.contains("Team service not available"),
-            "legacy 'backend' alias must parse through to service-upgrade step, got {err:?}"
+            err.contains("backend is no longer accepted"),
+            "expected explicit backend alias rejection, got {err:?}"
         );
     }
 }
