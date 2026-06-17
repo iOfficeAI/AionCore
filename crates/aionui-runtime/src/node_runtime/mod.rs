@@ -286,11 +286,13 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use std::io::Write;
     use tracing::Level;
     use tracing_subscriber::fmt;
+
+    static TEST_MANAGED_RUNTIME_CACHE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
     #[derive(Clone)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
@@ -352,6 +354,10 @@ mod tests {
             npx_args_prefix: vec![],
             env: vec![],
         }
+    }
+
+    fn test_managed_runtime_cache_lock() -> &'static tokio::sync::Mutex<()> {
+        TEST_MANAGED_RUNTIME_CACHE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[test]
@@ -429,6 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_managed_runtime_cache_is_evicted_when_root_is_deleted() {
+        let _guard = test_managed_runtime_cache_lock().lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("node-v24.11.0-test");
         let runtime = fake_managed_runtime(&root);
@@ -453,6 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_managed_runtime_emits_ready_after_validation() {
+        let _guard = test_managed_runtime_cache_lock().lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("node-v24.11.0-test");
         let runtime = fake_managed_runtime(&root);
