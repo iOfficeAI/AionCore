@@ -145,6 +145,7 @@ pub struct CronJobResponse {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCronJobRequest {
     pub name: String,
     #[serde(default)]
@@ -157,7 +158,6 @@ pub struct CreateCronJobRequest {
     pub conversation_id: String,
     #[serde(default)]
     pub conversation_title: Option<String>,
-    pub agent_type: Option<String>,
     pub created_by: String,
     #[serde(default)]
     pub execution_mode: Option<String>,
@@ -649,16 +649,14 @@ mod tests {
             "message": "Do the thing",
             "conversation_id": "conv_1",
             "conversation_title": "Tasks",
-            "agent_type": "acp",
             "created_by": "user",
             "execution_mode": "new_conversation",
-            "agent_config": {"backend": "acp", "name": "Claude"}
+            "agent_config": {"backend": "acp", "name": "Claude", "assistant_id": "assistant-1"}
         });
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name, "Daily task");
         assert_eq!(req.message.as_deref(), Some("Do the thing"));
         assert_eq!(req.conversation_id, "conv_1");
-        assert_eq!(req.agent_type.as_deref(), Some("acp"));
         assert_eq!(req.created_by, "user");
         assert_eq!(req.execution_mode.as_deref(), Some("new_conversation"));
         assert!(req.agent_config.is_some());
@@ -670,7 +668,6 @@ mod tests {
             "name": "Ping",
             "schedule": {"kind": "every", "every_ms": 60000},
             "conversation_id": "conv_1",
-            "agent_type": "acp",
             "created_by": "agent"
         });
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
@@ -679,7 +676,6 @@ mod tests {
         assert!(req.prompt.is_none());
         assert!(req.execution_mode.is_none());
         assert!(req.agent_config.is_none());
-        assert_eq!(req.agent_type.as_deref(), Some("acp"));
     }
 
     #[test]
@@ -689,7 +685,6 @@ mod tests {
             "schedule": {"kind": "at", "at_ms": 1000},
             "prompt": "Do something",
             "conversation_id": "conv_1",
-            "agent_type": "gemini",
             "created_by": "user"
         });
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
@@ -702,7 +697,6 @@ mod tests {
         let raw = json!({
             "schedule": {"kind": "every", "every_ms": 1000},
             "conversation_id": "c1",
-            "agent_type": "acp",
             "created_by": "user"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
@@ -713,7 +707,6 @@ mod tests {
         let raw = json!({
             "name": "X",
             "conversation_id": "c1",
-            "agent_type": "acp",
             "created_by": "user"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
@@ -724,22 +717,22 @@ mod tests {
         let raw = json!({
             "name": "X",
             "schedule": {"kind": "every", "every_ms": 1000},
-            "agent_type": "acp",
             "created_by": "user"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
     }
 
     #[test]
-    fn create_request_missing_agent_type() {
+    fn create_request_rejects_legacy_agent_type() {
         let raw = json!({
             "name": "X",
             "schedule": {"kind": "every", "every_ms": 1000},
             "conversation_id": "c1",
+            "agent_type": "acp",
             "created_by": "user"
         });
-        let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
-        assert!(req.agent_type.is_none());
+        let err = serde_json::from_value::<CreateCronJobRequest>(raw).expect_err("legacy agent_type must be rejected");
+        assert!(err.to_string().contains("agent_type"));
     }
 
     #[test]
@@ -748,7 +741,6 @@ mod tests {
             "name": "X",
             "schedule": {"kind": "every", "every_ms": 1000},
             "conversation_id": "c1",
-            "agent_type": "acp"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
     }

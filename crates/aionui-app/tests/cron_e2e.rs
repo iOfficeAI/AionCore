@@ -23,6 +23,15 @@ use common::{
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+const DEFAULT_CRON_ASSISTANT_ID: &str = "cron-e2e-assistant";
+
+fn default_assistant_agent_config(name: &str) -> serde_json::Value {
+    json!({
+        "name": name,
+        "assistant_id": DEFAULT_CRON_ASSISTANT_ID
+    })
+}
+
 fn create_job_body(name: &str) -> serde_json::Value {
     json!({
         "name": name,
@@ -30,8 +39,8 @@ fn create_job_body(name: &str) -> serde_json::Value {
         "message": "test message",
         "conversation_id": "conv_1",
         "conversation_title": "Test Conv",
-        "agent_type": "acp",
-        "created_by": "user"
+        "created_by": "user",
+        "agent_config": default_assistant_agent_config(name)
     })
 }
 
@@ -41,8 +50,8 @@ fn create_at_job_body(name: &str, at_ms: i64) -> serde_json::Value {
         "schedule": { "kind": "at", "at_ms": at_ms, "description": "once" },
         "message": "at message",
         "conversation_id": "conv_1",
-        "agent_type": "acp",
-        "created_by": "user"
+        "created_by": "user",
+        "agent_config": default_assistant_agent_config(name)
     })
 }
 
@@ -52,12 +61,33 @@ fn create_cron_job_body(name: &str, expr: &str) -> serde_json::Value {
         "schedule": { "kind": "cron", "expr": expr },
         "message": "cron message",
         "conversation_id": "conv_1",
-        "agent_type": "acp",
-        "created_by": "user"
+        "created_by": "user",
+        "agent_config": default_assistant_agent_config(name)
     })
 }
 
+async fn ensure_default_assistant(app: &mut axum::Router, token: &str, csrf: &str) {
+    let req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": DEFAULT_CRON_ASSISTANT_ID,
+            "name": "Cron E2E Assistant",
+            "preset_agent_type": "claude"
+        }),
+        token,
+        csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::CREATED || resp.status() == StatusCode::CONFLICT,
+        "expected assistant seed to be created or already exist, got {}",
+        resp.status()
+    );
+}
+
 async fn create_job(app: &mut axum::Router, token: &str, csrf: &str, body: serde_json::Value) -> serde_json::Value {
+    ensure_default_assistant(app, token, csrf).await;
     let req = json_with_token("POST", "/api/cron/jobs", body, token, csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -162,11 +192,12 @@ async fn cj2_create_three_schedule_types() {
 async fn cj3_create_missing_required_fields() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_assistant(&mut app, &token, &csrf).await;
 
     let invalid_bodies = vec![
-        json!({"schedule": {"kind": "every", "every_ms": 60000}, "conversation_id": "c1", "agent_type": "acp", "created_by": "user"}),
-        json!({"name": "X", "conversation_id": "c1", "agent_type": "acp", "created_by": "user"}),
-        json!({"name": "X", "schedule": {"kind": "every", "every_ms": 60000}, "agent_type": "acp", "created_by": "user"}),
+        json!({"schedule": {"kind": "every", "every_ms": 60000}, "conversation_id": "c1", "created_by": "user", "agent_config": default_assistant_agent_config("X")}),
+        json!({"name": "X", "conversation_id": "c1", "created_by": "user", "agent_config": default_assistant_agent_config("X")}),
+        json!({"name": "X", "schedule": {"kind": "every", "every_ms": 60000}, "created_by": "user", "agent_config": default_assistant_agent_config("X")}),
         json!({"name": "X", "schedule": {"kind": "every", "every_ms": 60000}, "conversation_id": "c1", "created_by": "user"}),
     ];
 
@@ -185,6 +216,7 @@ async fn cj3_create_missing_required_fields() {
 async fn cj3b_create_accepts_workspace_with_whitespace_segment() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_assistant(&mut app, &token, &csrf).await;
     let dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", aionui_common::generate_short_id()));
     std::fs::create_dir(&dir).unwrap();
     let workspace = dir.join("Archive ");
@@ -195,12 +227,12 @@ async fn cj3b_create_accepts_workspace_with_whitespace_segment() {
         "schedule": { "kind": "every", "every_ms": 60000, "description": "every minute" },
         "message": "test message",
         "conversation_id": "",
-        "agent_type": "acp",
         "created_by": "user",
         "execution_mode": "new_conversation",
         "agent_config": {
             "backend": "acp",
             "name": "Cron Agent",
+            "assistant_id": DEFAULT_CRON_ASSISTANT_ID,
             "workspace": workspace.to_string_lossy()
         }
     });
@@ -218,18 +250,19 @@ async fn cj3b_create_accepts_workspace_with_whitespace_segment() {
 async fn cj3c_create_rejects_missing_workspace_path() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_assistant(&mut app, &token, &csrf).await;
 
     let body = json!({
         "name": "Missing Workspace",
         "schedule": { "kind": "every", "every_ms": 60000, "description": "every minute" },
         "message": "test message",
         "conversation_id": "",
-        "agent_type": "acp",
         "created_by": "user",
         "execution_mode": "new_conversation",
         "agent_config": {
             "backend": "claude",
             "name": "Claude Code",
+            "assistant_id": DEFAULT_CRON_ASSISTANT_ID,
             "workspace": "/tmp/cron-job-workspace-missing-path"
         }
     });
@@ -458,8 +491,8 @@ async fn cj9b_update_schedule_preserves_existing_timezone_when_omitted() {
             "schedule": { "kind": "cron", "expr": "0 0 9 * * *", "tz": "Asia/Shanghai" },
             "message": "cron message",
             "conversation_id": "conv_1",
-            "agent_type": "acp",
-            "created_by": "user"
+            "created_by": "user",
+            "agent_config": default_assistant_agent_config("Schedule Change With Timezone")
         }),
     )
     .await;
@@ -674,7 +707,6 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
             "schedule": { "kind": "every", "every_ms": 60000, "description": "every minute" },
             "message": "cron preset assistant message",
             "conversation_id": "",
-            "agent_type": "acp",
             "created_by": "user",
             "execution_mode": "new_conversation",
             "agent_config": {
@@ -728,7 +760,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
         .expect("conversation should exist");
     let extra: serde_json::Value =
         serde_json::from_str(&conversation.extra).expect("conversation extra should be valid json");
-    assert_eq!(extra["assistant_id"], "u-fixed-mcp");
+    assert!(extra.get("assistant_id").is_none());
     assert!(extra.get("preset_assistant_id").is_none());
     assert!(extra.get("custom_agent_id").is_none());
     assert_eq!(extra["mcp_server_ids"], json!([fixed_mcp.id]));
@@ -954,14 +986,15 @@ async fn sc5_invalid_cron_expression() {
 async fn sc6_cron_with_timezone() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_assistant(&mut app, &token, &csrf).await;
 
     let body = json!({
         "name": "Shanghai Job",
         "schedule": { "kind": "cron", "expr": "0 0 9 * * *", "tz": "Asia/Shanghai" },
         "message": "hello",
         "conversation_id": "conv_1",
-        "agent_type": "acp",
-        "created_by": "user"
+        "created_by": "user",
+        "agent_config": default_assistant_agent_config("Shanghai Job")
     });
 
     let data = create_job(&mut app, &token, &csrf, body).await;
@@ -975,14 +1008,15 @@ async fn sc6_cron_with_timezone() {
 async fn sc7_every_zero_interval() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_assistant(&mut app, &token, &csrf).await;
 
     let body = json!({
         "name": "Zero Interval",
         "schedule": { "kind": "every", "every_ms": 0 },
         "message": "x",
         "conversation_id": "conv_1",
-        "agent_type": "acp",
-        "created_by": "user"
+        "created_by": "user",
+        "agent_config": default_assistant_agent_config("Zero Interval")
     });
     let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -995,14 +1029,15 @@ async fn sc7_every_zero_interval() {
 async fn sc8_every_negative_interval() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_assistant(&mut app, &token, &csrf).await;
 
     let body = json!({
         "name": "Negative Interval",
         "schedule": { "kind": "every", "every_ms": -1000 },
         "message": "x",
         "conversation_id": "conv_1",
-        "agent_type": "acp",
-        "created_by": "user"
+        "created_by": "user",
+        "agent_config": default_assistant_agent_config("Negative Interval")
     });
     let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
