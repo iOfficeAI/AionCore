@@ -137,6 +137,15 @@ pub struct ConversationRuntimeSummary {
     pub turn_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationAssistantIdentityResponse {
+    pub id: String,
+    pub source: String,
+    pub name: String,
+    pub avatar: String,
+    pub backend: String,
+}
+
 // ── Query types ────────────────────────────────────────────────────
 
 /// Query parameters for `GET /api/conversations`.
@@ -203,6 +212,8 @@ pub struct ConversationResponse {
     pub pinned_at: Option<TimestampMs>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_chat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant: Option<ConversationAssistantIdentityResponse>,
     pub created_at: TimestampMs,
     pub modified_at: TimestampMs,
     pub extra: serde_json::Value,
@@ -533,6 +544,7 @@ mod tests {
             pinned: false,
             pinned_at: None,
             channel_chat_id: None,
+            assistant: None,
             created_at: 1712345678000,
             modified_at: 1712345678000,
             extra: json!({ "workspace": "/project" }),
@@ -570,6 +582,7 @@ mod tests {
             pinned: false,
             pinned_at: None,
             channel_chat_id: None,
+            assistant: None,
             created_at: 1,
             modified_at: 1,
             extra: json!({}),
@@ -601,6 +614,7 @@ mod tests {
             pinned: true,
             pinned_at: Some(1712345678000),
             channel_chat_id: Some("group:42".into()),
+            assistant: None,
             created_at: 1000,
             modified_at: 2000,
             extra: json!({}),
@@ -684,6 +698,7 @@ mod tests {
                 pinned: false,
                 pinned_at: None,
                 channel_chat_id: None,
+                assistant: None,
                 created_at: 1712345678000,
                 modified_at: 1712345678000,
                 extra: json!({}),
@@ -720,6 +735,7 @@ mod tests {
                 pinned: false,
                 pinned_at: None,
                 channel_chat_id: None,
+                assistant: None,
                 created_at: 9000,
                 modified_at: 9000,
                 extra: json!({}),
@@ -790,6 +806,7 @@ mod tests {
                 pinned: false,
                 pinned_at: None,
                 channel_chat_id: None,
+                assistant: None,
                 created_at: 1000,
                 modified_at: 1000,
                 extra: json!({}),
@@ -834,6 +851,7 @@ mod tests {
                     pinned: false,
                     pinned_at: None,
                     channel_chat_id: None,
+                    assistant: None,
                     created_at: 5000,
                     modified_at: 5000,
                     extra: json!({}),

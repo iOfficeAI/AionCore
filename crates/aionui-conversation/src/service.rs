@@ -41,7 +41,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::convert::{
     TOOL_CONTENT_COMPACT_THRESHOLD_BYTES, row_to_artifact_response, row_to_message_response,
-    row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
+    row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item,
+    snapshot_to_assistant_identity, string_to_enum,
 };
 use crate::error::ConversationError;
 use crate::session_context::SessionContextBuilder;
@@ -531,6 +532,18 @@ impl ConversationService {
 // ── Conversation CRUD ───────────────────────────────────────────────
 
 impl ConversationService {
+    async fn attach_assistant_identity(&self, response: &mut ConversationResponse) -> Result<(), ConversationError> {
+        if response.assistant.is_some() {
+            return Ok(());
+        }
+
+        if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(&response.id).await? {
+            response.assistant = Some(snapshot_to_assistant_identity(&snapshot));
+        }
+
+        Ok(())
+    }
+
     /// Create a new conversation.
     ///
     /// Generates a UUID v7, sets status to `pending`, defaults source
@@ -955,7 +968,19 @@ impl ConversationService {
             self.persist_assistant_preferences_from_snapshot(snapshot).await?;
         }
 
-        let response = row_to_response(row, &self.workspace_root)?;
+        let mut response = row_to_response(row, &self.workspace_root)?;
+        if let Some(snapshot) = assistant_snapshot.as_ref() {
+            response.assistant = Some(aionui_api_types::ConversationAssistantIdentityResponse {
+                id: snapshot.assistant_id.clone(),
+                source: snapshot.assistant_source.clone(),
+                name: snapshot.name.clone(),
+                avatar: match snapshot.avatar_type.as_str() {
+                    "builtin_asset" | "user_asset" => format!("/api/assistants/{}/avatar", snapshot.assistant_id),
+                    _ => snapshot.avatar.clone().unwrap_or_default(),
+                },
+                backend: snapshot.agent_backend.clone(),
+            });
+        }
 
         self.broadcast_list_changed(&response.id, "created", response.source.as_ref());
 
@@ -1463,6 +1488,7 @@ impl ConversationService {
             .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
         self.backfill_extra_inplace(&row.id, &mut extra).await;
         let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
+        self.attach_assistant_identity(&mut response).await?;
         response.runtime = Some(self.runtime_summary_for(id).await);
         Ok(response)
     }
@@ -1504,7 +1530,10 @@ impl ConversationService {
             };
             self.backfill_extra_inplace(&row_id, &mut extra).await;
             match row_to_response_with_extra(row, extra, &self.workspace_root) {
-                Ok(resp) => items.push(resp),
+                Ok(mut resp) => {
+                    self.attach_assistant_identity(&mut resp).await?;
+                    items.push(resp);
+                }
                 Err(err) => warn!(
                     conversation_id = %row_id,
                     error = %ErrorChain(&err),
@@ -1838,9 +1867,13 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let rows = self.conversation_repo.list_associated(user_id, id).await?;
-        rows.into_iter()
-            .map(|row| row_to_response(row, &self.workspace_root))
-            .collect::<Result<Vec<_>, _>>()
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut response = row_to_response(row, &self.workspace_root)?;
+            self.attach_assistant_identity(&mut response).await?;
+            items.push(response);
+        }
+        Ok(items)
     }
 
     /// List conversations spawned by a specific cron job.
@@ -1850,9 +1883,13 @@ impl ConversationService {
         cron_job_id: &str,
     ) -> Result<Vec<ConversationResponse>, ConversationError> {
         let rows = self.conversation_repo.list_by_cron_job(user_id, cron_job_id).await?;
-        rows.into_iter()
-            .map(|row| row_to_response(row, &self.workspace_root))
-            .collect::<Result<Vec<_>, _>>()
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut response = row_to_response(row, &self.workspace_root)?;
+            self.attach_assistant_identity(&mut response).await?;
+            items.push(response);
+        }
+        Ok(items)
     }
 }
 
@@ -3383,6 +3420,7 @@ mod tests {
             pinned: false,
             pinned_at: None,
             channel_chat_id: None,
+            assistant: None,
             created_at: 0,
             modified_at: 0,
             extra: json!({}),

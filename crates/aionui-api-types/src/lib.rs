@@ -76,11 +76,11 @@ pub use conversation::{
     ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
     CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
-    ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationResponse,
-    ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest,
-    UpdateConversationRequest,
+    ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
     CreateCronJobRequest, CronAgentConfigDto, CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto,

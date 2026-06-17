@@ -4082,6 +4082,16 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     .unwrap();
     let resp = svc.create("user-1", req).await.unwrap();
 
+    assert_eq!(
+        resp.assistant,
+        Some(aionui_api_types::ConversationAssistantIdentityResponse {
+            id: "preset-1".into(),
+            source: "builtin".into(),
+            name: "Preset".into(),
+            avatar: "🤖".into(),
+            backend: "codex".into(),
+        })
+    );
     assert_eq!(resp.extra["assistant_id"], json!("preset-1"));
     assert!(resp.extra.get("preset_assistant_id").is_none());
     assert!(resp.extra.get("preset_context").is_none());
@@ -4106,6 +4116,42 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     assert_eq!(updated_pref.last_model_id.as_deref(), Some("new-model"));
     assert_eq!(updated_pref.last_skill_ids, r#"["pdf"]"#);
     assert_eq!(updated_pref.last_disabled_builtin_skill_ids, r#"["todo-tracker"]"#);
+
+    let fetched = svc.get("user-1", &resp.id).await.unwrap();
+    assert_eq!(
+        fetched.assistant,
+        Some(aionui_api_types::ConversationAssistantIdentityResponse {
+            id: "preset-1".into(),
+            source: "builtin".into(),
+            name: "Preset".into(),
+            avatar: "🤖".into(),
+            backend: "codex".into(),
+        })
+    );
+
+    let listed = svc
+        .list(
+            "user-1",
+            ListConversationsQuery {
+                cursor: None,
+                limit: Some(20),
+                source: None,
+                cron_job_id: None,
+                pinned: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.items[0].assistant,
+        Some(aionui_api_types::ConversationAssistantIdentityResponse {
+            id: "preset-1".into(),
+            source: "builtin".into(),
+            name: "Preset".into(),
+            avatar: "🤖".into(),
+            backend: "codex".into(),
+        })
+    );
 }
 
 #[tokio::test]
