@@ -334,8 +334,9 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
     let agent_config_dto = job.agent_config.as_ref().map(|c| {
         let canonical_assistant_id = c.assistant_id.clone().or_else(|| c.custom_agent_id.clone());
         let assistant_backed = canonical_assistant_id.is_some();
+        let preserve_backend = !assistant_backed || job.agent_type == "aionrs";
         CronAgentConfigDto {
-            backend: c.backend.clone(),
+            backend: preserve_backend.then(|| c.backend.clone()),
             name: c.name.clone(),
             cli_path: if assistant_backed { None } else { c.cli_path.clone() },
             is_preset: if assistant_backed { None } else { c.is_preset },
@@ -850,6 +851,7 @@ mod tests {
         let config = resp.metadata.agent_config.expect("assistant config should be present");
 
         assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
+        assert!(config.backend.is_none());
         assert!(config.cli_path.is_none());
         assert!(config.is_preset.is_none());
         assert!(config.custom_agent_id.is_none());
@@ -899,8 +901,36 @@ mod tests {
         let config = resp.metadata.agent_config.expect("assistant config should be present");
 
         assert_eq!(config.assistant_id.as_deref(), Some("legacy-assistant"));
+        assert!(config.backend.is_none());
         assert!(config.custom_agent_id.is_none());
         assert!(config.cli_path.is_none());
+    }
+
+    #[test]
+    fn domain_to_dto_keeps_provider_backend_for_aionrs_assistant_jobs() {
+        let job = CronJob {
+            agent_type: "aionrs".into(),
+            agent_config: Some(CronAgentConfig {
+                backend: "gemini".into(),
+                name: "Gemini Bare Assistant".into(),
+                cli_path: None,
+                is_preset: None,
+                assistant_id: Some("bare-gemini".into()),
+                custom_agent_id: None,
+                preset_agent_type: None,
+                mode: Some("default".into()),
+                model_id: Some("gemini-2.5-pro".into()),
+                config_options: None,
+                workspace: Some("/tmp/project".into()),
+            }),
+            ..sample_job()
+        };
+
+        let resp = cron_job_to_response(&job);
+        let config = resp.metadata.agent_config.expect("assistant config should be present");
+
+        assert_eq!(config.assistant_id.as_deref(), Some("bare-gemini"));
+        assert_eq!(config.backend.as_deref(), Some("gemini"));
     }
 
     // -- DTO → Domain schedule ------------------------------------------------

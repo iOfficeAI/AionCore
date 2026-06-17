@@ -38,7 +38,8 @@ pub enum CronScheduleDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CronAgentConfigDto {
-    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_path: Option<String>,
@@ -437,7 +438,7 @@ mod tests {
             "workspace": "/tmp/ws"
         });
         let c: CronAgentConfigDto = serde_json::from_value(raw).unwrap();
-        assert_eq!(c.backend, "acp");
+        assert_eq!(c.backend.as_deref(), Some("acp"));
         assert_eq!(c.name, "Claude Agent");
         assert_eq!(c.cli_path.as_deref(), Some("/usr/bin/claude"));
         assert_eq!(c.is_preset, Some(true));
@@ -451,7 +452,7 @@ mod tests {
     fn agent_config_minimal() {
         let raw = json!({"backend": "openai", "name": "GPT"});
         let c: CronAgentConfigDto = serde_json::from_value(raw).unwrap();
-        assert_eq!(c.backend, "openai");
+        assert_eq!(c.backend.as_deref(), Some("openai"));
         assert_eq!(c.name, "GPT");
         assert!(c.cli_path.is_none());
         assert!(c.is_preset.is_none());
@@ -461,7 +462,7 @@ mod tests {
     #[test]
     fn agent_config_serialize_omits_none() {
         let c = CronAgentConfigDto {
-            backend: "acp".into(),
+            backend: Some("acp".into()),
             name: "Test".into(),
             cli_path: None,
             is_preset: None,
@@ -482,7 +483,7 @@ mod tests {
     #[test]
     fn agent_config_roundtrip() {
         let c = CronAgentConfigDto {
-            backend: "acp".into(),
+            backend: Some("acp".into()),
             name: "Agent".into(),
             cli_path: Some("/bin/x".into()),
             is_preset: Some(false),
@@ -526,7 +527,7 @@ mod tests {
                 created_at: 1700000000000,
                 updated_at: 1700001000000,
                 agent_config: Some(CronAgentConfigDto {
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     name: "Claude".into(),
                     cli_path: None,
                     is_preset: None,
