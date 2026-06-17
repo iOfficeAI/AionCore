@@ -22,9 +22,10 @@ use aionui_conversation::ConversationService;
 use aionui_conversation::response_middleware::{CronCreateParams, CronUpdateParams};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
-    IConversationRepository, ICronRepository, MessageRowUpdate, MessageSearchRow, SortOrder,
-    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteCronRepository, init_database_memory,
-    models::MessageRow,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, IConversationRepository, ICronRepository,
+    MessageRowUpdate, MessageSearchRow, SortOrder, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteCronRepository,
+    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, init_database_memory, models::MessageRow,
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -556,6 +557,10 @@ async fn setup_with_conv_repo() -> (
     let cron_repo: Arc<dyn ICronRepository> = Arc::new(SqliteCronRepository::new(pool.clone()));
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
         Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
+    let assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository> =
+        Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
+    let assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository> =
+        Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
     let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
     let bc = Arc::new(MockBroadcaster::new());
     let data_dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", now_ms()));
@@ -612,10 +617,111 @@ async fn setup_with_conv_repo() -> (
     let scheduler = Arc::new(CronScheduler::new(Arc::new(|_| {})));
 
     let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn EventBroadcaster>);
-    let svc = CronService::new(cron_repo.clone(), scheduler, executor, emitter, data_dir);
+    let svc = CronService::new(
+        cron_repo.clone(),
+        assistant_definition_repo,
+        assistant_overlay_repo,
+        scheduler,
+        executor,
+        emitter,
+        data_dir,
+    );
 
     std::mem::forget(db);
     (svc, cron_repo, bc, stub_conv_repo)
+}
+
+async fn setup_with_assistant_repos() -> (
+    CronService,
+    Arc<dyn ICronRepository>,
+    Arc<MockBroadcaster>,
+    Arc<StubConvRepo>,
+    Arc<dyn IAssistantDefinitionRepository>,
+    Arc<dyn IAssistantOverlayRepository>,
+) {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool().clone();
+    let cron_repo: Arc<dyn ICronRepository> = Arc::new(SqliteCronRepository::new(pool.clone()));
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
+        Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
+    let assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository> =
+        Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
+    let assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository> =
+        Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
+    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
+    let bc = Arc::new(MockBroadcaster::new());
+    let data_dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", now_ms()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    struct StubSkillResolver;
+    #[async_trait::async_trait]
+    impl aionui_conversation::skill_resolver::SkillResolver for StubSkillResolver {
+        async fn auto_inject_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn resolve_skills(
+            &self,
+            _names: &[String],
+        ) -> Vec<aionui_conversation::skill_resolver::ResolvedAgentSkill> {
+            Vec::new()
+        }
+
+        async fn link_workspace_skills(
+            &self,
+            _workspace: &std::path::Path,
+            _rel_dirs: &[&str],
+            _skills: &[aionui_conversation::skill_resolver::ResolvedAgentSkill],
+        ) -> usize {
+            0
+        }
+    }
+
+    let stub_conv_repo = Arc::new(StubConvRepo::new());
+    let stub_conv_repo_trait: Arc<dyn IConversationRepository> = stub_conv_repo.clone();
+    let task_manager: Arc<dyn aionui_ai_agent::task_manager::IWorkerTaskManager> = Arc::new(StubTaskManager);
+    let conv_service = Arc::new(ConversationService::new(
+        std::env::temp_dir(),
+        bc.clone() as Arc<dyn EventBroadcaster>,
+        Arc::new(StubSkillResolver),
+        Arc::clone(&task_manager),
+        Arc::clone(&stub_conv_repo_trait),
+        Arc::clone(&agent_metadata_repo),
+        acp_session_repo,
+    ));
+    let agent_registry = AgentRegistry::new(agent_metadata_repo);
+    agent_registry.hydrate().await.unwrap();
+    let executor = Arc::new(JobExecutor::new(
+        task_manager,
+        stub_conv_repo_trait,
+        conv_service,
+        data_dir.clone(),
+        data_dir.clone(),
+        bc.clone() as Arc<dyn EventBroadcaster>,
+        agent_registry,
+    ));
+
+    let scheduler = Arc::new(CronScheduler::new(Arc::new(|_| {})));
+    let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn EventBroadcaster>);
+    let svc = CronService::new(
+        cron_repo.clone(),
+        assistant_definition_repo.clone(),
+        assistant_overlay_repo.clone(),
+        scheduler,
+        executor,
+        emitter,
+        data_dir,
+    );
+
+    std::mem::forget(db);
+    (
+        svc,
+        cron_repo,
+        bc,
+        stub_conv_repo,
+        assistant_definition_repo,
+        assistant_overlay_repo,
+    )
 }
 
 fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobRequest {
@@ -627,11 +733,68 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
         message: Some("test message".into()),
         conversation_id: "conv_1".into(),
         conversation_title: Some("Test Conv".into()),
-        agent_type: "acp".into(),
+        agent_type: Some("acp".into()),
         created_by: "user".into(),
         execution_mode: None,
         agent_config: None,
     }
+}
+
+async fn seed_assistant_definition(
+    repo: &Arc<dyn IAssistantDefinitionRepository>,
+    definition_id: &str,
+    assistant_key: &str,
+    agent_backend: &str,
+) {
+    repo.upsert(&UpsertAssistantDefinitionParams {
+        definition_id,
+        assistant_key,
+        source: "user",
+        owner_type: "user",
+        source_ref: Some(assistant_key),
+        source_version: None,
+        source_hash: None,
+        name: assistant_key,
+        name_i18n: "{}",
+        description: Some("test assistant"),
+        description_i18n: "{}",
+        avatar_type: "emoji",
+        avatar_value: Some("🤖"),
+        agent_backend,
+        rule_resource_type: "inline",
+        rule_resource_ref: None,
+        rule_inline_content: None,
+        recommended_prompts: "[]",
+        recommended_prompts_i18n: "{}",
+        default_model_mode: "auto",
+        default_model_value: None,
+        default_permission_mode: "auto",
+        default_permission_value: None,
+        default_skills_mode: "auto",
+        default_skill_ids: "[]",
+        custom_skill_names: "[]",
+        default_disabled_builtin_skill_ids: "[]",
+        default_mcps_mode: "auto",
+        default_mcp_ids: "[]",
+    })
+    .await
+    .unwrap();
+}
+
+async fn seed_assistant_overlay(
+    repo: &Arc<dyn IAssistantOverlayRepository>,
+    definition_id: &str,
+    agent_backend_override: Option<&str>,
+) {
+    repo.upsert(&UpsertAssistantOverlayParams {
+        definition_id,
+        enabled: true,
+        sort_order: 0,
+        agent_backend_override,
+        last_used_at: None,
+    })
+    .await
+    .unwrap();
 }
 
 fn every_60s() -> CronScheduleDto {
@@ -678,16 +841,14 @@ async fn cj1_create_cron_job() {
 
 #[tokio::test]
 async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
-    let (svc, _, _) = setup().await;
+    let (svc, _, _, _, definition_repo, _) = setup_with_assistant_repos().await;
+    seed_assistant_definition(&definition_repo, "asstdef_assistant_1", "assistant-1", "claude").await;
     let mut req = make_create_req("Assistant Only Create", every_60s());
-    req.agent_config = Some(aionui_api_types::CronAgentConfigDto {
+    req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
         backend: "claude".into(),
         name: "Helper".into(),
         cli_path: None,
-        is_preset: Some(true),
         assistant_id: Some("assistant-1".into()),
-        custom_agent_id: Some("legacy-assistant".into()),
-        preset_agent_type: Some("claude".into()),
         mode: Some("default".into()),
         model_id: Some("claude-sonnet-4".into()),
         config_options: None,
@@ -709,7 +870,7 @@ async fn create_job_rejects_deprecated_agent_types() {
 
     for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini", "codex"] {
         let mut req = make_create_req(&format!("Deprecated {agent_type}"), every_60s());
-        req.agent_type = agent_type.to_owned();
+        req.agent_type = Some(agent_type.to_owned());
 
         let err = svc.add_job(req).await.unwrap_err();
         assert!(matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)));
@@ -719,6 +880,73 @@ async fn create_job_rejects_deprecated_agent_types() {
             "unexpected error for {agent_type}: {err}"
         );
     }
+}
+
+#[tokio::test]
+async fn create_job_requires_agent_type_when_assistant_id_is_missing() {
+    let (svc, _, _) = setup().await;
+    let mut req = make_create_req("Missing Runtime Type", every_60s());
+    req.agent_type = None;
+
+    let err = svc.add_job(req).await.unwrap_err();
+    assert!(matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)));
+    assert!(
+        err.to_string()
+            .contains("agent_type is required when assistant_id is missing")
+    );
+}
+
+#[tokio::test]
+async fn create_job_derives_runtime_type_from_aionrs_assistant() {
+    let (svc, _, _, _, definition_repo, _) = setup_with_assistant_repos().await;
+    seed_assistant_definition(&definition_repo, "asstdef_runtime_aionrs", "assistant-aionrs", "aionrs").await;
+
+    let mut req = make_create_req("Assistant Aionrs", every_60s());
+    req.agent_type = None;
+    req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        backend: "provider-gemini".into(),
+        name: "Aionrs Assistant".into(),
+        cli_path: None,
+        assistant_id: Some("assistant-aionrs".into()),
+        mode: Some("yolo".into()),
+        model_id: Some("gemini-3.1-pro-preview".into()),
+        config_options: None,
+        workspace: None,
+    });
+
+    let job = svc.add_job(req).await.unwrap();
+
+    assert_eq!(job.agent_type, "aionrs");
+}
+
+#[tokio::test]
+async fn create_job_derives_runtime_type_from_assistant_overlay_override() {
+    let (svc, _, _, _, definition_repo, overlay_repo) = setup_with_assistant_repos().await;
+    seed_assistant_definition(
+        &definition_repo,
+        "asstdef_runtime_override",
+        "assistant-override",
+        "claude",
+    )
+    .await;
+    seed_assistant_overlay(&overlay_repo, "asstdef_runtime_override", Some("aionrs")).await;
+
+    let mut req = make_create_req("Assistant Override", every_60s());
+    req.agent_type = None;
+    req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        backend: "provider-openai".into(),
+        name: "Override Assistant".into(),
+        cli_path: None,
+        assistant_id: Some("assistant-override".into()),
+        mode: Some("acceptEdits".into()),
+        model_id: Some("gpt-5.4".into()),
+        config_options: None,
+        workspace: None,
+    });
+
+    let job = svc.add_job(req).await.unwrap();
+
+    assert_eq!(job.agent_type, "aionrs");
 }
 
 // ── CJ-2: Create three schedule types ──────────────────────────────
@@ -871,14 +1099,11 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
         schedule: None,
         message: None,
         execution_mode: None,
-        agent_config: Some(aionui_api_types::CronAgentConfigDto {
+        agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
             backend: "claude".into(),
             name: "Helper".into(),
             cli_path: None,
-            is_preset: Some(true),
             assistant_id: Some("assistant-1".into()),
-            custom_agent_id: Some("legacy-assistant".into()),
-            preset_agent_type: Some("claude".into()),
             mode: Some("default".into()),
             model_id: Some("claude-sonnet-4".into()),
             config_options: None,

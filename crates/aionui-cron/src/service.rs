@@ -9,7 +9,7 @@ use aionui_api_types::{
 use aionui_common::{
     AgentType, WorkspacePathValidationError, generate_prefixed_id, now_ms, validate_workspace_path_availability,
 };
-use aionui_db::{ICronRepository, UpdateCronJobParams};
+use aionui_db::{IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository, UpdateCronJobParams};
 use tracing::{error, info, warn};
 
 use crate::events::CronEventEmitter;
@@ -40,6 +40,8 @@ const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer suppor
 #[derive(Clone)]
 pub struct CronService {
     repo: Arc<dyn ICronRepository>,
+    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
     scheduler: Arc<CronScheduler>,
     executor: Arc<JobExecutor>,
     emitter: CronEventEmitter,
@@ -49,6 +51,8 @@ pub struct CronService {
 impl CronService {
     pub fn new(
         repo: Arc<dyn ICronRepository>,
+        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
         scheduler: Arc<CronScheduler>,
         executor: Arc<JobExecutor>,
         emitter: CronEventEmitter,
@@ -56,6 +60,8 @@ impl CronService {
     ) -> Self {
         Self {
             repo,
+            assistant_definition_repo,
+            assistant_overlay_repo,
             scheduler,
             executor,
             emitter,
@@ -70,8 +76,11 @@ impl CronService {
     pub async fn add_job(&self, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
         let schedule = schedule_from_dto(&req.schedule);
         validate_schedule(&schedule)?;
-        reject_deprecated_new_conversation_agent_type(&req.agent_type)?;
-        validate_aionrs_agent_config(&req.agent_type, req.agent_config.as_ref())?;
+        let resolved_agent_type = self
+            .resolve_new_job_agent_type(req.agent_type.as_deref(), req.agent_config.as_ref())
+            .await?;
+        reject_deprecated_new_conversation_agent_type(&resolved_agent_type)?;
+        validate_aionrs_agent_config(&resolved_agent_type, req.agent_config.as_ref())?;
 
         let execution_mode = parse_execution_mode(req.execution_mode.as_deref())?;
         let created_by = CreatedBy::from_str(&req.created_by)?;
@@ -107,7 +116,7 @@ impl CronService {
             agent_config,
             conversation_id: req.conversation_id,
             conversation_title: req.conversation_title,
-            agent_type: req.agent_type,
+            agent_type: resolved_agent_type,
             created_by,
             skill_content: None,
             description: req.description,
@@ -437,6 +446,35 @@ impl CronService {
 
     pub fn to_response(job: &CronJob) -> CronJobResponse {
         cron_job_to_response(job)
+    }
+
+    async fn resolve_new_job_agent_type(
+        &self,
+        legacy_agent_type: Option<&str>,
+        agent_config: Option<&aionui_api_types::CronAgentConfigWriteDto>,
+    ) -> Result<String, CronError> {
+        let Some(assistant_id) = agent_config.and_then(|config| config.assistant_id.as_deref()) else {
+            let agent_type = legacy_agent_type
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CronError::InvalidAgentConfig("agent_type is required when assistant_id is missing".into())
+                })?;
+            return Ok(agent_type.to_owned());
+        };
+
+        let definition = self
+            .assistant_definition_repo
+            .get_by_key(assistant_id)
+            .await?
+            .ok_or_else(|| CronError::InvalidAgentConfig(format!("assistant '{assistant_id}' not found")))?;
+        let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+        let effective_backend = overlay
+            .as_ref()
+            .and_then(|item| item.agent_backend_override.as_deref())
+            .unwrap_or(definition.agent_backend.as_str());
+
+        Ok(runtime_agent_type_for_backend(effective_backend).to_owned())
     }
 
     async fn bind_existing_conversation_if_needed(&self, job: &CronJob) {
@@ -891,7 +929,7 @@ impl aionui_conversation::response_middleware::ICronService for CronService {
             message: Some(params.message.clone()),
             conversation_id: conversation_id.to_owned(),
             conversation_title,
-            agent_type,
+            agent_type: Some(agent_type),
             created_by: "agent".to_owned(),
             execution_mode: Some("existing".to_owned()),
             agent_config,
@@ -1114,6 +1152,10 @@ fn get_string(extra: &serde_json::Value, keys: &[&str]) -> Option<String> {
 /// Aionrs cron jobs require `agent_config.backend` (provider_id) to be set —
 /// the executor uses it to look up the provider row and build the agent.
 /// Reject add/update requests that would produce an invalid aionrs job.
+fn runtime_agent_type_for_backend(backend: &str) -> &'static str {
+    if backend == "aionrs" { "aionrs" } else { "acp" }
+}
+
 fn validate_aionrs_agent_config(
     agent_type: &str,
     agent_config: Option<&aionui_api_types::CronAgentConfigWriteDto>,

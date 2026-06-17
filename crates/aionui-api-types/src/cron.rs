@@ -154,7 +154,7 @@ pub struct CreateCronJobRequest {
     pub conversation_id: String,
     #[serde(default)]
     pub conversation_title: Option<String>,
-    pub agent_type: String,
+    pub agent_type: Option<String>,
     pub created_by: String,
     #[serde(default)]
     pub execution_mode: Option<String>,
@@ -610,7 +610,7 @@ mod tests {
         assert_eq!(req.name, "Daily task");
         assert_eq!(req.message.as_deref(), Some("Do the thing"));
         assert_eq!(req.conversation_id, "conv_1");
-        assert_eq!(req.agent_type, "acp");
+        assert_eq!(req.agent_type.as_deref(), Some("acp"));
         assert_eq!(req.created_by, "user");
         assert_eq!(req.execution_mode.as_deref(), Some("new_conversation"));
         assert!(req.agent_config.is_some());
@@ -631,6 +631,7 @@ mod tests {
         assert!(req.prompt.is_none());
         assert!(req.execution_mode.is_none());
         assert!(req.agent_config.is_none());
+        assert_eq!(req.agent_type.as_deref(), Some("acp"));
     }
 
     #[test]
@@ -689,7 +690,8 @@ mod tests {
             "conversation_id": "c1",
             "created_by": "user"
         });
-        assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
+        let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.agent_type.is_none());
     }
 
     #[test]

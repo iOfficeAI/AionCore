@@ -684,8 +684,14 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     )));
 
     let emitter = CronEventEmitter::new(services.event_bus.clone());
+    let assistant_definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(
+        services.database.pool().clone(),
+    ));
+    let assistant_overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone()));
     let cron_service = Arc::new(aionui_cron::service::CronService::new(
         cron_repo,
+        assistant_definition_repo,
+        assistant_overlay_repo,
         scheduler,
         executor,
         emitter,
