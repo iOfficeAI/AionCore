@@ -218,6 +218,34 @@ impl AgentTurnExecutionPort for NoopTurnPort {
     }
 }
 
+#[derive(Default)]
+struct RecordingTurnPort {
+    requests: Mutex<Vec<AgentTurnRequest>>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutionPort for RecordingTurnPort {
+    async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        if let Some(on_started) = request.on_started.as_ref() {
+            on_started(AgentTurnStarted {
+                team_run_id: request.team_run_id.clone().expect("team run id"),
+                slot_id: request.slot_id.clone(),
+                role: request.role.clone(),
+                conversation_id: request.conversation_id.clone(),
+                turn_id: format!("turn-{}", request.slot_id),
+            })
+            .await;
+        }
+        self.requests.lock().unwrap().push(request.clone());
+        Ok(AgentTurnOutcome {
+            conversation_id: request.conversation_id,
+            turn_id: "turn-recorded".into(),
+            status: AgentTurnStatus::Completed,
+            runtime: None,
+        })
+    }
+}
+
 fn noop_turn_port() -> Arc<dyn AgentTurnExecutionPort> {
     Arc::new(NoopTurnPort)
 }
@@ -1131,8 +1159,144 @@ fn setup_with_ports_team_repo_and_conversation_repo(
     (svc, team_repo, conversation_ports, conv_repo)
 }
 
+fn setup_with_recording_turn_port() -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<RecordingTurnPort>,
+    Arc<MockConversationRepo>,
+) {
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone(), broadcaster.clone()));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
+    let turn_port = Arc::new(RecordingTurnPort::default());
+    let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let svc = TeamSessionService::new(
+        team_repo_dyn,
+        Arc::new(StubAgentMetadataRepo::empty()),
+        provider_repo,
+        conversation_port,
+        projection_store,
+        lookup_port,
+        broadcaster,
+        task_manager,
+        turn_port.clone(),
+        noop_cancellation_port(),
+        backend_binary_path,
+        None,
+    );
+    (svc, team_repo, turn_port, conv_repo)
+}
+
 fn setup() -> Arc<TeamSessionService> {
     setup_with_factory(success_factory()).0
+}
+
+#[tokio::test]
+async fn ensure_session_recovery_drain_runs_agent_turn_with_team_run_id() {
+    let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Recover".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let lead_slot_id = created.lead_agent_id.clone().expect("lead");
+    svc.stop_session("user1", &created.id)
+        .await
+        .expect("stop auto-started session");
+
+    team_repo
+        .write_message(&aionui_db::models::MailboxMessageRow {
+            id: "mailbox-orphan-1".into(),
+            team_id: created.id.clone(),
+            to_agent_id: lead_slot_id.clone(),
+            from_agent_id: "worker-or-user".into(),
+            msg_type: "message".into(),
+            content: "orphan backlog".into(),
+            summary: None,
+            files: None,
+            read: false,
+            created_at: aionui_common::now_ms(),
+        })
+        .await
+        .expect("seed orphan mailbox");
+
+    svc.ensure_session("user1", &created.id).await.expect("ensure");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !turn_port.requests.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("recovery turn should run");
+
+    let requests = turn_port.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].slot_id, lead_slot_id);
+    assert!(
+        requests[0].team_run_id.is_some(),
+        "recovery turn must be TeamRun-owned"
+    );
+}
+
+#[tokio::test]
+async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
+    let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Self Only".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let lead_slot_id = created.lead_agent_id.clone().expect("lead");
+    svc.stop_session("user1", &created.id)
+        .await
+        .expect("stop auto-started session");
+
+    team_repo
+        .write_message(&aionui_db::models::MailboxMessageRow {
+            id: "mailbox-self-1".into(),
+            team_id: created.id.clone(),
+            to_agent_id: lead_slot_id.clone(),
+            from_agent_id: lead_slot_id,
+            msg_type: "message".into(),
+            content: "self backlog".into(),
+            summary: None,
+            files: None,
+            read: false,
+            created_at: aionui_common::now_ms(),
+        })
+        .await
+        .expect("seed self mailbox");
+
+    svc.ensure_session("user1", &created.id).await.expect("ensure");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert!(
+        turn_port.requests.lock().unwrap().is_empty(),
+        "self-only unread must not start a recovery turn"
+    );
 }
 
 fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<RecordingBroadcaster>) {

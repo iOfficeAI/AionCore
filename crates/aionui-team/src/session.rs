@@ -205,10 +205,6 @@ impl TeamSession {
         &self.team_run_manager
     }
 
-    pub(crate) fn notify_agent_for_session_restore_drain(&self, slot_id: &str) {
-        self.event_loops.notify(slot_id);
-    }
-
     pub fn mcp_stdio_config(&self, slot_id: &str) -> TeamMcpStdioConfig {
         TeamMcpStdioConfig {
             team_id: self.team.id.clone(),
@@ -2570,24 +2566,6 @@ mod tests {
             TeamError::InvalidRequest(message)
                 if message == "no active team run for run-scoped wake"
         ));
-        session.stop();
-    }
-
-    #[tokio::test]
-    async fn session_restore_drain_does_not_record_pending_wake_without_active_run() {
-        let session = start_session().await;
-
-        session.notify_agent_for_session_restore_drain("worker-1");
-
-        let reservation = session
-            .team_run_manager()
-            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
-            .await;
-
-        assert!(
-            reservation.is_none(),
-            "restore drain must not create Team Run reservation"
-        );
         session.stop();
     }
 

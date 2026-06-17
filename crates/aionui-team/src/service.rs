@@ -552,19 +552,12 @@ impl TeamSessionService {
         };
         self.sessions.insert(team_id.to_owned(), entry);
 
-        // Notify all agents so they drain any pre-existing mailbox messages
-        // (e.g. from a prior session or backend restart).
-        for agent in &agents_snapshot {
-            if session.team_run_manager().active_run_id().await.is_some() {
-                warn!(
-                    team_id,
-                    slot_id = %agent.slot_id,
-                    wake_policy = "session_restore_drain",
-                    "session restore drain skipped because active team run exists"
-                );
-            } else {
-                session.notify_agent_for_session_restore_drain(&agent.slot_id);
-            }
+        if let Err(err) = session.try_start_recovery_drain("ensure_session_ready").await {
+            warn!(
+                team_id,
+                error = %err,
+                "team recovery scan failed after session ensure"
+            );
         }
 
         let active_count = if skip_leader {
