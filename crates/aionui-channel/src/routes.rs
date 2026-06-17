@@ -588,6 +588,7 @@ async fn set_channel_assistant_setting(
     let Json(req) = body.map_err(ApiError::from)?;
 
     state.settings_service.set_assistant_setting(platform, &req).await?;
+    state.session_manager.clear_all_sessions().await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -607,6 +608,7 @@ async fn set_channel_default_model_setting(
     let Json(req) = body.map_err(ApiError::from)?;
 
     state.settings_service.set_model_setting(platform, &req).await?;
+    state.session_manager.clear_all_sessions().await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
