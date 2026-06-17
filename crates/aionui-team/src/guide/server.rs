@@ -194,12 +194,6 @@ async fn exec_create_team(
         }
     };
 
-    let backend = request_body
-        .get("backend")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("claude")
-        .to_owned();
-
     let model = request_body
         .get("model")
         .and_then(serde_json::Value::as_str)
@@ -217,6 +211,15 @@ async fn exec_create_team(
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+
+    let assistant_id =
+        match resolve_requested_assistant_id(&svc, request_body, args, caller_conversation_id.as_deref()).await {
+            Ok(assistant_id) => assistant_id,
+            Err(error) => {
+                warn!(error, "Guide HTTP: aion_create_team missing assistant identity");
+                return serde_json::json!({ "error": error });
+            }
+        };
 
     // Refuse if the caller conversation already belongs to a team.
     // This prevents duplicate team creation when guide MCP is
@@ -245,9 +248,9 @@ async fn exec_create_team(
         agents: vec![TeamAgentInput {
             name: "Leader".to_owned(),
             role: "leader".to_owned(),
-            backend: Some(backend.clone()),
+            backend: None,
             model: model.clone(),
-            assistant_id: None,
+            assistant_id: Some(assistant_id),
             conversation_id: caller_conversation_id,
         }],
         workspace: None,
@@ -274,6 +277,43 @@ async fn exec_create_team(
             params.summary
         )
     })
+}
+
+fn extract_assistant_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("assistant_id")
+        .or_else(|| value.get("custom_agent_id"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("assistant")
+                .and_then(|assistant| assistant.get("id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+async fn resolve_requested_assistant_id(
+    service: &Arc<TeamSessionService>,
+    request_body: &serde_json::Value,
+    args: &serde_json::Value,
+    caller_conversation_id: Option<&str>,
+) -> Result<String, String> {
+    if let Some(assistant_id) = extract_assistant_id(request_body).or_else(|| extract_assistant_id(args)) {
+        return Ok(assistant_id);
+    }
+
+    let Some(conversation_id) = caller_conversation_id else {
+        return Err("assistant_id is required when the caller conversation is not assistant-backed".into());
+    };
+
+    service
+        .lookup_assistant_identity_by_conversation(conversation_id)
+        .await
+        .map_err(|error| format!("failed to resolve caller assistant identity: {error}"))?
+        .ok_or_else(|| "assistant_id is required when the caller conversation is not assistant-backed".into())
 }
 
 async fn exec_team_tool(
@@ -381,8 +421,83 @@ async fn resolve_team_context(service: &TeamSessionService, conversation_id: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    use aionui_db::models::{AssistantDefinitionRow, AssistantOverlayRow, ConversationRow};
+    use aionui_db::{
+        IAssistantDefinitionRepository, IAssistantOverlayRepository, IConversationRepository, ITeamRepository,
+    };
     use tokio::time::timeout;
+
+    use crate::test_utils::workspace_harness::setup_with_assistants_team_repo_and_conversation_repo;
+
+    struct SingleAssistantDefinitionRepo {
+        row: AssistantDefinitionRow,
+    }
+
+    #[async_trait::async_trait]
+    impl IAssistantDefinitionRepository for SingleAssistantDefinitionRepo {
+        async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, aionui_db::DbError> {
+            Ok(vec![self.row.clone()])
+        }
+
+        async fn get_by_key(&self, assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, aionui_db::DbError> {
+            Ok((self.row.assistant_key == assistant_key).then_some(self.row.clone()))
+        }
+
+        async fn get_by_definition_id(
+            &self,
+            definition_id: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, aionui_db::DbError> {
+            Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+        }
+
+        async fn get_by_source_ref(
+            &self,
+            _source: &str,
+            _source_ref: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, aionui_db::DbError> {
+            Ok(None)
+        }
+
+        async fn upsert(
+            &self,
+            _params: &aionui_db::models::UpsertAssistantDefinitionParams<'_>,
+        ) -> Result<AssistantDefinitionRow, aionui_db::DbError> {
+            Err(aionui_db::DbError::Init("not implemented".into()))
+        }
+
+        async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, aionui_db::DbError> {
+            Ok(false)
+        }
+    }
+
+    struct SingleAssistantOverlayRepo {
+        row: AssistantOverlayRow,
+    }
+
+    #[async_trait::async_trait]
+    impl IAssistantOverlayRepository for SingleAssistantOverlayRepo {
+        async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, aionui_db::DbError> {
+            Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+        }
+
+        async fn list(&self) -> Result<Vec<AssistantOverlayRow>, aionui_db::DbError> {
+            Ok(vec![self.row.clone()])
+        }
+
+        async fn upsert(
+            &self,
+            _params: &aionui_db::models::UpsertAssistantOverlayParams<'_>,
+        ) -> Result<AssistantOverlayRow, aionui_db::DbError> {
+            Err(aionui_db::DbError::Init("not implemented".into()))
+        }
+
+        async fn delete(&self, _definition_id: &str) -> Result<bool, aionui_db::DbError> {
+            Ok(false)
+        }
+    }
 
     #[tokio::test]
     async fn start_returns_positive_port_and_token() {
@@ -465,5 +580,112 @@ mod tests {
 
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body.get("result").is_some());
+    }
+
+    #[tokio::test]
+    async fn create_team_uses_assistant_identity_from_caller_conversation() {
+        let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+            row: AssistantDefinitionRow {
+                definition_id: "def-guide-lead".into(),
+                assistant_key: "assistant-lead".into(),
+                source: "user".into(),
+                owner_type: "user".into(),
+                source_ref: None,
+                source_version: None,
+                source_hash: None,
+                name: "Lead Assistant".into(),
+                name_i18n: "{}".into(),
+                description: None,
+                description_i18n: "{}".into(),
+                avatar_type: "emoji".into(),
+                avatar_value: Some("🤖".into()),
+                agent_backend: "claude".into(),
+                rule_resource_type: "inline".into(),
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: "[]".into(),
+                recommended_prompts_i18n: "{}".into(),
+                default_model_mode: "auto".into(),
+                default_model_value: None,
+                default_permission_mode: "auto".into(),
+                default_permission_value: None,
+                default_skills_mode: "auto".into(),
+                default_skill_ids: "[]".into(),
+                custom_skill_names: "[]".into(),
+                default_disabled_builtin_skill_ids: "[]".into(),
+                default_mcps_mode: "auto".into(),
+                default_mcp_ids: "[]".into(),
+                created_at: 0,
+                updated_at: 0,
+                deleted_at: None,
+            },
+        });
+        let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
+            row: AssistantOverlayRow {
+                definition_id: "def-guide-lead".into(),
+                enabled: true,
+                sort_order: 0,
+                agent_backend_override: Some("codex".into()),
+                last_used_at: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        });
+        let (svc, team_repo, _task_manager, conv_repo) =
+            setup_with_assistants_team_repo_and_conversation_repo(definition_repo, overlay_repo);
+
+        conv_repo
+            .create(&ConversationRow {
+                id: "caller-conv".into(),
+                user_id: "system_default_user".into(),
+                name: "Caller".into(),
+                r#type: "acp".into(),
+                pinned: false,
+                pinned_at: None,
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::json!({
+                    "assistant_id": "assistant-lead",
+                    "workspace": "/tmp/guide-workspace"
+                })
+                .to_string(),
+                model: None,
+                status: Some("completed".into()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed caller conversation");
+
+        let server = GuideMcpServer::start().await.expect("start guide server");
+        server.set_service(Arc::downgrade(&svc)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/tool", server.http_port()))
+            .header("Authorization", format!("Bearer {}", server.auth_token()))
+            .json(&serde_json::json!({
+                "tool": "aion_create_team",
+                "args": { "summary": "build a review team" },
+                "conversation_id": "caller-conv",
+                "user_id": "system_default_user"
+            }))
+            .send()
+            .await
+            .expect("call guide create team");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: serde_json::Value = resp.json().await.expect("guide create team response");
+        let team_id = body["teamId"].as_str().expect("team id in response");
+        let team_row = team_repo
+            .get_team(team_id)
+            .await
+            .expect("team lookup")
+            .expect("persisted team row");
+        let team = crate::types::Team::from_row(&team_row).expect("team row parses");
+        let leader = team.agents.first().expect("leader agent exists");
+
+        assert_eq!(leader.assistant_id.as_deref(), Some("assistant-lead"));
+        assert_eq!(leader.backend, "codex");
     }
 }

@@ -348,6 +348,18 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         }))
     }
 
+    async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, aionui_team::TeamError> {
+        Ok(self.repo.get_extra(conversation_id).and_then(|extra| {
+            extra
+                .get("assistant_id")
+                .or_else(|| extra.get("preset_assistant_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        }))
+    }
+
     async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, aionui_team::TeamError> {
         if self
             .fail_team_temp_create

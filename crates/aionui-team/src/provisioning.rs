@@ -79,6 +79,8 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
+    async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
+
     async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError>;
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;

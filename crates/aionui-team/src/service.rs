@@ -136,6 +136,13 @@ impl TeamSessionService {
             .await
     }
 
+    pub(crate) async fn lookup_assistant_identity_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>, TeamError> {
+        self.conversation_port.conversation_assistant_id(conversation_id).await
+    }
+
     async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
         let row = self
             .repo

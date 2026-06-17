@@ -569,6 +569,18 @@ pub(crate) mod workspace_harness {
             }))
         }
 
+        async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
+            Ok(self.repo.get_extra(conversation_id).and_then(|extra| {
+                extra
+                    .get("assistant_id")
+                    .or_else(|| extra.get("preset_assistant_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            }))
+        }
+
         async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError> {
             let path = self
                 .workspace_root
@@ -899,6 +911,43 @@ pub(crate) mod workspace_harness {
             Arc::new(EmptyAgentMetadataRepo),
             Arc::new(EmptyAssistantDefinitionRepo),
             Arc::new(EmptyAssistantOverlayRepo),
+            Arc::new(EmptyProviderRepo),
+            conversation_port,
+            projection_store,
+            lookup_port,
+            broadcaster,
+            task_manager.clone(),
+            Arc::new(NoopTurnPort),
+            Arc::new(NoopCancellationPort),
+            Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+            None,
+        );
+        (svc, team_repo, task_manager, conv_repo)
+    }
+
+    pub(crate) fn setup_with_assistants_team_repo_and_conversation_repo(
+        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    ) -> (
+        Arc<TeamSessionService>,
+        Arc<FullMockTeamRepo>,
+        Arc<dyn IWorkerTaskManager>,
+        Arc<MockConversationRepo>,
+    ) {
+        let team_repo = Arc::new(FullMockTeamRepo::new());
+        let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
+        let conv_repo = Arc::new(MockConversationRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
+        let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+        let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+        let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+        let svc = TeamSessionService::new(
+            team_repo_dyn,
+            Arc::new(EmptyAgentMetadataRepo),
+            assistant_definition_repo,
+            assistant_overlay_repo,
             Arc::new(EmptyProviderRepo),
             conversation_port,
             projection_store,

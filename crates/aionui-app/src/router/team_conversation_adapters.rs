@@ -211,6 +211,28 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map(str::to_owned))
     }
 
+    async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
+        if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(conversation_id).await? {
+            let assistant_id = snapshot.assistant_key.trim();
+            if !assistant_id.is_empty() {
+                return Ok(Some(assistant_id.to_owned()));
+            }
+        }
+
+        let Some(row) = self.conversation_repo.get(conversation_id).await? else {
+            return Ok(None);
+        };
+
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        Ok(extra
+            .get("assistant_id")
+            .or_else(|| extra.get("preset_assistant_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned))
+    }
+
     async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError> {
         self.conversation_service
             .create_team_temp_workspace(team_id)
