@@ -1814,20 +1814,8 @@ async fn s11_shutdown_approved_interception() {
 /// Scenario 12a: Cold-start lead gets role prompt injected into first_message.
 #[tokio::test]
 async fn s12a_cold_start_lead_gets_role_prompt() {
-    let (session, _tm, _repo, _sent) = setup_session().await;
-
-    session
-        .mailbox()
-        .write(
-            "e2e-team",
-            "lead-1",
-            "user",
-            aionui_team::MailboxMessageType::Message,
-            "kick off",
-            None,
-        )
-        .await
-        .unwrap();
+    let (session, _tm, _repo, _sent, _turn_requests) = setup_session_with_turn_recorder_without_loops().await;
+    session.send_message("kick off", None).await.unwrap();
 
     let input = session
         .compute_wake_input("lead-1")
@@ -1853,22 +1841,10 @@ async fn s12a_cold_start_lead_gets_role_prompt() {
 /// on a first compute_wake_input call, then assert the second call omits it.
 #[tokio::test]
 async fn s12b_warm_lead_skips_role_prompt() {
-    let (session, _tm, _repo, _sent) = setup_session().await;
+    let (session, _tm, _repo, _sent, _turn_requests) = setup_session_with_turn_recorder_without_loops().await;
 
-    // First: consume the cold-start role-prompt flag by calling compute_wake_input once.
-    // The mailbox will be empty so should_send=false, but the flag is consumed.
-    session
-        .mailbox()
-        .write(
-            "e2e-team",
-            "lead-1",
-            "user",
-            aionui_team::MailboxMessageType::Message,
-            "initial kick",
-            None,
-        )
-        .await
-        .unwrap();
+    // First: consume the cold-start role-prompt flag from a TeamRun-owned wake.
+    session.send_message("initial kick", None).await.unwrap();
     let first_input = session
         .compute_wake_input("lead-1")
         .await
@@ -1881,18 +1857,7 @@ async fn s12b_warm_lead_skips_role_prompt() {
     // The flag is now consumed (take_needs_role_prompt returned true, set to false).
 
     // Second call: write another message and compute again — no role prompt this time.
-    session
-        .mailbox()
-        .write(
-            "e2e-team",
-            "lead-1",
-            "user",
-            aionui_team::MailboxMessageType::Message,
-            "follow-up message",
-            None,
-        )
-        .await
-        .unwrap();
+    session.send_message("follow-up message", None).await.unwrap();
 
     let input = session
         .compute_wake_input("lead-1")

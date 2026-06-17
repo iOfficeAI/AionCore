@@ -1249,10 +1249,7 @@ async fn ensure_session_recovery_drain_runs_agent_turn_with_team_run_id() {
     let requests = turn_port.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].slot_id, lead_slot_id);
-    assert!(
-        requests[0].team_run_id.is_some(),
-        "recovery turn must be TeamRun-owned"
-    );
+    assert!(requests[0].team_run_id.is_some(), "recovery turn must be TeamRun-owned");
 }
 
 #[tokio::test]

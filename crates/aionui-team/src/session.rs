@@ -3117,12 +3117,26 @@ mod tests {
 
         session
             .mailbox()
-            .write(session.team_id(), &lead, "worker-1", MailboxMessageType::Message, "m1", None)
+            .write(
+                session.team_id(),
+                &lead,
+                "worker-1",
+                MailboxMessageType::Message,
+                "m1",
+                None,
+            )
             .await
             .expect("lead mailbox write 1");
         session
             .mailbox()
-            .write(session.team_id(), &lead, "worker-2", MailboxMessageType::Message, "m2", None)
+            .write(
+                session.team_id(),
+                &lead,
+                "worker-2",
+                MailboxMessageType::Message,
+                "m2",
+                None,
+            )
             .await
             .expect("lead mailbox write 2");
         session
@@ -3163,7 +3177,14 @@ mod tests {
 
         session
             .mailbox()
-            .write(session.team_id(), &lead, "worker-1", MailboxMessageType::Message, "late", None)
+            .write(
+                session.team_id(),
+                &lead,
+                "worker-1",
+                MailboxMessageType::Message,
+                "late",
+                None,
+            )
             .await
             .expect("late mailbox write");
 
@@ -3245,6 +3266,7 @@ mod tests {
             )
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
 
@@ -3270,6 +3292,7 @@ mod tests {
             )
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
         assert_eq!(
@@ -3303,6 +3326,7 @@ mod tests {
             )
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
         session.mirror_unread_to_conversation(&input).await;
@@ -3389,6 +3413,7 @@ mod tests {
             .write("t1", "worker-1", "lead-1", MailboxMessageType::Message, "do it", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "worker-1", TeamRunTargetRole::Teammate, 1).await;
 
         let input = session
             .compute_wake_input("worker-1")
