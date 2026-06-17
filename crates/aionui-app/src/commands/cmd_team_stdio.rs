@@ -192,9 +192,9 @@ struct ShutdownAgentParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ListModelsParams {
-    /// Agent type/backend to query (e.g. "gemini", "claude", "codex"). Shows all when omitted.
+    /// Assistant ID to query. Shows all backends when omitted.
     #[serde(default)]
-    agent_type: Option<String>,
+    assistant_id: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -310,12 +310,12 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_list_models",
-        description = "Query available models for team agent types. Returns the real-time model list that matches the frontend model selector.\n\nUse this to:\n- Check what models are available before spawning an agent with a specific model\n- See all available agent types and their models at once\n- Verify a model ID is valid for a given agent type\n\nPass agent_type to query a specific backend, or omit it to see all."
+        description = "Query available models for team assistants. Returns the real-time model list that matches the frontend model selector.\n\nUse this to:\n- Check what models are available before spawning an agent with a specific model\n- See all available assistant backends and their models at once\n- Verify a model ID is valid for a given assistant\n\nPass assistant_id to query a specific assistant, or omit it to see all backends."
     )]
     async fn list_models(&self, Parameters(params): Parameters<ListModelsParams>) -> CallToolResult {
         self.forward_to_tcp(
             "team_list_models",
-            &serde_json::json!({ "agent_type": params.agent_type }),
+            &serde_json::json!({ "assistant_id": params.assistant_id }),
         )
         .await
     }
@@ -645,6 +645,55 @@ mod tests {
         );
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("conv-secret-123"));
+    }
+
+    #[tokio::test]
+    async fn list_models_forwards_assistant_id_argument() {
+        let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _init = read_frame(&mut socket).await.unwrap();
+            let init_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {}
+            }))
+            .unwrap();
+            write_frame(&mut socket, &init_response).await.unwrap();
+
+            let call = read_frame(&mut socket).await.unwrap();
+            let call_value: serde_json::Value = serde_json::from_slice(&call).unwrap();
+            let arguments = &call_value["params"]["arguments"];
+            assert_eq!(arguments["assistant_id"], json!("assistant-social-job-publisher"));
+            assert!(arguments.get("agent_type").is_none());
+
+            let tool_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{ "type": "text", "text": "ok" }],
+                    "isError": false
+                }
+            }))
+            .unwrap();
+            write_frame(&mut socket, &tool_response).await.unwrap();
+        });
+        let server = TeamStdioServer {
+            port,
+            token: "dummy-token".into(),
+            slot_id: "dummy-slot".into(),
+        };
+
+        let result = server
+            .list_models(Parameters(ListModelsParams {
+                assistant_id: Some("assistant-social-job-publisher".into()),
+            }))
+            .await;
+
+        accept_task.await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(first_text(&result), "ok");
     }
 
     #[test]
