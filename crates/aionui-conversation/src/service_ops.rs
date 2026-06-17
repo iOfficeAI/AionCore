@@ -10,12 +10,14 @@
 use std::path::Component;
 
 use aionui_api_types::{
-    GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest,
-    SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse,
+    SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
+use aionui_common::ErrorChain;
+use tracing::warn;
 
 use crate::ConversationError;
-use crate::service::ConversationService;
+use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 
 const MAX_DIR_DEPTH: usize = 10;
 
@@ -48,10 +50,56 @@ impl ConversationService {
                 reason: "value must not be empty".into(),
             });
         }
-        self.task(conversation_id)?
+        let response = self
+            .task(conversation_id)?
             .set_config_option(option_id, &req.value)
             .await
-            .map_err(ConversationError::from)
+            .map_err(ConversationError::from)?;
+
+        // Mirror runtime model/mode switches into the persisted assistant
+        // snapshot + preference so the next conversation seeded from this
+        // assistant in `auto` mode reflects the latest pick. We only act on
+        // observed confirmations — `command_ack` means the agent merely
+        // accepted the request, not that the value is in effect, and
+        // unrelated option ids (e.g. `thought_level`) have no preference
+        // mapping. Persistence failures are logged but do not roll back the
+        // user-facing config switch.
+        if response.confirmation == ConfigOptionConfirmation::Observed {
+            let updates = match option_id {
+                "model" => Some(AssistantRuntimePreferenceUpdate {
+                    model: Some(req.value.as_str()),
+                    permission: None,
+                }),
+                "mode" => Some(AssistantRuntimePreferenceUpdate {
+                    model: None,
+                    permission: Some(req.value.as_str()),
+                }),
+                _ => None,
+            };
+            if let Some(updates) = updates {
+                if let Err(err) = self.persist_runtime_assistant_snapshot(conversation_id, updates).await {
+                    warn!(
+                        conversation_id,
+                        option_id,
+                        error = %ErrorChain(&err),
+                        "Failed to persist runtime assistant snapshot after set_config_option",
+                    );
+                }
+                if let Err(err) = self
+                    .persist_runtime_assistant_preferences(conversation_id, updates)
+                    .await
+                {
+                    warn!(
+                        conversation_id,
+                        option_id,
+                        error = %ErrorChain(&err),
+                        "Failed to persist runtime assistant preferences after set_config_option",
+                    );
+                }
+            }
+        }
+
+        Ok(response)
     }
 
     // ── Usage / Slash commands ──────────────────────────────────────
