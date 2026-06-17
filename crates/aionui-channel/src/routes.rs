@@ -9,7 +9,7 @@ use axum::routing::{get, post, put};
 use tracing::warn;
 
 use aionui_api_types::{
-    ApiResponse, ApprovePairingRequest, BridgeResponse, ChannelAssistantSetting, ChannelDefaultModelSetting,
+    ApiResponse, ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelDefaultModelSetting,
     ChannelPlatformSettingsResponse, ChannelSessionResponse, ChannelUserResponse, DisablePluginRequest,
     EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
     SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
@@ -581,7 +581,7 @@ async fn get_channel_settings(
 async fn set_channel_assistant_setting(
     State(state): State<ChannelRouterState>,
     Path(platform): Path<String>,
-    body: Result<Json<ChannelAssistantSetting>, JsonRejection>,
+    body: Result<Json<ChannelAssistantSettingRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let platform = PluginType::from_str_opt(&platform)
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;

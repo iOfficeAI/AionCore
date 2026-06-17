@@ -87,12 +87,23 @@ pub struct SyncChannelSettingsRequest {
     pub platform: String,
 }
 
-/// Assistant binding for a channel platform.
+/// Assistant binding request for a channel platform.
 ///
-/// Stored as backend-owned business data and used to resolve which assistant
-/// should handle new inbound channel conversations for a given platform.
+/// New writes must use assistant identity only. Legacy backend / agent fields
+/// remain readable in responses for historical settings migration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ChannelAssistantSetting {
+pub struct ChannelAssistantSettingRequest {
+    pub assistant_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Assistant binding returned by channel settings endpoints.
+///
+/// Responses remain backward-compatible while historical channel settings are
+/// still being read from assistant/backend mixed records.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelAssistantSettingResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assistant_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,7 +128,7 @@ pub struct ChannelDefaultModelSetting {
 pub struct ChannelPlatformSettingsResponse {
     pub platform: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub assistant: Option<ChannelAssistantSetting>,
+    pub assistant: Option<ChannelAssistantSettingResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<ChannelDefaultModelSetting>,
 }

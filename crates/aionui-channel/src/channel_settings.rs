@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use aionui_api_types::{ChannelAssistantSetting, ChannelDefaultModelSetting, ChannelPlatformSettingsResponse};
+use aionui_api_types::{
+    ChannelAssistantSettingRequest, ChannelAssistantSettingResponse, ChannelDefaultModelSetting,
+    ChannelPlatformSettingsResponse,
+};
 use aionui_common::ProviderWithModel;
 use aionui_db::{IAssistantDefinitionRepository, IAssistantOverlayRepository, IClientPreferenceRepository};
 use tracing::debug;
@@ -175,7 +178,7 @@ impl ChannelSettingsService {
     pub async fn get_assistant_setting(
         &self,
         platform: PluginType,
-    ) -> Result<Option<ChannelAssistantSetting>, ChannelError> {
+    ) -> Result<Option<ChannelAssistantSettingResponse>, ChannelError> {
         let key = agent_key(platform);
         let prefs = self.pref_repo.get_by_keys(&[&key]).await?;
 
@@ -183,14 +186,13 @@ impl ChannelSettingsService {
             return Ok(None);
         };
 
-        Ok(parse_channel_assistant_setting(&pref.value)
-            .map(|assistant| normalize_channel_assistant_setting_for_write(&assistant)))
+        Ok(parse_channel_assistant_setting(&pref.value).map(normalize_channel_assistant_setting_for_response))
     }
 
     pub async fn set_assistant_setting(
         &self,
         platform: PluginType,
-        assistant: &ChannelAssistantSetting,
+        assistant: &ChannelAssistantSettingRequest,
     ) -> Result<(), ChannelError> {
         let normalized = normalize_channel_assistant_setting_for_write(assistant);
         let payload = serde_json::to_string(&normalized).map_err(ChannelError::Json)?;
@@ -251,11 +253,11 @@ fn default_agent_config() -> ResolvedAgentConfig {
     }
 }
 
-fn parse_channel_assistant_setting(value: &str) -> Option<ChannelAssistantSetting> {
+fn parse_channel_assistant_setting(value: &str) -> Option<ChannelAssistantSettingResponse> {
     let parsed: serde_json::Value = serde_json::from_str(value).ok()?;
 
     if let Some(raw) = parsed.as_str() {
-        return Some(ChannelAssistantSetting {
+        return Some(ChannelAssistantSettingResponse {
             assistant_id: None,
             custom_agent_id: None,
             backend: Some(raw.to_owned()),
@@ -264,7 +266,7 @@ fn parse_channel_assistant_setting(value: &str) -> Option<ChannelAssistantSettin
         });
     }
 
-    Some(ChannelAssistantSetting {
+    Some(ChannelAssistantSettingResponse {
         assistant_id: parsed["assistant_id"].as_str().map(|s| s.to_owned()),
         custom_agent_id: parsed["custom_agent_id"].as_str().map(|s| s.to_owned()),
         backend: parsed["backend"].as_str().map(|s| s.to_owned()),
@@ -273,7 +275,21 @@ fn parse_channel_assistant_setting(value: &str) -> Option<ChannelAssistantSettin
     })
 }
 
-fn normalize_channel_assistant_setting_for_write(assistant: &ChannelAssistantSetting) -> ChannelAssistantSetting {
+fn normalize_channel_assistant_setting_for_write(
+    assistant: &ChannelAssistantSettingRequest,
+) -> ChannelAssistantSettingResponse {
+    ChannelAssistantSettingResponse {
+        assistant_id: Some(assistant.assistant_id.trim().to_owned()),
+        custom_agent_id: None,
+        backend: None,
+        agent_type: None,
+        name: assistant.name.clone(),
+    }
+}
+
+fn normalize_channel_assistant_setting_for_response(
+    assistant: ChannelAssistantSettingResponse,
+) -> ChannelAssistantSettingResponse {
     let assistant_id = assistant
         .assistant_id
         .as_deref()
@@ -287,12 +303,16 @@ fn normalize_channel_assistant_setting_for_write(assistant: &ChannelAssistantSet
                 .map(ToOwned::to_owned)
         });
 
-    ChannelAssistantSetting {
-        assistant_id,
-        custom_agent_id: None,
-        backend: None,
-        agent_type: None,
-        name: assistant.name.clone(),
+    if assistant_id.is_some() {
+        ChannelAssistantSettingResponse {
+            assistant_id,
+            custom_agent_id: None,
+            backend: None,
+            agent_type: None,
+            name: assistant.name,
+        }
+    } else {
+        assistant
     }
 }
 
@@ -722,11 +742,8 @@ mod tests {
 
         svc.set_assistant_setting(
             PluginType::Telegram,
-            &ChannelAssistantSetting {
-                assistant_id: Some("assistant-1".into()),
-                custom_agent_id: Some("legacy-custom".into()),
-                backend: Some("claude".into()),
-                agent_type: Some("acp".into()),
+            &ChannelAssistantSettingRequest {
+                assistant_id: "assistant-1".into(),
                 name: Some("Claude".into()),
             },
         )
@@ -744,17 +761,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_assistant_setting_promotes_legacy_custom_agent_id() {
+    async fn set_assistant_setting_trims_assistant_id_before_persisting() {
         let repo = Arc::new(MockPrefRepo::new());
         let svc = ChannelSettingsService::new(repo.clone());
 
         svc.set_assistant_setting(
             PluginType::Lark,
-            &ChannelAssistantSetting {
-                assistant_id: None,
-                custom_agent_id: Some("legacy-custom".into()),
-                backend: Some("codex".into()),
-                agent_type: Some("acp".into()),
+            &ChannelAssistantSettingRequest {
+                assistant_id: "  legacy-custom  ".into(),
                 name: Some("Codex".into()),
             },
         )
@@ -769,6 +783,40 @@ mod tests {
         assert!(payload.get("custom_agent_id").is_none());
         assert!(payload.get("backend").is_none());
         assert!(payload.get("agent_type").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_assistant_setting_promotes_legacy_custom_agent_id_in_response() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.telegram.agent",
+            r#"{"custom_agent_id":"legacy-custom","name":"Codex"}"#,
+        )]));
+        let svc = ChannelSettingsService::new(repo);
+
+        let setting = svc.get_assistant_setting(PluginType::Telegram).await.unwrap().unwrap();
+
+        assert_eq!(setting.assistant_id.as_deref(), Some("legacy-custom"));
+        assert!(setting.custom_agent_id.is_none());
+        assert!(setting.backend.is_none());
+        assert!(setting.agent_type.is_none());
+        assert_eq!(setting.name.as_deref(), Some("Codex"));
+    }
+
+    #[tokio::test]
+    async fn get_assistant_setting_preserves_backend_only_legacy_response() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.lark.agent",
+            r#"{"backend":"codex","name":"Codex"}"#,
+        )]));
+        let svc = ChannelSettingsService::new(repo);
+
+        let setting = svc.get_assistant_setting(PluginType::Lark).await.unwrap().unwrap();
+
+        assert!(setting.assistant_id.is_none());
+        assert!(setting.custom_agent_id.is_none());
+        assert_eq!(setting.backend.as_deref(), Some("codex"));
+        assert!(setting.agent_type.is_none());
+        assert_eq!(setting.name.as_deref(), Some("Codex"));
     }
 
     // ── resolved_model_to_provider ────────────────────────────────────
