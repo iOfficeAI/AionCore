@@ -332,13 +332,14 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
     };
 
     let agent_config_dto = job.agent_config.as_ref().map(|c| {
-        let assistant_backed = c.assistant_id.is_some();
+        let canonical_assistant_id = c.assistant_id.clone().or_else(|| c.custom_agent_id.clone());
+        let assistant_backed = canonical_assistant_id.is_some();
         CronAgentConfigDto {
             backend: c.backend.clone(),
             name: c.name.clone(),
             cli_path: if assistant_backed { None } else { c.cli_path.clone() },
             is_preset: if assistant_backed { None } else { c.is_preset },
-            assistant_id: c.assistant_id.clone(),
+            assistant_id: canonical_assistant_id,
             custom_agent_id: if assistant_backed {
                 None
             } else {
@@ -873,6 +874,33 @@ mod tests {
         };
         let resp = cron_job_to_response(&job);
         assert_eq!(resp.target.execution_mode.as_deref(), Some("new_conversation"));
+    }
+
+    #[test]
+    fn domain_to_dto_promotes_legacy_custom_agent_id_to_assistant_id() {
+        let job = CronJob {
+            agent_config: Some(CronAgentConfig {
+                backend: "claude".into(),
+                name: "Legacy Assistant Job".into(),
+                cli_path: Some("/tmp/claude".into()),
+                is_preset: Some(false),
+                assistant_id: None,
+                custom_agent_id: Some("legacy-assistant".into()),
+                preset_agent_type: None,
+                mode: Some("default".into()),
+                model_id: Some("claude-sonnet-4".into()),
+                config_options: None,
+                workspace: Some("/tmp/project".into()),
+            }),
+            ..sample_job()
+        };
+
+        let resp = cron_job_to_response(&job);
+        let config = resp.metadata.agent_config.expect("assistant config should be present");
+
+        assert_eq!(config.assistant_id.as_deref(), Some("legacy-assistant"));
+        assert!(config.custom_agent_id.is_none());
+        assert!(config.cli_path.is_none());
     }
 
     // -- DTO → Domain schedule ------------------------------------------------
