@@ -245,7 +245,7 @@ async fn exec_create_team(
         agents: vec![TeamAgentInput {
             name: "Leader".to_owned(),
             role: "leader".to_owned(),
-            backend: backend.clone(),
+            backend: Some(backend.clone()),
             model: model.clone(),
             assistant_id: None,
             custom_agent_id: None,

@@ -19,7 +19,7 @@ pub struct TeamAgentInput {
     pub name: String,
     pub role: String,
     #[serde(default)]
-    pub backend: String,
+    pub backend: Option<String>,
     pub model: String,
     #[serde(default)]
     pub assistant_id: Option<String>,
@@ -63,7 +63,7 @@ pub struct AddAgentRequest {
     pub name: String,
     pub role: String,
     #[serde(default)]
-    pub backend: String,
+    pub backend: Option<String>,
     pub model: String,
     #[serde(default)]
     pub assistant_id: Option<String>,
@@ -456,7 +456,7 @@ mod tests {
         assert_eq!(req.agents.len(), 2);
         assert_eq!(req.agents[0].name, "Lead");
         assert_eq!(req.agents[0].role, "lead");
-        assert_eq!(req.agents[0].backend, "acp");
+        assert_eq!(req.agents[0].backend.as_deref(), Some("acp"));
         assert_eq!(req.agents[0].model, "claude");
         assert_eq!(req.agents[0].assistant_id.as_deref(), Some("assistant-x"));
         assert_eq!(req.agents[1].name, "Worker");
@@ -498,7 +498,7 @@ mod tests {
             "assistant_id": "assistant-x"
         });
         let input: TeamAgentInput = serde_json::from_value(raw).unwrap();
-        assert_eq!(input.backend, "");
+        assert!(input.backend.is_none());
         assert_eq!(input.assistant_id.as_deref(), Some("assistant-x"));
     }
 
@@ -550,7 +550,7 @@ mod tests {
         let req: AddAgentRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name, "Helper");
         assert_eq!(req.role, "teammate");
-        assert_eq!(req.backend, "acp");
+        assert_eq!(req.backend.as_deref(), Some("acp"));
         assert_eq!(req.model, "claude");
         assert!(req.custom_agent_id.is_none());
     }
@@ -592,7 +592,7 @@ mod tests {
     fn deserialize_add_agent_request_missing_backend() {
         let raw = json!({ "name": "X", "role": "teammate", "model": "claude" });
         let req = serde_json::from_value::<AddAgentRequest>(raw).unwrap();
-        assert_eq!(req.backend, "");
+        assert!(req.backend.is_none());
     }
 
     #[test]
@@ -604,7 +604,7 @@ mod tests {
             "assistant_id": "assistant-1"
         });
         let req = serde_json::from_value::<AddAgentRequest>(raw).unwrap();
-        assert_eq!(req.backend, "");
+        assert!(req.backend.is_none());
         assert_eq!(req.assistant_id.as_deref(), Some("assistant-1"));
     }
 

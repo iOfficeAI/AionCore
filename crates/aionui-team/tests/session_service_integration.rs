@@ -1367,7 +1367,7 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
         TeamAgentInput {
             name: "Lead".into(),
             role: "lead".into(),
-            backend: "acp".into(),
+            backend: Some("acp".into()),
             model: "claude".into(),
             assistant_id: None,
             custom_agent_id: None,
@@ -1376,7 +1376,7 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
         TeamAgentInput {
             name: "Worker".into(),
             role: "teammate".into(),
-            backend: "acp".into(),
+            backend: Some("acp".into()),
             model: "claude".into(),
             assistant_id: None,
             custom_agent_id: None,
@@ -1513,7 +1513,7 @@ async fn tc_create_team_uses_assistant_id_icon_lookup() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: Some("2d23ff1c".into()),
@@ -1550,7 +1550,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "claude".into(),
+                    backend: Some("claude".into()),
                     model: "claude".into(),
                     assistant_id: Some("2d23ff1c".into()),
                     custom_agent_id: Some("2d23ff1c".into()),
@@ -1638,7 +1638,7 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: String::new(),
+                    backend: Some(String::new()),
                     model: "gpt-5".into(),
                     assistant_id: Some("assistant-lead".into()),
                     custom_agent_id: None,
@@ -1677,7 +1677,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -1696,7 +1696,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
             AddAgentRequest {
                 name: "Coder".into(),
                 role: "teammate".into(),
-                backend: "acp".into(),
+                backend: Some("acp".into()),
                 model: "codex".into(),
                 assistant_id: None,
                 custom_agent_id: None,
@@ -1773,7 +1773,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "claude".into(),
+                    backend: Some("claude".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -1792,7 +1792,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
-                backend: String::new(),
+                backend: Some(String::new()),
                 model: "gpt-5".into(),
                 assistant_id: Some("assistant-worker".into()),
                 custom_agent_id: None,
@@ -1816,7 +1816,7 @@ async fn tc2_create_single_agent_team() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -1844,7 +1844,7 @@ async fn tc4_first_agent_is_lead() {
                     TeamAgentInput {
                         name: "A".into(),
                         role: "teammate".into(),
-                        backend: "acp".into(),
+                        backend: Some("acp".into()),
                         model: "claude".into(),
                         assistant_id: None,
                         custom_agent_id: None,
@@ -1853,7 +1853,7 @@ async fn tc4_first_agent_is_lead() {
                     TeamAgentInput {
                         name: "B".into(),
                         role: "teammate".into(),
-                        backend: "acp".into(),
+                        backend: Some("acp".into()),
                         model: "claude".into(),
                         assistant_id: None,
                         custom_agent_id: None,
@@ -1985,7 +1985,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -2158,7 +2158,7 @@ async fn aa1_add_agent_to_team() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -2177,7 +2177,7 @@ async fn aa1_add_agent_to_team() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
-                backend: "acp".into(),
+                backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
                 custom_agent_id: None,
@@ -2210,7 +2210,7 @@ async fn aa_add_agent_inherits_team_workspace() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -2229,7 +2229,7 @@ async fn aa_add_agent_inherits_team_workspace() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
-                backend: "acp".into(),
+                backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
                 custom_agent_id: None,
@@ -2258,7 +2258,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -2283,7 +2283,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
-                backend: "acp".into(),
+                backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
                 custom_agent_id: None,
@@ -2314,7 +2314,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -2341,7 +2341,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
-                backend: "acp".into(),
+                backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
                 custom_agent_id: None,
@@ -2377,7 +2377,7 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -2400,7 +2400,7 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
-                backend: "acp".into(),
+                backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
                 custom_agent_id: None,
@@ -2429,7 +2429,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -2459,7 +2459,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
-                backend: "acp".into(),
+                backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
                 custom_agent_id: None,
@@ -2523,7 +2523,7 @@ async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
             AddAgentRequest {
                 name: "Extra".into(),
                 role: "teammate".into(),
-                backend: "acp".into(),
+                backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
                 custom_agent_id: None,
@@ -2559,7 +2559,7 @@ async fn aa4_add_agent_to_nonexistent_team() {
             AddAgentRequest {
                 name: "X".into(),
                 role: "teammate".into(),
-                backend: "acp".into(),
+                backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
                 custom_agent_id: None,
@@ -3217,7 +3217,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -3239,7 +3239,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                 AddAgentRequest {
                     name: "WorkerA".into(),
                     role: "teammate".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,
@@ -3258,7 +3258,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                 AddAgentRequest {
                     name: "WorkerB".into(),
                     role: "teammate".into(),
-                    backend: "acp".into(),
+                    backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
                     custom_agent_id: None,

@@ -146,7 +146,7 @@ impl TeamAgentProvisioner {
             leader_input.custom_agent_id.as_deref(),
         );
         let leader_backend = self
-            .resolve_requested_backend(leader_input.backend.as_str(), leader_assistant_id.as_deref())
+            .resolve_requested_backend(leader_input.backend.as_deref(), leader_assistant_id.as_deref())
             .await?;
         let leader_conversation = self
             .create_or_adopt_conversation(
@@ -195,7 +195,7 @@ impl TeamAgentProvisioner {
             let assistant_id =
                 Self::effective_assistant_id(input.assistant_id.as_deref(), input.custom_agent_id.as_deref());
             let backend = self
-                .resolve_requested_backend(input.backend.as_str(), assistant_id.as_deref())
+                .resolve_requested_backend(input.backend.as_deref(), assistant_id.as_deref())
                 .await?;
             let conversation = self
                 .create_or_adopt_conversation(
@@ -254,7 +254,7 @@ impl TeamAgentProvisioner {
         let workspace = self.workspace_resolver().resolve_for_new_agent(row, team).await?;
         let assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref(), req.custom_agent_id.as_deref());
         let backend = self
-            .resolve_requested_backend(req.backend.as_str(), assistant_id.as_deref())
+            .resolve_requested_backend(req.backend.as_deref(), assistant_id.as_deref())
             .await?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
@@ -275,11 +275,11 @@ impl TeamAgentProvisioner {
 
     async fn resolve_requested_backend(
         &self,
-        requested_backend: &str,
+        requested_backend: Option<&str>,
         assistant_id: Option<&str>,
     ) -> Result<String, TeamError> {
-        let requested_backend = requested_backend.trim();
-        if !requested_backend.is_empty() {
+        let requested_backend = requested_backend.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(requested_backend) = requested_backend {
             return Ok(requested_backend.to_owned());
         }
 
