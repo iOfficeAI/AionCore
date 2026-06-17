@@ -27,8 +27,7 @@ Before calling this tool in the normal planning flow:
 - In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well
 - Do NOT call this tool in that same turn; wait for explicit approval in a later user message
 
-When an assistant is a good fit, prefer passing assistant_id. Use agent_type only when no assistant is a good fit.
-
+When calling this tool, always provide assistant_id from the available assistants catalog.
 When calling this tool, provide the model parameter if a specific model was recommended and approved.
 
 The new agent will be created and added to the team. You can then assign tasks and send messages to it."#;
@@ -86,12 +85,11 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Agent display name" },
-                    "agent_type": { "type": "string", "description": "Fallback backend to use (e.g. \"claude\", \"codex\", \"codebuddy\", \"gemini\") when no assistant fits. Query team_list_models first to see available options." },
-                    "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be valid for the chosen assistant backend or fallback agent_type. Query team_list_models to see available models." },
-                    "assistant_id": { "type": "string", "description": "Preferred assistant ID to spawn (from the Available Assistants catalog). When set, agent_type is derived from the assistant's backend." },
+                    "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be valid for the chosen assistant backend. Query team_list_models to see available models." },
+                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn (from the Available Assistants catalog). The runtime backend is derived from this assistant." },
                     "role": { "type": "string", "description": "Agent role (default: 'teammate')" }
                 },
-                "required": ["name"]
+                "required": ["name", "assistant_id"]
             }),
         },
         ToolDescriptor {
@@ -201,18 +199,13 @@ pub struct SendMessageInput {
 
 /// Arguments for the `team_spawn_agent` MCP tool call.
 ///
-/// The AionUi contract (`docs/teams/phase1/aionui-audit.md` §2.1) names the
-/// agent-type field `agent_type` and adds `assistant_id` + `model`. The
-/// phase-1 Rust dispatch originally exposed `backend` (and `role`); this
-/// interface is now assistant-first and only accepts `assistant_id`,
-/// `agent_type`, and `model`.
+/// Team spawning is assistant-first. The MCP tool only accepts
+/// `assistant_id`, optional `model`, and optional `role`.
 #[derive(Debug, Default, Deserialize)]
 pub struct SpawnAgentInput {
     pub name: String,
     #[serde(default)]
     pub role: Option<String>,
-    #[serde(default)]
-    pub agent_type: Option<String>,
     #[serde(default)]
     #[serde(alias = "assistantId")]
     pub assistant_id: Option<String>,
@@ -265,7 +258,7 @@ pub fn is_whitelisted_backend(backend: &str) -> bool {
 pub fn parse_tool_call(
     tool_name: &str,
     arguments: &Value,
-    caller_role: TeammateRole,
+    _caller_role: TeammateRole,
 ) -> Result<SchedulerAction, String> {
     match tool_name {
         "team_send_message" => {
@@ -276,29 +269,7 @@ pub fn parse_tool_call(
                 message: input.message,
             })
         }
-        "team_spawn_agent" => {
-            if caller_role != TeammateRole::Lead {
-                return Err("Only Lead can spawn agents".into());
-            }
-            let input: SpawnAgentInput = serde_json::from_value(arguments.clone())
-                .map_err(|e| format!("Invalid arguments for team_spawn_agent: {e}"))?;
-            let backend = input
-                .agent_type
-                .clone()
-                .ok_or_else(|| "Missing 'agent_type' for team_spawn_agent".to_string())?;
-            if !is_whitelisted_backend(&backend) {
-                return Err(format!(
-                    "Backend '{}' not in hard whitelist. Whitelist: {}",
-                    backend,
-                    aionui_common::constants::TEAM_CAPABLE_BACKENDS.join(", ")
-                ));
-            }
-            Ok(SchedulerAction::SpawnAgent {
-                name: input.name,
-                role: input.role.unwrap_or_else(|| "teammate".into()),
-                backend,
-            })
-        }
+        "team_spawn_agent" => Err("handled directly by server".into()),
         "team_task_create" => {
             let input: TaskCreateInput = serde_json::from_value(arguments.clone())
                 .map_err(|e| format!("Invalid arguments for team_task_create: {e}"))?;
@@ -501,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn team_spawn_agent_schema_exposes_model_and_agent_type() {
+    fn team_spawn_agent_schema_exposes_model_and_assistant_id_only() {
         let desc = all_tool_descriptors()
             .into_iter()
             .find(|d| d.name == "team_spawn_agent")
@@ -509,12 +480,12 @@ mod tests {
         let props = desc.input_schema["properties"].as_object().unwrap();
         assert!(props.contains_key("model"), "schema must expose 'model' field");
         assert!(
-            props.contains_key("agent_type"),
-            "schema must expose 'agent_type' field"
-        );
-        assert!(
             props.contains_key("assistant_id"),
             "schema must expose 'assistant_id' field"
+        );
+        assert!(
+            !props.contains_key("agent_type"),
+            "assistant-first schema must not expose 'agent_type'"
         );
     }
 
@@ -545,30 +516,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_spawn_agent_lead_ok() {
-        let args = json!({"name": "Helper", "agent_type": "claude"});
-        let action = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead).unwrap();
-        assert!(matches!(
-            action,
-            SchedulerAction::SpawnAgent { name, backend, role }
-            if name == "Helper" && backend == "claude" && role == "teammate"
-        ));
+    fn parse_spawn_agent_is_handled_directly_by_server() {
+        let args = json!({"name": "Helper", "assistant_id": "word-creator"});
+        let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("handled directly by server"));
     }
 
     #[test]
     fn parse_spawn_agent_teammate_rejected() {
-        let args = json!({"name": "X", "agent_type": "claude"});
+        let args = json!({"name": "X", "assistant_id": "word-creator"});
         let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Teammate);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Only Lead"));
+        assert!(result.unwrap_err().contains("handled directly by server"));
     }
 
     #[test]
-    fn parse_spawn_agent_bad_backend() {
+    fn parse_spawn_agent_with_legacy_agent_type_is_handled_directly_by_server() {
         let args = json!({"name": "X", "agent_type": "malicious"});
         let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not in hard whitelist"));
+        assert!(result.unwrap_err().contains("handled directly by server"));
     }
 
     #[test]
@@ -615,14 +583,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_spawn_with_explicit_role() {
-        let args = json!({"name": "W", "role": "worker", "agent_type": "codex"});
-        let action = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead).unwrap();
-        assert!(matches!(
-            action,
-            SchedulerAction::SpawnAgent { role, .. }
-            if role == "worker"
-        ));
+    fn parse_spawn_with_explicit_role_is_handled_directly_by_server() {
+        let args = json!({"name": "W", "role": "worker", "assistant_id": "word-creator"});
+        let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("handled directly by server"));
     }
 
     #[test]
@@ -721,7 +686,6 @@ mod tests {
     fn parse_spawn_agent_requires_explicit_assistant_id_field() {
         let input: SpawnAgentInput = serde_json::from_value(json!({
             "name": "Preset helper",
-            "agent_type": "claude",
             "assistant_id": "word-creator",
         }))
         .unwrap();
@@ -729,16 +693,15 @@ mod tests {
     }
 
     #[test]
-    fn team_spawn_agent_schema_prefers_assistant_id_over_agent_type() {
+    fn team_spawn_agent_schema_requires_assistant_id_only() {
         let desc = all_tool_descriptors()
             .into_iter()
             .find(|d| d.name == "team_spawn_agent")
             .unwrap();
         let props = desc.input_schema["properties"].as_object().unwrap();
         let assistant_desc = props["assistant_id"]["description"].as_str().unwrap();
-        let agent_type_desc = props["agent_type"]["description"].as_str().unwrap();
-        assert!(assistant_desc.starts_with("Preferred assistant ID"));
-        assert!(agent_type_desc.starts_with("Fallback backend to use"));
+        assert!(assistant_desc.starts_with("Assistant ID to spawn"));
+        assert!(!props.contains_key("agent_type"));
         assert!(!props.contains_key("backend"));
     }
 

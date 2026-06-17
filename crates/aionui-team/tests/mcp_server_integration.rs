@@ -416,7 +416,7 @@ async fn sp1_lead_spawn_requires_live_session_service() {
         &mut stream,
         2,
         "team_spawn_agent",
-        json!({"name": "Helper", "role": "worker", "backend": "claude"}),
+        json!({"name": "Helper", "role": "worker", "assistant_id": "word-creator"}),
     )
     .await;
 
@@ -431,7 +431,7 @@ async fn sp1_lead_spawn_requires_live_session_service() {
 }
 
 #[tokio::test]
-async fn sp2_non_whitelisted_backend_rejected() {
+async fn sp2_legacy_backend_alias_rejected() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
@@ -445,9 +445,8 @@ async fn sp2_non_whitelisted_backend_rejected() {
 
     assert!(is_error_response(&resp));
     let text = extract_text(&resp);
-    // Without a live TeamSessionService the spawn fails at capability check or service access.
     assert!(
-        text.contains("not allowed") || text.contains("not available"),
+        text.contains("backend is no longer accepted"),
         "unexpected error: {text}"
     );
 

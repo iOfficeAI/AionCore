@@ -604,27 +604,28 @@ async fn exec_spawn_agent(
         return Err("Only Lead can spawn agents".into());
     }
     if args.get("backend").is_some() {
-        return Err("backend is no longer accepted; use agent_type".into());
+        return Err("backend is no longer accepted; use assistant_id".into());
+    }
+    if args.get("agent_type").is_some() {
+        return Err("agent_type is no longer accepted; use assistant_id".into());
     }
 
     let input: SpawnAgentInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
+    let assistant_id = input
+        .assistant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "Missing required field: assistant_id".to_owned())?;
 
     // Requested name — normalization / emptiness / uniqueness live in
     // `TeamSession::spawn_agent` so we do not double-validate here.
     let requested_name = input.name.clone();
 
-    // `agent_type` is the AionUi-spec fallback backend field. Assistant-first
-    // callers should prefer `assistant_id`; `agent_type` only remains for
-    // flows that intentionally spawn without an assistant.
-    let agent_type = input.agent_type;
-
-    // Dynamic capability check happens in `TeamSession::spawn_agent` which
-    // queries both the hard whitelist and persisted MCP capabilities.
-
     let req = SpawnAgentRequest {
         name: requested_name.clone(),
-        agent_type,
-        assistant_id: input.assistant_id,
+        assistant_id: Some(assistant_id),
         model: input.model,
     };
 
@@ -929,8 +930,8 @@ mod tests {
     #[tokio::test]
     async fn exec_spawn_agent_rejects_malformed_args() {
         let service: Weak<TeamSessionService> = Weak::new();
-        // `name` missing entirely — SpawnAgentInput requires it.
-        let args = json!({ "agent_type": "claude" });
+        // Wrong `name` type so serde fails before any service lookup.
+        let args = json!({ "assistant_id": "word-creator", "name": 42 });
         let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
         let err = result.expect_err("malformed args must be rejected");
         assert!(
@@ -949,7 +950,7 @@ mod tests {
         let service: Weak<TeamSessionService> = Weak::new();
         let args = json!({
             "name": "Helper",
-            "agent_type": "claude",
+            "assistant_id": "word-creator",
             "model": "claude-sonnet-4"
         });
         let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
@@ -969,6 +970,30 @@ mod tests {
         assert!(
             err.contains("backend is no longer accepted"),
             "expected explicit backend alias rejection, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_spawn_agent_rejects_legacy_agent_type_alias() {
+        let service: Weak<TeamSessionService> = Weak::new();
+        let args = json!({ "name": "Helper", "agent_type": "claude" });
+        let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
+        let err = result.expect_err("legacy agent_type alias must be rejected");
+        assert!(
+            err.contains("agent_type is no longer accepted"),
+            "expected explicit agent_type rejection, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_spawn_agent_requires_assistant_identity() {
+        let service: Weak<TeamSessionService> = Weak::new();
+        let args = json!({ "name": "Helper" });
+        let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
+        let err = result.expect_err("assistant_id must now be required");
+        assert!(
+            err.contains("Missing required field: assistant_id"),
+            "expected assistant_id requirement, got {err:?}"
         );
     }
 }

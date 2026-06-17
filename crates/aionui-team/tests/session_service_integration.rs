@@ -2687,8 +2687,7 @@ async fn spawn_agent_in_session_rejects_without_active_team_run_before_persistin
 
     let req = SpawnAgentRequest {
         name: "Helper".into(),
-        agent_type: Some("claude".into()),
-        assistant_id: None,
+        assistant_id: Some("word-creator".into()),
         model: Some("claude-sonnet-4".into()),
     };
 

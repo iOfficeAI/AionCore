@@ -66,7 +66,6 @@ impl TeamSessionService {
     pub(crate) async fn resolve_spawn_backend_and_model(
         &self,
         assistant_id: Option<&str>,
-        requested_backend: Option<&str>,
         requested_model: Option<&str>,
         fallback_backend: &str,
         fallback_model: &str,
@@ -101,11 +100,7 @@ impl TeamSessionService {
             return Ok((backend, model));
         }
 
-        let backend = requested_backend
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(fallback_backend)
-            .to_owned();
+        let backend = fallback_backend.to_owned();
         let requested_model = requested_model
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -585,7 +580,7 @@ mod tests {
         );
 
         let (backend, model) = svc
-            .resolve_spawn_backend_and_model(Some("word-creator"), None, None, "gemini", "gemini-2.5-pro")
+            .resolve_spawn_backend_and_model(Some("word-creator"), None, "gemini", "gemini-2.5-pro")
             .await
             .unwrap();
 

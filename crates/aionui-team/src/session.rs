@@ -53,7 +53,6 @@ pub struct WakeInput {
 #[derive(Debug, Clone)]
 pub struct SpawnAgentRequest {
     pub name: String,
-    pub agent_type: Option<String>,
     pub assistant_id: Option<String>,
     pub model: Option<String>,
 }
@@ -948,11 +947,10 @@ impl TeamSession {
 
     /// Spawn a new teammate at the Lead's request (backing of `team_spawn_agent`).
     ///
-    /// Validation chain mirrors the phase1 interface contract:
+    /// Validation chain mirrors the assistant-first team contract:
     /// 1. Caller must exist and carry `TeammateRole::Lead`.
     /// 2. `name` is normalized and must not collide with any live agent.
-    /// 3. `agent_type` (falling back to the caller's backend when unset) must
-    ///    be in the spawn whitelist.
+    /// 3. `assistant_id` must be present and resolve to a team-capable backend.
     ///
     /// On success, a new conversation is created, the agent slot is persisted
     /// into the team row, the MCP stdio config is written into the conversation
@@ -984,25 +982,12 @@ impl TeamSession {
             return Err(TeamError::DuplicateAgentName(requested_name));
         }
 
-        if req.assistant_id.is_none() {
-            let candidate_backend = req
-                .agent_type
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(caller.backend.as_str())
-                .to_owned();
-
-            if crate::service::spawn_support::parse_agent_type(&candidate_backend).is_err() {
-                return Err(TeamError::BackendNotAllowed(candidate_backend));
-            }
-
-            if !crate::guide::capability::TEAM_CAPABLE_BACKENDS.contains(&candidate_backend.as_str())
-                && self.service.upgrade().is_none()
-            {
-                return Err(TeamError::BackendNotAllowed(candidate_backend));
-            }
-        }
+        let assistant_id = req
+            .assistant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| TeamError::InvalidRequest("spawn_agent.assistant_id is required".into()))?;
 
         let service = self
             .service
@@ -1014,8 +999,7 @@ impl TeamSession {
         // identity rather than inheriting the caller backend.
         let (backend, model) = service
             .resolve_spawn_backend_and_model(
-                req.assistant_id.as_deref(),
-                req.agent_type.as_deref(),
+                Some(assistant_id),
                 req.model.as_deref(),
                 caller.backend.as_str(),
                 caller.model.as_str(),
@@ -1039,7 +1023,7 @@ impl TeamSession {
                 requested_name,
                 backend,
                 model,
-                req.assistant_id.clone(),
+                Some(assistant_id.to_owned()),
             )
             .await?;
 
@@ -2303,8 +2287,7 @@ mod tests {
     fn sample_spawn_req() -> SpawnAgentRequest {
         SpawnAgentRequest {
             name: "Helper".into(),
-            agent_type: None,
-            assistant_id: None,
+            assistant_id: Some("word-creator".into()),
             model: None,
         }
     }
@@ -2754,11 +2737,10 @@ mod tests {
         (session, recorder)
     }
 
-    fn spawn_req(agent_type: Option<&str>) -> SpawnAgentRequest {
+    fn spawn_req(assistant_id: Option<&str>) -> SpawnAgentRequest {
         SpawnAgentRequest {
             name: "Helper".into(),
-            agent_type: agent_type.map(str::to_owned),
-            assistant_id: None,
+            assistant_id: assistant_id.map(str::to_owned),
             model: None,
         }
     }
@@ -2775,66 +2757,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_accepts_claude_backend() {
-        let session = start_session_with_lead_backend("claude").await;
-        let err = session
-            .spawn_agent("lead-1", spawn_req(Some("claude")))
-            .await
-            .expect_err("unit test has no service wire; spawn stops at DB step");
-        assert_reached_db_step(err);
-        session.stop();
-    }
-
-    #[tokio::test]
-    async fn spawn_agent_accepts_codex_backend() {
-        let session = start_session_with_lead_backend("claude").await;
-        let err = session
-            .spawn_agent("lead-1", spawn_req(Some("codex")))
-            .await
-            .expect_err("unit test has no service wire; spawn stops at DB step");
-        assert_reached_db_step(err);
-        session.stop();
-    }
-
-    #[tokio::test]
-    async fn spawn_agent_rejects_unknown_backend() {
-        let session = start_session_with_lead_backend("claude").await;
-        let err = session
-            .spawn_agent("lead-1", spawn_req(Some("unknown_backend")))
-            .await
-            .expect_err("unknown backend must be rejected");
-        assert!(
-            matches!(&err, TeamError::BackendNotAllowed(b) if b == "unknown_backend"),
-            "expected BackendNotAllowed(\"unknown_backend\"), got {err:?}"
-        );
-        session.stop();
-    }
-
-    #[tokio::test]
-    async fn spawn_agent_inherits_caller_backend_when_unspecified() {
-        // No agent_type on the request -> must fall back to the caller's
-        // backend ("claude"), which passes the whitelist.
+    async fn spawn_agent_requires_assistant_identity() {
         let session = start_session_with_lead_backend("claude").await;
         let err = session
             .spawn_agent("lead-1", spawn_req(None))
             .await
-            .expect_err("unit test has no service wire; spawn stops at DB step");
-        assert_reached_db_step(err);
-        session.stop();
-    }
-
-    #[tokio::test]
-    async fn spawn_agent_rejects_when_inherited_backend_not_whitelisted() {
-        // Caller's backend is "acp" (not whitelisted). With no explicit
-        // agent_type, the inherited backend must be rejected.
-        let session = start_session_with_lead_backend("acp").await;
-        let err = session
-            .spawn_agent("lead-1", spawn_req(None))
-            .await
-            .expect_err("non-whitelisted inherited backend must be rejected");
+            .expect_err("assistant_id must be required");
         assert!(
-            matches!(&err, TeamError::BackendNotAllowed(b) if b == "acp"),
-            "expected BackendNotAllowed(\"acp\"), got {err:?}"
+            matches!(&err, TeamError::InvalidRequest(msg) if msg.contains("assistant_id is required")),
+            "expected InvalidRequest about missing assistant_id, got {err:?}"
         );
         session.stop();
     }
@@ -2843,7 +2774,7 @@ mod tests {
     async fn spawn_agent_rejects_non_lead_caller() {
         let session = start_session_with_lead_backend("claude").await;
         let err = session
-            .spawn_agent("worker-1", spawn_req(Some("claude")))
+            .spawn_agent("worker-1", spawn_req(Some("word-creator")))
             .await
             .expect_err("non-lead caller must be rejected");
         assert!(
@@ -2858,7 +2789,7 @@ mod tests {
         let session = start_session_with_lead_backend("claude").await;
         // The seeded team already has an agent named "Worker". Case + trim
         // normalization means "  worker " collides.
-        let mut req = spawn_req(Some("claude"));
+        let mut req = spawn_req(Some("word-creator"));
         req.name = "  worker ".into();
         let err = session
             .spawn_agent("lead-1", req)
@@ -2874,7 +2805,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_agent_rejects_empty_name() {
         let session = start_session_with_lead_backend("claude").await;
-        let mut req = spawn_req(Some("claude"));
+        let mut req = spawn_req(Some("word-creator"));
         req.name = "   ".into();
         let err = session
             .spawn_agent("lead-1", req)
@@ -2902,7 +2833,7 @@ mod tests {
     async fn spawn_agent_does_not_emit_before_db_step() {
         let (session, recorder) = start_session_with_recorder("claude").await;
         let err = session
-            .spawn_agent("lead-1", spawn_req(Some("claude")))
+            .spawn_agent("lead-1", spawn_req(Some("word-creator")))
             .await
             .expect_err("unit test has no service wire; spawn stops at DB step");
         assert_reached_db_step(err);
@@ -2918,7 +2849,7 @@ mod tests {
     async fn spawn_agent_does_not_emit_on_guard_rejection() {
         let (session, recorder) = start_session_with_recorder("claude").await;
         let err = session
-            .spawn_agent("worker-1", spawn_req(Some("claude")))
+            .spawn_agent("worker-1", spawn_req(Some("word-creator")))
             .await
             .expect_err("non-lead caller must be rejected");
         assert!(matches!(&err, TeamError::LeaderOnly(what) if what == "spawn_agent"));
