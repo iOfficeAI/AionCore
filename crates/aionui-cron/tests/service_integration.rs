@@ -355,6 +355,29 @@ impl IConversationRepository for StubConvRepo {
                 created_at: 1000,
                 updated_at: 1000,
             }
+        } else if id == "conv_mode_assistant_stale_backend" {
+            aionui_db::models::ConversationRow {
+                id: id.into(),
+                user_id: "u1".into(),
+                name: "Assistant Stale Backend Chat".into(),
+                r#type: "acp".into(),
+                model: None,
+                status: Some("active".into()),
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::json!({
+                    "assistant_id": "assistant-override",
+                    "backend": "claude",
+                    "agent_name": "Override Assistant",
+                    "workspace": ensure_named_workspace_path("aionui-cron-service-assistant-stale-backend-workspace"),
+                    "current_model_id": "gpt-5.4"
+                })
+                .to_string(),
+                pinned: false,
+                pinned_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            }
         } else {
             aionui_db::models::ConversationRow {
                 id: id.into(),
@@ -1675,6 +1698,46 @@ async fn icron_service_create_job_prefers_model_provider_over_stale_extra_backen
     assert_eq!(job.agent_type, "acp");
     assert_eq!(config.backend, "gemini");
     assert_eq!(config.model_id.as_deref(), Some("gemini-2.5-pro"));
+}
+
+#[tokio::test]
+async fn icron_service_create_job_prefers_assistant_backend_over_stale_extra_backend() {
+    let (svc, _, _, _, definition_repo, overlay_repo) = setup_with_assistant_repos().await;
+    seed_assistant_definition(
+        &definition_repo,
+        "asstdef_assistant_override",
+        "assistant-override",
+        "codex",
+    )
+    .await;
+    seed_assistant_overlay(&overlay_repo, "asstdef_assistant_override", Some("aionrs")).await;
+
+    use aionui_conversation::response_middleware::ICronService;
+
+    let params = CronCreateParams {
+        name: "Assistant Job".into(),
+        schedule: "0 */10 * * * *".into(),
+        schedule_description: "every 10 min".into(),
+        message: "do assistant work".into(),
+    };
+
+    let result = ICronService::create_job(&svc, "user_1", "conv_mode_assistant_stale_backend", &params).await;
+    assert!(result.success);
+
+    let jobs = svc
+        .list_jobs(&ListCronJobsQuery {
+            conversation_id: Some("conv_mode_assistant_stale_backend".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+
+    let job = &jobs[0];
+    let config = job.agent_config.as_ref().expect("agent config should be copied");
+    assert_eq!(config.assistant_id.as_deref(), Some("assistant-override"));
+    assert_eq!(config.backend, "aionrs");
+    assert_eq!(config.mode.as_deref(), Some("yolo"));
+    assert_eq!(config.model_id.as_deref(), Some("gpt-5.4"));
 }
 
 #[tokio::test]

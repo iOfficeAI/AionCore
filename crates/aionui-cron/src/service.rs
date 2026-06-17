@@ -872,6 +872,95 @@ impl CronService {
             );
         }
     }
+
+    async fn build_agent_config_from_conversation(
+        &self,
+        row: &aionui_db::models::ConversationRow,
+    ) -> (String, Option<aionui_api_types::CronAgentConfigWriteDto>) {
+        let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        // Both interactive `send_message` and the cron executor parse
+        // `conversation.model` via the same helper. Keeping the cron-side
+        // `agent_config.backend` derivation in sync with that parser
+        // prevents the cached vendor-label fallback (`"aionrs"`) from
+        // sneaking back in (Sentry ELECTRON-1HM).
+        let model_resolved = aionui_conversation::task_options::provider_model_from_conversation_row(row);
+        let model = (!model_resolved.provider_id.is_empty()).then_some(&model_resolved);
+        let preset_assistant_id = get_string(&extra, &["preset_assistant_id", "presetAssistantId"]);
+        let assistant_id = get_string(&extra, &["assistant_id", "assistantId"]).or(preset_assistant_id);
+        let assistant_backend = self
+            .resolve_assistant_backend(assistant_id.as_deref())
+            .await
+            .unwrap_or(None);
+
+        let backend = if row.r#type == "aionrs" {
+            model
+                .map(|value| value.provider_id.clone())
+                .filter(|value| !value.is_empty())
+                .or_else(|| get_string(&extra, &["backend"]))
+                .or_else(|| assistant_backend.clone())
+                .unwrap_or_else(|| "aionrs".to_owned())
+        } else {
+            assistant_backend
+                .clone()
+                .or_else(|| {
+                    model
+                        .map(|value| value.provider_id.clone())
+                        .filter(|value| !value.is_empty())
+                })
+                .or_else(|| get_string(&extra, &["backend"]))
+                .unwrap_or_else(|| row.r#type.clone())
+        };
+
+        let agent_type_enum = serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok();
+        let full_auto_mode = agent_type_enum
+            .unwrap_or(AgentType::Acp)
+            .full_auto_mode_id(Some(backend.as_str()))
+            .to_owned();
+        let agent_config = aionui_api_types::CronAgentConfigWriteDto {
+            backend,
+            name: get_string(&extra, &["agent_name", "agentName"]).unwrap_or_else(|| row.name.clone()),
+            cli_path: get_string(&extra, &["cli_path", "cliPath"]).or_else(|| {
+                extra
+                    .get("gateway")
+                    .and_then(|gateway| gateway.get("cli_path").or_else(|| gateway.get("cliPath")))
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+            }),
+            assistant_id,
+            mode: Some(full_auto_mode),
+            model_id: get_string(&extra, &["current_model_id", "currentModelId"]).or_else(|| {
+                model.and_then(|value| {
+                    value
+                        .use_model
+                        .clone()
+                        .or_else(|| (!value.model.is_empty()).then(|| value.model.clone()))
+                })
+            }),
+            config_options: None,
+            workspace: get_string(&extra, &["workspace"]),
+        };
+
+        (row.r#type.clone(), Some(agent_config))
+    }
+
+    async fn resolve_assistant_backend(&self, assistant_id: Option<&str>) -> Result<Option<String>, CronError> {
+        let Some(assistant_id) = assistant_id.filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+
+        let Some(definition) = self.assistant_definition_repo.get_by_key(assistant_id).await? else {
+            return Ok(None);
+        };
+        let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+
+        Ok(Some(
+            overlay
+                .as_ref()
+                .and_then(|item| item.agent_backend_override.as_deref())
+                .unwrap_or(definition.agent_backend.as_str())
+                .to_owned(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -907,7 +996,7 @@ impl aionui_conversation::response_middleware::ICronService for CronService {
             match self.executor.get_conversation_row(conversation_id).await {
                 Ok(Some(row)) => {
                     let title = Some(row.name.clone());
-                    let (agent_type, agent_config) = build_agent_config_from_conversation(&row);
+                    let (agent_type, agent_config) = self.build_agent_config_from_conversation(&row).await;
                     (agent_type, title, agent_config)
                 }
                 Ok(None) => ("acp".to_owned(), None, None),
@@ -1071,68 +1160,6 @@ impl aionui_conversation::response_middleware::ICronService for CronService {
     }
 }
 
-fn build_agent_config_from_conversation(
-    row: &aionui_db::models::ConversationRow,
-) -> (String, Option<aionui_api_types::CronAgentConfigWriteDto>) {
-    let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
-    // Both interactive `send_message` and the cron executor parse
-    // `conversation.model` via the same helper. Keeping the cron-side
-    // `agent_config.backend` derivation in sync with that parser
-    // prevents the cached vendor-label fallback (`"aionrs"`) from
-    // sneaking back in (Sentry ELECTRON-1HM).
-    let model_resolved = aionui_conversation::task_options::provider_model_from_conversation_row(row);
-    let model = (!model_resolved.provider_id.is_empty()).then_some(&model_resolved);
-
-    let backend = if row.r#type == "aionrs" {
-        model
-            .map(|value| value.provider_id.clone())
-            .filter(|value| !value.is_empty())
-            .or_else(|| get_string(&extra, &["backend"]))
-            .unwrap_or_else(|| "aionrs".to_owned())
-    } else {
-        model
-            .map(|value| value.provider_id.clone())
-            .filter(|value| !value.is_empty())
-            .or_else(|| get_string(&extra, &["backend"]))
-            .unwrap_or_else(|| row.r#type.clone())
-    };
-
-    let preset_assistant_id = get_string(&extra, &["preset_assistant_id", "presetAssistantId"]);
-    let assistant_id = get_string(&extra, &["assistant_id", "assistantId"]).or(preset_assistant_id);
-
-    let agent_type_enum = serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok();
-    // Backend is now the vendor label (e.g. "claude"); pass through as
-    // &str so `full_auto_mode_id` can key on it without re-parsing.
-    let full_auto_mode = agent_type_enum
-        .unwrap_or(AgentType::Acp)
-        .full_auto_mode_id(Some(backend.as_str()))
-        .to_owned();
-    let agent_config = aionui_api_types::CronAgentConfigWriteDto {
-        backend,
-        name: get_string(&extra, &["agent_name", "agentName"]).unwrap_or_else(|| row.name.clone()),
-        cli_path: get_string(&extra, &["cli_path", "cliPath"]).or_else(|| {
-            extra
-                .get("gateway")
-                .and_then(|gateway| gateway.get("cli_path").or_else(|| gateway.get("cliPath")))
-                .and_then(|value| value.as_str())
-                .map(ToOwned::to_owned)
-        }),
-        assistant_id,
-        mode: Some(full_auto_mode),
-        model_id: get_string(&extra, &["current_model_id", "currentModelId"]).or_else(|| {
-            model.and_then(|value| {
-                value
-                    .use_model
-                    .clone()
-                    .or_else(|| (!value.model.is_empty()).then(|| value.model.clone()))
-            })
-        }),
-        config_options: None,
-        workspace: get_string(&extra, &["workspace"]),
-    };
-
-    (row.r#type.clone(), Some(agent_config))
-}
 fn get_string(extra: &serde_json::Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         extra
