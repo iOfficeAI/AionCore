@@ -748,6 +748,36 @@ impl ConversationService {
         if let Some(snapshot) = assistant_snapshot.as_ref()
             && let Some(obj) = extra.as_object_mut()
         {
+            // Phase 2 frontends only send `assistant.id` and rely on the
+            // backend to resolve runtime identity from the snapshot. The
+            // legacy `extra.{backend, agent_id, agent_source}` triple is
+            // still consumed by ACP factory paths (`factory/acp.rs:34`),
+            // ACP session creation (`create_acp_session_row`), the
+            // session-context fallback chain, and several downstream
+            // helpers. Persisting them here keeps one source of truth —
+            // the assistant — while preserving the contract those
+            // downstreams already depend on.
+            if !snapshot.agent_backend.is_empty() && !obj.contains_key("backend") {
+                obj.insert(
+                    "backend".to_owned(),
+                    serde_json::Value::String(snapshot.agent_backend.clone()),
+                );
+            }
+            if let Some(agent_id) = snapshot.agent_id.as_ref()
+                && !agent_id.is_empty()
+                && !obj.contains_key("agent_id")
+            {
+                obj.insert("agent_id".to_owned(), serde_json::Value::String(agent_id.clone()));
+            }
+            if let Some(agent_source) = snapshot.agent_source.as_ref()
+                && !agent_source.is_empty()
+                && !obj.contains_key("agent_source")
+            {
+                obj.insert(
+                    "agent_source".to_owned(),
+                    serde_json::Value::String(agent_source.clone()),
+                );
+            }
             if let Some(model_id) = snapshot.resolved_defaults.model.as_ref()
                 && !obj.contains_key("current_model_id")
             {
