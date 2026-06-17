@@ -64,7 +64,8 @@ pub struct CronAgentConfigDto {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CronAgentConfigWriteDto {
-    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_path: Option<String>,
@@ -256,6 +257,18 @@ mod write_tests {
 
         let message = err.to_string();
         assert!(message.contains("is_preset") || message.contains("preset_agent_type"));
+    }
+
+    #[test]
+    fn cron_agent_config_write_allows_missing_backend_when_assistant_id_present() {
+        let parsed = serde_json::from_value::<CronAgentConfigWriteDto>(serde_json::json!({
+            "name": "Helper",
+            "assistant_id": "assistant-1",
+        }))
+        .expect("assistant-backed writes should not require backend");
+
+        assert_eq!(parsed.assistant_id.as_deref(), Some("assistant-1"));
+        assert!(parsed.backend.is_none());
     }
 }
 

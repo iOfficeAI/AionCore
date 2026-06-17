@@ -898,7 +898,7 @@ async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
     seed_assistant_definition(&definition_repo, "asstdef_assistant_1", "assistant-1", "claude").await;
     let mut req = make_create_req("Assistant Only Create", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
-        backend: "claude".into(),
+        backend: Some("claude".into()),
         name: "Helper".into(),
         cli_path: None,
         assistant_id: Some("assistant-1".into()),
@@ -957,7 +957,7 @@ async fn create_job_derives_runtime_type_from_aionrs_assistant() {
     let mut req = make_create_req("Assistant Aionrs", every_60s());
     req.agent_type = None;
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
-        backend: "provider-gemini".into(),
+        backend: Some("provider-gemini".into()),
         name: "Aionrs Assistant".into(),
         cli_path: None,
         assistant_id: Some("assistant-aionrs".into()),
@@ -987,7 +987,7 @@ async fn create_job_derives_runtime_type_from_assistant_overlay_override() {
     let mut req = make_create_req("Assistant Override", every_60s());
     req.agent_type = None;
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
-        backend: "provider-openai".into(),
+        backend: Some("provider-openai".into()),
         name: "Override Assistant".into(),
         cli_path: None,
         assistant_id: Some("assistant-override".into()),
@@ -1000,6 +1000,32 @@ async fn create_job_derives_runtime_type_from_assistant_overlay_override() {
     let job = svc.add_job(req).await.unwrap();
 
     assert_eq!(job.agent_type, "aionrs");
+}
+
+#[tokio::test]
+async fn create_job_allows_assistant_backed_acp_jobs_without_backend_hint() {
+    let (svc, _, _, _, definition_repo, _) = setup_with_assistant_repos().await;
+    seed_assistant_definition(&definition_repo, "asstdef_assistant_2", "assistant-2", "claude").await;
+
+    let mut req = make_create_req("Assistant Without Backend", every_60s());
+    req.agent_type = None;
+    req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        backend: None,
+        name: "Helper".into(),
+        cli_path: None,
+        assistant_id: Some("assistant-2".into()),
+        mode: Some("default".into()),
+        model_id: Some("claude-sonnet-4".into()),
+        config_options: None,
+        workspace: None,
+    });
+
+    let job = svc.add_job(req).await.unwrap();
+    let config = job.agent_config.expect("agent config");
+
+    assert_eq!(job.agent_type, "acp");
+    assert_eq!(config.assistant_id.as_deref(), Some("assistant-2"));
+    assert_eq!(config.backend, "claude");
 }
 
 // ── CJ-2: Create three schedule types ──────────────────────────────
@@ -1153,7 +1179,7 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
         message: None,
         execution_mode: None,
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
-            backend: "claude".into(),
+            backend: Some("claude".into()),
             name: "Helper".into(),
             cli_path: None,
             assistant_id: Some("assistant-1".into()),
