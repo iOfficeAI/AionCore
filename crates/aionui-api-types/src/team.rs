@@ -15,13 +15,14 @@ use crate::TeamMcpStdioConfig;
 /// When `conversation_id` is supplied the existing conversation is adopted
 /// rather than creating a new one (single-chat → team-chat handoff).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TeamAgentInput {
     pub name: String,
     pub role: String,
     #[serde(default)]
     pub backend: Option<String>,
     pub model: String,
-    #[serde(default, alias = "custom_agent_id", alias = "customAgentId")]
+    #[serde(default)]
     pub assistant_id: Option<String>,
     /// Adopt an existing conversation instead of creating a new one.
     /// When present the conversation's `extra` is updated with `teamId`
@@ -67,6 +68,7 @@ pub struct AddAgentRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddAgentRequestCompat {
     #[serde(default)]
     assistant: Option<TeamAgentInput>,
@@ -78,7 +80,7 @@ struct AddAgentRequestCompat {
     backend: Option<String>,
     #[serde(default)]
     model: Option<String>,
-    #[serde(default, alias = "custom_agent_id", alias = "customAgentId")]
+    #[serde(default)]
     assistant_id: Option<String>,
 }
 
@@ -545,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_team_agent_input_promotes_legacy_custom_agent_id() {
+    fn deserialize_team_agent_input_rejects_legacy_custom_agent_id() {
         let raw = json!({
             "name": "Lead",
             "role": "lead",
@@ -553,8 +555,8 @@ mod tests {
             "model": "claude",
             "custom_agent_id": "assistant-legacy"
         });
-        let input: TeamAgentInput = serde_json::from_value(raw).unwrap();
-        assert_eq!(input.assistant_id.as_deref(), Some("assistant-legacy"));
+        let result = serde_json::from_value::<TeamAgentInput>(raw);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -636,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_add_agent_request_with_custom_agent_id() {
+    fn deserialize_add_agent_request_rejects_custom_agent_id() {
         let raw = json!({
             "name": "Custom",
             "role": "teammate",
@@ -644,8 +646,8 @@ mod tests {
             "model": "claude",
             "custom_agent_id": "custom-1"
         });
-        let req: AddAgentRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.assistant_id.as_deref(), Some("custom-1"));
+        let result = serde_json::from_value::<AddAgentRequest>(raw);
+        assert!(result.is_err());
     }
 
     #[test]
