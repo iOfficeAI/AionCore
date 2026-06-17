@@ -61,6 +61,7 @@ pub struct CronAgentConfigDto {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CronAgentConfigWriteDto {
     pub backend: String,
     pub name: String,
@@ -222,6 +223,39 @@ pub struct CronJobExecutedEvent {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::CronAgentConfigWriteDto;
+
+    #[test]
+    fn cron_agent_config_write_rejects_legacy_custom_agent_id() {
+        let err = serde_json::from_value::<CronAgentConfigWriteDto>(serde_json::json!({
+            "backend": "claude",
+            "name": "Helper",
+            "assistant_id": "assistant-1",
+            "custom_agent_id": "legacy-agent",
+        }))
+        .expect_err("legacy custom_agent_id must be rejected");
+
+        assert!(err.to_string().contains("custom_agent_id"));
+    }
+
+    #[test]
+    fn cron_agent_config_write_rejects_legacy_preset_flags() {
+        let err = serde_json::from_value::<CronAgentConfigWriteDto>(serde_json::json!({
+            "backend": "claude",
+            "name": "Helper",
+            "assistant_id": "assistant-1",
+            "is_preset": true,
+            "preset_agent_type": "claude",
+        }))
+        .expect_err("legacy preset fields must be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("is_preset") || message.contains("preset_agent_type"));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

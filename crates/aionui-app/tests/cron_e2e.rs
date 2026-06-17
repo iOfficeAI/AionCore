@@ -680,9 +680,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
             "agent_config": {
                 "backend": "codex",
                 "name": "Cron MCP Assistant",
-                "is_preset": true,
-                "assistant_id": "u-fixed-mcp",
-                "preset_agent_type": "codex"
+                "assistant_id": "u-fixed-mcp"
             }
         }),
         &token,
