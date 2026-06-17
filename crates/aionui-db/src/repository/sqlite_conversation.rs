@@ -458,6 +458,52 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
+    async fn upsert_message(&self, message: &MessageRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO messages \
+                (id, conversation_id, msg_id, type, content, position, \
+                 status, hidden, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET \
+                content = CASE \
+                    WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN \
+                        CASE messages.type \
+                            WHEN 'acp_tool_call' THEN json_set( \
+                                json_patch(messages.content, excluded.content), \
+                                '$.update.status', \
+                                json_extract(messages.content, '$.update.status') \
+                            ) \
+                            ELSE json_set( \
+                                json_patch(messages.content, excluded.content), \
+                                '$.status', \
+                                json_extract(messages.content, '$.status') \
+                            ) \
+                        END \
+                    ELSE json_patch(messages.content, excluded.content) \
+                END, \
+                status = CASE \
+                    WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN messages.status \
+                    ELSE excluded.status \
+                END, \
+                position = COALESCE(messages.position, excluded.position), \
+                hidden = excluded.hidden, \
+                created_at = MIN(messages.created_at, excluded.created_at)",
+        )
+        .bind(&message.id)
+        .bind(&message.conversation_id)
+        .bind(&message.msg_id)
+        .bind(&message.r#type)
+        .bind(&message.content)
+        .bind(&message.position)
+        .bind(&message.status)
+        .bind(message.hidden)
+        .bind(message.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     async fn update_message(&self, id: &str, updates: &MessageRowUpdate) -> Result<(), DbError> {
         let mut set_parts: Vec<String> = Vec::new();
         let mut binds: Vec<BindValue> = Vec::new();
