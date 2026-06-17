@@ -40,7 +40,7 @@ Use this to:
 - See all available backends and their models at once
 - Verify a model ID is valid for the backend behind a chosen assistant or fallback backend
 
-Pass agent_type to query a specific backend, or omit it to see all backends.";
+Pass assistant_id to query models for a specific assistant, or omit it to see all backends.";
 
 /// Description for `team_describe_assistant` — verbatim from team-prompts.md §5.2.
 pub const TEAM_DESCRIBE_ASSISTANT_DESCRIPTION: &str =
@@ -180,7 +180,7 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "agent_type": { "type": "string", "description": "Backend to query (e.g. \"gemini\", \"claude\", \"codex\"). Shows all backends when omitted." }
+                    "assistant_id": { "type": "string", "description": "Assistant ID to query. When provided, returns models for the backend behind that assistant. Shows all backends when omitted." }
                 }
             }),
         },
@@ -324,11 +324,11 @@ pub fn handle_team_list_models(_args: &Value) -> Value {
 
 /// Build `team_list_models` response from DB rows. Reads each enabled,
 /// team-capable backend's `available_models` column. Filters by
-/// `agent_type` if provided. For internal agents (backend=NULL),
+/// `backend` if provided. For internal agents (backend=NULL),
 /// `provider_models` supplies the aggregated models from the providers table.
 pub fn build_list_models_from_rows(
     rows: &[AgentMetadataRow],
-    agent_type_filter: Option<&str>,
+    backend_filter: Option<&str>,
     provider_models: &[String],
 ) -> Value {
     use aionui_api_types::BehaviorPolicy;
@@ -363,8 +363,8 @@ pub fn build_list_models_from_rows(
             }
         }
 
-        // Apply agent_type filter
-        if let Some(filter) = agent_type_filter
+        // Apply backend filter
+        if let Some(filter) = backend_filter
             && key != filter
         {
             continue;
@@ -645,9 +645,22 @@ mod tests {
                 .starts_with("Query available models for assistant backends.")
         );
         assert!(
-            desc.description
-                .contains("Pass agent_type to query a specific backend, or omit it to see all backends.")
+            desc.description.contains(
+                "Pass assistant_id to query models for a specific assistant, or omit it to see all backends."
+            )
         );
+    }
+
+    #[test]
+    fn team_list_models_schema_prefers_assistant_id() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_list_models")
+            .unwrap();
+        let props = desc.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("assistant_id"));
+        assert!(!props.contains_key("agent_type"));
+        assert!(!props.contains_key("backend"));
     }
 
     #[test]
@@ -794,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn build_list_models_from_rows_filters_by_agent_type() {
+    fn build_list_models_from_rows_filters_by_backend() {
         let rows = vec![
             make_agent_row("claude", true, r#"[{"id":"claude-sonnet-4","name":"Sonnet 4"}]"#),
             make_agent_row("codebuddy", true, r#"[{"id":"cb-pro","name":"Pro"}]"#),
@@ -908,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn build_list_models_from_rows_filters_null_backend_by_agent_type() {
+    fn build_list_models_from_rows_filters_null_backend_by_backend() {
         let mut aionrs_row = make_agent_row("aionrs", true, r#"[{"id":"aionrs-default","name":"AionRS"}]"#);
         aionrs_row.backend = None;
         aionrs_row.agent_type = "aionrs".to_owned();

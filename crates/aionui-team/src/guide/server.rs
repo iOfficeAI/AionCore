@@ -132,7 +132,30 @@ async fn handle_tool_request(
         "aion_list_models" => {
             let result = match state.service.read().await.upgrade() {
                 Some(svc) => {
-                    let mut base = svc.list_models_from_db(None).await;
+                    if args.get("backend").is_some() {
+                        return Json(serde_json::json!({
+                            "error": "backend is no longer accepted; use assistant_id"
+                        }))
+                        .into_response();
+                    }
+                    if args.get("agent_type").is_some() {
+                        return Json(serde_json::json!({
+                            "error": "agent_type is no longer accepted; use assistant_id"
+                        }))
+                        .into_response();
+                    }
+                    let mut base = match svc
+                        .list_models_from_db(args.get("assistant_id").and_then(serde_json::Value::as_str))
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return Json(serde_json::json!({
+                                "error": error.to_string()
+                            }))
+                            .into_response();
+                        }
+                    };
                     // Guide surfaces Gemini even if not in spawn whitelist
                     if let Some(types) = base.get_mut("agent_types").and_then(serde_json::Value::as_array_mut) {
                         let has_gemini = types

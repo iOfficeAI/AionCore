@@ -224,12 +224,38 @@ impl TeamSessionService {
     /// Falls back to the hardcoded response if the DB query fails.
     /// For internal agents (like aionrs with backend=NULL), enriches
     /// with models from the providers table.
-    pub(crate) async fn list_models_from_db(&self, agent_type_filter: Option<&str>) -> serde_json::Value {
+    pub(crate) async fn list_models_from_db(
+        &self,
+        assistant_id_filter: Option<&str>,
+    ) -> Result<serde_json::Value, TeamError> {
         let Ok(rows) = self.agent_metadata_repo.list_all().await else {
-            return crate::mcp::tools::handle_team_list_models(&serde_json::Value::Null);
+            return Ok(crate::mcp::tools::handle_team_list_models(&serde_json::Value::Null));
+        };
+        let backend_filter = match assistant_id_filter.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(assistant_key) => {
+                let definition = self
+                    .assistant_definition_repo
+                    .get_by_key(assistant_key)
+                    .await?
+                    .ok_or_else(|| TeamError::InvalidRequest(format!("Assistant not found: {assistant_key}")))?;
+                let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+                Some(
+                    overlay
+                        .as_ref()
+                        .and_then(|row| row.agent_backend_override.as_deref())
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or(definition.agent_backend.as_str())
+                        .to_owned(),
+                )
+            }
+            None => None,
         };
         let provider_models = self.collect_provider_models().await;
-        crate::mcp::tools::build_list_models_from_rows(&rows, agent_type_filter, &provider_models)
+        Ok(crate::mcp::tools::build_list_models_from_rows(
+            &rows,
+            backend_filter.as_deref(),
+            &provider_models,
+        ))
     }
 
     /// Collect all enabled provider model IDs grouped by provider name.

@@ -136,9 +136,9 @@ struct CreateTeamParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ListModelsParams {
-    /// Agent type/backend to query (e.g. "gemini", "claude", "codex"). Shows all when omitted.
+    /// Assistant ID to query. Shows all backends when omitted.
     #[serde(default)]
-    agent_type: Option<String>,
+    assistant_id: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -213,9 +213,9 @@ struct ShutdownAgentParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct TeamListModelsParams {
-    /// Agent type to filter models (e.g. "claude", "codex"). Shows all when omitted.
+    /// Assistant ID to query. Shows all backends when omitted.
     #[serde(default)]
-    agent_type: Option<String>,
+    assistant_id: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -248,13 +248,13 @@ impl GuideServer {
 
     #[tool(
         name = "aion_list_models",
-        description = "Query available models for team agent types. Pass agent_type to filter, or omit to see all."
+        description = "Query available models for team assistants. Pass assistant_id to query a specific assistant, or omit it to see all backends."
     )]
     async fn list_models(&self, Parameters(params): Parameters<ListModelsParams>) -> CallToolResult {
         self.forward_tool(
             "aion_list_models",
             &serde_json::json!({
-                "agent_type": params.agent_type,
+                "assistant_id": params.assistant_id,
             }),
         )
         .await
@@ -365,13 +365,13 @@ impl GuideServer {
 
     #[tool(
         name = "team_list_models",
-        description = "Query available models for team agent types."
+        description = "Query available models for team assistants."
     )]
     async fn team_list_models(&self, Parameters(params): Parameters<TeamListModelsParams>) -> CallToolResult {
         self.forward_tool(
             "team_list_models",
             &serde_json::json!({
-                "agent_type": params.agent_type,
+                "assistant_id": params.assistant_id,
             }),
         )
         .await

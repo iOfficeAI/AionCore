@@ -450,10 +450,19 @@ pub(crate) async fn dispatch_tool(
 }
 
 async fn exec_list_models(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, String> {
-    let agent_type_filter = args.get("agent_type").and_then(Value::as_str);
+    if args.get("backend").is_some() {
+        return Err("backend is no longer accepted; use assistant_id".to_owned());
+    }
+    if args.get("agent_type").is_some() {
+        return Err("agent_type is no longer accepted; use assistant_id".to_owned());
+    }
+    let assistant_id_filter = args.get("assistant_id").and_then(Value::as_str);
 
     let value = match service.upgrade() {
-        Some(svc) => svc.list_models_from_db(agent_type_filter).await,
+        Some(svc) => svc
+            .list_models_from_db(assistant_id_filter)
+            .await
+            .map_err(|error| error.to_string())?,
         None => handle_team_list_models(args),
     };
     serde_json::to_string_pretty(&value).map_err(|e| format!("Serialization error: {e}"))
@@ -994,6 +1003,30 @@ mod tests {
         assert!(
             err.contains("Missing required field: assistant_id"),
             "expected assistant_id requirement, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_list_models_rejects_legacy_backend_alias() {
+        let service: Weak<TeamSessionService> = Weak::new();
+        let args = json!({ "backend": "claude" });
+        let result = exec_list_models(&args, &service).await;
+        let err = result.expect_err("legacy backend alias must be rejected");
+        assert!(
+            err.contains("backend is no longer accepted"),
+            "expected explicit backend rejection, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_list_models_rejects_legacy_agent_type_alias() {
+        let service: Weak<TeamSessionService> = Weak::new();
+        let args = json!({ "agent_type": "claude" });
+        let result = exec_list_models(&args, &service).await;
+        let err = result.expect_err("legacy agent_type alias must be rejected");
+        assert!(
+            err.contains("agent_type is no longer accepted"),
+            "expected explicit agent_type rejection, got {err:?}"
         );
     }
 }

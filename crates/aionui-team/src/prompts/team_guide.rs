@@ -46,7 +46,7 @@ You can create a multi-agent Team for the user.
 If case 2 applies, ask at most once whether the user wants to bring in a Team. Keep it brief and optional. If the user says no, ignores it, or prefers solo help, continue solo and do not mention Team again.
 
 ### How to proceed when Team is requested or approved (STRICT — follow every step, do NOT skip)
-1. FIRST call `aion_list_models` to check available models for each assistant backend you plan to use.
+1. FIRST call `aion_list_models` to check available models for each assistant you plan to use.
 2. Explain in one sentence why the Team setup helps this task.
 3. Present a team configuration table: role name, responsibility, recommended assistant, and recommended model (from aion_list_models results) for each member. Example format:
    | Role | Responsibility | Assistant | Model |
@@ -118,7 +118,7 @@ Handle the task yourself in the current chat by default. Do NOT proactively reco
 If case 2 applies, ask at most once whether the user wants to bring in a Team. Keep it brief and optional. If the user says no, ignores it, or prefers solo help, continue solo and do not mention Team again.\n\
 \n\
 ### How to proceed when Team is requested or approved (STRICT — follow every step, do NOT skip)\n\
-1. FIRST call `aion_list_models` to check available models for each assistant backend you plan to use.\n\
+1. FIRST call `aion_list_models` to check available models for each assistant you plan to use.\n\
 2. Explain in one sentence why the Team setup helps this task.\n\
 3. Present a team configuration table: role name, responsibility, recommended assistant, and recommended model (from aion_list_models results) for each member. Example format:\n   \
 | Role | Responsibility | Assistant | Model |\n   \
