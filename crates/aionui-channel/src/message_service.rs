@@ -127,7 +127,16 @@ impl ChannelMessageService {
         let source = platform_to_source(platform);
         let agent_config = self.settings.get_agent_config(platform).await?;
         let assistant_setting = self.settings.get_assistant_setting(platform).await?;
-        let assistant_id = assistant_setting.and_then(|setting| setting.assistant_id);
+        let assistant_id = assistant_setting
+            .as_ref()
+            .and_then(|setting| setting.assistant_id.as_deref())
+            .map(ToOwned::to_owned);
+        let assistant_name = assistant_setting
+            .as_ref()
+            .and_then(|setting| setting.name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned);
         let model_config = self.settings.get_model_config(platform).await?;
         let agent_type = parse_agent_type(&agent_config.agent_type)?;
         let model = resolved_model_to_provider(model_config.as_ref());
@@ -136,12 +145,14 @@ impl ChannelMessageService {
         } else {
             agent_config.backend.as_deref()
         });
-        let name = channel_conversation_name(
-            platform,
-            &agent_config.agent_type,
-            agent_config.backend.as_deref(),
-            session.chat_id.as_deref(),
-        );
+        let name = assistant_name.unwrap_or_else(|| {
+            channel_conversation_name(
+                platform,
+                &agent_config.agent_type,
+                agent_config.backend.as_deref(),
+                session.chat_id.as_deref(),
+            )
+        });
 
         // Top-level `model` is only accepted for aionrs; other types pass via `extra`.
         let top_level_model = if agent_type == AgentType::Aionrs {
