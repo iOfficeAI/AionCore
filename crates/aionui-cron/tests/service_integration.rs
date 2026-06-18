@@ -1051,6 +1051,31 @@ async fn create_job_allows_assistant_backed_acp_jobs_without_backend_hint() {
     assert_eq!(config.backend, "claude");
 }
 
+#[tokio::test]
+async fn create_job_rejects_backend_fallback_when_assistant_id_cannot_resolve() {
+    let (svc, _, _) = setup().await;
+
+    let mut req = make_create_req("Assistant Missing", every_60s());
+    req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        backend: Some("claude".into()),
+        name: "Helper".into(),
+        cli_path: None,
+        assistant_id: Some("missing-assistant".into()),
+        mode: Some("default".into()),
+        model_id: Some("claude-sonnet-4".into()),
+        config_options: None,
+        workspace: None,
+    });
+
+    let err = svc
+        .add_job(req)
+        .await
+        .expect_err("missing assistant must not fall back to backend");
+
+    assert!(matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)));
+    assert!(err.to_string().contains("missing-assistant"), "unexpected error: {err}");
+}
+
 // ── CJ-2: Create three schedule types ──────────────────────────────
 
 #[tokio::test]
@@ -1188,7 +1213,8 @@ async fn cj8_update_job() {
 
 #[tokio::test]
 async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
-    let (svc, _, _) = setup().await;
+    let (svc, _, _, _, definition_repo, _) = setup_with_assistant_repos().await;
+    seed_assistant_definition(&definition_repo, "asstdef_update_assistant_1", "assistant-1", "claude").await;
     let created = svc
         .add_job(make_create_req("Assistant Only Update", every_60s()))
         .await
@@ -1222,6 +1248,48 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
     assert!(config.custom_agent_id.is_none());
     assert!(config.preset_agent_type.is_none());
     assert!(config.is_preset.is_none());
+}
+
+#[tokio::test]
+async fn update_job_rejects_backend_fallback_when_assistant_id_cannot_resolve() {
+    let (svc, _, _) = setup().await;
+    let created = svc
+        .add_job(make_create_req("Assistant Missing Update", every_60s()))
+        .await
+        .unwrap();
+
+    let req = UpdateCronJobRequest {
+        name: None,
+        description: None,
+        enabled: None,
+        schedule: None,
+        message: None,
+        execution_mode: None,
+        agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
+            backend: Some("claude".into()),
+            name: "Helper".into(),
+            cli_path: None,
+            assistant_id: Some("missing-assistant".into()),
+            mode: Some("default".into()),
+            model_id: Some("claude-sonnet-4".into()),
+            config_options: None,
+            workspace: None,
+        }),
+        conversation_title: None,
+        max_retries: None,
+    };
+
+    let err = svc
+        .update_job(&created.id, req)
+        .await
+        .expect_err("missing assistant must not fall back to backend");
+
+    assert!(matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)));
+    assert!(
+        err.to_string()
+            .contains("assistant 'missing-assistant' could not resolve a runtime backend"),
+        "unexpected error: {err}"
+    );
 }
 
 // ── CJ-9: Update schedule type ────────────────────────────────────

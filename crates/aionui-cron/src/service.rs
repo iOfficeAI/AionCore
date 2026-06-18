@@ -942,7 +942,6 @@ impl CronService {
         } else if let Some(assistant_id) = config.assistant_id.as_deref() {
             self.resolve_assistant_backend(Some(assistant_id))
                 .await?
-                .or_else(|| config.backend.clone().filter(|value| !value.trim().is_empty()))
                 .ok_or_else(|| {
                     CronError::InvalidAgentConfig(format!(
                         "assistant '{assistant_id}' could not resolve a runtime backend"
