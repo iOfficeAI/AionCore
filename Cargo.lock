@@ -332,6 +332,7 @@ dependencies = [
  "aionui-realtime",
  "aionui-runtime",
  "aionui-system",
+ "aionui-team-prompts",
  "async-trait",
  "axum",
  "base64",

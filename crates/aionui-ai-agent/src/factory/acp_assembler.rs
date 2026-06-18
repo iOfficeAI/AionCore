@@ -1,9 +1,9 @@
-use crate::capability::team_guide_prompt;
 use crate::shared_kernel::PersistedSessionState;
 use agent_client_protocol::schema::{EnvVariable, McpServer, McpServerStdio, NewSessionRequest};
 use aionui_api_types::AgentMetadata;
 use aionui_api_types::{AcpBuildExtra, GuideMcpConfig, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 use aionui_common::CommandSpec;
+use aionui_team_prompts::guide as team_guide_prompt;
 use std::path::PathBuf;
 
 use aionui_common::constants::TEAM_CAPABLE_BACKENDS;
@@ -194,7 +194,14 @@ mod tests {
     fn compose_preset_context_team_capable_backend_appends_guide() {
         let result = compose_preset_context(None, Some("claude"), false);
         assert!(result.is_some());
-        assert!(result.unwrap().contains("team"));
+        let prompt = result.unwrap();
+        assert!(prompt.contains("aion_create_team"));
+        assert!(prompt.contains("aion_list_models"));
+        assert!(prompt.contains("hand off to the created Team conversation"));
+        assert!(!prompt.contains("Immediately"));
+        assert!(!prompt.contains(
+            "use team tools (`team_spawn_agent`, `team_send_message`, `team_members`, `team_task_create`, etc.) to manage your team"
+        ));
     }
 
     #[test]

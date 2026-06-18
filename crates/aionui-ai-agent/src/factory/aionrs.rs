@@ -14,7 +14,6 @@ use aionui_runtime::ensure_runtime_command_with_reporter;
 use tracing::{debug, info, warn};
 
 use crate::agent_task::AgentInstance;
-use crate::capability::team_guide_prompt;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
@@ -22,6 +21,7 @@ use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
+use aionui_team_prompts::guide as team_guide_prompt;
 
 const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionrs", "codebuddy"];
 
@@ -944,6 +944,21 @@ mod tests {
         assert_eq!(env.get("AION_MCP_BACKEND"), Some(&"aionrs".to_owned()));
         assert_eq!(env.get("AION_MCP_CONVERSATION_ID"), Some(&"conv-2".to_owned()));
         assert_eq!(env.get("AION_MCP_USER_ID"), Some(&"user-1".to_owned()));
+    }
+
+    #[test]
+    fn aionrs_guide_prompt_hands_off_after_create_team() {
+        let mut overrides = AionrsBuildExtra::default();
+        overrides.system_prompt = Some(team_guide_prompt::build_solo_team_guide_prompt("aionrs"));
+
+        let prompt = overrides.system_prompt.as_deref().unwrap();
+        assert!(prompt.contains("aion_create_team"));
+        assert!(prompt.contains("aion_list_models"));
+        assert!(prompt.contains("hand off to the created Team conversation"));
+        assert!(!prompt.contains("Immediately"));
+        assert!(!prompt.contains(
+            "use team tools (`team_spawn_agent`, `team_send_message`, `team_members`, `team_task_create`, etc.) to manage your team"
+        ));
     }
 
     #[test]
