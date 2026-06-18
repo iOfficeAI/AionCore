@@ -653,6 +653,22 @@ fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
     if contains_any(
         lower,
         &[
+            "repeatedly returned malformed tool calls",
+            "malformed tool call loop",
+            "malformed tool calls",
+        ],
+    ) {
+        return Some(provider_error(
+            "The model provider repeatedly returned malformed tool calls",
+            AgentErrorCode::UserLlmProviderInvalidRequest,
+            false,
+            AgentErrorResolutionKind::ChangeModel,
+            Some(AgentErrorResolutionTarget::ProviderSettings),
+        ));
+    }
+    if contains_any(
+        lower,
+        &[
             "model not found",
             "model does not exist",
             "unknown model",
@@ -1428,6 +1444,16 @@ mod tests {
             AgentErrorCode::UserLlmProviderUnsupportedModel,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::ChangeModel,
+        );
+        assert_classification(
+            "Aionrs agent error: provider repeatedly returned malformed tool calls (3/3); stopped to avoid wasting tokens",
+            AgentErrorCode::UserLlmProviderInvalidRequest,
+            AgentErrorOwnership::UserLlmProvider,
+            AgentErrorResolutionKind::ChangeModel,
+        );
+        assert_resolution_target(
+            "Aionrs agent error: provider repeatedly returned malformed tool calls (3/3); stopped to avoid wasting tokens",
+            AgentErrorResolutionTarget::ProviderSettings,
         );
         assert_classification(
             "API error 400: invalid params, context window exceeds limit",

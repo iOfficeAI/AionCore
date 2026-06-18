@@ -185,6 +185,7 @@ pub(super) async fn build(
         system_prompt: overrides.system_prompt,
         max_tokens: overrides.max_tokens,
         max_turns: overrides.max_turns,
+        max_malformed_tool_call_turns: overrides.max_malformed_tool_call_turns,
         compat_overrides,
         session_directory,
         session_mode: overrides.session_mode,

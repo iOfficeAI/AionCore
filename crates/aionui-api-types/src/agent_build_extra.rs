@@ -89,6 +89,8 @@ pub struct AionrsBuildExtra {
     #[serde(default)]
     pub max_turns: Option<usize>,
     #[serde(default)]
+    pub max_malformed_tool_call_turns: Option<usize>,
+    #[serde(default)]
     pub session_mode: Option<String>,
     #[serde(default)]
     pub team_mcp_stdio_config: Option<TeamMcpStdioConfig>,

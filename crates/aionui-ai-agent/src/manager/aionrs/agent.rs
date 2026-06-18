@@ -73,6 +73,7 @@ impl AionrsAgentManager {
             model: Some(config_extra.model.clone()),
             max_tokens: Some(config_extra.max_tokens),
             max_turns: config_extra.max_turns,
+            max_malformed_tool_call_turns: config_extra.max_malformed_tool_call_turns,
             system_prompt: config_extra.system_prompt.clone(),
             profile: None,
             auto_approve: config_extra.session_mode.as_deref() == Some("yolo"),
@@ -396,7 +397,11 @@ fn parse_session_mode(s: &str) -> SessionMode {
 
 fn aionrs_engine_error_to_send_error(error_msg: String) -> AgentSendError {
     let lower = error_msg.to_ascii_lowercase();
-    if lower.contains("provider error") || lower.contains("provider:") || lower.contains("api error:") {
+    if lower.contains("provider error")
+        || lower.contains("provider:")
+        || lower.contains("api error:")
+        || lower.contains("repeatedly returned malformed tool calls")
+    {
         return AgentSendError::from_agent_error(AgentError::bad_gateway(error_msg));
     }
     AgentSendError::from_agent_error(AgentError::internal(error_msg))
@@ -428,6 +433,7 @@ mod tests {
             system_prompt: None,
             max_tokens: 4096,
             max_turns: None,
+            max_malformed_tool_call_turns: None,
             compat_overrides: Default::default(),
             session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
             session_mode: None,
@@ -645,5 +651,23 @@ mod tests {
             Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
         );
         assert_eq!(send_error.stream_error().retryable, Some(true));
+    }
+
+    #[test]
+    fn aionrs_repeated_malformed_tool_call_is_user_llm_provider_error() {
+        let send_error = aionrs_engine_error_to_send_error(
+            "Aionrs agent error: provider repeatedly returned malformed tool calls (3/3); stopped to avoid wasting tokens"
+                .to_owned(),
+        );
+
+        assert_eq!(
+            send_error.code(),
+            Some(aionui_api_types::AgentErrorCode::UserLlmProviderInvalidRequest)
+        );
+        assert_eq!(
+            send_error.ownership(),
+            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
+        );
+        assert_eq!(send_error.stream_error().retryable, Some(false));
     }
 }

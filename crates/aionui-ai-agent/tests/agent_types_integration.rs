@@ -97,6 +97,7 @@ fn make_aionrs_config() -> AionrsResolvedConfig {
         system_prompt: None,
         max_tokens: 4096,
         max_turns: None,
+        max_malformed_tool_call_turns: None,
         compat_overrides: Default::default(),
         session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
         session_mode: None,
