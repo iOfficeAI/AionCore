@@ -638,6 +638,7 @@ async fn agent_overrides_roundtrip_and_management_summary() {
     // management row: safe fields, blocked PATH not counted
     let mreq = get_with_token("/api/agents/management", &token);
     let mbody = body_json(app.clone().oneshot(mreq).await.unwrap()).await;
+    let mbody_str = serde_json::to_string(&mbody).unwrap();
     let row = mbody["data"]
         .as_array()
         .unwrap()
@@ -647,8 +648,12 @@ async fn agent_overrides_roundtrip_and_management_summary() {
     assert_eq!(row["has_command_override"], true);
     assert_eq!(row["env_override_key_count"], 1); // PATH excluded
     assert!(
-        row.get("env_override").is_none(),
-        "management row must not carry env plaintext"
+        row["env"].as_array().map_or(true, |arr| arr.is_empty()),
+        "management row env must be empty or absent"
+    );
+    assert!(
+        !mbody_str.contains("sk-x"),
+        "management response must not leak secret values"
     );
 
     // GET overrides: plaintext echo

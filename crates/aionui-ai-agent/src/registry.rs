@@ -295,7 +295,7 @@ impl AgentRegistry {
                     installed: meta.available,
                     command: meta.command,
                     args: meta.args,
-                    env: meta.env,
+                    env: Vec::new(),
                     native_skills_dirs: meta.native_skills_dirs,
                     behavior_policy: meta.behavior_policy,
                     yolo_id: meta.yolo_id,
