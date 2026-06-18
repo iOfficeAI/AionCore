@@ -17,6 +17,7 @@
 //!   2. have NO non-empty `Text` content, AND
 //!   3. have NO subsequent `ToolResult` block (in any later message) that
 //!      references one of those tool-use ids.
+//!
 //! Also strip malformed tool calls whose `name` is empty, plus their matching
 //! results. Those are not valid protocol tool calls and strict providers reject
 //! them even when a matching result is present.
