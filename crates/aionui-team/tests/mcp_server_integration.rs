@@ -143,6 +143,24 @@ async fn read_response(stream: &mut TcpStream) -> Value {
     serde_json::from_slice(&frame).unwrap()
 }
 
+async fn http_rpc(port: u16, slot_id: &str, payload: Value) -> Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let body = serde_json::to_string(&payload).unwrap();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nx-slot-id: {slot_id}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let response = String::from_utf8_lossy(&buf);
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+    serde_json::from_str(body).unwrap()
+}
+
 async fn call_tool(stream: &mut TcpStream, id: u64, tool: &str, args: Value) -> Value {
     let req = json!({
         "jsonrpc": "2.0",
@@ -155,6 +173,22 @@ async fn call_tool(stream: &mut TcpStream, id: u64, tool: &str, args: Value) -> 
     });
     send_request(stream, &req).await;
     read_response(stream).await
+}
+
+async fn list_tools(stream: &mut TcpStream, id: u64) -> Vec<String> {
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/list"
+    });
+    send_request(stream, &req).await;
+    let resp = read_response(stream).await;
+    resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect()
 }
 
 fn extract_text(resp: &Value) -> String {
@@ -246,27 +280,40 @@ async fn tools_list_returns_all_10_tools() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
-    let req = json!({
-        "jsonrpc": "2.0",
-        "id": 10,
-        "method": "tools/list"
-    });
-    send_request(&mut stream, &req).await;
-    let resp = read_response(&mut stream).await;
-    let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 10);
+    let names = list_tools(&mut stream, 10).await;
+    assert_eq!(names.len(), 10);
 
-    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"team_send_message"));
-    assert!(names.contains(&"team_spawn_agent"));
-    assert!(names.contains(&"team_task_create"));
-    assert!(names.contains(&"team_task_update"));
-    assert!(names.contains(&"team_task_list"));
-    assert!(names.contains(&"team_members"));
-    assert!(names.contains(&"team_rename_agent"));
-    assert!(names.contains(&"team_shutdown_agent"));
-    assert!(names.contains(&"team_list_models"));
-    assert!(names.contains(&"team_describe_assistant"));
+    assert!(names.contains(&"team_send_message".to_owned()));
+    assert!(names.contains(&"team_spawn_agent".to_owned()));
+    assert!(names.contains(&"team_task_create".to_owned()));
+    assert!(names.contains(&"team_task_update".to_owned()));
+    assert!(names.contains(&"team_task_list".to_owned()));
+    assert!(names.contains(&"team_members".to_owned()));
+    assert!(names.contains(&"team_rename_agent".to_owned()));
+    assert!(names.contains(&"team_shutdown_agent".to_owned()));
+    assert!(names.contains(&"team_list_models".to_owned()));
+    assert!(names.contains(&"team_describe_assistant".to_owned()));
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn mcp_tools_list_filters_lead_only_tools() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let names = list_tools(&mut stream, 10).await;
+
+    assert!(!names.contains(&"team_spawn_agent".to_owned()));
+    assert!(!names.contains(&"team_rename_agent".to_owned()));
+    assert!(!names.contains(&"team_shutdown_agent".to_owned()));
+    assert!(names.contains(&"team_send_message".to_owned()));
+    assert!(names.contains(&"team_task_create".to_owned()));
+    assert!(names.contains(&"team_task_update".to_owned()));
+    assert!(names.contains(&"team_task_list".to_owned()));
+    assert!(names.contains(&"team_members".to_owned()));
+    assert!(names.contains(&"team_list_models".to_owned()));
+    assert!(names.contains(&"team_describe_assistant".to_owned()));
 
     env.server.stop();
 }
@@ -684,6 +731,80 @@ async fn tra2_rename_nonexistent_agent() {
     .await;
 
     assert!(is_error_response(&resp));
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn mcp_non_lead_cannot_rename_agent() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let resp = call_tool(
+        &mut stream,
+        2,
+        "team_rename_agent",
+        json!({"slot_id": "worker-1", "new_name": "Renamed"}),
+    )
+    .await;
+
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(text.contains("Only Lead"));
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn http_mcp_tools_list_filters_lead_only_tools() {
+    let env = setup().await;
+
+    let resp = http_rpc(
+        env.server.http_port(),
+        "worker-1",
+        json!({"jsonrpc": "2.0", "id": 10, "method": "tools/list"}),
+    )
+    .await;
+    let names: Vec<String> = resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+
+    assert!(!names.contains(&"team_spawn_agent".to_owned()));
+    assert!(!names.contains(&"team_rename_agent".to_owned()));
+    assert!(!names.contains(&"team_shutdown_agent".to_owned()));
+    assert!(names.contains(&"team_send_message".to_owned()));
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn http_mcp_non_lead_cannot_rename_agent() {
+    let env = setup().await;
+
+    let resp = http_rpc(
+        env.server.http_port(),
+        "worker-1",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "team_rename_agent",
+                "arguments": {
+                    "slot_id": "worker-1",
+                    "new_name": "Renamed"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Only Lead"));
 
     env.server.stop();
 }

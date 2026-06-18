@@ -24,7 +24,7 @@ use super::protocol::{
 };
 use super::tools::{
     RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskUpdateInput,
-    all_tool_descriptors, handle_team_describe_assistant, handle_team_list_models,
+    all_tool_descriptors_for_role, handle_team_describe_assistant, handle_team_list_models,
 };
 
 // ---------------------------------------------------------------------------
@@ -332,7 +332,7 @@ async fn handle_method(
 ) -> JsonRpcResponse {
     match request.method.as_str() {
         "notifications/initialized" => JsonRpcResponse::success(request.id, json!({})),
-        "tools/list" => handle_tools_list(request.id),
+        "tools/list" => handle_tools_list(request.id, scheduler, caller_slot_id).await,
         "tools/call" => handle_tools_call(request, scheduler, service, team_id, caller_slot_id).await,
         _ => JsonRpcResponse::error(
             request.id,
@@ -342,8 +342,17 @@ async fn handle_method(
     }
 }
 
-fn handle_tools_list(id: Option<u64>) -> JsonRpcResponse {
-    let tools = all_tool_descriptors();
+async fn caller_role_for_tools_list(scheduler: &TeammateManager, caller_slot_id: &str) -> TeammateRole {
+    scheduler
+        .get_agent(caller_slot_id)
+        .await
+        .map(|agent| agent.role)
+        .unwrap_or(TeammateRole::Teammate)
+}
+
+async fn handle_tools_list(id: Option<u64>, scheduler: &TeammateManager, caller_slot_id: &str) -> JsonRpcResponse {
+    let caller_role = caller_role_for_tools_list(scheduler, caller_slot_id).await;
+    let tools = all_tool_descriptors_for_role(caller_role);
     JsonRpcResponse::success(id, json!({ "tools": tools }))
 }
 
@@ -434,6 +443,8 @@ pub(crate) async fn dispatch_tool(
     caller_slot_id: &str,
     caller_role: TeammateRole,
 ) -> Result<String, String> {
+    super::tools::authorize_tool(caller_role, tool_name)?;
+
     match tool_name {
         "team_send_message" => exec_send_message(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_spawn_agent" => exec_spawn_agent(arguments, service, team_id, caller_slot_id, caller_role).await,
@@ -810,6 +821,11 @@ async fn http_mcp_loop(
                     // Handle JSON-RPC request
                     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
                     let id = value.get("id").cloned();
+                    let caller_slot_id = request.lines()
+                        .find(|l| l.to_lowercase().starts_with("x-slot-id:"))
+                        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
+                        .unwrap_or("");
+                    let caller_role = caller_role_for_tools_list(&sched, caller_slot_id).await;
 
                     let result = match method {
                         "initialize" => {
@@ -825,7 +841,7 @@ async fn http_mcp_loop(
                             return;
                         }
                         "tools/list" => {
-                            let tools: Vec<Value> = all_tool_descriptors()
+                            let tools: Vec<Value> = all_tool_descriptors_for_role(caller_role)
                                 .iter()
                                 .map(|d| json!({
                                     "name": d.name,
@@ -839,10 +855,6 @@ async fn http_mcp_loop(
                             let params = value.get("params").cloned().unwrap_or(json!({}));
                             let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
                             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-                            let caller_slot_id = request.lines()
-                                .find(|l| l.to_lowercase().starts_with("x-slot-id:"))
-                                .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
-                                .unwrap_or("");
                             match dispatch_tool(
                                 tool_name,
                                 &arguments,
@@ -850,7 +862,7 @@ async fn http_mcp_loop(
                                 &svc,
                                 &tid,
                                 caller_slot_id,
-                                TeammateRole::Lead,
+                                caller_role,
                             )
                             .await
                             {

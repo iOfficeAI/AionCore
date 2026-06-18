@@ -5,52 +5,9 @@ use serde_json::{Value, json};
 use crate::scheduler::SchedulerAction;
 use crate::types::TeammateRole;
 
-// ---------------------------------------------------------------------------
-// Tool description constants (原样复用 AionUi `toolDescriptions.ts`)
-// ---------------------------------------------------------------------------
-
-/// `team_spawn_agent` 工具描述 — 原样复制自 AionUi `toolDescriptions.ts`
-/// 对应 team-prompts.md §5.2 `team_spawn_agent` Description 原文。
-/// 禁止翻译、改写；aionui-audit §8 #5 硬约束。
-pub const TEAM_SPAWN_AGENT_DESCRIPTION: &str = r#"Create a new teammate agent to join the team.
-
-Use this only when one of the following is true:
-- The user explicitly approved the proposed teammate lineup in a previous message
-- The user explicitly instructed you to create a specific teammate immediately
-
-Before calling this tool in the normal planning flow:
-- Start with one short sentence explaining why additional teammates would help
-- Tell the user which teammate(s) you recommend
-- Present the proposal as a table with: name, responsibility, recommended agent type/backend, and recommended model
-- Include each teammate's responsibility, recommended agent type/backend, and model
-- Ask whether to create them as proposed or change any names, responsibilities, or agent types
-- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well
-- Do NOT call this tool in that same turn; wait for explicit approval in a later user message
-
-When calling this tool, provide the model parameter if a specific model was recommended and approved.
-
-The new agent will be created and added to the team. You can then assign tasks and send messages to it."#;
-
-/// Description for `team_list_models` — verbatim from team-prompts.md §5.2.
-pub const TEAM_LIST_MODELS_DESCRIPTION: &str = "Query available models for team agent types. Returns the real-time model list that matches the frontend model selector.
-
-Use this to:
-- Check what models are available before spawning an agent with a specific model
-- See all available agent types and their models at once
-- Verify a model ID is valid for a given agent type
-
-Pass agent_type to query a specific backend, or omit it to see all.";
-
-/// Description for `team_describe_assistant` — verbatim from team-prompts.md §5.2.
-pub const TEAM_DESCRIBE_ASSISTANT_DESCRIPTION: &str =
-    "Get detailed information about a preset assistant before spawning it as a teammate.
-
-Returns the preset's full description, enabled skills, and example tasks so you can
-judge whether it fits the user's request. Use this when two or more presets look
-relevant from the one-line catalog in your system prompt.
-
-Only works on preset assistants listed in \"Available Preset Assistants for Spawning\".
-After confirming a match, call team_spawn_agent with the same custom_agent_id.";
+pub use aionui_team_prompts::tools::{
+    TEAM_DESCRIBE_ASSISTANT_DESCRIPTION, TEAM_LIST_MODELS_DESCRIPTION, TEAM_SPAWN_AGENT_DESCRIPTION,
+};
 
 // ---------------------------------------------------------------------------
 // Tool descriptors (returned by tools/list)
@@ -63,129 +20,23 @@ pub struct ToolDescriptor {
     pub input_schema: Value,
 }
 
+pub fn all_tool_descriptors_for_role(caller_role: TeammateRole) -> Vec<ToolDescriptor> {
+    aionui_team_prompts::visible_team_tool_descriptors(caller_role == TeammateRole::Lead)
+        .into_iter()
+        .map(|descriptor| ToolDescriptor {
+            name: descriptor.name,
+            description: descriptor.description,
+            input_schema: descriptor.input_schema,
+        })
+        .collect()
+}
+
 pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
-    vec![
-        ToolDescriptor {
-            name: "team_send_message".into(),
-            description: "Send a message to a teammate or broadcast to all (to=\"*\").".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "to": { "type": "string", "description": "Target agent slot_id or \"*\" for broadcast" },
-                    "message": { "type": "string", "description": "Message content" }
-                },
-                "required": ["to", "message"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_spawn_agent".into(),
-            description: TEAM_SPAWN_AGENT_DESCRIPTION.into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Agent display name" },
-                    "agent_type": { "type": "string", "description": "Agent type/backend to use (e.g. \"claude\", \"codex\", \"codebuddy\", \"gemini\"). Query team_list_models first to see available options." },
-                    "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be a valid model for the chosen agent_type. Query team_list_models to see available models." },
-                    "custom_agent_id": { "type": "string", "description": "Preset assistant ID to spawn (from the Available Preset Assistants catalog). When set, agent_type is derived from the preset's backend." },
-                    "backend": { "type": "string", "description": "Legacy alias for agent_type. Prefer agent_type." },
-                    "role": { "type": "string", "description": "Agent role (default: 'teammate')" }
-                },
-                "required": ["name"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_task_create".into(),
-            description: "Create a new task on the team task board.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "subject": { "type": "string", "description": "Task subject" },
-                    "description": { "type": "string", "description": "Task description" },
-                    "owner": { "type": "string", "description": "Owning agent slotId" },
-                    "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Task IDs this task depends on" }
-                },
-                "required": ["subject"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_task_update".into(),
-            description: "Update an existing task on the team task board.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "Task ID to update" },
-                    "status": { "type": "string", "description": "New status: pending, in_progress, completed, deleted" },
-                    "description": { "type": "string", "description": "New description" },
-                    "owner": { "type": "string", "description": "New owning agent slotId" },
-                    "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "New dependency list" }
-                },
-                "required": ["task_id"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_task_list".into(),
-            description: "List all tasks on the team task board.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDescriptor {
-            name: "team_members".into(),
-            description: "List all team members with their roles and current status.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDescriptor {
-            name: "team_rename_agent".into(),
-            description: "Rename a team member.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "slot_id": { "type": "string", "description": "Agent slot_id to rename" },
-                    "new_name": { "type": "string", "description": "New display name" }
-                },
-                "required": ["slot_id", "new_name"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_shutdown_agent".into(),
-            description: "Initiate shutdown of a teammate (Lead only). Sends a shutdown_request to the target agent."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "slot_id": { "type": "string", "description": "Agent slot_id to shut down" },
-                    "reason": { "type": "string", "description": "Reason for shutdown" }
-                },
-                "required": ["slot_id"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_describe_assistant".into(),
-            description: TEAM_DESCRIBE_ASSISTANT_DESCRIPTION.into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "custom_agent_id": { "type": "string", "description": "The preset assistant ID from the \"Available Preset Assistants\" catalog (e.g., \"word-creator\")." },
-                    "locale": { "type": "string", "description": "Locale like \"zh-CN\" or \"en-US\". Defaults to the user's current UI language when omitted." }
-                },
-                "required": ["custom_agent_id"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_list_models".into(),
-            description: TEAM_LIST_MODELS_DESCRIPTION.into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_type": { "type": "string", "description": "Agent type/backend to query (e.g. \"gemini\", \"claude\", \"codex\"). Shows all when omitted." }
-                }
-            }),
-        },
-    ]
+    all_tool_descriptors_for_role(TeammateRole::Lead)
+}
+
+pub fn authorize_tool(caller_role: TeammateRole, tool_name: &str) -> Result<(), String> {
+    aionui_team_prompts::authorize_team_tool(caller_role == TeammateRole::Lead, tool_name)
 }
 
 // ---------------------------------------------------------------------------
