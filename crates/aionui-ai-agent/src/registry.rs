@@ -646,6 +646,19 @@ fn guidance_for_unavailable_reason(reason: &UnavailableReason) -> String {
     }
 }
 
+/// Keys a user-supplied env override must never set — they would corrupt the
+/// agent's runtime environment or AionUi-internal wiring. Case-insensitive.
+pub(crate) fn is_blocked_override_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    if upper.starts_with("AIONUI_") {
+        return true;
+    }
+    matches!(
+        upper.as_str(),
+        "HOME" | "PATH" | "USER" | "SHELL" | "TERM" | "CODEX_HOME"
+    )
+}
+
 pub(crate) fn guidance_for_snapshot_error_code(error_code: &str) -> &'static str {
     match error_code {
         "command_not_found" => {
@@ -1103,5 +1116,15 @@ mod tests {
             refreshed.handshake.agent_capabilities,
             Some(serde_json::json!({"x": 1}))
         );
+    }
+
+    #[test]
+    fn blocked_override_env_keys() {
+        for k in ["HOME", "PATH", "USER", "SHELL", "TERM", "CODEX_HOME", "AIONUI_FOO", "aionui_bar", "path"] {
+            assert!(super::is_blocked_override_env_key(k), "{k} should be blocked");
+        }
+        for k in ["ANTHROPIC_API_KEY", "FACTORY_API_KEY", "MY_VAR"] {
+            assert!(!super::is_blocked_override_env_key(k), "{k} should be allowed");
+        }
     }
 }
