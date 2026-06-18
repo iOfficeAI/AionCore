@@ -305,7 +305,6 @@ async fn exec_create_team(
 fn extract_assistant_id(value: &serde_json::Value) -> Option<String> {
     value
         .get("assistant_id")
-        .or_else(|| value.get("custom_agent_id"))
         .and_then(serde_json::Value::as_str)
         .or_else(|| {
             value
@@ -318,12 +317,24 @@ fn extract_assistant_id(value: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn validate_requested_assistant_identity_payload(
+    request_body: &serde_json::Value,
+    args: &serde_json::Value,
+) -> Result<(), String> {
+    if request_body.get("custom_agent_id").is_some() || args.get("custom_agent_id").is_some() {
+        return Err("custom_agent_id is no longer accepted; use assistant_id".to_owned());
+    }
+    Ok(())
+}
+
 async fn resolve_requested_assistant_id(
     service: &Arc<TeamSessionService>,
     request_body: &serde_json::Value,
     args: &serde_json::Value,
     caller_conversation_id: Option<&str>,
 ) -> Result<String, String> {
+    validate_requested_assistant_identity_payload(request_body, args)?;
+
     if let Some(assistant_id) = extract_assistant_id(request_body).or_else(|| extract_assistant_id(args)) {
         return Ok(assistant_id);
     }
@@ -561,6 +572,25 @@ mod tests {
             Ok(Err(_)) => { /* connection refused — expected */ }
             Err(_) => { /* timeout — expected */ }
         }
+    }
+
+    #[test]
+    fn extract_assistant_id_ignores_legacy_custom_agent_id() {
+        let payload = serde_json::json!({
+            "custom_agent_id": "legacy-assistant",
+        });
+        assert!(extract_assistant_id(&payload).is_none());
+    }
+
+    #[test]
+    fn validate_requested_assistant_identity_payload_rejects_legacy_custom_agent_id() {
+        let err = validate_requested_assistant_identity_payload(
+            &serde_json::json!({ "custom_agent_id": "legacy-assistant" }),
+            &serde_json::json!({}),
+        )
+        .expect_err("legacy custom_agent_id should be rejected");
+
+        assert!(err.contains("custom_agent_id"));
     }
 
     #[tokio::test]

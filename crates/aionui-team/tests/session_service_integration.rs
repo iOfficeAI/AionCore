@@ -1432,11 +1432,11 @@ async fn tc1_create_team_with_multiple_agents() {
         .unwrap();
 
     assert_eq!(resp.name, "Alpha");
-    assert_eq!(resp.agents.len(), 2);
-    assert_eq!(resp.agents[0].role, "lead");
-    assert_eq!(resp.agents[1].role, "teammate");
-    assert!(resp.lead_agent_id.is_some());
-    assert_eq!(resp.lead_agent_id, Some(resp.agents[0].slot_id.clone()));
+    assert_eq!(resp.assistants.len(), 2);
+    assert_eq!(resp.assistants[0].role, "lead");
+    assert_eq!(resp.assistants[1].role, "teammate");
+    assert!(resp.leader_assistant_id.is_some());
+    assert_eq!(resp.leader_assistant_id, Some(resp.assistants[0].slot_id.clone()));
 }
 
 #[tokio::test]
@@ -1463,7 +1463,7 @@ async fn create_team_with_workspace_writes_same_workspace_to_team_and_initial_ag
 
     let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.workspace, workspace);
-    for agent in &got.agents {
+    for agent in &got.assistants {
         let extra = conv_repo.get_extra(&agent.conversation_id).unwrap();
         assert_eq!(
             extra.get("workspace").and_then(serde_json::Value::as_str),
@@ -1498,7 +1498,7 @@ async fn create_team_without_workspace_uses_leader_auto_workspace_for_all_initia
         got.workspace
     );
 
-    for agent in &got.agents {
+    for agent in &got.assistants {
         let extra = conv_repo.get_extra(&agent.conversation_id).unwrap();
         assert_eq!(
             extra.get("workspace").and_then(serde_json::Value::as_str),
@@ -1578,7 +1578,7 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
         .unwrap();
 
     assert_eq!(
-        resp.agents[0].icon.as_deref(),
+        resp.assistants[0].icon.as_deref(),
         Some("/api/assistants/assistant-lead/avatar")
     );
 }
@@ -1649,7 +1649,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
         .unwrap();
 
     let row = conv_repo
-        .get(&resp.agents[0].conversation_id)
+        .get(&resp.assistants[0].conversation_id)
         .await
         .unwrap()
         .expect("lead conversation row");
@@ -1735,9 +1735,9 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
         .await
         .unwrap();
 
-    assert_eq!(created.agents[0].backend, "codex");
+    assert_eq!(created.assistants[0].backend, "codex");
     let extra = conv_repo
-        .get_extra(&created.agents[0].conversation_id)
+        .get_extra(&created.assistants[0].conversation_id)
         .expect("lead conversation extra");
     assert_eq!(extra.get("backend").and_then(serde_json::Value::as_str), Some("codex"));
     assert_eq!(
@@ -1822,9 +1822,9 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
         .await
         .unwrap();
 
-    assert_eq!(created.agents[0].backend, "codex");
+    assert_eq!(created.assistants[0].backend, "codex");
     let extra = conv_repo
-        .get_extra(&created.agents[0].conversation_id)
+        .get_extra(&created.assistants[0].conversation_id)
         .expect("lead conversation extra");
     assert_eq!(extra.get("backend").and_then(serde_json::Value::as_str), Some("codex"));
 }
@@ -2085,8 +2085,8 @@ async fn tc2_create_single_agent_team() {
         .await
         .unwrap();
 
-    assert_eq!(resp.agents.len(), 1);
-    assert_eq!(resp.agents[0].role, "lead");
+    assert_eq!(resp.assistants.len(), 1);
+    assert_eq!(resp.assistants[0].role, "lead");
 }
 
 #[tokio::test]
@@ -2121,8 +2121,8 @@ async fn tc4_first_agent_is_lead() {
         .await
         .unwrap();
 
-    assert_eq!(resp.agents[0].role, "lead");
-    assert_eq!(resp.lead_agent_id, Some(resp.agents[0].slot_id.clone()));
+    assert_eq!(resp.assistants[0].role, "lead");
+    assert_eq!(resp.leader_assistant_id, Some(resp.assistants[0].slot_id.clone()));
 }
 
 #[tokio::test]
@@ -2156,10 +2156,10 @@ async fn tc3_each_agent_has_conversation_id() {
         .await
         .unwrap();
 
-    for agent in &resp.agents {
+    for agent in &resp.assistants {
         assert!(!agent.conversation_id.is_empty());
     }
-    assert_ne!(resp.agents[0].conversation_id, resp.agents[1].conversation_id);
+    assert_ne!(resp.assistants[0].conversation_id, resp.assistants[1].conversation_id);
 }
 
 // -- List teams ---------------------------------------------------------------
@@ -2250,7 +2250,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
         )
         .await
         .unwrap();
-    let conversation_id = created.agents[0].conversation_id.clone();
+    let conversation_id = created.assistants[0].conversation_id.clone();
     task_manager
         .get_or_build_task(
             &conversation_id,
@@ -2265,7 +2265,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
 
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, created.id);
-    assert_eq!(list[0].agents[0].pending_confirmations, 2);
+    assert_eq!(list[0].assistants[0].pending_confirmations, 2);
     assert_eq!(after.build, before.build);
 }
 
@@ -2289,7 +2289,7 @@ async fn tg1_get_existing_team() {
     let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.id, created.id);
     assert_eq!(got.name, "Alpha");
-    assert_eq!(got.agents.len(), 2);
+    assert_eq!(got.assistants.len(), 2);
 }
 
 #[tokio::test]
@@ -2443,7 +2443,7 @@ async fn aa1_add_agent_to_team() {
     assert!(!agent.conversation_id.is_empty());
 
     let got = svc.get_team("user1", &created.id).await.unwrap();
-    assert_eq!(got.agents.len(), 2);
+    assert_eq!(got.assistants.len(), 2);
 }
 
 #[tokio::test]
@@ -2518,7 +2518,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
         )
         .await
         .unwrap();
-    let leader_workspace = conv_repo.get_extra(&created.agents[0].conversation_id).unwrap()["workspace"]
+    let leader_workspace = conv_repo.get_extra(&created.assistants[0].conversation_id).unwrap()["workspace"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2576,7 +2576,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
     force_team_workspace(&team_repo, &created.id, "").await;
     conv_repo
         .patch_extra(
-            &created.agents[0].conversation_id,
+            &created.assistants[0].conversation_id,
             serde_json::json!({ "workspace": "/tmp/aionui-team-missing-leader-workspace" }),
         )
         .unwrap();
@@ -2687,7 +2687,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
     force_team_workspace(&team_repo, &created.id, "").await;
     conv_repo
         .patch_extra(
-            &created.agents[0].conversation_id,
+            &created.assistants[0].conversation_id,
             serde_json::json!({ "workspace": "/tmp/aionui-team-missing-leader-workspace" }),
         )
         .unwrap();
@@ -2739,7 +2739,7 @@ async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
         .await
         .unwrap();
 
-    for agent in &created.agents {
+    for agent in &created.assistants {
         let extra = conv_repo.get_extra(&agent.conversation_id).unwrap();
         assert_eq!(extra.get("teamId").and_then(|v| v.as_str()), Some(created.id.as_str()));
         assert_eq!(
@@ -2824,12 +2824,12 @@ async fn ar1_remove_agent_from_team() {
         .await
         .unwrap();
 
-    let worker_slot = created.agents[1].slot_id.clone();
+    let worker_slot = created.assistants[1].slot_id.clone();
     svc.remove_agent("user1", &created.id, &worker_slot).await.unwrap();
 
     let got = svc.get_team("user1", &created.id).await.unwrap();
-    assert_eq!(got.agents.len(), 1);
-    assert!(got.agents.iter().all(|a| a.slot_id != worker_slot));
+    assert_eq!(got.assistants.len(), 1);
+    assert!(got.assistants.iter().all(|a| a.slot_id != worker_slot));
 }
 
 #[tokio::test]
@@ -2866,13 +2866,13 @@ async fn an1_rename_agent() {
         .await
         .unwrap();
 
-    let slot_id = created.agents[1].slot_id.clone();
+    let slot_id = created.assistants[1].slot_id.clone();
     svc.rename_agent("user1", &created.id, &slot_id, "Senior Worker")
         .await
         .unwrap();
 
     let got = svc.get_team("user1", &created.id).await.unwrap();
-    let agent = got.agents.iter().find(|a| a.slot_id == slot_id).unwrap();
+    let agent = got.assistants.iter().find(|a| a.slot_id == slot_id).unwrap();
     assert_eq!(agent.name, "Senior Worker");
 }
 
@@ -2936,7 +2936,7 @@ async fn spawn_agent_in_session_rejects_without_active_team_run_before_persistin
         .await
         .expect("session should be loaded without active Team Run");
     let lead_slot_id = created
-        .lead_agent_id
+        .leader_assistant_id
         .clone()
         .expect("created team should have a lead slot");
 
@@ -2962,8 +2962,8 @@ async fn spawn_agent_in_session_rejects_without_active_team_run_before_persistin
         .await
         .expect("team should still be readable");
     assert_eq!(
-        after.agents.len(),
-        created.agents.len(),
+        after.assistants.len(),
+        created.assistants.len(),
         "failed spawn must not persist a partial teammate"
     );
 }
@@ -3168,7 +3168,7 @@ async fn sa_send_message_to_agent_with_active_session() {
         .unwrap();
 
     svc.ensure_session("user1", &created.id).await.unwrap();
-    let worker_slot = created.agents[1].slot_id.clone();
+    let worker_slot = created.assistants[1].slot_id.clone();
     svc.send_message_to_agent("user1", &created.id, &worker_slot, "Do this", None)
         .await
         .unwrap();
@@ -3188,7 +3188,7 @@ async fn sa2_send_message_to_agent_rejects_cross_user_access() {
         )
         .await
         .unwrap();
-    let worker_slot = created.agents[1].slot_id.clone();
+    let worker_slot = created.assistants[1].slot_id.clone();
 
     let result = svc
         .send_message_to_agent("user2", &created.id, &worker_slot, "Do this", None)
@@ -3312,7 +3312,7 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
     let calls = tm.snapshot();
     assert_eq!(calls.kill.len(), 2, "expected 2 kill calls");
     assert_eq!(calls.build.len(), 2, "expected 2 build calls");
-    for (i, agent) in created.agents.iter().enumerate() {
+    for (i, agent) in created.assistants.iter().enumerate() {
         assert_eq!(calls.kill[i].0, agent.conversation_id);
         assert_eq!(calls.kill[i].1, Some(AgentKillReason::TeamMcpRebuild));
         assert_eq!(calls.build[i], agent.conversation_id);
@@ -3509,11 +3509,11 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
 
     let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(
-        got.agents.len(),
+        got.assistants.len(),
         3,
         "both concurrent add_agent calls must be persisted (1 lead + 2 workers)"
     );
-    let names: std::collections::HashSet<_> = got.agents.iter().map(|a| a.name.clone()).collect();
+    let names: std::collections::HashSet<_> = got.assistants.iter().map(|a| a.name.clone()).collect();
     assert!(names.contains("Lead"));
     assert!(names.contains("WorkerA"));
     assert!(names.contains("WorkerB"));
@@ -3549,10 +3549,10 @@ async fn d115_remove_team_kills_every_agent_process() {
     let new_kills = &calls.kill[before_kill..];
     assert_eq!(
         new_kills.len(),
-        created.agents.len(),
+        created.assistants.len(),
         "remove_team must kill every agent once"
     );
-    for (i, agent) in created.agents.iter().enumerate() {
+    for (i, agent) in created.assistants.iter().enumerate() {
         assert_eq!(new_kills[i].0, agent.conversation_id);
         assert_eq!(new_kills[i].1, Some(AgentKillReason::TeamDeleted));
     }

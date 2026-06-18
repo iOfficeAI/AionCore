@@ -478,8 +478,8 @@ async fn we2_agent_spawned_event() {
 
     let payload: TeamAgentSpawnedPayload = serde_json::from_value(spawned[0].data.clone()).unwrap();
     assert_eq!(payload.team_id, "t1");
-    assert_eq!(payload.agent.slot_id, "w2");
-    assert_eq!(payload.agent.name, "NewWorker");
+    assert_eq!(payload.assistant.slot_id, "w2");
+    assert_eq!(payload.assistant.name, "NewWorker");
 }
 
 // -- WE-3: Agent removed event -----------------------------------------------
@@ -559,7 +559,7 @@ fn event_emitter_uses_typed_payloads() {
     assert_eq!(p1.status, "thinking");
 
     let p2: TeamAgentSpawnedPayload = serde_json::from_value(events[1].data.clone()).unwrap();
-    assert_eq!(p2.agent.slot_id, "s1");
+    assert_eq!(p2.assistant.slot_id, "s1");
 
     let p3: TeamAgentRemovedPayload = serde_json::from_value(events[2].data.clone()).unwrap();
     assert_eq!(p3.slot_id, "s1");
