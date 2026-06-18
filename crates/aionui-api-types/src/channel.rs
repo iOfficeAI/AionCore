@@ -92,6 +92,7 @@ pub struct SyncChannelSettingsRequest {
 /// New writes must use assistant identity only. Legacy backend / agent fields
 /// remain readable in responses for historical settings migration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelAssistantSettingRequest {
     pub assistant_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -813,5 +814,35 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ChannelSessionResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, resp);
+    }
+
+    #[test]
+    fn test_channel_assistant_setting_request_rejects_legacy_backend_fields() {
+        let err = serde_json::from_str::<ChannelAssistantSettingRequest>(
+            r#"{"assistant_id":"bare-codex","backend":"codex","name":"Codex"}"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field `backend`"), "{err}");
+    }
+
+    #[test]
+    fn test_channel_assistant_setting_request_rejects_legacy_custom_agent_fields() {
+        let err = serde_json::from_str::<ChannelAssistantSettingRequest>(
+            r#"{"assistant_id":"legacy-custom","custom_agent_id":"legacy-custom","name":"Codex"}"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field `custom_agent_id`"), "{err}");
+    }
+
+    #[test]
+    fn test_channel_assistant_setting_request_rejects_legacy_agent_type_fields() {
+        let err = serde_json::from_str::<ChannelAssistantSettingRequest>(
+            r#"{"assistant_id":"bare-codex","agent_type":"acp","name":"Codex"}"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field `agent_type`"), "{err}");
     }
 }
