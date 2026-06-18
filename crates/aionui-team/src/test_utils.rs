@@ -755,6 +755,15 @@ pub(crate) mod workspace_harness {
             Ok(None)
         }
 
+        async fn update_agent_overrides(
+            &self,
+            _id: &str,
+            _command_override: Option<&str>,
+            _env_override: Option<&str>,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+
         async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
             Ok(false)
         }

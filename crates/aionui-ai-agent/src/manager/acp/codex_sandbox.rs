@@ -246,6 +246,8 @@ mod tests {
             last_success_at: None,
             last_failure_at: None,
             handshake: aionui_api_types::AgentHandshake::default(),
+            has_command_override: false,
+            env_override_key_count: 0,
         }
     }
 

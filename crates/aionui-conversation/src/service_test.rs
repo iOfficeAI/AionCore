@@ -187,6 +187,10 @@ impl AgentAvailabilityFeedbackPort for RecordingAvailabilityFeedback {
         });
         Ok(())
     }
+
+    async fn record_session_success(&self, _agent_id: &str) -> Result<(), AgentError> {
+        Ok(())
+    }
 }
 
 // ── Mock Repository ────────────────────────────────────────────────
@@ -606,6 +610,14 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
         _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
+    }
+    async fn update_agent_overrides(
+        &self,
+        _id: &str,
+        _command_override: Option<&str>,
+        _env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        Ok(())
     }
     async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
         Ok(false)

@@ -234,6 +234,26 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         self.get(id).await
     }
 
+    async fn update_agent_overrides(
+        &self,
+        id: &str,
+        command_override: Option<&str>,
+        env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE agent_metadata SET command_override = ?, env_override = ?, \
+             updated_at = ? WHERE id = ?",
+        )
+        .bind(command_override)
+        .bind(env_override)
+        .bind(aionui_common::now_ms())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+        Ok(())
+    }
+
     async fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool, DbError> {
         let now = now_ms();
         let result = sqlx::query("UPDATE agent_metadata SET enabled = ?, updated_at = ? WHERE id = ?")
@@ -557,5 +577,23 @@ mod tests {
             dup_count, 2,
             "both rows should coexist after dropping UNIQUE(agent_source,name)"
         );
+    }
+
+    #[tokio::test]
+    async fn update_agent_overrides_persists_and_leaves_other_columns() {
+        let (repo, _db) = setup().await;
+        // Seed one agent row
+        let p = custom_params("agent-x", "agent-x");
+        repo.upsert(&p).await.unwrap();
+
+        repo.update_agent_overrides("agent-x", Some("/real/bin/x"), Some(r#"[{"name":"K","value":"V"}]"#))
+            .await
+            .unwrap();
+
+        let row = repo.get("agent-x").await.unwrap().unwrap();
+        assert_eq!(row.command_override.as_deref(), Some("/real/bin/x"));
+        assert_eq!(row.env_override.as_deref(), Some(r#"[{"name":"K","value":"V"}]"#));
+        // seed columns untouched
+        assert_eq!(row.name, "agent-x");
     }
 }

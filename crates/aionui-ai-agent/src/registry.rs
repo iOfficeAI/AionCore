@@ -295,7 +295,7 @@ impl AgentRegistry {
                     installed: meta.available,
                     command: meta.command,
                     args: meta.args,
-                    env: meta.env,
+                    env: Vec::new(),
                     native_skills_dirs: meta.native_skills_dirs,
                     behavior_policy: meta.behavior_policy,
                     yolo_id: meta.yolo_id,
@@ -311,6 +311,8 @@ impl AgentRegistry {
                     last_check_at: meta.last_check_at,
                     last_success_at: meta.last_success_at,
                     last_failure_at: meta.last_failure_at,
+                    has_command_override: meta.has_command_override,
+                    env_override_key_count: meta.env_override_key_count,
                 }
             })
             .collect();
@@ -366,12 +368,33 @@ fn is_visible(meta: &AgentMetadata) -> bool {
     meta.enabled && matches!(derive_management_status(meta), AgentManagementStatus::Available)
 }
 
+/// Extract and trim a command override, filtering out empty strings.
+fn meta_command_override(raw: &Option<String>) -> Option<String> {
+    raw.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// Parse env_override JSON string into a vector of AgentEnvEntry.
+fn parse_env_override(raw: &Option<String>) -> Option<Vec<AgentEnvEntry>> {
+    let s = raw.as_deref()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Vec<AgentEnvEntry>>(s).ok()
+}
+
 /// Turn a DB row into the public `AgentMetadata`, probing the command
 /// on disk so `available` reflects the current PATH state. Returns
 /// the probe reason alongside the row so the caller can log a single
 /// uniform `(meta, reason)` line per agent without re-running the
 /// probe.
 fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<UnavailableReason>)> {
+    // Extract override fields before row is partially moved
+    let command_override_raw = row.command_override.clone();
+    let env_override_raw = row.env_override.clone();
+
     let agent_type = parse_agent_type(&row.agent_type)?;
     let agent_source = parse_agent_source(&row.agent_source)?;
     let agent_source_info = decode_json_field(row.agent_source_info.as_deref(), "agent_source_info")
@@ -427,7 +450,31 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
         last_success_at: row.last_success_at,
         last_failure_at: row.last_failure_at,
         handshake,
+        has_command_override: false,
+        env_override_key_count: 0,
     };
+
+    // ── Self-repair overrides ──────────────────────────────────────
+    // Layered on top of seed truth at this single projection point so both
+    // the runtime spawn (factory) and the probe (availability) observe the
+    // same merged command/env without either needing extra plumbing.
+    meta.has_command_override = meta_command_override(&command_override_raw).is_some();
+    meta.env_override_key_count = parse_env_override(&env_override_raw)
+        .map(|v| v.iter().filter(|e| !is_blocked_override_env_key(&e.name)).count())
+        .unwrap_or(0);
+
+    if let Some(path) = meta_command_override(&command_override_raw) {
+        meta.command = Some(path);
+    }
+    if let Some(extra) = parse_env_override(&env_override_raw) {
+        for entry in extra {
+            if is_blocked_override_env_key(&entry.name) {
+                tracing::warn!(key = %entry.name, "env override: blocked key skipped");
+                continue;
+            }
+            meta.env.push(entry);
+        }
+    }
 
     let (path, reason) = probe_with_reason(&meta);
     meta.resolved_command = path;
@@ -542,6 +589,7 @@ fn parse_last_check_status(raw: Option<&str>) -> Option<AgentSnapshotCheckStatus
     raw.and_then(|value| match value {
         "available" => Some(AgentSnapshotCheckStatus::Available),
         "unavailable" => Some(AgentSnapshotCheckStatus::Unavailable),
+        "needs_auth" => Some(AgentSnapshotCheckStatus::NeedsAuth),
         _ => {
             warn!(value, "agent_metadata: unknown last_check_status");
             None
@@ -569,6 +617,7 @@ fn derive_management_status(meta: &AgentMetadata) -> AgentManagementStatus {
 
     match meta.last_check_status {
         Some(AgentSnapshotCheckStatus::Unavailable) => AgentManagementStatus::Unavailable,
+        Some(AgentSnapshotCheckStatus::NeedsAuth) => AgentManagementStatus::NeedsAuth,
         _ => AgentManagementStatus::Available,
     }
 }
@@ -644,6 +693,19 @@ fn guidance_for_unavailable_reason(reason: &UnavailableReason) -> String {
             format!("Repair or reinstall the managed `{resource}` runtime, then run Test Connection again.")
         }
     }
+}
+
+/// Keys a user-supplied env override must never set — they would corrupt the
+/// agent's runtime environment or AionUi-internal wiring. Case-insensitive.
+pub(crate) fn is_blocked_override_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    if upper.starts_with("AIONUI_") {
+        return true;
+    }
+    matches!(
+        upper.as_str(),
+        "HOME" | "PATH" | "USER" | "SHELL" | "TERM" | "CODEX_HOME"
+    )
 }
 
 pub(crate) fn guidance_for_snapshot_error_code(error_code: &str) -> &'static str {
@@ -1103,5 +1165,112 @@ mod tests {
             refreshed.handshake.agent_capabilities,
             Some(serde_json::json!({"x": 1}))
         );
+    }
+
+    #[test]
+    fn blocked_override_env_keys() {
+        for k in ["HOME", "PATH", "USER", "SHELL", "TERM", "CODEX_HOME", "AIONUI_FOO", "aionui_bar", "path"] {
+            assert!(super::is_blocked_override_env_key(k), "{k} should be blocked");
+        }
+        for k in ["ANTHROPIC_API_KEY", "FACTORY_API_KEY", "MY_VAR"] {
+            assert!(!super::is_blocked_override_env_key(k), "{k} should be allowed");
+        }
+    }
+
+    #[test]
+    fn decode_row_applies_command_override() {
+        use aionui_db::AgentMetadataRow;
+        let row = AgentMetadataRow {
+            id: "test-agent".to_string(),
+            icon: None,
+            name: "Test Agent".to_string(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("test".to_string()),
+            agent_type: "acp".to_string(),
+            agent_source: "builtin".to_string(),
+            agent_source_info: None,
+            enabled: true,
+            command: Some("droid".to_string()),
+            command_override: Some("/opt/factory/bin/droid".to_string()),
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            env_override: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let (meta, _) = super::decode_row(row).expect("decodes");
+        assert_eq!(meta.command.as_deref(), Some("/opt/factory/bin/droid"));
+    }
+
+    #[test]
+    fn decode_row_appends_env_override_and_skips_blocked() {
+        use aionui_db::AgentMetadataRow;
+        let row = AgentMetadataRow {
+            id: "test-agent-2".to_string(),
+            icon: None,
+            name: "Test Agent 2".to_string(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("test".to_string()),
+            agent_type: "acp".to_string(),
+            agent_source: "builtin".to_string(),
+            agent_source_info: None,
+            enabled: true,
+            command: Some("test-cmd".to_string()),
+            command_override: None,
+            args: None,
+            env: Some(r#"[{"name":"BASE","value":"seed","description":""}]"#.to_string()),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            env_override: Some(
+                r#"[{"name":"ANTHROPIC_API_KEY","value":"sk-x","description":""},{"name":"PATH","value":"/evil","description":""}]"#.to_string(),
+            ),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let (meta, _) = super::decode_row(row).expect("decodes");
+        let names: Vec<&str> = meta.env.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"BASE"));
+        assert!(names.contains(&"ANTHROPIC_API_KEY"));
+        assert!(!names.contains(&"PATH"), "blocked key must be skipped");
     }
 }

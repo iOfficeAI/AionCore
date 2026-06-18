@@ -12,3 +12,9 @@ ALTER TABLE agent_metadata ADD COLUMN last_check_latency_ms INTEGER;
 ALTER TABLE agent_metadata ADD COLUMN last_check_at INTEGER;
 ALTER TABLE agent_metadata ADD COLUMN last_success_at INTEGER;
 ALTER TABLE agent_metadata ADD COLUMN last_failure_at INTEGER;
+
+-- Self-repair overrides: user-supplied executable path and extra env vars,
+-- layered on top of the seed row at projection time. Stored plaintext, same
+-- as the existing `env` column.
+ALTER TABLE agent_metadata ADD COLUMN command_override TEXT;
+ALTER TABLE agent_metadata ADD COLUMN env_override TEXT;

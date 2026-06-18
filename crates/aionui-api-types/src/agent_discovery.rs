@@ -112,6 +112,8 @@ pub enum AgentManagementStatus {
     Missing,
     Available,
     Unavailable,
+    #[serde(rename = "needs_auth")]
+    NeedsAuth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +121,8 @@ pub enum AgentManagementStatus {
 pub enum AgentSnapshotCheckStatus {
     Available,
     Unavailable,
+    #[serde(rename = "needs_auth")]
+    NeedsAuth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +236,15 @@ pub struct AgentMetadata {
 
     #[serde(default)]
     pub handshake: AgentHandshake,
+
+    /// Internal carrier: whether the agent row has a command override set.
+    /// Computed in decode_row and projected to `AgentManagementRow`.
+    #[serde(skip)]
+    pub has_command_override: bool,
+    /// Internal carrier: count of non-blocked env override keys.
+    /// Computed in decode_row and projected to `AgentManagementRow`.
+    #[serde(skip)]
+    pub env_override_key_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +301,10 @@ pub struct AgentManagementRow {
     pub last_success_at: Option<TimestampMs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_at: Option<TimestampMs>,
+    #[serde(default)]
+    pub has_command_override: bool,
+    #[serde(default)]
+    pub env_override_key_count: usize,
 }
 
 #[cfg(test)]
@@ -344,6 +361,8 @@ mod tests {
             last_success_at: None,
             last_failure_at: None,
             handshake: AgentHandshake::default(),
+            has_command_override: false,
+            env_override_key_count: 0,
         };
         let v = serde_json::to_value(&meta).unwrap();
         assert_eq!(v["id"], "abc12345");

@@ -784,6 +784,14 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
+    async fn update_agent_overrides(
+        &self,
+        _id: &str,
+        _command_override: Option<&str>,
+        _env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
     async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
         Ok(false)
     }
@@ -1369,6 +1377,8 @@ fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadata
         last_check_at: None,
         last_success_at: None,
         last_failure_at: None,
+        command_override: None,
+        env_override: None,
         created_at: 0,
         updated_at: 0,
     }

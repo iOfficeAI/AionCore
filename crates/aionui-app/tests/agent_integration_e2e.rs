@@ -616,3 +616,50 @@ async fn side_question_with_mock_agent() {
         "Expected 200 or 500, got {status}"
     );
 }
+
+// ── Agent overrides roundtrip ───────────────────────────────────
+
+#[tokio::test]
+async fn agent_overrides_roundtrip_and_management_summary() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    upsert_visible_agent_metadata(&services, "ovr-agent", "acp").await;
+    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+
+    // PUT overrides
+    let body = json!({
+        "command_override": "/real/bin/ovr",
+        "env_override": [{"name": "ANTHROPIC_API_KEY", "value": "sk-x"}, {"name": "PATH", "value": "/evil"}]
+    });
+    let req = json_with_token("PUT", "/api/agents/ovr-agent/overrides", body, &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // management row: safe fields, blocked PATH not counted
+    let mreq = get_with_token("/api/agents/management", &token);
+    let mbody = body_json(app.clone().oneshot(mreq).await.unwrap()).await;
+    let mbody_str = serde_json::to_string(&mbody).unwrap();
+    let row = mbody["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "ovr-agent")
+        .expect("row present");
+    assert_eq!(row["has_command_override"], true);
+    assert_eq!(row["env_override_key_count"], 1); // PATH excluded
+    assert!(
+        row["env"].as_array().map_or(true, |arr| arr.is_empty()),
+        "management row env must be empty or absent"
+    );
+    assert!(
+        !mbody_str.contains("sk-x"),
+        "management response must not leak secret values"
+    );
+
+    // GET overrides: plaintext echo
+    let greq = get_with_token("/api/agents/ovr-agent/overrides", &token);
+    let gbody = body_json(app.clone().oneshot(greq).await.unwrap()).await;
+    assert_eq!(gbody["data"]["command_override"], "/real/bin/ovr");
+    let envs = gbody["data"]["env_override"].as_array().unwrap();
+    assert!(envs.iter().any(|e| e["name"] == "ANTHROPIC_API_KEY"));
+}
