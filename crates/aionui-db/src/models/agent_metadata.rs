@@ -58,6 +58,9 @@ pub struct AgentMetadataRow {
     pub last_success_at: Option<TimestampMs>,
     pub last_failure_at: Option<TimestampMs>,
 
+    pub command_override: Option<String>,
+    pub env_override: Option<String>,
+
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
