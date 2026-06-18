@@ -286,13 +286,20 @@ fn lp3_lead_prompt_contains_task_management_guidance() {
 #[test]
 fn tp1_teammate_prompt_contains_execution_guidance() {
     let agent = make_agent("w1", "Worker1", TeammateRole::Teammate);
-    let prompt = build_teammate_prompt(&agent, "Alpha");
+    let members = vec![make_agent("lead-1", "Lead", TeammateRole::Lead), agent.clone()];
+    let prompt = build_teammate_prompt(&agent, "Alpha", &members);
 
-    assert!(prompt.contains("execute tasks"), "missing execution guidance");
+    assert!(prompt.contains("## Team Governance"), "missing governance");
+    assert!(
+        prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."),
+        "missing canonical coordination rule"
+    );
+    assert!(prompt.contains("## How to Work"), "missing execution guidance");
     assert!(prompt.contains("team_send_message"), "missing communication tool");
     assert!(prompt.contains("team_task_update"), "missing task update tool");
     assert!(prompt.contains("shutdown_request"), "missing shutdown protocol");
     assert!(prompt.contains("shutdown_approved"), "missing shutdown_approved");
+    assert!(prompt.contains("STOP GENERATING"), "missing stop protocol");
 }
 
 // -- TP-2: Teammate prompt contains team name --------------------------------
@@ -300,9 +307,10 @@ fn tp1_teammate_prompt_contains_execution_guidance() {
 #[test]
 fn tp2_teammate_prompt_contains_team_name() {
     let agent = make_agent("w1", "Worker1", TeammateRole::Teammate);
-    let prompt = build_teammate_prompt(&agent, "Project Falcon");
+    let members = vec![make_agent("lead-1", "Lead", TeammateRole::Lead), agent.clone()];
+    let prompt = build_teammate_prompt(&agent, "Project Falcon", &members);
 
-    assert!(prompt.contains("\"Project Falcon\""));
+    assert!(prompt.contains("Team: Project Falcon"));
 }
 
 // -- WP-1: Wake payload includes unread messages -----------------------------

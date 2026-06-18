@@ -1253,6 +1253,76 @@ async fn ensure_session_recovery_drain_runs_agent_turn_with_team_run_id() {
 }
 
 #[tokio::test]
+async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
+    let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Recover Teammate".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let worker_slot_id = created.agents[1].slot_id.clone();
+    svc.stop_session("user1", &created.id)
+        .await
+        .expect("stop auto-started session");
+
+    team_repo
+        .write_message(&aionui_db::models::MailboxMessageRow {
+            id: "mailbox-worker-1".into(),
+            team_id: created.id.clone(),
+            to_agent_id: worker_slot_id.clone(),
+            from_agent_id: "user".into(),
+            msg_type: "message".into(),
+            content: "do X".into(),
+            summary: None,
+            files: None,
+            read: false,
+            created_at: aionui_common::now_ms(),
+        })
+        .await
+        .expect("seed teammate mailbox");
+
+    svc.ensure_session("user1", &created.id).await.expect("ensure");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if turn_port
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.slot_id == worker_slot_id)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("teammate recovery turn should run");
+
+    let requests = turn_port.requests.lock().unwrap();
+    let worker_request = requests
+        .iter()
+        .find(|request| request.slot_id == worker_slot_id)
+        .expect("worker turn request");
+    let first_message = &worker_request.content;
+    assert!(first_message.contains("## Team Governance"));
+    assert!(first_message.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
+    assert!(first_message.contains("Use team_send_message to report results to the leader"));
+    assert!(first_message.contains("STOP GENERATING"));
+    assert!(!first_message.contains(
+        "You execute tasks assigned by the Lead Agent. Focus on completing your assigned work thoroughly and reporting back."
+    ));
+    assert!(first_message.contains("do X"));
+}
+
+#[tokio::test]
 async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
     let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
     let created = svc

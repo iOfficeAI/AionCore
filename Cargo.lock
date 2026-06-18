@@ -818,6 +818,7 @@ dependencies = [
  "aionui-common",
  "aionui-db",
  "aionui-realtime",
+ "aionui-team-prompts",
  "async-trait",
  "axum",
  "dashmap",

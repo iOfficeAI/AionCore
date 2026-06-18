@@ -305,7 +305,10 @@ impl TeamSession {
                         &available_agent_types,
                     )
                 }
-                TeammateRole::Teammate => build_teammate_prompt(&agent, &self.team.name),
+                TeammateRole::Teammate => {
+                    let members = self.scheduler.list_agents().await;
+                    build_teammate_prompt(&agent, &self.team.name, &members)
+                }
             };
             format!("{role_prompt}\n\n{wake_body}")
         } else {
@@ -2994,6 +2997,34 @@ mod tests {
             input.first_message
         );
         assert!(input.first_message.contains("do X"));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn teammate_first_wake_uses_canonical_prompt() {
+        let session = start_session().await;
+        session
+            .mailbox
+            .write("t1", "worker-1", "user", MailboxMessageType::Message, "do X", None)
+            .await
+            .unwrap();
+        record_recovery_wake(&session, "worker-1", TeamRunTargetRole::Teammate, 1).await;
+
+        let input = session
+            .compute_wake_input("worker-1")
+            .await
+            .unwrap()
+            .expect("WakeInput");
+        let first_message = input.first_message;
+
+        assert!(first_message.contains("## Team Governance"));
+        assert!(first_message.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
+        assert!(first_message.contains("Use team_send_message to report results to the leader"));
+        assert!(first_message.contains("STOP GENERATING"));
+        assert!(!first_message.contains(
+            "You execute tasks assigned by the Lead Agent. Focus on completing your assigned work thoroughly and reporting back."
+        ));
+        assert!(first_message.contains("do X"));
         session.stop();
     }
 
