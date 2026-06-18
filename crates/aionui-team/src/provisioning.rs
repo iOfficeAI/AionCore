@@ -50,7 +50,7 @@ struct NewAgentProvisioning {
 
 pub struct TeamConversationCreateRequest {
     pub user_id: String,
-    pub agent_type: AgentType,
+    pub agent_type: Option<AgentType>,
     pub name: String,
     pub top_level_model: Option<ProviderWithModel>,
     pub assistant_id: Option<String>,
@@ -482,7 +482,7 @@ impl TeamAgentProvisioner {
             .conversation_port
             .create_team_conversation(TeamConversationCreateRequest {
                 user_id: user_id.to_owned(),
-                agent_type,
+                agent_type: if assistant_id.is_some() { None } else { Some(agent_type) },
                 name: name.to_owned(),
                 top_level_model,
                 assistant_id: assistant_id.map(str::to_owned),

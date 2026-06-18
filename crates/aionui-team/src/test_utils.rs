@@ -536,7 +536,7 @@ pub(crate) mod workspace_harness {
                     id: id.clone(),
                     user_id: request.user_id,
                     name: request.name,
-                    r#type: request.agent_type.serde_name().to_owned(),
+                    r#type: request.agent_type.unwrap_or(AgentType::Acp).serde_name().to_owned(),
                     pinned: false,
                     pinned_at: None,
                     source: None,

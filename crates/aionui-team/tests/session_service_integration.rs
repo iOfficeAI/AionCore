@@ -271,6 +271,11 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         &self,
         request: TeamConversationCreateRequest,
     ) -> Result<TeamConversationCreateResult, aionui_team::TeamError> {
+        if request.assistant_id.is_some() && request.agent_type.is_some() {
+            return Err(aionui_team::TeamError::InvalidRequest(
+                "assistant-backed team conversations must not provide agent_type".into(),
+            ));
+        }
         let id = aionui_common::generate_id();
         let now = aionui_common::now_ms();
         let workspace = request
@@ -291,7 +296,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 id: id.clone(),
                 user_id: request.user_id,
                 name: request.name,
-                r#type: request.agent_type.serde_name().to_owned(),
+                r#type: request.agent_type.unwrap_or(AgentType::Acp).serde_name().to_owned(),
                 pinned: false,
                 pinned_at: None,
                 source: None,
