@@ -37,6 +37,10 @@ pub(super) async fn build(
     // Merge preset assistant rules into system_prompt (used as custom_prompt
     // in aionrs's build_system_prompt). Mirrors the old architecture's
     // `init_history` injection of `[Assistant System Rules]`.
+    // AionrsBuildExtra parses `skills` so Team preset snapshots preserve the
+    // target contract. Native skill materialization for Aionrs is tracked as a
+    // separate follow-up because this factory currently has no stable Aionrs
+    // skill-loading path.
     if let Some(rules) = overrides.preset_rules.take() {
         overrides.system_prompt = Some(match overrides.system_prompt.take() {
             Some(existing) => format!("{existing}\n\n{rules}"),
@@ -695,8 +699,86 @@ mod tests {
         }
     }
 
+    struct MockMcpRepo {
+        rows: Vec<McpServerRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl IMcpServerRepository for MockMcpRepo {
+        async fn list(&self) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().find(|row| row.id == id).cloned())
+        }
+
+        async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().find(|row| row.name == name).cloned())
+        }
+
+        async fn create(
+            &self,
+            _params: aionui_db::CreateMcpServerParams<'_>,
+        ) -> Result<McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+
+        async fn update(
+            &self,
+            _id: &str,
+            _params: aionui_db::UpdateMcpServerParams<'_>,
+        ) -> Result<McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+
+        async fn batch_upsert(
+            &self,
+            _servers: &[aionui_db::CreateMcpServerParams<'_>],
+        ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+
+        async fn update_status(
+            &self,
+            _id: &str,
+            _status: &str,
+            _last_connected: Option<aionui_common::TimestampMs>,
+        ) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+
+        async fn update_tools(&self, _id: &str, _tools: Option<&str>) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+    }
+
     fn test_broadcaster() -> Arc<dyn EventBroadcaster> {
         Arc::new(BroadcastEventBus::new(16))
+    }
+
+    #[tokio::test]
+    async fn aionrs_loads_mcp_servers_from_frozen_selection_snapshot() {
+        let mut row = make_row(
+            "mcp-docs",
+            "http",
+            r#"{"url":"http://localhost:54321/mcp","headers":{"Authorization":"Bearer frozen"}}"#,
+            false,
+            false,
+        );
+        row.id = "mcp-docs".into();
+        let repo = MockMcpRepo { rows: vec![row] };
+        let selected = vec!["mcp-docs".to_owned()];
+
+        let extra_mcp_servers =
+            load_user_mcp_servers(&repo, Some(&selected), "conv-frozen-mcp", test_broadcaster()).await;
+
+        assert!(extra_mcp_servers.contains_key("mcp-docs"));
+        assert_eq!(extra_mcp_servers["mcp-docs"].transport, TransportType::StreamableHttp);
     }
 
     #[cfg(unix)]

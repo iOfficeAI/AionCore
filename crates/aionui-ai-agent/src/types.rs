@@ -218,4 +218,14 @@ mod tests {
         assert!(extra.system_prompt.is_none());
         assert_eq!(extra.preset_rules.unwrap(), "You are a data analyst.");
     }
+
+    #[test]
+    fn aionrs_build_extra_accepts_frozen_skills_snapshot() {
+        let json = json!({
+            "preset_rules": "Rules",
+            "skills": ["pdf", "cron"]
+        });
+        let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
+        assert_eq!(extra.skills, vec!["pdf".to_owned(), "cron".to_owned()]);
+    }
 }

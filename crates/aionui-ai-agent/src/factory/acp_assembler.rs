@@ -214,6 +214,78 @@ mod tests {
         McpServer::Stdio(McpServerStdio::new(name, "/bin/sh"))
     }
 
+    fn team_cfg() -> TeamMcpStdioConfig {
+        TeamMcpStdioConfig {
+            team_id: "team-1".into(),
+            port: 9999,
+            token: "tok".into(),
+            slot_id: "slot-lead".into(),
+            binary_path: "/bin/backend".into(),
+        }
+    }
+
+    fn test_metadata() -> AgentMetadata {
+        AgentMetadata {
+            id: "agent-1".into(),
+            icon: None,
+            name: "Test ACP".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("claude".into()),
+            agent_type: aionui_common::AgentType::Acp,
+            agent_source: aionui_api_types::AgentSource::Builtin,
+            agent_source_info: aionui_api_types::AgentSourceInfo::default(),
+            enabled: true,
+            available: true,
+            command: Some("claude".into()),
+            resolved_command: None,
+            args: vec![],
+            env: vec![],
+            native_skills_dirs: None,
+            behavior_policy: aionui_api_types::BehaviorPolicy::default(),
+            yolo_id: None,
+            sort_order: 0,
+            team_capable: true,
+            handshake: aionui_api_types::AgentHandshake::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn assemble_acp_params_uses_frozen_preset_context_and_snapshot_seeds() {
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            preset_context: Some("frozen rules".into()),
+            skills: vec!["pdf".into()],
+            mcp_server_ids: Some(vec!["mcp-docs".into()]),
+            team_mcp_stdio_config: Some(team_cfg()),
+            ..Default::default()
+        };
+
+        let params = assemble_acp_params(
+            "conv-1".into(),
+            WorkspaceInfo {
+                path: "/tmp/workspace".into(),
+                is_custom: false,
+            },
+            test_metadata(),
+            CommandSpec::default(),
+            config,
+            vec![user_stdio("mcp-docs")],
+            None,
+            PathBuf::from("/tmp/data"),
+        )
+        .await;
+
+        assert_eq!(params.preset_context.as_deref(), Some("frozen rules"));
+        assert_eq!(params.config.skills, vec!["pdf"]);
+        assert_eq!(
+            params.config.mcp_server_ids.as_deref(),
+            Some(&["mcp-docs".to_owned()][..])
+        );
+        assert_eq!(params.mcp_servers.len(), 2);
+    }
+
     #[test]
     fn resolve_mcp_servers_prefers_team_over_guide() {
         let config = AcpBuildExtra {

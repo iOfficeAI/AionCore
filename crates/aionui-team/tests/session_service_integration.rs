@@ -272,8 +272,16 @@ struct FakeConversationPorts {
     repo: Arc<MockConversationRepo>,
     broadcaster: Arc<dyn EventBroadcaster>,
     workspace_root: std::path::PathBuf,
+    preset_snapshots: Mutex<HashMap<String, FakePresetAssistantSnapshot>>,
     fail_team_temp_create: std::sync::atomic::AtomicBool,
     fail_leader_workspace_patch: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone)]
+struct FakePresetAssistantSnapshot {
+    rules: String,
+    skills: Vec<String>,
+    mcp_server_ids: Vec<String>,
 }
 
 impl FakeConversationPorts {
@@ -284,9 +292,38 @@ impl FakeConversationPorts {
             repo,
             broadcaster,
             workspace_root,
+            preset_snapshots: Mutex::new(HashMap::new()),
             fail_team_temp_create: std::sync::atomic::AtomicBool::new(false),
             fail_leader_workspace_patch: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn upsert_preset_snapshot(&self, id: &str, snapshot: FakePresetAssistantSnapshot) {
+        self.preset_snapshots.lock().unwrap().insert(id.to_owned(), snapshot);
+    }
+
+    fn apply_preset_snapshot(&self, extra: &mut serde_json::Value) {
+        let Some(preset_id) = extra
+            .get("preset_assistant_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let Some(snapshot) = self.preset_snapshots.lock().unwrap().get(&preset_id).cloned() else {
+            return;
+        };
+        extra["preset_context"] = serde_json::Value::String(snapshot.rules.clone());
+        extra["preset_rules"] = serde_json::Value::String(snapshot.rules);
+        extra["skills"] =
+            serde_json::Value::Array(snapshot.skills.into_iter().map(serde_json::Value::String).collect());
+        extra["mcp_server_ids"] = serde_json::Value::Array(
+            snapshot
+                .mcp_server_ids
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
     }
 }
 
@@ -311,6 +348,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
             });
         let mut extra = request.extra;
         extra["workspace"] = serde_json::Value::String(workspace.clone());
+        self.apply_preset_snapshot(&mut extra);
         self.repo
             .create(&ConversationRow {
                 id: id.clone(),
@@ -1637,6 +1675,115 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
 
     assert_eq!(extra["custom_agent_id"], serde_json::json!("2d23ff1c"));
     assert_eq!(extra["preset_assistant_id"], serde_json::json!("2d23ff1c"));
+}
+
+fn fake_preset_snapshot(rules: &str, skills: &[&str], mcp_server_ids: &[&str]) -> FakePresetAssistantSnapshot {
+    FakePresetAssistantSnapshot {
+        rules: rules.to_owned(),
+        skills: skills.iter().map(|value| (*value).to_owned()).collect(),
+        mcp_server_ids: mcp_server_ids.iter().map(|value| (*value).to_owned()).collect(),
+    }
+}
+
+fn assert_frozen_preset_extra(extra: &serde_json::Value) {
+    assert_eq!(extra["preset_assistant_id"], serde_json::json!("word-creator"));
+    assert_eq!(extra["custom_agent_id"], serde_json::json!("word-creator"));
+    assert_eq!(extra["preset_context"], serde_json::json!("assistant rule body"));
+    assert_eq!(extra["preset_rules"], serde_json::json!("assistant rule body"));
+    assert_eq!(extra["skills"], serde_json::json!(["pdf", "cron"]));
+    assert_eq!(extra["mcp_server_ids"], serde_json::json!(["mcp-docs"]));
+}
+
+#[tokio::test]
+async fn team_preset_assistant_snapshot_is_frozen() {
+    let (svc, _team_repo, conversation_ports, conv_repo) =
+        setup_with_ports_team_repo_and_conversation_repo(success_factory(), Arc::new(StubAgentMetadataRepo::empty()));
+    conversation_ports.upsert_preset_snapshot(
+        "word-creator",
+        fake_preset_snapshot("assistant rule body", &["pdf", "cron"], &["mcp-docs"]),
+    );
+
+    let resp = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Preset Team".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: "claude".into(),
+                    model: "claude-sonnet-4".into(),
+                    custom_agent_id: Some("word-creator".into()),
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+
+    let extra = conv_repo.get_extra(&resp.agents[0].conversation_id).unwrap();
+    assert_frozen_preset_extra(&extra);
+
+    conversation_ports.upsert_preset_snapshot(
+        "word-creator",
+        fake_preset_snapshot("changed rule body", &["changed"], &["changed-mcp"]),
+    );
+
+    let after_live_change = conv_repo.get_extra(&resp.agents[0].conversation_id).unwrap();
+    assert_frozen_preset_extra(&after_live_change);
+}
+
+#[tokio::test]
+async fn spawned_preset_assistant_snapshot_is_frozen() {
+    let (svc, _team_repo, conversation_ports, conv_repo) =
+        setup_with_ports_team_repo_and_conversation_repo(success_factory(), Arc::new(StubAgentMetadataRepo::empty()));
+    conversation_ports.upsert_preset_snapshot(
+        "word-creator",
+        fake_preset_snapshot("assistant rule body", &["pdf", "cron"], &["mcp-docs"]),
+    );
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Spawn Preset".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let lead_slot_id = created.lead_agent_id.clone().expect("lead slot");
+    svc.ensure_session("user1", &created.id).await.expect("ensure session");
+    svc.send_message("user1", &created.id, "start active run", None)
+        .await
+        .expect("active run");
+
+    let spawned = svc
+        .spawn_agent_in_session(
+            &created.id,
+            &lead_slot_id,
+            SpawnAgentRequest {
+                name: "Writer".into(),
+                agent_type: Some("claude".into()),
+                custom_agent_id: Some("word-creator".into()),
+                model: Some("claude-sonnet-4".into()),
+            },
+        )
+        .await
+        .expect("spawn preset teammate");
+
+    let extra = conv_repo.get_extra(&spawned.conversation_id).unwrap();
+    assert_frozen_preset_extra(&extra);
+
+    conversation_ports.upsert_preset_snapshot(
+        "word-creator",
+        fake_preset_snapshot("changed rule body", &["changed"], &["changed-mcp"]),
+    );
+
+    let after_live_change = conv_repo.get_extra(&spawned.conversation_id).unwrap();
+    assert_frozen_preset_extra(&after_live_change);
 }
 
 #[tokio::test]
