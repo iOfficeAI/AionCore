@@ -120,7 +120,7 @@ impl AgentAvailabilityService {
         self.persist_snapshot(agent_id, &snapshot).await
     }
 
-    async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
+    pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
         self.registry
             .list_management_rows()
             .await

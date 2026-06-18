@@ -137,4 +137,65 @@ impl AgentService {
     ) -> Result<ProviderHealthCheckResponse, AgentError> {
         self.provider_health.health_check(req).await
     }
+
+    pub async fn set_agent_overrides(
+        &self,
+        id: &str,
+        req: aionui_api_types::SetAgentOverridesRequest,
+    ) -> Result<AgentManagementRow, AgentError> {
+        let repo = self.registry.repo_handle();
+        repo.get(id)
+            .await
+            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
+
+        let command_override = req
+            .command_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        let env_json = match req.env_override {
+            Some(entries) if !entries.is_empty() => Some(
+                serde_json::to_string(&entries)
+                    .map_err(|e| AgentError::internal(format!("encode env_override: {e}")))?,
+            ),
+            _ => None,
+        };
+
+        repo.update_agent_overrides(id, command_override.as_deref(), env_json.as_deref())
+            .await
+            .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides: {e}")))?;
+        self.registry.invalidate_and_rehydrate().await?;
+
+        self.availability
+            .management_row_by_id(id)
+            .await
+            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))
+    }
+
+    pub async fn get_agent_overrides(
+        &self,
+        id: &str,
+    ) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {
+        let row = self
+            .registry
+            .repo_handle()
+            .get(id)
+            .await
+            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
+
+        let env_override = row
+            .env_override
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<aionui_api_types::AgentEnvEntry>>(s).ok())
+            .unwrap_or_default();
+
+        Ok(aionui_api_types::AgentOverridesResponse {
+            command_override: row.command_override,
+            env_override,
+        })
+    }
 }
