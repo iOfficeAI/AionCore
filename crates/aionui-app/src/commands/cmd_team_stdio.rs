@@ -294,7 +294,7 @@ impl TeamStdioServer {
         self.forward_to_tcp("team_members", &serde_json::json!({})).await
     }
 
-    #[tool(name = "team_rename_agent", description = "Rename a team member.")]
+    #[tool(name = "team_rename_agent", description = "Rename a team member. Lead only.")]
     async fn rename_agent(&self, Parameters(params): Parameters<RenameAgentParams>) -> CallToolResult {
         self.forward_to_tcp(
             "team_rename_agent",
@@ -305,7 +305,7 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_shutdown_agent",
-        description = "Initiate shutdown of a teammate (Lead only). Sends a shutdown_request to the target agent."
+        description = "Initiate shutdown of a teammate. Lead only. Sends a shutdown_request to the target agent."
     )]
     async fn shutdown_agent(&self, Parameters(params): Parameters<ShutdownAgentParams>) -> CallToolResult {
         self.forward_to_tcp(
@@ -577,6 +577,29 @@ mod tests {
         assert_eq!(env.port, 12345);
         assert_eq!(env.token, "tok");
         assert_eq!(env.slot_id, "slot-a");
+    }
+
+    #[test]
+    fn team_stdio_descriptions_match_prompt_registry() {
+        let router = TeamStdioServer::tool_router();
+        let tools = router.list_all();
+
+        for spec in aionui_team_prompts::tools::team_tool_specs() {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == spec.name)
+                .unwrap_or_else(|| panic!("missing tool {}", spec.name));
+            let description = tool
+                .description
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing description for {}", spec.name));
+            assert_eq!(
+                description.as_ref(),
+                spec.description,
+                "description drift for {}",
+                spec.name
+            );
+        }
     }
 
     #[tokio::test]

@@ -391,6 +391,7 @@ dependencies = [
  "aionui-shell",
  "aionui-system",
  "aionui-team",
+ "aionui-team-prompts",
  "anyhow",
  "async-trait",
  "axum",
