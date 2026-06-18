@@ -311,6 +311,8 @@ impl AgentRegistry {
                     last_check_at: meta.last_check_at,
                     last_success_at: meta.last_success_at,
                     last_failure_at: meta.last_failure_at,
+                    has_command_override: meta.has_command_override,
+                    env_override_key_count: meta.env_override_key_count,
                 }
             })
             .collect();
@@ -448,12 +450,19 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
         last_success_at: row.last_success_at,
         last_failure_at: row.last_failure_at,
         handshake,
+        has_command_override: false,
+        env_override_key_count: 0,
     };
 
     // ── Self-repair overrides ──────────────────────────────────────
     // Layered on top of seed truth at this single projection point so both
     // the runtime spawn (factory) and the probe (availability) observe the
     // same merged command/env without either needing extra plumbing.
+    meta.has_command_override = meta_command_override(&command_override_raw).is_some();
+    meta.env_override_key_count = parse_env_override(&env_override_raw)
+        .map(|v| v.iter().filter(|e| !is_blocked_override_env_key(&e.name)).count())
+        .unwrap_or(0);
+
     if let Some(path) = meta_command_override(&command_override_raw) {
         meta.command = Some(path);
     }

@@ -2428,6 +2428,8 @@ mod tests {
             last_check_at: Some(1_750_000_000_000),
             last_success_at: Some(1_750_000_000_000),
             last_failure_at: None,
+            has_command_override: false,
+            env_override_key_count: 0,
         }
     }
 

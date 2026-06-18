@@ -544,6 +544,8 @@ mod tests {
             last_success_at: None,
             last_failure_at: None,
             handshake: AgentHandshake::default(),
+            has_command_override: false,
+            env_override_key_count: 0,
         };
 
         let snapshot = run_probe(
