@@ -137,6 +137,24 @@ impl CliAgentProcess {
         Ok(())
     }
 
+    /// Unconditionally force-kill this process and its entire process group.
+    ///
+    /// Unlike [`kill`](Self::kill), this neither closes stdin first nor waits
+    /// for a graceful exit, and it does **not** short-circuit when the direct
+    /// child has already exited. It always signals the process *group*, so a
+    /// descendant reparented to init after the launcher exited (e.g. an
+    /// npx-spawned ACP grandchild) is still reaped.
+    ///
+    /// Used by throwaway probe connections: the node/npx launcher exits on its
+    /// own once the ACP transport closes, but `kill_on_drop` reaps only the
+    /// direct child, leaving the grandchild (`codex-acp`, `codebuddy --acp`, …)
+    /// to leak as an orphan.
+    pub fn force_kill_tree(&self) {
+        if let Err(e) = force_kill(self.pid, self.process_group_id) {
+            warn!(pid = self.pid, error = %e, "force_kill_tree failed");
+        }
+    }
+
     /// Check whether the subprocess is still running.
     #[allow(dead_code)] // Complete CliProcess lifecycle API
     pub fn is_running(&self) -> bool {
@@ -447,6 +465,64 @@ pub(super) mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_kill_tree_reaps_grandchild_after_leader_exits() {
+        // Reproduces the probe leak: the spawned launcher backgrounds a
+        // long-lived grandchild then exits 0 on its own (mirrors node/npx
+        // forking the real ACP binary then returning once the transport
+        // closes). `kill_on_drop` would only reap the direct child; the
+        // grandchild reparents to init and leaks. `force_kill_tree` must
+        // signal the whole process group and take the grandchild with it.
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_string_lossy().into_owned();
+
+        let config = CommandSpec {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "sleep 60 & child=$!; printf '%s' \"$child\" > \"$1\"; exit 0".into(),
+                "probe-grandchild-cleanup".into(),
+                marker_path.clone(),
+            ],
+            env: vec![],
+            cwd: None,
+        };
+        let proc = spawn_sdk_test_process(config).await;
+
+        // Leader exits on its own; wait for the exit monitor to observe it.
+        timeout(Duration::from_secs(5), proc.wait_for_exit())
+            .await
+            .expect("leader should exit promptly");
+
+        let child_pid: u32 = std::fs::read_to_string(marker.path())
+            .expect("grandchild pid marker should exist")
+            .trim()
+            .parse()
+            .expect("grandchild pid should be numeric");
+
+        fn is_pid_alive(pid: u32) -> bool {
+            let result = unsafe { libc::kill(pid as i32, 0) };
+            if result == 0 {
+                return true;
+            }
+            !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
+        }
+
+        assert!(is_pid_alive(child_pid), "grandchild pid={child_pid} should be alive");
+
+        proc.force_kill_tree();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while is_pid_alive(child_pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !is_pid_alive(child_pid),
+            "grandchild pid={child_pid} should be reaped by force_kill_tree",
+        );
     }
 
     #[tokio::test]
