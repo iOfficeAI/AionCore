@@ -31,8 +31,6 @@ pub struct TeamAgentInput {
 #[serde(deny_unknown_fields)]
 struct TeamAgentInputCompat {
     #[serde(default)]
-    pub backend: Option<String>,
-    #[serde(default)]
     pub assistant_id: Option<String>,
     pub name: String,
     pub role: String,
@@ -59,7 +57,7 @@ impl<'de> Deserialize<'de> for TeamAgentInput {
         Ok(Self {
             name: raw.name,
             role: raw.role,
-            backend: raw.backend,
+            backend: None,
             model: raw.model,
             assistant_id: Some(assistant_id),
             conversation_id: raw.conversation_id,
@@ -113,8 +111,6 @@ struct AddAgentRequestCompat {
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
-    backend: Option<String>,
-    #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     assistant_id: Option<String>,
@@ -130,7 +126,7 @@ impl<'de> Deserialize<'de> for AddAgentRequest {
             return Ok(Self {
                 name: assistant.name,
                 role: assistant.role,
-                backend: assistant.backend,
+                backend: None,
                 model: assistant.model,
                 assistant_id: assistant.assistant_id,
             });
@@ -145,7 +141,7 @@ impl<'de> Deserialize<'de> for AddAgentRequest {
         Ok(Self {
             name,
             role,
-            backend: raw.backend,
+            backend: None,
             model,
             assistant_id: Some(assistant_id),
         })
@@ -528,14 +524,12 @@ mod tests {
                 {
                     "name": "Lead",
                     "role": "lead",
-                    "backend": "acp",
                     "model": "claude",
                     "assistant_id": "assistant-x"
                 },
                 {
                     "name": "Worker",
                     "role": "teammate",
-                    "backend": "acp",
                     "model": "claude",
                     "assistant_id": "assistant-y"
                 }
@@ -546,7 +540,7 @@ mod tests {
         assert_eq!(req.agents.len(), 2);
         assert_eq!(req.agents[0].name, "Lead");
         assert_eq!(req.agents[0].role, "lead");
-        assert_eq!(req.agents[0].backend.as_deref(), Some("acp"));
+        assert!(req.agents[0].backend.is_none());
         assert_eq!(req.agents[0].model, "claude");
         assert_eq!(req.agents[0].assistant_id.as_deref(), Some("assistant-x"));
         assert_eq!(req.agents[1].name, "Worker");
@@ -579,7 +573,6 @@ mod tests {
         let raw = json!({
             "name": "Lead",
             "role": "lead",
-            "backend": "acp",
             "model": "claude",
             "assistant_id": "assistant-x",
             "conversation_id": "existing-conv-123"
@@ -606,7 +599,6 @@ mod tests {
         let raw = json!({
             "name": "Lead",
             "role": "lead",
-            "backend": "acp",
             "model": "claude",
             "assistant_id": "assistant-x"
         });
@@ -625,6 +617,19 @@ mod tests {
         let input: TeamAgentInput = serde_json::from_value(raw).unwrap();
         assert!(input.backend.is_none());
         assert_eq!(input.assistant_id.as_deref(), Some("assistant-x"));
+    }
+
+    #[test]
+    fn deserialize_team_agent_input_rejects_backend_field() {
+        let raw = json!({
+            "name": "Lead",
+            "role": "lead",
+            "backend": "acp",
+            "model": "claude",
+            "assistant_id": "assistant-x"
+        });
+        let result = serde_json::from_value::<TeamAgentInput>(raw);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -681,14 +686,13 @@ mod tests {
         let raw = json!({
             "name": "Helper",
             "role": "teammate",
-            "backend": "acp",
             "model": "claude",
             "assistant_id": "assistant-1"
         });
         let req: AddAgentRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name, "Helper");
         assert_eq!(req.role, "teammate");
-        assert_eq!(req.backend.as_deref(), Some("acp"));
+        assert!(req.backend.is_none());
         assert_eq!(req.model, "claude");
         assert_eq!(req.assistant_id.as_deref(), Some("assistant-1"));
     }
@@ -698,7 +702,6 @@ mod tests {
         let raw = json!({
             "name": "Custom",
             "role": "teammate",
-            "backend": "acp",
             "model": "claude",
             "custom_agent_id": "custom-1"
         });
@@ -711,7 +714,6 @@ mod tests {
         let raw = json!({
             "name": "Custom",
             "role": "teammate",
-            "backend": "acp",
             "model": "claude",
             "assistant_id": "assistant-1"
         });
@@ -741,7 +743,6 @@ mod tests {
     fn deserialize_add_agent_request_missing_name() {
         let raw = json!({
             "role": "teammate",
-            "backend": "acp",
             "model": "claude",
             "assistant_id": "assistant-1"
         });
@@ -751,7 +752,7 @@ mod tests {
 
     #[test]
     fn deserialize_add_agent_request_requires_assistant_id() {
-        let raw = json!({ "name": "X", "role": "teammate", "backend": "acp", "model": "claude" });
+        let raw = json!({ "name": "X", "role": "teammate", "model": "claude" });
         let result = serde_json::from_value::<AddAgentRequest>(raw);
         assert!(result.is_err());
     }
@@ -767,6 +768,19 @@ mod tests {
         let req = serde_json::from_value::<AddAgentRequest>(raw).unwrap();
         assert!(req.backend.is_none());
         assert_eq!(req.assistant_id.as_deref(), Some("assistant-1"));
+    }
+
+    #[test]
+    fn deserialize_add_agent_request_rejects_backend_field() {
+        let raw = json!({
+            "name": "X",
+            "role": "teammate",
+            "backend": "acp",
+            "model": "claude",
+            "assistant_id": "assistant-1"
+        });
+        let result = serde_json::from_value::<AddAgentRequest>(raw);
+        assert!(result.is_err());
     }
 
     #[test]

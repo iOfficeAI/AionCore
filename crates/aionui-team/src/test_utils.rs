@@ -194,7 +194,7 @@ pub(crate) mod workspace_harness {
 
     use aionui_ai_agent::{AgentError, IWorkerTaskManager};
     use aionui_api_types::{CreateTeamRequest, WebSocketMessage};
-    use aionui_common::{AgentKillReason, PaginatedResult, now_ms};
+    use aionui_common::{AgentKillReason, AgentType, PaginatedResult, now_ms};
     use aionui_db::models::{
         AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow, TeamRow,
         TeamTaskRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
