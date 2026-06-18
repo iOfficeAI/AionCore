@@ -28,6 +28,7 @@ const DEFAULT_SCHEDULED_INTERVAL: Duration = Duration::from_secs(300);
 #[async_trait::async_trait]
 pub trait AgentAvailabilityFeedbackPort: Send + Sync {
     async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError>;
+    async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError>;
 }
 
 struct AvailabilitySnapshot {
@@ -122,6 +123,19 @@ impl AgentAvailabilityService {
             kind: "session",
             error_code: Some(code.to_owned()),
             error_message: Some(message.to_owned()),
+            latency_ms: 0,
+            checked_at,
+        };
+        self.persist_snapshot(agent_id, &snapshot).await
+    }
+
+    pub async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
+        let checked_at = now_ms();
+        let snapshot = AvailabilitySnapshot {
+            status: "available",
+            kind: "session",
+            error_code: None,
+            error_message: None,
             latency_ms: 0,
             checked_at,
         };
@@ -360,6 +374,10 @@ async fn try_connect_builtin_managed_agent(
 impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
     async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
         AgentAvailabilityService::record_session_failure(self, agent_id, code, message).await
+    }
+
+    async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
+        AgentAvailabilityService::record_session_success(self, agent_id).await
     }
 }
 
@@ -653,6 +671,75 @@ mod tests {
         assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Scheduled));
         assert!(row.last_check_status.is_some());
         assert!(row.last_check_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn record_session_success_clears_needs_auth() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+        repo.upsert(&UpsertAgentMetadataParams {
+            id: "auth-clear-agent",
+            icon: None,
+            name: "Auth Clear Agent",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("github"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"gh"}"#),
+            enabled: true,
+            command: Some("gh"),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 100,
+        })
+        .await
+        .unwrap();
+
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+
+        let service = AgentAvailabilityService::new(registry.clone(), std::env::temp_dir());
+
+        // First, set needs_auth via session failure
+        service
+            .record_session_failure("auth-clear-agent", "user_agent_auth_required", "needs login")
+            .await
+            .unwrap();
+
+        let row = service
+            .list_management_rows()
+            .await
+            .into_iter()
+            .find(|item| item.id == "auth-clear-agent")
+            .unwrap();
+        assert_eq!(row.status, AgentManagementStatus::NeedsAuth);
+        assert_eq!(row.last_check_status, Some(AgentSnapshotCheckStatus::NeedsAuth));
+
+        // Now record session success
+        service.record_session_success("auth-clear-agent").await.unwrap();
+
+        let row = service
+            .list_management_rows()
+            .await
+            .into_iter()
+            .find(|item| item.id == "auth-clear-agent")
+            .unwrap();
+        assert_eq!(row.status, AgentManagementStatus::Available);
+        assert_eq!(row.last_check_status, Some(AgentSnapshotCheckStatus::Available));
+        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Session));
+        assert!(row.last_success_at.is_some());
     }
 
     #[tokio::test]
