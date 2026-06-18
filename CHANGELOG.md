@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.32](https://github.com/iOfficeAI/AionCore/compare/v0.1.31...v0.1.32) (2026-06-18)
+
+
+### Features
+
+* **team:** centralize team MCP prompt governance ([#490](https://github.com/iOfficeAI/AionCore/issues/490)) ([5485a95](https://github.com/iOfficeAI/AionCore/commit/5485a95897c327dc2c8f4f1c44cfab7c6f628905))
+
+
+### Bug Fixes
+
+* **acp:** recover dead ACP connections ([#487](https://github.com/iOfficeAI/AionCore/issues/487)) ([8264873](https://github.com/iOfficeAI/AionCore/commit/8264873c3879a199201d3700a9f7a9a7b7ba1534))
+* **conversation:** upsert streaming tool calls (AIO-30) ([#484](https://github.com/iOfficeAI/AionCore/issues/484)) ([a0b3737](https://github.com/iOfficeAI/AionCore/commit/a0b3737bf6a60c6f5483d4112dc4f4f733a9e6fa))
+
+
+### Documentation
+
+* **skills:** add cross-platform notes so Windows users translate shell examples ([#489](https://github.com/iOfficeAI/AionCore/issues/489)) ([e03b030](https://github.com/iOfficeAI/AionCore/commit/e03b0309c9fcd4914175d22787efa90e9599c8ec))
+
 ## [0.1.31](https://github.com/iOfficeAI/AionCore/compare/v0.1.30...v0.1.31) (2026-06-17)
 
 
