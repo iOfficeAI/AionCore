@@ -589,6 +589,7 @@ fn parse_last_check_status(raw: Option<&str>) -> Option<AgentSnapshotCheckStatus
     raw.and_then(|value| match value {
         "available" => Some(AgentSnapshotCheckStatus::Available),
         "unavailable" => Some(AgentSnapshotCheckStatus::Unavailable),
+        "needs_auth" => Some(AgentSnapshotCheckStatus::NeedsAuth),
         _ => {
             warn!(value, "agent_metadata: unknown last_check_status");
             None
@@ -616,6 +617,7 @@ fn derive_management_status(meta: &AgentMetadata) -> AgentManagementStatus {
 
     match meta.last_check_status {
         Some(AgentSnapshotCheckStatus::Unavailable) => AgentManagementStatus::Unavailable,
+        Some(AgentSnapshotCheckStatus::NeedsAuth) => AgentManagementStatus::NeedsAuth,
         _ => AgentManagementStatus::Available,
     }
 }

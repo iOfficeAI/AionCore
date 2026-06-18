@@ -112,6 +112,8 @@ pub enum AgentManagementStatus {
     Missing,
     Available,
     Unavailable,
+    #[serde(rename = "needs_auth")]
+    NeedsAuth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +121,8 @@ pub enum AgentManagementStatus {
 pub enum AgentSnapshotCheckStatus {
     Available,
     Unavailable,
+    #[serde(rename = "needs_auth")]
+    NeedsAuth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

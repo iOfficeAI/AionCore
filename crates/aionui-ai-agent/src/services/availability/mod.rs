@@ -109,8 +109,16 @@ impl AgentAvailabilityService {
 
     pub async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
         let checked_at = now_ms();
+        // Auth failures mean "installed + handshakes, but not logged in" — a
+        // distinct, actionable state, not "broken". Everything else stays
+        // unavailable.
+        let status = if code == "user_agent_auth_required" {
+            "needs_auth"
+        } else {
+            "unavailable"
+        };
         let snapshot = AvailabilitySnapshot {
-            status: "unavailable",
+            status,
             kind: "session",
             error_code: Some(code.to_owned()),
             error_message: Some(message.to_owned()),
@@ -150,8 +158,22 @@ impl AgentAvailabilityService {
             .map_err(|error| AgentError::internal(format!("repo.get: {error}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
 
+        // A probe only proves the handshake works; it never verifies auth.
+        // So a probe's `available` must not overwrite a known `needs_auth`
+        // (which only a real session can clear). Keep needs_auth, refresh ts.
+        let is_probe = matches!(snapshot.kind, "manual" | "scheduled" | "startup");
+        let keep_needs_auth = is_probe
+            && snapshot.status == "available"
+            && existing.last_check_status.as_deref() == Some("needs_auth");
+
+        let effective_status = if keep_needs_auth {
+            "needs_auth"
+        } else {
+            snapshot.status
+        };
+
         let params = UpdateAgentAvailabilitySnapshotParams {
-            last_check_status: Some(snapshot.status),
+            last_check_status: Some(effective_status),
             last_check_kind: Some(snapshot.kind),
             last_check_error_code: snapshot.error_code.as_deref(),
             last_check_error_message: snapshot.error_message.as_deref(),
@@ -161,12 +183,12 @@ impl AgentAvailabilityService {
             }),
             last_check_latency_ms: Some(snapshot.latency_ms),
             last_check_at: Some(snapshot.checked_at),
-            last_success_at: if snapshot.status == "available" {
+            last_success_at: if effective_status == "available" {
                 Some(snapshot.checked_at)
             } else {
                 existing.last_success_at
             },
-            last_failure_at: if snapshot.status == "unavailable" {
+            last_failure_at: if effective_status == "unavailable" {
                 Some(snapshot.checked_at)
             } else {
                 existing.last_failure_at
@@ -246,6 +268,7 @@ async fn run_probe(
     let status = match status {
         AgentSnapshotCheckStatus::Available => "available",
         AgentSnapshotCheckStatus::Unavailable => "unavailable",
+        AgentSnapshotCheckStatus::NeedsAuth => "needs_auth",
     };
 
     AvailabilitySnapshot {
@@ -426,6 +449,142 @@ mod tests {
             )
         );
         assert!(row.last_failure_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn record_session_failure_with_auth_required_persists_needs_auth() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+        repo.upsert(&UpsertAgentMetadataParams {
+            id: "auth-agent",
+            icon: None,
+            name: "Auth Agent",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("github"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"gh"}"#),
+            enabled: true,
+            command: Some("gh"),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 100,
+        })
+        .await
+        .unwrap();
+
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+
+        let service = AgentAvailabilityService::new(registry.clone(), std::env::temp_dir());
+        service
+            .record_session_failure("auth-agent", "user_agent_auth_required", "needs login")
+            .await
+            .unwrap();
+
+        let row = service
+            .list_management_rows()
+            .await
+            .into_iter()
+            .find(|item| item.id == "auth-agent")
+            .unwrap();
+
+        assert_eq!(row.status, AgentManagementStatus::NeedsAuth);
+        assert_eq!(row.last_check_status, Some(AgentSnapshotCheckStatus::NeedsAuth));
+        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Session));
+        assert_eq!(row.last_check_error_code.as_deref(), Some("user_agent_auth_required"));
+        assert_eq!(row.last_check_error_message.as_deref(), Some("needs login"));
+    }
+
+    #[tokio::test]
+    async fn probe_available_does_not_clear_needs_auth() {
+        use super::AvailabilitySnapshot;
+
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+        repo.upsert(&UpsertAgentMetadataParams {
+            id: "auth-agent-2",
+            icon: None,
+            name: "Auth Agent 2",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("github"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"gh"}"#),
+            enabled: true,
+            command: Some("gh"),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 100,
+        })
+        .await
+        .unwrap();
+
+        let registry = AgentRegistry::new(repo.clone());
+        registry.hydrate().await.unwrap();
+
+        let service = AgentAvailabilityService::new(registry.clone(), std::env::temp_dir());
+
+        // First, record an auth failure
+        service
+            .record_session_failure("auth-agent-2", "user_agent_auth_required", "needs login")
+            .await
+            .unwrap();
+
+        // Verify it's set to needs_auth
+        let row = service
+            .list_management_rows()
+            .await
+            .into_iter()
+            .find(|item| item.id == "auth-agent-2")
+            .unwrap();
+        assert_eq!(row.last_check_status, Some(AgentSnapshotCheckStatus::NeedsAuth));
+
+        // Now simulate a manual probe that succeeds
+        let probe = AvailabilitySnapshot {
+            status: "available",
+            kind: "manual",
+            error_code: None,
+            error_message: None,
+            latency_ms: 1,
+            checked_at: aionui_common::now_ms(),
+        };
+        service.persist_snapshot("auth-agent-2", &probe).await.unwrap();
+
+        // Verify that needs_auth is preserved
+        let row = service
+            .list_management_rows()
+            .await
+            .into_iter()
+            .find(|item| item.id == "auth-agent-2")
+            .unwrap();
+        assert_eq!(row.last_check_status, Some(AgentSnapshotCheckStatus::NeedsAuth));
+        assert_eq!(row.status, AgentManagementStatus::NeedsAuth);
+        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentSendError, AgentSessionKind, IWorkerTaskManager};
+use aionui_api_types::AgentErrorCode;
 use aionui_common::{ConversationStatus, ErrorChain, now_ms};
 use aionui_db::models::ConversationRow;
 use tokio::sync::oneshot;
@@ -170,10 +171,15 @@ impl ConversationTurnOrchestrator {
             tokio::spawn(async move {
                 if let Err(e) = send_agent.send_message(current_send).await {
                     let failure_message = availability_failure_message(&e);
+                    let code = if e.code() == Some(AgentErrorCode::UserAgentAuthRequired) {
+                        "user_agent_auth_required"
+                    } else {
+                        "session_send_failed"
+                    };
                     record_agent_session_failure(
                         &feedback_service,
                         feedback_agent_id.as_deref(),
-                        "session_send_failed",
+                        code,
                         &failure_message,
                     )
                     .await;
