@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.33](https://github.com/iOfficeAI/AionCore/compare/v0.1.32...v0.1.33) (2026-06-19)
+
+
+### Miscellaneous Chores
+
+* **runtime:** pin Claude ACP to 0.39.0 ([#491](https://github.com/iOfficeAI/AionCore/issues/491)) ([134e5d1](https://github.com/iOfficeAI/AionCore/commit/134e5d1eeed7890cc11534ac703c7fa2cb4e085c))
+
 ## [0.1.32](https://github.com/iOfficeAI/AionCore/compare/v0.1.31...v0.1.32) (2026-06-18)
 
 
