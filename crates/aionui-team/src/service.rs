@@ -4,7 +4,7 @@ pub(crate) mod spawn_support;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
-use aionui_ai_agent::IWorkerTaskManager;
+use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GuideMcpConfig, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload,
     TeamResponse, TeamRunAckResponse, TeamRunTargetRole, WebSocketMessage,
@@ -721,16 +721,24 @@ impl TeamSessionService {
     }
 
     async fn wait_until_agent_not_running(&self, conversation_id: &str) {
+        let Some(agent) = self.task_manager.get_task(conversation_id) else {
+            return;
+        };
+        if agent.status() != Some(ConversationStatus::Running) {
+            return;
+        }
+        let mut events = agent.subscribe();
         loop {
-            let running = self
-                .task_manager
-                .get_task(conversation_id)
-                .and_then(|agent| agent.status())
-                == Some(ConversationStatus::Running);
-            if !running {
-                return;
+            match events.recv().await {
+                Ok(AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) => return,
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if agent.status() != Some(ConversationStatus::Running) {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 

@@ -1058,18 +1058,22 @@ fn confirmations_factory(count: usize) -> AgentFactory {
     })
 }
 
-fn status_factory(status: Arc<Mutex<Option<ConversationStatus>>>) -> AgentFactory {
+fn status_factory_with_event_sender(
+    status: Arc<Mutex<Option<ConversationStatus>>>,
+    event_sender: Arc<Mutex<Option<tokio::sync::broadcast::Sender<aionui_ai_agent::AgentStreamEvent>>>>,
+) -> AgentFactory {
     use futures_util::FutureExt;
     Arc::new(move |opts: BuildTaskOptions| {
         let status = status.clone();
+        let event_sender = event_sender.clone();
         async move {
-            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
-                mock_agent::MockAgent::with_status(
-                    opts.context.conversation.conversation_id,
-                    opts.context.workspace.path,
-                    status,
-                ),
-            )))
+            let agent = mock_agent::MockAgent::with_status(
+                opts.context.conversation.conversation_id,
+                opts.context.workspace.path,
+                status,
+            );
+            *event_sender.lock().unwrap() = Some(agent.event_tx.clone());
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(agent)))
         }
         .boxed()
     })
@@ -3215,8 +3219,9 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
 #[tokio::test]
 async fn d9_create_team_from_running_solo_leader_rebuilds_leader_after_turn_finishes() {
     let status = Arc::new(Mutex::new(Some(ConversationStatus::Running)));
+    let event_sender = Arc::new(Mutex::new(None));
     let (svc, tm, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
-        status_factory(status.clone()),
+        status_factory_with_event_sender(status.clone(), event_sender.clone()),
         Arc::new(StubAgentMetadataRepo::empty()),
     );
     let lead_conversation_id = "solo-lead";
@@ -3277,6 +3282,22 @@ async fn d9_create_team_from_running_solo_leader_rebuilds_leader_after_turn_fini
     );
 
     *status.lock().unwrap() = Some(ConversationStatus::Finished);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        tm.snapshot().kill.is_empty(),
+        "leader rebuild should wait for the agent terminal event, not poll status changes"
+    );
+
+    let sender = event_sender
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("mock agent should expose its stream event sender");
+    sender
+        .send(aionui_ai_agent::AgentStreamEvent::Finish(
+            aionui_ai_agent::protocol::events::FinishEventData { session_id: None },
+        ))
+        .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let calls = tm.snapshot();
