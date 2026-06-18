@@ -46,6 +46,10 @@ impl OutputSink for BackendOutputSink {
             tracing::error!(tool = name, "Cannot emit tool_call with empty tool_use_id");
             return;
         };
+        if name.trim().is_empty() {
+            tracing::error!(tool_use_id = %tool_use_id, "Cannot emit tool_call with empty tool name");
+            return;
+        }
 
         let parsed_input = serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_owned()));
 
@@ -80,6 +84,10 @@ impl OutputSink for BackendOutputSink {
             tracing::error!(tool = name, "Cannot emit tool_result with empty tool_use_id");
             return;
         };
+        if name.trim().is_empty() {
+            tracing::error!(tool_use_id = %tool_use_id, "Cannot emit tool_result with empty tool name");
+            return;
+        }
 
         let status = if is_error {
             ToolCallStatus::Error
@@ -192,6 +200,13 @@ mod tests {
     }
 
     #[test]
+    fn emit_tool_call_with_empty_name_is_ignored() {
+        let (sink, mut rx) = make_sink();
+        sink.emit_tool_call("call_bad", "   ", r#"{"path":"/tmp/a.txt"}"#);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn emit_tool_result_success_sends_completed() {
         let (sink, mut rx) = make_sink();
         sink.emit_tool_result("call_read_1", "Read", false, "file content here");
@@ -203,6 +218,13 @@ mod tests {
             }
             other => panic!("Expected ToolCall, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn emit_tool_result_with_empty_name_is_ignored() {
+        let (sink, mut rx) = make_sink();
+        sink.emit_tool_result("call_bad", "   ", false, "content");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
