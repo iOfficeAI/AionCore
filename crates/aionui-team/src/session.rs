@@ -2992,7 +2992,12 @@ mod tests {
             .expect("WakeInput");
 
         assert!(
-            input.first_message.contains("Teammate Agent"),
+            input.first_message.contains("## Team Governance"),
+            "expected Team Governance in teammate role prompt, got: {}",
+            input.first_message
+        );
+        assert!(
+            input.first_message.contains("# You are a Team Member"),
             "expected teammate role prompt, got: {}",
             input.first_message
         );
