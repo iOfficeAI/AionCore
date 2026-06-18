@@ -1033,6 +1033,27 @@ async fn inject_agent_identity(
     }
 }
 
+fn inject_configured_acp_model_id(extra: &mut serde_json::Map<String, serde_json::Value>, job: &CronJob) {
+    if job.agent_type == "aionrs" {
+        return;
+    }
+
+    let Some(model_id) = job
+        .agent_config
+        .as_ref()
+        .and_then(|config| config.model_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    extra.insert(
+        "current_model_id".to_owned(),
+        serde_json::Value::String(model_id.to_owned()),
+    );
+}
+
 #[cfg(test)]
 async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[String]) -> serde_json::Value {
     let mut extra = serde_json::Map::new();
@@ -1116,6 +1137,7 @@ async fn build_conversation_extra(
     }
 
     inject_agent_identity(&mut extra, registry, job).await;
+    inject_configured_acp_model_id(&mut extra, job);
 
     if let Some(config) = &job.agent_config {
         if let Some(cli_path) = &config.cli_path {
@@ -1707,6 +1729,60 @@ mod tests {
             extra["workspace"],
             ensure_named_workspace_path("aionui-cron-sample-job-workspace")
         );
+    }
+
+    #[tokio::test]
+    async fn build_conversation_extra_preserves_configured_acp_model_id() {
+        let registry = hydrated_registry().await;
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            agent_type: "codex".into(),
+            agent_config: Some(CronAgentConfig {
+                backend: "codex".into(),
+                name: "Codex CLI".into(),
+                cli_path: None,
+                is_preset: None,
+                custom_agent_id: None,
+                preset_agent_type: None,
+                mode: Some("full-access".into()),
+                model_id: Some("gpt-5.5/high".into()),
+                config_options: None,
+                workspace: Some("/Users/a1-6/news".into()),
+            }),
+            ..sample_job()
+        };
+
+        let extra = build_conversation_extra(&registry, &job, None).await;
+
+        assert_eq!(extra["backend"], "codex");
+        assert_eq!(extra["current_model_id"], "gpt-5.5/high");
+        assert_eq!(extra["session_mode"], "full-access");
+    }
+
+    #[tokio::test]
+    async fn build_conversation_extra_skips_current_model_id_for_aionrs() {
+        let registry = hydrated_registry().await;
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            agent_type: "aionrs".into(),
+            agent_config: Some(CronAgentConfig {
+                backend: "provider_hash".into(),
+                name: "Aionrs".into(),
+                cli_path: None,
+                is_preset: None,
+                custom_agent_id: None,
+                preset_agent_type: None,
+                mode: None,
+                model_id: Some("gpt-5".into()),
+                config_options: None,
+                workspace: None,
+            }),
+            ..sample_job()
+        };
+
+        let extra = build_conversation_extra(&registry, &job, None).await;
+
+        assert!(extra.get("current_model_id").is_none());
     }
 
     #[tokio::test]
