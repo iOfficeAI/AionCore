@@ -14,21 +14,57 @@ use crate::TeamMcpStdioConfig;
 ///
 /// When `conversation_id` is supplied the existing conversation is adopted
 /// rather than creating a new one (single-chat → team-chat handoff).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct TeamAgentInput {
     pub name: String,
     pub role: String,
-    #[serde(default)]
     pub backend: Option<String>,
     pub model: String,
-    #[serde(default)]
     pub assistant_id: Option<String>,
     /// Adopt an existing conversation instead of creating a new one.
     /// When present the conversation's `extra` is updated with `teamId`
     /// and `backend`; no new conversation row is written.
+    pub conversation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeamAgentInputCompat {
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub assistant_id: Option<String>,
+    pub name: String,
+    pub role: String,
+    pub model: String,
     #[serde(default)]
     pub conversation_id: Option<String>,
+}
+
+fn normalize_assistant_id(assistant_id: Option<String>) -> Option<String> {
+    assistant_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+impl<'de> Deserialize<'de> for TeamAgentInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = TeamAgentInputCompat::deserialize(deserializer)?;
+        let assistant_id =
+            normalize_assistant_id(raw.assistant_id).ok_or_else(|| serde::de::Error::missing_field("assistant_id"))?;
+
+        Ok(Self {
+            name: raw.name,
+            role: raw.role,
+            backend: raw.backend,
+            model: raw.model,
+            assistant_id: Some(assistant_id),
+            conversation_id: raw.conversation_id,
+        })
+    }
 }
 
 /// Request body for `POST /api/teams`.
@@ -103,13 +139,15 @@ impl<'de> Deserialize<'de> for AddAgentRequest {
         let name = raw.name.ok_or_else(|| serde::de::Error::missing_field("name"))?;
         let role = raw.role.ok_or_else(|| serde::de::Error::missing_field("role"))?;
         let model = raw.model.ok_or_else(|| serde::de::Error::missing_field("model"))?;
+        let assistant_id =
+            normalize_assistant_id(raw.assistant_id).ok_or_else(|| serde::de::Error::missing_field("assistant_id"))?;
 
         Ok(Self {
             name,
             role,
             backend: raw.backend,
             model,
-            assistant_id: raw.assistant_id,
+            assistant_id: Some(assistant_id),
         })
     }
 }
@@ -496,7 +534,8 @@ mod tests {
                     "name": "Worker",
                     "role": "teammate",
                     "backend": "acp",
-                    "model": "claude"
+                    "model": "claude",
+                    "assistant_id": "assistant-y"
                 }
             ]
         });
@@ -509,7 +548,7 @@ mod tests {
         assert_eq!(req.agents[0].model, "claude");
         assert_eq!(req.agents[0].assistant_id.as_deref(), Some("assistant-x"));
         assert_eq!(req.agents[1].name, "Worker");
-        assert!(req.agents[1].assistant_id.is_none());
+        assert_eq!(req.agents[1].assistant_id.as_deref(), Some("assistant-y"));
     }
 
     #[test]
@@ -540,6 +579,7 @@ mod tests {
             "role": "lead",
             "backend": "acp",
             "model": "claude",
+            "assistant_id": "assistant-x",
             "conversation_id": "existing-conv-123"
         });
         let input: TeamAgentInput = serde_json::from_value(raw).unwrap();
@@ -565,7 +605,8 @@ mod tests {
             "name": "Lead",
             "role": "lead",
             "backend": "acp",
-            "model": "claude"
+            "model": "claude",
+            "assistant_id": "assistant-x"
         });
         let input: TeamAgentInput = serde_json::from_value(raw).unwrap();
         assert!(input.conversation_id.is_none());
@@ -582,6 +623,18 @@ mod tests {
         let input: TeamAgentInput = serde_json::from_value(raw).unwrap();
         assert!(input.backend.is_none());
         assert_eq!(input.assistant_id.as_deref(), Some("assistant-x"));
+    }
+
+    #[test]
+    fn deserialize_team_agent_input_requires_assistant_id() {
+        let raw = json!({
+            "name": "Lead",
+            "role": "lead",
+            "backend": "acp",
+            "model": "claude"
+        });
+        let result = serde_json::from_value::<TeamAgentInput>(raw);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -627,14 +680,15 @@ mod tests {
             "name": "Helper",
             "role": "teammate",
             "backend": "acp",
-            "model": "claude"
+            "model": "claude",
+            "assistant_id": "assistant-1"
         });
         let req: AddAgentRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name, "Helper");
         assert_eq!(req.role, "teammate");
         assert_eq!(req.backend.as_deref(), Some("acp"));
         assert_eq!(req.model, "claude");
-        assert!(req.assistant_id.is_none());
+        assert_eq!(req.assistant_id.as_deref(), Some("assistant-1"));
     }
 
     #[test]
@@ -683,16 +737,21 @@ mod tests {
 
     #[test]
     fn deserialize_add_agent_request_missing_name() {
-        let raw = json!({ "role": "teammate", "backend": "acp", "model": "claude" });
+        let raw = json!({
+            "role": "teammate",
+            "backend": "acp",
+            "model": "claude",
+            "assistant_id": "assistant-1"
+        });
         let result = serde_json::from_value::<AddAgentRequest>(raw);
         assert!(result.is_err());
     }
 
     #[test]
-    fn deserialize_add_agent_request_missing_backend() {
-        let raw = json!({ "name": "X", "role": "teammate", "model": "claude" });
-        let req = serde_json::from_value::<AddAgentRequest>(raw).unwrap();
-        assert!(req.backend.is_none());
+    fn deserialize_add_agent_request_requires_assistant_id() {
+        let raw = json!({ "name": "X", "role": "teammate", "backend": "acp", "model": "claude" });
+        let result = serde_json::from_value::<AddAgentRequest>(raw);
+        assert!(result.is_err());
     }
 
     #[test]

@@ -10,17 +10,49 @@ use common::{
     setup_and_login,
 };
 
+const DEFAULT_TEAM_ASSISTANT_ID: &str = "team-e2e-assistant";
+
+fn team_agent(name: &str, role: &str) -> serde_json::Value {
+    json!({
+        "name": name,
+        "role": role,
+        "model": "claude",
+        "assistant_id": DEFAULT_TEAM_ASSISTANT_ID
+    })
+}
+
 fn two_agent_body() -> serde_json::Value {
     json!({
         "name": "Alpha",
         "agents": [
-            { "name": "Lead", "role": "lead", "backend": "acp", "model": "claude" },
-            { "name": "Worker", "role": "teammate", "backend": "acp", "model": "claude" }
+            team_agent("Lead", "lead"),
+            team_agent("Worker", "teammate")
         ]
     })
 }
 
+async fn ensure_default_team_assistant(app: &mut axum::Router, token: &str, csrf: &str) {
+    let req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": DEFAULT_TEAM_ASSISTANT_ID,
+            "name": "Team E2E Assistant",
+            "preset_agent_type": "claude"
+        }),
+        token,
+        csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::CREATED || resp.status() == StatusCode::CONFLICT,
+        "expected team assistant seed to be created or already exist, got {}",
+        resp.status()
+    );
+}
+
 async fn create_team(app: &mut axum::Router, token: &str, csrf: &str) -> serde_json::Value {
+    ensure_default_team_assistant(app, token, csrf).await;
     let req = json_with_token("POST", "/api/teams", two_agent_body(), token, csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -53,10 +85,11 @@ async fn tc1_create_team_with_multiple_agents() {
 async fn tc2_create_single_agent_team() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &token, &csrf).await;
 
     let body = json!({
         "name": "Solo",
-        "agents": [{ "name": "Lead", "role": "lead", "backend": "acp", "model": "claude" }]
+        "agents": [team_agent("Lead", "lead")]
     });
     let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -97,8 +130,8 @@ async fn tc3b_create_team_writes_legacy_extra_shape() {
     assert_eq!(extra["teamId"], data["id"]);
     assert!(extra["slot_id"].as_str().is_some_and(|s| !s.is_empty()));
     assert_eq!(extra["role"], "lead");
-    assert_eq!(extra["backend"], "acp");
-    assert_eq!(extra["session_mode"], "yolo");
+    assert_eq!(extra["backend"], "claude");
+    assert_eq!(extra["session_mode"], "bypassPermissions");
     assert_eq!(extra["current_model_id"], "claude");
 }
 
@@ -107,12 +140,13 @@ async fn tc3b_create_team_writes_legacy_extra_shape() {
 async fn tc4_first_agent_is_lead() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &token, &csrf).await;
 
     let body = json!({
         "name": "T",
         "agents": [
-            { "name": "A", "role": "teammate", "backend": "acp", "model": "claude" },
-            { "name": "B", "role": "teammate", "backend": "acp", "model": "claude" }
+            team_agent("A", "teammate"),
+            team_agent("B", "teammate")
         ]
     });
     let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
@@ -139,8 +173,14 @@ async fn tc5_empty_agents_returns_error() {
 async fn tc6_missing_name_returns_error() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &token, &csrf).await;
 
-    let body = json!({ "agents": [{ "name": "L", "role": "lead", "backend": "acp", "model": "c" }] });
+    let body = json!({ "agents": [json!({
+        "name": "L",
+        "role": "lead",
+        "model": "c",
+        "assistant_id": DEFAULT_TEAM_ASSISTANT_ID
+    })] });
     let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -150,6 +190,7 @@ async fn tc6_missing_name_returns_error() {
 async fn tc6b_workspace_with_whitespace_segment_is_accepted() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &token, &csrf).await;
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("Archive ");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -157,7 +198,7 @@ async fn tc6b_workspace_with_whitespace_segment_is_accepted() {
     let body = json!({
         "name": "Alpha",
         "workspace": workspace.to_string_lossy(),
-        "agents": [{ "name": "Lead", "role": "lead", "backend": "acp", "model": "claude" }]
+        "agents": [team_agent("Lead", "lead")]
     });
     let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -171,13 +212,14 @@ async fn tc6b_workspace_with_whitespace_segment_is_accepted() {
 async fn tc6c_create_team_rejects_missing_workspace_path() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &token, &csrf).await;
     let missing_workspace =
         std::env::temp_dir().join(format!("aionui-team-missing-{}", aionui_common::generate_short_id()));
 
     let body = json!({
         "name": "Alpha",
         "workspace": missing_workspace.to_string_lossy(),
-        "agents": [{ "name": "Lead", "role": "lead", "backend": "acp", "model": "claude" }]
+        "agents": [team_agent("Lead", "lead")]
     });
     let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -237,10 +279,11 @@ async fn tl2_list_multiple_teams() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     create_team(&mut app, &token, &csrf).await;
+    ensure_default_team_assistant(&mut app, &token, &csrf).await;
 
     let body = json!({
         "name": "Beta",
-        "agents": [{ "name": "Lead", "role": "lead", "backend": "acp", "model": "claude" }]
+        "agents": [team_agent("Lead", "lead")]
     });
     let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -514,8 +557,8 @@ async fn aa1_add_agent_to_team() {
     let body = json!({
         "name": "New Agent",
         "role": "teammate",
-        "backend": "acp",
-        "model": "claude"
+        "model": "claude",
+        "assistant_id": DEFAULT_TEAM_ASSISTANT_ID
     });
     let req = json_with_token("POST", &format!("/api/teams/{team_id}/agents"), body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -534,7 +577,12 @@ async fn aa2_add_agent_increases_count() {
     let data = create_team(&mut app, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
-    let body = json!({ "name": "X", "role": "teammate", "backend": "acp", "model": "claude" });
+    let body = json!({
+        "name": "X",
+        "role": "teammate",
+        "model": "claude",
+        "assistant_id": DEFAULT_TEAM_ASSISTANT_ID
+    });
     let req = json_with_token("POST", &format!("/api/teams/{team_id}/agents"), body, &token, &csrf);
     app.clone().oneshot(req).await.unwrap();
 
@@ -550,7 +598,12 @@ async fn aa4_add_agent_nonexistent_team() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let body = json!({ "name": "X", "role": "teammate", "backend": "acp", "model": "claude" });
+    let body = json!({
+        "name": "X",
+        "role": "teammate",
+        "model": "claude",
+        "assistant_id": DEFAULT_TEAM_ASSISTANT_ID
+    });
     let req = json_with_token("POST", "/api/teams/nonexistent/agents", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -565,7 +618,7 @@ async fn aa5_add_agent_missing_fields() {
     let data = create_team(&mut app, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
-    let body = json!({ "role": "teammate", "backend": "acp" });
+    let body = json!({ "role": "teammate" });
     let req = json_with_token("POST", &format!("/api/teams/{team_id}/agents"), body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -980,7 +1033,12 @@ async fn full_team_lifecycle() {
     assert_eq!(data["agents"].as_array().unwrap().len(), 2);
 
     // Add agent
-    let body = json!({ "name": "Helper", "role": "teammate", "backend": "acp", "model": "claude" });
+    let body = json!({
+        "name": "Helper",
+        "role": "teammate",
+        "model": "claude",
+        "assistant_id": DEFAULT_TEAM_ASSISTANT_ID
+    });
     let req = json_with_token("POST", &format!("/api/teams/{team_id}/agents"), body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
