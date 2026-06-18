@@ -157,13 +157,13 @@ async fn handle_tool_request(
                         }
                     };
                     // Guide surfaces Gemini even if not in spawn whitelist
-                    if let Some(types) = base.get_mut("agent_types").and_then(serde_json::Value::as_array_mut) {
-                        let has_gemini = types
+                    if let Some(backends) = base.get_mut("backends").and_then(serde_json::Value::as_array_mut) {
+                        let has_gemini = backends
                             .iter()
-                            .any(|e| e.get("type").and_then(serde_json::Value::as_str) == Some("gemini"));
+                            .any(|entry| entry.get("backend").and_then(serde_json::Value::as_str) == Some("gemini"));
                         if !has_gemini {
-                            types.push(serde_json::json!({
-                                "type": "gemini",
+                            backends.push(serde_json::json!({
+                                "backend": "gemini",
                                 "models": ["gemini-2.5-pro", "gemini-2.5-flash"]
                             }));
                         }
@@ -603,6 +603,88 @@ mod tests {
 
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body.get("result").is_some());
+    }
+
+    #[tokio::test]
+    async fn service_backed_list_models_appends_gemini_to_backends() {
+        let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+            row: AssistantDefinitionRow {
+                definition_id: "def-guide-models".into(),
+                assistant_key: "assistant-models".into(),
+                source: "user".into(),
+                owner_type: "user".into(),
+                source_ref: None,
+                source_version: None,
+                source_hash: None,
+                name: "Models Assistant".into(),
+                name_i18n: "{}".into(),
+                description: None,
+                description_i18n: "{}".into(),
+                avatar_type: "emoji".into(),
+                avatar_value: Some("🤖".into()),
+                agent_backend: "claude".into(),
+                rule_resource_type: "inline".into(),
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: "[]".into(),
+                recommended_prompts_i18n: "{}".into(),
+                default_model_mode: "auto".into(),
+                default_model_value: None,
+                default_permission_mode: "auto".into(),
+                default_permission_value: None,
+                default_skills_mode: "auto".into(),
+                default_skill_ids: "[]".into(),
+                custom_skill_names: "[]".into(),
+                default_disabled_builtin_skill_ids: "[]".into(),
+                default_mcps_mode: "auto".into(),
+                default_mcp_ids: "[]".into(),
+                created_at: 0,
+                updated_at: 0,
+                deleted_at: None,
+            },
+        });
+        let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
+            row: AssistantOverlayRow {
+                definition_id: "def-guide-models".into(),
+                enabled: true,
+                sort_order: 0,
+                agent_backend_override: None,
+                last_used_at: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        });
+        let (svc, _team_repo, _task_manager, _conv_repo) =
+            setup_with_assistants_team_repo_and_conversation_repo(definition_repo, overlay_repo);
+
+        let server = GuideMcpServer::start().await.expect("start guide server");
+        server.set_service(Arc::downgrade(&svc)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/tool", server.http_port()))
+            .header("Authorization", format!("Bearer {}", server.auth_token()))
+            .json(&serde_json::json!({
+                "tool": "aion_list_models",
+                "args": {}
+            }))
+            .send()
+            .await
+            .expect("call guide list models");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: serde_json::Value = resp.json().await.expect("guide list models response");
+        let result = serde_json::from_str::<serde_json::Value>(body["result"].as_str().expect("result string payload"))
+            .expect("parse result payload");
+        let backends = result["backends"].as_array().expect("backends array");
+        assert!(
+            backends.iter().any(|entry| entry["backend"].as_str() == Some("gemini")),
+            "service-backed list_models should still advertise gemini",
+        );
+        assert!(
+            result.get("agent_types").is_none(),
+            "guide payload should no longer expose legacy agent_types",
+        );
     }
 
     #[tokio::test]
