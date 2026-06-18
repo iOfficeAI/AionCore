@@ -570,6 +570,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_tool_json_array_body_returns_unexpected_without_echoing_body() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(["team-secret-456"])))
+            .mount(&mock_server)
+            .await;
+
+        let server = guide_server_for_port(mock_server.address().port());
+        let result = server.forward_tool("team_members", &json!({})).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(first_text(&result), "unexpected local guide tool response");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["code"],
+            "MCP_TOOL_RESPONSE_UNEXPECTED"
+        );
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("team-secret-456"));
+    }
+
+    #[tokio::test]
     async fn forward_tool_response_read_failure_is_not_overwritten_by_later_connect_failure() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -658,7 +680,9 @@ impl GuideServer {
                                             .or_else(|| extract_nested_code(&v, &["error", "data", "errorCode"])),
                                     );
                                 }
-                                return tool_success(v.to_string());
+                                if matches!(v, serde_json::Value::Object(_)) {
+                                    return tool_success(v.to_string());
+                                }
                             }
                             return tool_error(
                                 CliBoundaryCode::McpToolResponseUnexpected,
