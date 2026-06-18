@@ -27,7 +27,7 @@ use aionui_runtime::{
     ManagedAcpToolId, RuntimeCommandProbe, probe_managed_acp_tool_supported, probe_node_runtime_supported,
     probe_runtime_command, resolve_command_path,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
@@ -306,6 +306,7 @@ impl AgentRegistry {
                     last_check_kind: meta.last_check_kind,
                     last_check_error_code: diagnostics.error_code,
                     last_check_error_message: diagnostics.error_message,
+                    last_check_error_details: diagnostics.details,
                     last_check_guidance: diagnostics.guidance,
                     last_check_latency_ms: meta.last_check_latency_ms,
                     last_check_at: meta.last_check_at,
@@ -444,6 +445,7 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
         last_check_kind: parse_last_check_kind(row.last_check_kind.as_deref()),
         last_check_error_code: row.last_check_error_code,
         last_check_error_message: row.last_check_error_message,
+        last_check_error_details: None,
         last_check_guidance: row.last_check_guidance,
         last_check_latency_ms: row.last_check_latency_ms,
         last_check_at: row.last_check_at,
@@ -625,6 +627,7 @@ fn derive_management_status(meta: &AgentMetadata) -> AgentManagementStatus {
 struct ManagementDiagnostics {
     error_code: Option<String>,
     error_message: Option<String>,
+    details: Option<Value>,
     guidance: Option<String>,
 }
 
@@ -643,6 +646,10 @@ fn derive_management_diagnostics(meta: &AgentMetadata, status: AgentManagementSt
         .last_check_error_message
         .clone()
         .or_else(|| derived_reason.as_ref().map(|reason| reason.to_string()));
+    let details = derived_reason
+        .as_ref()
+        .and_then(diagnostic_details_for_unavailable_reason)
+        .or_else(|| error_code.as_deref().and_then(|code| diagnostic_details_for_snapshot_code(meta, code)));
     let guidance = meta.last_check_guidance.clone().or_else(|| {
         if let Some(reason) = derived_reason.as_ref() {
             Some(guidance_for_unavailable_reason(reason))
@@ -658,7 +665,51 @@ fn derive_management_diagnostics(meta: &AgentMetadata, status: AgentManagementSt
     ManagementDiagnostics {
         error_code,
         error_message,
+        details,
         guidance,
+    }
+}
+
+fn diagnostic_details_for_snapshot_code(meta: &AgentMetadata, error_code: &str) -> Option<Value> {
+    match error_code {
+        "command_not_found" => Some(json!({
+            "code": error_code,
+            "command": meta
+                .agent_source_info
+                .binary_name
+                .as_deref()
+                .or(meta.command.as_deref())
+                .unwrap_or("command"),
+        })),
+        "acp_init_failed" | "health_check_failed" | "session_send_failed" => Some(json!({
+            "code": error_code,
+            "agent_name": meta.name,
+            "backend": meta.backend,
+        })),
+        _ => Some(json!({ "code": error_code })),
+    }
+}
+
+fn diagnostic_details_for_unavailable_reason(reason: &UnavailableReason) -> Option<Value> {
+    match reason {
+        UnavailableReason::Disabled => Some(json!({ "code": "disabled" })),
+        UnavailableReason::NoCommand => Some(json!({ "code": "no_command" })),
+        UnavailableReason::BridgeMissing { bridge } => Some(json!({
+            "code": "bridge_missing",
+            "command": bridge,
+        })),
+        UnavailableReason::PrimaryMissing { binary } => Some(json!({
+            "code": "primary_missing",
+            "command": binary,
+        })),
+        UnavailableReason::CommandMissing { command } => Some(json!({
+            "code": "command_missing",
+            "command": command,
+        })),
+        UnavailableReason::ManagedRuntimeUnavailable { resource, .. } => Some(json!({
+            "code": "managed_runtime_unavailable",
+            "resource": resource,
+        })),
     }
 }
 

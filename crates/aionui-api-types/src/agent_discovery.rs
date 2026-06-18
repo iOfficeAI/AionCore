@@ -224,6 +224,8 @@ pub struct AgentMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_error_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_guidance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_latency_ms: Option<i64>,
@@ -292,6 +294,8 @@ pub struct AgentManagementRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_error_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_guidance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_latency_ms: Option<i64>,
@@ -355,6 +359,7 @@ mod tests {
             last_check_kind: None,
             last_check_error_code: None,
             last_check_error_message: None,
+            last_check_error_details: None,
             last_check_guidance: None,
             last_check_latency_ms: None,
             last_check_at: None,

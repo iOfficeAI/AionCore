@@ -36,6 +36,7 @@ fn probe_resolved_command_accepts_bare_npx_when_managed_runtime_is_supported() {
         last_check_kind: None,
         last_check_error_code: None,
         last_check_error_message: None,
+        last_check_error_details: None,
         last_check_guidance: None,
         last_check_latency_ms: None,
         last_check_at: None,
@@ -87,6 +88,7 @@ fn probe_resolved_command_requires_primary_binary_for_builtin_managed_claude() {
         last_check_kind: None,
         last_check_error_code: None,
         last_check_error_message: None,
+        last_check_error_details: None,
         last_check_guidance: None,
         last_check_latency_ms: None,
         last_check_at: None,
@@ -141,6 +143,7 @@ fn probe_resolved_command_requires_primary_binary_for_builtin_managed_codex() {
         last_check_kind: None,
         last_check_error_code: None,
         last_check_error_message: None,
+        last_check_error_details: None,
         last_check_guidance: None,
         last_check_latency_ms: None,
         last_check_at: None,
@@ -213,5 +216,10 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
         row.last_check_guidance
             .as_deref()
             .is_some_and(|guidance| guidance.contains("PATH"))
+    );
+    let row_json = serde_json::to_value(&row).unwrap();
+    assert_eq!(
+        row_json["last_check_error_details"]["command"].as_str(),
+        Some("definitely-missing-cli")
     );
 }

@@ -240,6 +240,7 @@ mod tests {
             last_check_kind: None,
             last_check_error_code: None,
             last_check_error_message: None,
+            last_check_error_details: None,
             last_check_guidance: None,
             last_check_latency_ms: None,
             last_check_at: None,

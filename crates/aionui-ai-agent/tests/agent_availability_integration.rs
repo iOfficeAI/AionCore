@@ -106,6 +106,11 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
     );
     assert_eq!(unavailable.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
     assert_eq!(unavailable.last_check_error_code.as_deref(), Some("auth_required"));
+    let unavailable_json = serde_json::to_value(unavailable).unwrap();
+    assert_eq!(
+        unavailable_json["last_check_error_details"]["code"].as_str(),
+        Some("auth_required")
+    );
 
     let available = rows.iter().find(|row| row.id == "agent-available").unwrap();
     assert_eq!(available.status, AgentManagementStatus::Available);

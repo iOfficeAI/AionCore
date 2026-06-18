@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::error::classify_public_error;
 use crate::service::TeamSessionService;
 use crate::types::TeammateRole;
 
@@ -188,6 +189,26 @@ async fn handle_tool_request(
     resp
 }
 
+fn error_response(message: impl Into<String>) -> serde_json::Value {
+    let message = message.into();
+    if let Some(public) = classify_public_error(&message) {
+        let mut data = serde_json::json!({
+            "domainCode": public.code,
+        });
+        if let Some(details) = public.details {
+            data["details"] = details;
+        }
+        serde_json::json!({
+            "error": {
+                "message": message,
+                "data": data,
+            }
+        })
+    } else {
+        serde_json::json!({ "error": message })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
@@ -240,7 +261,7 @@ async fn exec_create_team(
             Ok(assistant_id) => assistant_id,
             Err(error) => {
                 warn!(error, "Guide HTTP: aion_create_team missing assistant identity");
-                return serde_json::json!({ "error": error });
+                return error_response(error);
             }
         };
 
@@ -261,7 +282,7 @@ async fn exec_create_team(
             Ok(_) => {}
             Err(error) => {
                 warn!(conversation_id = conv_id, error = %error, "Guide HTTP: team binding lookup failed");
-                return serde_json::json!({"error": "Failed to inspect conversation team binding."});
+                return error_response("Failed to inspect conversation team binding.");
             }
         }
     }
@@ -283,7 +304,7 @@ async fn exec_create_team(
         Ok(t) => t,
         Err(e) => {
             warn!(error = %e, "Guide HTTP: aion_create_team create_team failed");
-            return serde_json::json!({"error": e.to_string()});
+            return error_response(e.to_string());
         }
     };
 
@@ -411,8 +432,24 @@ async fn exec_team_tool(
             serde_json::json!({"result": text})
         }
         Err(err) => {
-            warn!(tool = tool_name, team_id = %team_id, error = %err, "Guide HTTP: team tool failed");
-            serde_json::json!({"error": err})
+            warn!(tool = tool_name, team_id = %team_id, error = %err.message, "Guide HTTP: team tool failed");
+            if err.domain_code.is_some() || err.details.is_some() {
+                let mut data = serde_json::json!({});
+                if let Some(domain_code) = err.domain_code {
+                    data["domainCode"] = serde_json::json!(domain_code);
+                }
+                if let Some(details) = err.details {
+                    data["details"] = details;
+                }
+                serde_json::json!({
+                    "error": {
+                        "message": err.message,
+                        "data": data,
+                    }
+                })
+            } else {
+                serde_json::json!({"error": err.message})
+            }
         }
     }
 }
@@ -1028,9 +1065,11 @@ mod tests {
         let body: serde_json::Value = resp.json().await.expect("guide create team error response");
 
         assert_eq!(
-            body["error"].as_str(),
+            body["error"]["message"].as_str(),
             Some("assistant_id is required when the caller conversation is not assistant-backed")
         );
+        assert_eq!(body["error"]["data"]["domainCode"].as_str(), Some("TEAM_ASSISTANT_ID_REQUIRED"));
+        assert_eq!(body["error"]["data"]["details"]["field"].as_str(), Some("assistant_id"));
         assert!(body.get("teamId").is_none());
         assert!(
             team_repo
