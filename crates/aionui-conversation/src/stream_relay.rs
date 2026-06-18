@@ -1805,6 +1805,75 @@ mod tests {
         fn take_updates(&self) -> Vec<(String, aionui_db::MessageRowUpdate)> {
             std::mem::take(&mut self.updates.lock().unwrap())
         }
+
+        fn merged_row(existing: &MessageRow, incoming: &MessageRow) -> MessageRow {
+            let preserve_terminal_status = matches!(existing.status.as_deref(), Some("finish" | "error"))
+                && incoming.status.as_deref() == Some("work");
+            let mut content = Self::merge_json_content(&existing.content, &incoming.content);
+            if preserve_terminal_status {
+                content = Self::preserve_json_status(&content, &existing.content, &existing.r#type);
+            }
+
+            let mut merged = existing.clone();
+            merged.content = content;
+            merged.status = if preserve_terminal_status {
+                existing.status.clone()
+            } else {
+                incoming.status.clone()
+            };
+            merged.hidden = incoming.hidden;
+            merged
+        }
+
+        fn merge_json_content(existing_json: &str, incoming_json: &str) -> String {
+            let mut existing: serde_json::Value = serde_json::from_str(existing_json).unwrap_or_default();
+            let incoming: serde_json::Value = serde_json::from_str(incoming_json).unwrap_or_default();
+            Self::merge_json_value(&mut existing, incoming);
+            existing.to_string()
+        }
+
+        fn merge_json_value(existing: &mut serde_json::Value, incoming: serde_json::Value) {
+            match (existing, incoming) {
+                (serde_json::Value::Object(existing_obj), serde_json::Value::Object(incoming_obj)) => {
+                    for (key, value) in incoming_obj {
+                        if !value.is_null() {
+                            if let Some(existing_value) = existing_obj.get_mut(&key) {
+                                Self::merge_json_value(existing_value, value);
+                            } else {
+                                existing_obj.insert(key, value);
+                            }
+                        }
+                    }
+                }
+                (existing_value, incoming_value) => {
+                    if !incoming_value.is_null() {
+                        *existing_value = incoming_value;
+                    }
+                }
+            }
+        }
+
+        fn preserve_json_status(merged_json: &str, existing_json: &str, msg_type: &str) -> String {
+            let mut merged: serde_json::Value = serde_json::from_str(merged_json).unwrap_or_default();
+            let existing: serde_json::Value = serde_json::from_str(existing_json).unwrap_or_default();
+            let status = if msg_type == "acp_tool_call" {
+                existing.pointer("/update/status").cloned()
+            } else {
+                existing.get("status").cloned()
+            };
+
+            if let Some(status) = status {
+                if msg_type == "acp_tool_call" {
+                    if let Some(update) = merged.get_mut("update").and_then(|value| value.as_object_mut()) {
+                        update.insert("status".into(), status);
+                    }
+                } else if let Some(object) = merged.as_object_mut() {
+                    object.insert("status".into(), status);
+                }
+            }
+
+            merged.to_string()
+        }
     }
 
     #[async_trait::async_trait]
@@ -1879,6 +1948,30 @@ mod tests {
                 return Err(DbError::Init("FOREIGN KEY constraint failed".into()));
             }
             self.inserts.lock().unwrap().push(row.clone());
+            Ok(())
+        }
+        async fn upsert_message(&self, row: &MessageRow) -> Result<(), DbError> {
+            if self.not_found.load(Ordering::Acquire) {
+                return Err(DbError::NotFound(format!("Message '{}'", row.id)));
+            }
+            if self.foreign_key_failure.load(Ordering::Acquire) {
+                return Err(DbError::Init("FOREIGN KEY constraint failed".into()));
+            }
+
+            let mut inserts = self.inserts.lock().unwrap();
+            if let Some(existing) = inserts.iter().find(|message| message.id == row.id) {
+                let merged = Self::merged_row(existing, row);
+                self.updates.lock().unwrap().push((
+                    row.id.clone(),
+                    aionui_db::MessageRowUpdate {
+                        content: Some(merged.content),
+                        status: Some(merged.status),
+                        hidden: Some(merged.hidden),
+                    },
+                ));
+            } else {
+                inserts.push(row.clone());
+            }
             Ok(())
         }
         async fn update_message(&self, id: &str, updates: &aionui_db::MessageRowUpdate) -> Result<(), DbError> {

@@ -96,6 +96,25 @@ pub trait IConversationRepository: Send + Sync {
     /// Inserts a new message row.
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError>;
 
+    /// Inserts a message row, or merges mutable fields into the existing row with the same ID.
+    async fn upsert_message(&self, message: &MessageRow) -> Result<(), DbError> {
+        match self.insert_message(message).await {
+            Ok(()) => Ok(()),
+            Err(DbError::Conflict(_)) => {
+                self.update_message(
+                    &message.id,
+                    &MessageRowUpdate {
+                        content: Some(message.content.clone()),
+                        status: Some(message.status.clone()),
+                        hidden: Some(message.hidden),
+                    },
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Partially updates a message. Returns `DbError::NotFound` if ID is missing.
     async fn update_message(&self, id: &str, updates: &MessageRowUpdate) -> Result<(), DbError>;
 
