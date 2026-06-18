@@ -1508,48 +1508,55 @@ async fn create_team_without_workspace_uses_leader_auto_workspace_for_all_initia
 }
 
 #[tokio::test]
-async fn tc_create_team_uses_assistant_id_icon_lookup() {
-    let svc = setup_with_metadata_rows(vec![make_agent_metadata_row(
-        "2d23ff1c",
-        "claude",
-        "/api/assets/logos/ai-major/claude.svg",
-    )]);
-
-    let resp = svc
-        .create_team(
-            "user1",
-            CreateTeamRequest {
-                name: "Alpha".into(),
-                agents: vec![TeamAgentInput {
-                    name: "Lead".into(),
-                    role: "lead".into(),
-                    backend: Some("acp".into()),
-                    model: "claude".into(),
-                    assistant_id: Some("2d23ff1c".into()),
-                    conversation_id: None,
-                }],
-                workspace: None,
-            },
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        resp.agents[0].icon.as_deref(),
-        Some("/api/assets/logos/ai-major/claude.svg")
-    );
-}
-
-#[tokio::test]
-async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra() {
+async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
         Arc::new(StubAgentMetadataRepo::with_rows(vec![make_agent_metadata_row(
-            "2d23ff1c",
+            "builtin-claude",
             "claude",
             "/api/assets/logos/ai-major/claude.svg",
         )]));
-    let (svc, _task_manager, conv_repo) =
-        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+        row: AssistantDefinitionRow {
+            definition_id: "def-team-lead".into(),
+            assistant_key: "assistant-lead".into(),
+            source: "builtin".into(),
+            owner_type: "system".into(),
+            source_ref: Some("assistant-lead".into()),
+            source_version: None,
+            source_hash: None,
+            name: "Lead Assistant".into(),
+            name_i18n: "{}".into(),
+            description: None,
+            description_i18n: "{}".into(),
+            avatar_type: "builtin_asset".into(),
+            avatar_value: Some("avatars/assistant-lead.png".into()),
+            agent_backend: "claude".into(),
+            rule_resource_type: "inline".into(),
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]".into(),
+            recommended_prompts_i18n: "{}".into(),
+            default_model_mode: "auto".into(),
+            default_model_value: None,
+            default_permission_mode: "auto".into(),
+            default_permission_value: None,
+            default_skills_mode: "auto".into(),
+            default_skill_ids: "[]".into(),
+            custom_skill_names: "[]".into(),
+            default_disabled_builtin_skill_ids: "[]".into(),
+            default_mcps_mode: "auto".into(),
+            default_mcp_ids: "[]".into(),
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        },
+    });
+    let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        agent_metadata_repo,
+        definition_repo,
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
 
     let resp = svc
         .create_team(
@@ -1561,7 +1568,78 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
                     role: "lead".into(),
                     backend: Some("claude".into()),
                     model: "claude".into(),
-                    assistant_id: Some("2d23ff1c".into()),
+                    assistant_id: Some("assistant-lead".into()),
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.agents[0].icon.as_deref(),
+        Some("/api/assistants/assistant-lead/avatar")
+    );
+}
+
+#[tokio::test]
+async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+        row: AssistantDefinitionRow {
+            definition_id: "def-team-lead".into(),
+            assistant_key: "assistant-lead".into(),
+            source: "user".into(),
+            owner_type: "user".into(),
+            source_ref: None,
+            source_version: None,
+            source_hash: None,
+            name: "Lead Assistant".into(),
+            name_i18n: "{}".into(),
+            description: None,
+            description_i18n: "{}".into(),
+            avatar_type: "emoji".into(),
+            avatar_value: Some("🤖".into()),
+            agent_backend: "claude".into(),
+            rule_resource_type: "inline".into(),
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]".into(),
+            recommended_prompts_i18n: "{}".into(),
+            default_model_mode: "auto".into(),
+            default_model_value: None,
+            default_permission_mode: "auto".into(),
+            default_permission_value: None,
+            default_skills_mode: "auto".into(),
+            default_skill_ids: "[]".into(),
+            custom_skill_names: "[]".into(),
+            default_disabled_builtin_skill_ids: "[]".into(),
+            default_mcps_mode: "auto".into(),
+            default_mcp_ids: "[]".into(),
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        },
+    });
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_with_factory_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        agent_metadata_repo,
+        definition_repo,
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
+
+    let resp = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("claude".into()),
+                    model: "claude".into(),
+                    assistant_id: Some("assistant-lead".into()),
                     conversation_id: None,
                 }],
                 workspace: None,
@@ -1577,7 +1655,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
         .expect("lead conversation row");
     let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
 
-    assert_eq!(extra["assistant_id"], serde_json::json!("2d23ff1c"));
+    assert_eq!(extra["assistant_id"], serde_json::json!("assistant-lead"));
     assert!(extra.get("preset_assistant_id").is_none());
 }
 

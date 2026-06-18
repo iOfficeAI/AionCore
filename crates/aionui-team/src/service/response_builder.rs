@@ -37,10 +37,14 @@ impl TeamSessionService {
 
     async fn resolve_agent_icon(&self, agent: &TeamAgent) -> Result<Option<String>, TeamError> {
         if let Some(assistant_id) = agent.assistant_id.as_deref()
-            && let Some(row) = self.agent_metadata_repo.get(assistant_id).await?
-            && row.icon.is_some()
+            && let Some(definition) = self.assistant_definition_repo.get_by_key(assistant_id).await?
+            && let Some(icon) = assistant_icon(
+                definition.assistant_key.as_str(),
+                &definition.avatar_type,
+                definition.avatar_value.as_deref(),
+            )
         {
-            return Ok(row.icon);
+            return Ok(Some(icon));
         }
 
         if let Some(row) = self
@@ -63,4 +67,25 @@ impl TeamSessionService {
 
         Ok(None)
     }
+}
+
+fn assistant_icon(assistant_key: &str, avatar_type: &str, avatar_value: Option<&str>) -> Option<String> {
+    match avatar_type {
+        "builtin_asset" | "user_asset" => avatar_value.map(|value| {
+            if is_direct_avatar_url(value) {
+                value.to_string()
+            } else {
+                format!("/api/assistants/{assistant_key}/avatar")
+            }
+        }),
+        _ => None,
+    }
+}
+
+fn is_direct_avatar_url(value: &str) -> bool {
+    value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("data:")
+        || value.starts_with("file://")
+        || value.starts_with("/api/assistants/")
 }
