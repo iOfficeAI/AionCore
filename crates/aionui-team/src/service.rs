@@ -9,7 +9,7 @@ use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GuideMcpConfig, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload,
     TeamResponse, TeamRunAckResponse, TeamRunTargetRole, WebSocketMessage,
 };
-use aionui_common::{AgentKillReason, generate_id, now_ms};
+use aionui_common::{AgentKillReason, ConversationStatus, generate_id, now_ms};
 use aionui_db::models::TeamRow;
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
 use aionui_realtime::EventBroadcaster;
@@ -189,6 +189,7 @@ impl TeamSessionService {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
         }
 
+        let adopted_leader_conversation_id = req.agents.first().and_then(|agent| agent.conversation_id.clone());
         let shared_workspace = match req.workspace.as_deref() {
             Some(workspace) if !workspace.is_empty() => Some(validate_create_workspace_path(workspace)?),
             _ => None,
@@ -249,6 +250,14 @@ impl TeamSessionService {
         // via POST /api/teams/{id}/session if needed.
         if let Err(e) = self.ensure_session_inner(&team.id, true).await {
             warn!(team_id = %team.id, error = %e, "auto ensure_session after create_team failed");
+        } else if let Some(conversation_id) = adopted_leader_conversation_id
+            && let Some(leader) = team
+                .agents
+                .iter()
+                .find(|agent| agent.role == TeammateRole::Lead && agent.conversation_id == conversation_id)
+                .cloned()
+        {
+            self.schedule_deferred_leader_rebuild(user_id.to_owned(), team.id.clone(), leader);
         }
 
         self.build_team_response(&team).await
@@ -683,6 +692,69 @@ impl TeamSessionService {
                 return Err(TeamError::InvalidRequest(msg));
             }
         }
+        Ok(())
+    }
+
+    fn schedule_deferred_leader_rebuild(&self, user_id: String, team_id: String, leader: TeamAgent) {
+        info!(
+            team_id = %team_id,
+            slot_id = %leader.slot_id,
+            conversation_id = %leader.conversation_id,
+            "deferred leader Team MCP rebuild scheduled"
+        );
+        let service = self.self_ref.clone();
+        tokio::spawn(async move {
+            let Some(service) = service.upgrade() else {
+                return;
+            };
+            service.wait_until_agent_not_running(&leader.conversation_id).await;
+            if let Err(error) = service.rebuild_single_agent_process(&user_id, &team_id, &leader).await {
+                warn!(
+                    team_id = %team_id,
+                    slot_id = %leader.slot_id,
+                    conversation_id = %leader.conversation_id,
+                    error = %error,
+                    "deferred leader Team MCP rebuild failed"
+                );
+            }
+        });
+    }
+
+    async fn wait_until_agent_not_running(&self, conversation_id: &str) {
+        loop {
+            let running = self
+                .task_manager
+                .get_task(conversation_id)
+                .and_then(|agent| agent.status())
+                == Some(ConversationStatus::Running);
+            if !running {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn rebuild_single_agent_process(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        agent: &TeamAgent,
+    ) -> Result<(), TeamError> {
+        let session = self
+            .sessions
+            .get(team_id)
+            .map(|entry| Arc::clone(&entry.session))
+            .ok_or_else(|| TeamError::InvalidRequest(format!("no active session for team {team_id}")))?;
+        let cfg = session.mcp_stdio_config(&agent.slot_id);
+        self.provisioner()
+            .attach_agent_process(user_id, agent, cfg, &self.task_manager)
+            .await?;
+        info!(
+            team_id = %team_id,
+            slot_id = %agent.slot_id,
+            conversation_id = %agent.conversation_id,
+            "deferred leader Team MCP rebuild completed"
+        );
         Ok(())
     }
 

@@ -11,7 +11,7 @@ use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
-use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
+use aionui_common::{AgentKillReason, AgentType, ConversationStatus, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
     AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
@@ -939,11 +939,12 @@ mod mock_agent {
         pub workspace: String,
         pub event_tx: broadcast::Sender<AgentStreamEvent>,
         pub confirmations: Vec<Confirmation>,
+        pub status: Option<std::sync::Arc<std::sync::Mutex<Option<ConversationStatus>>>>,
     }
 
     impl MockAgent {
         pub fn new(conversation_id: String, workspace: String) -> Self {
-            Self::with_confirmations(conversation_id, workspace, Vec::new())
+            Self::with_confirmations_and_status(conversation_id, workspace, Vec::new(), None)
         }
 
         pub fn with_confirmations(
@@ -951,12 +952,30 @@ mod mock_agent {
             workspace: String,
             confirmations: Vec<Confirmation>,
         ) -> Self {
+            Self::with_confirmations_and_status(conversation_id, workspace, confirmations, None)
+        }
+
+        pub fn with_status(
+            conversation_id: String,
+            workspace: String,
+            status: std::sync::Arc<std::sync::Mutex<Option<ConversationStatus>>>,
+        ) -> Self {
+            Self::with_confirmations_and_status(conversation_id, workspace, Vec::new(), Some(status))
+        }
+
+        fn with_confirmations_and_status(
+            conversation_id: String,
+            workspace: String,
+            confirmations: Vec<Confirmation>,
+            status: Option<std::sync::Arc<std::sync::Mutex<Option<ConversationStatus>>>>,
+        ) -> Self {
             let (event_tx, _) = broadcast::channel(16);
             Self {
                 conversation_id,
                 workspace,
                 event_tx,
                 confirmations,
+                status,
             }
         }
     }
@@ -973,7 +992,7 @@ mod mock_agent {
             &self.workspace
         }
         fn status(&self) -> Option<ConversationStatus> {
-            None
+            self.status.as_ref().and_then(|status| *status.lock().unwrap())
         }
         fn last_activity_at(&self) -> TimestampMs {
             0
@@ -1032,6 +1051,23 @@ fn confirmations_factory(count: usize) -> AgentFactory {
                     opts.context.conversation.conversation_id,
                     opts.context.workspace.path,
                     confirmations,
+                ),
+            )))
+        }
+        .boxed()
+    })
+}
+
+fn status_factory(status: Arc<Mutex<Option<ConversationStatus>>>) -> AgentFactory {
+    use futures_util::FutureExt;
+    Arc::new(move |opts: BuildTaskOptions| {
+        let status = status.clone();
+        async move {
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                mock_agent::MockAgent::with_status(
+                    opts.context.conversation.conversation_id,
+                    opts.context.workspace.path,
+                    status,
                 ),
             )))
         }
@@ -3174,6 +3210,95 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
         assert_eq!(calls.kill[i].1, Some(AgentKillReason::TeamMcpRebuild));
         assert_eq!(calls.build[i], agent.conversation_id);
     }
+}
+
+#[tokio::test]
+async fn d9_create_team_from_running_solo_leader_rebuilds_leader_after_turn_finishes() {
+    let status = Arc::new(Mutex::new(Some(ConversationStatus::Running)));
+    let (svc, tm, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
+        status_factory(status.clone()),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let lead_conversation_id = "solo-lead";
+    let workspace = "/tmp/aioncore-test-solo-lead";
+    conv_repo
+        .create(&ConversationRow {
+            id: lead_conversation_id.to_owned(),
+            user_id: "user1".to_owned(),
+            name: "Solo Lead".to_owned(),
+            r#type: "acp".to_owned(),
+            pinned: false,
+            pinned_at: None,
+            source: None,
+            channel_chat_id: None,
+            extra: serde_json::json!({
+                "backend": "claude",
+                "current_model_id": "opus",
+                "workspace": workspace,
+            })
+            .to_string(),
+            model: None,
+            status: Some("running".to_owned()),
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        })
+        .await
+        .unwrap();
+    tm.get_or_build_task(
+        lead_conversation_id,
+        test_acp_build_options(lead_conversation_id.to_owned(), workspace.to_owned()),
+    )
+    .await
+    .unwrap();
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Guide Upgrade".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Leader".into(),
+                    role: "lead".into(),
+                    backend: "claude".into(),
+                    model: "opus".into(),
+                    custom_agent_id: None,
+                    conversation_id: Some(lead_conversation_id.to_owned()),
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        tm.snapshot().kill.is_empty(),
+        "running solo leader must not be killed before the create_team tool turn can finish"
+    );
+
+    *status.lock().unwrap() = Some(ConversationStatus::Finished);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let calls = tm.snapshot();
+            if calls.kill.len() == 1 && calls.build.len() == 2 {
+                break calls;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("leader should be rebuilt after solo turn finishes");
+
+    let calls = tm.snapshot();
+    assert_eq!(
+        calls.kill,
+        vec![(lead_conversation_id.to_owned(), Some(AgentKillReason::TeamMcpRebuild))]
+    );
+    assert_eq!(
+        calls.build,
+        vec![lead_conversation_id.to_owned(), lead_conversation_id.to_owned()]
+    );
+    assert_eq!(created.agents.len(), 1);
 }
 
 #[tokio::test]
