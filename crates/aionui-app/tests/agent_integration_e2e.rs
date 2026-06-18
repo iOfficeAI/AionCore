@@ -250,7 +250,7 @@ async fn upsert_visible_agent_metadata(services: &aionui_app::AppServices, id: &
 // ── Agent catalog tests ─────────────────────────────────────────
 
 #[tokio::test]
-async fn agents_endpoint_hides_deprecated_runtime_rows() {
+async fn management_endpoint_keeps_deprecated_runtime_rows_for_diagnostics() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
 
@@ -266,7 +266,7 @@ async fn agents_endpoint_hides_deprecated_runtime_rows() {
     }
     services.agent_registry.invalidate_and_rehydrate().await.unwrap();
 
-    let req = get_with_token("/api/agents", &token);
+    let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -276,14 +276,14 @@ async fn agents_endpoint_hides_deprecated_runtime_rows() {
 
     assert!(types.contains(&"acp"));
     assert!(types.contains(&"aionrs"));
-    assert!(!types.contains(&"openclaw-gateway"));
-    assert!(!types.contains(&"nanobot"));
-    assert!(!types.contains(&"remote"));
-    assert!(!types.contains(&"gemini"));
+    assert!(types.contains(&"openclaw-gateway"));
+    assert!(types.contains(&"nanobot"));
+    assert!(types.contains(&"remote"));
+    assert!(types.contains(&"gemini"));
 }
 
 #[tokio::test]
-async fn agents_endpoint_handles_openclaw_as_acp_backend() {
+async fn management_endpoint_handles_openclaw_as_acp_backend() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
 
@@ -298,7 +298,7 @@ async fn agents_endpoint_handles_openclaw_as_acp_backend() {
     assert_eq!(meta.args, vec!["acp"]);
     assert_eq!(meta.agent_source, AgentSource::Builtin);
 
-    let req = get_with_token("/api/agents", &token);
+    let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -307,25 +307,12 @@ async fn agents_endpoint_handles_openclaw_as_acp_backend() {
 
     let openclaw = agents
         .iter()
-        .find(|agent| agent["backend"].as_str() == Some("openclaw"));
-    if meta.available {
-        let openclaw = openclaw.expect("available OpenClaw ACP should be visible from /api/agents");
-        assert_eq!(openclaw["agent_type"], "acp");
-        assert_eq!(openclaw["command"], "openclaw");
-        assert_eq!(openclaw["args"], json!(["acp"]));
-    } else {
-        assert!(
-            openclaw.is_none(),
-            "unavailable OpenClaw ACP should be hidden from /api/agents"
-        );
-    }
-
-    assert!(
-        agents
-            .iter()
-            .all(|agent| agent["agent_type"].as_str() != Some("openclaw-gateway")),
-        "old openclaw-gateway row must remain hidden from new conversation catalog"
-    );
+        .find(|agent| agent["backend"].as_str() == Some("openclaw"))
+        .expect("OpenClaw ACP row should be visible from /api/agents/management");
+    assert!(meta.available || openclaw["status"] != "available");
+    assert_eq!(openclaw["agent_type"], "acp");
+    assert_eq!(openclaw["command"], "openclaw");
+    assert_eq!(openclaw["args"], json!(["acp"]));
 }
 
 #[tokio::test]
@@ -365,7 +352,10 @@ async fn agent_logos_endpoint_returns_backend_to_logo_catalog() {
         let logo = entry["logo"].as_str().expect("logo present");
         assert!(!backend.is_empty(), "backend must not be empty");
         assert!(!logo.is_empty(), "logo must not be empty");
-        assert!(seen.insert(backend.to_owned()), "backend {backend} duplicated in catalog");
+        assert!(
+            seen.insert(backend.to_owned()),
+            "backend {backend} duplicated in catalog"
+        );
     }
 }
 

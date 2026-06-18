@@ -142,8 +142,9 @@ pub struct AgentLogoEntry {
 
 /// The unified, decoded view of an `agent_metadata` row.
 ///
-/// Also the API response shape: `/api/agents` returns a list of these
-/// directly, no adapter required.
+/// This remains the refresh/logos/custom-agent CRUD read model for the
+/// legacy agent catalog, even though business surfaces now consume
+/// assistants instead of `GET /api/agents`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMetadata {
     pub id: String,

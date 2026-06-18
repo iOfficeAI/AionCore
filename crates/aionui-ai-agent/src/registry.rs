@@ -239,12 +239,12 @@ impl AgentRegistry {
         rows
     }
 
-    /// Snapshot of every row the caller is expected to see — rows
-    /// that are user-disabled (`enabled = 0`) or whose spawn command
-    /// could not be located on `$PATH` (`available = false`) are
-    /// filtered out. `/api/agents` feeds the frontend pill bar, which
-    /// would otherwise render unusable vendor chips that fail the
-    /// moment the user tries to spawn them.
+    /// Snapshot of every visible row — rows that are user-disabled
+    /// (`enabled = 0`) or whose spawn command could not be located on
+    /// `$PATH` (`available = false`) are filtered out. Callers that
+    /// still need a legacy "available agents only" read model (for
+    /// example refresh responses) should use this rather than the
+    /// diagnostics-first management list.
     pub async fn list_all(&self) -> Vec<AgentMetadata> {
         let mut rows: Vec<AgentMetadata> = self
             .by_id
@@ -357,11 +357,11 @@ impl AgentRegistry {
     }
 }
 
-/// A catalog row is visible to conversation callers when the user has
-/// it enabled, the spawn command was resolved at hydrate/refresh time,
-/// and the latest known availability snapshot does not already mark it
-/// unavailable. This keeps both uninstalled CLIs and rows that most
-/// recently failed ACP/session admission out of `/api/agents`.
+/// A catalog row is visible when the user has it enabled, the spawn
+/// command was resolved at hydrate/refresh time, and the latest known
+/// availability snapshot does not already mark it unavailable. This
+/// keeps both uninstalled CLIs and rows that most recently failed
+/// ACP/session admission out of visible legacy catalog reads.
 fn is_visible(meta: &AgentMetadata) -> bool {
     meta.enabled && matches!(derive_management_status(meta), AgentManagementStatus::Available)
 }

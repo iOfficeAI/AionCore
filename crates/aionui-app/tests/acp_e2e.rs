@@ -19,11 +19,11 @@ use common::{body_json, build_app, get_with_token, json_with_token, setup_and_lo
 // ── Global ACP routes ────────────────────────────────────────────
 
 #[tokio::test]
-async fn list_agents_returns_array() {
+async fn management_list_returns_array() {
     let (mut app, services) = build_app().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let req = get_with_token("/api/agents", &token);
+    let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -122,7 +122,7 @@ async fn management_list_includes_missing_custom_agents() {
 }
 
 #[tokio::test]
-async fn list_agents_hides_rows_with_unavailable_snapshot() {
+async fn management_list_marks_rows_with_unavailable_snapshot() {
     let (mut app, services) = build_app().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
@@ -174,17 +174,27 @@ async fn list_agents_hides_rows_with_unavailable_snapshot() {
     .unwrap();
     services.agent_registry.invalidate_and_rehydrate().await.unwrap();
 
-    let req = get_with_token("/api/agents", &token);
+    let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body = body_json(resp).await;
     let rows = body["data"].as_array().expect("data should be an array");
-    assert!(
-        rows.iter()
-            .all(|item| item["id"].as_str() != Some("custom-unavailable-agent")),
-        "rows with last_check_status=unavailable should stay out of /api/agents"
-    );
+    let row = rows
+        .iter()
+        .find(|item| item["id"].as_str() == Some("custom-unavailable-agent"))
+        .expect("management list should include unavailable rows");
+    assert_eq!(row["status"], "unavailable");
+}
+
+#[tokio::test]
+async fn legacy_agents_endpoint_is_not_found() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+
+    let req = get_with_token("/api/agents", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
