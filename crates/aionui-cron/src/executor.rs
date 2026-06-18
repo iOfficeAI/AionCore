@@ -1055,13 +1055,18 @@ async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[Str
         if !config.name.is_empty() {
             extra.insert("agent_name".to_owned(), serde_json::Value::String(config.name.clone()));
         }
+        let has_assistant_id = config
+            .assistant_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
         if let Some(assistant_id) = &config.assistant_id {
             extra.insert(
                 "assistant_id".to_owned(),
                 serde_json::Value::String(assistant_id.clone()),
             );
         }
-        if let Some(custom_agent_id) = &config.custom_agent_id {
+        if !has_assistant_id && let Some(custom_agent_id) = &config.custom_agent_id {
             extra.insert(
                 "custom_agent_id".to_owned(),
                 serde_json::Value::String(custom_agent_id.clone()),
@@ -1656,6 +1661,22 @@ mod tests {
         assert_eq!(extra["agent_name"], "Claude");
         assert_eq!(extra["assistant_id"], "assistant-sample");
         assert_eq!(extra["skills"], serde_json::json!(["cron-cron_test1"]));
+    }
+
+    #[tokio::test]
+    async fn build_task_extra_omits_legacy_assistant_identity_when_assistant_id_is_present() {
+        let registry = hydrated_registry().await;
+        let mut job = sample_job();
+        let config = job.agent_config.as_mut().expect("sample job should carry config");
+        config.assistant_id = Some("assistant-sample".into());
+        config.custom_agent_id = Some("legacy-custom".into());
+        config.is_preset = Some(true);
+
+        let extra = build_task_extra(&registry, &job, &[]).await;
+
+        assert_eq!(extra["assistant_id"], "assistant-sample");
+        assert!(extra.get("custom_agent_id").is_none());
+        assert!(extra.get("preset_assistant_id").is_none());
     }
 
     #[tokio::test]
