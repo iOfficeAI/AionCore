@@ -291,8 +291,8 @@ impl Team {
             id: self.id.clone(),
             name: self.name.clone(),
             workspace: self.workspace.clone(),
-            agents: self.agents.iter().map(|a| a.to_response()).collect(),
-            lead_agent_id: self.lead_agent_id.clone(),
+            assistants: self.agents.iter().map(|a| a.to_response()).collect(),
+            leader_assistant_id: self.lead_agent_id.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -676,9 +676,9 @@ mod tests {
         let resp = team.to_response();
         assert_eq!(resp.id, "t1");
         assert_eq!(resp.name, "Alpha");
-        assert_eq!(resp.agents.len(), 1);
-        assert_eq!(resp.agents[0].slot_id, "s1");
-        assert_eq!(resp.lead_agent_id.as_deref(), Some("s1"));
+        assert_eq!(resp.assistants.len(), 1);
+        assert_eq!(resp.assistants[0].slot_id, "s1");
+        assert_eq!(resp.leader_assistant_id.as_deref(), Some("s1"));
         assert_eq!(resp.created_at, 1000);
         assert_eq!(resp.updated_at, 2000);
     }

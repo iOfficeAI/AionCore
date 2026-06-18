@@ -11,8 +11,8 @@ impl TeamSessionService {
             id: team.id.clone(),
             name: team.name.clone(),
             workspace: team.workspace.clone(),
-            agents,
-            lead_agent_id: team.lead_agent_id.clone(),
+            assistants: agents,
+            leader_assistant_id: team.lead_agent_id.clone(),
             created_at: team.created_at,
             updated_at: team.updated_at,
         })

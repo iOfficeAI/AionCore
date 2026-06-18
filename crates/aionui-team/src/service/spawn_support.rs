@@ -510,7 +510,7 @@ mod tests {
             .create_team("user1", single_agent_team_request("Spawn Legacy"))
             .await
             .unwrap();
-        let leader_workspace = conv_repo.get_extra(&created.agents[0].conversation_id).unwrap()["workspace"]
+        let leader_workspace = conv_repo.get_extra(&created.assistants[0].conversation_id).unwrap()["workspace"]
             .as_str()
             .unwrap()
             .to_owned();
