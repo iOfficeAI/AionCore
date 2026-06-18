@@ -144,11 +144,18 @@ async fn read_response(stream: &mut TcpStream) -> Value {
 }
 
 async fn http_rpc(port: u16, slot_id: &str, payload: Value) -> Value {
+    http_rpc_with_auth(port, slot_id, Some("test-token-123"), payload).await
+}
+
+async fn http_rpc_with_auth(port: u16, slot_id: &str, token: Option<&str>, payload: Value) -> Value {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let body = serde_json::to_string(&payload).unwrap();
+    let auth_header = token
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nx-slot-id: {slot_id}\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n{auth_header}x-slot-id: {slot_id}\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
@@ -805,6 +812,86 @@ async fn http_mcp_non_lead_cannot_rename_agent() {
     assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
     let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("Only Lead"));
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn http_mcp_rejects_missing_auth_token() {
+    let env = setup().await;
+
+    let resp = http_rpc_with_auth(
+        env.server.http_port(),
+        "worker-1",
+        None,
+        json!({"jsonrpc": "2.0", "id": 12, "method": "tools/list"}),
+    )
+    .await;
+
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32600));
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Authentication failed")
+    );
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn http_mcp_rejects_invalid_auth_token() {
+    let env = setup().await;
+
+    let resp = http_rpc_with_auth(
+        env.server.http_port(),
+        "worker-1",
+        Some("wrong-token"),
+        json!({"jsonrpc": "2.0", "id": 13, "method": "tools/list"}),
+    )
+    .await;
+
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32600));
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Authentication failed")
+    );
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn http_mcp_rejects_lead_slot_spoof_without_valid_auth() {
+    let env = setup().await;
+
+    let resp = http_rpc_with_auth(
+        env.server.http_port(),
+        "lead-1",
+        Some("wrong-token"),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 14,
+            "method": "tools/call",
+            "params": {
+                "name": "team_rename_agent",
+                "arguments": {
+                    "slot_id": "worker-1",
+                    "new_name": "Spoofed"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32600));
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Authentication failed")
+    );
 
     env.server.stop();
 }

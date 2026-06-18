@@ -15,7 +15,7 @@ use crate::commands::error::{CliBoundaryCode, CliBoundaryError, missing_env, par
 use aionui_api_types::TeamMcpStdioConfig;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, Content, ListToolsResult, Tool};
 use rmcp::{schemars, service::ServiceExt, tool, tool_router, transport};
 use serde::Deserialize;
 use tokio::net::TcpStream;
@@ -216,7 +216,7 @@ struct DescribeAssistantParams {
 // Tool router
 // ---------------------------------------------------------------------------
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl TeamStdioServer {
     #[tool(
         name = "team_send_message",
@@ -340,6 +340,21 @@ impl TeamStdioServer {
     }
 }
 
+#[rmcp::tool_handler(router = Self::tool_router())]
+impl rmcp::ServerHandler for TeamStdioServer {
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        let tools = self
+            .list_tools_from_tcp()
+            .await
+            .map_err(|_| rmcp::ErrorData::internal_error("failed to list local team tools", None))?;
+        Ok(ListToolsResult::with_all_items(tools))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TCP forwarding
 // ---------------------------------------------------------------------------
@@ -405,6 +420,43 @@ impl TeamStdioServer {
 
         parse_tool_response(&text)
     }
+
+    async fn list_tools_from_tcp(&self) -> Result<Vec<Tool>, ToolForwardError> {
+        let mut stream = TcpStream::connect((CONNECT_HOST, self.port))
+            .await
+            .map_err(|_| tcp_connect_error(self.port))?;
+        stream.set_nodelay(true).ok();
+
+        let init_frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "auth_token": self.token,
+                "slot_id": self.slot_id,
+            }
+        });
+        let init_bytes = serde_json::to_vec(&init_frame).map_err(|_| json_serialize_error())?;
+        write_frame(&mut stream, &init_bytes)
+            .await
+            .map_err(|_| tcp_write_error())?;
+        let init_resp = read_frame(&mut stream).await.map_err(|_| tcp_read_error())?;
+        let init_text = String::from_utf8_lossy(&init_resp).into_owned();
+        parse_json_rpc_success(&init_text)?;
+
+        let list_frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+        });
+        let list_bytes = serde_json::to_vec(&list_frame).map_err(|_| json_serialize_error())?;
+        write_frame(&mut stream, &list_bytes)
+            .await
+            .map_err(|_| tcp_write_error())?;
+        let resp_bytes = read_frame(&mut stream).await.map_err(|_| tcp_read_error())?;
+        let text = String::from_utf8_lossy(&resp_bytes).into_owned();
+        parse_tools_list_response(&text)
+    }
 }
 
 #[derive(Debug)]
@@ -464,6 +516,52 @@ fn parse_tool_response(text: &str) -> Result<String, ToolForwardError> {
         }
     }
     Err(tool_response_unexpected().into())
+}
+
+fn parse_json_rpc_success(text: &str) -> Result<serde_json::Value, ToolForwardError> {
+    let value = serde_json::from_str::<serde_json::Value>(text).map_err(|_| tool_response_unexpected())?;
+    if value.get("error").is_some() {
+        return Err(remote_tool_error(
+            extract_nested_code(&value, &["error", "code"]),
+            extract_nested_code(&value, &["error", "data", "domainCode"])
+                .or_else(|| extract_nested_code(&value, &["error", "data", "code"]))
+                .or_else(|| extract_nested_code(&value, &["error", "data", "errorCode"])),
+        ));
+    }
+    value
+        .get("result")
+        .cloned()
+        .ok_or_else(tool_response_unexpected)
+        .map_err(Into::into)
+}
+
+#[derive(Deserialize)]
+struct RemoteToolDescriptor {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default, alias = "inputSchema")]
+    input_schema: serde_json::Value,
+}
+
+fn parse_tools_list_response(text: &str) -> Result<Vec<Tool>, ToolForwardError> {
+    let result = parse_json_rpc_success(text)?;
+    let descriptors = serde_json::from_value::<Vec<RemoteToolDescriptor>>(
+        result.get("tools").cloned().ok_or_else(tool_response_unexpected)?,
+    )
+    .map_err(|_| tool_response_unexpected())?;
+
+    descriptors
+        .into_iter()
+        .map(|descriptor| {
+            let schema = descriptor
+                .input_schema
+                .as_object()
+                .cloned()
+                .ok_or_else(tool_response_unexpected)?;
+            Ok(Tool::new(descriptor.name, descriptor.description, schema))
+        })
+        .collect()
 }
 
 fn json_serialize_error() -> CliBoundaryError {
@@ -600,6 +698,77 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn list_tools_uses_team_server_filtered_descriptors() {
+        let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let init = read_frame(&mut socket).await.unwrap();
+            let init_value: serde_json::Value = serde_json::from_slice(&init).unwrap();
+            assert_eq!(init_value["method"], "initialize");
+            assert_eq!(init_value["params"]["slot_id"], "worker-1");
+
+            let init_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {}
+            }))
+            .unwrap();
+            write_frame(&mut socket, &init_response).await.unwrap();
+
+            let list = read_frame(&mut socket).await.unwrap();
+            let list_value: serde_json::Value = serde_json::from_slice(&list).unwrap();
+            assert_eq!(list_value["method"], "tools/list");
+
+            let list_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "team_send_message",
+                            "description": "Send a message",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {
+                                    "to": { "type": "string" },
+                                    "message": { "type": "string" }
+                                },
+                                "required": ["to", "message"]
+                            }
+                        }
+                    ]
+                }
+            }))
+            .unwrap();
+            write_frame(&mut socket, &list_response).await.unwrap();
+        });
+        let server = TeamStdioServer {
+            port,
+            token: "dummy-token".into(),
+            slot_id: "worker-1".into(),
+        };
+
+        let tools = server.list_tools_from_tcp().await.expect("tools/list");
+
+        accept_task.await.unwrap();
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(names, vec!["team_send_message"]);
+        assert!(!names.contains(&"team_spawn_agent"));
+        assert!(!names.contains(&"team_rename_agent"));
+        assert!(!names.contains(&"team_shutdown_agent"));
+        assert_eq!(
+            tools[0]
+                .input_schema
+                .get("properties")
+                .and_then(|value| value.as_object())
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

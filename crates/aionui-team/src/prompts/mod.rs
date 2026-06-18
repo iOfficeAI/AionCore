@@ -1,8 +1,6 @@
-pub mod lead;
 pub mod team_guide;
 
 pub use team_guide::{TEAM_GUIDE_PROMPT_TEMPLATE, build_team_guide_prompt};
-pub mod teammate;
 
 use std::collections::HashMap;
 
@@ -28,11 +26,9 @@ fn to_prompt_agent(agent: &TeamAgent) -> aionui_team_prompts::TeamPromptAgent {
 
 /// Build the leader system prompt.
 ///
-/// Delegates to [`lead::build_lead_prompt`], which mirrors the AionUi
-/// `leadPrompt.ts` template verbatim. A one-line `Team: "<name>"` header
-/// is prepended so the leader knows which team it belongs to (AionUi
-/// surfaces this through other channels, but the backend session has no
-/// other place to inject it).
+/// Delegates to `aionui-team-prompts`, the canonical Team role prompt crate.
+/// A one-line `Team: "<name>"` header is prepended so the leader knows which
+/// team it belongs to.
 ///
 /// `available_agent_types` carries `(backend_id, display_name)` pairs that
 /// feed the `## Available Agent Types for Spawning` section; callers

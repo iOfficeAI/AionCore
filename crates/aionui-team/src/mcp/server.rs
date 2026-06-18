@@ -798,7 +798,7 @@ async fn http_mcp_loop(
             accept = listener.accept() => {
                 let Ok((mut stream, peer)) = accept else { continue };
                 info!(team_id = %team_id, ?peer, "HTTP MCP: new connection accepted");
-                let _token = auth_token.clone();
+                let token = auth_token.clone();
                 let sched = scheduler.clone();
                 let svc = service.clone();
                 let tid = team_id.clone();
@@ -821,6 +821,25 @@ async fn http_mcp_loop(
                     // Handle JSON-RPC request
                     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
                     let id = value.get("id").cloned();
+                    let auth_ok = http_bearer_token(&request).is_some_and(|provided| provided == token);
+                    if !auth_ok {
+                        let response_body = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": INVALID_REQUEST,
+                                "message": "Authentication failed: invalid auth_token"
+                            }
+                        });
+                        let body_bytes = serde_json::to_vec(&response_body).unwrap_or_default();
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            body_bytes.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(&body_bytes).await;
+                        return;
+                    }
                     let caller_slot_id = request.lines()
                         .find(|l| l.to_lowercase().starts_with("x-slot-id:"))
                         .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
@@ -894,6 +913,16 @@ async fn http_mcp_loop(
             }
         }
     }
+}
+
+fn http_bearer_token(request: &str) -> Option<&str> {
+    request
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+        .and_then(|line| line.split_once(':').map(|(_, value)| value.trim()))
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 // ---------------------------------------------------------------------------
