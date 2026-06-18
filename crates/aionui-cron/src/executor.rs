@@ -885,7 +885,7 @@ impl JobExecutor {
         }
 
         agent
-            .set_mode(desired_mode)
+            .set_config_option("mode", desired_mode)
             .await
             .map_err(|e| CronError::Scheduler(format!("set session mode to {desired_mode}: {e}")))?;
 
@@ -1224,7 +1224,7 @@ mod tests {
     use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
     use aionui_ai_agent::protocol::events::FinishEventData;
     use aionui_ai_agent::types::BuildTaskOptions;
-    use aionui_api_types::{AgentModeResponse, WebSocketMessage};
+    use aionui_api_types::{AgentModeResponse, ConfigOptionConfirmation, SetConfigOptionResponse, WebSocketMessage};
     use aionui_common::{AgentKillReason, ConversationStatus, PaginatedResult, TimestampMs};
     use aionui_db::{
         ConversationArtifactRow, ConversationFilters, ConversationRowUpdate, MessageRowUpdate, MessageSearchRow,
@@ -2394,11 +2394,23 @@ mod tests {
             })
         }
 
-        async fn set_mode(&self, mode: &str) -> Result<(), aionui_ai_agent::AgentError> {
+        async fn set_config_option(
+            &self,
+            option_id: &str,
+            value: &str,
+        ) -> Result<SetConfigOptionResponse, aionui_ai_agent::AgentError> {
+            if option_id != "mode" {
+                return Err(aionui_ai_agent::AgentError::bad_request(format!(
+                    "unsupported config option: {option_id}"
+                )));
+            }
             self.set_mode_calls.fetch_add(1, Ordering::Relaxed);
             let mut guard = self.mode.write().await;
-            *guard = mode.to_owned();
-            Ok(())
+            *guard = value.to_owned();
+            Ok(SetConfigOptionResponse {
+                confirmation: ConfigOptionConfirmation::Observed,
+                config_options: None,
+            })
         }
     }
 

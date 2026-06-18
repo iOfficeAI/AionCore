@@ -1573,7 +1573,6 @@ struct MockAgent {
     set_config_option_calls: Arc<Mutex<Vec<(String, String)>>>,
     set_config_option_error: Arc<Mutex<Option<AgentError>>>,
     set_config_option_response: Arc<Mutex<Option<SetConfigOptionResponse>>>,
-    keep_reported_model_on_set: bool,
     confirmations: Mutex<Vec<Confirmation>>,
     approval_memory: Mutex<std::collections::HashMap<String, bool>>,
     allow_direct_confirm: bool,
@@ -1613,7 +1612,6 @@ impl MockAgent {
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
-            keep_reported_model_on_set: false,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -1633,7 +1631,6 @@ impl MockAgent {
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
-            keep_reported_model_on_set: false,
             confirmations: Mutex::new(confirmations),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: false,
@@ -1653,7 +1650,6 @@ impl MockAgent {
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
-            keep_reported_model_on_set: false,
             confirmations: Mutex::new(vec![]),
             approval_memory: Mutex::new(std::collections::HashMap::new()),
             allow_direct_confirm: true,
@@ -1756,26 +1752,9 @@ impl IMockAgent for MockAgent {
         })
     }
 
-    async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
-        *self.mode.lock().unwrap() = mode.to_owned();
-        Ok(())
-    }
-
     async fn get_model(&self) -> Result<GetModelInfoResponse, AgentError> {
         let current = self.model_id.lock().unwrap().clone();
         Ok(Self::build_model_response(&current))
-    }
-
-    async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
-        if !self.keep_reported_model_on_set {
-            *self.model_id.lock().unwrap() = model_id.to_owned();
-        }
-        Ok(())
-    }
-
-    async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
-        self.set_model(model_id).await?;
-        Ok(Self::build_model_response(model_id))
     }
 
     async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {

@@ -4,7 +4,7 @@ pub(crate) mod spawn_support;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
-use aionui_ai_agent::IWorkerTaskManager;
+use aionui_ai_agent::{AgentError, AgentInstance, IWorkerTaskManager};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GuideMcpConfig, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload,
     TeamResponse, TeamRunAckResponse, TeamRunTargetRole, WebSocketMessage,
@@ -869,7 +869,7 @@ impl TeamSessionService {
 
         for agent in &team.agents {
             if let Some(instance) = self.task_manager.get_task(&agent.conversation_id)
-                && let Err(e) = instance.set_mode(mode).await
+                && let Err(e) = set_active_agent_session_mode(&instance, mode).await
             {
                 warn!(
                     team_id,
@@ -999,6 +999,15 @@ impl TeamSessionService {
             .session
             .wake_leader_after_recovery_message(source_slot_id, source)
             .await
+    }
+}
+
+async fn set_active_agent_session_mode(instance: &AgentInstance, mode: &str) -> Result<(), AgentError> {
+    #[allow(unreachable_patterns)]
+    match instance {
+        AgentInstance::Acp(_) => instance.set_config_option("mode", mode).await.map(|_| ()),
+        AgentInstance::Aionrs(manager) => manager.set_mode(mode).await,
+        _ => instance.set_config_option("mode", mode).await.map(|_| ()),
     }
 }
 
