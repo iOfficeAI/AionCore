@@ -62,7 +62,7 @@ If case 2 applies, ask at most once whether the user wants to bring in a Team. K
    | Tester | Write and run tests | Suitable assistant | (model from list) |
 4. **Output the table as a normal text message and END YOUR TURN.** Do NOT call `aion_create_team` or any other tool (including ask_user) in this turn. Wait for the user to reply in their next message with explicit confirmation (e.g. \"ok\", \"go ahead\", \"确认\") before proceeding.
 5. After user confirms → call `aion_create_team`. The summary MUST include both the goal and the confirmed team configuration. (The system automatically derives the correct backend from a chosen assistant — you do NOT need to pass agentType when using assistant identities.)
-6. After `aion_create_team` returns → you ARE now the team Leader. The system navigates to the team page automatically. **Immediately** use `team_spawn_agent` to create each teammate from the confirmed configuration table. Then use `team_send_message` to assign initial tasks to each spawned teammate. Do NOT end your turn until all teammates are spawned and tasked.
+6. After `aion_create_team` returns → you ARE now the team Leader. The system navigates to the team page automatically. First call `team_list_assistants` if you need the real assistant catalog for the confirmed lineup, and only use returned assistant_id values with `team_spawn_agent`. Then use `team_send_message` to assign initial tasks to each spawned teammate. Do NOT end your turn until all teammates are spawned and tasked.
 7. User declines or wants changes → adjust or proceed solo. Do not mention Team again unless the user asks.
 
 ### Tool constraint
@@ -124,15 +124,9 @@ mod tests {
     fn build_solo_team_guide_prompt_uses_assistant_table_copy() {
         let prompt = build_solo_team_guide_prompt("gemini");
         assert!(prompt.contains("| Role | Responsibility | Assistant | Model |"));
-        assert!(prompt.contains(
-            "| Leader | Coordinate and review | Current assistant (gemini) | (default) |"
-        ));
-        assert!(prompt.contains(
-            "| Developer | Implement features | Suitable assistant | (model from list) |"
-        ));
-        assert!(prompt.contains(
-            "| Tester | Write and run tests | Suitable assistant | (model from list) |"
-        ));
+        assert!(prompt.contains("| Leader | Coordinate and review | Current assistant (gemini) | (default) |"));
+        assert!(prompt.contains("| Developer | Implement features | Suitable assistant | (model from list) |"));
+        assert!(prompt.contains("| Tester | Write and run tests | Suitable assistant | (model from list) |"));
         assert!(!prompt.contains("| Role | Responsibility | Type | Model |"));
         assert!(!prompt.contains("| Leader | Coordinate and review | gemini | (default) |"));
     }
@@ -140,9 +134,7 @@ mod tests {
     #[test]
     fn build_solo_team_guide_prompt_empty_backend_falls_back_to_claude() {
         let prompt = build_solo_team_guide_prompt("");
-        assert!(prompt.contains(
-            "| Leader | Coordinate and review | Current assistant (claude) | (default) |"
-        ));
+        assert!(prompt.contains("| Leader | Coordinate and review | Current assistant (claude) | (default) |"));
     }
 
     #[test]
@@ -187,7 +179,7 @@ If case 2 applies, ask at most once whether the user wants to bring in a Team. K
 | Tester | Write and run tests | Suitable assistant | (model from list) |\n\
 4. **Output the table as a normal text message and END YOUR TURN.** Do NOT call `aion_create_team` or any other tool (including ask_user) in this turn. Wait for the user to reply in their next message with explicit confirmation (e.g. \"ok\", \"go ahead\", \"确认\") before proceeding.\n\
 5. After user confirms → call `aion_create_team`. The summary MUST include both the goal and the confirmed team configuration. (The system automatically derives the correct backend from a chosen assistant — you do NOT need to pass agentType when using assistant identities.)\n\
-6. After `aion_create_team` returns → you ARE now the team Leader. The system navigates to the team page automatically. **Immediately** use `team_spawn_agent` to create each teammate from the confirmed configuration table. Then use `team_send_message` to assign initial tasks to each spawned teammate. Do NOT end your turn until all teammates are spawned and tasked.\n\
+6. After `aion_create_team` returns → you ARE now the team Leader. The system navigates to the team page automatically. First call `team_list_assistants` if you need the real assistant catalog for the confirmed lineup, and only use returned assistant_id values with `team_spawn_agent`. Then use `team_send_message` to assign initial tasks to each spawned teammate. Do NOT end your turn until all teammates are spawned and tasked.\n\
 7. User declines or wants changes → adjust or proceed solo. Do not mention Team again unless the user asks.\n\
 \n\
 ### Tool constraint\n\

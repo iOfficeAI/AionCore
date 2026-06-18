@@ -443,10 +443,24 @@ pub(crate) async fn dispatch_tool(
         "team_shutdown_agent" => {
             exec_shutdown_agent(arguments, scheduler, service, team_id, caller_slot_id, caller_role).await
         }
+        "team_list_assistants" => exec_list_assistants(arguments, service).await,
         "team_list_models" => exec_list_models(arguments, service).await,
         "team_describe_assistant" => exec_describe_assistant(arguments, service).await,
         _ => Err(format!("Unknown tool: {tool_name}")),
     }
+}
+
+async fn exec_list_assistants(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, String> {
+    let props = args.as_object().cloned().unwrap_or_default();
+    if !props.is_empty() {
+        return Err("team_list_assistants does not accept arguments".to_owned());
+    }
+    let service = service
+        .upgrade()
+        .ok_or_else(|| "Team service not available".to_owned())?;
+    let assistants = service.list_team_selectable_assistants().await;
+    let value = json!({ "assistants": assistants });
+    serde_json::to_string_pretty(&value).map_err(|e| format!("Serialization error: {e}"))
 }
 
 async fn exec_list_models(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, String> {
@@ -572,10 +586,6 @@ async fn exec_send_message(
     let service = service
         .upgrade()
         .ok_or_else(|| "Team service not available; cannot wake target".to_string())?;
-    service
-        .require_active_team_run_for_team_work(team_id)
-        .await
-        .map_err(|e| e.to_string())?;
 
     let targets = if resolved_to == "*" {
         scheduler
@@ -1027,6 +1037,17 @@ mod tests {
         assert!(
             err.contains("agent_type is no longer accepted"),
             "expected explicit agent_type rejection, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_list_assistants_reports_service_unavailable_when_weak_dead() {
+        let service: Weak<TeamSessionService> = Weak::new();
+        let result = exec_list_assistants(&json!({}), &service).await;
+        let err = result.expect_err("dead service should be surfaced");
+        assert!(
+            err.contains("Team service not available"),
+            "expected service unavailable error, got {err:?}"
         );
     }
 }

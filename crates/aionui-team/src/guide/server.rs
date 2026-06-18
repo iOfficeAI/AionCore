@@ -294,14 +294,12 @@ async fn exec_create_team(
         "name": team.name,
         "route": route,
         "status": "team_created",
-        "next_step": format!(
-            "You are now the team Leader. Your team tools (team_spawn_agent, team_send_message, etc.) are now active. \
-             Immediately proceed to spawn teammates as planned. When calling `team_spawn_agent`, use `assistant_id` \
-             from the `Available Assistants for Spawning` catalog. Do not use backend names like `claude/codex` as \
-             `assistant_id`; for generic vendor teammates, choose the matching `bare:...` assistant from that catalog. \
-             Task summary: {}",
-            params.summary
-        )
+        "next_step": "You are now the team Leader. Your team tools (team_spawn_agent, team_send_message, etc.) are now active. \
+             First call `team_list_assistants` if you need the real catalog for the confirmed lineup. When calling \
+             `team_spawn_agent`, use only `assistant_id` values returned by `team_list_assistants` / the `Available \
+             Assistants for Spawning` catalog. Do not use backend names like `claude/codex` as `assistant_id`; for \
+             generic vendor teammates, choose the matching catalog entry. Treat any backend/model labels from the earlier \
+             planning summary as runtime hints only, and map each teammate to a real catalog `assistant_id` before spawning."
     })
 }
 
@@ -826,9 +824,113 @@ mod tests {
 
         assert_eq!(leader.assistant_id.as_deref(), Some("assistant-lead"));
         assert_eq!(leader.backend, "codex");
+        assert!(next_step.contains("team_list_assistants"));
         assert!(next_step.contains("assistant_id"));
         assert!(next_step.contains("Available Assistants for Spawning"));
         assert!(next_step.contains("claude/codex"));
+    }
+
+    #[tokio::test]
+    async fn create_team_next_step_does_not_echo_backend_only_teammate_plan() {
+        let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+            row: AssistantDefinitionRow {
+                definition_id: "def-guide-summary".into(),
+                assistant_key: "assistant-lead".into(),
+                source: "user".into(),
+                owner_type: "user".into(),
+                source_ref: None,
+                source_version: None,
+                source_hash: None,
+                name: "Lead Assistant".into(),
+                name_i18n: "{}".into(),
+                description: None,
+                description_i18n: "{}".into(),
+                avatar_type: "emoji".into(),
+                avatar_value: Some("🤖".into()),
+                agent_backend: "claude".into(),
+                rule_resource_type: "inline".into(),
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: "[]".into(),
+                recommended_prompts_i18n: "{}".into(),
+                default_model_mode: "auto".into(),
+                default_model_value: None,
+                default_permission_mode: "auto".into(),
+                default_permission_value: None,
+                default_skills_mode: "auto".into(),
+                default_skill_ids: "[]".into(),
+                custom_skill_names: "[]".into(),
+                default_disabled_builtin_skill_ids: "[]".into(),
+                default_mcps_mode: "auto".into(),
+                default_mcp_ids: "[]".into(),
+                created_at: 0,
+                updated_at: 0,
+                deleted_at: None,
+            },
+        });
+        let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
+            row: AssistantOverlayRow {
+                definition_id: "def-guide-summary".into(),
+                enabled: true,
+                sort_order: 0,
+                agent_backend_override: Some("claude".into()),
+                last_used_at: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        });
+        let (svc, _team_repo, _task_manager, conv_repo) =
+            setup_with_assistants_team_repo_and_conversation_repo(definition_repo, overlay_repo);
+
+        conv_repo
+            .create(&ConversationRow {
+                id: "caller-conv-summary".into(),
+                user_id: "system_default_user".into(),
+                name: "Caller".into(),
+                r#type: "acp".into(),
+                pinned: false,
+                pinned_at: None,
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::json!({
+                    "assistant_id": "assistant-lead",
+                    "workspace": "/tmp/guide-workspace"
+                })
+                .to_string(),
+                model: None,
+                status: Some("completed".into()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed caller conversation");
+
+        let server = GuideMcpServer::start().await.expect("start guide server");
+        server.set_service(Arc::downgrade(&svc)).await;
+
+        let summary = "已确认的团队配置:\n- 正方辩手:gemini(gemini-3.1-pro-preview)\n- 反方辩手:codex(gpt-5.5)\n- 裁判/评委:claude(global.anthropic.claude-sonnet-4-6)";
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/tool", server.http_port()))
+            .header("Authorization", format!("Bearer {}", server.auth_token()))
+            .json(&serde_json::json!({
+                "tool": "aion_create_team",
+                "args": { "summary": summary },
+                "conversation_id": "caller-conv-summary",
+                "user_id": "system_default_user"
+            }))
+            .send()
+            .await
+            .expect("call guide create team");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: serde_json::Value = resp.json().await.expect("guide create team response");
+        let next_step = body["next_step"].as_str().expect("next_step in response");
+
+        assert!(next_step.contains("team_list_assistants"));
+        assert!(!next_step.contains("正方辩手:gemini("));
+        assert!(!next_step.contains("反方辩手:codex("));
+        assert!(!next_step.contains("裁判/评委:claude("));
     }
 
     #[tokio::test]

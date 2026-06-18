@@ -24,6 +24,7 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 
+use aionui_team::TeamSessionService;
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
@@ -33,7 +34,6 @@ use aionui_team::{
     TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationCreateResult,
     TeamConversationProvisioningPort, TeamProjectionMessageStore,
 };
-use aionui_team::{TeamError, TeamSessionService};
 use common::MockTeamRepo;
 
 // ---------------------------------------------------------------------------
@@ -2923,8 +2923,61 @@ async fn es1_ensure_session_creates_session() {
 }
 
 #[tokio::test]
-async fn spawn_agent_in_session_rejects_without_active_team_run_before_persisting_agent() {
-    let svc = setup();
+async fn spawn_agent_in_session_succeeds_without_active_team_run() {
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+        row: AssistantDefinitionRow {
+            definition_id: "def-spawn-worker".into(),
+            assistant_key: "assistant-worker".into(),
+            source: "user".into(),
+            owner_type: "user".into(),
+            source_ref: None,
+            source_version: None,
+            source_hash: None,
+            name: "Worker Assistant".into(),
+            name_i18n: "{}".into(),
+            description: None,
+            description_i18n: "{}".into(),
+            avatar_type: "emoji".into(),
+            avatar_value: Some("🤖".into()),
+            agent_backend: "claude".into(),
+            rule_resource_type: "inline".into(),
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]".into(),
+            recommended_prompts_i18n: "{}".into(),
+            default_model_mode: "auto".into(),
+            default_model_value: None,
+            default_permission_mode: "auto".into(),
+            default_permission_value: None,
+            default_skills_mode: "auto".into(),
+            default_skill_ids: "[]".into(),
+            custom_skill_names: "[]".into(),
+            default_disabled_builtin_skill_ids: "[]".into(),
+            default_mcps_mode: "auto".into(),
+            default_mcp_ids: "[]".into(),
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        },
+    });
+    let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
+        row: AssistantOverlayRow {
+            definition_id: "def-spawn-worker".into(),
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: Some("codex".into()),
+            last_used_at: None,
+            created_at: 0,
+            updated_at: 0,
+        },
+    });
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        agent_metadata_repo,
+        definition_repo,
+        overlay_repo,
+    );
     let created = svc
         .create_team(
             "user1",
@@ -2947,20 +3000,16 @@ async fn spawn_agent_in_session_rejects_without_active_team_run_before_persistin
 
     let req = SpawnAgentRequest {
         name: "Helper".into(),
-        assistant_id: Some("word-creator".into()),
+        assistant_id: Some("assistant-worker".into()),
         model: Some("claude-sonnet-4".into()),
     };
 
-    let err = svc
+    let spawned = svc
         .spawn_agent_in_session(&created.id, &lead_slot_id, req)
         .await
-        .expect_err("spawn without active Team Run must fail before persistence");
-
-    assert!(matches!(
-        err,
-        TeamError::InvalidRequest(message)
-            if message == "no active team run for run-scoped wake"
-    ));
+        .expect("spawn without active Team Run should still succeed");
+    assert_eq!(spawned.name, "Helper");
+    assert_eq!(spawned.assistant_id.as_deref(), Some("assistant-worker"));
 
     let after = svc
         .get_team("user1", &created.id)
@@ -2968,9 +3017,48 @@ async fn spawn_agent_in_session_rejects_without_active_team_run_before_persistin
         .expect("team should still be readable");
     assert_eq!(
         after.assistants.len(),
-        created.assistants.len(),
-        "failed spawn must not persist a partial teammate"
+        created.assistants.len() + 1,
+        "successful spawn should persist the teammate"
     );
+    assert!(
+        after.assistants.iter().any(|agent| agent.slot_id == spawned.slot_id),
+        "spawned teammate must be visible in persisted team state"
+    );
+}
+
+#[tokio::test]
+async fn lead_send_agent_message_in_session_succeeds_without_active_team_run() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+
+    svc.ensure_session("user1", &created.id)
+        .await
+        .expect("session should be loaded without active Team Run");
+
+    let lead_slot_id = created
+        .leader_assistant_id
+        .clone()
+        .expect("created team should have a lead slot");
+    let worker_slot_id = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .map(|agent| agent.slot_id.clone())
+        .expect("seeded teammate slot");
+
+    svc.send_agent_message_from_agent(&created.id, &lead_slot_id, &worker_slot_id, "Do this")
+        .await
+        .expect("leader direct message should succeed without active Team Run");
 }
 
 #[tokio::test]

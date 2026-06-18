@@ -53,6 +53,12 @@ relevant from the one-line catalog in your system prompt.
 Only works on assistants listed in \"Available Assistants for Spawning\".
 After confirming a match, call team_spawn_agent with the same assistant_id.";
 
+/// Description for `team_list_assistants` — canonical assistant catalog.
+pub const TEAM_LIST_ASSISTANTS_DESCRIPTION: &str = "List the assistants available for team spawning. Returns the real assistant catalog with \
+real assistant_id values, names, backends, descriptions, and skills.\n\nUse this before \
+team_spawn_agent when you need the exact assistant_id for a teammate. Do NOT guess from backend \
+names like claude/codex/gemini — only use assistant_id values returned here.";
+
 // ---------------------------------------------------------------------------
 // Tool descriptors (returned by tools/list)
 // ---------------------------------------------------------------------------
@@ -160,6 +166,14 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
                     "reason": { "type": "string", "description": "Reason for shutdown" }
                 },
                 "required": ["slot_id"]
+            }),
+        },
+        ToolDescriptor {
+            name: "team_list_assistants".into(),
+            description: TEAM_LIST_ASSISTANTS_DESCRIPTION.into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
             }),
         },
         ToolDescriptor {
@@ -295,6 +309,7 @@ pub fn parse_tool_call(
         | "team_members"
         | "team_rename_agent"
         | "team_shutdown_agent"
+        | "team_list_assistants"
         | "team_list_models"
         | "team_describe_assistant" => Err("handled directly by server".into()),
         _ => Err(format!("Unknown tool: {tool_name}")),
@@ -693,6 +708,32 @@ mod tests {
         assert!(!props.contains_key("custom_agent_id"));
         assert!(names.contains(&"assistant_id"));
         assert!(!names.contains(&"custom_agent_id"));
+    }
+
+    #[test]
+    fn team_list_assistants_descriptor_guides_real_assistant_ids() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_list_assistants")
+            .expect("team_list_assistants descriptor missing");
+        assert!(
+            desc.description
+                .starts_with("List the assistants available for team spawning."),
+            "unexpected descriptor text: {}",
+            desc.description
+        );
+        assert!(desc.description.contains("real assistant_id values"));
+    }
+
+    #[test]
+    fn team_list_assistants_schema_is_empty_object() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_list_assistants")
+            .expect("team_list_assistants descriptor missing");
+        let props = desc.input_schema["properties"].as_object().unwrap();
+        assert!(props.is_empty(), "team_list_assistants should not accept arguments");
+        assert!(desc.input_schema["required"].is_null());
     }
 
     #[test]

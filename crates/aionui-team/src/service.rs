@@ -919,7 +919,6 @@ impl TeamSessionService {
         to_slot_id: &str,
         content: &str,
     ) -> Result<(), TeamError> {
-        self.require_active_team_run_for_team_work(team_id).await?;
         let session = {
             let entry = self
                 .sessions
@@ -952,6 +951,19 @@ impl TeamSessionService {
         entry
             .session
             .notify_reserved_wake_for_team_work(slot_id, target_role, source);
+    }
+
+    pub(crate) fn notify_mailbox_only_wake(&self, team_id: &str, slot_id: &str, source: TeamWakeSource) {
+        let Some(entry) = self.sessions.get(team_id) else {
+            warn!(
+                team_id,
+                slot_id,
+                wake_source = %source,
+                "mailbox-only wake notify skipped because session is missing"
+            );
+            return;
+        };
+        entry.session.notify_mailbox_only_wake(slot_id, source);
     }
 
     pub(crate) async fn require_active_team_run_for_team_work(&self, team_id: &str) -> Result<(), TeamError> {

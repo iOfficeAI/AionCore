@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use serde::Serialize;
+
 use crate::types::TeamAgent;
 
 /// Placeholder for D5b-1's `include_str!("prompt_templates/lead.txt")`.
@@ -37,7 +39,7 @@ pub struct AvailableAgentType {
 
 /// A preset assistant the leader may spawn via `assistant_id`.
 /// Phase1 shape per interface-contracts §5 (lines 212-218).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AvailableAssistant {
     pub assistant_id: String,
     pub name: String,

@@ -182,7 +182,7 @@ async fn mc1_correct_token_connects() {
     send_request(&mut stream, &req).await;
     let resp = read_response(&mut stream).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 10);
+    assert_eq!(tools.len(), 11);
 
     env.server.stop();
 }
@@ -242,7 +242,7 @@ async fn mc3_no_token_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_returns_all_10_tools() {
+async fn tools_list_returns_all_11_tools() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
@@ -254,7 +254,7 @@ async fn tools_list_returns_all_10_tools() {
     send_request(&mut stream, &req).await;
     let resp = read_response(&mut stream).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 10);
+    assert_eq!(tools.len(), 11);
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"team_send_message"));
@@ -265,6 +265,7 @@ async fn tools_list_returns_all_10_tools() {
     assert!(names.contains(&"team_members"));
     assert!(names.contains(&"team_rename_agent"));
     assert!(names.contains(&"team_shutdown_agent"));
+    assert!(names.contains(&"team_list_assistants"));
     assert!(names.contains(&"team_list_models"));
     assert!(names.contains(&"team_describe_assistant"));
 

@@ -233,7 +233,7 @@ mod tests {
 
         // Workflow — 15-step procedure with model listing at step 3
         assert!(prompt.contains("## Workflow"));
-        assert!(prompt.contains("FIRST call `team_list_models`"));
+        assert!(prompt.contains("FIRST call `team_list_assistants`"));
         assert!(prompt.contains("Wait for explicit confirmation before using team_spawn_agent"));
         assert!(prompt.contains("End your turn after the proposal"));
 

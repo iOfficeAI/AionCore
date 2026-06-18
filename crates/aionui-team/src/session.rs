@@ -57,6 +57,11 @@ pub struct SpawnAgentRequest {
     pub model: Option<String>,
 }
 
+enum SpawnWakePlan {
+    RunScoped(TeamRunTargetRole),
+    MailboxOnly,
+}
+
 pub struct TeamSession {
     team: Team,
     scheduler: Arc<TeammateManager>,
@@ -523,7 +528,7 @@ impl TeamSession {
             );
         }
 
-        self.wake_agent_for_team_work(
+        self.direct_or_run_scoped_wake(
             to_slot_id,
             TeamWakeSource::McpSendMessage,
             Some(mailbox_message.id.clone()),
@@ -557,6 +562,41 @@ impl TeamSession {
             "team wake recorded but event loop is not registered; pending wake retained"
         );
         Ok(())
+    }
+
+    async fn direct_or_run_scoped_wake(
+        &self,
+        slot_id: &str,
+        source: TeamWakeSource,
+        trigger_message_id: Option<String>,
+    ) -> Result<(), TeamError> {
+        if self.team_run_manager.active_run_id().await.is_some() {
+            return self.wake_agent_for_team_work(slot_id, source, trigger_message_id).await;
+        }
+        self.notify_mailbox_only_wake(slot_id, source);
+        Ok(())
+    }
+
+    pub(crate) fn notify_mailbox_only_wake(&self, slot_id: &str, source: TeamWakeSource) {
+        if self.event_loops.has(slot_id) {
+            self.event_loops.notify(slot_id);
+            info!(
+                team_id = %self.team.id,
+                slot_id,
+                wake_source = %source,
+                wake_policy = "mailbox_only",
+                "team mailbox-only wake notified"
+            );
+            return;
+        }
+
+        info!(
+            team_id = %self.team.id,
+            slot_id,
+            wake_source = %source,
+            wake_policy = "mailbox_only_deferred",
+            "team mailbox-only wake deferred because event loop is not registered"
+        );
     }
 
     pub(crate) async fn reserve_wake_for_team_work(
@@ -1046,21 +1086,33 @@ impl TeamSession {
             )
             .await?;
 
-        let spawn_welcome_role = self
-            .reserve_wake_for_team_work(
-                &new_agent.slot_id,
-                TeamWakeSource::SpawnWelcome,
-                Some(welcome_message.id),
-            )
-            .await?
-            .ok_or_else(|| TeamError::InvalidRequest("spawn welcome wake was suppressed".into()))?;
-        info!(
-            team_id = %self.team.id,
-            slot_id = %new_agent.slot_id,
-            target_role = ?spawn_welcome_role,
-            wake_source = %TeamWakeSource::SpawnWelcome,
-            "spawn welcome wake reserved before runtime attach"
-        );
+        let spawn_wake_plan = if self.team_run_manager.active_run_id().await.is_some() {
+            let spawn_welcome_role = self
+                .reserve_wake_for_team_work(
+                    &new_agent.slot_id,
+                    TeamWakeSource::SpawnWelcome,
+                    Some(welcome_message.id),
+                )
+                .await?
+                .ok_or_else(|| TeamError::InvalidRequest("spawn welcome wake was suppressed".into()))?;
+            info!(
+                team_id = %self.team.id,
+                slot_id = %new_agent.slot_id,
+                target_role = ?spawn_welcome_role,
+                wake_source = %TeamWakeSource::SpawnWelcome,
+                "spawn welcome wake reserved before runtime attach"
+            );
+            SpawnWakePlan::RunScoped(spawn_welcome_role)
+        } else {
+            info!(
+                team_id = %self.team.id,
+                slot_id = %new_agent.slot_id,
+                wake_source = %TeamWakeSource::SpawnWelcome,
+                wake_policy = "mailbox_only",
+                "spawn welcome wake will use mailbox-only delivery because no active team run exists"
+            );
+            SpawnWakePlan::MailboxOnly
+        };
 
         // Step 7: attach the CLI process and register the finish subscriber
         // in a background task. This involves spawning the CLI process and
@@ -1111,13 +1163,19 @@ impl TeamSession {
                 // Register the event loop for the newly spawned agent.
                 service.register_event_loop(&team_id, &agent_clone.slot_id);
 
-                // Notify the event loop to drain the welcome message.
-                service.notify_reserved_wake_for_team_work(
-                    &team_id,
-                    &agent_clone.slot_id,
-                    spawn_welcome_role,
-                    TeamWakeSource::SpawnWelcome,
-                );
+                match spawn_wake_plan {
+                    SpawnWakePlan::RunScoped(spawn_welcome_role) => {
+                        service.notify_reserved_wake_for_team_work(
+                            &team_id,
+                            &agent_clone.slot_id,
+                            spawn_welcome_role,
+                            TeamWakeSource::SpawnWelcome,
+                        );
+                    }
+                    SpawnWakePlan::MailboxOnly => {
+                        service.notify_mailbox_only_wake(&team_id, &agent_clone.slot_id, TeamWakeSource::SpawnWelcome);
+                    }
+                }
             });
         }
 
