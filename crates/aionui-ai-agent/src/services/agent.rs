@@ -106,14 +106,22 @@ impl AgentService {
         let mut seen = std::collections::HashSet::new();
         let mut entries = Vec::new();
         for agent in self.registry.list_all_including_hidden().await {
-            let (Some(backend), Some(logo)) = (agent.backend, agent.icon) else {
+            let Some(logo) = agent.icon.filter(|value| !value.is_empty()) else {
                 continue;
             };
-            if backend.is_empty() || logo.is_empty() {
+            // Frontend rows resolve a logo from the conversation's runtime key,
+            // which is the vendor `backend` for ACP agents but the `agent_type`
+            // for backends without a vendor label (e.g. aionrs, where `backend`
+            // is NULL). Key on `backend` when present, otherwise the agent_type.
+            let key = agent
+                .backend
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| agent.agent_type.serde_name().to_owned());
+            if key.is_empty() {
                 continue;
             }
-            if seen.insert(backend.clone()) {
-                entries.push(AgentLogoEntry { backend, logo });
+            if seen.insert(key.clone()) {
+                entries.push(AgentLogoEntry { backend: key, logo });
             }
         }
         Ok(entries)
