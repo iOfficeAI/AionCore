@@ -323,9 +323,13 @@ mod tests {
         assert!(got.contains("skills: docx, formatting"));
         assert!(got.contains("### How to pick an assistant"));
         assert!(got.contains("Pass the assistant's ID as `assistant_id`"));
+        assert!(got.contains("runtime backend"));
+        assert!(got.contains("derived automatically"));
         assert!(!got.contains("backend: claude"));
         assert!(!got.contains("Generic Backends"));
         assert!(!got.contains("custom_agent_id"));
+        assert!(!got.contains("choose a backend"));
+        assert!(!got.contains("select a backend"));
     }
 
     #[test]

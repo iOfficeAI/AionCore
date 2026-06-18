@@ -63,18 +63,18 @@ Before team creation: use **only** `aion_create_team` and `aion_list_models`. Af
 
 /// Build the Team Guide prompt for a solo agent.
 ///
-/// * `backend` — agent backend key (`"claude"`, `"gemini"`, `"codex"`, …). Empty
+/// * `backend` — assistant runtime backend key (`"claude"`, `"gemini"`, `"codex"`, …). Empty
 ///   string falls back to `"claude"`, matching AionUi `opts.backend || 'claude'`.
 /// * `leader_label` — optional display name for a preset assistant (e.g.
 ///   `"Word Creator"`). When present it renders as `"{label} ({backend})"`,
-///   mirroring the `rawLabel ? "${rawLabel} (${agentType})" : agentType` branch
-///   in `teamGuidePrompt.ts`. Whitespace-only labels are treated as absent.
+///   mirroring AionUi's preset-label formatting branch. Whitespace-only labels
+///   are treated as absent.
 pub fn build_team_guide_prompt(backend: &str, leader_label: Option<&str>) -> String {
-    let agent_type = if backend.is_empty() { "claude" } else { backend };
+    let leader_backend = if backend.is_empty() { "claude" } else { backend };
     let raw_label = leader_label.map(str::trim).filter(|s| !s.is_empty());
     let leader_cell = match raw_label {
-        Some(label) => format!("{label} ({agent_type})"),
-        None => agent_type.to_owned(),
+        Some(label) => format!("{label} ({leader_backend})"),
+        None => format!("Current assistant ({leader_backend})"),
     };
 
     TEAM_GUIDE_PROMPT_TEMPLATE
@@ -122,7 +122,7 @@ If case 2 applies, ask at most once whether the user wants to bring in a Team. K
 2. Explain in one sentence why the Team setup helps this task.\n\
 3. Present a team configuration table: role name, responsibility, recommended assistant, and recommended model (from aion_list_models results) for each member. Example format:\n   \
 | Role | Responsibility | Assistant | Model |\n   \
-| Leader | Coordinate and review | claude | (default) |\n   \
+| Leader | Coordinate and review | Current assistant (claude) | (default) |\n   \
 | Developer | Implement features | Suitable assistant | (model from list) |\n   \
 | Tester | Write and run tests | Suitable assistant | (model from list) |\n\
 4. **Output the table as a normal text message and END YOUR TURN.** Do NOT call `aion_create_team` or any other tool (including ask_user) in this turn. Wait for the user to reply in their next message with explicit confirmation (e.g. \"ok\", \"go ahead\", \"确认\") before proceeding.\n\
@@ -147,12 +147,19 @@ Before team creation: use **only** `aion_create_team` and `aion_list_models`. Af
     #[test]
     fn team_guide_prompt_empty_backend_falls_back_to_claude() {
         let prompt = build_team_guide_prompt("", None);
-        assert!(prompt.contains("| Leader | Coordinate and review | claude | (default) |"));
+        assert!(prompt.contains("| Leader | Coordinate and review | Current assistant (claude) | (default) |"));
     }
 
     #[test]
     fn team_guide_prompt_whitespace_label_treated_as_absent() {
         let prompt = build_team_guide_prompt("codex", Some("   "));
-        assert!(prompt.contains("| Leader | Coordinate and review | codex | (default) |"));
+        assert!(prompt.contains("| Leader | Coordinate and review | Current assistant (codex) | (default) |"));
+    }
+
+    #[test]
+    fn team_guide_prompt_without_leader_label_uses_assistant_first_leader_cell() {
+        let prompt = build_team_guide_prompt("gemini", None);
+        assert!(prompt.contains("| Leader | Coordinate and review | Current assistant (gemini) | (default) |"));
+        assert!(!prompt.contains("| Leader | Coordinate and review | gemini | (default) |"));
     }
 }
