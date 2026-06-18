@@ -150,11 +150,12 @@ struct SendMessageParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SpawnAgentParams {
     /// Name for the new teammate agent.
     name: String,
     /// Assistant identifier from the available assistants catalog.
-    #[serde(default, alias = "custom_agent_id")]
+    #[serde(default)]
     assistant_id: Option<String>,
     /// Model override for the new agent.
     #[serde(default)]
@@ -219,9 +220,9 @@ struct TeamListModelsParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DescribeAssistantParams {
     /// Assistant identifier to look up.
-    #[serde(alias = "custom_agent_id")]
     assistant_id: String,
     /// Locale for the description (e.g. "en", "zh"). Default when omitted.
     #[serde(default)]
@@ -435,6 +436,31 @@ mod tests {
         assert_eq!(env.backend, "codex");
         assert_eq!(env.conversation_id, "conv-1");
         assert_eq!(env.user_id, "user-1");
+    }
+
+    #[test]
+    fn spawn_agent_params_reject_legacy_custom_agent_id_alias() {
+        let parsed = serde_json::from_value::<SpawnAgentParams>(json!({
+            "name": "helper",
+            "custom_agent_id": "assistant-123",
+        }));
+        assert!(parsed.is_err(), "legacy custom_agent_id alias should be rejected");
+        let err = parsed.err().unwrap();
+
+        assert!(err.to_string().contains("unknown field"));
+        assert!(err.to_string().contains("custom_agent_id"));
+    }
+
+    #[test]
+    fn describe_assistant_params_reject_legacy_custom_agent_id_alias() {
+        let parsed = serde_json::from_value::<DescribeAssistantParams>(json!({
+            "custom_agent_id": "assistant-123",
+        }));
+        assert!(parsed.is_err(), "legacy custom_agent_id alias should be rejected");
+        let err = parsed.err().unwrap();
+
+        assert!(err.to_string().contains("unknown field"));
+        assert!(err.to_string().contains("custom_agent_id"));
     }
 
     fn guide_server_for_port(port: u16) -> GuideServer {

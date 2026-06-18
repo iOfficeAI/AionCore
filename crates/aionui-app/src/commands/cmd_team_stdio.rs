@@ -126,6 +126,7 @@ struct SendMessageParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SpawnAgentParams {
     /// Agent display name.
     name: String,
@@ -133,7 +134,7 @@ struct SpawnAgentParams {
     #[serde(default)]
     model: Option<String>,
     /// Assistant identifier from the available assistants catalog.
-    #[serde(default, alias = "custom_agent_id")]
+    #[serde(default)]
     assistant_id: Option<String>,
     /// Agent role (default: "teammate").
     #[serde(default)]
@@ -198,9 +199,9 @@ struct ListModelsParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DescribeAssistantParams {
     /// The assistant ID from the "Available Assistants" catalog.
-    #[serde(alias = "custom_agent_id")]
     assistant_id: String,
     /// Locale for the description (e.g. "en", "zh"). Default when omitted.
     #[serde(default)]
@@ -570,6 +571,31 @@ mod tests {
         assert_eq!(env.port, 12345);
         assert_eq!(env.token, "tok");
         assert_eq!(env.slot_id, "slot-a");
+    }
+
+    #[test]
+    fn spawn_agent_params_reject_legacy_custom_agent_id_alias() {
+        let parsed = serde_json::from_value::<SpawnAgentParams>(json!({
+            "name": "helper",
+            "custom_agent_id": "assistant-123",
+        }));
+        assert!(parsed.is_err(), "legacy custom_agent_id alias should be rejected");
+        let err = parsed.err().unwrap();
+
+        assert!(err.to_string().contains("unknown field"));
+        assert!(err.to_string().contains("custom_agent_id"));
+    }
+
+    #[test]
+    fn describe_assistant_params_reject_legacy_custom_agent_id_alias() {
+        let parsed = serde_json::from_value::<DescribeAssistantParams>(json!({
+            "custom_agent_id": "assistant-123",
+        }));
+        assert!(parsed.is_err(), "legacy custom_agent_id alias should be rejected");
+        let err = parsed.err().unwrap();
+
+        assert!(err.to_string().contains("unknown field"));
+        assert!(err.to_string().contains("custom_agent_id"));
     }
 
     #[tokio::test]
