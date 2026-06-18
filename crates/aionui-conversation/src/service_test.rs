@@ -4313,6 +4313,105 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
 }
 
 #[tokio::test]
+async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
+    let resolver = Arc::new(FixedSkillResolver {
+        names: vec!["cron".into(), "todo-tracker".into()],
+    });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("preset-1".to_string(), "assistant rule body".to_string())]),
+    });
+    let (svc, _broadcaster, repo, definition_repo, state_repo, preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+    let workspace = ensure_test_workspace_path();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            definition_id: "asstdef_preset_legacy_seed",
+            assistant_key: "preset-1",
+            source: "builtin",
+            owner_type: "system",
+            source_ref: Some("preset-1"),
+            source_version: None,
+            source_hash: None,
+            name: "Preset",
+            name_i18n: "{}",
+            description: Some("desc"),
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🤖"),
+            agent_backend: "claude",
+            rule_resource_type: "builtin_asset",
+            rule_resource_ref: Some("preset-1"),
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            definition_id: "asstdef_preset_legacy_seed",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: Some("codex"),
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            definition_id: "asstdef_preset_legacy_seed",
+            last_model_id: Some("preferred-model"),
+            last_permission_value: Some("workspace-write"),
+            last_skill_ids: r#"["legacy-skill"]"#,
+            last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
+            last_mcp_ids: r#"["legacy-mcp"]"#,
+        })
+        .await
+        .unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "assistant": {
+            "id": "preset-1",
+            "locale": "zh-CN",
+            "conversation_overrides": {
+                "model": "override-model"
+            }
+        },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude",
+            "current_model_id": "legacy-model",
+            "session_mode": "legacy-mode",
+            "current_mode_id": "legacy-mode"
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(resp.extra["current_model_id"], json!("override-model"));
+    assert_eq!(resp.extra["session_mode"], json!("workspace-write"));
+    assert_eq!(resp.extra["current_mode_id"], json!("workspace-write"));
+
+    let snapshot = repo.get_assistant_snapshot(&resp.id).await.unwrap().unwrap();
+    assert_eq!(snapshot.agent_backend, "codex");
+    assert_eq!(snapshot.resolved_model_id.as_deref(), Some("override-model"));
+    assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
+}
+
+#[tokio::test]
 async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
     let resolver = Arc::new(FixedSkillResolver { names: vec![] });
     let dispatcher = Arc::new(StaticAssistantDispatcher {

@@ -781,19 +781,15 @@ impl ConversationService {
             } else {
                 obj.remove("agent_source");
             }
-            if let Some(model_id) = snapshot.resolved_defaults.model.as_ref()
-                && !obj.contains_key("current_model_id")
-            {
+            if let Some(model_id) = snapshot.resolved_defaults.model.as_ref() {
                 obj.insert(
                     "current_model_id".to_owned(),
                     serde_json::Value::String(model_id.clone()),
                 );
             }
             if let Some(permission) = snapshot.resolved_defaults.permission.as_ref() {
-                if !obj.contains_key("session_mode") {
-                    obj.insert("session_mode".to_owned(), serde_json::Value::String(permission.clone()));
-                }
-                if matches!(effective_type, AgentType::Acp) && !obj.contains_key("current_mode_id") {
+                obj.insert("session_mode".to_owned(), serde_json::Value::String(permission.clone()));
+                if matches!(effective_type, AgentType::Acp) {
                     obj.insert(
                         "current_mode_id".to_owned(),
                         serde_json::Value::String(permission.clone()),
