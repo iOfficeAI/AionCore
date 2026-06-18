@@ -547,6 +547,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_tool_json_object_success_body_is_returned_as_text() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "teamId": "team-123",
+                "status": "team_created",
+                "next_step": "Use team_spawn_agent with assistant_id from the catalog.",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server = guide_server_for_port(mock_server.address().port());
+        let result = server.forward_tool("aion_create_team", &json!({})).await;
+
+        assert_eq!(result.is_error, Some(false));
+        let text = first_text(&result);
+        assert!(text.contains("\"teamId\":\"team-123\""));
+        assert!(text.contains("\"status\":\"team_created\""));
+        assert!(text.contains("assistant_id"));
+    }
+
+    #[tokio::test]
     async fn forward_tool_response_read_failure_is_not_overwritten_by_later_connect_failure() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -635,6 +658,7 @@ impl GuideServer {
                                             .or_else(|| extract_nested_code(&v, &["error", "data", "errorCode"])),
                                     );
                                 }
+                                return tool_success(v.to_string());
                             }
                             return tool_error(
                                 CliBoundaryCode::McpToolResponseUnexpected,
