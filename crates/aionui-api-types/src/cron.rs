@@ -37,7 +37,7 @@ pub enum CronScheduleDto {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CronAgentConfigDto {
+pub struct CronAgentConfigReadDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     pub name: String,
@@ -109,7 +109,7 @@ pub struct CronJobMetadataDto {
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_config: Option<CronAgentConfigDto>,
+    pub agent_config: Option<CronAgentConfigReadDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -433,7 +433,7 @@ mod tests {
         }
     }
 
-    // -- B. CronAgentConfigDto ------------------------------------------------
+    // -- B. CronAgentConfigReadDto -------------------------------------------
 
     #[test]
     fn agent_config_full() {
@@ -450,7 +450,7 @@ mod tests {
             "config_options": {"key": "value"},
             "workspace": "/tmp/ws"
         });
-        let c: CronAgentConfigDto = serde_json::from_value(raw).unwrap();
+        let c: CronAgentConfigReadDto = serde_json::from_value(raw).unwrap();
         assert_eq!(c.backend.as_deref(), Some("acp"));
         assert_eq!(c.name, "Claude Agent");
         assert_eq!(c.cli_path.as_deref(), Some("/usr/bin/claude"));
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn agent_config_minimal() {
         let raw = json!({"backend": "openai", "name": "GPT"});
-        let c: CronAgentConfigDto = serde_json::from_value(raw).unwrap();
+        let c: CronAgentConfigReadDto = serde_json::from_value(raw).unwrap();
         assert_eq!(c.backend.as_deref(), Some("openai"));
         assert_eq!(c.name, "GPT");
         assert!(c.cli_path.is_none());
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn agent_config_serialize_omits_none() {
-        let c = CronAgentConfigDto {
+        let c = CronAgentConfigReadDto {
             backend: Some("acp".into()),
             name: "Test".into(),
             cli_path: None,
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn agent_config_roundtrip() {
-        let c = CronAgentConfigDto {
+        let c = CronAgentConfigReadDto {
             backend: Some("acp".into()),
             name: "Agent".into(),
             cli_path: Some("/bin/x".into()),
@@ -509,7 +509,7 @@ mod tests {
             workspace: Some("/ws".into()),
         };
         let json = serde_json::to_string(&c).unwrap();
-        let parsed: CronAgentConfigDto = serde_json::from_str(&json).unwrap();
+        let parsed: CronAgentConfigReadDto = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, c);
     }
 
@@ -539,7 +539,7 @@ mod tests {
                 created_by: "user".into(),
                 created_at: 1700000000000,
                 updated_at: 1700001000000,
-                agent_config: Some(CronAgentConfigDto {
+                agent_config: Some(CronAgentConfigReadDto {
                     backend: Some("acp".into()),
                     name: "Claude".into(),
                     cli_path: None,

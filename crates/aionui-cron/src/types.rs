@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use aionui_api_types::{
-    CronAgentConfigDto, CronJobMetadataDto, CronJobPayloadDto, CronJobResponse, CronJobStateDto, CronJobTargetDto,
+    CronAgentConfigReadDto, CronJobMetadataDto, CronJobPayloadDto, CronJobResponse, CronJobStateDto, CronJobTargetDto,
     CronScheduleDto,
 };
 use aionui_common::TimestampMs;
@@ -335,7 +335,7 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
         let canonical_assistant_id = c.assistant_id.clone().or_else(|| c.custom_agent_id.clone());
         let assistant_backed = canonical_assistant_id.is_some();
         let preserve_backend = !assistant_backed || job.agent_type == "aionrs";
-        CronAgentConfigDto {
+        CronAgentConfigReadDto {
             backend: preserve_backend.then(|| c.backend.clone()),
             name: c.name.clone(),
             cli_path: if assistant_backed { None } else { c.cli_path.clone() },

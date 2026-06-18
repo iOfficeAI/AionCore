@@ -83,7 +83,7 @@ pub use conversation::{
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
-    CreateCronJobRequest, CronAgentConfigDto, CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto,
+    CreateCronJobRequest, CronAgentConfigReadDto, CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto,
     CronJobPayloadDto, CronJobRemovedPayload, CronJobResponse, CronJobStateDto, CronJobTargetDto, CronScheduleDto,
     HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest, UpdateCronJobRequest,
 };
