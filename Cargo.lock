@@ -833,6 +833,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aionui-team-prompts"
+version = "0.1.31"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"

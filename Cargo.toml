@@ -17,6 +17,7 @@ members = [
     "crates/aionui-conversation",
     "crates/aionui-extension",
     "crates/aionui-channel",
+    "crates/aionui-team-prompts",
     "crates/aionui-team",
     "crates/aionui-cron",
     "crates/aionui-assistant",
@@ -46,6 +47,7 @@ aionui-mcp = { path = "crates/aionui-mcp" }
 aionui-conversation = { path = "crates/aionui-conversation" }
 aionui-extension = { path = "crates/aionui-extension" }
 aionui-channel = { path = "crates/aionui-channel" }
+aionui-team-prompts = { path = "crates/aionui-team-prompts" }
 aionui-team = { path = "crates/aionui-team" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
