@@ -421,6 +421,78 @@ async fn send_to_agent_rejects_unresolvable_channel_assistant_binding() {
 }
 
 #[tokio::test]
+async fn send_to_agent_without_saved_binding_defaults_to_bare_aionrs_assistant() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool().clone();
+
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::new());
+    let conversation_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
+    let conversation_repo_trait: Arc<dyn IConversationRepository> = conversation_repo.clone();
+    let acp_session_repo = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
+    let conversation_svc = Arc::new(ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(TestBroadcaster::new()),
+        Arc::new(NoopSkillResolver),
+        Arc::clone(&task_manager),
+        conversation_repo_trait,
+        Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
+        acp_session_repo,
+    ));
+
+    let pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
+    let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
+    let overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
+    let assistant_preference_repo = Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone()));
+    conversation_svc.with_assistant_definition_repo(definition_repo.clone());
+    conversation_svc.with_assistant_state_repo(overlay_repo.clone());
+    conversation_svc.with_assistant_preference_repo(assistant_preference_repo);
+    definition_repo
+        .upsert(&bare_assistant_definition_params(
+            "asstdef-channel-aionrs",
+            "bare-aionrs",
+            "aionrs",
+        ))
+        .await
+        .unwrap();
+
+    let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
+    let message_svc = ChannelMessageService::new(
+        conversation_svc,
+        Arc::clone(&task_manager),
+        settings,
+        "system_default_user".to_owned(),
+    );
+
+    let session = AssistantSessionRow {
+        id: "session-assisted-default-aionrs".to_owned(),
+        user_id: "channel-user-default".to_owned(),
+        agent_type: "aionrs".to_owned(),
+        conversation_id: None,
+        workspace: None,
+        chat_id: Some("7088048018".to_owned()),
+        created_at: 1,
+        last_activity: 1,
+    };
+
+    let result = message_svc
+        .send_to_agent(&session, "hello", PluginType::Telegram)
+        .await
+        .unwrap();
+
+    let snapshot = conversation_repo
+        .get_assistant_snapshot(&result.conversation_id)
+        .await
+        .unwrap()
+        .expect("channel-created conversation should default to a bare assistant snapshot");
+    let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
+
+    assert_eq!(snapshot.assistant_key, "bare-aionrs");
+    assert_eq!(snapshot.agent_backend, "aionrs");
+    assert_eq!(conversation.r#type, AgentType::Aionrs.serde_name());
+    assert_eq!(conversation.name, "tg-aionrs-70880480");
+}
+
+#[tokio::test]
 async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name() {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();

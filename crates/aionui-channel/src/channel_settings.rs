@@ -174,6 +174,10 @@ impl ChannelSettingsService {
             }
         }
 
+        if assistant.is_none() {
+            assistant = self.resolve_default_channel_assistant_setting().await?;
+        }
+
         Ok(ChannelPlatformSettingsResponse {
             platform: platform.to_string(),
             assistant,
@@ -189,7 +193,7 @@ impl ChannelSettingsService {
         let prefs = self.pref_repo.get_by_keys(&[&key]).await?;
 
         let Some(pref) = prefs.into_iter().next() else {
-            return Ok(None);
+            return self.resolve_default_channel_assistant_setting().await;
         };
 
         let parsed = if let Some(assistant) = parse_channel_assistant_setting(&pref.value) {
@@ -312,6 +316,46 @@ impl ChannelSettingsService {
             Ok(assistant)
         }
     }
+
+    async fn resolve_default_channel_assistant_setting(
+        &self,
+    ) -> Result<Option<ChannelAssistantSettingResponse>, ChannelError> {
+        let Some(assistant_id) = self.resolve_default_assistant_identity().await? else {
+            return Ok(None);
+        };
+
+        Ok(Some(ChannelAssistantSettingResponse {
+            assistant_id: Some(assistant_id),
+            custom_agent_id: None,
+            backend: None,
+            agent_type: None,
+            name: None,
+        }))
+    }
+
+    async fn resolve_default_assistant_identity(&self) -> Result<Option<String>, ChannelError> {
+        let (Some(definition_repo), Some(overlay_repo)) =
+            (&self.assistant_definition_repo, &self.assistant_overlay_repo)
+        else {
+            return Ok(None);
+        };
+
+        let definitions = definition_repo.list().await?;
+        let overlays = overlay_repo.list().await?;
+
+        let generated_aionrs = definitions.iter().find(|definition| {
+            definition.source == "generated" && effective_assistant_backend(definition, &overlays) == DEFAULT_AGENT_TYPE
+        });
+        if let Some(definition) = generated_aionrs {
+            return Ok(Some(definition.assistant_key.clone()));
+        }
+
+        let any_aionrs = definitions
+            .iter()
+            .find(|definition| effective_assistant_backend(definition, &overlays) == DEFAULT_AGENT_TYPE);
+
+        Ok(any_aionrs.map(|definition| definition.assistant_key.clone()))
+    }
 }
 
 fn agent_key(platform: PluginType) -> String {
@@ -361,6 +405,18 @@ fn normalize_channel_assistant_setting_for_write(
         agent_type: None,
         name: assistant.name.clone(),
     }
+}
+
+fn effective_assistant_backend(
+    definition: &aionui_db::models::AssistantDefinitionRow,
+    overlays: &[aionui_db::models::AssistantOverlayRow],
+) -> String {
+    overlays
+        .iter()
+        .find(|overlay| overlay.definition_id == definition.definition_id)
+        .and_then(|overlay| overlay.agent_backend_override.as_deref())
+        .unwrap_or(definition.agent_backend.as_str())
+        .to_owned()
 }
 
 fn parse_channel_model_setting(value: &str) -> Option<ChannelDefaultModelSetting> {
@@ -869,6 +925,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_assistant_setting_defaults_to_generated_aionrs_assistant() {
+        let repo = Arc::new(MockPrefRepo::new());
+        let definition_repo = Arc::new(MockAssistantDefinitionRepo {
+            rows: vec![
+                make_definition("bare-claude", "claude"),
+                make_definition("bare-aionrs", "aionrs"),
+            ],
+        });
+        let overlay_repo = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
+        let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
+
+        let setting = svc.get_assistant_setting(PluginType::Telegram).await.unwrap().unwrap();
+
+        assert_eq!(setting.assistant_id.as_deref(), Some("bare-aionrs"));
+        assert!(setting.custom_agent_id.is_none());
+        assert!(setting.backend.is_none());
+        assert!(setting.agent_type.is_none());
+        assert!(setting.name.is_none());
+    }
+
+    #[tokio::test]
     async fn get_assistant_setting_preserves_backend_only_legacy_response() {
         let repo = Arc::new(MockPrefRepo::with_data(vec![(
             "assistant.lark.agent",
@@ -922,6 +999,28 @@ mod tests {
         assert!(assistant.backend.is_none());
         assert!(assistant.agent_type.is_none());
         assert_eq!(assistant.name.as_deref(), Some("Codex"));
+    }
+
+    #[tokio::test]
+    async fn get_platform_settings_defaults_to_generated_aionrs_assistant() {
+        let repo = Arc::new(MockPrefRepo::new());
+        let definition_repo = Arc::new(MockAssistantDefinitionRepo {
+            rows: vec![
+                make_definition("bare-claude", "claude"),
+                make_definition("bare-aionrs", "aionrs"),
+            ],
+        });
+        let overlay_repo = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
+        let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
+
+        let settings = svc.get_platform_settings(PluginType::Telegram).await.unwrap();
+        let assistant = settings.assistant.expect("assistant settings");
+
+        assert_eq!(assistant.assistant_id.as_deref(), Some("bare-aionrs"));
+        assert!(assistant.custom_agent_id.is_none());
+        assert!(assistant.backend.is_none());
+        assert!(assistant.agent_type.is_none());
+        assert!(assistant.name.is_none());
     }
 
     #[tokio::test]
