@@ -23,7 +23,7 @@
 //! shared connection, each awaited in its own caller task.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use agent_client_protocol::schema::{
     AGENT_METHOD_NAMES, AuthenticateResponse, ClientNotification, ClientRequest, CloseSessionResponse, ExtResponse,
@@ -61,6 +61,14 @@ const INIT_TIMEOUT_SECS: u64 = 30;
 /// API rejects when empty. Always send non-empty values (see issue #3326).
 const ACP_CLIENT_NAME: &str = "AionUi";
 const ACP_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpConnectionPhase {
+    Starting,
+    Initializing,
+    Ready,
+    ShuttingDown,
+}
 
 /// Build the ACP `initialize` request, always populating `clientInfo` with a
 /// non-empty name and version so downstream agents that require client metadata
@@ -394,6 +402,8 @@ async fn run_sdk_background(
     let mut init_tx = Some(init_tx);
     let mut ready_tx = Some(ready_tx);
     let mut shutdown_rx = Some(shutdown_rx);
+    let phase = Arc::new(Mutex::new(AcpConnectionPhase::Starting));
+    let phase_for_main = Arc::clone(&phase);
 
     let result = Client
         .builder()
@@ -439,6 +449,7 @@ async fn run_sdk_background(
             let init_result = {
                 let req = build_initialize_request();
                 log_client_request("initialize", &json_str(&req));
+                *phase_for_main.lock().unwrap() = AcpConnectionPhase::Initializing;
                 let raw = connection.send_request(req).block_task().await;
                 log_agent_response("initialize", &json_or_err(&raw));
                 raw.map_err(|e| AcpError::from_sdk(e, "initialize"))
@@ -466,11 +477,13 @@ async fn run_sdk_background(
                 // Owner dropped before we became ready — nothing more to do.
                 return Ok(());
             }
+            *phase_for_main.lock().unwrap() = AcpConnectionPhase::Ready;
 
             // Step 3 — keep the connection alive until AcpProtocol::drop
             // releases the shutdown oneshot.
             if let Some(rx) = shutdown_rx.take() {
                 let _ = rx.await;
+                *phase_for_main.lock().unwrap() = AcpConnectionPhase::ShuttingDown;
             }
             Ok(())
         })
@@ -478,9 +491,10 @@ async fn run_sdk_background(
 
     alive.store(false, Ordering::Release);
 
+    let close_phase = *phase.lock().unwrap();
     match result {
-        Ok(_) => debug!("ACP SDK connection closed normally"),
-        Err(e) => warn!(error = %ErrorChain(&e), "ACP SDK connection closed with error"),
+        Ok(_) => debug!(?close_phase, "ACP SDK connection closed normally"),
+        Err(e) => warn!(?close_phase, error = %ErrorChain(&e), "ACP SDK connection closed with error"),
     }
 }
 

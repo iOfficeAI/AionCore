@@ -245,6 +245,25 @@ fn matched_slash_command(raw_user_input: &str, commands: &[AvailableCommand]) ->
 /// (Claude, Qwen, CodeBuddy, Codex, etc.). Communication now happens via
 /// the `agent-client-protocol` SDK's JSON-RPC transport, replacing the
 /// previous hand-crafted JSON-over-stdin/stdout approach.
+fn mark_session_opened_after_protocol_ready(
+    session: &mut AcpSession,
+    sid: String,
+    protocol_connected: bool,
+    conversation_id: &str,
+    backend: Option<&str>,
+) -> Result<String, AgentError> {
+    if !protocol_connected {
+        warn!(
+            conversation_id = %conversation_id,
+            backend = backend.unwrap_or("-"),
+            "ACP session open returned after protocol disconnected; rejecting opened transition"
+        );
+        return Err(AcpError::NotConnected.into());
+    }
+    session.mark_opened();
+    Ok(sid)
+}
+
 pub struct AcpAgentManager {
     /// Pre-computed, immutable session parameters assembled by the factory.
     pub(super) params: Arc<AcpSessionParams>,
@@ -465,6 +484,19 @@ impl AcpAgentManager {
         runtime.bump_activity();
     }
 
+    fn ensure_protocol_connected_for_operation(&self, operation: &'static str) -> Result<(), AgentError> {
+        if self.protocol.is_connected() {
+            return Ok(());
+        }
+        warn!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            operation,
+            "ACP operation rejected because protocol is disconnected"
+        );
+        Err(AcpError::NotConnected.into())
+    }
+
     pub(crate) async fn mode(&self) -> Result<aionui_api_types::AgentModeResponse, AgentError> {
         let desired = self
             .session
@@ -551,6 +583,8 @@ impl AcpAgentManager {
         option_id: &str,
         value: &str,
     ) -> Result<SetConfigOptionResponse, AgentError> {
+        self.ensure_protocol_connected_for_operation("set_config_option")?;
+
         let (session_id, set_path, is_mode_option) = {
             let session = self.session.read().await;
             let snapshot = session.config_snapshot();
@@ -990,6 +1024,7 @@ impl AcpAgentManager {
     async fn ensure_session_opened(&self) -> Result<String, AgentError> {
         debug!("Ensuring ACP session is opened");
         let _lock = self.session_lock.lock().await;
+        self.ensure_protocol_connected_for_operation("ensure_session_opened")?;
 
         let (session_id, opened) = {
             let s = self.session.read().await;
@@ -1004,10 +1039,16 @@ impl AcpAgentManager {
 
         {
             let mut s = self.session.write().await;
-            s.mark_opened();
+            let sid = mark_session_opened_after_protocol_ready(
+                &mut s,
+                sid,
+                self.protocol.is_connected(),
+                &self.params.conversation_id,
+                self.backend(),
+            )?;
             self.commit_session_changes(&mut s).await;
+            Ok(sid)
         }
-        Ok(sid)
     }
 
     /// Initialize or resume a session, then send the user message.
@@ -1312,8 +1353,8 @@ mod tests {
     use crate::agent_runtime::AgentRuntime;
     use crate::error::AgentError;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
-    use crate::protocol::error::CloseReason;
-    use crate::shared_kernel::{ConfigKey, ConfigValue};
+    use crate::protocol::error::{AcpError, CloseReason};
+    use crate::shared_kernel::{ConfigKey, ConfigValue, SessionId as DomainSessionId};
     use agent_client_protocol::schema::{AvailableCommand, SessionConfigOptionCategory};
     use serde_json::json;
     use std::collections::HashMap;
@@ -1352,6 +1393,31 @@ mod tests {
     fn rate_limited_has_no_colon_returns_full_string() {
         let err = AgentError::RateLimited;
         assert_eq!(user_facing_message(&err), "Rate limited");
+    }
+
+    #[test]
+    fn warmup_does_not_mark_opened_when_protocol_disconnected_after_open() {
+        let mut session = AcpSession::new(None, None, Default::default());
+        session.set_session_id(DomainSessionId::new("sess-disconnected"));
+
+        let err = super::mark_session_opened_after_protocol_ready(
+            &mut session,
+            "sess-disconnected".to_owned(),
+            false,
+            "conv-test",
+            Some("codex"),
+        )
+        .expect_err("disconnected protocol must reject the opened transition");
+
+        assert!(
+            matches!(err, AgentError::Acp(AcpError::NotConnected)),
+            "expected AcpError::NotConnected, got {err:?}"
+        );
+        assert_eq!(session.session_id(), Some("sess-disconnected"));
+        assert!(
+            !session.is_opened(),
+            "warmup must not mark the aggregate opened when the protocol is already disconnected"
+        );
     }
 
     #[test]

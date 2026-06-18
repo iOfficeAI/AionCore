@@ -9,7 +9,7 @@ use std::time::Duration;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentError, AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::{AcpError, AgentError, AgentSendError, IWorkerTaskManager};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
@@ -1571,6 +1571,7 @@ struct MockAgent {
     model_id: Mutex<String>,
     config_options: Arc<Mutex<Vec<AcpConfigOptionDto>>>,
     set_config_option_calls: Arc<Mutex<Vec<(String, String)>>>,
+    set_config_option_error: Arc<Mutex<Option<AgentError>>>,
     set_config_option_response: Arc<Mutex<Option<SetConfigOptionResponse>>>,
     keep_reported_model_on_set: bool,
     confirmations: Mutex<Vec<Confirmation>>,
@@ -1610,6 +1611,7 @@ impl MockAgent {
             model_id: Mutex::new("model-a".to_owned()),
             config_options: Arc::new(Mutex::new(Vec::new())),
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
+            set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
             keep_reported_model_on_set: false,
             confirmations: Mutex::new(vec![]),
@@ -1629,6 +1631,7 @@ impl MockAgent {
             model_id: Mutex::new("model-a".to_owned()),
             config_options: Arc::new(Mutex::new(Vec::new())),
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
+            set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
             keep_reported_model_on_set: false,
             confirmations: Mutex::new(confirmations),
@@ -1648,6 +1651,7 @@ impl MockAgent {
             model_id: Mutex::new("model-a".to_owned()),
             config_options: Arc::new(Mutex::new(Vec::new())),
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
+            set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
             keep_reported_model_on_set: false,
             confirmations: Mutex::new(vec![]),
@@ -1664,6 +1668,11 @@ impl MockAgent {
 
     fn with_set_config_option_response(self, response: SetConfigOptionResponse) -> Self {
         *self.set_config_option_response.lock().unwrap() = Some(response);
+        self
+    }
+
+    fn with_set_config_option_error(self, error: AgentError) -> Self {
+        *self.set_config_option_error.lock().unwrap() = Some(error);
         self
     }
 }
@@ -1780,6 +1789,9 @@ impl IMockAgent for MockAgent {
             .lock()
             .unwrap()
             .push((option_id.to_owned(), value.to_owned()));
+        if let Some(error) = self.set_config_option_error.lock().unwrap().take() {
+            return Err(error);
+        }
         if let Some(response) = self.set_config_option_response.lock().unwrap().clone() {
             return Ok(response);
         }
@@ -2473,6 +2485,36 @@ async fn set_config_option_returns_observed_confirmation() {
     assert_eq!(
         agent.set_config_option_calls.lock().unwrap().as_slice(),
         &[("reasoning_effort".to_owned(), "high".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn set_config_option_evicts_task_when_acp_protocol_is_not_connected() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent =
+        Arc::new(MockAgent::new(&conv.id).with_set_config_option_error(AgentError::Acp(AcpError::NotConnected)));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+
+    let err = svc
+        .set_config_option(
+            &conv.id,
+            "model",
+            SetConfigOptionRequest {
+                value: "gpt-5".to_owned(),
+            },
+        )
+        .await
+        .expect_err("set_config_option must surface ACP NotConnected");
+
+    assert!(
+        matches!(err, ConversationError::Acp(AcpError::NotConnected)),
+        "expected ACP NotConnected, got {err:?}"
+    );
+    assert_eq!(
+        task_mgr.kill_records(),
+        vec![(conv.id.clone(), Some(AgentKillReason::AgentErrorRecovery))]
     );
 }
 

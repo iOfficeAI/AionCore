@@ -466,6 +466,10 @@ impl ConversationService {
             })
     }
 
+    pub(crate) fn task_manager(&self) -> &Arc<dyn IWorkerTaskManager> {
+        &self.task_manager
+    }
+
     pub async fn runtime_summary_for(&self, conversation_id: &str) -> ConversationRuntimeSummary {
         let agent = self.task_manager.get_task(conversation_id);
         let has_task = agent.is_some();
