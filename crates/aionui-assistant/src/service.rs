@@ -296,7 +296,17 @@ impl AssistantService {
                 .resolve_definition_identity("generated", Some(&row.id), &assistant_key)
                 .await?;
             let avatar_value = row.icon.as_deref().filter(|value| !value.trim().is_empty());
-            let backend = row.backend.as_deref().unwrap_or("");
+            // ACP agents expose their engine in `backend` (claude/gemini/…), but
+            // single-engine agents like Aion CLI carry it in `agent_type` and
+            // leave `backend` empty. Fall back to `agent_type` so the bare
+            // assistant always has a concrete `preset_agent_type` for the
+            // frontend to route on; an empty backend would otherwise drop the
+            // top-level model and fail warmup with "Provider '' not found".
+            let backend = row
+                .backend
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| row.agent_type.serde_name());
 
             self.definition_repo
                 .upsert(&UpsertAssistantDefinitionParams {
@@ -2423,6 +2433,7 @@ mod tests {
             last_check_kind: Some(aionui_api_types::AgentSnapshotCheckKind::Manual),
             last_check_error_code: None,
             last_check_error_message: None,
+            last_check_error_details: None,
             last_check_guidance: None,
             last_check_latency_ms: Some(42),
             last_check_at: Some(1_750_000_000_000),
@@ -2536,6 +2547,35 @@ mod tests {
         assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Available);
         assert!(bare.team_selectable);
         assert!(!bare.deletable);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_falls_back_to_agent_type_when_backend_is_empty() {
+        // Engines like Aion CLI carry their identity in `agent_type` and leave
+        // `backend` empty (it is an ACP-vendor label). The bare assistant must
+        // still expose a concrete `preset_agent_type` so the frontend can route
+        // it as an aionrs conversation; otherwise the top-level model is dropped
+        // and warmup fails with "Provider '' not found".
+        let mut agent_row = mk_agent_row(
+            "agent-aionrs",
+            "aionrs",
+            aionui_api_types::AgentManagementStatus::Available,
+        );
+        agent_row.backend = None;
+        agent_row.agent_type = aionui_common::AgentType::Aionrs;
+
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![agent_row],
+            ..Default::default()
+        })
+        .await;
+
+        let list = fx.service.list().await.unwrap();
+        let bare = list
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-aionrs")
+            .unwrap();
+        assert_eq!(bare.preset_agent_type, "aionrs");
     }
 
     #[tokio::test]

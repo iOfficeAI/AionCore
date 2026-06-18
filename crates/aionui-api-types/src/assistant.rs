@@ -423,6 +423,9 @@ mod tests {
             "enabled": true,
             "sort_order": 7,                   // snake required field
             "preset_agent_type": "gemini",     // snake required field
+            "agent_status": "available",       // snake required field
+            "team_selectable": true,           // snake required field
+            "deletable": true,                 // snake required field
             "presetAgentType": "claude",       // legacy camel — must be ignored
             "sortOrder": 99,                   // legacy camel — must be ignored
             "lastUsedAt": 111_222,             // legacy camel for optional field — must be ignored
