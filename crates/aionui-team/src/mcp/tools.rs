@@ -874,6 +874,8 @@ mod tests {
             last_check_at: None,
             last_success_at: None,
             last_failure_at: None,
+            command_override: None,
+            env_override: None,
             created_at: 0,
             updated_at: 0,
         }
