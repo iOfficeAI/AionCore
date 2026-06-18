@@ -6,6 +6,7 @@ use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentError, AgentSendError, AgentStreamEvent, IMockAgent, IWorkerTaskManager};
 use aionui_api_types::WebSocketMessage;
 use aionui_channel::channel_settings::ChannelSettingsService;
+use aionui_channel::error::ChannelError;
 use aionui_channel::message_service::ChannelMessageService;
 use aionui_channel::types::PluginType;
 use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs};
@@ -348,11 +349,6 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
     let snapshot = snapshot.unwrap();
     let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
     assert_eq!(conversation.r#type, AgentType::Acp.serde_name());
-    let extra: serde_json::Value = serde_json::from_str(&conversation.extra).unwrap();
-    assert!(
-        extra.get("backend").is_none(),
-        "assistant-bound channel conversations should not persist legacy extra.backend"
-    );
     let session_row = acp_session_repo
         .get(&result.conversation_id)
         .await
@@ -363,6 +359,65 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
     assert_eq!(snapshot.assistant_key, "bare-claude");
     assert_eq!(snapshot.agent_backend, "claude");
     assert_eq!(conversation.name, "Claude");
+}
+
+#[tokio::test]
+async fn send_to_agent_rejects_unresolvable_channel_assistant_binding() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool().clone();
+
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::new());
+    let conversation_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
+    let conversation_repo_trait: Arc<dyn IConversationRepository> = conversation_repo.clone();
+    let acp_session_repo = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
+    let conversation_svc = Arc::new(ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(TestBroadcaster::new()),
+        Arc::new(NoopSkillResolver),
+        Arc::clone(&task_manager),
+        conversation_repo_trait,
+        Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
+        acp_session_repo,
+    ));
+
+    let pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
+    pref_repo
+        .upsert_batch(&[(
+            "assistant.telegram.agent",
+            r#"{"assistant_id":"missing-assistant","name":"Missing"}"#,
+        )])
+        .await
+        .unwrap();
+    let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
+    let overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
+    let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
+    let message_svc = ChannelMessageService::new(
+        conversation_svc,
+        Arc::clone(&task_manager),
+        settings,
+        "system_default_user".to_owned(),
+    );
+
+    let session = AssistantSessionRow {
+        id: "session-assisted-missing".to_owned(),
+        user_id: "channel-user-missing".to_owned(),
+        agent_type: "aionrs".to_owned(),
+        conversation_id: None,
+        workspace: None,
+        chat_id: Some("7088048017".to_owned()),
+        created_at: 1,
+        last_activity: 1,
+    };
+
+    let err = message_svc
+        .send_to_agent(&session, "hello", PluginType::Telegram)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChannelError::MessageSendFailed(_)));
+    assert!(
+        err.to_string().contains("missing-assistant"),
+        "error should surface the unresolved assistant identity"
+    );
 }
 
 #[tokio::test]

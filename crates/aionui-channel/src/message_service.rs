@@ -125,7 +125,11 @@ impl ChannelMessageService {
         platform: PluginType,
     ) -> Result<String, ChannelError> {
         let source = platform_to_source(platform);
-        let agent_config = self.settings.get_agent_config(platform).await?;
+        let agent_config = self
+            .settings
+            .get_agent_config(platform)
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
         let assistant_setting = self.settings.get_assistant_setting(platform).await?;
         let assistant_id = assistant_setting
             .as_ref()

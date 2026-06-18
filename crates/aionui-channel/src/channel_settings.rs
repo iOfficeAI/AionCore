@@ -77,17 +77,21 @@ impl ChannelSettingsService {
         };
 
         if let Some(setting) = parse_channel_assistant_setting(&pref.value) {
-            if let Some(assistant_id) = setting.assistant_id.as_deref()
-                && let Some(resolved) = self.resolve_assistant_agent_config(assistant_id).await?
-            {
-                debug!(
-                    platform = %platform,
-                    assistant_id,
-                    agent_type = %resolved.agent_type,
-                    backend = ?resolved.backend,
-                    "resolved channel agent config from assistant identity"
-                );
-                return Ok(resolved);
+            if let Some(assistant_id) = setting.assistant_id.as_deref() {
+                if let Some(resolved) = self.resolve_assistant_agent_config(assistant_id).await? {
+                    debug!(
+                        platform = %platform,
+                        assistant_id,
+                        agent_type = %resolved.agent_type,
+                        backend = ?resolved.backend,
+                        "resolved channel agent config from assistant identity"
+                    );
+                    return Ok(resolved);
+                }
+
+                return Err(ChannelError::InvalidConfig(format!(
+                    "Channel assistant binding references unresolved assistant identity: {assistant_id}"
+                )));
             }
 
             if let Some(at) = setting.agent_type.as_deref() {
@@ -740,6 +744,25 @@ mod tests {
         let config = svc.get_agent_config(PluginType::Telegram).await.unwrap();
         assert_eq!(config.agent_type, "acp");
         assert_eq!(config.backend.as_deref(), Some("codex"));
+    }
+
+    #[tokio::test]
+    async fn agent_config_errors_when_assistant_identity_cannot_resolve() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.telegram.agent",
+            r#"{"assistant_id":"missing-assistant","name":"Missing"}"#,
+        )]));
+        let definition_repo: Arc<dyn IAssistantDefinitionRepository> =
+            Arc::new(MockAssistantDefinitionRepo { rows: vec![] });
+        let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
+        let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
+
+        let err = svc.get_agent_config(PluginType::Telegram).await.unwrap_err();
+        assert!(matches!(err, ChannelError::InvalidConfig(_)));
+        assert!(
+            err.to_string().contains("missing-assistant"),
+            "error should name the unresolved assistant identity"
+        );
     }
 
     // ── get_model_config ──────────────────────────────────────────────
