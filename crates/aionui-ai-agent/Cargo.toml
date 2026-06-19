@@ -33,6 +33,7 @@ thiserror.workspace = true
 tracing.workspace = true
 which.workspace = true
 aion-agent.workspace = true
+aion-providers.workspace = true
 aion-types.workspace = true
 aion-protocol.workspace = true
 aion-config.workspace = true

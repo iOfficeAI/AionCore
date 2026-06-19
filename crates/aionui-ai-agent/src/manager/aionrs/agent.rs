@@ -24,6 +24,8 @@ use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
 
+use super::error::aionrs_engine_error_to_send_error;
+
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
@@ -257,14 +259,13 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
                 Ok(())
             }
             Some(Err(e)) => {
-                let error_msg = format!("Aionrs agent error: {e}");
                 error!(
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,
                     error = %ErrorChain(&e),
                     "Aionrs engine.run() failed, emitting Error"
                 );
-                let send_error = aionrs_engine_error_to_send_error(error_msg);
+                let send_error = aionrs_engine_error_to_send_error(&e);
                 self.runtime.emit_error_data(send_error.stream_error().clone());
                 Err(send_error)
             }
@@ -393,18 +394,6 @@ fn parse_session_mode(s: &str) -> SessionMode {
         "yolo" => SessionMode::Yolo,
         _ => SessionMode::Default,
     }
-}
-
-fn aionrs_engine_error_to_send_error(error_msg: String) -> AgentSendError {
-    let lower = error_msg.to_ascii_lowercase();
-    if lower.contains("provider error")
-        || lower.contains("provider:")
-        || lower.contains("api error:")
-        || lower.contains("repeatedly returned malformed tool calls")
-    {
-        return AgentSendError::from_agent_error(AgentError::bad_gateway(error_msg));
-    }
-    AgentSendError::from_agent_error(AgentError::internal(error_msg))
 }
 
 #[cfg(test)]
@@ -616,58 +605,5 @@ mod tests {
             AgentStreamEvent::Finish(_) => {}
             other => panic!("Expected Finish, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn aionrs_provider_connection_error_is_user_llm_provider_error() {
-        let send_error = aionrs_engine_error_to_send_error(
-            "Aionrs agent error: Provider error: Connection error: Signable request error: failed to create canonical request"
-                .to_owned(),
-        );
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UserLlmProviderConfigError)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(false));
-    }
-
-    #[test]
-    fn aionrs_api_connection_error_is_user_llm_provider_network_error() {
-        let send_error = aionrs_engine_error_to_send_error(
-            "Aionrs agent error: API error: Connection error: error decoding response body".to_owned(),
-        );
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UserLlmProviderNetworkError)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(true));
-    }
-
-    #[test]
-    fn aionrs_repeated_malformed_tool_call_is_user_llm_provider_error() {
-        let send_error = aionrs_engine_error_to_send_error(
-            "Aionrs agent error: provider repeatedly returned malformed tool calls (3/3); stopped to avoid wasting tokens"
-                .to_owned(),
-        );
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UserLlmProviderInvalidRequest)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(false));
     }
 }

@@ -1,3 +1,5 @@
+mod error;
+
 pub mod agent;
 pub mod history_sanitize;
 
