@@ -10,6 +10,9 @@ pub mod dingtalk;
 #[cfg(feature = "weixin")]
 pub mod weixin;
 
+#[cfg(feature = "mattermost")]
+pub mod mattermost;
+
 #[cfg(feature = "slack")]
 pub mod slack;
 
@@ -35,6 +38,9 @@ pub fn create_plugin(plugin_type: PluginType) -> Option<Box<dyn ChannelPlugin>> 
 
         #[cfg(feature = "weixin")]
         PluginType::Weixin => Some(Box::new(weixin::WeixinPlugin::new())),
+
+        #[cfg(feature = "mattermost")]
+        PluginType::Mattermost => Some(Box::new(mattermost::MattermostPlugin::new())),
 
         #[cfg(feature = "slack")]
         PluginType::Slack => Some(Box::new(slack::SlackPlugin::new())),

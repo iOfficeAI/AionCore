@@ -633,6 +633,7 @@ impl ChannelManager {
             PluginType::Lark => "Lark Bot".into(),
             PluginType::Dingtalk => "DingTalk Bot".into(),
             PluginType::Weixin => "WeChat Bot".into(),
+            PluginType::Mattermost => "Mattermost".into(),
             PluginType::Slack => "Slack Bot".into(),
             PluginType::Discord => "Discord Bot".into(),
         }
@@ -1606,6 +1607,7 @@ mod tests {
         assert_eq!(mgr.default_plugin_name(PluginType::Lark), "Lark Bot");
         assert_eq!(mgr.default_plugin_name(PluginType::Dingtalk), "DingTalk Bot");
         assert_eq!(mgr.default_plugin_name(PluginType::Weixin), "WeChat Bot");
+        assert_eq!(mgr.default_plugin_name(PluginType::Mattermost), "Mattermost");
         assert_eq!(mgr.default_plugin_name(PluginType::Slack), "Slack Bot");
         assert_eq!(mgr.default_plugin_name(PluginType::Discord), "Discord Bot");
     }
