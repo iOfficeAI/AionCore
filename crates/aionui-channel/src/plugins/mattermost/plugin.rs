@@ -20,6 +20,7 @@ use super::types::{
 };
 
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct MattermostPlugin {
     status: PluginStatus,
@@ -233,9 +234,24 @@ async fn connect_once(
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), ChannelError> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(api.websocket_url())
-        .await
-        .map_err(|e| ChannelError::ConnectionFailed(format!("Mattermost WebSocket connect failed: {e}")))?;
+    use tokio_tungstenite::connect_async_tls_with_config;
+
+    let ws_url = api.websocket_url();
+    info!(url = %ws_url, "Mattermost WebSocket connecting");
+
+    let connector = build_ws_tls_connector()?;
+    let (mut ws, _) = tokio::time::timeout(
+        WS_CONNECT_TIMEOUT,
+        connect_async_tls_with_config(&ws_url, None, false, Some(connector)),
+    )
+    .await
+    .map_err(|_| {
+        ChannelError::ConnectionFailed(format!(
+            "Mattermost WebSocket connect timed out after {}s",
+            WS_CONNECT_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|e| ChannelError::ConnectionFailed(format!("Mattermost WebSocket connect failed: {e}")))?;
 
     let auth = serde_json::json!({
         "seq": 1,
@@ -244,8 +260,14 @@ async fn connect_once(
             "token": api.access_token(),
         },
     });
-    ws.send(Message::Text(auth.to_string().into()))
+    tokio::time::timeout(WS_CONNECT_TIMEOUT, ws.send(Message::Text(auth.to_string().into())))
         .await
+        .map_err(|_| {
+            ChannelError::ConnectionFailed(format!(
+                "Mattermost WebSocket auth send timed out after {}s",
+                WS_CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
         .map_err(|e| ChannelError::ConnectionFailed(format!("Mattermost WebSocket auth send failed: {e}")))?;
     info!("Mattermost WebSocket connected");
 
@@ -277,6 +299,32 @@ async fn connect_once(
     }
 }
 
+/// Build a TLS connector for WebSocket connections.
+///
+/// WebSocket upgrade requires HTTP/1.1. Some Mattermost deployments sit behind
+/// reverse proxies that negotiate h2 by ALPN unless the client pins HTTP/1.1.
+fn build_ws_tls_connector() -> Result<tokio_tungstenite::Connector, ChannelError> {
+    use std::sync::Arc;
+    use tokio_tungstenite::Connector;
+
+    let certs = rustls_native_certs::load_native_certs();
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.add_parsable_certificates(certs.certs);
+
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| ChannelError::ConnectionFailed(format!("TLS config error: {e}")))?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    Ok(Connector::Rustls(Arc::new(config)))
+}
+
 async fn handle_ws_text(
     text: &str,
     config: &MattermostConfig,
@@ -294,8 +342,16 @@ async fn handle_ws_text(
     let Some(post) = parse_posted_event(&value) else {
         return;
     };
-    if let Some(msg) = post_to_unified(&post, config, me) {
-        let _ = message_tx.send(msg).await;
+    info!(
+        post_id = %post.id,
+        channel_id = %post.channel_id,
+        user_id = %post.user_id,
+        "Mattermost post event received"
+    );
+    if let Some(msg) = post_to_unified(&post, config, me)
+        && let Err(e) = message_tx.send(msg).await
+    {
+        warn!(error = %e, "Mattermost incoming message dispatch failed");
     }
 }
 
