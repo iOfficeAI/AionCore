@@ -2,7 +2,7 @@ use reqwest::{Client, StatusCode};
 
 use crate::error::ChannelError;
 
-use super::types::{CreatePostRequest, MattermostUser};
+use super::types::{CreatePostRequest, MattermostUser, PatchPostRequest};
 
 #[derive(Clone)]
 pub(crate) struct MattermostApi {
@@ -67,6 +67,27 @@ impl MattermostApi {
             .as_str()
             .map(ToOwned::to_owned)
             .ok_or_else(|| ChannelError::MessageSendFailed("Mattermost post response missing id".into()))
+    }
+
+    pub async fn patch_post(&self, post_id: &str, req: &PatchPostRequest) -> Result<(), ChannelError> {
+        let url = format!("{}/api/v4/posts/{post_id}/patch", self.server_url);
+        let response = self
+            .client
+            .put(url)
+            .bearer_auth(&self.access_token)
+            .json(req)
+            .send()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("Mattermost post patch request failed: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ChannelError::MessageSendFailed(format!(
+                "Mattermost post patch request failed with status {status}"
+            )));
+        }
+
+        Ok(())
     }
 
     pub fn websocket_url(&self) -> String {

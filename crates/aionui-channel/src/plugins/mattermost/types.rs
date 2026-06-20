@@ -89,6 +89,11 @@ pub(crate) struct CreatePostRequest {
     pub root_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PatchPostRequest {
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct MattermostPost {
     pub id: String,

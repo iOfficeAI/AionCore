@@ -16,7 +16,8 @@ use crate::types::{
 
 use super::api::MattermostApi;
 use super::types::{
-    CreatePostRequest, MattermostConfig, MattermostPost, MattermostUser, parse_posted_event, post_to_content,
+    CreatePostRequest, MattermostConfig, MattermostPost, MattermostUser, PatchPostRequest, parse_posted_event,
+    post_to_content,
 };
 
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
@@ -162,11 +163,18 @@ impl ChannelPlugin for MattermostPlugin {
 
     async fn edit_message(
         &self,
-        chat_id: &str,
-        _message_id: &str,
+        _chat_id: &str,
+        message_id: &str,
         message: UnifiedOutgoingMessage,
     ) -> Result<(), ChannelError> {
-        self.send_message(chat_id, message).await.map(|_| ())
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
+        let req = PatchPostRequest {
+            message: message.text.unwrap_or_default(),
+        };
+        api.patch_post(message_id, &req).await
     }
 
     fn active_user_count(&self) -> usize {
@@ -557,6 +565,17 @@ mod tests {
         };
         let value = serde_json::to_value(req).unwrap();
         assert_eq!(value["root_id"], "p1");
+    }
+
+    #[test]
+    fn patch_post_payload_updates_message_only() {
+        let req = PatchPostRequest {
+            message: "updated".into(),
+        };
+        let value = serde_json::to_value(req).unwrap();
+        assert_eq!(value["message"], "updated");
+        assert!(value.get("channel_id").is_none());
+        assert!(value.get("root_id").is_none());
     }
 
     #[test]
