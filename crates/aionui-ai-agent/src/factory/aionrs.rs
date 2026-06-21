@@ -24,6 +24,7 @@ use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
 use aionui_team_prompts::guide as team_guide_prompt;
 
 const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionrs", "codebuddy"];
+const NON_V1_OPENAI_COMPAT_API_ROOTS: &[&str] = &["/api/paas/v4", "/api/v3", "/v2"];
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -259,6 +260,10 @@ pub(crate) fn resolve_aionrs_url_and_compat(
         compat.max_tokens_field = Some("max_completion_tokens".to_owned());
     }
 
+    if mapped_provider == "openai" && has_non_v1_openai_compat_api_root(raw_base_url) {
+        compat.api_path = Some("/chat/completions".to_owned());
+    }
+
     (base_url, compat)
 }
 
@@ -269,6 +274,17 @@ fn is_openai_host(url: &str) -> bool {
         .or_else(|| lower.strip_prefix("http://"))
         .map(|rest| rest == "api.openai.com" || rest.starts_with("api.openai.com/"))
         .unwrap_or(false)
+}
+
+fn has_non_v1_openai_compat_api_root(url: &str) -> bool {
+    let trimmed = url.trim_end_matches('/');
+    let rest = trimmed.split_once("://").map(|(_, rest)| rest).unwrap_or(trimmed);
+    let Some(path_start) = rest.find('/') else {
+        return false;
+    };
+    let path = &rest[path_start..];
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    NON_V1_OPENAI_COMPAT_API_ROOTS.iter().any(|root| path.ends_with(root))
 }
 
 /// Strip trailing `/v1`, `/v1/`, or lone `/` from a base URL so that
@@ -901,6 +917,21 @@ mod tests {
             resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/v1", "openai", false);
         assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com"));
         assert!(compat.max_tokens_field.is_none());
+    }
+
+    #[test]
+    fn resolve_non_v1_openai_compat_roots_use_root_chat_path() {
+        for raw_base_url in [
+            "https://open.bigmodel.cn/api/paas/v4",
+            "https://ark.cn-beijing.volces.com/api/v3",
+            "https://qianfan.baidubce.com/v2",
+            "https://open.bigmodel.cn/api/paas/v4/",
+        ] {
+            let (base_url, compat) = resolve_aionrs_url_and_compat("custom", raw_base_url, "openai", false);
+            assert_eq!(base_url.as_deref(), Some(raw_base_url.trim_end_matches('/')));
+            assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
+            assert!(compat.max_tokens_field.is_none());
+        }
     }
 
     #[test]
