@@ -23,7 +23,7 @@ use aionui_api_types::{
     SlashCommandCompletionBehavior, SlashCommandItem,
 };
 use aionui_common::{
-    AgentKillReason, AgentType, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case,
+    AgentKillReason, AgentType, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case, now_ms,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -935,6 +935,37 @@ impl AcpAgentManager {
     }
 }
 
+fn log_idle_acp_shutdown_started(conversation_id: &str, backend: &str, session_id: Option<&str>, pid: u32) {
+    info!(
+        conversation_id = %conversation_id,
+        backend = %backend,
+        session_id = %session_id.unwrap_or("none"),
+        pid,
+        reason = %"IdleTimeout",
+        "Idle kill: ACP shutdown started"
+    );
+}
+
+fn log_idle_acp_cancel_sent(conversation_id: &str, backend: &str, session_id: &str, pid: u32) {
+    info!(
+        conversation_id = %conversation_id,
+        backend = %backend,
+        session_id = %session_id,
+        pid,
+        "Idle kill: ACP session cancel sent"
+    );
+}
+
+fn log_idle_acp_cancel_skipped(conversation_id: &str, backend: &str, pid: u32) {
+    info!(
+        conversation_id = %conversation_id,
+        backend = %backend,
+        pid,
+        reason = %"no_session_id",
+        "Idle kill: ACP session cancel skipped"
+    );
+}
+
 #[async_trait::async_trait]
 impl crate::agent_task::IAgentTask for AcpAgentManager {
     fn agent_type(&self) -> AgentType {
@@ -1017,7 +1048,8 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
                 Ok(())
             }
             Err(err) => {
-                let send_error = err.to_agent_send_error();
+                let backend = self.params.metadata.backend.as_deref();
+                let send_error = err.to_agent_send_error_for_backend(backend);
                 let agent_err = err.into_agent_error();
                 // Build a CloseReason that captures whatever context we still
                 // have. Two cases matter:
@@ -1082,34 +1114,65 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
         // Mark closing to prevent reconnect attempts
         self.permission_router.set_closing();
 
-        // Cancel the current session if active
-        if let Ok(session) = self.session.try_read()
-            && let Some(sid) = session.session_id()
-        {
+        let backend = self.params.metadata.backend.as_deref().unwrap_or("unknown");
+        let pid = self.process.pid();
+        let idle_timeout = matches!(reason, Some(AgentKillReason::IdleTimeout));
+        let session_id = self
+            .session
+            .try_read()
+            .ok()
+            .and_then(|session| session.session_id().map(ToOwned::to_owned));
+
+        if idle_timeout {
+            log_idle_acp_shutdown_started(&self.params.conversation_id, backend, session_id.as_deref(), pid);
+        }
+
+        if let Some(sid) = session_id.as_deref() {
             self.protocol.cancel(CancelNotification::new(SessionId::new(sid)));
+            if idle_timeout {
+                log_idle_acp_cancel_sent(&self.params.conversation_id, backend, sid, pid);
+            }
+        } else if idle_timeout {
+            log_idle_acp_cancel_skipped(&self.params.conversation_id, backend, pid);
         }
 
         let process = Arc::clone(&self.process);
         let grace = Duration::from_millis(ACP_KILL_GRACE_MS);
         let conversation_id = self.params.conversation_id.clone();
-        let pid = process.pid();
+        let process_group_id = process.process_group_id();
+        let backend = backend.to_owned();
+        let idle_timeout = matches!(reason, Some(AgentKillReason::IdleTimeout));
 
         tokio::spawn(async move {
-            if let Err(e) = process.kill(grace).await {
-                // Tag the failure with conversation_id + pid so Sentry can
-                // group these and ops can correlate with the matching
-                // "Killing ACP agent" log line. ELECTRON-1E9: an unannotated
-                // failure here on Windows left the CLI subprocess running
-                // while the manager believed it had been torn down,
-                // producing the "no reply / second send hangs" symptom.
-                error!(
-                    %conversation_id,
-                    pid,
-                    error = %ErrorChain(&e),
-                    "Failed to kill ACP process"
-                );
-            } else {
-                debug!(%conversation_id, pid, "ACP process kill completed");
+            let started_at = now_ms();
+            match process.kill(grace).await {
+                Ok(()) => {
+                    if idle_timeout {
+                        info!(
+                            %conversation_id,
+                            backend,
+                            pid,
+                            process_group_id,
+                            elapsed_ms = now_ms().saturating_sub(started_at),
+                            result = "ok",
+                            "Idle kill: ACP process shutdown completed"
+                        );
+                    } else {
+                        debug!(%conversation_id, pid, process_group_id, "ACP process kill completed");
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        %conversation_id,
+                        backend,
+                        pid,
+                        process_group_id,
+                        elapsed_ms = now_ms().saturating_sub(started_at),
+                        result = "error",
+                        error = %ErrorChain(&e),
+                        "Idle kill: ACP process shutdown completed"
+                    );
+                }
             }
         });
 
@@ -1189,6 +1252,42 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
+    fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt;
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedBuf(Arc::clone(&buffer))
+        };
+
+        let subscriber = fmt::Subscriber::builder()
+            .with_max_level(max_level)
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
     #[test]
     fn exit_status_parts_handles_missing_status() {
         assert_eq!(exit_status_parts(None), (None, None));
@@ -1223,6 +1322,33 @@ mod tests {
     fn rate_limited_has_no_colon_returns_full_string() {
         let err = AgentError::RateLimited;
         assert_eq!(user_facing_message(&err), "Rate limited");
+    }
+
+    #[test]
+    fn idle_acp_shutdown_started_log_contains_diagnostic_context() {
+        let captured = capture_logs(tracing::Level::INFO, || {
+            super::log_idle_acp_shutdown_started("conv_openclaw", "openclaw", Some("session_123"), 4242);
+        });
+
+        assert!(captured.contains("Idle kill: ACP shutdown started"));
+        assert!(captured.contains("conversation_id=conv_openclaw"));
+        assert!(captured.contains("backend=openclaw"));
+        assert!(captured.contains("session_id=session_123"));
+        assert!(captured.contains("pid=4242"));
+        assert!(captured.contains("reason=IdleTimeout"));
+    }
+
+    #[test]
+    fn idle_acp_cancel_skipped_log_contains_reason() {
+        let captured = capture_logs(tracing::Level::INFO, || {
+            super::log_idle_acp_cancel_skipped("conv_openclaw", "openclaw", 4242);
+        });
+
+        assert!(captured.contains("Idle kill: ACP session cancel skipped"));
+        assert!(captured.contains("conversation_id=conv_openclaw"));
+        assert!(captured.contains("backend=openclaw"));
+        assert!(captured.contains("pid=4242"));
+        assert!(captured.contains("reason=no_session_id"));
     }
 
     #[test]

@@ -126,7 +126,17 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
 
     fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
-            info!(conversation_id = %id, ?reason, "Killing agent task");
+            let agent_type = slot.get().map(|agent| agent.agent_type());
+            if matches!(reason, Some(AgentKillReason::IdleTimeout)) {
+                info!(
+                    conversation_id = %id,
+                    ?agent_type,
+                    reason = %"IdleTimeout",
+                    "Idle kill: task removed from manager"
+                );
+            } else {
+                info!(conversation_id = %id, ?reason, "Killing agent task");
+            }
             if let Some(agent) = slot.get() {
                 agent.kill(reason)?;
             }
@@ -140,7 +150,17 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
-            info!(conversation_id = %id, ?reason, "Killing agent task (awaitable)");
+            let agent_type = slot.get().map(|agent| agent.agent_type());
+            if matches!(reason, Some(AgentKillReason::IdleTimeout)) {
+                info!(
+                    conversation_id = %id,
+                    ?agent_type,
+                    reason = %"IdleTimeout",
+                    "Idle kill: task removed from manager"
+                );
+            } else {
+                info!(conversation_id = %id, ?reason, "Killing agent task (awaitable)");
+            }
             if let Some(agent) = slot.get() {
                 return agent.kill_and_wait(reason);
             }
@@ -172,11 +192,28 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             .iter()
             .filter_map(|entry| {
                 let agent = entry.value().get()?;
-                // Only ACP agents participate in idle cleanup per API Spec
-                (agent.agent_type() == AgentType::Acp
-                    && agent.status() == Some(ConversationStatus::Finished)
-                    && (now - agent.last_activity_at()) > idle_threshold_ms)
-                    .then(|| entry.key().clone())
+                let agent_type = agent.agent_type();
+                let status = agent.status();
+                let last_activity_at = agent.last_activity_at();
+                let idle_ms = now.saturating_sub(last_activity_at);
+
+                let selected = agent_type == AgentType::Acp
+                    && status == Some(ConversationStatus::Finished)
+                    && idle_ms > idle_threshold_ms;
+                if selected {
+                    info!(
+                        conversation_id = %entry.key(),
+                        ?agent_type,
+                        ?status,
+                        idle_ms,
+                        threshold_ms = idle_threshold_ms,
+                        last_activity_at,
+                        "Idle scan: selected idle agent"
+                    );
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -325,6 +362,42 @@ mod tests {
             async move { Ok(mock_instance(MockAgent::new(opts.conversation_id(), None))) }.boxed()
         });
         WorkerTaskManagerImpl::new(factory)
+    }
+
+    fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt;
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedBuf(Arc::clone(&buffer))
+        };
+
+        let subscriber = fmt::Subscriber::builder()
+            .with_max_level(max_level)
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
     }
 
     /// Two [`AgentInstance`]s point to the same underlying agent iff they
@@ -513,6 +586,53 @@ mod tests {
         let idle = mgr.collect_idle(300_000); // 5-min threshold
         assert_eq!(idle.len(), 1);
         assert_eq!(idle[0], "conv-stale");
+    }
+
+    #[test]
+    fn collect_idle_logs_selected_agent_with_idle_fields() {
+        let manager = WorkerTaskManagerImpl::new(Arc::new(|_options| {
+            async { Err(AgentError::bad_gateway("not used")) }.boxed()
+        }));
+        let now = now_ms();
+        let agent =
+            Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)).with_last_activity(now - 10_000));
+        let slot = Arc::new(OnceCell::new());
+        assert!(slot.set(AgentInstance::Mock(agent)).is_ok());
+        manager.tasks.insert("conv_idle".to_owned(), slot);
+
+        let captured = capture_logs(tracing::Level::INFO, || {
+            let ids = manager.collect_idle(5_000);
+            assert_eq!(ids, vec!["conv_idle".to_owned()]);
+        });
+
+        assert!(captured.contains("Idle scan: selected idle agent"));
+        assert!(captured.contains("conversation_id=conv_idle"));
+        assert!(captured.contains("agent_type=Acp"));
+        assert!(captured.contains("status=Some(Finished)"));
+        assert!(captured.contains("idle_ms="));
+        assert!(captured.contains("threshold_ms=5000"));
+        assert!(captured.contains("last_activity_at="));
+    }
+
+    #[test]
+    fn kill_and_wait_logs_idle_task_removed_with_agent_type() {
+        let manager = WorkerTaskManagerImpl::new(Arc::new(|_options| {
+            async { Err(AgentError::bad_gateway("not used")) }.boxed()
+        }));
+        let agent = Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)));
+        let slot = Arc::new(OnceCell::new());
+        assert!(slot.set(AgentInstance::Mock(agent)).is_ok());
+        manager.tasks.insert("conv_idle".to_owned(), slot);
+
+        let captured = capture_logs(tracing::Level::INFO, || {
+            let wait = manager.kill_and_wait("conv_idle", Some(AgentKillReason::IdleTimeout));
+            drop(wait);
+        });
+
+        assert!(captured.contains("Idle kill: task removed from manager"));
+        assert!(captured.contains("conversation_id=conv_idle"));
+        assert!(captured.contains("agent_type=Some(Acp)"));
+        assert!(captured.contains("reason=IdleTimeout"));
     }
 
     #[test]
