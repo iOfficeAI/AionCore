@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.35](https://github.com/iOfficeAI/AionCore/compare/v0.1.34...v0.1.35) (2026-06-22)
+
+
+### Bug Fixes
+
+* **agent:** support aionrs 0.1.31 ([#503](https://github.com/iOfficeAI/AionCore/issues/503)) ([d612602](https://github.com/iOfficeAI/AionCore/commit/d612602aa3bfa88bef60a85a1aa5cb40634055fd))
+
 ## [0.1.34](https://github.com/iOfficeAI/AionCore/compare/v0.1.33...v0.1.34) (2026-06-22)
 
 
