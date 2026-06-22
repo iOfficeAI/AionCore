@@ -1017,7 +1017,8 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
                 Ok(())
             }
             Err(err) => {
-                let send_error = err.to_agent_send_error();
+                let backend = self.params.metadata.backend.as_deref();
+                let send_error = err.to_agent_send_error_for_backend(backend);
                 let agent_err = err.into_agent_error();
                 // Build a CloseReason that captures whatever context we still
                 // have. Two cases matter:
