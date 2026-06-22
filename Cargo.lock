@@ -117,8 +117,8 @@ dependencies = [
 
 [[package]]
 name = "aion-agent"
-version = "0.1.30"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.30#f048034140aa7974b82fd38e5e492d5851329c00"
+version = "0.1.31"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.31#cd519955545cd2669c0877d979c2c1aad2e446c1"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -147,8 +147,8 @@ dependencies = [
 
 [[package]]
 name = "aion-compact"
-version = "0.1.30"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.30#f048034140aa7974b82fd38e5e492d5851329c00"
+version = "0.1.31"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.31#cd519955545cd2669c0877d979c2c1aad2e446c1"
 dependencies = [
  "regex",
  "serde",
@@ -158,8 +158,8 @@ dependencies = [
 
 [[package]]
 name = "aion-config"
-version = "0.1.30"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.30#f048034140aa7974b82fd38e5e492d5851329c00"
+version = "0.1.31"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.31#cd519955545cd2669c0877d979c2c1aad2e446c1"
 dependencies = [
  "aion-compact",
  "aion-types",
@@ -182,8 +182,8 @@ dependencies = [
 
 [[package]]
 name = "aion-mcp"
-version = "0.1.30"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.30#f048034140aa7974b82fd38e5e492d5851329c00"
+version = "0.1.31"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.31#cd519955545cd2669c0877d979c2c1aad2e446c1"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -203,8 +203,8 @@ dependencies = [
 
 [[package]]
 name = "aion-memory"
-version = "0.1.30"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.30#f048034140aa7974b82fd38e5e492d5851329c00"
+version = "0.1.31"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.31#cd519955545cd2669c0877d979c2c1aad2e446c1"
 dependencies = [
  "aion-config",
  "chrono",
@@ -217,8 +217,8 @@ dependencies = [
 
 [[package]]
 name = "aion-protocol"
-version = "0.1.30"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.30#f048034140aa7974b82fd38e5e492d5851329c00"
+version = "0.1.31"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.31#cd519955545cd2669c0877d979c2c1aad2e446c1"
 dependencies = [
  "aion-types",
  "serde",
@@ -230,8 +230,8 @@ dependencies = [
 
 [[package]]
 name = "aion-providers"
-version = "0.1.30"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.30#f048034140aa7974b82fd38e5e492d5851329c00"
+version = "0.1.31"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.31#cd519955545cd2669c0877d979c2c1aad2e446c1"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -258,8 +258,8 @@ dependencies = [
 
 [[package]]
 name = "aion-skills"
-version = "0.1.30"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.30#f048034140aa7974b82fd38e5e492d5851329c00"
+version = "0.1.31"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.31#cd519955545cd2669c0877d979c2c1aad2e446c1"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -284,8 +284,8 @@ dependencies = [
 
 [[package]]
 name = "aion-tools"
-version = "0.1.30"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.30#f048034140aa7974b82fd38e5e492d5851329c00"
+version = "0.1.31"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.31#cd519955545cd2669c0877d979c2c1aad2e446c1"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -304,8 +304,8 @@ dependencies = [
 
 [[package]]
 name = "aion-types"
-version = "0.1.30"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.30#f048034140aa7974b82fd38e5e492d5851329c00"
+version = "0.1.31"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.31#cd519955545cd2669c0877d979c2c1aad2e446c1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6484,7 +6484,7 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.30#f048034140aa7974b82fd38e5e492d5851329c00"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.31#cd519955545cd2669c0877d979c2c1aad2e446c1"
 
 [[package]]
 name = "writeable"

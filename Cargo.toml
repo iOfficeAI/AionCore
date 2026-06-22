@@ -53,12 +53,12 @@ aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
-aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
-aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
-aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
-aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
-aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
+aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.31" }
+aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.31" }
+aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.31" }
+aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.31" }
+aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.31" }
+aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.31" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
