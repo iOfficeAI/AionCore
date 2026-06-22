@@ -1080,6 +1080,23 @@ impl TeamSessionService {
         ))
     }
 
+    pub(crate) async fn accept_assistant_first_team_run(
+        &self,
+        team_id: &str,
+        lead_slot_id: &str,
+    ) -> Result<TeamRunAckResponse, TeamError> {
+        let entry = self
+            .sessions
+            .get(team_id)
+            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+        let manager = entry.session.team_run_manager().clone();
+        drop(entry);
+
+        manager
+            .accept_user_message(lead_slot_id, TeamRunTargetRole::Lead, true, None)
+            .await
+    }
+
     pub(crate) async fn notify_leader_spawn_attach_failed(
         &self,
         team_id: &str,

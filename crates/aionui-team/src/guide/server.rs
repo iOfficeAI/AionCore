@@ -328,10 +328,52 @@ async fn exec_create_team(
         }
     };
 
+    let lead_slot_id = match team.leader_assistant_id.as_deref().or_else(|| {
+        team.assistants
+            .iter()
+            .find(|assistant| assistant.role == "leader" || assistant.role == "lead")
+            .map(|assistant| assistant.slot_id.as_str())
+    }) {
+        Some(slot_id) if !slot_id.is_empty() => slot_id,
+        _ => {
+            warn!(
+                team_id = %team.id,
+                "Guide HTTP: aion_create_team created team but response did not include a leader slot"
+            );
+            return error_response("Created team is missing a leader slot.");
+        }
+    };
+
+    let team_run = match svc.accept_assistant_first_team_run(&team.id, lead_slot_id).await {
+        Ok(ack) => ack,
+        Err(error) => {
+            warn!(
+                team_id = %team.id,
+                lead_slot_id,
+                error = %error,
+                "Guide HTTP: aion_create_team created team but failed to open assistant-first TeamRun"
+            );
+            let route = format!("/team/{}", team.id);
+            return serde_json::json!({
+                "teamId": team.id,
+                "name": team.name,
+                "route": route,
+                "status": "team_created",
+                "error": GUIDE_NO_ACTIVE_TEAM_RUN_HANDOFF_ERROR,
+                "next_step": GUIDE_NO_ACTIVE_TEAM_RUN_HANDOFF_ERROR
+            });
+        }
+    };
+
     let route = format!("/team/{}", team.id);
-    info!(team_id = %team.id, "Guide HTTP: aion_create_team succeeded");
+    info!(
+        team_id = %team.id,
+        team_run_id = %team_run.team_run_id,
+        "Guide HTTP: aion_create_team succeeded"
+    );
     serde_json::json!({
         "teamId": team.id,
+        "teamRunId": team_run.team_run_id,
         "name": team.name,
         "route": route,
         "status": "team_created",
@@ -985,6 +1027,108 @@ mod tests {
         assert!(next_step.contains("assistant_id"));
         assert!(next_step.contains("Available Assistants for Spawning"));
         assert!(next_step.contains("claude/codex"));
+    }
+
+    #[tokio::test]
+    async fn create_team_opens_active_team_run_for_assistant_first_tools() {
+        let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+            row: AssistantDefinitionRow {
+                definition_id: "def-guide-teamrun".into(),
+                assistant_key: "assistant-teamrun".into(),
+                source: "user".into(),
+                owner_type: "user".into(),
+                source_ref: None,
+                source_version: None,
+                source_hash: None,
+                name: "TeamRun Assistant".into(),
+                name_i18n: "{}".into(),
+                description: None,
+                description_i18n: "{}".into(),
+                avatar_type: "emoji".into(),
+                avatar_value: Some("🤖".into()),
+                agent_backend: "claude".into(),
+                rule_resource_type: "inline".into(),
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: "[]".into(),
+                recommended_prompts_i18n: "{}".into(),
+                default_model_mode: "auto".into(),
+                default_model_value: None,
+                default_permission_mode: "auto".into(),
+                default_permission_value: None,
+                default_skills_mode: "auto".into(),
+                default_skill_ids: "[]".into(),
+                custom_skill_names: "[]".into(),
+                default_disabled_builtin_skill_ids: "[]".into(),
+                default_mcps_mode: "auto".into(),
+                default_mcp_ids: "[]".into(),
+                created_at: 0,
+                updated_at: 0,
+                deleted_at: None,
+            },
+        });
+        let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
+            row: AssistantOverlayRow {
+                definition_id: "def-guide-teamrun".into(),
+                enabled: true,
+                sort_order: 0,
+                agent_backend_override: Some("claude".into()),
+                last_used_at: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        });
+        let (svc, _team_repo, _task_manager, conv_repo) =
+            setup_with_assistants_team_repo_and_conversation_repo(definition_repo, overlay_repo);
+
+        conv_repo
+            .create(&ConversationRow {
+                id: "caller-conv-teamrun".into(),
+                user_id: "system_default_user".into(),
+                name: "Caller".into(),
+                r#type: "acp".into(),
+                pinned: false,
+                pinned_at: None,
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::json!({
+                    "assistant_id": "assistant-teamrun",
+                    "workspace": "/tmp/guide-teamrun-workspace"
+                })
+                .to_string(),
+                model: None,
+                status: Some("completed".into()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed caller conversation");
+
+        let server = GuideMcpServer::start().await.expect("start guide server");
+        server.set_service(Arc::downgrade(&svc)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/tool", server.http_port()))
+            .header("Authorization", format!("Bearer {}", server.auth_token()))
+            .json(&serde_json::json!({
+                "tool": "aion_create_team",
+                "args": { "summary": "create a debate team" },
+                "conversation_id": "caller-conv-teamrun",
+                "user_id": "system_default_user"
+            }))
+            .send()
+            .await
+            .expect("call guide create team");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: serde_json::Value = resp.json().await.expect("guide create team response");
+        let team_id = body["teamId"].as_str().expect("team id in response");
+
+        assert!(is_run_scoped_guide_team_tool("team_spawn_agent"));
+        svc.require_active_team_run_for_team_work(team_id)
+            .await
+            .expect("assistant-first create_team should open a TeamRun before run-scoped tools are used");
     }
 
     #[tokio::test]
