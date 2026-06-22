@@ -148,16 +148,22 @@ pub struct TryConnectCustomAgentRequest {
 
 /// Outcome of [`TryConnectCustomAgentRequest`].
 ///
-/// Tagged enum: `step` distinguishes the three states the frontend's
-/// Alert component renders (success → green, fail_cli → red,
-/// fail_acp → yellow). `error` carries a human-readable reason for the
-/// two failure variants.
+/// Tagged enum: `step` distinguishes the states the frontend's Alert component
+/// renders (success → green, fail_cli → red, fail_acp → yellow, fail_auth →
+/// yellow with a "needs login" hint). `error` carries a human-readable reason
+/// for the failure variants.
+///
+/// The probe reaches `session/new` (not just `initialize`), so `fail_auth`
+/// distinguishes "reachable but not authorized" (ACP `auth_required`,
+/// JSON-RPC `-32000`) from other ACP failures — `initialize` alone cannot
+/// tell these apart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
 pub enum TryConnectCustomAgentResponse {
     Success,
     FailCli { error: String },
     FailAcp { error: String },
+    FailAuth { error: String },
 }
 
 /// Query parameters for workspace browse.
@@ -309,6 +315,16 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&fail).unwrap(),
             serde_json::json!({"step":"fail_cli","error":"not found"})
+        );
+
+        // Reachable-but-unauthorized is its own tag so the UI can show a
+        // "needs login" hint instead of a generic ACP failure.
+        let auth = TryConnectCustomAgentResponse::FailAuth {
+            error: "requires login".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&auth).unwrap(),
+            serde_json::json!({"step":"fail_auth","error":"requires login"})
         );
     }
 

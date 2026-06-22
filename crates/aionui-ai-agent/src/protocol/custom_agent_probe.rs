@@ -24,6 +24,9 @@ use tracing::{debug, warn};
 
 use crate::capability::cli_process::CliAgentProcess;
 use crate::protocol::acp::AcpProtocol;
+use crate::protocol::error::AcpError;
+
+use agent_client_protocol::schema::NewSessionRequest;
 
 /// Step 2 overall timeout. Belt-and-suspenders: `AcpProtocol::connect`
 /// already caps the initialize RPC at 30 s, but a CLI that hangs
@@ -67,10 +70,9 @@ pub async fn try_connect_custom_agent(
     };
 
     let outcome = match tokio::time::timeout(STEP2_TIMEOUT, run_handshake(&proc)).await {
-        Ok(Ok(())) => TryConnectCustomAgentResponse::Success,
-        Ok(Err(msg)) => TryConnectCustomAgentResponse::FailAcp { error: msg },
+        Ok(outcome) => outcome.into_response(),
         Err(_) => TryConnectCustomAgentResponse::FailAcp {
-            error: format!("ACP initialize did not complete within {}s", STEP2_TIMEOUT.as_secs()),
+            error: format!("ACP handshake did not complete within {}s", STEP2_TIMEOUT.as_secs()),
         },
     };
 
@@ -144,25 +146,54 @@ impl Drop for ProbeProcessGuard<'_> {
     }
 }
 
-pub(crate) async fn acp_initialize_command_spec(spec: CommandSpec, data_dir: &Path) -> Result<(), String> {
-    let proc = CliAgentProcess::spawn_for_sdk(spec, data_dir)
-        .await
-        .map_err(|e| format!("spawn failed: {e}"))?;
+/// Probe a pre-built [`CommandSpec`] (used by the builtin managed-agent path).
+///
+/// Runs the same Step 2 handshake as [`try_connect_custom_agent`] —
+/// `initialize` followed by `session/new` — so auth-gated builtin agents
+/// (e.g. gemini logged out) surface as [`TryConnectCustomAgentResponse::FailAuth`]
+/// rather than appearing online.
+pub(crate) async fn acp_probe_command_spec(spec: CommandSpec, data_dir: &Path) -> TryConnectCustomAgentResponse {
+    let proc = match CliAgentProcess::spawn_for_sdk(spec, data_dir).await {
+        Ok(proc) => proc,
+        Err(e) => return TryConnectCustomAgentResponse::FailAcp { error: format!("spawn failed: {e}") },
+    };
 
     // From here on, the process tree is reaped on every exit path, including
     // cancellation when an outer timeout drops this future.
     let _guard = ProbeProcessGuard { proc: &proc };
 
-    run_handshake(&proc).await
+    run_handshake(&proc).await.into_response()
 }
 
-async fn run_handshake(proc: &CliAgentProcess) -> Result<(), String> {
-    let (stdin, stdout) = proc
-        .take_stdio()
-        .await
-        .ok_or_else(|| "stdio not available after spawn_for_sdk".to_string())?;
+/// Result of the Step 2 probe (`initialize` + `session/new`).
+///
+/// The probe reaches `session/new` so it can tell "reachable but not
+/// authorized" (`Auth`) apart from other ACP failures (`Fail`) — `initialize`
+/// alone returns `authMethods` even for already-authorized agents and cannot
+/// make this distinction.
+enum ProbeOutcome {
+    Ok,
+    Auth(String),
+    Fail(String),
+}
 
-    // Throwaway channels — we only care about init handshake succeeding.
+impl ProbeOutcome {
+    fn into_response(self) -> TryConnectCustomAgentResponse {
+        match self {
+            ProbeOutcome::Ok => TryConnectCustomAgentResponse::Success,
+            ProbeOutcome::Auth(error) => TryConnectCustomAgentResponse::FailAuth { error },
+            ProbeOutcome::Fail(error) => TryConnectCustomAgentResponse::FailAcp { error },
+        }
+    }
+}
+
+async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
+    let Some((stdin, stdout)) = proc.take_stdio().await else {
+        return ProbeOutcome::Fail("stdio not available after spawn_for_sdk".to_string());
+    };
+
+    // Throwaway channels — a probe session never sends a prompt, so no events,
+    // permission requests, or notifications are consumed.
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (permission_tx, _permission_rx) = mpsc::channel(4);
     let (notification_tx, _notification_rx) = mpsc::channel(4);
@@ -173,16 +204,12 @@ async fn run_handshake(proc: &CliAgentProcess) -> Result<(), String> {
     // `AcpProtocol::connect` call would block on its internal 30 s
     // timeout waiting for an `initialize` reply that will never arrive.
     let connect = AcpProtocol::connect(stdin, stdout, event_tx, permission_tx, notification_tx);
-    tokio::select! {
+    let protocol = tokio::select! {
         biased;
-        res = connect => {
-            let protocol = res.map_err(|e| format!("ACP initialize failed: {e}"))?;
-            // We only care that the handshake succeeded. Drop `protocol` so
-            // its shutdown oneshot fires before the outer cleanup path (or the
-            // drop guard for timeout-cancelled callers) reaps the process tree.
-            drop(protocol);
-            Ok(())
-        }
+        res = connect => match res {
+            Ok(protocol) => protocol,
+            Err(e) => return ProbeOutcome::Fail(format!("ACP initialize failed: {e}")),
+        },
         exit = proc.wait_for_exit() => {
             let stderr = proc.take_stderr().await;
             let stderr = stderr.trim();
@@ -190,13 +217,31 @@ async fn run_handshake(proc: &CliAgentProcess) -> Result<(), String> {
                 Some(s) => format!("{s}"),
                 None => "unknown".to_string(),
             };
-            if stderr.is_empty() {
-                Err(format!("CLI exited before ACP initialize completed (status={status})"))
+            return if stderr.is_empty() {
+                ProbeOutcome::Fail(format!("CLI exited before ACP initialize completed (status={status})"))
             } else {
-                Err(format!("CLI exited before ACP initialize completed (status={status}): {stderr}"))
-            }
+                ProbeOutcome::Fail(format!("CLI exited before ACP initialize completed (status={status}): {stderr}"))
+            };
         }
-    }
+    };
+
+    // `initialize` only proves the agent speaks ACP, not that it is usable.
+    // Open a real session (no prompt) so an auth-gated agent surfaces its
+    // `auth_required` error here instead of silently appearing "online".
+    let outcome = match protocol.new_session(NewSessionRequest::new(std::env::temp_dir())).await {
+        Ok(_) => ProbeOutcome::Ok,
+        Err(AcpError::AuthRequired) => {
+            ProbeOutcome::Auth("Agent reachable but requires login/authorization".to_string())
+        }
+        Err(e) => ProbeOutcome::Fail(format!("ACP session/new failed: {e}")),
+    };
+
+    // Drop `protocol` so its shutdown oneshot fires before the outer cleanup
+    // path (or the drop guard for timeout-cancelled callers) reaps the process
+    // tree. The probe session is throwaway; the process-group kill in the
+    // caller tears down the session along with the CLI.
+    drop(protocol);
+    outcome
 }
 
 #[cfg(test)]
@@ -255,7 +300,7 @@ mod tests {
         let _ = aionui_runtime::agent_process_env().await;
 
         let tmp = std::env::temp_dir();
-        let result = tokio::time::timeout(Duration::from_secs(2), acp_initialize_command_spec(spec, &tmp)).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), acp_probe_command_spec(spec, &tmp)).await;
         assert!(
             result.is_err(),
             "handshake should not complete; outer timeout must fire"

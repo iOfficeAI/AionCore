@@ -765,11 +765,17 @@ pub(crate) fn guidance_for_snapshot_error_code(error_code: &str) -> &'static str
         "acp_init_failed" => {
             "The CLI was found, but ACP initialization failed. Complete sign-in or setup in the CLI, then run Test Connection again."
         }
+        "auth_required" => {
+            "The agent is reachable but requires sign-in. Log in via the CLI (or add the required API key under Environment Variables), then run Test Connection again."
+        }
         "health_check_failed" => {
             "Open the CLI once to finish any first-run setup or sign-in flow, then run Test Connection again."
         }
         "session_send_failed" => {
             "Fix the provider credentials or network issue that caused the last session failure, then start a new conversation."
+        }
+        "no_provider" => {
+            "Add and enable a model provider in Settings, then run Test Connection again."
         }
         _ => "",
     }

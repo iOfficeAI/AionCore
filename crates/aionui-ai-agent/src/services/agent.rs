@@ -42,8 +42,8 @@ impl AgentService {
         encryption_key: [u8; 32],
         data_dir: PathBuf,
     ) -> Arc<Self> {
-        let provider_health = ProviderHealthCheckService::new(provider_repo, encryption_key, data_dir.clone());
-        let availability = AgentAvailabilityService::new(registry.clone(), data_dir.clone());
+        let provider_health = ProviderHealthCheckService::new(provider_repo.clone(), encryption_key, data_dir.clone());
+        let availability = AgentAvailabilityService::new(registry.clone(), provider_repo, data_dir.clone());
         Arc::new(Self {
             registry,
             broadcaster,

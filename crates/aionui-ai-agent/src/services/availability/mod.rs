@@ -11,8 +11,8 @@ use aionui_api_types::{
     TryConnectCustomAgentResponse,
 };
 use aionui_common::now_ms;
-use aionui_common::{CommandSpec, EnvVar};
-use aionui_db::UpdateAgentAvailabilitySnapshotParams;
+use aionui_common::{AgentType, CommandSpec, EnvVar};
+use aionui_db::{IProviderRepository, UpdateAgentAvailabilitySnapshotParams};
 use aionui_runtime::{
     ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, resolve_command_path,
 };
@@ -43,16 +43,24 @@ struct AvailabilitySnapshot {
 pub struct AgentAvailabilityService {
     registry: Arc<AgentRegistry>,
     data_dir: PathBuf,
+    // Used to decide aionrs (built-in, no external CLI) availability: it is
+    // usable only when at least one model provider is configured & enabled.
+    provider_repo: Arc<dyn IProviderRepository>,
     scheduler_started: Arc<AtomicBool>,
     startup_delay: Duration,
     scheduled_interval: Duration,
 }
 
 impl AgentAvailabilityService {
-    pub fn new(registry: Arc<AgentRegistry>, data_dir: PathBuf) -> Self {
+    pub fn new(
+        registry: Arc<AgentRegistry>,
+        provider_repo: Arc<dyn IProviderRepository>,
+        data_dir: PathBuf,
+    ) -> Self {
         Self {
             registry,
             data_dir,
+            provider_repo,
             scheduler_started: Arc::new(AtomicBool::new(false)),
             startup_delay: DEFAULT_STARTUP_DELAY,
             scheduled_interval: DEFAULT_SCHEDULED_INTERVAL,
@@ -100,7 +108,14 @@ impl AgentAvailabilityService {
                 .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")));
         }
 
-        let snapshot = run_probe(&self.registry, &meta, &self.data_dir, AgentSnapshotCheckKind::Manual).await;
+        let snapshot = run_probe(
+            &self.registry,
+            &self.provider_repo,
+            &meta,
+            &self.data_dir,
+            AgentSnapshotCheckKind::Manual,
+        )
+        .await;
         self.persist_snapshot(id, &snapshot).await?;
         self.management_row_by_id(id)
             .await
@@ -135,7 +150,14 @@ impl AgentAvailabilityService {
             .into_iter()
             .filter(|item| item.enabled && item.available && item.agent_type.supports_new_conversation())
         {
-            let snapshot = run_probe(&self.registry, &meta, &self.data_dir, AgentSnapshotCheckKind::Scheduled).await;
+            let snapshot = run_probe(
+                &self.registry,
+                &self.provider_repo,
+                &meta,
+                &self.data_dir,
+                AgentSnapshotCheckKind::Scheduled,
+            )
+            .await;
             self.persist_snapshot(&meta.id, &snapshot).await?;
         }
         Ok(())
@@ -184,6 +206,7 @@ impl AgentAvailabilityService {
 
 async fn run_probe(
     registry: &Arc<AgentRegistry>,
+    provider_repo: &Arc<dyn IProviderRepository>,
     meta: &AgentMetadata,
     data_dir: &std::path::Path,
     kind: AgentSnapshotCheckKind,
@@ -207,6 +230,13 @@ async fn run_probe(
                 Some("acp_init_failed".to_owned()),
                 Some(error),
             ),
+            // Reachable but not authorized: still offline (unusable), but a
+            // dedicated code lets the UI guide the user to log in.
+            TryConnectCustomAgentResponse::FailAuth { error } => (
+                AgentSnapshotCheckStatus::Offline,
+                Some("auth_required".to_owned()),
+                Some(error),
+            ),
         }
     } else if let Some(command) = meta.command.as_deref() {
         let env: HashMap<String, String> = meta
@@ -226,6 +256,13 @@ async fn run_probe(
                 Some("acp_init_failed".to_owned()),
                 Some(error),
             ),
+            // Reachable but not authorized: still offline (unusable), but a
+            // dedicated code lets the UI guide the user to log in.
+            TryConnectCustomAgentResponse::FailAuth { error } => (
+                AgentSnapshotCheckStatus::Offline,
+                Some("auth_required".to_owned()),
+                Some(error),
+            ),
         }
     } else if let Some(backend) = meta.backend.as_deref() {
         let result = cli_detect::health_check(registry, backend).await;
@@ -238,6 +275,12 @@ async fn run_probe(
                 result.error,
             )
         }
+    } else if meta.agent_type == AgentType::Aionrs {
+        // aionrs is the built-in Rust agent: there is no external CLI to probe,
+        // so its usability hinges entirely on having a configured model. It is
+        // online only when at least one model provider is enabled — otherwise
+        // it cannot run a single turn.
+        probe_aionrs_provider_readiness(provider_repo).await
     } else {
         (AgentSnapshotCheckStatus::Online, None, None)
     };
@@ -260,6 +303,31 @@ async fn run_probe(
         error_message,
         latency_ms,
         checked_at: started_at,
+    }
+}
+
+/// Readiness check for the built-in aionrs agent.
+///
+/// aionrs has no external CLI; it runs models through configured providers.
+/// Mirrors `AssistantService::resolve_default_agent_type`, which treats aionrs
+/// as usable exactly when at least one provider is enabled. With no enabled
+/// provider it cannot complete a turn, so we report it offline with a
+/// `no_provider` code the UI maps to "configure a model" guidance.
+async fn probe_aionrs_provider_readiness(
+    provider_repo: &Arc<dyn IProviderRepository>,
+) -> (AgentSnapshotCheckStatus, Option<String>, Option<String>) {
+    match provider_repo.list().await {
+        Ok(providers) if providers.iter().any(|p| p.enabled) => (AgentSnapshotCheckStatus::Online, None, None),
+        Ok(_) => (
+            AgentSnapshotCheckStatus::Offline,
+            Some("no_provider".to_owned()),
+            Some("No model provider is configured. Add and enable a provider to use the built-in agent.".to_owned()),
+        ),
+        Err(e) => (
+            AgentSnapshotCheckStatus::Offline,
+            Some("no_provider".to_owned()),
+            Some(format!("Failed to read model providers: {e}")),
+        ),
     }
 }
 
@@ -321,14 +389,13 @@ async fn try_connect_builtin_managed_agent(
 
     match tokio::time::timeout(
         Duration::from_secs(35),
-        custom_agent_probe::acp_initialize_command_spec(spec, data_dir),
+        custom_agent_probe::acp_probe_command_spec(spec, data_dir),
     )
     .await
     {
-        Ok(Ok(())) => TryConnectCustomAgentResponse::Success,
-        Ok(Err(error)) => TryConnectCustomAgentResponse::FailAcp { error },
+        Ok(response) => response,
         Err(_) => TryConnectCustomAgentResponse::FailAcp {
-            error: "ACP initialize did not complete within 35s".to_owned(),
+            error: "ACP handshake did not complete within 35s".to_owned(),
         },
     }
 }
@@ -350,12 +417,55 @@ mod tests {
     };
     use aionui_common::AgentType;
     use aionui_db::{
-        IAgentMetadataRepository, SqliteAgentMetadataRepository, UpsertAgentMetadataParams, init_database_memory,
+        CreateProviderParams, IAgentMetadataRepository, IProviderRepository, SqliteAgentMetadataRepository,
+        SqliteProviderRepository, UpsertAgentMetadataParams, init_database_memory,
     };
     use tokio::time::Duration;
 
-    use super::{AgentAvailabilityService, run_probe};
+    use super::{AgentAvailabilityService, probe_aionrs_provider_readiness, run_probe};
     use crate::registry::AgentRegistry;
+
+    fn enabled_provider_params() -> CreateProviderParams<'static> {
+        CreateProviderParams {
+            id: None,
+            platform: "openai",
+            name: "OpenAI",
+            base_url: "https://api.openai.com",
+            api_key_encrypted: "enc",
+            models: r#"["gpt-4"]"#,
+            enabled: true,
+            capabilities: r#"[{"type":"text"}]"#,
+            context_limit: None,
+            model_protocols: None,
+            model_enabled: None,
+            model_health: None,
+            bedrock_config: None,
+            is_full_url: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn aionrs_is_offline_without_an_enabled_provider() {
+        let db = init_database_memory().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+
+        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo).await;
+
+        assert_eq!(status, AgentSnapshotCheckStatus::Offline);
+        assert_eq!(code.as_deref(), Some("no_provider"));
+    }
+
+    #[tokio::test]
+    async fn aionrs_is_online_when_a_provider_is_enabled() {
+        let db = init_database_memory().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        provider_repo.create(enabled_provider_params()).await.unwrap();
+
+        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo).await;
+
+        assert_eq!(status, AgentSnapshotCheckStatus::Online);
+        assert!(code.is_none());
+    }
 
     #[tokio::test]
     async fn record_session_failure_persists_unavailable_snapshot() {
@@ -394,7 +504,8 @@ mod tests {
         let registry = AgentRegistry::new(repo);
         registry.hydrate().await.unwrap();
 
-        let service = AgentAvailabilityService::new(registry.clone(), std::env::temp_dir());
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let service = AgentAvailabilityService::new(registry.clone(), provider_repo, std::env::temp_dir());
         service
             .record_session_failure(
                 "agent-session-failure",
@@ -464,9 +575,11 @@ mod tests {
         let registry = AgentRegistry::new(repo);
         registry.hydrate().await.unwrap();
 
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
         let service = AgentAvailabilityService {
             registry: registry.clone(),
             data_dir: std::env::temp_dir(),
+            provider_repo,
             scheduler_started: Arc::new(AtomicBool::new(false)),
             startup_delay: Duration::from_millis(10),
             scheduled_interval: Duration::from_secs(60),
@@ -498,6 +611,7 @@ mod tests {
     async fn managed_builtin_probe_checks_primary_binary_before_running_bridge_command() {
         let db = init_database_memory().await.unwrap();
         let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
         let registry = AgentRegistry::new(repo);
         registry.hydrate().await.unwrap();
 
@@ -549,6 +663,7 @@ mod tests {
 
         let snapshot = run_probe(
             &registry,
+            &provider_repo,
             &meta,
             std::env::temp_dir().as_path(),
             AgentSnapshotCheckKind::Manual,
