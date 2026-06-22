@@ -7,7 +7,12 @@ use aionui_db::{
     UpsertAgentMetadataParams, init_database_memory,
 };
 
-fn custom_params<'a>(id: &'a str, name: &'a str, command: &'a str) -> UpsertAgentMetadataParams<'a> {
+fn custom_params<'a>(
+    id: &'a str,
+    name: &'a str,
+    command: &'a str,
+    agent_source_info: &'a str,
+) -> UpsertAgentMetadataParams<'a> {
     UpsertAgentMetadataParams {
         id,
         icon: None,
@@ -18,7 +23,7 @@ fn custom_params<'a>(id: &'a str, name: &'a str, command: &'a str) -> UpsertAgen
         backend: Some("claude"),
         agent_type: "acp",
         agent_source: "custom",
-        agent_source_info: Some(r#"{"binary_name":"claude"}"#),
+        agent_source_info: Some(agent_source_info),
         enabled: true,
         command: Some(command),
         args: Some("[]"),
@@ -45,15 +50,26 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
         "agent-missing",
         "Missing Agent",
         "aionui-missing-agent-binary",
+        r#"{"binary_name":"aionui-missing-agent-binary"}"#,
     ))
     .await
     .unwrap();
-    repo.upsert(&custom_params("agent-unavailable", "Unavailable Agent", "cargo"))
-        .await
-        .unwrap();
-    repo.upsert(&custom_params("agent-available", "Available Agent", "cargo"))
-        .await
-        .unwrap();
+    repo.upsert(&custom_params(
+        "agent-unavailable",
+        "Unavailable Agent",
+        "cargo",
+        r#"{"binary_name":"cargo"}"#,
+    ))
+    .await
+    .unwrap();
+    repo.upsert(&custom_params(
+        "agent-available",
+        "Available Agent",
+        "cargo",
+        r#"{"binary_name":"cargo"}"#,
+    ))
+    .await
+    .unwrap();
 
     repo.update_availability_snapshot(
         "agent-unavailable",

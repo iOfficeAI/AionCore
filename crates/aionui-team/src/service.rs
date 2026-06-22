@@ -80,6 +80,7 @@ pub struct TeamSessionService {
 }
 
 impl TeamSessionService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<dyn ITeamRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
