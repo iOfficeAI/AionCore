@@ -74,6 +74,17 @@ impl From<ConversationError> for ApiError {
             ConversationError::WorkspacePathRuntimeUnavailable { path } => {
                 ApiError::WorkspacePathRuntimeUnavailable(path)
             }
+            ConversationError::OpenClawGatewayUnreachable { detail } => ApiError::coded(
+                StatusCode::BAD_GATEWAY,
+                "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE",
+                "OpenClaw Gateway is not reachable",
+                Some(serde_json::json!({
+                    "detail": detail,
+                    "error_kind": "openclaw_gateway_unreachable",
+                    "backend": "openclaw",
+                    "port": 18789
+                })),
+            ),
             ConversationError::Acp(_) => ApiError::BadGateway("Agent protocol error".into()),
         }
     }
@@ -438,5 +449,19 @@ mod error_mapping_tests {
             app,
             ApiError::WorkspacePathRuntimeUnavailable(message) if message == "/tmp/my project"
         ));
+    }
+
+    #[test]
+    fn openclaw_gateway_unreachable_maps_to_coded_bad_gateway() {
+        let app = ApiError::from(ConversationError::OpenClawGatewayUnreachable {
+            detail: "OpenClaw Gateway is not running or cannot be reached at 127.0.0.1:18789.".into(),
+        });
+
+        assert_eq!(app.status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(app.error_code(), "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE");
+        assert_eq!(app.public_message(), "OpenClaw Gateway is not reachable");
+        let details = app.error_details().expect("details should be present");
+        assert_eq!(details["backend"], "openclaw");
+        assert_eq!(details["port"], 18789);
     }
 }

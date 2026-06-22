@@ -3956,6 +3956,58 @@ async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
     ));
 }
 
+#[tokio::test]
+async fn warmup_returns_openclaw_gateway_unreachable_when_startup_stderr_matches() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(AgentErrorFailingBuildTaskManager::new(AgentError::from(
+        AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789".into(),
+        },
+    )));
+
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("openclaw"))
+        .await
+        .unwrap();
+
+    let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+
+    match err {
+        ConversationError::OpenClawGatewayUnreachable { detail } => {
+            assert!(detail.contains("127.0.0.1:18789"));
+            assert!(detail.contains("openclaw gateway status"));
+            assert!(detail.contains("openclaw gateway start"));
+        }
+        other => panic!("expected OpenClawGatewayUnreachable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn warmup_keeps_generic_error_for_non_openclaw_gateway_signature() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(AgentErrorFailingBuildTaskManager::new(AgentError::from(
+        AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789".into(),
+        },
+    )));
+
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("codex"))
+        .await
+        .unwrap();
+
+    let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+
+    assert!(
+        !matches!(err, ConversationError::OpenClawGatewayUnreachable { .. }),
+        "non-OpenClaw backend must not receive the OpenClaw Gateway error"
+    );
+}
+
 // ── Confirmation system tests ────────────────────────────────────
 
 fn make_test_confirmations() -> Vec<Confirmation> {

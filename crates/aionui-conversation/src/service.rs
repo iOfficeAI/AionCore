@@ -2546,7 +2546,30 @@ impl ConversationService {
         let build_opts = self.build_task_options(&row).await?;
         self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
-        let agent = task_manager.get_or_build_task(conversation_id, build_opts).await?;
+        let backend = build_options_backend(&build_opts).map(str::to_owned);
+        let agent = match task_manager.get_or_build_task(conversation_id, build_opts).await {
+            Ok(agent) => agent,
+            Err(err) => {
+                let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref());
+                if send_error.is_openclaw_gateway_unreachable() {
+                    warn!(
+                        conversation_id = %conversation_id,
+                        backend = "openclaw",
+                        error_kind = "openclaw_gateway_unreachable",
+                        port = 18789_u16,
+                        phase = "warmup",
+                        "OpenClaw Gateway unreachable during ACP startup"
+                    );
+                    let detail = send_error
+                        .stream_error()
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| send_error.stream_error().message.clone());
+                    return Err(ConversationError::OpenClawGatewayUnreachable { detail });
+                }
+                return Err(err.into());
+            }
+        };
 
         // Persist auto-resolved workspace if factory picked a different path.
         self.maybe_persist_workspace(conversation_id, &stored_workspace, agent.workspace())
@@ -2876,6 +2899,13 @@ fn context_backend_value(context: &AgentSessionContext) -> Option<serde_json::Va
             .filter(|value| !value.is_empty())
             .map(|value| serde_json::Value::String(value.clone())),
         _ => None,
+    }
+}
+
+fn build_options_backend(options: &BuildTaskOptions) -> Option<&str> {
+    match &options.context.kind {
+        AgentSessionKind::Acp(ctx) => ctx.config.backend.as_deref(),
+        AgentSessionKind::Aionrs(_) => None,
     }
 }
 
