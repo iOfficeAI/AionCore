@@ -25,7 +25,8 @@ use aionui_db::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IConversationRepository, ICronRepository,
     MessageRowUpdate, MessageSearchRow, SortOrder, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteCronRepository,
-    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, init_database_memory, models::MessageRow,
+    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, init_database_memory,
+    models::{ConversationAssistantSnapshotRow, MessageRow},
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -103,6 +104,7 @@ struct StubConvRepo {
     messages: Mutex<Vec<MessageRow>>,
     artifacts: Mutex<Vec<aionui_db::ConversationArtifactRow>>,
     rows: Mutex<HashMap<String, aionui_db::models::ConversationRow>>,
+    assistant_snapshots: Mutex<HashMap<String, ConversationAssistantSnapshotRow>>,
 }
 
 impl StubConvRepo {
@@ -111,6 +113,7 @@ impl StubConvRepo {
             messages: Mutex::new(Vec::new()),
             artifacts: Mutex::new(Vec::new()),
             rows: Mutex::new(HashMap::new()),
+            assistant_snapshots: Mutex::new(HashMap::new()),
         }
     }
 
@@ -130,6 +133,13 @@ impl StubConvRepo {
 
     fn artifacts(&self) -> Vec<aionui_db::ConversationArtifactRow> {
         self.artifacts.lock().unwrap().clone()
+    }
+
+    fn insert_assistant_snapshot(&self, row: ConversationAssistantSnapshotRow) {
+        self.assistant_snapshots
+            .lock()
+            .unwrap()
+            .insert(row.conversation_id.clone(), row);
     }
 }
 
@@ -378,6 +388,49 @@ impl IConversationRepository for StubConvRepo {
                 created_at: 1000,
                 updated_at: 1000,
             }
+        } else if id == "conv_mode_missing_assistant_stale_backend" {
+            aionui_db::models::ConversationRow {
+                id: id.into(),
+                user_id: "u1".into(),
+                name: "Missing Assistant Stale Backend Chat".into(),
+                r#type: "acp".into(),
+                model: None,
+                status: Some("active".into()),
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::json!({
+                    "assistant_id": "missing-assistant",
+                    "backend": "claude",
+                    "agent_name": "Missing Assistant",
+                    "workspace": ensure_named_workspace_path("aionui-cron-service-missing-assistant-stale-backend-workspace")
+                })
+                .to_string(),
+                pinned: false,
+                pinned_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            }
+        } else if id == "conv_mode_assistant_snapshot" {
+            aionui_db::models::ConversationRow {
+                id: id.into(),
+                user_id: "u1".into(),
+                name: "Snapshot Assistant Chat".into(),
+                r#type: "acp".into(),
+                model: None,
+                status: Some("active".into()),
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::json!({
+                    "backend": "claude",
+                    "agent_name": "Legacy Extra Assistant",
+                    "workspace": ensure_named_workspace_path("aionui-cron-service-assistant-snapshot-workspace")
+                })
+                .to_string(),
+                pinned: false,
+                pinned_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            }
         } else {
             aionui_db::models::ConversationRow {
                 id: id.into(),
@@ -399,6 +452,14 @@ impl IConversationRepository for StubConvRepo {
         rows.insert(id.to_owned(), row.clone());
         Ok(Some(row))
     }
+
+    async fn get_assistant_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationAssistantSnapshotRow>, aionui_db::DbError> {
+        Ok(self.assistant_snapshots.lock().unwrap().get(conversation_id).cloned())
+    }
+
     async fn create(&self, row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
         self.rows.lock().unwrap().insert(row.id.clone(), row.clone());
         Ok(())
@@ -1855,6 +1916,86 @@ async fn icron_service_create_job_prefers_assistant_backend_over_stale_extra_bac
     assert_eq!(config.backend, "aionrs");
     assert_eq!(config.mode.as_deref(), Some("yolo"));
     assert_eq!(config.model_id.as_deref(), Some("gpt-5.4"));
+}
+
+#[tokio::test]
+async fn icron_service_create_job_inherits_assistant_snapshot_identity() {
+    let (svc, _, _, conv_repo, definition_repo, _) = setup_with_assistant_repos().await;
+    seed_assistant_definition(&definition_repo, "asstdef_snapshot", "assistant-snapshot", "claude").await;
+    conv_repo.insert_assistant_snapshot(ConversationAssistantSnapshotRow {
+        conversation_id: "conv_mode_assistant_snapshot".into(),
+        assistant_definition_id: "asstdef_snapshot".into(),
+        assistant_key: "assistant-snapshot".into(),
+        assistant_source: "bare".into(),
+        assistant_name: "Snapshot Assistant".into(),
+        assistant_avatar_type: "emoji".into(),
+        assistant_avatar_value: Some("S".into()),
+        agent_backend: "codex".into(),
+        rules_content: String::new(),
+        default_model_mode: "default".into(),
+        resolved_model_id: Some("gpt-5.1".into()),
+        default_permission_mode: "default".into(),
+        resolved_permission_value: Some("ask".into()),
+        default_skills_mode: "default".into(),
+        resolved_skill_ids: "[]".into(),
+        resolved_disabled_builtin_skill_ids: "[]".into(),
+        default_mcps_mode: "default".into(),
+        resolved_mcp_ids: "[]".into(),
+        created_at: 1000,
+        updated_at: 1000,
+    });
+
+    use aionui_conversation::response_middleware::ICronService;
+
+    let params = CronCreateParams {
+        name: "Snapshot Assistant Job".into(),
+        schedule: "0 */10 * * * *".into(),
+        schedule_description: "every 10 min".into(),
+        message: "do assistant work".into(),
+    };
+
+    let result = ICronService::create_job(&svc, "user_1", "conv_mode_assistant_snapshot", &params).await;
+    assert!(result.success);
+
+    let jobs = svc
+        .list_jobs(&ListCronJobsQuery {
+            conversation_id: Some("conv_mode_assistant_snapshot".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+
+    let config = jobs[0].agent_config.as_ref().expect("agent config should be copied");
+    assert_eq!(config.assistant_id.as_deref(), Some("assistant-snapshot"));
+    assert_eq!(config.backend, "codex");
+    assert_eq!(config.name, "Snapshot Assistant");
+    assert_eq!(config.model_id.as_deref(), Some("gpt-5.1"));
+}
+
+#[tokio::test]
+async fn icron_service_create_job_rejects_stale_extra_backend_when_assistant_cannot_resolve() {
+    let (svc, _, _, _, _, _) = setup_with_assistant_repos().await;
+
+    use aionui_conversation::response_middleware::ICronService;
+
+    let params = CronCreateParams {
+        name: "Missing Assistant Job".into(),
+        schedule: "0 */10 * * * *".into(),
+        schedule_description: "every 10 min".into(),
+        message: "do assistant work".into(),
+    };
+
+    let result = ICronService::create_job(&svc, "user_1", "conv_mode_missing_assistant_stale_backend", &params).await;
+
+    assert!(!result.success);
+    assert!(result.message.contains("missing-assistant"));
+    let jobs = svc
+        .list_jobs(&ListCronJobsQuery {
+            conversation_id: Some("conv_mode_missing_assistant_stale_backend".into()),
+        })
+        .await
+        .unwrap();
+    assert!(jobs.is_empty());
 }
 
 #[tokio::test]

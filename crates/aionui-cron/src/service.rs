@@ -74,13 +74,14 @@ impl CronService {
     // -----------------------------------------------------------------------
 
     pub async fn add_job(&self, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
-        self.add_job_internal(req, None).await
+        self.add_job_internal(req, None, None).await
     }
 
     async fn add_job_internal(
         &self,
         req: CreateCronJobRequest,
         runtime_agent_type: Option<String>,
+        assistant_backend_override: Option<String>,
     ) -> Result<CronJob, CronError> {
         let schedule = schedule_from_dto(&req.schedule);
         validate_schedule(&schedule)?;
@@ -97,8 +98,12 @@ impl CronService {
 
         let agent_config = match req.agent_config {
             Some(config) => Some(
-                self.build_cron_agent_config(&resolved_agent_type, sanitize_agent_config_dto(config))
-                    .await?,
+                self.build_cron_agent_config(
+                    &resolved_agent_type,
+                    sanitize_agent_config_dto(config),
+                    assistant_backend_override.as_deref(),
+                )
+                .await?,
             ),
             None => None,
         };
@@ -175,7 +180,7 @@ impl CronService {
         if let Some(config_dto) = &req.agent_config {
             let config_dto = sanitize_agent_config_dto(config_dto.clone());
             validate_aionrs_agent_config(&job.agent_type, Some(&config_dto))?;
-            job.agent_config = Some(self.build_cron_agent_config(&job.agent_type, config_dto).await?);
+            job.agent_config = Some(self.build_cron_agent_config(&job.agent_type, config_dto, None).await?);
         }
         if let Some(title) = &req.conversation_title {
             job.conversation_title = Some(title.clone());
@@ -859,8 +864,23 @@ impl CronService {
     async fn build_agent_config_from_conversation(
         &self,
         row: &aionui_db::models::ConversationRow,
-    ) -> (String, Option<aionui_api_types::CronAgentConfigWriteDto>) {
+    ) -> (
+        String,
+        Option<aionui_api_types::CronAgentConfigWriteDto>,
+        Option<String>,
+    ) {
         let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let assistant_snapshot = match self.executor.get_assistant_snapshot(&row.id).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                warn!(
+                    conversation_id = %row.id,
+                    error = %err,
+                    "Failed to load conversation assistant snapshot for cron agent config"
+                );
+                None
+            }
+        };
         // Both interactive `send_message` and the cron executor parse
         // `conversation.model` via the same helper. Keeping the cron-side
         // `agent_config.backend` derivation in sync with that parser
@@ -869,11 +889,20 @@ impl CronService {
         let model_resolved = aionui_conversation::task_options::provider_model_from_conversation_row(row);
         let model = (!model_resolved.provider_id.is_empty()).then_some(&model_resolved);
         let preset_assistant_id = get_string(&extra, &["preset_assistant_id", "presetAssistantId"]);
-        let assistant_id = get_string(&extra, &["assistant_id", "assistantId"]).or(preset_assistant_id);
-        let assistant_backend = self
+        let extra_assistant_id = get_string(&extra, &["assistant_id", "assistantId"]).or(preset_assistant_id);
+        let snapshot_assistant_id = assistant_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.assistant_key.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let assistant_id = snapshot_assistant_id.or(extra_assistant_id);
+        let snapshot_backend = assistant_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.agent_backend.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let assistant_backend = snapshot_backend.clone().or(self
             .resolve_assistant_backend(assistant_id.as_deref())
             .await
-            .unwrap_or(None);
+            .unwrap_or(None));
 
         let backend = if row.r#type == "aionrs" {
             model
@@ -901,7 +930,12 @@ impl CronService {
             .to_owned();
         let agent_config = aionui_api_types::CronAgentConfigWriteDto {
             backend: Some(backend),
-            name: get_string(&extra, &["agent_name", "agentName"]).unwrap_or_else(|| row.name.clone()),
+            name: assistant_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.assistant_name.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .or_else(|| get_string(&extra, &["agent_name", "agentName"]))
+                .unwrap_or_else(|| row.name.clone()),
             cli_path: get_string(&extra, &["cli_path", "cliPath"]).or_else(|| {
                 extra
                     .get("gateway")
@@ -911,25 +945,32 @@ impl CronService {
             }),
             assistant_id,
             mode: Some(full_auto_mode),
-            model_id: get_string(&extra, &["current_model_id", "currentModelId"]).or_else(|| {
-                model.and_then(|value| {
-                    value
-                        .use_model
-                        .clone()
-                        .or_else(|| (!value.model.is_empty()).then(|| value.model.clone()))
+            model_id: get_string(&extra, &["current_model_id", "currentModelId"])
+                .or_else(|| {
+                    model.and_then(|value| {
+                        value
+                            .use_model
+                            .clone()
+                            .or_else(|| (!value.model.is_empty()).then(|| value.model.clone()))
+                    })
                 })
-            }),
+                .or_else(|| {
+                    assistant_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.resolved_model_id.clone())
+                }),
             config_options: None,
             workspace: get_string(&extra, &["workspace"]),
         };
 
-        (row.r#type.clone(), Some(agent_config))
+        (row.r#type.clone(), Some(agent_config), snapshot_backend)
     }
 
     async fn build_cron_agent_config(
         &self,
         runtime_agent_type: &str,
         config: aionui_api_types::CronAgentConfigWriteDto,
+        assistant_backend_override: Option<&str>,
     ) -> Result<CronAgentConfig, CronError> {
         let backend = if runtime_agent_type == "aionrs" {
             config
@@ -940,8 +981,11 @@ impl CronService {
                     CronError::InvalidAgentConfig("aionrs cron jobs require agent_config.backend (provider_id)".into())
                 })?
         } else if let Some(assistant_id) = config.assistant_id.as_deref() {
-            self.resolve_assistant_backend(Some(assistant_id))
-                .await?
+            assistant_backend_override
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .or(self.resolve_assistant_backend(Some(assistant_id)).await?)
                 .ok_or_else(|| {
                     CronError::InvalidAgentConfig(format!(
                         "assistant '{assistant_id}' could not resolve a runtime backend"
@@ -1023,21 +1067,22 @@ impl aionui_conversation::response_middleware::ICronService for CronService {
             description: Some(params.schedule_description.clone()),
         };
 
-        let (agent_type, conversation_title, agent_config) =
+        let (agent_type, conversation_title, agent_config, assistant_backend_override) =
             match self.executor.get_conversation_row(conversation_id).await {
                 Ok(Some(row)) => {
                     let title = Some(row.name.clone());
-                    let (agent_type, agent_config) = self.build_agent_config_from_conversation(&row).await;
-                    (agent_type, title, agent_config)
+                    let (agent_type, agent_config, assistant_backend_override) =
+                        self.build_agent_config_from_conversation(&row).await;
+                    (agent_type, title, agent_config, assistant_backend_override)
                 }
-                Ok(None) => ("acp".to_owned(), None, None),
+                Ok(None) => ("acp".to_owned(), None, None, None),
                 Err(err) => {
                     warn!(
                         conversation_id,
                         error = %err,
                         "Failed to load conversation context for cron create; falling back to defaults"
                     );
-                    ("acp".to_owned(), None, None)
+                    ("acp".to_owned(), None, None, None)
                 }
             };
 
@@ -1054,7 +1099,10 @@ impl aionui_conversation::response_middleware::ICronService for CronService {
             agent_config,
         };
 
-        match self.add_job_internal(req, Some(agent_type)).await {
+        match self
+            .add_job_internal(req, Some(agent_type), assistant_backend_override)
+            .await
+        {
             Ok(job) => {
                 if let Err(err) = self
                     .executor

@@ -193,6 +193,16 @@ impl JobExecutor {
             .map_err(CronError::Database)
     }
 
+    pub async fn get_assistant_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<aionui_db::models::ConversationAssistantSnapshotRow>, CronError> {
+        self.conversation_repo
+            .get_assistant_snapshot(conversation_id)
+            .await
+            .map_err(CronError::Database)
+    }
+
     pub(crate) async fn resolve_job_workspace_raw(&self, job: &CronJob) -> Result<String, CronError> {
         self.resolve_execution_workspace_raw(job, &job.conversation_id).await
     }
