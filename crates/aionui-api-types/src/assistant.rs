@@ -346,7 +346,7 @@ mod tests {
             prompts_i18n: HashMap::new(),
             models: vec![],
             last_used_at: Some(1_234),
-            agent_status: AgentManagementStatus::Available,
+            agent_status: AgentManagementStatus::Online,
             agent_status_message: None,
             team_selectable: true,
             team_block_reason: None,
@@ -423,7 +423,7 @@ mod tests {
             "enabled": true,
             "sort_order": 7,                   // snake required field
             "preset_agent_type": "gemini",     // snake required field
-            "agent_status": "available",       // snake required field
+            "agent_status": "online",       // snake required field
             "team_selectable": true,           // snake required field
             "deletable": true,                 // snake required field
             "presetAgentType": "claude",       // legacy camel — must be ignored

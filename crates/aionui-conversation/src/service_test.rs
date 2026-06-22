@@ -187,10 +187,6 @@ impl AgentAvailabilityFeedbackPort for RecordingAvailabilityFeedback {
         });
         Ok(())
     }
-
-    async fn record_session_success(&self, _agent_id: &str) -> Result<(), AgentError> {
-        Ok(())
-    }
 }
 
 // ── Mock Repository ────────────────────────────────────────────────

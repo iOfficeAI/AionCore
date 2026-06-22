@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentSendError, AgentSessionKind, IWorkerTaskManager};
-use aionui_api_types::AgentErrorCode;
 use aionui_common::{ConversationStatus, ErrorChain, now_ms};
 use aionui_db::models::ConversationRow;
 use tokio::sync::oneshot;
@@ -169,52 +168,42 @@ impl ConversationTurnOrchestrator {
             let (send_error_tx, send_error_rx) = oneshot::channel();
 
             tokio::spawn(async move {
-                match send_agent.send_message(current_send).await {
-                    Ok(()) => {
-                        record_agent_session_success(&feedback_service, feedback_agent_id.as_deref()).await;
-                    }
-                    Err(e) => {
-                        let failure_message = availability_failure_message(&e);
-                        let code = if e.code() == Some(AgentErrorCode::UserAgentAuthRequired) {
-                            "user_agent_auth_required"
-                        } else {
-                            "session_send_failed"
-                        };
-                        record_agent_session_failure(
-                            &feedback_service,
-                            feedback_agent_id.as_deref(),
-                            code,
-                            &failure_message,
-                        )
-                        .await;
-                        let task_status = send_agent.status();
-                        let agent_type = send_agent.agent_type();
-                        error!(
+                if let Err(e) = send_agent.send_message(current_send).await {
+                    let failure_message = availability_failure_message(&e);
+                    record_agent_session_failure(
+                        &feedback_service,
+                        feedback_agent_id.as_deref(),
+                        "session_send_failed",
+                        &failure_message,
+                    )
+                    .await;
+                    let task_status = send_agent.status();
+                    let agent_type = send_agent.agent_type();
+                    error!(
+                        conversation_id = %conv_id_send,
+                        turn_id = %turn_id_for_send,
+                        ?agent_type,
+                        ?task_status,
+                        error = %ErrorChain(&e),
+                        "Agent send_message failed"
+                    );
+                    if task_status == Some(ConversationStatus::Finished) {
+                        debug!(
                             conversation_id = %conv_id_send,
                             turn_id = %turn_id_for_send,
                             ?agent_type,
-                            ?task_status,
-                            error = %ErrorChain(&e),
-                            "Agent send_message failed"
+                            "Agent send_message failure already published runtime terminal; skipping fallback stream error"
                         );
-                        if task_status == Some(ConversationStatus::Finished) {
-                            debug!(
-                                conversation_id = %conv_id_send,
-                                turn_id = %turn_id_for_send,
-                                ?agent_type,
-                                "Agent send_message failure already published runtime terminal; skipping fallback stream error"
-                            );
-                        } else {
-                            warn!(
-                                conversation_id = %conv_id_send,
-                                turn_id = %turn_id_for_send,
-                                ?agent_type,
-                                code = ?e.code(),
-                                ownership = ?e.ownership(),
-                                "Agent send_message returned error without runtime terminal; injecting fallback stream error"
-                            );
-                            let _ = send_error_tx.send(e);
-                        }
+                    } else {
+                        warn!(
+                            conversation_id = %conv_id_send,
+                            turn_id = %turn_id_for_send,
+                            ?agent_type,
+                            code = ?e.code(),
+                            ownership = ?e.ownership(),
+                            "Agent send_message returned error without runtime terminal; injecting fallback stream error"
+                        );
+                        let _ = send_error_tx.send(e);
                     }
                 }
             });
@@ -313,22 +302,6 @@ async fn record_agent_session_failure(
             code,
             error = %ErrorChain(&error),
             "Failed to record agent availability session failure"
-        );
-    }
-}
-
-async fn record_agent_session_success(service: &ConversationService, agent_id: Option<&str>) {
-    let Some(agent_id) = agent_id else {
-        return;
-    };
-    let Some(feedback) = service.agent_availability_feedback() else {
-        return;
-    };
-    if let Err(error) = feedback.record_session_success(agent_id).await {
-        warn!(
-            agent_id,
-            error = %ErrorChain(&error),
-            "Failed to record agent availability session success"
         );
     }
 }

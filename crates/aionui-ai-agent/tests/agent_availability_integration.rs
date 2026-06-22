@@ -58,7 +58,7 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
     repo.update_availability_snapshot(
         "agent-unavailable",
         &UpdateAgentAvailabilitySnapshotParams {
-            last_check_status: Some("unavailable"),
+            last_check_status: Some("offline"),
             last_check_kind: Some("manual"),
             last_check_error_code: Some("auth_required"),
             last_check_error_message: Some("Login required"),
@@ -75,7 +75,7 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
     repo.update_availability_snapshot(
         "agent-available",
         &UpdateAgentAvailabilitySnapshotParams {
-            last_check_status: Some("available"),
+            last_check_status: Some("online"),
             last_check_kind: Some("scheduled"),
             last_check_error_code: None,
             last_check_error_message: None,
@@ -99,10 +99,10 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
     assert_eq!(missing.last_check_status, None);
 
     let unavailable = rows.iter().find(|row| row.id == "agent-unavailable").unwrap();
-    assert_eq!(unavailable.status, AgentManagementStatus::Unavailable);
+    assert_eq!(unavailable.status, AgentManagementStatus::Offline);
     assert_eq!(
         unavailable.last_check_status,
-        Some(AgentSnapshotCheckStatus::Unavailable)
+        Some(AgentSnapshotCheckStatus::Offline)
     );
     assert_eq!(unavailable.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
     assert_eq!(unavailable.last_check_error_code.as_deref(), Some("auth_required"));
@@ -113,8 +113,8 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
     );
 
     let available = rows.iter().find(|row| row.id == "agent-available").unwrap();
-    assert_eq!(available.status, AgentManagementStatus::Available);
-    assert_eq!(available.last_check_status, Some(AgentSnapshotCheckStatus::Available));
+    assert_eq!(available.status, AgentManagementStatus::Online);
+    assert_eq!(available.last_check_status, Some(AgentSnapshotCheckStatus::Online));
     assert_eq!(available.last_check_kind, Some(AgentSnapshotCheckKind::Scheduled));
     assert_eq!(available.last_check_latency_ms, Some(120));
 }

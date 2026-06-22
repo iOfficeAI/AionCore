@@ -366,7 +366,7 @@ impl AgentRegistry {
 /// keeps both uninstalled CLIs and rows that most recently failed
 /// ACP/session admission out of visible legacy catalog reads.
 fn is_visible(meta: &AgentMetadata) -> bool {
-    meta.enabled && matches!(derive_management_status(meta), AgentManagementStatus::Available)
+    meta.enabled && matches!(derive_management_status(meta), AgentManagementStatus::Online)
 }
 
 /// Extract and trim a command override, filtering out empty strings.
@@ -589,9 +589,8 @@ fn parse_agent_source(raw: &str) -> Option<AgentSource> {
 
 fn parse_last_check_status(raw: Option<&str>) -> Option<AgentSnapshotCheckStatus> {
     raw.and_then(|value| match value {
-        "available" => Some(AgentSnapshotCheckStatus::Available),
-        "unavailable" => Some(AgentSnapshotCheckStatus::Unavailable),
-        "needs_auth" => Some(AgentSnapshotCheckStatus::NeedsAuth),
+        "online" => Some(AgentSnapshotCheckStatus::Online),
+        "offline" => Some(AgentSnapshotCheckStatus::Offline),
         _ => {
             warn!(value, "agent_metadata: unknown last_check_status");
             None
@@ -618,9 +617,8 @@ fn derive_management_status(meta: &AgentMetadata) -> AgentManagementStatus {
     }
 
     match meta.last_check_status {
-        Some(AgentSnapshotCheckStatus::Unavailable) => AgentManagementStatus::Unavailable,
-        Some(AgentSnapshotCheckStatus::NeedsAuth) => AgentManagementStatus::NeedsAuth,
-        _ => AgentManagementStatus::Available,
+        Some(AgentSnapshotCheckStatus::Offline) => AgentManagementStatus::Offline,
+        _ => AgentManagementStatus::Online,
     }
 }
 

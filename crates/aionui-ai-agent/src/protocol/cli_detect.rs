@@ -80,7 +80,7 @@ mod tests {
             yolo_id: None,
             sort_order: 0,
             team_capable: false,
-            last_check_status: Some(AgentSnapshotCheckStatus::Available),
+            last_check_status: Some(AgentSnapshotCheckStatus::Online),
             last_check_kind: Some(AgentSnapshotCheckKind::Startup),
             last_check_error_code: None,
             last_check_error_message: None,

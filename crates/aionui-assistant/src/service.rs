@@ -278,7 +278,7 @@ impl AssistantService {
             .filter(|row| {
                 row.enabled
                     && row.agent_type.supports_new_conversation()
-                    && matches!(row.status, AgentManagementStatus::Available)
+                    && matches!(row.status, AgentManagementStatus::Online)
             })
             .collect();
         let missing_generated_count = generated_rows
@@ -1903,7 +1903,7 @@ fn assistant_projection_for_definition(
             Some(row) if matches!(row.status, AgentManagementStatus::Missing) => {
                 Some("This assistant's agent is not installed.".to_string())
             }
-            Some(row) if matches!(row.status, AgentManagementStatus::Unavailable) => Some(
+            Some(row) if matches!(row.status, AgentManagementStatus::Offline) => Some(
                 row.last_check_error_message
                     .clone()
                     .or_else(|| row.last_check_guidance.clone())
@@ -1919,7 +1919,7 @@ fn assistant_projection_for_definition(
         agent_status,
         agent_status_message,
         team_selectable: enabled
-            && agent_row.is_some_and(|row| matches!(row.status, AgentManagementStatus::Available) && row.team_capable),
+            && agent_row.is_some_and(|row| matches!(row.status, AgentManagementStatus::Online) && row.team_capable),
         team_block_reason,
         deletable: matches!(source, AssistantSource::User),
     }
@@ -2429,7 +2429,7 @@ mod tests {
             sort_order: 3100,
             team_capable: true,
             status,
-            last_check_status: Some(aionui_api_types::AgentSnapshotCheckStatus::Available),
+            last_check_status: Some(aionui_api_types::AgentSnapshotCheckStatus::Online),
             last_check_kind: Some(aionui_api_types::AgentSnapshotCheckKind::Manual),
             last_check_error_code: None,
             last_check_error_message: None,
@@ -2531,7 +2531,7 @@ mod tests {
             agent_rows: vec![mk_agent_row(
                 "agent-claude",
                 "claude",
-                aionui_api_types::AgentManagementStatus::Available,
+                aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
         })
@@ -2544,7 +2544,7 @@ mod tests {
             .unwrap();
         assert_eq!(bare.source, AssistantSource::Bare);
         assert_eq!(bare.preset_agent_type, "claude");
-        assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Available);
+        assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Online);
         assert!(bare.team_selectable);
         assert!(!bare.deletable);
     }
@@ -2559,7 +2559,7 @@ mod tests {
         let mut agent_row = mk_agent_row(
             "agent-aionrs",
             "aionrs",
-            aionui_api_types::AgentManagementStatus::Available,
+            aionui_api_types::AgentManagementStatus::Online,
         );
         agent_row.backend = None;
         agent_row.agent_type = aionui_common::AgentType::Aionrs;
@@ -2586,12 +2586,12 @@ mod tests {
                 mk_agent_row(
                     "agent-claude",
                     "claude",
-                    aionui_api_types::AgentManagementStatus::Available,
+                    aionui_api_types::AgentManagementStatus::Online,
                 ),
                 mk_agent_row(
                     "agent-codex",
                     "codex",
-                    aionui_api_types::AgentManagementStatus::Available,
+                    aionui_api_types::AgentManagementStatus::Online,
                 ),
             ],
             ..Default::default()
@@ -2621,7 +2621,7 @@ mod tests {
             agent_rows: vec![mk_agent_row(
                 "agent-claude",
                 "claude",
-                aionui_api_types::AgentManagementStatus::Available,
+                aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
         })
@@ -2892,7 +2892,7 @@ mod tests {
             agent_rows: vec![mk_agent_row(
                 "agent-claude",
                 "claude",
-                aionui_api_types::AgentManagementStatus::Available,
+                aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
         })
@@ -3487,7 +3487,7 @@ mod tests {
             agent_rows: vec![mk_agent_row(
                 "agent-claude",
                 "claude",
-                aionui_api_types::AgentManagementStatus::Available,
+                aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
         })
@@ -3506,7 +3506,7 @@ mod tests {
             agent_rows: vec![mk_agent_row(
                 "agent-claude",
                 "claude",
-                aionui_api_types::AgentManagementStatus::Available,
+                aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
         })
@@ -3521,7 +3521,7 @@ mod tests {
             agent_rows: vec![mk_agent_row(
                 "agent-claude",
                 "claude",
-                aionui_api_types::AgentManagementStatus::Available,
+                aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
         })
@@ -3540,7 +3540,7 @@ mod tests {
             agent_rows: vec![mk_agent_row(
                 "agent-claude",
                 "claude",
-                aionui_api_types::AgentManagementStatus::Available,
+                aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
         })

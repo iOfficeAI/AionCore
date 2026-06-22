@@ -110,19 +110,15 @@ pub struct AgentHandshake {
 #[serde(rename_all = "snake_case")]
 pub enum AgentManagementStatus {
     Missing,
-    Available,
-    Unavailable,
-    #[serde(rename = "needs_auth")]
-    NeedsAuth,
+    Online,
+    Offline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSnapshotCheckStatus {
-    Available,
-    Unavailable,
-    #[serde(rename = "needs_auth")]
-    NeedsAuth,
+    Online,
+    Offline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,8 +398,8 @@ mod tests {
 
     #[test]
     fn agent_management_status_serializes_snake_case() {
-        let value = serde_json::to_value(AgentManagementStatus::Unavailable).unwrap();
-        assert_eq!(value, json!("unavailable"));
+        let value = serde_json::to_value(AgentManagementStatus::Offline).unwrap();
+        assert_eq!(value, json!("offline"));
     }
 }
 
