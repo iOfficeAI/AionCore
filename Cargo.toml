@@ -7,6 +7,7 @@ members = [
     "crates/aionui-api-types",
     "crates/aionui-realtime",
     "crates/aionui-runtime",
+    "crates/aionui-process",
     "crates/aionui-auth",
     "crates/aionui-system",
     "crates/aionui-file",
@@ -37,6 +38,7 @@ aionui-db = { path = "crates/aionui-db" }
 aionui-api-types = { path = "crates/aionui-api-types" }
 aionui-realtime = { path = "crates/aionui-realtime" }
 aionui-runtime = { path = "crates/aionui-runtime" }
+aionui-process = { path = "crates/aionui-process" }
 aionui-auth = { path = "crates/aionui-auth" }
 aionui-system = { path = "crates/aionui-system" }
 aionui-file = { path = "crates/aionui-file" }
