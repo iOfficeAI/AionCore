@@ -10,7 +10,10 @@ use aion_config::config::{CliArgs, Config};
 use aion_mcp::manager::McpManager;
 use aion_protocol::commands::SessionMode;
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
-use aionui_api_types::{AgentModeResponse, SlashCommandItem};
+use aionui_api_types::{
+    AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
+    GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
+};
 use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -383,8 +386,68 @@ impl AionrsAgentManager {
         Ok(())
     }
 
+    pub async fn config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+        Ok(GetConfigOptionsResponse {
+            config_options: vec![aionrs_mode_config_option(self.approval_manager.current_mode())],
+        })
+    }
+
+    pub async fn set_config_option(&self, option_id: &str, value: &str) -> Result<SetConfigOptionResponse, AgentError> {
+        let option_id = option_id.trim();
+        let value = value.trim();
+
+        if option_id != AIONRS_MODE_OPTION_ID {
+            return Err(AgentError::bad_request(format!(
+                "Config option '{option_id}' is not available"
+            )));
+        }
+        if !is_aionrs_session_mode(value) {
+            return Err(AgentError::bad_request(format!(
+                "Value '{value}' is not selectable for config option '{option_id}'"
+            )));
+        }
+
+        self.set_mode(value).await?;
+        Ok(SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::Observed,
+            config_options: Some(self.config_options().await?.config_options),
+        })
+    }
+
     pub async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AgentError> {
         Ok(self.slash_commands.clone())
+    }
+}
+
+const AIONRS_MODE_OPTION_ID: &str = "mode";
+
+fn is_aionrs_session_mode(s: &str) -> bool {
+    matches!(s, "default" | "auto_edit" | "yolo")
+}
+
+fn aionrs_mode_config_option(current_value: String) -> AcpConfigOptionDto {
+    AcpConfigOptionDto {
+        id: AIONRS_MODE_OPTION_ID.to_owned(),
+        name: Some("Mode".to_owned()),
+        label: None,
+        description: None,
+        category: Some("mode".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some(current_value),
+        options: vec![
+            aionrs_mode_select_option("default", "Default"),
+            aionrs_mode_select_option("auto_edit", "Auto Edit"),
+            aionrs_mode_select_option("yolo", "YOLO"),
+        ],
+    }
+}
+
+fn aionrs_mode_select_option(value: &str, name: &str) -> AcpConfigSelectOptionDto {
+    AcpConfigSelectOptionDto {
+        value: value.to_owned(),
+        name: Some(name.to_owned()),
+        label: None,
+        description: None,
     }
 }
 

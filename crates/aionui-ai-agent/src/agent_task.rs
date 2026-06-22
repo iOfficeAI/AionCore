@@ -329,9 +329,7 @@ impl AgentInstance {
     pub async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
         match self {
             Self::Acp(m) => m.config_options().await,
-            Self::Aionrs(_) => Ok(GetConfigOptionsResponse {
-                config_options: Vec::new(),
-            }),
+            Self::Aionrs(m) => m.config_options().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_config_options().await,
         }
@@ -346,9 +344,7 @@ impl AgentInstance {
         }
         match self {
             Self::Acp(m) => m.set_config_option_confirmed(option_id, value).await,
-            Self::Aionrs(_) => Err(AgentError::bad_request(
-                "Config option switching is not supported for this agent type",
-            )),
+            Self::Aionrs(m) => m.set_config_option(option_id, value).await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.set_config_option(option_id, value).await,
         }
@@ -504,5 +500,105 @@ mod cc_switch_model_merge_tests {
     fn merge_returns_none_when_both_none() {
         let result = merge_model_info(None, None);
         assert!(result.is_none());
+    }
+}
+
+#[cfg(test)]
+mod aionrs_config_option_tests {
+    use std::sync::Arc;
+
+    use aionui_api_types::ConfigOptionConfirmation;
+
+    use super::*;
+    use crate::types::AionrsResolvedConfig;
+
+    fn make_test_config() -> AionrsResolvedConfig {
+        AionrsResolvedConfig {
+            provider: "anthropic".into(),
+            api_key: "sk-test-key".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            base_url: None,
+            system_prompt: None,
+            max_tokens: 4096,
+            max_turns: None,
+            max_malformed_tool_call_turns: None,
+            compat_overrides: Default::default(),
+            session_directory: std::env::temp_dir().join("aionrs-agent-task-test-sessions"),
+            session_mode: None,
+            extra_mcp_servers: std::collections::HashMap::new(),
+            bedrock_config: None,
+        }
+    }
+
+    async fn aionrs_instance() -> AgentInstance {
+        let manager = AionrsAgentManager::new("conv-aionrs-config".into(), "/project".into(), make_test_config(), None)
+            .await
+            .expect("aionrs manager should start in tests");
+        AgentInstance::Aionrs(Arc::new(manager))
+    }
+
+    #[tokio::test]
+    async fn aionrs_exposes_mode_as_config_option() {
+        let instance = aionrs_instance().await;
+
+        let response = instance.get_config_options().await.unwrap();
+
+        let mode = response
+            .config_options
+            .iter()
+            .find(|option| option.id == "mode")
+            .expect("aionrs should expose a mode config option");
+        assert_eq!(mode.category.as_deref(), Some("mode"));
+        assert_eq!(mode.option_type, "select");
+        assert_eq!(mode.current_value.as_deref(), Some("default"));
+        assert_eq!(
+            mode.options
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["default", "auto_edit", "yolo"]
+        );
+    }
+
+    #[tokio::test]
+    async fn aionrs_set_config_option_mode_switches_session_mode() {
+        let instance = aionrs_instance().await;
+
+        let response = instance.set_config_option("mode", "yolo").await.unwrap();
+
+        assert_eq!(response.confirmation, ConfigOptionConfirmation::Observed);
+        let options = response
+            .config_options
+            .expect("observed response should include snapshot");
+        let mode = options
+            .iter()
+            .find(|option| option.id == "mode")
+            .expect("response should include mode option");
+        assert_eq!(mode.current_value.as_deref(), Some("yolo"));
+        assert_eq!(instance.get_mode().await.unwrap().mode, "yolo");
+    }
+
+    #[tokio::test]
+    async fn aionrs_set_config_option_rejects_invalid_mode() {
+        let instance = aionrs_instance().await;
+
+        let error = instance.set_config_option("mode", "invalid").await.unwrap_err();
+
+        assert!(
+            matches!(&error, AgentError::BadRequest(message) if message == "Value 'invalid' is not selectable for config option 'mode'"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn aionrs_set_config_option_rejects_unavailable_option() {
+        let instance = aionrs_instance().await;
+
+        let error = instance.set_config_option("thought_level", "high").await.unwrap_err();
+
+        assert!(
+            matches!(&error, AgentError::BadRequest(message) if message == "Config option 'thought_level' is not available"),
+            "unexpected error: {error:?}"
+        );
     }
 }
