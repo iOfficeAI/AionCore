@@ -15,6 +15,7 @@ use crate::types::DocType;
 
 const POLL_INTERVAL_MS: u64 = 100;
 const POLL_MAX_ATTEMPTS: u32 = 150;
+const START_PORT_MAX_ATTEMPTS: usize = 3;
 const STOP_DELAY_MS: u64 = 500;
 const VERSION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -118,35 +119,58 @@ impl OfficecliWatchManager {
     }
 
     async fn try_start(&self, resolved: &str, doc_type: DocType) -> Result<u16, OfficeError> {
-        let port = allocate_port()?;
+        for attempt in 1..=START_PORT_MAX_ATTEMPTS {
+            let port = allocate_port()?;
+            match self.spawn_officecli_with_install(resolved, port, doc_type).await {
+                Ok(process) => {
+                    self.poll_port_ready(port, resolved).await?;
 
-        let spawn_result = self.spawner.spawn_officecli(resolved, port, doc_type).await;
+                    let key = session_key(resolved, doc_type);
+                    self.sessions.insert(
+                        key,
+                        WatchSession {
+                            port,
+                            process,
+                            file_path: resolved.to_owned(),
+                            doc_type,
+                            aborted: false,
+                        },
+                    );
 
-        let process = match spawn_result {
-            Ok(p) => p,
+                    return Ok(port);
+                }
+                Err(error) if is_port_in_use_start_failure(&error) && attempt < START_PORT_MAX_ATTEMPTS => {
+                    tracing::debug!(
+                        port,
+                        attempt,
+                        max_attempts = START_PORT_MAX_ATTEMPTS,
+                        "allocated preview port was already in use; retrying"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(OfficeError::StartFailed(
+            "failed to allocate an available preview port".into(),
+        ))
+    }
+
+    async fn spawn_officecli_with_install(
+        &self,
+        resolved: &str,
+        port: u16,
+        doc_type: DocType,
+    ) -> Result<Box<dyn ProcessHandle>, OfficeError> {
+        match self.spawner.spawn_officecli(resolved, port, doc_type).await {
+            Ok(process) => Ok(process),
             Err(OfficeError::OfficecliNotFound) => {
                 self.broadcast_status(doc_type, PreviewState::Installing, None);
                 self.spawner.install_officecli().await?;
-                self.spawner.spawn_officecli(resolved, port, doc_type).await?
+                self.spawner.spawn_officecli(resolved, port, doc_type).await
             }
-            Err(e) => return Err(e),
-        };
-
-        self.poll_port_ready(port, resolved).await?;
-
-        let key = session_key(resolved, doc_type);
-        self.sessions.insert(
-            key,
-            WatchSession {
-                port,
-                process,
-                file_path: resolved.to_owned(),
-                doc_type,
-                aborted: false,
-            },
-        );
-
-        Ok(port)
+            Err(error) => Err(error),
+        }
     }
 
     async fn poll_port_ready(&self, port: u16, file_path: &str) -> Result<(), OfficeError> {
@@ -404,6 +428,18 @@ fn session_key(resolved_path: &str, doc_type: DocType) -> String {
     format!("{doc_type}:{resolved_path}")
 }
 
+fn is_port_in_use_start_failure(error: &OfficeError) -> bool {
+    matches!(error, OfficeError::StartFailed(message) if is_port_in_use_message(message))
+}
+
+fn is_port_in_use_message(message: &str) -> bool {
+    message.contains("Address already in use")
+        || message.contains("Only one usage of each socket address")
+        || message.contains("os error 98")
+        || message.contains("os error 48")
+        || message.contains("os error 10048")
+}
+
 fn normalize_officecli_version(raw: &str) -> String {
     raw.split_whitespace()
         .last()
@@ -476,6 +512,7 @@ mod tests {
         install_count: AtomicU32,
         update_count: AtomicU32,
         fail_spawn: AtomicBool,
+        fail_with_address_in_use_once: AtomicBool,
         start_listener: AtomicBool,
     }
 
@@ -487,6 +524,7 @@ mod tests {
                 install_count: AtomicU32::new(0),
                 update_count: AtomicU32::new(0),
                 fail_spawn: AtomicBool::new(false),
+                fail_with_address_in_use_once: AtomicBool::new(false),
                 start_listener: AtomicBool::new(true),
             }
         }
@@ -504,6 +542,10 @@ mod tests {
 
             if self.fail_spawn.load(Ordering::SeqCst) {
                 return Err(OfficeError::StartFailed("mock spawn failure".into()));
+            }
+
+            if self.fail_with_address_in_use_once.swap(false, Ordering::SeqCst) {
+                return Err(OfficeError::StartFailed("Address already in use (os error 98)".into()));
             }
 
             if !self.installed.load(Ordering::SeqCst) {
@@ -580,6 +622,25 @@ mod tests {
         assert_eq!(public_preview_error_message(&err), "officecli install failed");
     }
 
+    #[test]
+    fn port_in_use_start_failure_detects_platform_messages() {
+        for message in [
+            "Address already in use (os error 98)",
+            "Address already in use (os error 48)",
+            "Only one usage of each socket address (protocol/network address/port) is normally permitted. (os error 10048)",
+        ] {
+            assert!(is_port_in_use_start_failure(&OfficeError::StartFailed(message.into())));
+        }
+    }
+
+    #[test]
+    fn port_in_use_start_failure_ignores_other_errors() {
+        assert!(!is_port_in_use_start_failure(&OfficeError::StartFailed(
+            "mock spawn failure".into()
+        )));
+        assert!(!is_port_in_use_start_failure(&OfficeError::OfficecliNotFound));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn officecli_capability_probe_requires_watch_command() {
@@ -629,6 +690,24 @@ mod tests {
 
         assert_eq!(p1, p2);
         assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn start_retries_when_allocated_port_is_taken() {
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.fail_with_address_in_use_once.store(true, Ordering::SeqCst);
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.docx");
+        std::fs::write(&file, b"test").unwrap();
+
+        let port = mgr.start(file.to_str().unwrap(), DocType::Word).await.unwrap();
+
+        assert!(port > 0);
+        assert!(mgr.is_active_port(port, DocType::Word));
+        assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
