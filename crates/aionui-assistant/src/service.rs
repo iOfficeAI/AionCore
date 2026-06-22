@@ -1872,6 +1872,13 @@ fn assistant_projection_for_definition(
         .and_then(|row| row.agent_backend_override.as_deref())
         .unwrap_or(definition.agent_backend.as_str());
 
+    // An agent row identifies its runtime key by `backend` for vendor ACP
+    // agents, but aionrs (the built-in Rust agent) has a NULL `backend` and is
+    // keyed by its `agent_type` ("aionrs") instead. Match on either so aionrs
+    // assistants resolve to the aionrs row rather than falling back to Missing.
+    let row_matches_backend =
+        |row: &&AgentManagementRow| row.backend.as_deref() == Some(effective_backend) || row.agent_type.serde_name() == effective_backend;
+
     let agent_row = if matches!(source, AssistantSource::Bare) {
         definition
             .source_ref
@@ -1880,12 +1887,8 @@ fn assistant_projection_for_definition(
     } else {
         agent_rows
             .iter()
-            .find(|row| row.backend.as_deref() == Some(effective_backend) && row.agent_source != AgentSource::Custom)
-            .or_else(|| {
-                agent_rows
-                    .iter()
-                    .find(|row| row.backend.as_deref() == Some(effective_backend))
-            })
+            .find(|row| row_matches_backend(row) && row.agent_source != AgentSource::Custom)
+            .or_else(|| agent_rows.iter().find(row_matches_backend))
     };
 
     let agent_status = agent_row
@@ -2576,6 +2579,38 @@ mod tests {
             .find(|assistant| assistant.id == "bare:agent-aionrs")
             .unwrap();
         assert_eq!(bare.preset_agent_type, "aionrs");
+    }
+
+    #[tokio::test]
+    async fn aionrs_assistant_resolves_agent_status_via_agent_type_not_backend() {
+        // Regression: an assistant whose engine is aionrs must match the aionrs
+        // agent row by `agent_type` ("aionrs"), since that row's `backend` is
+        // NULL. Matching on `backend` alone left the row unresolved and
+        // mislabelled every aionrs assistant as Missing/unavailable.
+        let mut aionrs_row = mk_agent_row("agent-aionrs", "aionrs", aionui_api_types::AgentManagementStatus::Online);
+        aionrs_row.backend = None;
+        aionrs_row.agent_type = aionui_common::AgentType::Aionrs;
+
+        let mut builtin = mk_builtin("builtin-aionrs", "Aion Assistant");
+        builtin.preset_agent_type = "aionrs".into();
+
+        let fx = fixture_with_options(FixtureOpts {
+            builtins: vec![builtin],
+            agent_rows: vec![aionrs_row],
+            ..Default::default()
+        })
+        .await;
+
+        let list = fx.service.list().await.unwrap();
+        let assistant = list
+            .iter()
+            .find(|assistant| assistant.id == "builtin-aionrs")
+            .expect("aionrs builtin assistant should be listed");
+        assert_eq!(
+            assistant.agent_status,
+            aionui_api_types::AgentManagementStatus::Online,
+            "aionrs assistant should resolve to the online aionrs agent row, not Missing"
+        );
     }
 
     #[tokio::test]
