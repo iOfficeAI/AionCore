@@ -381,7 +381,7 @@ async fn we2_add_agent_broadcasts_spawned() {
     let events = h.broadcaster.events_by_name("team.agentSpawned");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].data["team_id"], "team-1");
-    assert!(events[0].data["agent"].is_object());
+    assert!(events[0].data["assistant"].is_object());
 }
 
 // -- WE-3: Remove agent broadcasts team.agentRemoved ----------------------

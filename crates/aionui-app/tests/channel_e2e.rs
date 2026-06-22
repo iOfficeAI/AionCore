@@ -334,7 +334,10 @@ async fn get_channel_settings_defaults_to_generated_aionrs_assistant() {
     let assistant_id = json["data"]["assistant"]["assistant_id"]
         .as_str()
         .expect("default channel assistant should be the generated aionrs bare assistant");
-    assert!(assistant_id.starts_with("bare:"), "expected bare assistant id, got {assistant_id}");
+    assert!(
+        assistant_id.starts_with("bare:"),
+        "expected bare assistant id, got {assistant_id}"
+    );
     assert!(json["data"]["assistant"]["backend"].is_null());
     assert!(json["data"]["assistant"]["agent_type"].is_null());
     assert!(json["data"]["default_model"].is_null());

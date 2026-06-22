@@ -2,11 +2,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use aionui_api_types::{
-    TeamChildTurnPayload, TeamRunAckResponse, TeamRunPayload, TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload,
+    TeamChildTurnPayload, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStatus, TeamRunTargetRole,
+    TeamSlotRuntimeHealth, TeamSlotWorkPayload,
 };
 use aionui_common::{TimestampMs, generate_id, now_ms};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::TeamError;
 use crate::events::{
@@ -18,6 +19,9 @@ use crate::slot_wake_gate::{SlotWakeGate, WakeGateDecision};
 use crate::types::TeammateRole;
 use crate::wake::TeamWakeSource;
 
+const ACTIVE_CHILD_SLOW_THRESHOLD_MS: u64 = 10 * 60 * 1000;
+const ACTIVE_CHILD_SLOW_REPEAT_MS: u64 = 10 * 60 * 1000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveChildTurn {
     pub team_run_id: String,
@@ -25,6 +29,8 @@ pub struct ActiveChildTurn {
     pub role: TeamRunTargetRole,
     pub conversation_id: String,
     pub turn_id: String,
+    pub started_at_ms: TimestampMs,
+    pub last_slow_notified_at_ms: Option<TimestampMs>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +46,8 @@ pub struct StartingChildReservation {
     pub slot_id: String,
     pub role: TeamRunTargetRole,
     pub conversation_id: String,
+    pub(crate) wake_source: TeamWakeSource,
+    pub(crate) message_id: Option<String>,
     pub state: StartingReservationState,
 }
 
@@ -70,6 +78,49 @@ pub(crate) enum WakeRecordDecision {
     Suppressed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TeamRunOperationLease {
+    pub lease_id: String,
+    pub team_run_id: String,
+    pub slot_id: String,
+    pub role: TeamRunTargetRole,
+    pub wake_source: TeamWakeSource,
+    pub accepted_as_new_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveOperationLease {
+    lease: TeamRunOperationLease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TeamRunWakeAcquireOutcome {
+    Accepted(TeamRunOperationLease),
+    Suppressed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamRunSlotState {
+    Busy,
+    Pending,
+    Paused,
+    Idle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcquirePolicyDecision {
+    Accept,
+    Suppress(&'static str),
+    RejectSlotBusy,
+    RejectInvalid(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamRunWakeIntent {
+    ExternalRequest,
+    SchedulerWakeTarget,
+}
+
 #[derive(Debug, Clone)]
 pub struct PauseSlotOutcome {
     pub team_run_id: String,
@@ -83,10 +134,27 @@ pub(crate) struct PendingWakeView {
     pub message_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveryWakeCandidate {
+    pub slot_id: String,
+    pub role: TeamRunTargetRole,
+    pub unread_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveryBacklogResult {
+    pub team_run_id: String,
+    pub source: TeamRunSource,
+    pub recorded_wakes: Vec<String>,
+    pub pending_wake_count: usize,
+}
+
 #[derive(Debug, Clone)]
 struct TeamRunRecord {
     team_run_id: String,
     team_id: String,
+    source: TeamRunSource,
+    has_user_intervention: bool,
     target_slot_id: String,
     target_role: TeamRunTargetRole,
     status: TeamRunStatus,
@@ -97,7 +165,9 @@ struct TeamRunRecord {
     active_child_turns: HashMap<String, ActiveChildTurn>,
     starting_reservations: HashMap<String, StartingChildReservation>,
     pending_wakes: HashMap<String, VecDeque<PendingWake>>,
+    slot_runtime_health: HashMap<String, TeamSlotRuntimeHealth>,
     slot_wake_gate: SlotWakeGate,
+    active_operation_leases: HashMap<String, ActiveOperationLease>,
 }
 
 impl TeamRunRecord {
@@ -114,6 +184,32 @@ impl TeamRunRecord {
             .values()
             .filter(|reservation| reservation.slot_id == slot_id)
             .count()
+    }
+
+    fn active_operation_lease_count(&self) -> usize {
+        self.active_operation_leases.len()
+    }
+
+    fn slot_run_state(&self, slot_id: &str) -> TeamRunSlotState {
+        if self.active_child_turns.contains_key(slot_id) || self.starting_child_count_for_slot(slot_id) > 0 {
+            return TeamRunSlotState::Busy;
+        }
+        if self.pending_wake_count_for_slot(slot_id) > 0 {
+            return TeamRunSlotState::Pending;
+        }
+        if self.slot_wake_gate.snapshot_for_slot(slot_id).paused {
+            return TeamRunSlotState::Paused;
+        }
+        TeamRunSlotState::Idle
+    }
+
+    fn has_spawn_welcome_for_slot(&self, slot_id: &str) -> bool {
+        self.pending_wakes
+            .get(slot_id)
+            .is_some_and(|wakes| wakes.iter().any(|wake| wake.source == TeamWakeSource::SpawnWelcome))
+            || self.active_operation_leases.values().any(|active| {
+                active.lease.slot_id == slot_id && active.lease.wake_source == TeamWakeSource::SpawnWelcome
+            })
     }
 
     fn role_for_slot(&self, slot_id: &str) -> Option<TeamRunTargetRole> {
@@ -137,6 +233,7 @@ impl TeamRunRecord {
     }
 
     fn slot_work(&self) -> Vec<TeamSlotWorkPayload> {
+        let now = now_ms();
         let mut slot_ids = self
             .pending_wakes
             .keys()
@@ -147,6 +244,7 @@ impl TeamRunRecord {
                     .map(|reservation| reservation.slot_id.clone()),
             )
             .chain(self.active_child_turns.keys().cloned())
+            .chain(self.slot_runtime_health.keys().cloned())
             .chain(self.slot_wake_gate.slot_ids().cloned())
             .collect::<Vec<_>>();
         slot_ids.sort();
@@ -157,12 +255,25 @@ impl TeamRunRecord {
             .filter_map(|slot_id| {
                 let role = self.role_for_slot(&slot_id)?;
                 let gate = self.slot_wake_gate.snapshot_for_slot(&slot_id);
+                let active_child = self.active_child_turns.get(&slot_id);
+                let active_elapsed_ms = active_child.map(|child| {
+                    child
+                        .last_slow_notified_at_ms
+                        .unwrap_or(now)
+                        .saturating_sub(child.started_at_ms)
+                        .max(0) as u64
+                });
                 Some(TeamSlotWorkPayload {
                     pending_wake_count: self.pending_wake_count_for_slot(&slot_id),
                     starting_child_count: self.starting_child_count_for_slot(&slot_id),
                     paused: gate.paused,
                     suppressed_wake_count: gate.suppressed_wake_count,
-                    active_turn_id: self.active_child_turns.get(&slot_id).map(|child| child.turn_id.clone()),
+                    active_turn_id: active_child.map(|child| child.turn_id.clone()),
+                    active_turn_started_at_ms: active_child.map(|child| child.started_at_ms),
+                    active_turn_elapsed_ms: active_elapsed_ms,
+                    active_turn_slow: active_elapsed_ms.map(|elapsed| elapsed >= ACTIVE_CHILD_SLOW_THRESHOLD_MS),
+                    active_turn_slow_threshold_ms: active_child.map(|_| ACTIVE_CHILD_SLOW_THRESHOLD_MS),
+                    runtime_health: self.slot_runtime_health.get(&slot_id).cloned(),
                     slot_id,
                     role,
                 })
@@ -184,6 +295,8 @@ impl TeamRunRecord {
         TeamRunPayload {
             team_id: self.team_id.clone(),
             team_run_id: self.team_run_id.clone(),
+            source: self.source.clone(),
+            has_user_intervention: self.has_user_intervention,
             target_slot_id: self.target_slot_id.clone(),
             target_role: self.target_role.clone(),
             status: self.status.clone(),
@@ -203,6 +316,8 @@ impl TeamRunRecord {
         TeamRunAckResponse {
             team_run_id: self.team_run_id.clone(),
             team_id: self.team_id.clone(),
+            source: self.source.clone(),
+            has_user_intervention: self.has_user_intervention,
             target_slot_id: self.target_slot_id.clone(),
             target_role: self.target_role.clone(),
             accepted_slot_id: accepted_slot_id.to_owned(),
@@ -214,6 +329,133 @@ impl TeamRunRecord {
 
     fn is_active(&self) -> bool {
         matches!(self.status, TeamRunStatus::Accepted | TeamRunStatus::Running)
+    }
+}
+
+fn new_operation_lease(
+    run: &mut TeamRunRecord,
+    slot_id: &str,
+    role: TeamRunTargetRole,
+    wake_source: TeamWakeSource,
+    accepted_as_new_run: bool,
+) -> TeamRunOperationLease {
+    let lease = TeamRunOperationLease {
+        lease_id: generate_id(),
+        team_run_id: run.team_run_id.clone(),
+        slot_id: slot_id.to_owned(),
+        role,
+        wake_source,
+        accepted_as_new_run,
+    };
+    run.active_operation_leases
+        .insert(lease.lease_id.clone(), ActiveOperationLease { lease: lease.clone() });
+    lease
+}
+
+fn new_team_run_record(
+    team_id: String,
+    target_slot_id: &str,
+    target_role: TeamRunTargetRole,
+    source: TeamRunSource,
+    has_user_intervention: bool,
+) -> TeamRunRecord {
+    TeamRunRecord {
+        team_run_id: generate_id(),
+        team_id,
+        source,
+        has_user_intervention,
+        target_slot_id: target_slot_id.to_owned(),
+        target_role,
+        status: TeamRunStatus::Accepted,
+        started_at: None,
+        completed_at: None,
+        cancelled_at: None,
+        cancel_reason: None,
+        active_child_turns: HashMap::new(),
+        starting_reservations: HashMap::new(),
+        pending_wakes: HashMap::new(),
+        slot_runtime_health: HashMap::new(),
+        slot_wake_gate: SlotWakeGate::default(),
+        active_operation_leases: HashMap::new(),
+    }
+}
+
+fn push_pending_wake_locked(
+    run: &mut TeamRunRecord,
+    slot_id: String,
+    role: TeamRunTargetRole,
+    source: TeamWakeSource,
+    message_id: Option<String>,
+) {
+    let wake = PendingWake {
+        slot_id: slot_id.clone(),
+        role,
+        source,
+        message_id,
+    };
+    let queue = run.pending_wakes.entry(slot_id).or_default();
+    if is_foreground_wake(source) {
+        let insert_at = queue
+            .iter()
+            .position(|pending| !is_foreground_wake(pending.source))
+            .unwrap_or(queue.len());
+        queue.insert(insert_at, wake);
+    } else {
+        queue.push_back(wake);
+    }
+}
+
+fn is_foreground_wake(source: TeamWakeSource) -> bool {
+    matches!(source, TeamWakeSource::UserMessage | TeamWakeSource::UserIntervention)
+}
+
+fn acquire_policy(
+    source: TeamWakeSource,
+    slot_state: TeamRunSlotState,
+    has_spawn_welcome: bool,
+    intent: TeamRunWakeIntent,
+) -> AcquirePolicyDecision {
+    match source {
+        TeamWakeSource::UserMessage | TeamWakeSource::UserIntervention => match slot_state {
+            TeamRunSlotState::Busy => AcquirePolicyDecision::RejectSlotBusy,
+            TeamRunSlotState::Pending | TeamRunSlotState::Paused | TeamRunSlotState::Idle => {
+                AcquirePolicyDecision::Accept
+            }
+        },
+        TeamWakeSource::McpSendMessage => match slot_state {
+            TeamRunSlotState::Paused => AcquirePolicyDecision::Suppress("paused_slot_background_wake"),
+            TeamRunSlotState::Busy | TeamRunSlotState::Pending | TeamRunSlotState::Idle => {
+                AcquirePolicyDecision::Accept
+            }
+        },
+        TeamWakeSource::SpawnWelcome => {
+            if has_spawn_welcome {
+                return AcquirePolicyDecision::Suppress("duplicate_spawn_welcome");
+            }
+            match slot_state {
+                TeamRunSlotState::Busy => AcquirePolicyDecision::RejectInvalid("spawn welcome target is already busy"),
+                TeamRunSlotState::Pending => AcquirePolicyDecision::Suppress("spawn_welcome_already_pending"),
+                TeamRunSlotState::Paused | TeamRunSlotState::Idle => AcquirePolicyDecision::Accept,
+            }
+        }
+        TeamWakeSource::McpShutdownRequest => AcquirePolicyDecision::Accept,
+        TeamWakeSource::IdleNotification | TeamWakeSource::InterruptedNotification => match slot_state {
+            TeamRunSlotState::Idle if intent == TeamRunWakeIntent::SchedulerWakeTarget => AcquirePolicyDecision::Accept,
+            TeamRunSlotState::Idle => AcquirePolicyDecision::Suppress("background_notification_without_wake_target"),
+            TeamRunSlotState::Busy | TeamRunSlotState::Pending | TeamRunSlotState::Paused => {
+                AcquirePolicyDecision::Suppress("background_notification_deduped")
+            }
+        },
+        TeamWakeSource::RecoveryDrain
+        | TeamWakeSource::CrashNotification
+        | TeamWakeSource::InactivityTimeout
+        | TeamWakeSource::SpawnAttachFailure
+        | TeamWakeSource::ShutdownRejected => match slot_state {
+            TeamRunSlotState::Paused => AcquirePolicyDecision::Suppress("paused_slot_recovery_wake"),
+            TeamRunSlotState::Busy | TeamRunSlotState::Pending | TeamRunSlotState::Idle => {
+                AcquirePolicyDecision::Accept
+            }
+        },
     }
 }
 
@@ -241,7 +483,7 @@ impl TeamRunManager {
         message_id: Option<String>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         let mut guard = self.state.lock().await;
-        if let Some(active) = guard.as_ref().filter(|r| r.is_active()) {
+        if let Some(active) = guard.as_mut().filter(|r| r.is_active()) {
             if allow_active_intervention {
                 if active.slot_is_busy(target_slot_id) {
                     info!(
@@ -262,6 +504,7 @@ impl TeamRunManager {
                     active_target_role = ?active.target_role,
                     "team_run active intervention accepted"
                 );
+                active.has_user_intervention = true;
                 return Ok(active.ack(target_slot_id, target_role, message_id));
             }
             return Err(TeamError::InvalidRequest("team run is already active".into()));
@@ -273,21 +516,13 @@ impl TeamRunManager {
             )));
         }
 
-        let record = TeamRunRecord {
-            team_run_id: generate_id(),
-            team_id: self.team_id.clone(),
-            target_slot_id: target_slot_id.to_owned(),
-            target_role: target_role.clone(),
-            status: TeamRunStatus::Accepted,
-            started_at: None,
-            completed_at: None,
-            cancelled_at: None,
-            cancel_reason: None,
-            active_child_turns: HashMap::new(),
-            starting_reservations: HashMap::new(),
-            pending_wakes: HashMap::new(),
-            slot_wake_gate: SlotWakeGate::default(),
-        };
+        let record = new_team_run_record(
+            self.team_id.clone(),
+            target_slot_id,
+            target_role.clone(),
+            TeamRunSource::UserMessage,
+            true,
+        );
         let ack = record.ack(target_slot_id, target_role, message_id);
         let payload = record.payload();
         *guard = Some(record);
@@ -302,6 +537,368 @@ impl TeamRunManager {
         );
         self.emitter.broadcast_team_run(TEAM_RUN_ACCEPTED_EVENT, payload);
         Ok(ack)
+    }
+
+    pub(crate) async fn acquire_user_message_wake(
+        &self,
+        slot_id: &str,
+        role: TeamRunTargetRole,
+    ) -> Result<(TeamRunAckResponse, TeamRunOperationLease), TeamError> {
+        let mut guard = self.state.lock().await;
+
+        if let Some(run) = guard.as_mut().filter(|r| r.is_active()) {
+            if matches!(run.slot_run_state(slot_id), TeamRunSlotState::Busy) {
+                info!(
+                    team_id = %self.team_id,
+                    team_run_id = %run.team_run_id,
+                    slot_id,
+                    role = ?role,
+                    "team_run user wake acquire rejected because slot is busy"
+                );
+                return Err(TeamError::SlotBusy(slot_id.to_owned()));
+            }
+
+            let source = TeamWakeSource::UserIntervention;
+            let _ = run.slot_wake_gate.before_wake(slot_id, source, None);
+            run.has_user_intervention = true;
+            let lease = new_operation_lease(run, slot_id, role.clone(), source, false);
+            let ack = run.ack(slot_id, role, None);
+            info!(
+                team_id = %self.team_id,
+                team_run_id = %lease.team_run_id,
+                lease_id = %lease.lease_id,
+                slot_id = %lease.slot_id,
+                wake_source = %lease.wake_source,
+                accepted_as_new_run = lease.accepted_as_new_run,
+                "team_run operation lease acquired"
+            );
+            return Ok((ack, lease));
+        }
+
+        if let Some(cancelling) = guard.as_ref().filter(|r| matches!(r.status, TeamRunStatus::Cancelling)) {
+            return Err(TeamError::InvalidRequest(format!(
+                "team run {} is cancelling",
+                cancelling.team_run_id
+            )));
+        }
+
+        let mut record = new_team_run_record(
+            self.team_id.clone(),
+            slot_id,
+            role.clone(),
+            TeamRunSource::UserMessage,
+            true,
+        );
+        let lease = new_operation_lease(&mut record, slot_id, role.clone(), TeamWakeSource::UserMessage, true);
+        let ack = record.ack(slot_id, role, None);
+        let payload = record.payload();
+        *guard = Some(record);
+        drop(guard);
+
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %ack.team_run_id,
+            target_slot_id = %ack.target_slot_id,
+            target_role = ?ack.target_role,
+            "team_run accepted"
+        );
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %lease.team_run_id,
+            lease_id = %lease.lease_id,
+            slot_id = %lease.slot_id,
+            wake_source = %lease.wake_source,
+            accepted_as_new_run = lease.accepted_as_new_run,
+            "team_run operation lease acquired"
+        );
+        self.emitter.broadcast_team_run(TEAM_RUN_ACCEPTED_EVENT, payload);
+        Ok((ack, lease))
+    }
+
+    pub(crate) async fn recover_mailbox_backlog(
+        &self,
+        candidates: Vec<RecoveryWakeCandidate>,
+    ) -> Option<RecoveryBacklogResult> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let mut guard = self.state.lock().await;
+        if let Some(run) = guard.as_ref().filter(|r| matches!(r.status, TeamRunStatus::Cancelling)) {
+            warn!(
+                team_id = %self.team_id,
+                team_run_id = %run.team_run_id,
+                source = %TeamWakeSource::RecoveryDrain,
+                candidate_count = candidates.len(),
+                reason = "active_run_cancelling",
+                "team recovery backlog skipped"
+            );
+            return None;
+        }
+
+        if guard.as_ref().is_none_or(|run| !run.is_active()) {
+            let first = candidates.first().expect("checked non-empty");
+            let mut run = new_team_run_record(
+                self.team_id.clone(),
+                &first.slot_id,
+                first.role.clone(),
+                TeamRunSource::RecoveryDrain,
+                false,
+            );
+            for candidate in &candidates {
+                push_pending_wake_locked(
+                    &mut run,
+                    candidate.slot_id.clone(),
+                    candidate.role.clone(),
+                    TeamWakeSource::RecoveryDrain,
+                    None,
+                );
+            }
+            let payload = run.payload();
+            let result = RecoveryBacklogResult {
+                team_run_id: run.team_run_id.clone(),
+                source: run.source.clone(),
+                recorded_wakes: candidates.iter().map(|candidate| candidate.slot_id.clone()).collect(),
+                pending_wake_count: payload.pending_wake_count,
+            };
+            *guard = Some(run);
+            drop(guard);
+
+            info!(
+                team_id = %self.team_id,
+                team_run_id = %result.team_run_id,
+                source = "recovery_drain",
+                slot_count = result.recorded_wakes.len(),
+                pending_wake_count = result.pending_wake_count,
+                reason = "orphan_mailbox_backlog",
+                "team recovery drain accepted"
+            );
+            self.emitter.broadcast_team_run(TEAM_RUN_ACCEPTED_EVENT, payload);
+            return Some(result);
+        }
+
+        let run = guard.as_mut().expect("active checked");
+        let mut recorded_wakes = Vec::new();
+        for candidate in candidates {
+            let slot_state = run.slot_run_state(&candidate.slot_id);
+            if !matches!(slot_state, TeamRunSlotState::Idle) {
+                debug!(
+                    team_id = %self.team_id,
+                    team_run_id = %run.team_run_id,
+                    slot_id = %candidate.slot_id,
+                    source = "recovery_drain",
+                    unread_count = candidate.unread_count,
+                    slot_state = ?slot_state,
+                    reason = "slot_already_has_run_work",
+                    "team recovery backlog wake skipped"
+                );
+                continue;
+            }
+            push_pending_wake_locked(
+                run,
+                candidate.slot_id.clone(),
+                candidate.role,
+                TeamWakeSource::RecoveryDrain,
+                None,
+            );
+            recorded_wakes.push(candidate.slot_id);
+        }
+
+        if recorded_wakes.is_empty() {
+            return None;
+        }
+
+        let payload = run.payload();
+        let result = RecoveryBacklogResult {
+            team_run_id: run.team_run_id.clone(),
+            source: run.source.clone(),
+            recorded_wakes,
+            pending_wake_count: payload.pending_wake_count,
+        };
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %result.team_run_id,
+            source = "recovery_drain",
+            slot_count = result.recorded_wakes.len(),
+            pending_wake_count = result.pending_wake_count,
+            reason = "attached_to_active_run",
+            "team recovery backlog attached to active run"
+        );
+        drop(guard);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
+        Some(result)
+    }
+
+    pub(crate) async fn commit_operation_lease(
+        &self,
+        lease_id: &str,
+        trigger_message_id: Option<String>,
+    ) -> Result<(), TeamError> {
+        let mut guard = self.state.lock().await;
+        let Some(run) = guard.as_mut().filter(|r| r.is_active()) else {
+            error!(
+                team_id = %self.team_id,
+                lease_id,
+                "team_run operation lease commit failed because no active run exists"
+            );
+            return Err(TeamError::InvalidRequest(format!(
+                "team run operation lease missing: {lease_id}"
+            )));
+        };
+        let Some(active) = run.active_operation_leases.remove(lease_id) else {
+            error!(
+                team_id = %self.team_id,
+                team_run_id = %run.team_run_id,
+                lease_id,
+                "team_run operation lease commit failed because lease is missing"
+            );
+            return Err(TeamError::InvalidRequest(format!(
+                "team run operation lease missing: {lease_id}"
+            )));
+        };
+
+        let lease = active.lease;
+        push_pending_wake_locked(
+            run,
+            lease.slot_id.clone(),
+            lease.role.clone(),
+            lease.wake_source,
+            trigger_message_id,
+        );
+        let payload = run.payload();
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %run.team_run_id,
+            lease_id = %lease.lease_id,
+            slot_id = %lease.slot_id,
+            wake_source = %lease.wake_source,
+            pending_wake_count = payload.pending_wake_count,
+            active_operation_lease_count = run.active_operation_lease_count(),
+            "team_run operation lease committed"
+        );
+        drop(guard);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
+        Ok(())
+    }
+
+    pub(crate) async fn abort_operation_lease(&self, lease_id: &str, reason: &str) -> Result<(), TeamError> {
+        let mut guard = self.state.lock().await;
+        let Some(run) = guard.as_mut().filter(|r| r.is_active()) else {
+            error!(
+                team_id = %self.team_id,
+                lease_id,
+                reason,
+                "team_run operation lease abort failed because no active run exists"
+            );
+            return Err(TeamError::InvalidRequest(format!(
+                "team run operation lease missing: {lease_id}"
+            )));
+        };
+        let Some(active) = run.active_operation_leases.remove(lease_id) else {
+            error!(
+                team_id = %self.team_id,
+                team_run_id = %run.team_run_id,
+                lease_id,
+                reason,
+                "team_run operation lease abort failed because lease is missing"
+            );
+            return Err(TeamError::InvalidRequest(format!(
+                "team run operation lease missing: {lease_id}"
+            )));
+        };
+        let payload = run.payload();
+        warn!(
+            team_id = %self.team_id,
+            team_run_id = %run.team_run_id,
+            lease_id = %active.lease.lease_id,
+            slot_id = %active.lease.slot_id,
+            wake_source = %active.lease.wake_source,
+            reason,
+            active_operation_lease_count = run.active_operation_lease_count(),
+            "team_run operation lease aborted"
+        );
+        drop(guard);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
+        Ok(())
+    }
+
+    async fn acquire_run_scoped_wake_with_intent(
+        &self,
+        slot_id: &str,
+        role: TeamRunTargetRole,
+        source: TeamWakeSource,
+        intent: TeamRunWakeIntent,
+    ) -> Result<TeamRunWakeAcquireOutcome, TeamError> {
+        let mut guard = self.state.lock().await;
+        let Some(run) = guard.as_mut().filter(|r| r.is_active()) else {
+            warn!(
+                team_id = %self.team_id,
+                slot_id,
+                role = ?role,
+                wake_source = %source,
+                "team_run wake acquire rejected because no active run exists"
+            );
+            return Err(TeamError::InvalidRequest(
+                "no active team run for run-scoped wake".into(),
+            ));
+        };
+
+        let slot_state = run.slot_run_state(slot_id);
+        let decision = acquire_policy(source, slot_state, run.has_spawn_welcome_for_slot(slot_id), intent);
+        match decision {
+            AcquirePolicyDecision::RejectSlotBusy => Err(TeamError::SlotBusy(slot_id.to_owned())),
+            AcquirePolicyDecision::RejectInvalid(message) => Err(TeamError::InvalidRequest(message.into())),
+            AcquirePolicyDecision::Suppress(reason) => {
+                let _ = run.slot_wake_gate.before_wake(slot_id, source, None);
+                let payload = run.payload();
+                debug!(
+                    team_id = %self.team_id,
+                    team_run_id = %run.team_run_id,
+                    slot_id,
+                    wake_source = %source,
+                    slot_state = ?slot_state,
+                    reason,
+                    "team_run wake acquire suppressed"
+                );
+                drop(guard);
+                self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
+                Ok(TeamRunWakeAcquireOutcome::Suppressed)
+            }
+            AcquirePolicyDecision::Accept => {
+                let _ = run.slot_wake_gate.before_wake(slot_id, source, None);
+                let lease = new_operation_lease(run, slot_id, role, source, false);
+                info!(
+                    team_id = %self.team_id,
+                    team_run_id = %lease.team_run_id,
+                    lease_id = %lease.lease_id,
+                    slot_id = %lease.slot_id,
+                    wake_source = %lease.wake_source,
+                    accepted_as_new_run = lease.accepted_as_new_run,
+                    "team_run operation lease acquired"
+                );
+                Ok(TeamRunWakeAcquireOutcome::Accepted(lease))
+            }
+        }
+    }
+
+    pub(crate) async fn acquire_run_scoped_wake(
+        &self,
+        slot_id: &str,
+        role: TeamRunTargetRole,
+        source: TeamWakeSource,
+    ) -> Result<TeamRunWakeAcquireOutcome, TeamError> {
+        self.acquire_run_scoped_wake_with_intent(slot_id, role, source, TeamRunWakeIntent::ExternalRequest)
+            .await
+    }
+
+    pub(crate) async fn acquire_scheduler_wake(
+        &self,
+        slot_id: &str,
+        role: TeamRunTargetRole,
+        source: TeamWakeSource,
+    ) -> Result<TeamRunWakeAcquireOutcome, TeamError> {
+        self.acquire_run_scoped_wake_with_intent(slot_id, role, source, TeamRunWakeIntent::SchedulerWakeTarget)
+            .await
     }
 
     pub async fn active_run_id(&self) -> Option<String> {
@@ -324,7 +921,71 @@ impl TeamRunManager {
 
     pub async fn current_payload(&self) -> Option<TeamRunPayload> {
         let guard = self.state.lock().await;
-        guard.as_ref().map(TeamRunRecord::payload)
+        guard.as_ref().filter(|run| run.is_active()).map(TeamRunRecord::payload)
+    }
+
+    pub(crate) async fn slot_work_for_slot(&self, slot_id: &str) -> Option<(String, TeamSlotWorkPayload)> {
+        let guard = self.state.lock().await;
+        let run = guard.as_ref().filter(|run| run.is_active())?;
+        let payload = run.payload();
+        let work = payload.slot_work.iter().find(|work| work.slot_id == slot_id).cloned()?;
+        Some((payload.team_run_id, work))
+    }
+
+    pub async fn mark_slot_runtime_health(
+        &self,
+        slot_id: &str,
+        health: TeamSlotRuntimeHealth,
+    ) -> Option<TeamRunPayload> {
+        let mut guard = self.state.lock().await;
+        let run = guard.as_mut().filter(|run| run.is_active())?;
+        run.slot_runtime_health.insert(slot_id.to_owned(), health);
+        let payload = run.payload();
+        drop(guard);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload.clone());
+        Some(payload)
+    }
+
+    pub async fn observe_slow_child_turns(&self, now: TimestampMs) -> Option<TeamRunPayload> {
+        let mut guard = self.state.lock().await;
+        let run = guard.as_mut().filter(|run| run.is_active())?;
+        let mut observed = false;
+
+        for child in run.active_child_turns.values_mut() {
+            let elapsed_ms = now.saturating_sub(child.started_at_ms).max(0) as u64;
+            if elapsed_ms < ACTIVE_CHILD_SLOW_THRESHOLD_MS {
+                continue;
+            }
+            let due = child
+                .last_slow_notified_at_ms
+                .map(|last| now.saturating_sub(last).max(0) as u64 >= ACTIVE_CHILD_SLOW_REPEAT_MS)
+                .unwrap_or(true);
+            if !due {
+                continue;
+            }
+            child.last_slow_notified_at_ms = Some(now);
+            observed = true;
+            info!(
+                team_id = %self.team_id,
+                team_run_id = %child.team_run_id,
+                slot_id = %child.slot_id,
+                role = ?child.role,
+                conversation_id = %child.conversation_id,
+                turn_id = %child.turn_id,
+                elapsed_ms,
+                slow_threshold_ms = ACTIVE_CHILD_SLOW_THRESHOLD_MS,
+                "team_child_turn slow"
+            );
+        }
+
+        if !observed {
+            return None;
+        }
+
+        let payload = run.payload();
+        drop(guard);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload.clone());
+        Some(payload)
     }
 
     pub async fn pause_slot_work(&self, slot_id: &str, reason: Option<String>) -> Result<PauseSlotOutcome, TeamError> {
@@ -432,16 +1093,13 @@ impl TeamRunManager {
                 Ok(WakeRecordDecision::Suppressed)
             }
             WakeGateDecision::Record { resumed_from_pause } => {
-                let pending = PendingWake {
-                    slot_id: slot_id.to_owned(),
-                    role: target_role.clone(),
-                    source: wake_source,
-                    message_id: trigger_message_id.clone(),
-                };
-                run.pending_wakes
-                    .entry(slot_id.to_owned())
-                    .or_default()
-                    .push_back(pending);
+                push_pending_wake_locked(
+                    run,
+                    slot_id.to_owned(),
+                    target_role.clone(),
+                    wake_source,
+                    trigger_message_id.clone(),
+                );
                 let slot_pending_wake_count = run.pending_wake_count_for_slot(slot_id);
                 let payload = run.payload();
                 if resumed_from_pause {
@@ -498,6 +1156,7 @@ impl TeamRunManager {
         if run.pending_wakes.get(slot_id).is_some_and(VecDeque::is_empty) {
             run.pending_wakes.remove(slot_id);
         }
+        run.slot_runtime_health.remove(slot_id);
         if pending.slot_id != slot_id {
             warn!(
                 team_id = %self.team_id,
@@ -525,6 +1184,8 @@ impl TeamRunManager {
             slot_id: pending.slot_id.clone(),
             role,
             conversation_id: conversation_id.to_owned(),
+            wake_source: pending.source,
+            message_id: pending.message_id.clone(),
             state: StartingReservationState::Starting,
         };
         run.starting_reservations
@@ -546,6 +1207,50 @@ impl TeamRunManager {
         drop(guard);
         self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload);
         Some(reservation)
+    }
+
+    pub async fn retry_child_start_later(&self, reservation_id: &str, reason: &str) -> Option<TeamRunPayload> {
+        let mut guard = self.state.lock().await;
+        let run = guard.as_mut().filter(|run| run.is_active())?;
+        let reservation = match run.starting_reservations.remove(reservation_id) {
+            Some(reservation) => reservation,
+            None => {
+                warn!(
+                    team_id = %self.team_id,
+                    reservation_id,
+                    error = %reason,
+                    "team_run reservation retry ignored because reservation is missing"
+                );
+                return None;
+            }
+        };
+
+        let pending = PendingWake {
+            slot_id: reservation.slot_id.clone(),
+            role: reservation.role,
+            source: reservation.wake_source,
+            message_id: reservation.message_id.clone(),
+        };
+        run.pending_wakes
+            .entry(reservation.slot_id.clone())
+            .or_default()
+            .push_front(pending);
+        let payload = run.payload();
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %run.team_run_id,
+            reservation_id = %reservation.reservation_id,
+            slot_id = %reservation.slot_id,
+            error = %reason,
+            slot_pending_wake_count = run.pending_wake_count_for_slot(&reservation.slot_id),
+            pending_wake_count = payload.pending_wake_count,
+            starting_child_count = payload.starting_child_count,
+            active_child_count = payload.active_child_count,
+            "team_run reservation deferred for retry"
+        );
+        drop(guard);
+        self.emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, payload.clone());
+        Some(payload)
     }
 
     pub(crate) async fn peek_next_pending_wake(&self, slot_id: &str) -> Option<PendingWakeView> {
@@ -1017,15 +1722,7 @@ impl TeamRunManager {
         let mut guard = self.state.lock().await;
         let run = guard.as_mut().filter(|r| r.is_active())?;
         let source = run.slot_wake_gate.release_suppressed_if_resumed(slot_id)?;
-        run.pending_wakes
-            .entry(slot_id.to_owned())
-            .or_default()
-            .push_back(PendingWake {
-                slot_id: slot_id.to_owned(),
-                role: role.clone(),
-                source,
-                message_id: None,
-            });
+        push_pending_wake_locked(run, slot_id.to_owned(), role.clone(), source, None);
         let payload = run.payload();
         let slot_work = payload.slot_work.iter().find(|work| work.slot_id == slot_id);
         info!(
@@ -1076,6 +1773,7 @@ fn maybe_complete_locked(run: &mut TeamRunRecord, emitter: &TeamEventEmitter) ->
     if run.pending_wake_count() > 0
         || !run.starting_reservations.is_empty()
         || !run.active_child_turns.is_empty()
+        || run.active_operation_lease_count() > 0
         || run.has_retained_wake_gate_work()
     {
         emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, run.payload());
@@ -1109,6 +1807,7 @@ fn maybe_cancelled_locked(run: &mut TeamRunRecord, emitter: &TeamEventEmitter) -
     if run.pending_wake_count() > 0
         || !run.starting_reservations.is_empty()
         || !run.active_child_turns.is_empty()
+        || run.active_operation_lease_count() > 0
         || run.has_retained_wake_gate_work()
     {
         emitter.broadcast_team_run(TEAM_RUN_UPDATED_EVENT, run.payload());
@@ -1188,6 +1887,624 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_message_run_payload_has_user_source() {
+        let (manager, _bc) = manager();
+        let (ack, lease) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect("user message should create run");
+
+        assert_eq!(ack.source, TeamRunSource::UserMessage);
+        assert!(ack.has_user_intervention);
+
+        manager
+            .commit_operation_lease(&lease.lease_id, Some("mailbox-1".into()))
+            .await
+            .expect("commit user wake");
+
+        let payload = manager.current_payload().await.expect("active payload");
+        assert_eq!(payload.source, TeamRunSource::UserMessage);
+        assert!(payload.has_user_intervention);
+    }
+
+    #[tokio::test]
+    async fn active_recovery_run_records_user_intervention_without_changing_source() {
+        let (manager, _bc) = manager();
+        let result = manager
+            .recover_mailbox_backlog(vec![RecoveryWakeCandidate {
+                slot_id: "lead".into(),
+                role: TeamRunTargetRole::Lead,
+                unread_count: 2,
+            }])
+            .await
+            .expect("recovery scan should succeed");
+
+        assert_eq!(result.source, TeamRunSource::RecoveryDrain);
+        assert_eq!(
+            manager.current_payload().await.unwrap().source,
+            TeamRunSource::RecoveryDrain
+        );
+
+        let (ack, lease) = manager
+            .acquire_user_message_wake("worker", TeamRunTargetRole::Teammate)
+            .await
+            .expect("user intervention should join recovery run");
+        assert_eq!(ack.team_run_id, result.team_run_id);
+        assert_eq!(ack.source, TeamRunSource::RecoveryDrain);
+        assert!(ack.has_user_intervention);
+        assert!(!lease.accepted_as_new_run);
+
+        let payload = manager.current_payload().await.expect("active payload");
+        assert_eq!(payload.source, TeamRunSource::RecoveryDrain);
+        assert!(payload.has_user_intervention);
+    }
+
+    #[tokio::test]
+    async fn recovery_drain_creates_run_with_pending_wakes() {
+        let (manager, _bc) = manager();
+        let result = manager
+            .recover_mailbox_backlog(vec![
+                RecoveryWakeCandidate {
+                    slot_id: "lead".into(),
+                    role: TeamRunTargetRole::Lead,
+                    unread_count: 2,
+                },
+                RecoveryWakeCandidate {
+                    slot_id: "worker".into(),
+                    role: TeamRunTargetRole::Teammate,
+                    unread_count: 1,
+                },
+            ])
+            .await
+            .expect("recovery should create run");
+
+        assert_eq!(result.source, TeamRunSource::RecoveryDrain);
+        assert_eq!(result.recorded_wakes.len(), 2);
+        assert_eq!(result.pending_wake_count, 2);
+
+        let lead = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .expect("lead recovery wake should be claimable");
+        assert_eq!(lead.team_run_id, result.team_run_id);
+        assert_eq!(lead.wake_source, TeamWakeSource::RecoveryDrain);
+        assert!(lead.message_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_backlog_attaches_to_active_user_run() {
+        let (manager, _bc) = manager();
+        let (ack, lease) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect("user run");
+        manager
+            .commit_operation_lease(&lease.lease_id, Some("mailbox-user".into()))
+            .await
+            .expect("commit user wake");
+
+        let result = manager
+            .recover_mailbox_backlog(vec![RecoveryWakeCandidate {
+                slot_id: "worker".into(),
+                role: TeamRunTargetRole::Teammate,
+                unread_count: 3,
+            }])
+            .await
+            .expect("recovery should attach to active run");
+
+        assert_eq!(result.team_run_id, ack.team_run_id);
+        assert_eq!(result.source, TeamRunSource::UserMessage);
+        assert_eq!(result.recorded_wakes, vec!["worker".to_string()]);
+
+        let worker = manager
+            .claim_wake_for_turn("worker", TeamRunTargetRole::Teammate, "conv-worker")
+            .await
+            .expect("attached recovery wake should be claimable");
+        assert_eq!(worker.wake_source, TeamWakeSource::RecoveryDrain);
+        assert!(worker.message_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn user_intervention_wake_prioritizes_over_recovery_backlog() {
+        let (manager, _bc) = manager();
+        let result = manager
+            .recover_mailbox_backlog(vec![RecoveryWakeCandidate {
+                slot_id: "lead".into(),
+                role: TeamRunTargetRole::Lead,
+                unread_count: 2,
+            }])
+            .await
+            .expect("recovery should create run");
+
+        let (ack, lease) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect("user intervention should join recovery run");
+        assert_eq!(ack.team_run_id, result.team_run_id);
+        assert_eq!(ack.source, TeamRunSource::RecoveryDrain);
+        assert!(ack.has_user_intervention);
+        assert!(!lease.accepted_as_new_run);
+
+        manager
+            .commit_operation_lease(&lease.lease_id, Some("mailbox-user".into()))
+            .await
+            .expect("commit user intervention wake");
+
+        let foreground = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead-user")
+            .await
+            .expect("foreground user wake should be claimed first");
+        assert_eq!(foreground.team_run_id, result.team_run_id);
+        assert_eq!(foreground.wake_source, TeamWakeSource::UserIntervention);
+        assert_eq!(foreground.message_id.as_deref(), Some("mailbox-user"));
+
+        let recovery = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead-recovery")
+            .await
+            .expect("recovery backlog should remain after foreground wake");
+        assert_eq!(recovery.team_run_id, result.team_run_id);
+        assert_eq!(recovery.wake_source, TeamWakeSource::RecoveryDrain);
+        assert!(recovery.message_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_backlog_does_not_duplicate_pending_slot_work() {
+        let (manager, _bc) = manager();
+        let (_ack, lease) = manager
+            .acquire_user_message_wake("worker", TeamRunTargetRole::Teammate)
+            .await
+            .expect("user run");
+        manager
+            .commit_operation_lease(&lease.lease_id, Some("mailbox-worker".into()))
+            .await
+            .expect("commit pending user wake");
+
+        let result = manager
+            .recover_mailbox_backlog(vec![RecoveryWakeCandidate {
+                slot_id: "worker".into(),
+                role: TeamRunTargetRole::Teammate,
+                unread_count: 3,
+            }])
+            .await;
+
+        assert!(result.is_none(), "pending slot work already owns the unread backlog");
+
+        let user_wake = manager
+            .claim_wake_for_turn("worker", TeamRunTargetRole::Teammate, "conv-worker")
+            .await
+            .expect("original pending user wake should remain");
+        assert_eq!(user_wake.wake_source, TeamWakeSource::UserMessage);
+        assert_eq!(user_wake.message_id.as_deref(), Some("mailbox-worker"));
+
+        assert!(
+            manager
+                .claim_wake_for_turn("worker", TeamRunTargetRole::Teammate, "conv-worker-dup")
+                .await
+                .is_none(),
+            "recovery scan must not append a duplicate wake for represented work"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_backlog_does_not_duplicate_paused_gate_work() {
+        let (manager, _bc) = manager();
+        let (_ack, lease) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect("user run");
+        manager
+            .commit_operation_lease(&lease.lease_id, Some("mailbox-lead".into()))
+            .await
+            .expect("commit pending user wake");
+
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .expect("claim lead wake");
+        let child = ActiveChildTurn {
+            team_run_id: reservation.team_run_id.clone(),
+            slot_id: "lead".into(),
+            role: TeamRunTargetRole::Lead,
+            conversation_id: "conv-lead".into(),
+            turn_id: "turn-lead".into(),
+            started_at_ms: now_ms(),
+            last_slow_notified_at_ms: None,
+        };
+        assert_eq!(
+            manager
+                .record_child_started(&reservation.reservation_id, child.clone())
+                .await,
+            ChildStartDecision::Accepted
+        );
+        manager
+            .complete_pause_after_child_cancelled(&child, Some("test_pause".into()))
+            .await
+            .expect("pause slot");
+
+        let result = manager
+            .recover_mailbox_backlog(vec![RecoveryWakeCandidate {
+                slot_id: "lead".into(),
+                role: TeamRunTargetRole::Lead,
+                unread_count: 3,
+            }])
+            .await;
+
+        assert!(result.is_none(), "paused wake gate already represents retained work");
+        assert!(
+            manager
+                .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead-dup")
+                .await
+                .is_none(),
+            "recovery scan must not append a duplicate wake for paused gate work"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_recovery_backlog_does_not_create_run() {
+        let (manager, _bc) = manager();
+        let result = manager.recover_mailbox_backlog(vec![]).await;
+        assert!(result.is_none());
+        assert!(manager.active_run_id().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn lease_keeps_run_active_until_commit() {
+        let (manager, _bc) = manager();
+        let (ack, lease) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect("user message should create run and lease");
+
+        assert_eq!(lease.team_run_id, ack.team_run_id);
+        assert_eq!(lease.slot_id, "lead");
+        assert_eq!(lease.wake_source, TeamWakeSource::UserMessage);
+        assert!(lease.accepted_as_new_run);
+
+        let completed = manager.maybe_complete().await;
+        assert!(completed.is_none(), "active lease must retain the run");
+        assert_eq!(manager.active_run_id().await.as_deref(), Some(ack.team_run_id.as_str()));
+
+        manager
+            .commit_operation_lease(&lease.lease_id, Some("mailbox-1".into()))
+            .await
+            .expect("commit should convert lease to pending wake");
+
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .expect("committed wake should be claimable");
+        assert_eq!(reservation.message_id.as_deref(), Some("mailbox-1"));
+    }
+
+    #[tokio::test]
+    async fn abort_lease_releases_completion_hold() {
+        let (manager, _bc) = manager();
+        let (ack, lease) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect("user message should create run and lease");
+
+        manager
+            .abort_operation_lease(&lease.lease_id, "mailbox_write_failed")
+            .await
+            .expect("abort should remove lease");
+
+        let completed = manager
+            .maybe_complete()
+            .await
+            .expect("run should complete after aborted only lease");
+        assert_eq!(completed.team_run_id, ack.team_run_id);
+        assert_eq!(completed.status, TeamRunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn commit_missing_lease_returns_internal_consistency_error() {
+        let (manager, _bc) = manager();
+        manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect("create active run");
+
+        let err = manager
+            .commit_operation_lease("missing-lease", Some("mailbox-1".into()))
+            .await
+            .expect_err("missing lease is a contract violation");
+
+        assert!(matches!(
+            err,
+            TeamError::InvalidRequest(message)
+                if message == "team run operation lease missing: missing-lease"
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_scoped_wake_without_active_run_is_rejected() {
+        let (manager, _bc) = manager();
+
+        let err = manager
+            .acquire_run_scoped_wake("worker", TeamRunTargetRole::Teammate, TeamWakeSource::McpSendMessage)
+            .await
+            .expect_err("run-scoped wake must need active run");
+
+        assert!(matches!(
+            err,
+            TeamError::InvalidRequest(message)
+                if message == "no active team run for run-scoped wake"
+        ));
+    }
+
+    #[tokio::test]
+    async fn user_message_busy_active_slot_is_rejected_without_lease() {
+        let (manager, _bc) = manager();
+        let (ack, lease) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .unwrap();
+        manager
+            .commit_operation_lease(&lease.lease_id, Some("mailbox-1".into()))
+            .await
+            .unwrap();
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .unwrap();
+        manager
+            .record_child_started(
+                &reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id,
+                    slot_id: "lead".into(),
+                    role: TeamRunTargetRole::Lead,
+                    conversation_id: "conv-lead".into(),
+                    turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
+                },
+            )
+            .await;
+
+        let err = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect_err("foreground user message must reject busy active slot");
+
+        assert!(matches!(err, TeamError::SlotBusy(slot) if slot == "lead"));
+        let payload = manager.current_payload().await.unwrap();
+        assert_eq!(payload.pending_wake_count, 0);
+    }
+
+    #[tokio::test]
+    async fn user_message_pending_slot_is_accepted_as_additional_foreground_wake() {
+        let (manager, _bc) = manager();
+        let (_ack, first) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .unwrap();
+        manager
+            .commit_operation_lease(&first.lease_id, Some("mailbox-1".into()))
+            .await
+            .unwrap();
+
+        let (_ack, second) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .expect("pending foreground message must be accepted");
+        manager
+            .commit_operation_lease(&second.lease_id, Some("mailbox-2".into()))
+            .await
+            .unwrap();
+
+        let payload = manager.current_payload().await.unwrap();
+        assert_eq!(payload.pending_wake_count, 2);
+    }
+
+    #[tokio::test]
+    async fn mcp_send_message_busy_slot_is_accepted_and_queued() {
+        let (manager, _bc) = manager();
+        let (ack, first) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .unwrap();
+        manager
+            .commit_operation_lease(&first.lease_id, Some("mailbox-1".into()))
+            .await
+            .unwrap();
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .unwrap();
+        manager
+            .record_child_started(
+                &reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id,
+                    slot_id: "lead".into(),
+                    role: TeamRunTargetRole::Lead,
+                    conversation_id: "conv-lead".into(),
+                    turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
+                },
+            )
+            .await;
+
+        let outcome = manager
+            .acquire_run_scoped_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::McpSendMessage)
+            .await
+            .expect("MCP message to busy slot must be accepted");
+        let TeamRunWakeAcquireOutcome::Accepted(lease) = outcome else {
+            panic!("MCP message should not be suppressed");
+        };
+        manager
+            .commit_operation_lease(&lease.lease_id, Some("mailbox-2".into()))
+            .await
+            .unwrap();
+
+        let payload = manager.current_payload().await.unwrap();
+        assert_eq!(payload.pending_wake_count, 1);
+    }
+
+    #[tokio::test]
+    async fn paused_slot_suppresses_mcp_send_message_without_lease() {
+        let (manager, _bc) = manager();
+        let (ack, _lease) = manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .unwrap();
+        manager
+            .pause_slot_work("lead", Some("user stopped".into()))
+            .await
+            .unwrap();
+
+        let outcome = manager
+            .acquire_run_scoped_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::McpSendMessage)
+            .await
+            .expect("paused background wake suppresses cleanly");
+        assert_eq!(outcome, TeamRunWakeAcquireOutcome::Suppressed);
+        assert_eq!(manager.active_run_id().await.as_deref(), Some(ack.team_run_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn duplicate_spawn_welcome_is_suppressed() {
+        let (manager, _bc) = manager();
+        manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .unwrap();
+
+        let first = manager
+            .acquire_run_scoped_wake("new-worker", TeamRunTargetRole::Teammate, TeamWakeSource::SpawnWelcome)
+            .await
+            .unwrap();
+        let TeamRunWakeAcquireOutcome::Accepted(first) = first else {
+            panic!("first spawn welcome should be accepted");
+        };
+        manager
+            .commit_operation_lease(&first.lease_id, Some("welcome-1".into()))
+            .await
+            .unwrap();
+
+        let second = manager
+            .acquire_run_scoped_wake("new-worker", TeamRunTargetRole::Teammate, TeamWakeSource::SpawnWelcome)
+            .await
+            .unwrap();
+        assert_eq!(second, TeamRunWakeAcquireOutcome::Suppressed);
+    }
+
+    #[tokio::test]
+    async fn idle_notification_idle_slot_is_suppressed_without_scheduler_wake_target() {
+        let (manager, _bc) = manager();
+        manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .unwrap();
+
+        let outcome = manager
+            .acquire_run_scoped_wake("worker", TeamRunTargetRole::Teammate, TeamWakeSource::IdleNotification)
+            .await
+            .expect("generic idle notification should suppress cleanly");
+
+        assert_eq!(outcome, TeamRunWakeAcquireOutcome::Suppressed);
+    }
+
+    #[tokio::test]
+    async fn scheduler_idle_notification_idle_slot_is_accepted() {
+        let (manager, _bc) = manager();
+        manager
+            .acquire_user_message_wake("lead", TeamRunTargetRole::Lead)
+            .await
+            .unwrap();
+
+        let outcome = manager
+            .acquire_scheduler_wake("worker", TeamRunTargetRole::Teammate, TeamWakeSource::IdleNotification)
+            .await
+            .expect("scheduler-produced wake target should be accepted");
+        let TeamRunWakeAcquireOutcome::Accepted(lease) = outcome else {
+            panic!("scheduler wake target should produce a lease");
+        };
+
+        manager
+            .commit_operation_lease(&lease.lease_id, None)
+            .await
+            .expect("scheduler wake should commit");
+        let reservation = manager
+            .claim_wake_for_turn("worker", TeamRunTargetRole::Teammate, "conv-worker")
+            .await
+            .expect("scheduler wake should be claimable");
+        assert_eq!(reservation.wake_source, TeamWakeSource::IdleNotification);
+    }
+
+    #[tokio::test]
+    async fn active_slot_work_includes_backend_slow_fields_after_threshold() {
+        let (manager, _rx) = manager();
+        let ack = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, true, Some("msg-1".into()))
+            .await
+            .unwrap();
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .unwrap();
+
+        let child = ActiveChildTurn {
+            team_run_id: ack.team_run_id.clone(),
+            slot_id: "lead".into(),
+            role: TeamRunTargetRole::Lead,
+            conversation_id: "conv-lead".into(),
+            turn_id: "turn-lead".into(),
+            started_at_ms: 10_000,
+            last_slow_notified_at_ms: None,
+        };
+        manager.record_child_started(&reservation.reservation_id, child).await;
+
+        manager.observe_slow_child_turns(610_001).await;
+        let payload = manager.current_payload().await.unwrap();
+        let lead = slot_work(&payload, "lead");
+
+        assert_eq!(lead.active_turn_started_at_ms, Some(10_000));
+        assert_eq!(lead.active_turn_elapsed_ms, Some(600_001));
+        assert_eq!(lead.active_turn_slow, Some(true));
+        assert_eq!(lead.active_turn_slow_threshold_ms, Some(600_000));
+        assert_eq!(lead.runtime_health, None);
+    }
+
+    #[tokio::test]
+    async fn slow_observation_is_rate_limited_per_active_child() {
+        let (manager, _rx) = manager();
+        let ack = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, true, Some("msg-1".into()))
+            .await
+            .unwrap();
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .unwrap();
+
+        let child = ActiveChildTurn {
+            team_run_id: ack.team_run_id.clone(),
+            slot_id: "lead".into(),
+            role: TeamRunTargetRole::Lead,
+            conversation_id: "conv-lead".into(),
+            turn_id: "turn-lead".into(),
+            started_at_ms: 0,
+            last_slow_notified_at_ms: None,
+        };
+        manager.record_child_started(&reservation.reservation_id, child).await;
+
+        assert!(manager.observe_slow_child_turns(600_001).await.is_some());
+        assert!(manager.observe_slow_child_turns(900_000).await.is_none());
+        assert!(manager.observe_slow_child_turns(1_200_001).await.is_some());
+    }
+
+    #[tokio::test]
     async fn cancel_run_clears_paused_gate_and_reaches_cancelled_terminal() {
         let (manager, bc) = manager();
         manager
@@ -1254,6 +2571,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv-lead".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1295,6 +2614,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv-lead".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1338,6 +2659,8 @@ mod tests {
             role: TeamRunTargetRole::Lead,
             conversation_id: "conv-lead".into(),
             turn_id: "turn-lead".into(),
+            started_at_ms: now_ms(),
+            last_slow_notified_at_ms: None,
         };
         manager
             .record_child_started(&reservation.reservation_id, child.clone())
@@ -1500,6 +2823,8 @@ mod tests {
                         role: TeamRunTargetRole::Lead,
                         conversation_id: "conv-lead".into(),
                         turn_id: "turn-user".into(),
+                        started_at_ms: now_ms(),
+                        last_slow_notified_at_ms: None,
                     },
                 )
                 .await,
@@ -1532,6 +2857,8 @@ mod tests {
                         role: TeamRunTargetRole::Lead,
                         conversation_id: "conv-lead".into(),
                         turn_id: "turn-background".into(),
+                        started_at_ms: now_ms(),
+                        last_slow_notified_at_ms: None,
                     },
                 )
                 .await,
@@ -1626,6 +2953,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv-lead".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1803,6 +3132,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv".into(),
                     turn_id: "turn".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1867,6 +3198,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv".into(),
                     turn_id: "turn".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1905,6 +3238,8 @@ mod tests {
                         role: TeamRunTargetRole::Lead,
                         conversation_id: "conv".into(),
                         turn_id: "turn".into(),
+                        started_at_ms: now_ms(),
+                        last_slow_notified_at_ms: None,
                     },
                 )
                 .await,
@@ -1979,6 +3314,8 @@ mod tests {
                     role: TeamRunTargetRole::Teammate,
                     conversation_id: "conv-worker".into(),
                     turn_id: "turn-worker".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -2015,6 +3352,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "conv".into(),
                     turn_id: "late-turn".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;

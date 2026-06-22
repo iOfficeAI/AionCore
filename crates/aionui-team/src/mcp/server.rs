@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
-use aionui_api_types::{TeamMcpPhase, TeamMcpStatusPayload, WebSocketMessage};
+use aionui_api_types::{
+    TeamMcpPhase, TeamMcpStatusPayload, TeamSendMessageQueuedResponse, TeamSendMessageStatus, WebSocketMessage,
+};
 use aionui_realtime::EventBroadcaster;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -12,7 +14,7 @@ use crate::error::{TeamError, classify_public_error};
 use crate::events::TEAM_MCP_STATUS_EVENT;
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
-use crate::session::SpawnAgentRequest;
+use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
 use crate::types::{TeammateRole, TeammateStatus};
 use crate::wake::TeamWakeSource;
 
@@ -22,7 +24,7 @@ use super::protocol::{
 };
 use super::tools::{
     RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskUpdateInput,
-    all_tool_descriptors, handle_team_list_models,
+    all_tool_descriptors_for_role, handle_team_list_models,
 };
 
 // ---------------------------------------------------------------------------
@@ -330,7 +332,7 @@ async fn handle_method(
 ) -> JsonRpcResponse {
     match request.method.as_str() {
         "notifications/initialized" => JsonRpcResponse::success(request.id, json!({})),
-        "tools/list" => handle_tools_list(request.id),
+        "tools/list" => handle_tools_list(request.id, scheduler, caller_slot_id).await,
         "tools/call" => handle_tools_call(request, scheduler, service, team_id, caller_slot_id).await,
         _ => JsonRpcResponse::error(
             request.id,
@@ -340,8 +342,17 @@ async fn handle_method(
     }
 }
 
-fn handle_tools_list(id: Option<u64>) -> JsonRpcResponse {
-    let tools = all_tool_descriptors();
+async fn caller_role_for_tools_list(scheduler: &TeammateManager, caller_slot_id: &str) -> TeammateRole {
+    scheduler
+        .get_agent(caller_slot_id)
+        .await
+        .map(|agent| agent.role)
+        .unwrap_or(TeammateRole::Teammate)
+}
+
+async fn handle_tools_list(id: Option<u64>, scheduler: &TeammateManager, caller_slot_id: &str) -> JsonRpcResponse {
+    let caller_role = caller_role_for_tools_list(scheduler, caller_slot_id).await;
+    let tools = all_tool_descriptors_for_role(caller_role);
     JsonRpcResponse::success(id, json!({ "tools": tools }))
 }
 
@@ -473,6 +484,8 @@ pub(crate) async fn dispatch_tool(
     caller_slot_id: &str,
     caller_role: TeammateRole,
 ) -> Result<String, ToolCallError> {
+    super::tools::authorize_tool(caller_role, tool_name).map_err(ToolCallError::from_message)?;
+
     match tool_name {
         "team_send_message" => exec_send_message(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_spawn_agent" => exec_spawn_agent(arguments, service, team_id, caller_slot_id, caller_role).await,
@@ -494,7 +507,9 @@ pub(crate) async fn dispatch_tool(
 async fn exec_list_assistants(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, ToolCallError> {
     let props = args.as_object().cloned().unwrap_or_default();
     if !props.is_empty() {
-        return Err(ToolCallError::from_message("team_list_assistants does not accept arguments"));
+        return Err(ToolCallError::from_message(
+            "team_list_assistants does not accept arguments",
+        ));
     }
     let service = service
         .upgrade()
@@ -506,10 +521,14 @@ async fn exec_list_assistants(args: &Value, service: &Weak<TeamSessionService>) 
 
 async fn exec_list_models(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, ToolCallError> {
     if args.get("backend").is_some() {
-        return Err(ToolCallError::from_message("backend is no longer accepted; use assistant_id"));
+        return Err(ToolCallError::from_message(
+            "backend is no longer accepted; use assistant_id",
+        ));
     }
     if args.get("agent_type").is_some() {
-        return Err(ToolCallError::from_message("agent_type is no longer accepted; use assistant_id"));
+        return Err(ToolCallError::from_message(
+            "agent_type is no longer accepted; use assistant_id",
+        ));
     }
     let assistant_id_filter = args.get("assistant_id").and_then(Value::as_str);
 
@@ -525,7 +544,9 @@ async fn exec_list_models(args: &Value, service: &Weak<TeamSessionService>) -> R
 
 async fn exec_describe_assistant(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, ToolCallError> {
     if args.get("custom_agent_id").is_some() {
-        return Err(ToolCallError::from_message("custom_agent_id is no longer accepted; use assistant_id"));
+        return Err(ToolCallError::from_message(
+            "custom_agent_id is no longer accepted; use assistant_id",
+        ));
     }
     let assistant_key = args
         .get("assistant_id")
@@ -569,8 +590,8 @@ async fn exec_send_message(
     team_id: &str,
     caller_slot_id: &str,
 ) -> Result<String, ToolCallError> {
-    let input: SendMessageInput =
-        serde_json::from_value(args.clone()).map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let input: SendMessageInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
     let trimmed = input.message.trim();
     if trimmed == "shutdown_approved" {
@@ -642,14 +663,33 @@ async fn exec_send_message(
     } else {
         vec![resolved_to.clone()]
     };
+    let mut target_results = Vec::with_capacity(targets.len());
     for target in &targets {
-        service
+        let result = service
             .send_agent_message_from_agent(team_id, caller_slot_id, target, &input.message)
             .await
             .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+        target_results.push(result);
     }
 
-    Ok(format!("Message sent to {}", input.to))
+    let response = build_send_message_queued_response(target_results).map_err(ToolCallError::from_message)?;
+
+    serde_json::to_string(&response).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
+}
+
+fn build_send_message_queued_response(
+    target_results: Vec<AgentMessageQueueResult>,
+) -> Result<TeamSendMessageQueuedResponse, String> {
+    let first = target_results
+        .first()
+        .ok_or_else(|| "No message targets resolved".to_string())?;
+    Ok(TeamSendMessageQueuedResponse {
+        status: TeamSendMessageStatus::Queued,
+        delivery: first.delivery.clone(),
+        reason: first.target.queue_state.clone(),
+        team_run_id: first.team_run_id.clone(),
+        targets: target_results.into_iter().map(|result| result.target).collect(),
+    })
 }
 
 async fn exec_spawn_agent(
@@ -667,14 +707,18 @@ async fn exec_spawn_agent(
         return Err(ToolCallError::from_message("Only Lead can spawn agents"));
     }
     if args.get("backend").is_some() {
-        return Err(ToolCallError::from_message("backend is no longer accepted; use assistant_id"));
+        return Err(ToolCallError::from_message(
+            "backend is no longer accepted; use assistant_id",
+        ));
     }
     if args.get("agent_type").is_some() {
-        return Err(ToolCallError::from_message("agent_type is no longer accepted; use assistant_id"));
+        return Err(ToolCallError::from_message(
+            "agent_type is no longer accepted; use assistant_id",
+        ));
     }
 
-    let input: SpawnAgentInput =
-        serde_json::from_value(args.clone()).map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let input: SpawnAgentInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
     let assistant_id = input
         .assistant_id
         .as_deref()
@@ -705,8 +749,8 @@ async fn exec_spawn_agent(
 }
 
 async fn exec_task_create(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
-    let input: TaskCreateInput =
-        serde_json::from_value(args.clone()).map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let input: TaskCreateInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
     let action = crate::scheduler::SchedulerAction::TaskCreate {
         subject: input.subject.clone(),
@@ -723,8 +767,8 @@ async fn exec_task_create(args: &Value, scheduler: &TeammateManager) -> Result<S
 }
 
 async fn exec_task_update(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
-    let input: TaskUpdateInput =
-        serde_json::from_value(args.clone()).map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let input: TaskUpdateInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
     let action = crate::scheduler::SchedulerAction::TaskUpdate {
         task_id: input.task_id.clone(),
@@ -795,8 +839,8 @@ async fn exec_rename_agent(
     service: &Weak<TeamSessionService>,
     team_id: &str,
 ) -> Result<String, ToolCallError> {
-    let input: RenameAgentInput =
-        serde_json::from_value(args.clone()).map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let input: RenameAgentInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
     let resolved_slot = resolve_agent_target(scheduler, &input.slot_id)
         .await
@@ -831,8 +875,8 @@ async fn exec_shutdown_agent(
     if caller_role != TeammateRole::Lead {
         return Err(ToolCallError::from_message("Only Lead can shut down agents"));
     }
-    let input: ShutdownAgentInput =
-        serde_json::from_value(args.clone()).map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let input: ShutdownAgentInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
     let target_slot_id = resolve_agent_target(scheduler, &input.slot_id)
         .await
@@ -841,21 +885,7 @@ async fn exec_shutdown_agent(
         .upgrade()
         .ok_or_else(|| ToolCallError::from_message("Team service not available; cannot wake shutdown target"))?;
     service
-        .require_active_team_run_for_team_work(team_id)
-        .await
-        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
-
-    let action = crate::scheduler::SchedulerAction::ShutdownAgent {
-        slot_id: target_slot_id.clone(),
-        reason: input.reason,
-    };
-    scheduler
-        .execute_action(caller_slot_id, &action)
-        .await
-        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
-
-    service
-        .wake_agent_for_team_work(team_id, &target_slot_id, TeamWakeSource::McpShutdownRequest, None)
+        .shutdown_agent_in_session(team_id, caller_slot_id, &target_slot_id, input.reason)
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
 
@@ -881,7 +911,7 @@ async fn http_mcp_loop(
             accept = listener.accept() => {
                 let Ok((mut stream, peer)) = accept else { continue };
                 info!(team_id = %team_id, ?peer, "HTTP MCP: new connection accepted");
-                let _token = auth_token.clone();
+                let token = auth_token.clone();
                 let sched = scheduler.clone();
                 let svc = service.clone();
                 let tid = team_id.clone();
@@ -904,6 +934,30 @@ async fn http_mcp_loop(
                     // Handle JSON-RPC request
                     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
                     let id = value.get("id").cloned();
+                    let auth_ok = http_bearer_token(&request).is_some_and(|provided| provided == token);
+                    if !auth_ok {
+                        let response_body = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": INVALID_REQUEST,
+                                "message": "Authentication failed: invalid auth_token"
+                            }
+                        });
+                        let body_bytes = serde_json::to_vec(&response_body).unwrap_or_default();
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            body_bytes.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(&body_bytes).await;
+                        return;
+                    }
+                    let caller_slot_id = request.lines()
+                        .find(|l| l.to_lowercase().starts_with("x-slot-id:"))
+                        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
+                        .unwrap_or("");
+                    let caller_role = caller_role_for_tools_list(&sched, caller_slot_id).await;
 
                     let result = match method {
                         "initialize" => {
@@ -919,7 +973,7 @@ async fn http_mcp_loop(
                             return;
                         }
                         "tools/list" => {
-                            let tools: Vec<Value> = all_tool_descriptors()
+                            let tools: Vec<Value> = all_tool_descriptors_for_role(caller_role)
                                 .iter()
                                 .map(|d| json!({
                                     "name": d.name,
@@ -933,10 +987,6 @@ async fn http_mcp_loop(
                             let params = value.get("params").cloned().unwrap_or(json!({}));
                             let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
                             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-                            let caller_slot_id = request.lines()
-                                .find(|l| l.to_lowercase().starts_with("x-slot-id:"))
-                                .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
-                                .unwrap_or("");
                             match dispatch_tool(
                                 tool_name,
                                 &arguments,
@@ -944,7 +994,7 @@ async fn http_mcp_loop(
                                 &svc,
                                 &tid,
                                 caller_slot_id,
-                                TeammateRole::Lead,
+                                caller_role,
                             )
                             .await
                             {
@@ -994,6 +1044,16 @@ async fn http_mcp_loop(
     }
 }
 
+fn http_bearer_token(request: &str) -> Option<&str> {
+    request
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+        .and_then(|line| line.split_once(':').map(|(_, value)| value.trim()))
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 // ---------------------------------------------------------------------------
 // Tests — exec_spawn_agent dispatch-layer unit tests
 // ---------------------------------------------------------------------------
@@ -1001,6 +1061,35 @@ async fn http_mcp_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_api_types::{
+        TeamRunTargetRole, TeamSendMessageDelivery, TeamSendMessageReason, TeamSendMessageTargetQueueState,
+    };
+
+    #[test]
+    fn build_send_message_queued_response_serializes_json_contract() {
+        let response = build_send_message_queued_response(vec![AgentMessageQueueResult {
+            team_run_id: "run-1".into(),
+            delivery: TeamSendMessageDelivery::WakeRecorded,
+            target: TeamSendMessageTargetQueueState {
+                slot_id: "worker-1".into(),
+                role: TeamRunTargetRole::Teammate,
+                queue_state: TeamSendMessageReason::QueuedForIdle,
+                pending_wake_count: 1,
+                starting_child_count: 0,
+                active_turn_id: None,
+                suppressed_wake_count: 0,
+            },
+        }])
+        .unwrap();
+
+        let text = serde_json::to_string(&response).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).expect("team_send_message result must be JSON");
+        assert_eq!(payload["status"], "queued");
+        assert_eq!(payload["delivery"], "wake_recorded");
+        assert_eq!(payload["reason"], "queued_for_idle");
+        assert_eq!(payload["targets"][0]["slot_id"], "worker-1");
+        assert_eq!(payload["targets"][0]["queue_state"], "queued_for_idle");
+    }
 
     /// Non-Lead callers are rejected at the dispatch layer with the
     /// "Only Lead ..." phrasing. Service weak is never upgraded because

@@ -1,9 +1,13 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{TeamRunAckResponse, TeamRunTargetRole};
-use aionui_common::AgentKillReason;
+use aionui_api_types::{
+    TeamRunAckResponse, TeamRunTargetRole, TeamSendMessageDelivery, TeamSendMessageReason,
+    TeamSendMessageTargetQueueState, TeamSlotRuntimeHealth, TeamSlotWorkPayload,
+};
+use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
 use tracing::{info, warn};
@@ -18,10 +22,14 @@ use crate::message_projection::{
 };
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
 use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
+use crate::provisioning::PersistSpawnedAgentRequest;
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
-use crate::team_run::{ChildCancelTarget, TeamRunManager, WakeRecordDecision, target_role_for};
+use crate::team_run::{
+    ChildCancelTarget, RecoveryBacklogResult, RecoveryWakeCandidate, TeamRunManager, TeamRunWakeAcquireOutcome,
+    WakeRecordDecision, target_role_for,
+};
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::wake::TeamWakeSource;
 
@@ -46,6 +54,13 @@ pub struct WakeInput {
     pub agent_role: TeammateRole,
     pub(crate) wake_source: Option<TeamWakeSource>,
     pub(crate) trigger_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMessageQueueResult {
+    pub team_run_id: String,
+    pub delivery: TeamSendMessageDelivery,
+    pub target: TeamSendMessageTargetQueueState,
 }
 
 /// Input for [`TeamSession::spawn_agent`]. Populated by the lead agent when
@@ -89,6 +104,12 @@ pub struct TeamSession {
     /// Per-agent event loop registry. Each agent has a dedicated tokio task
     /// that drains its mailbox whenever notified.
     event_loops: Arc<EventLoopRegistry>,
+    /// Set after the session lifecycle performs its system recovery mailbox scan.
+    /// Written by `try_start_recovery_drain` and read by later scan attempts so
+    /// ordinary event-loop notifications cannot repeatedly create recovery runs.
+    /// Reset only by constructing a fresh `TeamSession` during a new restore,
+    /// reconnect, or explicit re-ensure lifecycle.
+    recovery_scan_completed: AtomicBool,
 }
 
 impl TeamSession {
@@ -154,6 +175,7 @@ impl TeamSession {
             service,
             broadcaster,
             event_loops,
+            recovery_scan_completed: AtomicBool::new(false),
         })
     }
 
@@ -183,10 +205,6 @@ impl TeamSession {
 
     pub fn team_run_manager(&self) -> &Arc<TeamRunManager> {
         &self.team_run_manager
-    }
-
-    pub(crate) fn notify_agent_for_session_restore_drain(&self, slot_id: &str) {
-        self.event_loops.notify(slot_id);
     }
 
     pub fn mcp_stdio_config(&self, slot_id: &str) -> TeamMcpStdioConfig {
@@ -239,6 +257,19 @@ impl TeamSession {
         } else {
             all_unread.into_iter().filter(|m| m.from_agent_id != slot_id).collect()
         };
+        let active_team_run_id = self.team_run_manager.active_run_id().await;
+        if !unread.is_empty() && (active_team_run_id.is_none() || next_wake.is_none()) {
+            warn!(
+                team_id = %self.team.id,
+                slot_id,
+                unread_count = unread.len(),
+                has_active_team_run = active_team_run_id.is_some(),
+                has_pending_wake = next_wake.is_some(),
+                reason = "unowned_mailbox_backlog",
+                "team wake input skipped because unread mailbox is not owned by a TeamRun wake"
+            );
+            return Ok(None);
+        }
         let tasks = self.scheduler.list_tasks().await?;
 
         let mut wake_body = build_wake_payload(&agent, &tasks, &unread);
@@ -266,7 +297,10 @@ impl TeamSession {
                         &available_assistants,
                     )
                 }
-                TeammateRole::Teammate => build_teammate_prompt(&agent, &self.team.name),
+                TeammateRole::Teammate => {
+                    let members = self.scheduler.list_agents().await;
+                    build_teammate_prompt(&agent, &self.team.name, &members)
+                }
             };
             format!("{role_prompt}\n\n{wake_body}")
         } else {
@@ -276,7 +310,7 @@ impl TeamSession {
         let should_send = !unread.is_empty();
 
         Ok(Some(WakeInput {
-            team_run_id: self.team_run_manager.active_run_id().await,
+            team_run_id: active_team_run_id,
             conversation_id: agent.conversation_id,
             first_message,
             should_send,
@@ -353,9 +387,9 @@ impl TeamSession {
             .ok_or_else(|| TeamError::AgentNotFound("no lead agent in team".into()))?;
 
         let lead_conv_id = self.scheduler.get_agent(&lead_slot_id).await?.conversation_id;
-        let mut ack = self
+        let (mut ack, lease) = self
             .team_run_manager
-            .accept_user_message(&lead_slot_id, TeamRunTargetRole::Lead, true, None)
+            .acquire_user_message_wake(&lead_slot_id, TeamRunTargetRole::Lead)
             .await?;
 
         let mailbox_message = match self
@@ -373,7 +407,10 @@ impl TeamSession {
         {
             Ok(message) => message,
             Err(err) => {
-                self.team_run_manager.complete_failed().await;
+                let _ = self
+                    .team_run_manager
+                    .abort_operation_lease(&lease.lease_id, "mailbox_write_failed")
+                    .await;
                 return Err(err);
             }
         };
@@ -398,12 +435,10 @@ impl TeamSession {
         }
 
         let _ = files;
-        self.wake_agent_for_team_work(
-            &lead_slot_id,
-            TeamWakeSource::UserMessage,
-            Some(mailbox_message.id.clone()),
-        )
-        .await?;
+        self.team_run_manager
+            .commit_operation_lease(&lease.lease_id, Some(mailbox_message.id.clone()))
+            .await?;
+        self.notify_reserved_wake_for_team_work(&lead_slot_id, lease.role.clone(), lease.wake_source);
         Ok(ack)
     }
 
@@ -418,15 +453,9 @@ impl TeamSession {
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
-        let has_active_run = self.team_run_manager.active_run_id().await.is_some();
-        let source = if has_active_run {
-            TeamWakeSource::UserIntervention
-        } else {
-            TeamWakeSource::UserMessage
-        };
-        let mut ack = self
+        let (mut ack, lease) = self
             .team_run_manager
-            .accept_user_message(slot_id, target_role_for(agent.role), has_active_run, None)
+            .acquire_user_message_wake(slot_id, target_role_for(agent.role))
             .await?;
 
         let mailbox_message = match self
@@ -444,7 +473,10 @@ impl TeamSession {
         {
             Ok(message) => message,
             Err(err) => {
-                self.team_run_manager.complete_failed().await;
+                let _ = self
+                    .team_run_manager
+                    .abort_operation_lease(&lease.lease_id, "mailbox_write_failed")
+                    .await;
                 return Err(err);
             }
         };
@@ -469,8 +501,10 @@ impl TeamSession {
         }
 
         let _ = files;
-        self.wake_agent_for_team_work(slot_id, source, Some(mailbox_message.id.clone()))
+        self.team_run_manager
+            .commit_operation_lease(&lease.lease_id, Some(mailbox_message.id.clone()))
             .await?;
+        self.notify_reserved_wake_for_team_work(slot_id, lease.role.clone(), lease.wake_source);
         Ok(ack)
     }
 
@@ -479,11 +513,49 @@ impl TeamSession {
         from_slot_id: &str,
         to_slot_id: &str,
         content: &str,
-    ) -> Result<(), TeamError> {
+    ) -> Result<AgentMessageQueueResult, TeamError> {
         let to_agent = self.scheduler.get_agent(to_slot_id).await?;
         let from_agent = self.scheduler.get_agent(from_slot_id).await?;
+        let to_role = target_role_for(to_agent.role);
+        let outcome = self
+            .team_run_manager
+            .acquire_run_scoped_wake(to_slot_id, to_role.clone(), TeamWakeSource::McpSendMessage)
+            .await?;
+        let TeamRunWakeAcquireOutcome::Accepted(lease) = outcome else {
+            let (team_run_id, work) = self
+                .team_run_manager
+                .slot_work_for_slot(to_slot_id)
+                .await
+                .ok_or_else(|| TeamError::InvalidRequest(format!("no active team run work for slot {to_slot_id}")))?;
+            let queue_state = classify_send_message_queue_state(&work, true);
+            let target = TeamSendMessageTargetQueueState {
+                slot_id: work.slot_id,
+                role: work.role,
+                queue_state,
+                pending_wake_count: work.pending_wake_count,
+                starting_child_count: work.starting_child_count,
+                active_turn_id: work.active_turn_id,
+                suppressed_wake_count: work.suppressed_wake_count,
+            };
+            info!(
+                team_id = %self.team.id,
+                team_run_id = %team_run_id,
+                caller_slot_id = from_slot_id,
+                target_slot_id = to_slot_id,
+                target_role = ?target.role,
+                wake_source = %TeamWakeSource::McpSendMessage,
+                suppressed_wake_count = target.suppressed_wake_count,
+                reason = ?target.queue_state,
+                "team_agent_message_wake_suppressed"
+            );
+            return Ok(AgentMessageQueueResult {
+                team_run_id,
+                delivery: TeamSendMessageDelivery::WakeSuppressed,
+                target,
+            });
+        };
 
-        let mailbox_message = self
+        let mailbox_message = match self
             .mailbox
             .write(
                 &self.team.id,
@@ -493,7 +565,17 @@ impl TeamSession {
                 content,
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(message) => message,
+            Err(err) => {
+                let _ = self
+                    .team_run_manager
+                    .abort_operation_lease(&lease.lease_id, "mailbox_write_failed")
+                    .await;
+                return Err(err);
+            }
+        };
 
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest {
@@ -528,14 +610,127 @@ impl TeamSession {
             );
         }
 
-        self.direct_or_run_scoped_wake(
-            to_slot_id,
-            TeamWakeSource::McpSendMessage,
-            Some(mailbox_message.id.clone()),
-        )
-        .await
+        self.team_run_manager
+            .commit_operation_lease(&lease.lease_id, Some(mailbox_message.id.clone()))
+            .await?;
+        let target_event_loop_registered = self.event_loops.has(to_slot_id);
+        if !target_event_loop_registered {
+            warn!(
+                team_id = %self.team.id,
+                slot_id = to_slot_id,
+                target_role = ?to_role,
+                wake_source = %TeamWakeSource::McpSendMessage,
+                "team wake recorded but event loop is not registered; pending wake retained"
+            );
+            self.team_run_manager
+                .mark_slot_runtime_health(to_slot_id, TeamSlotRuntimeHealth::Unhealthy)
+                .await;
+        }
+
+        let (team_run_id, work) = self
+            .team_run_manager
+            .slot_work_for_slot(to_slot_id)
+            .await
+            .ok_or_else(|| TeamError::InvalidRequest(format!("no active team run work for slot {to_slot_id}")))?;
+        let queue_state = classify_send_message_queue_state(&work, target_event_loop_registered);
+        let target = TeamSendMessageTargetQueueState {
+            slot_id: work.slot_id,
+            role: work.role,
+            queue_state,
+            pending_wake_count: work.pending_wake_count,
+            starting_child_count: work.starting_child_count,
+            active_turn_id: work.active_turn_id,
+            suppressed_wake_count: work.suppressed_wake_count,
+        };
+
+        info!(
+            team_id = %self.team.id,
+            team_run_id = %team_run_id,
+            caller_slot_id = from_slot_id,
+            target_slot_id = to_slot_id,
+            target_role = ?target.role,
+            wake_source = %TeamWakeSource::McpSendMessage,
+            message_id = %mailbox_message.id,
+            slot_pending_wake_count = target.pending_wake_count,
+            starting_child_count = target.starting_child_count,
+            active_turn_id = ?target.active_turn_id.as_deref(),
+            suppressed_wake_count = target.suppressed_wake_count,
+            reason = ?target.queue_state,
+            "team_agent_message_queued"
+        );
+
+        if target_event_loop_registered {
+            self.notify_reserved_wake_for_team_work(to_slot_id, to_role, TeamWakeSource::McpSendMessage);
+        }
+
+        Ok(AgentMessageQueueResult {
+            team_run_id,
+            delivery: TeamSendMessageDelivery::WakeRecorded,
+            target,
+        })
     }
 
+    pub(crate) async fn shutdown_agent(
+        &self,
+        caller_slot_id: &str,
+        target_slot_id: &str,
+        reason: Option<String>,
+    ) -> Result<(), TeamError> {
+        let caller = self.scheduler.get_agent(caller_slot_id).await?;
+        if caller.role != TeammateRole::Lead {
+            return Err(TeamError::LeaderOnly("team_shutdown_agent".into()));
+        }
+        let target = self.scheduler.get_agent(target_slot_id).await?;
+        if target.role == TeammateRole::Lead {
+            return Err(TeamError::InvalidRequest("cannot shutdown the team lead".into()));
+        }
+
+        let outcome = self
+            .team_run_manager
+            .acquire_run_scoped_wake(
+                target_slot_id,
+                target_role_for(target.role),
+                TeamWakeSource::McpShutdownRequest,
+            )
+            .await?;
+        let TeamRunWakeAcquireOutcome::Accepted(lease) = outcome else {
+            return Err(TeamError::InvalidRequest("shutdown wake was suppressed".into()));
+        };
+
+        let shutdown_message = match self
+            .scheduler
+            .request_shutdown_agent(caller_slot_id, target_slot_id, reason.as_deref())
+            .await
+        {
+            Ok(message) => message,
+            Err(err) => {
+                let _ = self
+                    .team_run_manager
+                    .abort_operation_lease(&lease.lease_id, "shutdown_scheduler_action_failed")
+                    .await;
+                return Err(err);
+            }
+        };
+
+        if shutdown_message.to_agent_id != target_slot_id {
+            let _ = self
+                .team_run_manager
+                .abort_operation_lease(&lease.lease_id, "shutdown_mailbox_target_mismatch")
+                .await;
+            return Err(TeamError::InvalidRequest(format!(
+                "shutdown mailbox target mismatch: expected {target_slot_id}, got {}",
+                shutdown_message.to_agent_id
+            )));
+        }
+
+        self.team_run_manager
+            .commit_operation_lease(&lease.lease_id, Some(shutdown_message.id.clone()))
+            .await?;
+        self.notify_reserved_wake_for_team_work(target_slot_id, lease.role.clone(), lease.wake_source);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) async fn wake_agent_for_team_work(
         &self,
         slot_id: &str,
@@ -561,19 +756,6 @@ impl TeamSession {
             wake_source = %source,
             "team wake recorded but event loop is not registered; pending wake retained"
         );
-        Ok(())
-    }
-
-    async fn direct_or_run_scoped_wake(
-        &self,
-        slot_id: &str,
-        source: TeamWakeSource,
-        trigger_message_id: Option<String>,
-    ) -> Result<(), TeamError> {
-        if self.team_run_manager.active_run_id().await.is_some() {
-            return self.wake_agent_for_team_work(slot_id, source, trigger_message_id).await;
-        }
-        self.notify_mailbox_only_wake(slot_id, source);
         Ok(())
     }
 
@@ -639,6 +821,114 @@ impl TeamSession {
             wake_source = %source,
             "team reserved wake notification skipped because event loop is not registered"
         );
+    }
+
+    pub(crate) async fn scheduler_wake_agent_for_team_work(
+        &self,
+        slot_id: &str,
+        source: TeamWakeSource,
+    ) -> Result<(), TeamError> {
+        let agent = self.scheduler.get_agent(slot_id).await?;
+        let target_role = target_role_for(agent.role);
+        let outcome = self
+            .team_run_manager
+            .acquire_scheduler_wake(slot_id, target_role.clone(), source)
+            .await?;
+        let TeamRunWakeAcquireOutcome::Accepted(lease) = outcome else {
+            return Ok(());
+        };
+
+        self.team_run_manager
+            .commit_operation_lease(&lease.lease_id, None)
+            .await?;
+        self.notify_reserved_wake_for_team_work(slot_id, target_role, source);
+        Ok(())
+    }
+
+    pub(crate) async fn try_start_recovery_drain(
+        &self,
+        reason: &'static str,
+    ) -> Result<Option<RecoveryBacklogResult>, TeamError> {
+        if self.recovery_scan_completed.swap(true, Ordering::AcqRel) {
+            tracing::debug!(
+                team_id = %self.team.id,
+                reason,
+                "team recovery scan skipped because it already ran for this session lifecycle"
+            );
+            return Ok(None);
+        }
+
+        let agents = self.scheduler.list_agents().await;
+        let mut candidates = Vec::new();
+        let mut unread_total = 0usize;
+        let mut missing_event_loops = Vec::new();
+
+        for agent in agents {
+            if !self.event_loops.has(&agent.slot_id) {
+                missing_event_loops.push(agent.slot_id.clone());
+                continue;
+            }
+
+            let unread = self.mailbox.peek_unread(&self.team.id, &agent.slot_id).await?;
+            let recoverable_count = unread
+                .into_iter()
+                .filter(|message| message.from_agent_id != agent.slot_id)
+                .count();
+            if recoverable_count == 0 {
+                continue;
+            }
+            unread_total += recoverable_count;
+            candidates.push(RecoveryWakeCandidate {
+                slot_id: agent.slot_id,
+                role: target_role_for(agent.role),
+                unread_count: recoverable_count,
+            });
+        }
+
+        if !missing_event_loops.is_empty() {
+            warn!(
+                team_id = %self.team.id,
+                reason,
+                missing_event_loop_count = missing_event_loops.len(),
+                unread_count = unread_total,
+                "team recovery scan found slots without event loops; unread work is retained"
+            );
+        }
+
+        if candidates.is_empty() {
+            tracing::debug!(
+                team_id = %self.team.id,
+                reason,
+                "team recovery scan found no recoverable mailbox backlog"
+            );
+            return Ok(None);
+        }
+
+        let result = self.team_run_manager.recover_mailbox_backlog(candidates).await;
+        if let Some(result) = result.as_ref() {
+            info!(
+                team_id = %self.team.id,
+                team_run_id = %result.team_run_id,
+                source = "recovery_drain",
+                slot_count = result.recorded_wakes.len(),
+                pending_wake_count = result.pending_wake_count,
+                reason,
+                "team recovery scan recorded TeamRun wakes"
+            );
+            for slot_id in &result.recorded_wakes {
+                self.event_loops.notify(slot_id);
+            }
+        } else {
+            warn!(
+                team_id = %self.team.id,
+                source = "recovery_drain",
+                unread_count = unread_total,
+                reason,
+                "team recovery scan retained unread mailbox backlog without recording wakes"
+            );
+        }
+
+        Ok(result)
     }
 
     /// Mirror each non-user mailbox row into the target agent's conversation
@@ -889,8 +1179,7 @@ impl TeamSession {
     async fn notify_leader_child_interrupted(&self, slot_id: &str, reason: Option<String>) -> Result<(), TeamError> {
         if let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await {
             let content = reason.unwrap_or_else(|| format!("Agent {slot_id} was interrupted by the user."));
-            let mailbox_message = self
-                .mailbox
+            self.mailbox
                 .write(
                     &self.team.id,
                     &lead_slot_id,
@@ -900,12 +1189,8 @@ impl TeamSession {
                     Some("Interrupted by user"),
                 )
                 .await?;
-            self.wake_agent_for_team_work(
-                &lead_slot_id,
-                TeamWakeSource::InterruptedNotification,
-                Some(mailbox_message.id),
-            )
-            .await?;
+            self.wake_leader_after_recovery_message(slot_id, TeamWakeSource::InterruptedNotification)
+                .await?;
         }
         Ok(())
     }
@@ -919,8 +1204,7 @@ impl TeamSession {
             return Err(TeamError::AgentNotFound("lead".into()));
         };
         let content = format!("Spawned teammate {failed_slot_id} failed to attach its runtime. Error: {error}");
-        let mailbox_message = self
-            .mailbox
+        self.mailbox
             .write(
                 &self.team.id,
                 &lead_slot_id,
@@ -930,12 +1214,8 @@ impl TeamSession {
                 None,
             )
             .await?;
-        self.wake_agent_for_team_work(
-            &lead_slot_id,
-            TeamWakeSource::SpawnAttachFailure,
-            Some(mailbox_message.id),
-        )
-        .await
+        self.wake_leader_after_recovery_message(failed_slot_id, TeamWakeSource::SpawnAttachFailure)
+            .await
     }
 
     pub(crate) async fn wake_leader_after_recovery_message(
@@ -946,17 +1226,34 @@ impl TeamSession {
         let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await else {
             return Err(TeamError::AgentNotFound("lead".into()));
         };
-        if self.team_run_manager.active_run_id().await.is_some() {
-            return self.wake_agent_for_team_work(&lead_slot_id, source, None).await;
-        }
-        info!(
-            team_id = %self.team.id,
-            slot_id = %lead_slot_id,
-            source_slot_id,
-            wake_source = %source,
-            wake_policy = "deferred_mailbox_only",
-            "leader recovery message deferred because no active team run exists"
-        );
+        let outcome = match self
+            .team_run_manager
+            .acquire_run_scoped_wake(&lead_slot_id, TeamRunTargetRole::Lead, source)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(TeamError::InvalidRequest(message)) if message == "no active team run for run-scoped wake" => {
+                info!(
+                    team_id = %self.team.id,
+                    slot_id = %lead_slot_id,
+                    source_slot_id,
+                    wake_source = %source,
+                    wake_policy = "deferred_mailbox_only",
+                    "leader recovery message deferred because no active team run exists"
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+
+        let TeamRunWakeAcquireOutcome::Accepted(lease) = outcome else {
+            return Ok(());
+        };
+
+        self.team_run_manager
+            .commit_operation_lease(&lease.lease_id, None)
+            .await?;
+        self.notify_reserved_wake_for_team_work(&lead_slot_id, TeamRunTargetRole::Lead, source);
         Ok(())
     }
 
@@ -1056,15 +1353,17 @@ impl TeamSession {
         }
 
         // Step 5: DB side-effects (new conversation + persisted agent slot).
+        let new_slot_id = generate_id();
         let new_agent = service
-            .persist_spawned_agent(
-                &self.team.id,
-                &self.user_id,
-                requested_name,
+            .persist_spawned_agent(PersistSpawnedAgentRequest {
+                team_id: self.team.id.clone(),
+                user_id: self.user_id.clone(),
+                slot_id: new_slot_id.clone(),
+                name: requested_name,
                 backend,
                 model,
-                Some(assistant_id.to_owned()),
-            )
+                assistant_id: Some(assistant_id.to_owned()),
+            })
             .await?;
 
         // Step 5: attach to the in-memory scheduler so wake-from-lead finds
@@ -1074,7 +1373,7 @@ impl TeamSession {
         // Step 6: welcome message. The mailbox write is the source of truth —
         // if the wake never fires (e.g. warmup raced), the next caller-triggered
         // wake will still drain this entry.
-        let welcome_message = self
+        let welcome_message = match self
             .mailbox
             .write(
                 &self.team.id,
@@ -1084,7 +1383,20 @@ impl TeamSession {
                 "You have been spawned as a teammate. Read your mailbox and wait for instructions.",
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(message) => message,
+            Err(err) => {
+                if let Some(service) = self.service.upgrade() {
+                    let _ = service
+                        .remove_agent(&self.user_id, &self.team.id, &new_agent.slot_id)
+                        .await;
+                } else {
+                    let _ = self.scheduler.remove_agent(&new_agent.slot_id).await;
+                }
+                return Err(err);
+            }
+        };
 
         let spawn_wake_plan = if self.team_run_manager.active_run_id().await.is_some() {
             let spawn_welcome_role = self
@@ -1214,17 +1526,43 @@ impl TeamSession {
     }
 }
 
+fn classify_send_message_queue_state(
+    work: &TeamSlotWorkPayload,
+    target_event_loop_registered: bool,
+) -> TeamSendMessageReason {
+    if matches!(work.runtime_health, Some(TeamSlotRuntimeHealth::Disconnected)) {
+        return TeamSendMessageReason::TargetDisconnected;
+    }
+    if !target_event_loop_registered || matches!(work.runtime_health, Some(TeamSlotRuntimeHealth::Unhealthy)) {
+        return TeamSendMessageReason::TargetUnhealthy;
+    }
+    if work.paused && work.suppressed_wake_count > 0 {
+        return TeamSendMessageReason::SuppressedByPause;
+    }
+    if work.active_turn_id.is_some() {
+        return TeamSendMessageReason::BehindActiveTurn;
+    }
+    if work.starting_child_count > 0 {
+        return TeamSendMessageReason::BehindStartingTurn;
+    }
+    TeamSendMessageReason::QueuedForIdle
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::team_run::ActiveChildTurn;
+    use crate::event_loop::AgentLoopContext;
+    use crate::team_run::{ActiveChildTurn, RecoveryWakeCandidate};
     use crate::test_utils::MockTeamRepo;
     use crate::types::{Team, TeamAgent, TeammateRole};
     use aionui_ai_agent::AgentError;
     use aionui_ai_agent::agent_task::AgentInstance;
     use aionui_ai_agent::types::BuildTaskOptions;
-    use aionui_api_types::WebSocketMessage;
-    use aionui_common::{AgentKillReason, TimestampMs};
+    use aionui_api_types::{
+        TeamRunSource, TeamRunStatus, TeamRunTargetRole, TeamSendMessageDelivery, TeamSendMessageReason,
+        WebSocketMessage,
+    };
+    use aionui_common::{AgentKillReason, TimestampMs, now_ms};
     use std::sync::{Arc, Mutex};
 
     struct NullBroadcaster;
@@ -1351,6 +1689,64 @@ mod tests {
         async fn insert_projected_message(&self, row: &aionui_db::models::MessageRow) -> Result<(), TeamError> {
             self.inserted.lock().unwrap().push(row.clone());
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CompletingProjectionStore {
+        manager: Mutex<Option<Arc<TeamRunManager>>>,
+    }
+
+    impl CompletingProjectionStore {
+        fn set_manager(&self, manager: Arc<TeamRunManager>) {
+            *self.manager.lock().unwrap() = Some(manager);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TeamProjectionMessageStore for CompletingProjectionStore {
+        fn mint_message_id(&self) -> String {
+            "projection-completes-run".into()
+        }
+
+        async fn find_projected_message(
+            &self,
+            _conversation_id: &str,
+            _msg_id: &str,
+            _msg_type: &str,
+        ) -> Result<Option<aionui_db::models::MessageRow>, TeamError> {
+            Ok(None)
+        }
+
+        async fn insert_projected_message(&self, _row: &aionui_db::models::MessageRow) -> Result<(), TeamError> {
+            let manager = self.manager.lock().unwrap().clone();
+            if let Some(manager) = manager {
+                manager.maybe_complete().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingProjectionStore;
+
+    #[async_trait::async_trait]
+    impl TeamProjectionMessageStore for FailingProjectionStore {
+        fn mint_message_id(&self) -> String {
+            "projection-fails".into()
+        }
+
+        async fn find_projected_message(
+            &self,
+            _conversation_id: &str,
+            _msg_id: &str,
+            _msg_type: &str,
+        ) -> Result<Option<aionui_db::models::MessageRow>, TeamError> {
+            Ok(None)
+        }
+
+        async fn insert_projected_message(&self, _row: &aionui_db::models::MessageRow) -> Result<(), TeamError> {
+            Err(TeamError::InvalidRequest("projection failed for test".into()))
         }
     }
 
@@ -1514,8 +1910,61 @@ mod tests {
         .unwrap()
     }
 
+    async fn start_session_arc() -> Arc<TeamSession> {
+        Arc::new(start_session().await)
+    }
+
+    async fn record_recovery_wake(session: &TeamSession, slot_id: &str, role: TeamRunTargetRole, unread_count: usize) {
+        session
+            .team_run_manager()
+            .recover_mailbox_backlog(vec![RecoveryWakeCandidate {
+                slot_id: slot_id.to_owned(),
+                role,
+                unread_count,
+            }])
+            .await
+            .expect("recovery wake");
+    }
+
+    fn register_test_event_loop(session: &Arc<TeamSession>, slot_id: &str) {
+        session.event_loops().spawn(
+            slot_id,
+            AgentLoopContext {
+                team_id: session.team_id().to_owned(),
+                slot_id: slot_id.to_owned(),
+                user_id: session.user_id().to_owned(),
+                session: session.clone(),
+                scheduler: session.scheduler().clone(),
+                mailbox: session.mailbox().clone(),
+                turn_port: session.turn_port().clone(),
+                registry: session.event_loops().clone(),
+            },
+        );
+    }
+
     async fn start_session_with_projection_store(store: Arc<dyn TeamProjectionMessageStore>) -> TeamSession {
         let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        TeamSession::start(
+            make_team(),
+            repo,
+            broadcaster,
+            backend_path(),
+            empty_task_manager(),
+            noop_turn_port(),
+            noop_cancellation_port(),
+            store,
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn start_session_with_repo_and_projection_store(
+        repo: Arc<dyn ITeamRepository>,
+        store: Arc<dyn TeamProjectionMessageStore>,
+    ) -> TeamSession {
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         TeamSession::start(
             make_team(),
@@ -1585,6 +2034,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_send_message_survives_completion_between_projection_and_commit() {
+        let store = Arc::new(CompletingProjectionStore::default());
+        let session = start_session_with_projection_store(store.clone()).await;
+        store.set_manager(session.team_run_manager().clone());
+        session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("active run before agent message");
+
+        session
+            .send_agent_message_from_agent("lead-1", "worker-1", "lease protected")
+            .await
+            .expect("agent message lease should retain run while projection completes it");
+
+        let unread = session
+            .mailbox()
+            .peek_unread(session.team_id(), "worker-1")
+            .await
+            .unwrap();
+        assert!(unread.iter().any(|msg| msg.content == "lease protected"));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn agent_message_to_idle_target_returns_queued_for_idle() {
+        let session = start_session_arc().await;
+        register_test_event_loop(&session, "worker-1");
+        let ack = session.send_message("start", None).await.unwrap();
+
+        let result = session
+            .send_agent_message_from_agent("lead-1", "worker-1", "Do the implementation")
+            .await
+            .unwrap();
+
+        assert_eq!(result.team_run_id, ack.team_run_id);
+        assert_eq!(result.delivery, TeamSendMessageDelivery::WakeRecorded);
+        assert_eq!(result.target.queue_state, TeamSendMessageReason::QueuedForIdle);
+        assert_eq!(result.target.pending_wake_count, 1);
+        session.event_loops().shutdown();
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn agent_message_to_active_target_returns_behind_active_turn() {
+        let session = start_session_arc().await;
+        register_test_event_loop(&session, "worker-1");
+        let ack = session
+            .team_run_manager()
+            .accept_user_message("worker-1", TeamRunTargetRole::Teammate, false, None)
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_pending_wake("worker-1", TeamRunTargetRole::Teammate, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "conv-worker")
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_child_started(
+                &reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id.clone(),
+                    slot_id: "worker-1".into(),
+                    role: TeamRunTargetRole::Teammate,
+                    conversation_id: "conv-worker".into(),
+                    turn_id: "turn-worker".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
+                },
+            )
+            .await;
+
+        let result = session
+            .send_agent_message_from_agent("lead-1", "worker-1", "Second item")
+            .await
+            .unwrap();
+
+        assert_eq!(result.target.queue_state, TeamSendMessageReason::BehindActiveTurn);
+        assert_eq!(result.target.pending_wake_count, 1);
+        assert_eq!(result.target.active_turn_id.as_deref(), Some("turn-worker"));
+        session.event_loops().shutdown();
+        session.stop();
+    }
+
+    #[tokio::test]
     async fn leader_message_reuses_active_run_when_leader_slot_is_free() {
         let session = start_session().await;
         let first = session
@@ -1611,19 +2151,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leader_message_rejects_when_leader_slot_is_busy() {
+    async fn leader_message_queues_when_leader_slot_has_pending_wake() {
         let session = start_session().await;
-        session
+        let first = session
             .send_message("First leader message", None)
             .await
             .expect("first leader send creates run");
 
-        let err = session
+        let second = session
             .send_message("Second leader message", None)
             .await
-            .expect_err("leader pending wake must make leader slot busy");
+            .expect("leader pending wake should accept additional foreground message");
 
-        assert!(matches!(err, TeamError::SlotBusy(slot_id) if slot_id == "lead-1"));
+        assert_eq!(second.team_run_id, first.team_run_id);
+        let payload = session.team_run_manager().current_payload().await.unwrap();
+        assert_eq!(payload.pending_wake_count, 2);
         session.stop();
     }
 
@@ -1642,6 +2184,8 @@ mod tests {
             role: TeamRunTargetRole::Lead,
             conversation_id: "c1".into(),
             turn_id: "turn-lead".into(),
+            started_at_ms: now_ms(),
+            last_slow_notified_at_ms: None,
         };
         let worker = ActiveChildTurn {
             team_run_id: ack.team_run_id.clone(),
@@ -1649,6 +2193,8 @@ mod tests {
             role: TeamRunTargetRole::Teammate,
             conversation_id: "c2".into(),
             turn_id: "turn-worker".into(),
+            started_at_ms: now_ms(),
+            last_slow_notified_at_ms: None,
         };
 
         session
@@ -1722,6 +2268,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "c1".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1746,6 +2294,8 @@ mod tests {
                     role: TeamRunTargetRole::Teammate,
                     conversation_id: "c2".into(),
                     turn_id: "turn-worker".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1816,6 +2366,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "c1".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1871,6 +2423,8 @@ mod tests {
                     role: TeamRunTargetRole::Lead,
                     conversation_id: "c1".into(),
                     turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
                 },
             )
             .await;
@@ -1900,7 +2454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paused_slot_suppresses_background_wake_and_keeps_mailbox_unread() {
+    async fn paused_slot_suppresses_mcp_send_without_mailbox_write() {
         let session = start_session().await;
         let ack = session.send_message("start", None).await.unwrap();
         session
@@ -1924,7 +2478,10 @@ mod tests {
             .peek_unread(session.team_id(), "lead-1")
             .await
             .unwrap();
-        assert!(unread.iter().any(|msg| msg.content == "background update"));
+        assert!(
+            unread.iter().all(|msg| msg.content != "background update"),
+            "suppressed acquire must not write mailbox"
+        );
         session.stop();
     }
 
@@ -2031,24 +2588,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_restore_drain_does_not_record_pending_wake_without_active_run() {
-        let session = start_session().await;
-
-        session.notify_agent_for_session_restore_drain("worker-1");
-
-        let reservation = session
-            .team_run_manager()
-            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
-            .await;
-
-        assert!(
-            reservation.is_none(),
-            "restore drain must not create Team Run reservation"
-        );
-        session.stop();
-    }
-
-    #[tokio::test]
     async fn crash_notification_in_active_run_wakes_leader() {
         let session = start_session().await;
         session
@@ -2073,7 +2612,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_notification_without_active_run_is_deferred_mailbox_only() {
+    async fn recovery_wake_without_active_run_is_deferred_without_active_run_snapshot_branch() {
         let session = start_session().await;
 
         session
@@ -2211,6 +2750,67 @@ mod tests {
         let session = start_session().await;
         let result = session.send_message_to_agent("nonexistent", "Hello", None).await;
         assert!(result.is_err());
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_active_run_does_not_write_mailbox() {
+        let session = start_session().await;
+
+        let err = session
+            .shutdown_agent("lead-1", "worker-1", Some("done".into()))
+            .await
+            .expect_err("shutdown is run-scoped");
+
+        assert!(matches!(
+            err,
+            TeamError::InvalidRequest(message)
+                if message == "no active team run for run-scoped wake"
+        ));
+        let unread = session.mailbox().peek_unread("t1", "worker-1").await.unwrap();
+        assert!(unread.is_empty());
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn shutdown_busy_target_is_accepted_as_lifecycle_wake() {
+        let session = start_session().await;
+        let ack = session.send_message("start", None).await.unwrap();
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("lead-1", TeamRunTargetRole::Lead, "c1")
+            .await
+            .unwrap();
+        session
+            .team_run_manager()
+            .record_child_started(
+                &reservation.reservation_id,
+                ActiveChildTurn {
+                    team_run_id: ack.team_run_id,
+                    slot_id: "lead-1".into(),
+                    role: TeamRunTargetRole::Lead,
+                    conversation_id: "c1".into(),
+                    turn_id: "turn-lead".into(),
+                    started_at_ms: now_ms(),
+                    last_slow_notified_at_ms: None,
+                },
+            )
+            .await;
+
+        session
+            .shutdown_agent("lead-1", "worker-1", Some("done".into()))
+            .await
+            .expect("shutdown lifecycle wake should be accepted");
+
+        let unread = session.mailbox().peek_unread("t1", "worker-1").await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].msg_type, MailboxMessageType::ShutdownRequest);
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await
+            .expect("shutdown wake should be pending");
+        assert_eq!(reservation.wake_source, TeamWakeSource::McpShutdownRequest);
         session.stop();
     }
 
@@ -2374,6 +2974,7 @@ mod tests {
             .write("t1", "lead-1", "user", MailboxMessageType::Message, "kick off", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
 
@@ -2396,6 +2997,7 @@ mod tests {
             .write("t1", "worker-1", "user", MailboxMessageType::Message, "do X", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "worker-1", TeamRunTargetRole::Teammate, 1).await;
 
         let input = session
             .compute_wake_input("worker-1")
@@ -2404,11 +3006,44 @@ mod tests {
             .expect("WakeInput");
 
         assert!(
-            input.first_message.contains("Teammate Agent"),
+            input.first_message.contains("## Team Governance"),
+            "expected Team Governance in teammate role prompt, got: {}",
+            input.first_message
+        );
+        assert!(
+            input.first_message.contains("# You are a Team Member"),
             "expected teammate role prompt, got: {}",
             input.first_message
         );
         assert!(input.first_message.contains("do X"));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn teammate_first_wake_uses_canonical_prompt() {
+        let session = start_session().await;
+        session
+            .mailbox
+            .write("t1", "worker-1", "user", MailboxMessageType::Message, "do X", None)
+            .await
+            .unwrap();
+        record_recovery_wake(&session, "worker-1", TeamRunTargetRole::Teammate, 1).await;
+
+        let input = session
+            .compute_wake_input("worker-1")
+            .await
+            .unwrap()
+            .expect("WakeInput");
+        let first_message = input.first_message;
+
+        assert!(first_message.contains("## Team Governance"));
+        assert!(first_message.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
+        assert!(first_message.contains("Use team_send_message to report results to the leader"));
+        assert!(first_message.contains("STOP GENERATING"));
+        assert!(!first_message.contains(
+            "You execute tasks assigned by the Lead Agent. Focus on completing your assigned work thoroughly and reporting back."
+        ));
+        assert!(first_message.contains("do X"));
         session.stop();
     }
 
@@ -2427,6 +3062,7 @@ mod tests {
             .write("t1", "lead-1", "user", MailboxMessageType::Message, "follow-up", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
 
@@ -2451,6 +3087,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compute_wake_input_refuses_unowned_mailbox_backlog() {
+        let session = start_session().await;
+        let lead = session.scheduler().find_lead_slot_id().await.expect("lead");
+        session
+            .mailbox()
+            .write(
+                session.team_id(),
+                &lead,
+                "worker-1",
+                MailboxMessageType::Message,
+                "recover this",
+                None,
+            )
+            .await
+            .expect("mailbox write");
+
+        let input = session
+            .compute_wake_input(&lead)
+            .await
+            .expect("compute should not fail");
+
+        assert!(input.is_none(), "unowned unread mailbox must not start a turn");
+    }
+
+    #[tokio::test]
+    async fn compute_wake_input_accepts_recovery_pending_wake() {
+        let session = start_session().await;
+        let lead = session.scheduler().find_lead_slot_id().await.expect("lead");
+        session
+            .mailbox()
+            .write(
+                session.team_id(),
+                &lead,
+                "worker-1",
+                MailboxMessageType::Message,
+                "recover this",
+                None,
+            )
+            .await
+            .expect("mailbox write");
+        session
+            .team_run_manager()
+            .recover_mailbox_backlog(vec![RecoveryWakeCandidate {
+                slot_id: lead.clone(),
+                role: TeamRunTargetRole::Lead,
+                unread_count: 1,
+            }])
+            .await
+            .expect("recovery run");
+
+        let input = session
+            .compute_wake_input(&lead)
+            .await
+            .expect("compute")
+            .expect("owned wake input");
+
+        assert!(input.team_run_id.is_some());
+        assert!(input.should_send);
+        assert_eq!(input.wake_source, Some(TeamWakeSource::RecoveryDrain));
+        assert!(input.trigger_message_id.is_none());
+        assert_eq!(input.unread.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_scan_creates_one_wake_per_slot_with_non_self_unread() {
+        let session = start_session_arc().await;
+        let lead = session.scheduler().find_lead_slot_id().await.expect("lead");
+        let worker = session
+            .scheduler()
+            .list_agents()
+            .await
+            .into_iter()
+            .find(|agent| agent.slot_id != lead)
+            .expect("worker")
+            .slot_id;
+        register_test_event_loop(&session, &lead);
+        register_test_event_loop(&session, &worker);
+
+        session
+            .mailbox()
+            .write(
+                session.team_id(),
+                &lead,
+                "worker-1",
+                MailboxMessageType::Message,
+                "m1",
+                None,
+            )
+            .await
+            .expect("lead mailbox write 1");
+        session
+            .mailbox()
+            .write(
+                session.team_id(),
+                &lead,
+                "worker-2",
+                MailboxMessageType::Message,
+                "m2",
+                None,
+            )
+            .await
+            .expect("lead mailbox write 2");
+        session
+            .mailbox()
+            .write(
+                session.team_id(),
+                &worker,
+                &worker,
+                MailboxMessageType::Message,
+                "self",
+                None,
+            )
+            .await
+            .expect("self mailbox write");
+
+        let result = session
+            .try_start_recovery_drain("test_restore")
+            .await
+            .expect("scan should not fail")
+            .expect("recovery result");
+
+        assert_eq!(result.recorded_wakes, vec![lead.clone()]);
+        assert_eq!(result.source, TeamRunSource::RecoveryDrain);
+        assert_eq!(result.pending_wake_count, 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_scan_is_one_shot_per_session_lifecycle() {
+        let session = start_session_arc().await;
+        let lead = session.scheduler().find_lead_slot_id().await.expect("lead");
+        register_test_event_loop(&session, &lead);
+
+        let first = session
+            .try_start_recovery_drain("test_restore_no_work")
+            .await
+            .expect("first scan");
+        assert!(first.is_none(), "empty first scan must not create recovery work");
+
+        session
+            .mailbox()
+            .write(
+                session.team_id(),
+                &lead,
+                "worker-1",
+                MailboxMessageType::Message,
+                "late",
+                None,
+            )
+            .await
+            .expect("late mailbox write");
+
+        let second = session
+            .try_start_recovery_drain("test_restore_second")
+            .await
+            .expect("second scan should not fail");
+
+        assert!(
+            second.is_none(),
+            "ordinary new work must not create a second recovery scan"
+        );
+    }
+
+    #[tokio::test]
     async fn compute_wake_input_returns_unread_rows_and_role_for_teammate() {
         let session = start_session().await;
         session
@@ -2470,6 +3269,7 @@ mod tests {
             .write("t1", "worker-1", "user", MailboxMessageType::Message, "from user", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "worker-1", TeamRunTargetRole::Teammate, 2).await;
 
         let input = session
             .compute_wake_input("worker-1")
@@ -2492,6 +3292,7 @@ mod tests {
             .write("t1", "lead-1", "user", MailboxMessageType::Message, "hi lead", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
 
@@ -2515,6 +3316,7 @@ mod tests {
             )
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
 
@@ -2540,6 +3342,7 @@ mod tests {
             )
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
         assert_eq!(
@@ -2573,6 +3376,7 @@ mod tests {
             )
             .await
             .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
 
         let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
         session.mirror_unread_to_conversation(&input).await;
@@ -2585,6 +3389,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_message_to_agent_survives_completion_between_projection_and_commit() {
+        let store = Arc::new(CompletingProjectionStore::default());
+        let session = start_session_with_projection_store(store.clone()).await;
+        store.set_manager(session.team_run_manager().clone());
+        session
+            .team_run_manager()
+            .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("active run before user intervention");
+
+        let ack = session
+            .send_message_to_agent("worker-1", "race window message", None)
+            .await
+            .expect("lease should retain run while projection completes it");
+
+        assert_eq!(ack.accepted_slot_id, "worker-1");
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await
+            .expect("committed user intervention should be pending");
+        assert_eq!(reservation.message_id, ack.message_id);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn send_message_projection_failure_still_commits_wake() {
+        let session = start_session_with_projection_store(Arc::new(FailingProjectionStore)).await;
+
+        let ack = session
+            .send_message_to_agent("worker-1", "projection can fail", None)
+            .await
+            .expect("projection failure is non-fatal");
+
+        let reservation = session
+            .team_run_manager()
+            .claim_wake_for_turn("worker-1", TeamRunTargetRole::Teammate, "c2")
+            .await
+            .expect("wake should still be committed");
+        assert_eq!(reservation.message_id, ack.message_id);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn send_message_mailbox_failure_aborts_lease_and_allows_completion() {
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::with_message_write_failure());
+        let session = start_session_with_repo_and_projection_store(repo, noop_projection_store()).await;
+
+        let err = session
+            .send_message("mailbox fails", None)
+            .await
+            .expect_err("mailbox write failure must be returned");
+        assert!(
+            err.to_string().contains("forced mailbox write failure"),
+            "unexpected error: {err}"
+        );
+
+        let completed = session
+            .team_run_manager()
+            .maybe_complete()
+            .await
+            .expect("aborted lease should allow empty run to complete");
+        assert_eq!(completed.status, TeamRunStatus::Completed);
+        session.stop();
+    }
+
+    #[tokio::test]
     async fn mirror_unread_to_conversation_skips_when_service_weak_is_dangling() {
         let session = start_session().await;
         session
@@ -2592,6 +3463,7 @@ mod tests {
             .write("t1", "worker-1", "lead-1", MailboxMessageType::Message, "do it", None)
             .await
             .unwrap();
+        record_recovery_wake(&session, "worker-1", TeamRunTargetRole::Teammate, 1).await;
 
         let input = session
             .compute_wake_input("worker-1")

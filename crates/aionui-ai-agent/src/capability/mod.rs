@@ -10,6 +10,5 @@ pub(crate) mod cli_process;
 pub(crate) mod first_message_injector;
 pub mod prompt_pipeline;
 pub(crate) mod skill_manager;
-pub(crate) mod team_guide_prompt;
 
 pub use prompt_pipeline::{PostRecvHook, PreSendHook, PromptCtx, PromptPipeline};

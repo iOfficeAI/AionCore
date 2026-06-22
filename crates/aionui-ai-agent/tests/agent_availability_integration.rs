@@ -100,10 +100,7 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
 
     let unavailable = rows.iter().find(|row| row.id == "agent-unavailable").unwrap();
     assert_eq!(unavailable.status, AgentManagementStatus::Offline);
-    assert_eq!(
-        unavailable.last_check_status,
-        Some(AgentSnapshotCheckStatus::Offline)
-    );
+    assert_eq!(unavailable.last_check_status, Some(AgentSnapshotCheckStatus::Offline));
     assert_eq!(unavailable.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
     assert_eq!(unavailable.last_check_error_code.as_deref(), Some("auth_required"));
     let unavailable_json = serde_json::to_value(unavailable).unwrap();

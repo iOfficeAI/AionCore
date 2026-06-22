@@ -40,12 +40,23 @@ struct ProvisionedConversation {
 struct NewAgentProvisioning {
     user_id: String,
     team_id: String,
+    slot_id: String,
     name: String,
     role: TeammateRole,
     backend: String,
     model: String,
     assistant_id: Option<String>,
     workspace: Option<String>,
+}
+
+pub(crate) struct PersistSpawnedAgentRequest {
+    pub user_id: String,
+    pub team_id: String,
+    pub slot_id: String,
+    pub name: String,
+    pub backend: String,
+    pub model: String,
+    pub assistant_id: Option<String>,
 }
 
 pub struct TeamConversationCreateRequest {
@@ -253,6 +264,7 @@ impl TeamAgentProvisioner {
             .provision_new_agent(NewAgentProvisioning {
                 user_id: user_id.to_owned(),
                 team_id: team.id.clone(),
+                slot_id: generate_id(),
                 name: req.name,
                 role,
                 backend,
@@ -293,36 +305,29 @@ impl TeamAgentProvisioner {
         Ok(requested_backend.to_owned())
     }
 
-    pub(crate) async fn persist_spawned_agent(
-        &self,
-        user_id: &str,
-        team_id: &str,
-        name: String,
-        backend: String,
-        model: String,
-        assistant_id: Option<String>,
-    ) -> Result<TeamAgent, TeamError> {
+    pub(crate) async fn persist_spawned_agent(&self, req: PersistSpawnedAgentRequest) -> Result<TeamAgent, TeamError> {
         let row = self
             .repo
-            .get_team(team_id)
+            .get_team(&req.team_id)
             .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+            .ok_or_else(|| TeamError::TeamNotFound(req.team_id.clone()))?;
         let mut team = Team::from_row(&row)?;
         let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
-                user_id: user_id.to_owned(),
-                team_id: team_id.to_owned(),
-                name,
+                user_id: req.user_id,
+                team_id: req.team_id.clone(),
+                slot_id: req.slot_id,
+                name: req.name,
                 role: TeammateRole::Teammate,
-                backend,
-                model,
-                assistant_id,
+                backend: req.backend,
+                model: req.model,
+                assistant_id: req.assistant_id,
                 workspace: Some(workspace),
             })
             .await?;
         team.agents.push(agent.clone());
-        self.persist_agents(team_id, &team.agents).await?;
+        self.persist_agents(&req.team_id, &team.agents).await?;
         Ok(agent)
     }
 
@@ -389,12 +394,11 @@ impl TeamAgentProvisioner {
     }
 
     async fn provision_new_agent(&self, input: NewAgentProvisioning) -> Result<TeamAgent, TeamError> {
-        let slot_id = generate_id();
         let conversation = self
             .create_or_adopt_conversation(
                 &input.user_id,
                 &input.team_id,
-                &slot_id,
+                &input.slot_id,
                 input.role,
                 &input.name,
                 &input.backend,
@@ -405,7 +409,7 @@ impl TeamAgentProvisioner {
             )
             .await?;
         Ok(TeamAgent {
-            slot_id,
+            slot_id: input.slot_id,
             name: input.name,
             role: input.role,
             conversation_id: conversation.conversation_id,

@@ -109,9 +109,14 @@ impl ChannelManager {
         let plugin_type =
             PluginType::from_str_opt(plugin_id).ok_or_else(|| ChannelError::InvalidPluginType(plugin_id.to_owned()))?;
 
-        // Parse and validate config structure
-        let config: PluginConfig = serde_json::from_value(config_value.clone())
-            .map_err(|e| ChannelError::InvalidConfig(format!("Invalid config: {e}")))?;
+        // Resolve the effective config. The Settings re-enable toggle sends an
+        // empty config and expects the previously stored credentials to be
+        // reused, so fall back to the persisted config when no new credentials
+        // are supplied.
+        let config: PluginConfig = match Self::config_with_credentials(config_value)? {
+            Some(config) => config,
+            None => self.load_stored_config(plugin_id).await?,
+        };
 
         // Stop existing plugin if running
         if self.plugins.contains_key(plugin_id) {
@@ -367,6 +372,54 @@ impl ChannelManager {
     }
 
     // ── Private helpers ──────────────────────────────────────────────
+
+    /// Parses a freshly supplied plugin config, returning it only when it
+    /// carries usable credentials.
+    ///
+    /// Returns `Ok(None)` when the caller supplied no credentials (an empty
+    /// `{}` config or one whose `credentials` field is absent or blank),
+    /// signalling that the stored configuration should be reused. A config that
+    /// does carry credentials but fails to parse is reported as `InvalidConfig`.
+    fn config_with_credentials(config_value: &serde_json::Value) -> Result<Option<PluginConfig>, ChannelError> {
+        let credentials_supplied = config_value
+            .get("credentials")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|creds| !creds.is_empty());
+        if !credentials_supplied {
+            return Ok(None);
+        }
+
+        let config: PluginConfig = serde_json::from_value(config_value.clone())
+            .map_err(|e| ChannelError::InvalidConfig(format!("Invalid config: {e}")))?;
+        if config.credentials.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(config))
+        }
+    }
+
+    /// Loads and decrypts the persisted config for a plugin.
+    ///
+    /// Used when an enable request omits credentials and the stored
+    /// configuration should be reused (Settings re-enable toggle). Returns
+    /// `InvalidConfig` when there is no stored config to fall back to.
+    async fn load_stored_config(&self, plugin_id: &str) -> Result<PluginConfig, ChannelError> {
+        let row = self
+            .repo
+            .get_plugin(plugin_id)
+            .await?
+            .filter(|row| !row.config.is_empty())
+            .ok_or_else(|| {
+                ChannelError::InvalidConfig(format!(
+                    "No credentials provided and no stored configuration for plugin '{plugin_id}'"
+                ))
+            })?;
+
+        let config_json = decrypt_string(&row.config, &self.encryption_key)
+            .map_err(|e| ChannelError::DecryptionFailed(e.to_string()))?;
+        let config: PluginConfig = serde_json::from_str(&config_json)?;
+        Ok(config)
+    }
 
     /// Stops and removes an active plugin instance.
     async fn stop_plugin(&self, plugin_id: &str) {

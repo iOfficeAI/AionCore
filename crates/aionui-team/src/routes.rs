@@ -48,7 +48,7 @@ impl From<TeamError> for ApiError {
                     ApiError::BadRequest(msg)
                 }
             }
-            TeamError::SlotBusy(msg) => ApiError::BadRequest(format!("Team slot is busy: {msg}")),
+            TeamError::SlotBusy(msg) => ApiError::Conflict(format!("Team slot is busy: {msg}")),
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
@@ -342,8 +342,7 @@ mod tests {
 
     #[test]
     fn invalid_request_maps_unknown_assistant_to_coded_api_error() {
-        let err: ApiError =
-            TeamError::InvalidRequest("Preset assistant not found: bare:deadbeef".into()).into();
+        let err: ApiError = TeamError::InvalidRequest("Preset assistant not found: bare:deadbeef".into()).into();
         assert_eq!(err.error_code(), "TEAM_ASSISTANT_NOT_FOUND");
         assert_eq!(
             err.error_details(),
@@ -355,8 +354,7 @@ mod tests {
 
     #[test]
     fn invalid_request_maps_legacy_identity_field_to_coded_api_error() {
-        let err: ApiError =
-            TeamError::InvalidRequest("backend is no longer accepted; use assistant_id".into()).into();
+        let err: ApiError = TeamError::InvalidRequest("backend is no longer accepted; use assistant_id".into()).into();
         assert_eq!(err.error_code(), "TEAM_ASSISTANT_FIELD_UNSUPPORTED");
         assert_eq!(
             err.error_details(),
@@ -365,6 +363,12 @@ mod tests {
                 "required_field": "assistant_id",
             }))
         );
+    }
+
+    #[test]
+    fn slot_busy_maps_to_conflict() {
+        let api_error: ApiError = TeamError::SlotBusy("lead-1".into()).into();
+        assert_eq!(api_error.status_code(), StatusCode::CONFLICT);
     }
 
     #[test]

@@ -175,10 +175,7 @@ impl AgentService {
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))
     }
 
-    pub async fn get_agent_overrides(
-        &self,
-        id: &str,
-    ) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {
+    pub async fn get_agent_overrides(&self, id: &str) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {
         let row = self
             .registry
             .repo_handle()

@@ -3,6 +3,8 @@ name: x-recruiter
 description: 用于在 X (x.com) 发布招聘帖子。包含文案规范、图片生成提示和自动化发布脚本。发布 AI 相关岗位或设计类岗位时优先使用。
 ---
 
+> **⚠️ Platform note — read before running any command.** The command examples here are written for **macOS / Linux**. On **Windows**: run `python` (or `py`) instead of `python3`, use `$env:USERPROFILE\…` and backslashes instead of `~/…`, and translate any shell pipes/redirects (`|`, `>`, `&&`) to their PowerShell equivalents before running. The scripts themselves are cross-platform; only the way you invoke them differs.
+
 # X Recruiter (X 招聘助手)
 
 本技能用于快速在 X 发布招聘信息，包含文案规则、封面/详情图提示与自动化发布脚本。

@@ -3,6 +3,22 @@ name: officecli-xlsx
 description: "Use this skill any time a .xlsx file is involved -- as input, output, or both. This includes: creating spreadsheets, financial models, dashboards, or trackers; reading, parsing, or extracting data from any .xlsx file; editing, modifying, or updating existing workbooks; working with formulas, charts, pivot tables, or templates; importing CSV/TSV data into Excel format. Trigger whenever the user mentions 'spreadsheet', 'workbook', 'Excel', 'financial model', 'tracker', 'dashboard', or references a .xlsx/.csv filename."
 ---
 
+> **⚠️ Platform note — read before running any command.** The shell snippets in this skill are written for **macOS / Linux** (bash/zsh). Always check which OS you are on first. On **Windows** do **not** run them verbatim — the underlying tool/CLI commands are usually cross-platform, but the surrounding shell syntax is not. Translate it to PowerShell before running:
+>
+> | bash (macOS / Linux) | PowerShell (Windows) |
+> | --- | --- |
+> | `a && b` | run as two steps, or `a; if ($?) { b }` |
+> | `cat <<'EOF' \| tool …` (heredoc) | write the text to a temp file, then pipe/pass that file to the tool |
+> | `VAR=$(cmd)` … `$VAR` | `$VAR = cmd` … `$VAR` |
+> | `cmd > /dev/null` | `cmd > $null` |
+> | `… \| grep PAT` | `… \| Select-String PAT` |
+> | `… \| jq …` | `… \| ConvertFrom-Json`, then read the fields |
+> | `python3 x.py` | `python x.py` (or `py x.py`) |
+> | `~/dir`, `/tmp` | `$env:USERPROFILE\dir`, `$env:TEMP` |
+> | `cp` / `mkdir -p` / `rm -rf` | `Copy-Item` / `New-Item -ItemType Directory -Force` / `Remove-Item -Recurse -Force` |
+>
+> If a command has no obvious Windows equivalent, prefer the built-in file/HTTP tools over raw shell.
+
 # OfficeCLI XLSX Skill
 
 ## Setup

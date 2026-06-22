@@ -110,20 +110,8 @@ pub trait IMockAgent: IAgentTask {
             initialized: false,
         })
     }
-    async fn set_mode(&self, _mode: &str) -> Result<(), AgentError> {
-        Err(AgentError::bad_request("Mode switching is not supported for this mock"))
-    }
     async fn get_model(&self) -> Result<GetModelInfoResponse, AgentError> {
         Ok(GetModelInfoResponse { model_info: None })
-    }
-    async fn set_model(&self, _model_id: &str) -> Result<(), AgentError> {
-        Err(AgentError::bad_request(
-            "Model switching is not supported for this mock",
-        ))
-    }
-    async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
-        self.set_model(model_id).await?;
-        self.get_model().await
     }
     async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
         Ok(GetConfigOptionsResponse {
@@ -316,18 +304,6 @@ impl AgentInstance {
         }
     }
 
-    /// Set the session mode. Unsupported for variants other than ACP /
-    /// Aionrs — returns a `BadRequest` so the caller can surface an
-    /// actionable error rather than silently no-op.
-    pub async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
-        match self {
-            Self::Acp(m) => m.set_mode(mode).await,
-            Self::Aionrs(m) => m.set_mode(mode).await,
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Mock(m) => m.set_mode(mode).await,
-        }
-    }
-
     /// Get the current session model info. Only ACP exposes a model
     /// catalog; other variants report `model_info = None` so the UI can
     /// hide the model picker without an error.
@@ -347,42 +323,6 @@ impl AgentInstance {
             Self::Aionrs(_) => Ok(GetModelInfoResponse { model_info: None }),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_model().await,
-        }
-    }
-
-    /// Switch the active model. Unsupported for variants other than ACP —
-    /// returns a `BadRequest` so the caller can surface an actionable
-    /// error rather than silently no-op.
-    pub async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
-        if model_id.trim().is_empty() {
-            return Err(AgentError::bad_request("model_id must not be empty"));
-        }
-        match self {
-            Self::Acp(m) => m.set_model(model_id).await,
-            Self::Aionrs(_) => Err(AgentError::bad_request(
-                "Model switching is not supported for this agent type",
-            )),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Mock(m) => m.set_model(model_id).await,
-        }
-    }
-
-    /// Switch the active model and return the confirmed model payload for
-    /// this specific mutation, rather than re-reading potentially stale
-    /// cached state.
-    pub async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
-        if model_id.trim().is_empty() {
-            return Err(AgentError::bad_request("model_id must not be empty"));
-        }
-        match self {
-            Self::Acp(m) => Ok(GetModelInfoResponse {
-                model_info: Some(map_sdk_model_to_payload(m.set_model_confirmed(model_id).await?)),
-            }),
-            Self::Aionrs(_) => Err(AgentError::bad_request(
-                "Model switching is not supported for this agent type",
-            )),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Mock(m) => m.set_model_confirmed(model_id).await,
         }
     }
 

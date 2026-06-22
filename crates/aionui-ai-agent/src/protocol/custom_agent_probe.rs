@@ -155,7 +155,11 @@ impl Drop for ProbeProcessGuard<'_> {
 pub(crate) async fn acp_probe_command_spec(spec: CommandSpec, data_dir: &Path) -> TryConnectCustomAgentResponse {
     let proc = match CliAgentProcess::spawn_for_sdk(spec, data_dir).await {
         Ok(proc) => proc,
-        Err(e) => return TryConnectCustomAgentResponse::FailAcp { error: format!("spawn failed: {e}") },
+        Err(e) => {
+            return TryConnectCustomAgentResponse::FailAcp {
+                error: format!("spawn failed: {e}"),
+            };
+        }
     };
 
     // From here on, the process tree is reaped on every exit path, including

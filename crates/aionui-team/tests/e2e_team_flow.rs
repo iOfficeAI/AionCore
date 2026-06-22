@@ -121,6 +121,27 @@ impl AgentTurnExecutionPort for ErrorBeforeStartTurnPort {
     }
 }
 
+#[derive(Default)]
+struct SkippedBusyTurnPort {
+    requests: Arc<Mutex<Vec<AgentTurnRequest>>>,
+}
+
+impl SkippedBusyTurnPort {
+    fn requests(&self) -> Arc<Mutex<Vec<AgentTurnRequest>>> {
+        self.requests.clone()
+    }
+}
+
+#[async_trait]
+impl AgentTurnExecutionPort for SkippedBusyTurnPort {
+    async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        self.requests.lock().unwrap().push(request.clone());
+        Err(AgentTurnExecutionError::Skipped {
+            reason: format!("conversation {} is already running", request.conversation_id),
+        })
+    }
+}
+
 struct StartedThenFailedTurnPort;
 
 #[async_trait]
@@ -696,6 +717,16 @@ async fn wait_for_event(broadcaster: &RecordingBroadcaster, name: &str) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("timed out waiting for event {name}");
+}
+
+async fn wait_for_turn_request_count(requests: &Arc<Mutex<Vec<AgentTurnRequest>>>, count: usize) {
+    for _ in 0..100 {
+        if requests.lock().unwrap().len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {count} turn requests");
 }
 
 fn register_test_event_loops(session: &Arc<TeamSession>) {
@@ -1595,6 +1626,51 @@ async fn s9b_event_loop_fails_run_when_turn_errors_before_started() {
 }
 
 #[tokio::test]
+async fn s9b_retryable_busy_before_start_retains_team_run_without_timer_retry() {
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let turn_port = Arc::new(SkippedBusyTurnPort::default());
+    let requests = turn_port.requests();
+    let session =
+        setup_session_with_runtime_ports(turn_port, Arc::new(NoopCancellationPort), broadcaster.clone()).await;
+
+    session
+        .send_message("user input to team", None)
+        .await
+        .expect("send_message must succeed");
+
+    wait_for_turn_request_count(&requests, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    let request_log = requests.lock().unwrap();
+    let first_team_run_id = request_log[0]
+        .team_run_id
+        .as_deref()
+        .expect("first attempt should belong to TeamRun")
+        .to_owned();
+    assert_eq!(
+        request_log.len(),
+        1,
+        "Team event loop should not use a timer to retry retryable busy skips"
+    );
+    drop(request_log);
+
+    assert_eq!(
+        session.team_run_manager().active_run_id().await,
+        Some(first_team_run_id.clone()),
+        "run should remain active for a state-driven retry"
+    );
+    let payload = session
+        .team_run_manager()
+        .current_payload()
+        .await
+        .expect("retryable busy skip should keep the active run");
+    assert_eq!(payload.team_run_id, first_team_run_id);
+    assert_eq!(payload.pending_wake_count, 1);
+    assert_eq!(payload.starting_child_count, 0);
+
+    session.stop();
+}
+
+#[tokio::test]
 async fn s9c_event_loop_fails_run_when_started_turn_returns_failed() {
     let broadcaster = Arc::new(RecordingBroadcaster::new());
     let session = setup_session_with_runtime_ports(
@@ -1739,20 +1815,8 @@ async fn s11_shutdown_approved_interception() {
 /// Scenario 12a: Cold-start lead gets role prompt injected into first_message.
 #[tokio::test]
 async fn s12a_cold_start_lead_gets_role_prompt() {
-    let (session, _tm, _repo, _sent) = setup_session().await;
-
-    session
-        .mailbox()
-        .write(
-            "e2e-team",
-            "lead-1",
-            "user",
-            aionui_team::MailboxMessageType::Message,
-            "kick off",
-            None,
-        )
-        .await
-        .unwrap();
+    let (session, _tm, _repo, _sent, _turn_requests) = setup_session_with_turn_recorder_without_loops().await;
+    session.send_message("kick off", None).await.unwrap();
 
     let input = session
         .compute_wake_input("lead-1")
@@ -1778,22 +1842,10 @@ async fn s12a_cold_start_lead_gets_role_prompt() {
 /// on a first compute_wake_input call, then assert the second call omits it.
 #[tokio::test]
 async fn s12b_warm_lead_skips_role_prompt() {
-    let (session, _tm, _repo, _sent) = setup_session().await;
+    let (session, _tm, _repo, _sent, _turn_requests) = setup_session_with_turn_recorder_without_loops().await;
 
-    // First: consume the cold-start role-prompt flag by calling compute_wake_input once.
-    // The mailbox will be empty so should_send=false, but the flag is consumed.
-    session
-        .mailbox()
-        .write(
-            "e2e-team",
-            "lead-1",
-            "user",
-            aionui_team::MailboxMessageType::Message,
-            "initial kick",
-            None,
-        )
-        .await
-        .unwrap();
+    // First: consume the cold-start role-prompt flag from a TeamRun-owned wake.
+    session.send_message("initial kick", None).await.unwrap();
     let first_input = session
         .compute_wake_input("lead-1")
         .await
@@ -1806,18 +1858,7 @@ async fn s12b_warm_lead_skips_role_prompt() {
     // The flag is now consumed (take_needs_role_prompt returned true, set to false).
 
     // Second call: write another message and compute again — no role prompt this time.
-    session
-        .mailbox()
-        .write(
-            "e2e-team",
-            "lead-1",
-            "user",
-            aionui_team::MailboxMessageType::Message,
-            "follow-up message",
-            None,
-        )
-        .await
-        .unwrap();
+    session.send_message("follow-up message", None).await.unwrap();
 
     let input = session
         .compute_wake_input("lead-1")

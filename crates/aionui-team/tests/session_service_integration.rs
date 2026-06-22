@@ -11,7 +11,7 @@ use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
-use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
+use aionui_common::{AgentKillReason, AgentType, ConversationStatus, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow,
     UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
@@ -221,6 +221,34 @@ impl AgentTurnExecutionPort for NoopTurnPort {
     }
 }
 
+#[derive(Default)]
+struct RecordingTurnPort {
+    requests: Mutex<Vec<AgentTurnRequest>>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutionPort for RecordingTurnPort {
+    async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        if let Some(on_started) = request.on_started.as_ref() {
+            on_started(AgentTurnStarted {
+                team_run_id: request.team_run_id.clone().expect("team run id"),
+                slot_id: request.slot_id.clone(),
+                role: request.role.clone(),
+                conversation_id: request.conversation_id.clone(),
+                turn_id: format!("turn-{}", request.slot_id),
+            })
+            .await;
+        }
+        self.requests.lock().unwrap().push(request.clone());
+        Ok(AgentTurnOutcome {
+            conversation_id: request.conversation_id,
+            turn_id: "turn-recorded".into(),
+            status: AgentTurnStatus::Completed,
+            runtime: None,
+        })
+    }
+}
+
 fn noop_turn_port() -> Arc<dyn AgentTurnExecutionPort> {
     Arc::new(NoopTurnPort)
 }
@@ -247,8 +275,16 @@ struct FakeConversationPorts {
     repo: Arc<MockConversationRepo>,
     broadcaster: Arc<dyn EventBroadcaster>,
     workspace_root: std::path::PathBuf,
+    preset_snapshots: Mutex<HashMap<String, FakePresetAssistantSnapshot>>,
     fail_team_temp_create: std::sync::atomic::AtomicBool,
     fail_leader_workspace_patch: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone)]
+struct FakePresetAssistantSnapshot {
+    rules: String,
+    skills: Vec<String>,
+    mcp_server_ids: Vec<String>,
 }
 
 impl FakeConversationPorts {
@@ -259,9 +295,39 @@ impl FakeConversationPorts {
             repo,
             broadcaster,
             workspace_root,
+            preset_snapshots: Mutex::new(HashMap::new()),
             fail_team_temp_create: std::sync::atomic::AtomicBool::new(false),
             fail_leader_workspace_patch: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn upsert_preset_snapshot(&self, id: &str, snapshot: FakePresetAssistantSnapshot) {
+        self.preset_snapshots.lock().unwrap().insert(id.to_owned(), snapshot);
+    }
+
+    fn apply_preset_snapshot(&self, extra: &mut serde_json::Value) {
+        let Some(preset_id) = extra
+            .get("assistant_id")
+            .or_else(|| extra.get("preset_assistant_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let Some(snapshot) = self.preset_snapshots.lock().unwrap().get(&preset_id).cloned() else {
+            return;
+        };
+        extra["preset_context"] = serde_json::Value::String(snapshot.rules.clone());
+        extra["preset_rules"] = serde_json::Value::String(snapshot.rules);
+        extra["skills"] =
+            serde_json::Value::Array(snapshot.skills.into_iter().map(serde_json::Value::String).collect());
+        extra["mcp_server_ids"] = serde_json::Value::Array(
+            snapshot
+                .mcp_server_ids
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
     }
 }
 
@@ -291,6 +357,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
             });
         let mut extra = request.extra;
         extra["workspace"] = serde_json::Value::String(workspace.clone());
+        self.apply_preset_snapshot(&mut extra);
         self.repo
             .create(&ConversationRow {
                 id: id.clone(),
@@ -590,6 +657,8 @@ struct FullMockTeamRepo {
     inner: MockTeamRepo,
     teams: std::sync::Mutex<Vec<aionui_db::models::TeamRow>>,
     fail_workspace_update: std::sync::Mutex<bool>,
+    fail_agent_update: std::sync::Mutex<bool>,
+    fail_message_writes: std::sync::Mutex<bool>,
 }
 
 impl FullMockTeamRepo {
@@ -598,11 +667,21 @@ impl FullMockTeamRepo {
             inner: MockTeamRepo::new(),
             teams: std::sync::Mutex::new(Vec::new()),
             fail_workspace_update: std::sync::Mutex::new(false),
+            fail_agent_update: std::sync::Mutex::new(false),
+            fail_message_writes: std::sync::Mutex::new(false),
         }
     }
 
     fn fail_workspace_update(&self) {
         *self.fail_workspace_update.lock().unwrap() = true;
+    }
+
+    fn fail_agent_updates(&self) {
+        *self.fail_agent_update.lock().unwrap() = true;
+    }
+
+    fn fail_message_writes(&self) {
+        *self.fail_message_writes.lock().unwrap() = true;
     }
 }
 
@@ -632,6 +711,9 @@ impl ITeamRepository for FullMockTeamRepo {
         if params.workspace.is_some() && *self.fail_workspace_update.lock().unwrap() {
             return Err(DbError::Init("forced workspace writeback failure".into()));
         }
+        if params.agents.is_some() && *self.fail_agent_update.lock().unwrap() {
+            return Err(DbError::Init("forced agent update failure".into()));
+        }
         let mut teams = self.teams.lock().unwrap();
         let team = teams
             .iter_mut()
@@ -658,6 +740,9 @@ impl ITeamRepository for FullMockTeamRepo {
     }
 
     async fn write_message(&self, row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
+        if *self.fail_message_writes.lock().unwrap() {
+            return Err(DbError::Init("forced mailbox write failure".into()));
+        }
         self.inner.write_message(row).await
     }
     async fn read_unread_and_mark(
@@ -890,11 +975,12 @@ mod mock_agent {
         pub workspace: String,
         pub event_tx: broadcast::Sender<AgentStreamEvent>,
         pub confirmations: Vec<Confirmation>,
+        pub status: Option<std::sync::Arc<std::sync::Mutex<Option<ConversationStatus>>>>,
     }
 
     impl MockAgent {
         pub fn new(conversation_id: String, workspace: String) -> Self {
-            Self::with_confirmations(conversation_id, workspace, Vec::new())
+            Self::with_confirmations_and_status(conversation_id, workspace, Vec::new(), None)
         }
 
         pub fn with_confirmations(
@@ -902,12 +988,30 @@ mod mock_agent {
             workspace: String,
             confirmations: Vec<Confirmation>,
         ) -> Self {
+            Self::with_confirmations_and_status(conversation_id, workspace, confirmations, None)
+        }
+
+        pub fn with_status(
+            conversation_id: String,
+            workspace: String,
+            status: std::sync::Arc<std::sync::Mutex<Option<ConversationStatus>>>,
+        ) -> Self {
+            Self::with_confirmations_and_status(conversation_id, workspace, Vec::new(), Some(status))
+        }
+
+        fn with_confirmations_and_status(
+            conversation_id: String,
+            workspace: String,
+            confirmations: Vec<Confirmation>,
+            status: Option<std::sync::Arc<std::sync::Mutex<Option<ConversationStatus>>>>,
+        ) -> Self {
             let (event_tx, _) = broadcast::channel(16);
             Self {
                 conversation_id,
                 workspace,
                 event_tx,
                 confirmations,
+                status,
             }
         }
     }
@@ -924,7 +1028,7 @@ mod mock_agent {
             &self.workspace
         }
         fn status(&self) -> Option<ConversationStatus> {
-            None
+            self.status.as_ref().and_then(|status| *status.lock().unwrap())
         }
         fn last_activity_at(&self) -> TimestampMs {
             0
@@ -985,6 +1089,27 @@ fn confirmations_factory(count: usize) -> AgentFactory {
                     confirmations,
                 ),
             )))
+        }
+        .boxed()
+    })
+}
+
+fn status_factory_with_event_sender(
+    status: Arc<Mutex<Option<ConversationStatus>>>,
+    event_sender: Arc<Mutex<Option<tokio::sync::broadcast::Sender<aionui_ai_agent::AgentStreamEvent>>>>,
+) -> AgentFactory {
+    use futures_util::FutureExt;
+    Arc::new(move |opts: BuildTaskOptions| {
+        let status = status.clone();
+        let event_sender = event_sender.clone();
+        async move {
+            let agent = mock_agent::MockAgent::with_status(
+                opts.context.conversation.conversation_id,
+                opts.context.workspace.path,
+                status,
+            );
+            *event_sender.lock().unwrap() = Some(agent.event_tx.clone());
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(agent)))
         }
         .boxed()
     })
@@ -1276,6 +1401,25 @@ fn setup_with_ports_team_repo_and_conversation_repo(
     Arc<FakeConversationPorts>,
     Arc<MockConversationRepo>,
 ) {
+    setup_with_ports_metadata_assistants_and_conversation_repo(
+        factory,
+        agent_metadata_repo,
+        Arc::new(EmptyAssistantDefinitionRepo),
+        Arc::new(EmptyAssistantOverlayRepo),
+    )
+}
+
+fn setup_with_ports_metadata_assistants_and_conversation_repo(
+    factory: AgentFactory,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<FakeConversationPorts>,
+    Arc<MockConversationRepo>,
+) {
     let team_repo = Arc::new(FullMockTeamRepo::new());
     let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
@@ -1290,8 +1434,8 @@ fn setup_with_ports_team_repo_and_conversation_repo(
     let svc = TeamSessionService::new(
         team_repo_dyn,
         agent_metadata_repo,
-        Arc::new(EmptyAssistantDefinitionRepo),
-        Arc::new(EmptyAssistantOverlayRepo),
+        assistant_definition_repo,
+        assistant_overlay_repo,
         provider_repo,
         conversation_port,
         projection_store,
@@ -1306,8 +1450,213 @@ fn setup_with_ports_team_repo_and_conversation_repo(
     (svc, team_repo, conversation_ports, conv_repo)
 }
 
+fn setup_with_recording_turn_port() -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<RecordingTurnPort>,
+    Arc<MockConversationRepo>,
+) {
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone(), broadcaster.clone()));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
+    let turn_port = Arc::new(RecordingTurnPort::default());
+    let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let svc = TeamSessionService::new(
+        team_repo_dyn,
+        Arc::new(StubAgentMetadataRepo::empty()),
+        Arc::new(EmptyAssistantDefinitionRepo),
+        Arc::new(EmptyAssistantOverlayRepo),
+        provider_repo,
+        conversation_port,
+        projection_store,
+        lookup_port,
+        broadcaster,
+        task_manager,
+        turn_port.clone(),
+        noop_cancellation_port(),
+        backend_binary_path,
+        None,
+    );
+    (svc, team_repo, turn_port, conv_repo)
+}
+
 fn setup() -> Arc<TeamSessionService> {
     setup_with_factory(success_factory()).0
+}
+
+#[tokio::test]
+async fn ensure_session_recovery_drain_runs_agent_turn_with_team_run_id() {
+    let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Recover".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let lead_slot_id = created.leader_assistant_id.clone().expect("lead");
+    svc.stop_session("user1", &created.id)
+        .await
+        .expect("stop auto-started session");
+
+    team_repo
+        .write_message(&aionui_db::models::MailboxMessageRow {
+            id: "mailbox-orphan-1".into(),
+            team_id: created.id.clone(),
+            to_agent_id: lead_slot_id.clone(),
+            from_agent_id: "worker-or-user".into(),
+            msg_type: "message".into(),
+            content: "orphan backlog".into(),
+            summary: None,
+            files: None,
+            read: false,
+            created_at: aionui_common::now_ms(),
+        })
+        .await
+        .expect("seed orphan mailbox");
+
+    svc.ensure_session("user1", &created.id).await.expect("ensure");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !turn_port.requests.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("recovery turn should run");
+
+    let requests = turn_port.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].slot_id, lead_slot_id);
+    assert!(requests[0].team_run_id.is_some(), "recovery turn must be TeamRun-owned");
+}
+
+#[tokio::test]
+async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
+    let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Recover Teammate".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let worker_slot_id = created.assistants[1].slot_id.clone();
+    svc.stop_session("user1", &created.id)
+        .await
+        .expect("stop auto-started session");
+
+    team_repo
+        .write_message(&aionui_db::models::MailboxMessageRow {
+            id: "mailbox-worker-1".into(),
+            team_id: created.id.clone(),
+            to_agent_id: worker_slot_id.clone(),
+            from_agent_id: "user".into(),
+            msg_type: "message".into(),
+            content: "do X".into(),
+            summary: None,
+            files: None,
+            read: false,
+            created_at: aionui_common::now_ms(),
+        })
+        .await
+        .expect("seed teammate mailbox");
+
+    svc.ensure_session("user1", &created.id).await.expect("ensure");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if turn_port
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.slot_id == worker_slot_id)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("teammate recovery turn should run");
+
+    let requests = turn_port.requests.lock().unwrap();
+    let worker_request = requests
+        .iter()
+        .find(|request| request.slot_id == worker_slot_id)
+        .expect("worker turn request");
+    let first_message = &worker_request.content;
+    assert!(first_message.contains("## Team Governance"));
+    assert!(first_message.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
+    assert!(first_message.contains("Use team_send_message to report results to the leader"));
+    assert!(first_message.contains("STOP GENERATING"));
+    assert!(!first_message.contains(
+        "You execute tasks assigned by the Lead Agent. Focus on completing your assigned work thoroughly and reporting back."
+    ));
+    assert!(first_message.contains("do X"));
+}
+
+#[tokio::test]
+async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
+    let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Self Only".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let lead_slot_id = created.leader_assistant_id.clone().expect("lead");
+    svc.stop_session("user1", &created.id)
+        .await
+        .expect("stop auto-started session");
+
+    team_repo
+        .write_message(&aionui_db::models::MailboxMessageRow {
+            id: "mailbox-self-1".into(),
+            team_id: created.id.clone(),
+            to_agent_id: lead_slot_id.clone(),
+            from_agent_id: lead_slot_id,
+            msg_type: "message".into(),
+            content: "self backlog".into(),
+            summary: None,
+            files: None,
+            read: false,
+            created_at: aionui_common::now_ms(),
+        })
+        .await
+        .expect("seed self mailbox");
+
+    svc.ensure_session("user1", &created.id).await.expect("ensure");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert!(
+        turn_port.requests.lock().unwrap().is_empty(),
+        "self-only unread must not start a recovery turn"
+    );
 }
 
 fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<RecordingBroadcaster>) {
@@ -1381,6 +1730,43 @@ fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadata
         env_override: None,
         created_at: 0,
         updated_at: 0,
+    }
+}
+
+fn word_creator_definition() -> AssistantDefinitionRow {
+    AssistantDefinitionRow {
+        definition_id: "def-word-creator".into(),
+        assistant_key: "word-creator".into(),
+        source: "builtin".into(),
+        owner_type: "system".into(),
+        source_ref: Some("word-creator".into()),
+        source_version: None,
+        source_hash: None,
+        name: "Word Creator".into(),
+        name_i18n: "{}".into(),
+        description: Some("Drafts Word documents".into()),
+        description_i18n: "{}".into(),
+        avatar_type: "builtin_asset".into(),
+        avatar_value: None,
+        agent_backend: "claude".into(),
+        rule_resource_type: "inline".into(),
+        rule_resource_ref: None,
+        rule_inline_content: None,
+        recommended_prompts: "[]".into(),
+        recommended_prompts_i18n: "{}".into(),
+        default_model_mode: "auto".into(),
+        default_model_value: None,
+        default_permission_mode: "auto".into(),
+        default_permission_value: None,
+        default_skills_mode: "auto".into(),
+        default_skill_ids: "[]".into(),
+        custom_skill_names: "[]".into(),
+        default_disabled_builtin_skill_ids: "[]".into(),
+        default_mcps_mode: "auto".into(),
+        default_mcp_ids: "[]".into(),
+        created_at: 0,
+        updated_at: 0,
+        deleted_at: None,
     }
 }
 
@@ -1842,6 +2228,127 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
         .get_extra(&created.assistants[0].conversation_id)
         .expect("lead conversation extra");
     assert_eq!(extra.get("backend").and_then(serde_json::Value::as_str), Some("codex"));
+}
+
+fn fake_preset_snapshot(rules: &str, skills: &[&str], mcp_server_ids: &[&str]) -> FakePresetAssistantSnapshot {
+    FakePresetAssistantSnapshot {
+        rules: rules.to_owned(),
+        skills: skills.iter().map(|value| (*value).to_owned()).collect(),
+        mcp_server_ids: mcp_server_ids.iter().map(|value| (*value).to_owned()).collect(),
+    }
+}
+
+fn assert_frozen_preset_extra(extra: &serde_json::Value) {
+    assert_eq!(extra["assistant_id"], serde_json::json!("word-creator"));
+    assert_eq!(extra["preset_context"], serde_json::json!("assistant rule body"));
+    assert_eq!(extra["preset_rules"], serde_json::json!("assistant rule body"));
+    assert_eq!(extra["skills"], serde_json::json!(["pdf", "cron"]));
+    assert_eq!(extra["mcp_server_ids"], serde_json::json!(["mcp-docs"]));
+}
+
+#[tokio::test]
+async fn team_preset_assistant_snapshot_is_frozen() {
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+        row: word_creator_definition(),
+    });
+    let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+        definition_repo,
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
+    conversation_ports.upsert_preset_snapshot(
+        "word-creator",
+        fake_preset_snapshot("assistant rule body", &["pdf", "cron"], &["mcp-docs"]),
+    );
+
+    let resp = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Preset Team".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("claude".into()),
+                    model: "claude-sonnet-4".into(),
+                    assistant_id: Some("word-creator".into()),
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+
+    let extra = conv_repo.get_extra(&resp.assistants[0].conversation_id).unwrap();
+    assert_frozen_preset_extra(&extra);
+
+    conversation_ports.upsert_preset_snapshot(
+        "word-creator",
+        fake_preset_snapshot("changed rule body", &["changed"], &["changed-mcp"]),
+    );
+
+    let after_live_change = conv_repo.get_extra(&resp.assistants[0].conversation_id).unwrap();
+    assert_frozen_preset_extra(&after_live_change);
+}
+
+#[tokio::test]
+async fn spawned_preset_assistant_snapshot_is_frozen() {
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+        row: word_creator_definition(),
+    });
+    let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+        definition_repo,
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
+    conversation_ports.upsert_preset_snapshot(
+        "word-creator",
+        fake_preset_snapshot("assistant rule body", &["pdf", "cron"], &["mcp-docs"]),
+    );
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Spawn Preset".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let lead_slot_id = created.leader_assistant_id.clone().expect("lead slot");
+    svc.ensure_session("user1", &created.id).await.expect("ensure session");
+    svc.send_message("user1", &created.id, "start active run", None)
+        .await
+        .expect("active run");
+
+    let spawned = svc
+        .spawn_agent_in_session(
+            &created.id,
+            &lead_slot_id,
+            SpawnAgentRequest {
+                name: "Writer".into(),
+                assistant_id: Some("word-creator".into()),
+                model: Some("claude-sonnet-4".into()),
+            },
+        )
+        .await
+        .expect("spawn preset teammate");
+
+    let extra = conv_repo.get_extra(&spawned.conversation_id).unwrap();
+    assert_frozen_preset_extra(&extra);
+
+    conversation_ports.upsert_preset_snapshot(
+        "word-creator",
+        fake_preset_snapshot("changed rule body", &["changed"], &["changed-mcp"]),
+    );
+
+    let after_live_change = conv_repo.get_extra(&spawned.conversation_id).unwrap();
+    assert_frozen_preset_extra(&after_live_change);
 }
 
 #[tokio::test]
@@ -3037,7 +3544,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
 }
 
 #[tokio::test]
-async fn lead_send_agent_message_in_session_succeeds_without_active_team_run() {
+async fn lead_send_agent_message_in_session_requires_active_team_run() {
     let svc = setup();
     let created = svc
         .create_team(
@@ -3066,9 +3573,105 @@ async fn lead_send_agent_message_in_session_succeeds_without_active_team_run() {
         .map(|agent| agent.slot_id.clone())
         .expect("seeded teammate slot");
 
-    svc.send_agent_message_from_agent(&created.id, &lead_slot_id, &worker_slot_id, "Do this")
+    let err = svc
+        .send_agent_message_from_agent(&created.id, &lead_slot_id, &worker_slot_id, "Do this")
         .await
-        .expect("leader direct message should succeed without active Team Run");
+        .expect_err("leader direct message should require active Team Run");
+    assert!(err.to_string().contains("no active team run"));
+}
+
+#[tokio::test]
+async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
+    let (svc, team_repo, _, _) = setup_with_factory_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+        Arc::new(SingleAssistantDefinitionRepo {
+            row: word_creator_definition(),
+        }),
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.send_message("user1", &created.id, "start active run", None)
+        .await
+        .expect("active run");
+    team_repo.fail_agent_updates();
+
+    let lead_slot_id = created.leader_assistant_id.clone().unwrap();
+    let req = SpawnAgentRequest {
+        name: "Helper".into(),
+        assistant_id: Some("word-creator".into()),
+        model: Some("claude-sonnet-4".into()),
+    };
+
+    let err = svc
+        .spawn_agent_in_session(&created.id, &lead_slot_id, req)
+        .await
+        .expect_err("forced agent persistence failure should fail spawn");
+    assert!(err.to_string().contains("forced agent update failure"));
+
+    let after = svc.get_team("user1", &created.id).await.unwrap();
+    assert!(
+        after.assistants.iter().all(|agent| agent.name != "Helper"),
+        "failed spawn must not persist helper after aborted spawn lease"
+    );
+}
+
+#[tokio::test]
+async fn spawn_agent_in_session_compensates_when_welcome_mailbox_write_fails() {
+    let (svc, team_repo, _, _) = setup_with_factory_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+        Arc::new(SingleAssistantDefinitionRepo {
+            row: word_creator_definition(),
+        }),
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.send_message("user1", &created.id, "start active run", None)
+        .await
+        .expect("active run");
+    team_repo.fail_message_writes();
+
+    let lead_slot_id = created.leader_assistant_id.clone().unwrap();
+    let req = SpawnAgentRequest {
+        name: "Helper".into(),
+        assistant_id: Some("word-creator".into()),
+        model: Some("claude-sonnet-4".into()),
+    };
+
+    let err = svc
+        .spawn_agent_in_session(&created.id, &lead_slot_id, req)
+        .await
+        .expect_err("welcome mailbox write failure should fail spawn");
+    assert!(err.to_string().contains("forced mailbox write failure"));
+
+    let after = svc.get_team("user1", &created.id).await.unwrap();
+    assert!(
+        after.assistants.iter().all(|agent| agent.name != "Helper"),
+        "compensation must remove persisted helper after welcome write failure"
+    );
 }
 
 #[tokio::test]
@@ -3420,6 +4023,112 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
         assert_eq!(calls.kill[i].1, Some(AgentKillReason::TeamMcpRebuild));
         assert_eq!(calls.build[i], agent.conversation_id);
     }
+}
+
+#[tokio::test]
+async fn d9_create_team_from_running_solo_leader_rebuilds_leader_after_turn_finishes() {
+    let status = Arc::new(Mutex::new(Some(ConversationStatus::Running)));
+    let event_sender = Arc::new(Mutex::new(None));
+    let (svc, tm, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
+        status_factory_with_event_sender(status.clone(), event_sender.clone()),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let lead_conversation_id = "solo-lead";
+    let workspace = "/tmp/aioncore-test-solo-lead";
+    conv_repo
+        .create(&ConversationRow {
+            id: lead_conversation_id.to_owned(),
+            user_id: "user1".to_owned(),
+            name: "Solo Lead".to_owned(),
+            r#type: "acp".to_owned(),
+            pinned: false,
+            pinned_at: None,
+            source: None,
+            channel_chat_id: None,
+            extra: serde_json::json!({
+                "backend": "claude",
+                "current_model_id": "opus",
+                "workspace": workspace,
+            })
+            .to_string(),
+            model: None,
+            status: Some("running".to_owned()),
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        })
+        .await
+        .unwrap();
+    tm.get_or_build_task(
+        lead_conversation_id,
+        test_acp_build_options(lead_conversation_id.to_owned(), workspace.to_owned()),
+    )
+    .await
+    .unwrap();
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Guide Upgrade".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Leader".into(),
+                    role: "lead".into(),
+                    backend: Some("claude".into()),
+                    model: "opus".into(),
+                    assistant_id: None,
+                    conversation_id: Some(lead_conversation_id.to_owned()),
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        tm.snapshot().kill.is_empty(),
+        "running solo leader must not be killed before the create_team tool turn can finish"
+    );
+
+    *status.lock().unwrap() = Some(ConversationStatus::Finished);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        tm.snapshot().kill.is_empty(),
+        "leader rebuild should wait for the agent terminal event, not poll status changes"
+    );
+
+    let sender = event_sender
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("mock agent should expose its stream event sender");
+    sender
+        .send(aionui_ai_agent::AgentStreamEvent::Finish(
+            aionui_ai_agent::protocol::events::FinishEventData { session_id: None },
+        ))
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let calls = tm.snapshot();
+            if calls.kill.len() == 1 && calls.build.len() == 2 {
+                break calls;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("leader should be rebuilt after solo turn finishes");
+
+    let calls = tm.snapshot();
+    assert_eq!(
+        calls.kill,
+        vec![(lead_conversation_id.to_owned(), Some(AgentKillReason::TeamMcpRebuild))]
+    );
+    assert_eq!(
+        calls.build,
+        vec![lead_conversation_id.to_owned(), lead_conversation_id.to_owned()]
+    );
+    assert_eq!(created.assistants.len(), 1);
 }
 
 #[tokio::test]

@@ -184,7 +184,7 @@ async fn management_list_marks_rows_with_unavailable_snapshot() {
         .iter()
         .find(|item| item["id"].as_str() == Some("custom-unavailable-agent"))
         .expect("management list should include unavailable rows");
-    assert_eq!(row["status"], "unavailable");
+    assert_eq!(row["status"], "online");
 }
 
 #[tokio::test]

@@ -647,7 +647,11 @@ fn derive_management_diagnostics(meta: &AgentMetadata, status: AgentManagementSt
     let details = derived_reason
         .as_ref()
         .and_then(diagnostic_details_for_unavailable_reason)
-        .or_else(|| error_code.as_deref().and_then(|code| diagnostic_details_for_snapshot_code(meta, code)));
+        .or_else(|| {
+            error_code
+                .as_deref()
+                .and_then(|code| diagnostic_details_for_snapshot_code(meta, code))
+        });
     let guidance = meta.last_check_guidance.clone().or_else(|| {
         if let Some(reason) = derived_reason.as_ref() {
             Some(guidance_for_unavailable_reason(reason))
@@ -774,9 +778,7 @@ pub(crate) fn guidance_for_snapshot_error_code(error_code: &str) -> &'static str
         "session_send_failed" => {
             "Fix the provider credentials or network issue that caused the last session failure, then start a new conversation."
         }
-        "no_provider" => {
-            "Add and enable a model provider in Settings, then run Test Connection again."
-        }
+        "no_provider" => "Add and enable a model provider in Settings, then run Test Connection again.",
         _ => "",
     }
 }
@@ -1224,7 +1226,17 @@ mod tests {
 
     #[test]
     fn blocked_override_env_keys() {
-        for k in ["HOME", "PATH", "USER", "SHELL", "TERM", "CODEX_HOME", "AIONUI_FOO", "aionui_bar", "path"] {
+        for k in [
+            "HOME",
+            "PATH",
+            "USER",
+            "SHELL",
+            "TERM",
+            "CODEX_HOME",
+            "AIONUI_FOO",
+            "aionui_bar",
+            "path",
+        ] {
             assert!(super::is_blocked_override_env_key(k), "{k} should be blocked");
         }
         for k in ["ANTHROPIC_API_KEY", "FACTORY_API_KEY", "MY_VAR"] {

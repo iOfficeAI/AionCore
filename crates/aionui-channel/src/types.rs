@@ -194,6 +194,26 @@ pub struct PluginCredentials {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+impl PluginCredentials {
+    /// Returns true when no credential field carries a value.
+    ///
+    /// Used to detect "reuse stored credentials" enable requests: the Settings
+    /// re-enable toggle sends an empty config, so the manager must fall back to
+    /// the previously persisted credentials instead of failing.
+    pub fn is_empty(&self) -> bool {
+        self.token.is_none()
+            && self.app_id.is_none()
+            && self.app_secret.is_none()
+            && self.encrypt_key.is_none()
+            && self.verification_token.is_none()
+            && self.client_id.is_none()
+            && self.client_secret.is_none()
+            && self.account_id.is_none()
+            && self.bot_token.is_none()
+            && self.extra.is_empty()
+    }
+}
+
 /// Plugin connection options.
 ///
 /// Configures the connection mode, webhook URL, rate limiting,

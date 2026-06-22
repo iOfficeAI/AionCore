@@ -3,6 +3,22 @@ name: aionui-config
 description: Configure AionUi itself through its backend API — create and edit assistants (name, avatar, system prompt, quick-start prompts, engine), import and attach skills, manage MCP servers, configure LLM providers (add/edit a model endpoint, set the API key, fetch the model list, pick the default model), and change app/UI settings (language, theme, font size, zoom, notifications). Use when the user wants you to set up an AionUi assistant, sink a skill into AionUi's skill registry, attach skills to an assistant, change an assistant's avatar or system prompt, add or configure an MCP server, add an LLM/model provider or API key, switch the default model, change the theme or language, or otherwise configure their AionUi installation. This is "Agent-assisted AionUi configuration": you act on the user's behalf via the local backend.
 ---
 
+> **⚠️ Platform note — read before running any command.** The shell snippets in this skill are written for **macOS / Linux** (bash/zsh). Always check which OS you are on first. On **Windows** do **not** run them verbatim — the underlying tool/CLI commands are usually cross-platform, but the surrounding shell syntax is not. Translate it to PowerShell before running:
+>
+> | bash (macOS / Linux) | PowerShell (Windows) |
+> | --- | --- |
+> | `a && b` | run as two steps, or `a; if ($?) { b }` |
+> | `cat <<'EOF' \| tool …` (heredoc) | write the text to a temp file, then pipe/pass that file to the tool |
+> | `VAR=$(cmd)` … `$VAR` | `$VAR = cmd` … `$VAR` |
+> | `cmd > /dev/null` | `cmd > $null` |
+> | `… \| grep PAT` | `… \| Select-String PAT` |
+> | `… \| jq …` | `… \| ConvertFrom-Json`, then read the fields |
+> | `python3 x.py` | `python x.py` (or `py x.py`) |
+> | `~/dir`, `/tmp` | `$env:USERPROFILE\dir`, `$env:TEMP` |
+> | `cp` / `mkdir -p` / `rm -rf` | `Copy-Item` / `New-Item -ItemType Directory -Force` / `Remove-Item -Recurse -Force` |
+>
+> If a command has no obvious Windows equivalent, prefer the built-in file/HTTP tools over raw shell.
+
 # AionUi Config
 
 Configure a running AionUi installation by calling its backend (aioncore) REST API.

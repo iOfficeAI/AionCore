@@ -3,6 +3,22 @@ name: officecli-data-dashboard
 description: "Use this skill to build a multi-element Excel dashboard — Dashboard sheet on open, multiple formula-driven KPI cards, multiple charts, sparklines, and conditional formatting — from CSV or tabular input. Trigger on: 'dashboard', 'KPI dashboard', 'analytics dashboard', 'executive dashboard', 'metrics dashboard', 'CSV to dashboard', 'data visualization'. Output is a single .xlsx. Scene-layer on officecli-xlsx: inherits every xlsx hard rule. DO NOT invoke for: a single budget tracker / one-sheet CSV-with-formatting (use xlsx), a 3-statement / DCF / LBO financial model (use financial-model), a weekly report with ≤ 1 chart and < 10 rows (use xlsx)."
 ---
 
+> **⚠️ Platform note — read before running any command.** The shell snippets in this skill are written for **macOS / Linux** (bash/zsh). Always check which OS you are on first. On **Windows** do **not** run them verbatim — the underlying tool/CLI commands are usually cross-platform, but the surrounding shell syntax is not. Translate it to PowerShell before running:
+>
+> | bash (macOS / Linux) | PowerShell (Windows) |
+> | --- | --- |
+> | `a && b` | run as two steps, or `a; if ($?) { b }` |
+> | `cat <<'EOF' \| tool …` (heredoc) | write the text to a temp file, then pipe/pass that file to the tool |
+> | `VAR=$(cmd)` … `$VAR` | `$VAR = cmd` … `$VAR` |
+> | `cmd > /dev/null` | `cmd > $null` |
+> | `… \| grep PAT` | `… \| Select-String PAT` |
+> | `… \| jq …` | `… \| ConvertFrom-Json`, then read the fields |
+> | `python3 x.py` | `python x.py` (or `py x.py`) |
+> | `~/dir`, `/tmp` | `$env:USERPROFILE\dir`, `$env:TEMP` |
+> | `cp` / `mkdir -p` / `rm -rf` | `Copy-Item` / `New-Item -ItemType Directory -Force` / `Remove-Item -Recurse -Force` |
+>
+> If a command has no obvious Windows equivalent, prefer the built-in file/HTTP tools over raw shell.
+
 # Data Dashboard (scene-layer on officecli-xlsx)
 
 A dashboard is not "a spreadsheet with charts". It is a composition: **one Dashboard sheet the user lands on** with formula-driven KPI cards, cell-range-linked charts, sparklines, and semantic conditional formatting. Everything else (raw data, aggregations) is upstream infrastructure the user should never need to open. This skill teaches the composition pattern. Everything about the xlsx engine — cells, formulas, batch JSON, shell quoting, validate, HTML preview — comes from `officecli-xlsx` and is not re-taught here.

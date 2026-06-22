@@ -7,6 +7,7 @@ use std::sync::Mutex;
 pub struct MockState {
     pub messages: Vec<MailboxMessageRow>,
     pub tasks: Vec<TeamTaskRow>,
+    pub fail_message_writes: bool,
 }
 
 pub struct MockTeamRepo {
@@ -18,6 +19,12 @@ impl MockTeamRepo {
         Self {
             state: Mutex::new(MockState::default()),
         }
+    }
+
+    pub fn with_message_write_failure() -> Self {
+        let repo = Self::new();
+        repo.state.lock().unwrap().fail_message_writes = true;
+        repo
     }
 }
 
@@ -47,7 +54,11 @@ impl ITeamRepository for MockTeamRepo {
     // ── Mailbox ─────────────────────────────────────────────────────
 
     async fn write_message(&self, row: &MailboxMessageRow) -> Result<(), DbError> {
-        self.state.lock().unwrap().messages.push(row.clone());
+        let mut state = self.state.lock().unwrap();
+        if state.fail_message_writes {
+            return Err(DbError::Init("forced mailbox write failure".into()));
+        }
+        state.messages.push(row.clone());
         Ok(())
     }
 

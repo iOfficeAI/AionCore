@@ -12,7 +12,8 @@ use tracing::{debug, info, warn};
 
 use crate::mailbox::Mailbox;
 use crate::ports::{
-    AgentTurnExecutionPort, AgentTurnRequest, AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback,
+    AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnRequest, AgentTurnSource, AgentTurnStarted,
+    AgentTurnStartedCallback,
 };
 use crate::scheduler::TeammateManager;
 use crate::session::TeamSession;
@@ -116,6 +117,10 @@ struct TurnExecution {
     finish_ok: bool,
     team_run_id: Option<String>,
     turn_id: Option<String>,
+}
+
+fn is_retryable_start_skip(error: &AgentTurnExecutionError) -> bool {
+    matches!(error, AgentTurnExecutionError::Skipped { reason } if reason.contains("already running"))
 }
 
 /// The event loop for one agent slot. Spawned as a tokio task.
@@ -267,6 +272,8 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                     role: started.role,
                     conversation_id: started.conversation_id,
                     turn_id: started.turn_id,
+                    started_at_ms: aionui_common::now_ms(),
+                    last_slow_notified_at_ms: None,
                 };
                 match team_run_manager
                     .record_child_started(&reservation_id, child.clone())
@@ -335,6 +342,13 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
             {
                 if started_seen.load(Ordering::SeqCst) {
                     ctx.session.team_run_manager().complete_failed().await;
+                } else if is_retryable_start_skip(&e) {
+                    ctx.session
+                        .team_run_manager()
+                        .retry_child_start_later(&reservation.reservation_id, &e.to_string())
+                        .await;
+                    let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
+                    return None;
                 } else {
                     ctx.session
                         .team_run_manager()
@@ -390,7 +404,7 @@ async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, input: &crat
             if wake_target != ctx.slot_id
                 && let Err(e) = ctx
                     .session
-                    .wake_agent_for_team_work(&wake_target, TeamWakeSource::IdleNotification, None)
+                    .scheduler_wake_agent_for_team_work(&wake_target, TeamWakeSource::IdleNotification)
                     .await
             {
                 warn!(

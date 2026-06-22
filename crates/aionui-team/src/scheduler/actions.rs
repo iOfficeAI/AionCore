@@ -2,7 +2,7 @@ use tracing::debug;
 
 use super::TeammateManager;
 use crate::error::TeamError;
-use crate::types::{MailboxMessageType, TeammateRole};
+use crate::types::{MailboxMessage, MailboxMessageType, TeammateRole};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SchedulerAction {
@@ -102,7 +102,7 @@ impl TeammateManager {
                 Ok(None)
             }
             SchedulerAction::ShutdownAgent { slot_id, reason } => {
-                self.handle_shutdown_agent(from_slot_id, slot_id, reason.as_deref())
+                self.request_shutdown_agent(from_slot_id, slot_id, reason.as_deref())
                     .await?;
                 Ok(None)
             }
@@ -169,12 +169,12 @@ impl TeammateManager {
         self.mark_idle(from_slot_id, summary).await
     }
 
-    async fn handle_shutdown_agent(
+    pub async fn request_shutdown_agent(
         &self,
         from_slot_id: &str,
         target_slot_id: &str,
         reason: Option<&str>,
-    ) -> Result<(), TeamError> {
+    ) -> Result<MailboxMessage, TeamError> {
         let from_role = {
             let slots = self.slots.lock().await;
             let slot = slots
@@ -206,9 +206,7 @@ impl TeammateManager {
                 reason.unwrap_or("shutdown requested"),
                 None,
             )
-            .await?;
-
-        Ok(())
+            .await
     }
 
     async fn handle_rename_agent(&self, slot_id: &str, new_name: &str) -> Result<(), TeamError> {

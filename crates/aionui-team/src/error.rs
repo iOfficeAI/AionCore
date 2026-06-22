@@ -129,13 +129,11 @@ mod tests {
         assert_eq!(required.code, "TEAM_ASSISTANT_ID_REQUIRED");
         assert_eq!(required.details, Some(json!({ "field": "assistant_id" })));
 
-        let assistant =
-            classify_public_error("Preset assistant not found: bare:abcd1234").expect("assistant lookup");
+        let assistant = classify_public_error("Preset assistant not found: bare:abcd1234").expect("assistant lookup");
         assert_eq!(assistant.code, "TEAM_ASSISTANT_NOT_FOUND");
         assert_eq!(assistant.details, Some(json!({ "assistant_id": "bare:abcd1234" })));
 
-        let legacy =
-            classify_public_error("backend is no longer accepted; use assistant_id").expect("legacy field");
+        let legacy = classify_public_error("backend is no longer accepted; use assistant_id").expect("legacy field");
         assert_eq!(legacy.code, "TEAM_ASSISTANT_FIELD_UNSUPPORTED");
         assert_eq!(
             legacy.details,

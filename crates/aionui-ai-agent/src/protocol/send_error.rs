@@ -298,14 +298,14 @@ impl AgentSendError {
             ),
             AcpError::NotConnected => Self::new(
                 "AionUI lost its Agent protocol connection",
-                AgentErrorCode::AionuiInternalError,
-                AgentErrorOwnership::Aionui,
+                AgentErrorCode::UserAgentDisconnected,
+                AgentErrorOwnership::UserAgent,
                 Some(detail),
                 true,
-                true,
+                false,
                 resolution(
-                    AgentErrorResolutionKind::SendFeedback,
-                    Some(AgentErrorResolutionTarget::Feedback),
+                    AgentErrorResolutionKind::ReconnectAgent,
+                    Some(AgentErrorResolutionTarget::AgentSettings),
                 ),
             ),
             AcpError::AgentInternal { .. } => unknown_upstream_error(detail),
@@ -648,6 +648,22 @@ fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
             true,
             AgentErrorResolutionKind::Retry,
             None,
+        ));
+    }
+    if contains_any(
+        lower,
+        &[
+            "repeatedly returned malformed tool calls",
+            "malformed tool call loop",
+            "malformed tool calls",
+        ],
+    ) {
+        return Some(provider_error(
+            "The model provider repeatedly returned malformed tool calls",
+            AgentErrorCode::UserLlmProviderInvalidRequest,
+            false,
+            AgentErrorResolutionKind::ChangeModel,
+            Some(AgentErrorResolutionTarget::ProviderSettings),
         ));
     }
     if contains_any(
@@ -1183,6 +1199,27 @@ mod tests {
     }
 
     #[test]
+    fn not_connected_maps_to_user_agent_disconnected() {
+        let disconnected = AgentSendError::from(AcpError::NotConnected);
+        assert_eq!(
+            disconnected.stream_error.code,
+            Some(AgentErrorCode::UserAgentDisconnected)
+        );
+        assert_eq!(
+            disconnected.stream_error.ownership,
+            Some(AgentErrorOwnership::UserAgent)
+        );
+        assert_eq!(
+            disconnected
+                .stream_error
+                .resolution
+                .as_ref()
+                .map(|resolution| resolution.kind),
+            Some(AgentErrorResolutionKind::ReconnectAgent)
+        );
+    }
+
+    #[test]
     fn classifies_acp_internal_provider_failure_from_structured_message() {
         assert_acp_classification(
             AcpError::AgentInternal {
@@ -1407,6 +1444,16 @@ mod tests {
             AgentErrorCode::UserLlmProviderUnsupportedModel,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::ChangeModel,
+        );
+        assert_classification(
+            "Aionrs agent error: provider repeatedly returned malformed tool calls (3/3); stopped to avoid wasting tokens",
+            AgentErrorCode::UserLlmProviderInvalidRequest,
+            AgentErrorOwnership::UserLlmProvider,
+            AgentErrorResolutionKind::ChangeModel,
+        );
+        assert_resolution_target(
+            "Aionrs agent error: provider repeatedly returned malformed tool calls (3/3); stopped to avoid wasting tokens",
+            AgentErrorResolutionTarget::ProviderSettings,
         );
         assert_classification(
             "API error 400: invalid params, context window exceeds limit",

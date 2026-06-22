@@ -32,7 +32,7 @@ fn acp_error_to_api_error(err: AcpError) -> ApiError {
         AcpError::MethodNotFound { .. } => ApiError::BadRequest(acp_error_public_message(&err)),
         AcpError::InvalidParams { .. } => ApiError::BadRequest(acp_error_public_message(&err)),
         AcpError::AgentInternal { .. } => ApiError::BadGateway(acp_error_public_message(&err)),
-        AcpError::NotConnected => ApiError::Internal("ACP protocol not connected".into()),
+        AcpError::NotConnected => ApiError::BadGateway(acp_error_public_message(&err)),
         AcpError::InitTimeout { .. } => ApiError::BadGateway(acp_error_public_message(&err)),
     }
 }
@@ -76,7 +76,7 @@ mod tests {
                 },
                 StatusCode::BAD_GATEWAY,
             ),
-            (AcpError::NotConnected, StatusCode::INTERNAL_SERVER_ERROR),
+            (AcpError::NotConnected, StatusCode::BAD_GATEWAY),
             (AcpError::InitTimeout { timeout_secs: 30 }, StatusCode::BAD_GATEWAY),
         ];
 

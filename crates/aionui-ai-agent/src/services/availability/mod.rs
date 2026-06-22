@@ -52,11 +52,7 @@ pub struct AgentAvailabilityService {
 }
 
 impl AgentAvailabilityService {
-    pub fn new(
-        registry: Arc<AgentRegistry>,
-        provider_repo: Arc<dyn IProviderRepository>,
-        data_dir: PathBuf,
-    ) -> Self {
+    pub fn new(registry: Arc<AgentRegistry>, provider_repo: Arc<dyn IProviderRepository>, data_dir: PathBuf) -> Self {
         Self {
             registry,
             data_dir,

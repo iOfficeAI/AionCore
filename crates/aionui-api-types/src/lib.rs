@@ -155,8 +155,10 @@ pub use team::{
     RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput,
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentSpawnedPayload,
     TeamAgentStatusPayload, TeamChildTurnPayload, TeamListResponse, TeamMcpPhase, TeamMcpRuntimeConfig,
-    TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunStatus, TeamRunTargetRole,
-    TeamRuntimeSeed, TeamSessionBinding, TeamSlotWorkPayload, TeammateMessagePayload,
+    TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStatus,
+    TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageDelivery, TeamSendMessageQueuedResponse, TeamSendMessageReason,
+    TeamSendMessageStatus, TeamSendMessageTargetQueueState, TeamSessionBinding, TeamSlotRuntimeHealth,
+    TeamSlotWorkPayload, TeammateMessagePayload,
 };
 pub use team_mcp::{GuideMcpConfig, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use websocket::WebSocketMessage;

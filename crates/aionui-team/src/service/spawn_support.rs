@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 use crate::prompts::AvailableAssistant;
 
+use crate::provisioning::PersistSpawnedAgentRequest;
+
 /// Known ACP vendor labels. Kept in lockstep with the `agent_metadata`
 /// seed in `005_agent_metadata.sql` — a caller hitting an unknown
 /// vendor should trigger a schema drift discussion, not silently fall
@@ -321,25 +323,15 @@ impl TeamSessionService {
     /// The lock is *not* held across the process warmup step — callers
     /// (`TeamSession::spawn_agent`) wire that up separately so a slow
     /// `warmup` never stalls other spawns against the same team.
-    pub(crate) async fn persist_spawned_agent(
-        &self,
-        team_id: &str,
-        user_id: &str,
-        name: String,
-        backend: String,
-        model: String,
-        assistant_id: Option<String>,
-    ) -> Result<TeamAgent, TeamError> {
+    pub(crate) async fn persist_spawned_agent(&self, req: PersistSpawnedAgentRequest) -> Result<TeamAgent, TeamError> {
         let lock = self
             .add_agent_locks
-            .entry(team_id.to_owned())
+            .entry(req.team_id.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
 
-        self.provisioner()
-            .persist_spawned_agent(user_id, team_id, name, backend, model, assistant_id)
-            .await
+        self.provisioner().persist_spawned_agent(req).await
     }
 }
 
@@ -517,14 +509,15 @@ mod tests {
         force_team_workspace(&team_repo, &created.id, "").await;
 
         let spawned = svc
-            .persist_spawned_agent(
-                &created.id,
-                "user1",
-                "Spawned".into(),
-                "acp".into(),
-                "claude".into(),
-                None,
-            )
+            .persist_spawned_agent(PersistSpawnedAgentRequest {
+                team_id: created.id.clone(),
+                user_id: "user1".into(),
+                slot_id: "spawn-slot-1".into(),
+                name: "Spawned".into(),
+                backend: "acp".into(),
+                model: "claude".into(),
+                assistant_id: None,
+            })
             .await
             .unwrap();
 

@@ -17,6 +17,7 @@ members = [
     "crates/aionui-conversation",
     "crates/aionui-extension",
     "crates/aionui-channel",
+    "crates/aionui-team-prompts",
     "crates/aionui-team",
     "crates/aionui-cron",
     "crates/aionui-assistant",
@@ -24,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.30"
+version = "0.1.33"
 edition = "2024"
 license = "MIT"
 
@@ -46,16 +47,18 @@ aionui-mcp = { path = "crates/aionui-mcp" }
 aionui-conversation = { path = "crates/aionui-conversation" }
 aionui-extension = { path = "crates/aionui-extension" }
 aionui-channel = { path = "crates/aionui-channel" }
+aionui-team-prompts = { path = "crates/aionui-team-prompts" }
 aionui-team = { path = "crates/aionui-team" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.29" }
-aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.29" }
-aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.29" }
-aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.29" }
-aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.29" }
+aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
+aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
+aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
+aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
+aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
+aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.30" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }

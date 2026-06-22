@@ -2588,11 +2588,7 @@ mod tests {
                     "claude",
                     aionui_api_types::AgentManagementStatus::Online,
                 ),
-                mk_agent_row(
-                    "agent-codex",
-                    "codex",
-                    aionui_api_types::AgentManagementStatus::Online,
-                ),
+                mk_agent_row("agent-codex", "codex", aionui_api_types::AgentManagementStatus::Online),
             ],
             ..Default::default()
         })

@@ -1,22 +1,35 @@
-pub mod lead;
 pub mod team_guide;
 
-pub use lead::AvailableAssistant;
+pub use aionui_team_prompts::AvailableAssistant;
 pub use team_guide::{TEAM_GUIDE_PROMPT_TEMPLATE, build_team_guide_prompt};
-pub mod teammate;
 
 use std::collections::HashMap;
 
-use crate::prompts::lead::LeadPromptParams;
 use crate::types::{MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask};
+
+fn to_prompt_role(role: crate::types::TeammateRole) -> aionui_team_prompts::TeamPromptRole {
+    match role {
+        crate::types::TeammateRole::Lead => aionui_team_prompts::TeamPromptRole::Lead,
+        crate::types::TeammateRole::Teammate => aionui_team_prompts::TeamPromptRole::Teammate,
+    }
+}
+
+fn to_prompt_agent(agent: &TeamAgent) -> aionui_team_prompts::TeamPromptAgent {
+    aionui_team_prompts::TeamPromptAgent {
+        slot_id: agent.slot_id.clone(),
+        name: agent.name.clone(),
+        role: to_prompt_role(agent.role),
+        backend: agent.backend.clone(),
+        model: agent.model.clone(),
+        status: agent.status.map(|status| status.to_string()),
+    }
+}
 
 /// Build the leader system prompt.
 ///
-/// Delegates to [`lead::build_lead_prompt`], which mirrors the AionUi
-/// `leadPrompt.ts` template verbatim. A one-line `Team: "<name>"` header
-/// is prepended so the leader knows which team it belongs to (AionUi
-/// surfaces this through other channels, but the backend session has no
-/// other place to inject it).
+/// Delegates to `aionui-team-prompts`, the canonical Team role prompt crate.
+/// A one-line `Team: "<name>"` header is prepended so the leader knows which
+/// team it belongs to.
 ///
 /// `available_assistants` is the assistant catalog the leader may use when
 /// staffing the team. Callers should only include assistants that are both
@@ -26,48 +39,50 @@ pub fn build_lead_prompt(
     members: &[TeamAgent],
     available_assistants: &[AvailableAssistant],
 ) -> String {
+    let prompt_members: Vec<_> = members.iter().map(to_prompt_agent).collect();
     let renamed: HashMap<String, String> = HashMap::new();
 
-    let params = LeadPromptParams {
+    let body = aionui_team_prompts::build_lead_prompt(&aionui_team_prompts::LeadPromptParams {
         team_name,
-        teammates: members,
+        teammates: &prompt_members,
         available_agent_types: &[],
         available_assistants,
         renamed_agents: &renamed,
         team_workspace: None,
-    };
-
-    let body = lead::build_lead_prompt(&params);
+    });
     format!("Team: \"{team_name}\"\n\n{body}")
 }
 
-pub fn build_teammate_prompt(agent: &TeamAgent, team_name: &str) -> String {
-    let mut prompt = String::with_capacity(1024);
+pub fn build_teammate_prompt(agent: &TeamAgent, team_name: &str, members: &[TeamAgent]) -> String {
+    let prompt_agent = to_prompt_agent(agent);
+    let prompt_members: Vec<_> = members.iter().map(to_prompt_agent).collect();
+    let leader = prompt_members
+        .iter()
+        .find(|candidate| candidate.role == aionui_team_prompts::TeamPromptRole::Lead)
+        .cloned()
+        .unwrap_or_else(|| aionui_team_prompts::TeamPromptAgent {
+            slot_id: "lead".to_owned(),
+            name: "Lead".to_owned(),
+            role: aionui_team_prompts::TeamPromptRole::Lead,
+            backend: agent.backend.clone(),
+            model: agent.model.clone(),
+            status: None,
+        });
+    let teammates: Vec<_> = prompt_members
+        .iter()
+        .filter(|candidate| candidate.slot_id != prompt_agent.slot_id)
+        .cloned()
+        .collect();
+    let renamed = HashMap::new();
 
-    prompt.push_str(&format!(
-        "You are **{}**, a Teammate Agent in team \"{}\". \
-         Your slot ID is `{}`.\n\n",
-        agent.name, team_name, agent.slot_id,
-    ));
-
-    prompt.push_str("## Your Role\n\n");
-    prompt.push_str(
-        "You execute tasks assigned by the Lead Agent. Focus on completing your \
-         assigned work thoroughly and reporting back.\n\n",
-    );
-
-    prompt.push_str("## Communication Protocol\n\n");
-    prompt.push_str(
-        "- Use `team_send_message` to report progress or ask questions to the Lead.\n\
-         - Use `team_task_update` to update task status as you work \
-         (pending → in_progress → completed).\n\
-         - When your assigned work is done, send an idle notification. \
-         The system will notify the Lead.\n\
-         - If you receive a `shutdown_request`, finish any critical work, \
-         then respond with \"shutdown_approved\" or \"shutdown_rejected: <reason>\".\n",
-    );
-
-    prompt
+    aionui_team_prompts::build_teammate_prompt(&aionui_team_prompts::TeammatePromptParams {
+        agent: &prompt_agent,
+        team_name,
+        leader: &leader,
+        teammates: &teammates,
+        renamed_agents: &renamed,
+        team_workspace: None,
+    })
 }
 
 pub fn build_wake_payload(agent: &TeamAgent, tasks: &[TeamTask], unread_messages: &[MailboxMessage]) -> String {
@@ -305,30 +320,36 @@ mod tests {
     #[test]
     fn teammate_prompt_contains_agent_identity() {
         let agent = make_teammate("w1", "Worker1");
-        let prompt = build_teammate_prompt(&agent, "Alpha");
+        let members = vec![make_lead(), agent.clone()];
+        let prompt = build_teammate_prompt(&agent, "Alpha", &members);
 
-        assert!(prompt.contains("**Worker1**"));
-        assert!(prompt.contains("\"Alpha\""));
-        assert!(prompt.contains("`w1`"));
+        assert!(prompt.contains("## Team Governance"));
+        assert!(prompt.contains("Name: Worker1"));
+        assert!(prompt.contains("Team: Alpha"));
+        assert!(prompt.contains("Leader: Lead"));
     }
 
     #[test]
     fn teammate_prompt_contains_communication_protocol() {
         let agent = make_teammate("w1", "Worker1");
-        let prompt = build_teammate_prompt(&agent, "Alpha");
+        let members = vec![make_lead(), agent.clone()];
+        let prompt = build_teammate_prompt(&agent, "Alpha", &members);
 
+        assert!(prompt.contains("## Team Coordination Tools"));
+        assert!(prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
         assert!(prompt.contains("team_send_message"));
         assert!(prompt.contains("team_task_update"));
-        assert!(prompt.contains("idle notification"));
         assert!(prompt.contains("shutdown_request"));
         assert!(prompt.contains("shutdown_approved"));
+        assert!(prompt.contains("STOP GENERATING"));
     }
 
     #[test]
     fn teammate_prompt_contains_team_name() {
         let agent = make_teammate("w1", "W");
-        let prompt = build_teammate_prompt(&agent, "Beta Team");
-        assert!(prompt.contains("\"Beta Team\""));
+        let members = vec![make_lead(), agent.clone()];
+        let prompt = build_teammate_prompt(&agent, "Beta Team", &members);
+        assert!(prompt.contains("Team: Beta Team"));
     }
 
     // -- Wake payload ---------------------------------------------------------

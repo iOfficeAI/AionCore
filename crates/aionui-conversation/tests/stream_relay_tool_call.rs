@@ -107,6 +107,62 @@ async fn run_tool_call_with_empty_call_id_is_not_persisted() {
     );
 }
 
+#[tokio::test]
+async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
+    let (repo, _db) = setup_repo().await;
+    let bus = Arc::new(BroadcastEventBus::new(64));
+    let (tx, _) = broadcast::channel(64);
+
+    let relay = StreamRelay::new(
+        "conv-1".into(),
+        "asst-1".into(),
+        "turn-1".into(),
+        "system_default_user".into(),
+        repo.clone(),
+        bus,
+        None,
+    );
+
+    let rx = tx.subscribe();
+    tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+        call_id: "glob-1".into(),
+        name: "Glob".into(),
+        args: json!({"pattern": "*.rs"}),
+        status: ToolCallStatus::Completed,
+        input: None,
+        output: Some("src/main.rs".into()),
+        description: None,
+    }))
+    .unwrap();
+    tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+        call_id: "glob-1".into(),
+        name: "Glob".into(),
+        args: json!({"pattern": "*.rs"}),
+        status: ToolCallStatus::Running,
+        input: Some(json!({"pattern": "*.rs"})),
+        output: None,
+        description: Some("search files".into()),
+    }))
+    .unwrap();
+    tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+    relay.consume(rx).await;
+
+    let messages = repo.get_messages("conv-1", 1, 100, SortOrder::Asc).await.unwrap();
+    let msg = messages
+        .items
+        .iter()
+        .find(|row| row.id == "glob-1" && row.r#type == "tool_call")
+        .expect("tool call row should be persisted");
+    assert_eq!(msg.status.as_deref(), Some("finish"));
+
+    let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
+    assert_eq!(content["status"], "completed");
+    assert_eq!(content["output"], "src/main.rs");
+    assert_eq!(content["input"]["pattern"], "*.rs");
+    assert_eq!(content["description"], "search files");
+}
+
 struct ToolCallAgent {
     conversation_id: String,
     event_tx: broadcast::Sender<AgentStreamEvent>,

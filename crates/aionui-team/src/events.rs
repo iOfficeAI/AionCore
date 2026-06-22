@@ -272,6 +272,8 @@ mod tests {
             aionui_api_types::TeamRunPayload {
                 team_id: "team-1".into(),
                 team_run_id: "run-1".into(),
+                source: aionui_api_types::TeamRunSource::UserMessage,
+                has_user_intervention: true,
                 target_slot_id: "lead-1".into(),
                 target_role: aionui_api_types::TeamRunTargetRole::Lead,
                 status: aionui_api_types::TeamRunStatus::Accepted,
