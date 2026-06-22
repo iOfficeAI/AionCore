@@ -1037,11 +1037,11 @@ mod tests {
         let prompt = overrides.system_prompt.as_deref().unwrap();
         assert!(prompt.contains("aion_create_team"));
         assert!(prompt.contains("aion_list_models"));
-        assert!(prompt.contains("hand off to the created Team conversation"));
-        assert!(!prompt.contains("Immediately"));
-        assert!(!prompt.contains(
+        assert!(prompt.contains("only use returned assistant_id values with `team_spawn_agent`"));
+        assert!(prompt.contains(
             "use team tools (`team_spawn_agent`, `team_send_message`, `team_members`, `team_task_create`, etc.) to manage your team"
         ));
+        assert!(!prompt.contains("hand off to the created Team conversation"));
     }
 
     #[test]

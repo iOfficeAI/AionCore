@@ -9,10 +9,18 @@ pub(super) enum AcpSendFailure {
 }
 
 impl AcpSendFailure {
+    #[allow(dead_code)]
     pub(super) fn to_agent_send_error(&self) -> AgentSendError {
         match self {
             AcpSendFailure::Agent(err) => AgentSendError::from_agent_error_ref(err),
             AcpSendFailure::Acp(err) => AgentSendError::from_acp_error_ref(err),
+        }
+    }
+
+    pub(super) fn to_agent_send_error_for_backend(&self, backend: Option<&str>) -> AgentSendError {
+        match self {
+            AcpSendFailure::Agent(err) => AgentSendError::from_agent_error_ref_for_backend(err, backend),
+            AcpSendFailure::Acp(err) => AgentSendError::from_acp_error_ref_for_backend(err, backend),
         }
     }
 
