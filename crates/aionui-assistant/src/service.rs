@@ -1876,8 +1876,9 @@ fn assistant_projection_for_definition(
     // agents, but aionrs (the built-in Rust agent) has a NULL `backend` and is
     // keyed by its `agent_type` ("aionrs") instead. Match on either so aionrs
     // assistants resolve to the aionrs row rather than falling back to Missing.
-    let row_matches_backend =
-        |row: &&AgentManagementRow| row.backend.as_deref() == Some(effective_backend) || row.agent_type.serde_name() == effective_backend;
+    let row_matches_backend = |row: &&AgentManagementRow| {
+        row.backend.as_deref() == Some(effective_backend) || row.agent_type.serde_name() == effective_backend
+    };
 
     let agent_row = if matches!(source, AssistantSource::Bare) {
         definition
@@ -2587,7 +2588,11 @@ mod tests {
         // agent row by `agent_type` ("aionrs"), since that row's `backend` is
         // NULL. Matching on `backend` alone left the row unresolved and
         // mislabelled every aionrs assistant as Missing/unavailable.
-        let mut aionrs_row = mk_agent_row("agent-aionrs", "aionrs", aionui_api_types::AgentManagementStatus::Online);
+        let mut aionrs_row = mk_agent_row(
+            "agent-aionrs",
+            "aionrs",
+            aionui_api_types::AgentManagementStatus::Online,
+        );
         aionrs_row.backend = None;
         aionrs_row.agent_type = aionui_common::AgentType::Aionrs;
 
