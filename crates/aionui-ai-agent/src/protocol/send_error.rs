@@ -7,6 +7,9 @@ use super::error::AcpError;
 use crate::error::AgentError;
 
 const MAX_DETAIL_CHARS: usize = 1000;
+const OPENCLAW_BACKEND: &str = "openclaw";
+const OPENCLAW_GATEWAY_MESSAGE: &str = "OpenClaw Gateway is not reachable";
+const OPENCLAW_GATEWAY_DETAIL: &str = "OpenClaw Gateway is not running or cannot be reached at 127.0.0.1:18789.\n\nStart OpenClaw Gateway and try again. You can run:\nopenclaw gateway status\nopenclaw gateway start";
 
 #[derive(Debug, Clone)]
 pub struct AgentSendError {
@@ -190,6 +193,22 @@ impl AgentSendError {
         }
     }
 
+    pub fn from_agent_error_ref_for_backend(err: &AgentError, backend: Option<&str>) -> Self {
+        match err {
+            AgentError::Acp(acp_err)
+                if is_openclaw_backend(backend) && openclaw_gateway_unreachable_from_acp_error(acp_err) =>
+            {
+                openclaw_gateway_unreachable_send_error()
+            }
+            AgentError::BadGateway(detail)
+                if is_openclaw_backend(backend) && contains_openclaw_gateway_unreachable_signature(detail) =>
+            {
+                openclaw_gateway_unreachable_send_error()
+            }
+            _ => Self::from_agent_error_ref(err),
+        }
+    }
+
     pub fn stream_error(&self) -> &AgentStreamErrorData {
         &self.stream_error
     }
@@ -208,6 +227,17 @@ impl AgentSendError {
 
     pub(crate) fn from_acp_error_ref(err: &AcpError) -> Self {
         classify_acp_error(err)
+    }
+
+    pub(crate) fn from_acp_error_ref_for_backend(err: &AcpError, backend: Option<&str>) -> Self {
+        if is_openclaw_backend(backend) && openclaw_gateway_unreachable_from_acp_error(err) {
+            return openclaw_gateway_unreachable_send_error();
+        }
+        Self::from_acp_error_ref(err)
+    }
+
+    pub fn is_openclaw_gateway_unreachable(&self) -> bool {
+        self.code() == Some(AgentErrorCode::UserAgentOpenClawGatewayUnreachable)
     }
 
     fn from_acp_non_internal(err: &AcpError, detail: String) -> Self {
@@ -862,6 +892,48 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+fn is_openclaw_backend(backend: Option<&str>) -> bool {
+    matches!(backend, Some(value) if value.eq_ignore_ascii_case(OPENCLAW_BACKEND))
+}
+
+fn contains_openclaw_gateway_unreachable_signature(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "acp bridge failed",
+            "connect econnrefused 127.0.0.1:18789",
+            "econnrefused 127.0.0.1:18789",
+        ],
+    )
+}
+
+fn openclaw_gateway_unreachable_from_acp_error(err: &AcpError) -> bool {
+    match err {
+        AcpError::StartupCrash { stderr, .. } => contains_openclaw_gateway_unreachable_signature(stderr),
+        AcpError::AgentInternal { message, data, .. } => acp_agent_internal_texts(message, data.as_ref())
+            .into_iter()
+            .any(contains_openclaw_gateway_unreachable_signature),
+        AcpError::InitTimeout { .. } => contains_openclaw_gateway_unreachable_signature(&err.to_string()),
+        _ => false,
+    }
+}
+
+fn openclaw_gateway_unreachable_send_error() -> AgentSendError {
+    AgentSendError::new(
+        OPENCLAW_GATEWAY_MESSAGE,
+        AgentErrorCode::UserAgentOpenClawGatewayUnreachable,
+        AgentErrorOwnership::UserAgent,
+        Some(OPENCLAW_GATEWAY_DETAIL.to_owned()),
+        true,
+        false,
+        resolution(
+            AgentErrorResolutionKind::CheckAgentInstallation,
+            Some(AgentErrorResolutionTarget::AgentSettings),
+        ),
+    )
+}
+
 pub(crate) fn sanitize_error_detail(input: &str) -> String {
     let stripped = strip_markup(input);
     let without_query = redact_url_queries(&stripped);
@@ -1007,6 +1079,99 @@ mod tests {
             err.stream_error().resolution.and_then(|value| value.target),
             Some(target)
         );
+    }
+
+    #[test]
+    fn classifies_openclaw_gateway_unreachable_from_startup_stderr_with_backend_context() {
+        let err = AgentError::from(AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789".into(),
+        });
+
+        let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, Some("openclaw"));
+
+        assert_eq!(
+            send_error.code(),
+            Some(AgentErrorCode::UserAgentOpenClawGatewayUnreachable)
+        );
+        assert_eq!(send_error.ownership(), Some(AgentErrorOwnership::UserAgent));
+        assert_eq!(send_error.stream_error().retryable, Some(true));
+        assert_eq!(send_error.stream_error().feedback_recommended, Some(false));
+        assert_eq!(
+            send_error.stream_error().resolution.map(|value| value.kind),
+            Some(AgentErrorResolutionKind::CheckAgentInstallation)
+        );
+        assert!(
+            send_error
+                .stream_error()
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("openclaw gateway start")
+        );
+    }
+
+    #[test]
+    fn keeps_openclaw_generic_startup_crash_when_gateway_signature_is_absent() {
+        let err = AgentError::from(AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ordinary OpenClaw startup failure without gateway signature".into(),
+        });
+
+        let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, Some("openclaw"));
+
+        assert_ne!(
+            send_error.code(),
+            Some(AgentErrorCode::UserAgentOpenClawGatewayUnreachable)
+        );
+        assert_eq!(send_error.code(), Some(AgentErrorCode::UserAgentStartupFailed));
+    }
+
+    #[test]
+    fn does_not_classify_openclaw_gateway_signature_for_other_backends() {
+        let err = AgentError::from(AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789".into(),
+        });
+
+        let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, Some("codex"));
+
+        assert_ne!(
+            send_error.code(),
+            Some(AgentErrorCode::UserAgentOpenClawGatewayUnreachable)
+        );
+        assert_eq!(send_error.code(), Some(AgentErrorCode::UserAgentStartupFailed));
+    }
+
+    #[test]
+    fn does_not_classify_plain_init_timeout_as_openclaw_gateway_unreachable() {
+        let err = AgentError::from(AcpError::InitTimeout { timeout_secs: 30 });
+
+        let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, Some("openclaw"));
+
+        assert_ne!(
+            send_error.code(),
+            Some(AgentErrorCode::UserAgentOpenClawGatewayUnreachable)
+        );
+        assert_eq!(send_error.code(), Some(AgentErrorCode::UserAgentStartupFailed));
+    }
+
+    #[test]
+    fn classifies_openclaw_gateway_unreachable_from_bad_gateway_detail_only_with_backend_context() {
+        let detail = "Bad gateway: ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789";
+        let err = AgentError::bad_gateway(detail);
+
+        let openclaw = AgentSendError::from_agent_error_ref_for_backend(&err, Some("openclaw"));
+        let codex = AgentSendError::from_agent_error_ref_for_backend(&err, Some("codex"));
+
+        assert_eq!(
+            openclaw.code(),
+            Some(AgentErrorCode::UserAgentOpenClawGatewayUnreachable)
+        );
+        assert_ne!(codex.code(), Some(AgentErrorCode::UserAgentOpenClawGatewayUnreachable));
     }
 
     #[test]
