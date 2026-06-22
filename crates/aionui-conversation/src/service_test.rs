@@ -768,6 +768,19 @@ fn make_create_req() -> CreateConversationRequest {
     .unwrap()
 }
 
+fn make_create_req_with_backend(backend: &str) -> CreateConversationRequest {
+    let workspace = ensure_test_workspace_path();
+    serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace,
+            "custom_workspace": true,
+            "backend": backend
+        }
+    }))
+    .unwrap()
+}
+
 fn ensure_test_workspace_path() -> String {
     let workspace = std::env::temp_dir().join("aionui-conversation-service-test-project");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -1912,6 +1925,18 @@ impl FailingBuildTaskManager {
     }
 }
 
+struct AgentErrorFailingBuildTaskManager {
+    error: Mutex<Option<AgentError>>,
+}
+
+impl AgentErrorFailingBuildTaskManager {
+    fn new(error: AgentError) -> Self {
+        Self {
+            error: Mutex::new(Some(error)),
+        }
+    }
+}
+
 struct DelayedFailingBuildTaskManager {
     delay: Duration,
     error: String,
@@ -1923,6 +1948,48 @@ impl DelayedFailingBuildTaskManager {
             delay,
             error: error.into(),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for AgentErrorFailingBuildTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        None
+    }
+
+    async fn get_or_build_task(
+        &self,
+        _conversation_id: &str,
+        _options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        Err(self
+            .error
+            .lock()
+            .unwrap()
+            .take()
+            .expect("test build error should be consumed once"))
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        _conversation_id: &str,
+        _reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    async fn clear(&self) {}
+
+    fn active_count(&self) -> usize {
+        0
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        vec![]
     }
 }
 
@@ -3107,6 +3174,74 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
         .expect("agent build failure should broadcast the error tips message");
     assert_eq!(error_tip_event.data["status"], "error");
     assert_eq!(error_tip_event.data["data"]["code"], "BAD_GATEWAY");
+    assert_eq!(error_tip_event.data["turn_id"], response.turn_id);
+}
+
+#[tokio::test]
+async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_fails() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(AgentErrorFailingBuildTaskManager::new(AgentError::from(
+        AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789".into(),
+        },
+    )));
+
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("openclaw"))
+        .await
+        .unwrap();
+    broadcaster.take_events();
+
+    let response = svc
+        .send_message(
+            "user_1",
+            &conv.id,
+            SendMessageRequest {
+                content: "hello".into(),
+                hidden: false,
+                files: vec![],
+                inject_skills: vec![],
+            },
+            &task_mgr,
+        )
+        .await
+        .unwrap();
+
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let tip = messages
+        .iter()
+        .find(|row| row.r#type == "tips" && row.status.as_deref() == Some("error"))
+        .expect("send failure tip should be persisted");
+    let content: serde_json::Value = serde_json::from_str(&tip.content).unwrap();
+
+    assert_eq!(content["source"], "send_failed");
+    assert_eq!(content["error"]["code"], "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE");
+    assert_eq!(content["error"]["ownership"], "user_agent");
+    assert!(
+        content["error"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("openclaw gateway start")
+    );
+
+    let events = broadcaster.take_events();
+    let error_tip_event = events
+        .iter()
+        .find(|event| event.name == "message.stream" && event.data["type"] == "tips")
+        .expect("OpenClaw Gateway build failure should broadcast the error tips message");
+    assert_eq!(error_tip_event.data["status"], "error");
+    assert_eq!(
+        error_tip_event.data["data"]["code"],
+        "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE"
+    );
+    assert_eq!(
+        error_tip_event.data["data"]["error"]["code"],
+        "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE"
+    );
     assert_eq!(error_tip_event.data["turn_id"], response.turn_id);
 }
 
