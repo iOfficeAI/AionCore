@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.36](https://github.com/iOfficeAI/AionCore/compare/v0.1.35...v0.1.36) (2026-06-23)
+
+
+### Bug Fixes
+
+* **deps:** update quinn-proto for RustSec advisory ([#508](https://github.com/iOfficeAI/AionCore/issues/508)) ([05df6f7](https://github.com/iOfficeAI/AionCore/commit/05df6f7c2d924b94d1514bcee4ff835ea0e0b0fb))
+* load skills in custom workspaces ([#506](https://github.com/iOfficeAI/AionCore/issues/506)) ([d73c398](https://github.com/iOfficeAI/AionCore/commit/d73c39855c1863e0606aedcb6c4ef8ebffeec8cc))
+
 ## [0.1.35](https://github.com/iOfficeAI/AionCore/compare/v0.1.34...v0.1.35) (2026-06-22)
 
 
