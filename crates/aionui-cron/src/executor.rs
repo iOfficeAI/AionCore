@@ -1011,7 +1011,6 @@ async fn inject_agent_identity(
         if let Some(backend) = meta.backend {
             extra.insert("backend".to_owned(), serde_json::Value::String(backend));
         }
-        return;
     }
 }
 
