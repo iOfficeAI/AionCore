@@ -7,6 +7,13 @@ use std::sync::Arc;
 
 pub use aionui_extension::ResolvedAgentSkill;
 use async_trait::async_trait;
+use tracing::warn;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedAgentSkill {
+    pub name: String,
+    pub body: String,
+}
 
 #[async_trait]
 pub trait SkillResolver: Send + Sync {
@@ -17,6 +24,13 @@ pub trait SkillResolver: Send + Sync {
     /// Resolve each skill name to its on-disk source directory, using the
     /// same search order as `materialize_skills_for_agent`.
     async fn resolve_skills(&self, names: &[String]) -> Vec<ResolvedAgentSkill>;
+
+    /// Load full skill bodies for prompt-protocol agents that request
+    /// `[LOAD_SKILL: name]` in their response.
+    async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
+        let resolved = self.resolve_skills(names).await;
+        load_resolved_skill_bodies(&resolved).await
+    }
 
     /// Create symlinks pointing at each resolved skill inside the given
     /// workspace's per-backend native skills directories. `rel_dirs` is
@@ -33,6 +47,54 @@ pub struct ExtensionSkillResolver {
 impl ExtensionSkillResolver {
     pub fn new(paths: Arc<aionui_extension::SkillPaths>) -> Self {
         Self { paths }
+    }
+}
+
+async fn load_resolved_skill_bodies(skills: &[ResolvedAgentSkill]) -> Vec<LoadedAgentSkill> {
+    let mut loaded = Vec::new();
+    for skill in skills {
+        let skill_file = skill.source_path.join("SKILL.md");
+        match tokio::fs::read_to_string(&skill_file).await {
+            Ok(content) => loaded.push(LoadedAgentSkill {
+                name: skill.name.clone(),
+                body: extract_skill_body(&content),
+            }),
+            Err(e) => {
+                warn!(
+                    skill = %skill.name,
+                    path = %skill_file.display(),
+                    error = %e,
+                    "Failed to read requested skill body"
+                );
+            }
+        }
+    }
+    loaded
+}
+
+fn extract_skill_body(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return content.to_string();
+    }
+
+    let after_open = &trimmed[3..];
+    if let Some(close_idx) = after_open.find("---") {
+        let after_close = &after_open[close_idx + 3..];
+        after_close.trim_start_matches('\n').to_string()
+    } else {
+        content.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_skill_body_removes_frontmatter() {
+        let content = "---\nname: cron\ndescription: Cron\n---\nCron body";
+        assert_eq!(extract_skill_body(content), "Cron body");
     }
 }
 

@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use regex::Regex;
 use tracing::{debug, warn};
 
+use crate::skill_resolver::LoadedAgentSkill;
+
 // ---------------------------------------------------------------------------
 // Think-tag cleaning
 // ---------------------------------------------------------------------------
@@ -38,6 +40,10 @@ static CRON_LIST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[CRON_LIST
 /// Regex for `[CRON_DELETE: <id>]`.
 static CRON_DELETE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[CRON_DELETE:\s*([^\]]+)\]").expect("valid cron-delete regex"));
+
+/// Regex for `[LOAD_SKILL: <name>]` requests emitted by prompt-protocol agents.
+static LOAD_SKILL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\[LOAD_SKILL:\s*([^\]]+)\]").expect("valid load-skill regex"));
 
 /// A parsed cron command extracted from agent text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +124,24 @@ pub fn strip_cron_commands(text: &str) -> String {
     let result = CRON_LIST_RE.replace_all(&result, "");
     let result = CRON_DELETE_RE.replace_all(&result, "");
     result.into_owned()
+}
+
+pub fn detect_skill_load_requests(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for cap in LOAD_SKILL_RE.captures_iter(text) {
+        let Some(name) = cap.get(1).map(|m| m.as_str().trim()) else {
+            continue;
+        };
+        if name.is_empty() || names.iter().any(|existing| existing == name) {
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    names
+}
+
+pub fn has_skill_load_requests(text: &str) -> bool {
+    LOAD_SKILL_RE.is_match(text)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +244,11 @@ pub trait ICronService: Send + Sync {
     async fn delete_job(&self, user_id: &str, job_id: &str) -> CronCommandResult;
 }
 
+#[async_trait]
+pub trait ISkillLoadService: Send + Sync {
+    async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill>;
+}
+
 // ---------------------------------------------------------------------------
 // MessageMiddleware
 // ---------------------------------------------------------------------------
@@ -243,6 +272,7 @@ pub struct MiddlewareResult {
 /// 3. Return cleaned message + any system responses
 pub struct MessageMiddleware {
     cron_service: Option<Box<dyn ICronService>>,
+    skill_loader: Option<Box<dyn ISkillLoadService>>,
 }
 
 impl MessageMiddleware {
@@ -251,7 +281,20 @@ impl MessageMiddleware {
     /// When `cron_service` is `None`, cron commands are still detected and
     /// stripped, but not executed (system responses will indicate unavailability).
     pub fn new(cron_service: Option<Box<dyn ICronService>>) -> Self {
-        Self { cron_service }
+        Self {
+            cron_service,
+            skill_loader: None,
+        }
+    }
+
+    pub fn new_with_skill_loader(
+        cron_service: Option<Box<dyn ICronService>>,
+        skill_loader: Option<Box<dyn ISkillLoadService>>,
+    ) -> Self {
+        Self {
+            cron_service,
+            skill_loader,
+        }
     }
 
     /// Process a completed agent message through the middleware pipeline.
@@ -259,8 +302,9 @@ impl MessageMiddleware {
         // Step 1: Strip think tags
         let cleaned = strip_think_tags(message);
 
-        // Step 2: Detect cron commands
-        if !has_cron_commands(&cleaned) {
+        let has_cron = has_cron_commands(&cleaned);
+        let has_skill_load = has_skill_load_requests(&cleaned);
+        if !has_cron && !has_skill_load {
             return MiddlewareResult {
                 message: cleaned,
                 display_message: None,
@@ -269,16 +313,50 @@ impl MessageMiddleware {
         }
 
         let commands = detect_cron_commands(&cleaned);
-        let display_message = strip_cron_commands(&cleaned);
+        let skill_names = detect_skill_load_requests(&cleaned);
+        let display_message = if has_cron {
+            strip_cron_commands(&cleaned)
+        } else {
+            cleaned.clone()
+        };
 
-        // Step 3: Execute cron commands
-        let system_responses = self.execute_cron_commands(user_id, conversation_id, &commands).await;
+        let mut system_responses = if commands.is_empty() {
+            Vec::new()
+        } else {
+            self.execute_cron_commands(user_id, conversation_id, &commands).await
+        };
+        system_responses.extend(self.load_requested_skills(&skill_names).await);
 
         MiddlewareResult {
             message: display_message.clone(),
-            display_message: Some(display_message),
+            display_message: has_cron.then_some(display_message),
             system_responses,
         }
+    }
+
+    async fn load_requested_skills(&self, names: &[String]) -> Vec<String> {
+        if names.is_empty() {
+            return Vec::new();
+        }
+
+        let Some(skill_loader) = &self.skill_loader else {
+            debug!(
+                count = names.len(),
+                "Skill load requests detected but no skill loader configured"
+            );
+            return Vec::new();
+        };
+
+        let loaded = skill_loader.load_skill_bodies(names).await;
+        if loaded.is_empty() {
+            return Vec::new();
+        }
+
+        let mut responses = Vec::new();
+        for skill in loaded {
+            responses.push(format!("[Skill: {}]\n{}", skill.name, skill.body));
+        }
+        responses
     }
 
     /// Execute a list of cron commands via the injected service.
@@ -475,6 +553,12 @@ mod tests {
         assert!(!has_cron_commands("[CRON_SOMETHING_ELSE]"));
     }
 
+    #[test]
+    fn detect_skill_load_requests_is_case_insensitive_and_dedupes() {
+        let requests = detect_skill_load_requests("[load_skill: cron] [LOAD_SKILL: cron] [LOAD_SKILL: pdf]");
+        assert_eq!(requests, vec!["cron", "pdf"]);
+    }
+
     // -----------------------------------------------------------------------
     // strip_cron_commands
     // -----------------------------------------------------------------------
@@ -603,6 +687,22 @@ mod tests {
         }
     }
 
+    struct MockSkillLoader;
+
+    #[async_trait]
+    impl ISkillLoadService for MockSkillLoader {
+        async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
+            names
+                .iter()
+                .filter(|name| name.as_str() == "cron")
+                .map(|name| LoadedAgentSkill {
+                    name: name.clone(),
+                    body: "Cron skill body".into(),
+                })
+                .collect()
+        }
+    }
+
     #[tokio::test]
     async fn middleware_strips_think_tags() {
         let mw = MessageMiddleware::new(None);
@@ -623,6 +723,19 @@ mod tests {
         assert!(result.display_message.is_some());
         assert_eq!(result.system_responses.len(), 1);
         assert!(result.system_responses[0].contains("Created cron job"));
+    }
+
+    #[tokio::test]
+    async fn middleware_loads_requested_skill_as_system_response() {
+        let mw = MessageMiddleware::new_with_skill_loader(None, Some(Box::new(MockSkillLoader)));
+        let input = "I'll use [LOAD_SKILL: cron] for this.";
+
+        let result = mw.process(input, "user1", "conv1").await;
+
+        assert_eq!(result.message, input);
+        assert!(result.display_message.is_none());
+        assert_eq!(result.system_responses.len(), 1);
+        assert_eq!(result.system_responses[0], "[Skill: cron]\nCron skill body");
     }
 
     #[tokio::test]

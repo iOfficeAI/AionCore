@@ -568,9 +568,8 @@ impl ConversationService {
 
         // Determine whether the user chose this workspace ("custom") or we
         // auto-provision one under `{data_dir}/conversations/{label}-temp-{id}/`.
-        // `is_custom_workspace` is the authoritative signal consumed later to
-        // decide whether we should wire skill symlinks (temp workspaces only
-        // — user-chosen paths must not be mutated).
+        // Skill wiring runs for both kinds so native CLI discovery behaves
+        // consistently.
         let user_supplied_workspace = match extra
             .get("workspace")
             .and_then(|v| v.as_str())
@@ -579,7 +578,6 @@ impl ConversationService {
             Some(workspace) => Some(normalize_workspace_path(workspace)?),
             None => None,
         };
-        let is_custom_workspace = user_supplied_workspace.is_some();
         if let Some(workspace) = user_supplied_workspace.as_ref() {
             extra["workspace"] = serde_json::Value::String(workspace.clone());
         }
@@ -710,12 +708,14 @@ impl ConversationService {
         let auto_inject_names = self.skill_resolver.auto_inject_names().await;
         let initial_skills = compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject);
 
-        // Wire skill symlinks into the auto-provisioned workspace so the
-        // agent CLI picks them up via its native skills dir (e.g.
-        // `.claude/skills/`). Runs only for temp workspaces — a user-chosen
-        // path must not be mutated.
-        if let Some(ws_path) = auto_provisioned_workspace.as_ref()
-            && !is_custom_workspace
+        // Wire skill links into the runtime workspace so the agent CLI picks
+        // them up via its native skills dir (e.g. `.claude/skills/`). This
+        // applies to both temp and user-selected workspaces.
+        let skill_link_workspace = user_supplied_workspace
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| auto_provisioned_workspace.clone());
+        if let Some(ws_path) = skill_link_workspace.as_ref()
             && !initial_skills.is_empty()
             && let Some(rel_dirs) =
                 native_skills_dirs(&self.agent_metadata_repo, &req.r#type, extra.get("backend")).await
@@ -2265,7 +2265,7 @@ impl ConversationService {
                 return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
         };
-        self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
+        self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
         let user_msg_id_ret = user_msg_id.clone();
@@ -2351,7 +2351,7 @@ impl ConversationService {
             }
         };
 
-        self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
+        self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let conversation_id = request.conversation_id.clone();
         let result = ConversationTurnOrchestrator::new(self.clone(), self.task_manager.clone())
@@ -2544,7 +2544,7 @@ impl ConversationService {
         reject_deprecated_runtime_row(&row)?;
 
         let build_opts = self.build_task_options(&row).await?;
-        self.ensure_auto_workspace_skill_links(&row, &build_opts).await;
+        self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let backend = build_options_backend(&build_opts).map(str::to_owned);
         let agent = match task_manager.get_or_build_task(conversation_id, build_opts).await {
@@ -2626,22 +2626,25 @@ impl ConversationService {
             .await
     }
 
-    pub(crate) async fn ensure_auto_workspace_skill_links(&self, row: &ConversationRow, build_opts: &BuildTaskOptions) {
+    /// Ensure native skill links exist in the runtime workspace. Auto
+    /// workspaces are constrained to AionUi's generated path; custom
+    /// workspaces were validated when the session context was built.
+    pub(crate) async fn ensure_workspace_skill_links(&self, row: &ConversationRow, build_opts: &BuildTaskOptions) {
         let context = &build_opts.context;
-        if context.workspace.is_custom {
-            return;
-        }
         let backend = context_backend_value(context);
-        let expected_workspace = expected_auto_workspace_path(
-            &self.workspace_root,
-            &row.id,
-            &context.conversation.agent_type,
-            backend.as_ref(),
-        );
 
         let workspace = PathBuf::from(context.workspace.path.trim());
-        if workspace != expected_workspace {
-            return;
+        if !context.workspace.is_custom {
+            let expected_workspace = expected_auto_workspace_path(
+                &self.workspace_root,
+                &row.id,
+                &context.conversation.agent_type,
+                backend.as_ref(),
+            );
+
+            if workspace != expected_workspace {
+                return;
+            }
         }
 
         let skill_names = context_skill_names(context);
@@ -2751,6 +2754,10 @@ impl ConversationService {
             Ok(guard) => guard.as_ref().map(Arc::clone),
             Err(_) => None,
         }
+    }
+
+    pub(crate) fn skill_resolver(&self) -> Arc<dyn SkillResolver> {
+        Arc::clone(&self.skill_resolver)
     }
 
     /// Backfill `extra.skills` if the row predates the snapshot model.

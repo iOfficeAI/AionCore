@@ -24,7 +24,6 @@ impl PreSendHook for SessionNewPreludeHook {
         let config = InjectionConfig {
             preset_context: ctx.params.preset_context.as_deref(),
             skills: &ctx.params.config.skills,
-            custom_workspace: ctx.params.workspace.is_custom,
             native_skill_support: metadata
                 .native_skills_dirs
                 .as_ref()

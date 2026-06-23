@@ -66,6 +66,7 @@ impl ConversationTurnOrchestrator {
         let build_started_at = now_ms();
         let persistence = self.service.runtime_persistence();
         let runtime_state = self.service.runtime_state();
+        let allowed_skill_names = input.build_options.context.skills.clone();
         let mut turn_failed = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
@@ -170,6 +171,8 @@ impl ConversationTurnOrchestrator {
                 self.service.broadcaster().clone(),
                 self.service.current_cron_service(),
             )
+            .with_skill_resolver(self.service.skill_resolver())
+            .with_allowed_skill_names(allowed_skill_names.clone())
             .with_runtime_state(Arc::clone(&runtime_state))
             .with_persistence(persistence.clone())
             .with_turn_completion(false);
