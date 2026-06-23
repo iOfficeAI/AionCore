@@ -984,47 +984,24 @@ async fn parse_agent_type(registry: &AgentRegistry, agent_type_str: &str) -> Res
 /// `CreateConversationRequest.model` stay `None` for those types, which is the
 /// correct semantic.
 ///
-/// For aionrs, `agent_config.backend` holds the provider_id (a DB hash, not a
-/// vendor label). `CronService::add_job`/`update_job` already rejects aionrs
-/// jobs lacking this field, so the `None` return here is defensive for any
-/// legacy in-memory row that somehow slipped through.
 fn resolve_model(job: &CronJob) -> Option<ProviderWithModel> {
     if job.agent_type != "aionrs" {
         return None;
     }
-    let config = job.agent_config.as_ref()?;
-    if config.backend.trim().is_empty() {
-        return None;
-    }
-    Some(ProviderWithModel {
-        provider_id: config.backend.clone(),
-        model: config.model_id.clone().unwrap_or_else(|| "default".to_owned()),
-        use_model: None,
-    })
+    job.agent_config.as_ref()?.model.clone()
 }
 
 /// Fill `extra` with the agent identity the factory should use.
 ///
 /// Preferred path: resolve a builtin ACP catalog row via the
 /// registry and emit `agent_id` (exact factory lookup) alongside
-/// `backend` (convenience for other consumers). Legacy path: when
-/// `agent_config.backend` names something that isn't a builtin ACP
-/// vendor (e.g. the bare string `"acp"` that old rows still carry),
-/// pass it through unchanged so the factory's agent-type branch can
-/// handle it. Same treatment for `agent_type` when there is no
-/// `agent_config` but the stored type matches a vendor label.
+/// `backend` (convenience for other consumers).
 async fn inject_agent_identity(
     extra: &mut serde_json::Map<String, serde_json::Value>,
     registry: &AgentRegistry,
     job: &CronJob,
 ) {
-    let config_backend = job
-        .agent_config
-        .as_ref()
-        .map(|c| c.backend.trim())
-        .filter(|s| !s.is_empty());
-
-    let lookup_label = config_backend.unwrap_or_else(|| job.agent_type.trim());
+    let lookup_label = job.agent_type.trim();
     if lookup_label.is_empty() {
         return;
     }
@@ -1035,12 +1012,6 @@ async fn inject_agent_identity(
             extra.insert("backend".to_owned(), serde_json::Value::String(backend));
         }
         return;
-    }
-
-    // No catalog hit — fall through to the legacy raw-label emission
-    // so existing rows keep working.
-    if let Some(backend) = config_backend {
-        extra.insert("backend".to_owned(), serde_json::Value::String(backend.to_owned()));
     }
 }
 
@@ -1202,16 +1173,11 @@ fn schedule_description_text(schedule: &crate::types::CronSchedule) -> String {
 fn default_temp_workspace_path(
     data_dir: &std::path::Path,
     agent_type: &AgentType,
-    job: &CronJob,
+    _job: &CronJob,
     conversation_id: &str,
 ) -> std::path::PathBuf {
     let label = if *agent_type == AgentType::Acp {
-        job.agent_config
-            .as_ref()
-            .map(|config| config.backend.trim())
-            .filter(|backend| !backend.is_empty())
-            .unwrap_or("acp")
-            .to_owned()
+        "acp".to_owned()
     } else {
         agent_type.serde_name().to_owned()
     };
@@ -1287,7 +1253,6 @@ mod tests {
             message: "do something".into(),
             execution_mode: ExecutionMode::Existing,
             agent_config: Some(CronAgentConfig {
-                backend: "acp".into(),
                 name: "Claude".into(),
                 cli_path: Some("/usr/bin/claude".into()),
                 is_preset: None,
@@ -1296,6 +1261,7 @@ mod tests {
                 preset_agent_type: None,
                 mode: None,
                 model_id: Some("claude-sonnet-4".into()),
+                model: None,
                 config_options: None,
                 workspace: Some(ensure_named_workspace_path("aionui-cron-sample-job-workspace")),
             }),
@@ -1574,7 +1540,6 @@ mod tests {
         let job = CronJob {
             agent_type: "aionrs".into(),
             agent_config: Some(CronAgentConfig {
-                backend: "4056cdea".into(),
                 name: "OpenAI".into(),
                 cli_path: None,
                 is_preset: None,
@@ -1583,6 +1548,11 @@ mod tests {
                 preset_agent_type: None,
                 mode: None,
                 model_id: Some("gpt-5".into()),
+                model: Some(ProviderWithModel {
+                    provider_id: "4056cdea".into(),
+                    model: "gpt-5".into(),
+                    use_model: None,
+                }),
                 config_options: None,
                 workspace: None,
             }),
@@ -1594,11 +1564,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_aionrs_without_model_id_defaults_to_default() {
+    fn resolve_model_aionrs_uses_model_payload() {
         let job = CronJob {
             agent_type: "aionrs".into(),
             agent_config: Some(CronAgentConfig {
-                backend: "4056cdea".into(),
                 name: "OpenAI".into(),
                 cli_path: None,
                 is_preset: None,
@@ -1607,14 +1576,19 @@ mod tests {
                 preset_agent_type: None,
                 mode: None,
                 model_id: None,
+                model: Some(ProviderWithModel {
+                    provider_id: "4056cdea".into(),
+                    model: "gpt-5".into(),
+                    use_model: Some("gpt-5".into()),
+                }),
                 config_options: None,
                 workspace: None,
             }),
             ..sample_job()
         };
-        let model = resolve_model(&job).expect("aionrs without model_id still returns Some");
+        let model = resolve_model(&job).expect("aionrs model payload returns Some");
         assert_eq!(model.provider_id, "4056cdea");
-        assert_eq!(model.model, "default");
+        assert_eq!(model.model, "gpt-5");
     }
 
     #[test]
@@ -1630,11 +1604,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_aionrs_with_empty_backend_returns_none() {
+    fn resolve_model_aionrs_without_model_returns_none() {
         let job = CronJob {
             agent_type: "aionrs".into(),
             agent_config: Some(CronAgentConfig {
-                backend: "   ".into(),
                 name: "Bogus".into(),
                 cli_path: None,
                 is_preset: None,
@@ -1643,6 +1616,7 @@ mod tests {
                 preset_agent_type: None,
                 mode: None,
                 model_id: Some("gpt-5".into()),
+                model: None,
                 config_options: None,
                 workspace: None,
             }),
@@ -1666,7 +1640,6 @@ mod tests {
         let registry = hydrated_registry().await;
         let job = sample_job();
         let extra = build_task_extra(&registry, &job, &["cron-cron_test1".into()]).await;
-        assert_eq!(extra["backend"], "acp");
         assert_eq!(extra["cli_path"], "/usr/bin/claude");
         assert_eq!(extra["agent_name"], "Claude");
         assert_eq!(extra["assistant_id"], "assistant-sample");

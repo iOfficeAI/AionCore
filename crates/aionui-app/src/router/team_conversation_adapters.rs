@@ -234,7 +234,7 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
         if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(conversation_id).await? {
-            let assistant_id = snapshot.assistant_key.trim();
+            let assistant_id = snapshot.assistant_id.trim();
             if !assistant_id.is_empty() {
                 return Ok(Some(assistant_id.to_owned()));
             }

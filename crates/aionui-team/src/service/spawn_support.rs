@@ -84,13 +84,13 @@ impl TeamSessionService {
         fallback_backend: &str,
         fallback_model: &str,
     ) -> Result<(String, String), TeamError> {
-        if let Some(assistant_key) = assistant_id.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(assistant_id) = assistant_id.map(str::trim).filter(|value| !value.is_empty()) {
             let definition = self
                 .assistant_definition_repo
-                .get_by_key(assistant_key)
+                .get_by_assistant_id(assistant_id)
                 .await?
-                .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_key}")))?;
-            let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+                .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_id}")))?;
+            let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
             let effective_agent_id = overlay
                 .as_ref()
                 .and_then(|row| row.agent_id_override.as_deref())
@@ -164,8 +164,10 @@ impl TeamSessionService {
             return Vec::new();
         };
 
-        let overlay_by_definition: HashMap<&str, &AssistantOverlayRow> =
-            overlays.iter().map(|row| (row.definition_id.as_str(), row)).collect();
+        let overlay_by_definition: HashMap<&str, &AssistantOverlayRow> = overlays
+            .iter()
+            .map(|row| (row.assistant_definition_id.as_str(), row))
+            .collect();
 
         let mut assistants: Vec<(i32, AvailableAssistant)> = Vec::new();
 
@@ -176,7 +178,7 @@ impl TeamSessionService {
             }) else {
                 continue;
             };
-            let overlay = overlay_by_definition.get(definition.definition_id.as_str()).copied();
+            let overlay = overlay_by_definition.get(definition.id.as_str()).copied();
             let enabled = overlay.is_none_or(|row| row.enabled);
             if !enabled {
                 continue;
@@ -220,7 +222,7 @@ impl TeamSessionService {
             assistants.push((
                 overlay.map(|row| row.sort_order).unwrap_or(i32::MAX),
                 AvailableAssistant {
-                    assistant_id: definition.assistant_key.clone(),
+                    assistant_id: definition.assistant_id.clone(),
                     name: definition.name.clone(),
                     backend: effective_backend.to_owned(),
                     description: definition.description.clone().unwrap_or_default(),
@@ -251,13 +253,13 @@ impl TeamSessionService {
             return Ok(crate::mcp::tools::handle_team_list_models(&serde_json::Value::Null));
         };
         let backend_filter = match assistant_id_filter.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(assistant_key) => {
+            Some(assistant_id) => {
                 let definition = self
                     .assistant_definition_repo
-                    .get_by_key(assistant_key)
+                    .get_by_assistant_id(assistant_id)
                     .await?
-                    .ok_or_else(|| TeamError::InvalidRequest(format!("Assistant not found: {assistant_key}")))?;
-                let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+                    .ok_or_else(|| TeamError::InvalidRequest(format!("Assistant not found: {assistant_id}")))?;
+                let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
                 Some(
                     resolve_runtime_backend(
                         &self.agent_metadata_repo,
@@ -383,12 +385,12 @@ mod tests {
             Ok(vec![self.row.clone()])
         }
 
-        async fn get_by_key(&self, assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
-            Ok((self.row.assistant_key == assistant_key).then_some(self.row.clone()))
+        async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok((self.row.assistant_id == assistant_id).then_some(self.row.clone()))
         }
 
-        async fn get_by_definition_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
-            Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+        async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok((self.row.id == definition_id).then_some(self.row.clone()))
         }
 
         async fn get_by_source_ref(
@@ -419,7 +421,7 @@ mod tests {
     #[async_trait::async_trait]
     impl IAssistantOverlayRepository for SingleAssistantOverlayRepo {
         async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
-            Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+            Ok((self.row.assistant_definition_id == definition_id).then_some(self.row.clone()))
         }
 
         async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
@@ -558,8 +560,8 @@ mod tests {
             svc.agent_metadata_repo.clone(),
             Arc::new(SingleAssistantDefinitionRepo {
                 row: AssistantDefinitionRow {
-                    definition_id: "def-1".into(),
-                    assistant_key: "word-creator".into(),
+                    id: "def-1".into(),
+                    assistant_id: "word-creator".into(),
                     source: "builtin".into(),
                     owner_type: "system".into(),
                     source_ref: Some("word-creator".into()),
@@ -594,7 +596,7 @@ mod tests {
             }),
             Arc::new(SingleAssistantOverlayRepo {
                 row: AssistantOverlayRow {
-                    definition_id: "def-1".into(),
+                    assistant_definition_id: "def-1".into(),
                     enabled: true,
                     sort_order: 0,
                     agent_id_override: None,

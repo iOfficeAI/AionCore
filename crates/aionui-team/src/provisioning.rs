@@ -287,14 +287,14 @@ impl TeamAgentProvisioner {
         requested_backend: Option<&str>,
         assistant_id: Option<&str>,
     ) -> Result<String, TeamError> {
-        let assistant_key = assistant_id.map(str::trim).filter(|value| !value.is_empty());
-        if let Some(assistant_key) = assistant_key {
+        let assistant_id = assistant_id.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(assistant_id) = assistant_id {
             let definition = self
                 .assistant_definition_repo
-                .get_by_key(assistant_key)
+                .get_by_assistant_id(assistant_id)
                 .await?
-                .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_key}")))?;
-            let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+                .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_id}")))?;
+            let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
             let effective_agent_id = overlay
                 .and_then(|row| row.agent_id_override)
                 .filter(|value| !value.trim().is_empty())

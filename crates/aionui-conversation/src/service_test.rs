@@ -334,7 +334,7 @@ impl IConversationRepository for MockRepo {
         let row = ConversationAssistantSnapshotRow {
             conversation_id: params.conversation_id.to_owned(),
             assistant_definition_id: params.assistant_definition_id.to_owned(),
-            assistant_key: params.assistant_key.to_owned(),
+            assistant_id: params.assistant_id.to_owned(),
             assistant_source: params.assistant_source.to_owned(),
             assistant_name: params.assistant_name.to_owned(),
             assistant_avatar_type: params.assistant_avatar_type.to_owned(),
@@ -947,20 +947,20 @@ fn ensure_test_workspace_path() -> String {
 async fn upsert_test_assistant_definition(
     repo: &SqliteAssistantDefinitionRepository,
     definition_id: &str,
-    assistant_key: &str,
+    assistant_id: &str,
     agent_id: &str,
     default_model_mode: &str,
     default_permission_mode: &str,
 ) {
     repo.upsert(&UpsertAssistantDefinitionParams {
-        definition_id,
-        assistant_key,
+        id: definition_id,
+        assistant_id,
         source: "builtin",
         owner_type: "system",
-        source_ref: Some(assistant_key),
+        source_ref: Some(assistant_id),
         source_version: None,
         source_hash: None,
-        name: assistant_key,
+        name: assistant_id,
         name_i18n: "{}",
         description: Some("desc"),
         description_i18n: "{}",
@@ -968,7 +968,7 @@ async fn upsert_test_assistant_definition(
         avatar_value: Some("🤖"),
         agent_id,
         rule_resource_type: "builtin_asset",
-        rule_resource_ref: Some(assistant_key),
+        rule_resource_ref: Some(assistant_id),
         rule_inline_content: None,
         recommended_prompts: "[]",
         recommended_prompts_i18n: "{}",
@@ -1228,7 +1228,7 @@ async fn create_derives_aionrs_type_from_assistant_backend_when_type_is_missing(
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_aionrs_missing_type",
+            assistant_definition_id: "asstdef_aionrs_missing_type",
             enabled: true,
             sort_order: 0,
             agent_id_override: None,
@@ -1279,7 +1279,7 @@ async fn create_derives_acp_type_from_assistant_backend_when_type_is_missing() {
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_acp_missing_type",
+            assistant_definition_id: "asstdef_acp_missing_type",
             enabled: true,
             sort_order: 0,
             agent_id_override: None,
@@ -2867,7 +2867,7 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_acp_auto",
+            assistant_definition_id: "asstdef_acp_auto",
             enabled: true,
             sort_order: 0,
             agent_id_override: None,
@@ -2877,7 +2877,7 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_acp_auto",
+            assistant_definition_id: "asstdef_acp_auto",
             last_model_id: Some("legacy-acp-model"),
             last_permission_value: Some("legacy-mode"),
             last_skill_ids: "[]",
@@ -2957,7 +2957,7 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_acp_fixed",
+            assistant_definition_id: "asstdef_acp_fixed",
             enabled: true,
             sort_order: 0,
             agent_id_override: None,
@@ -2967,7 +2967,7 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_acp_fixed",
+            assistant_definition_id: "asstdef_acp_fixed",
             last_model_id: Some("legacy-fixed-model"),
             last_permission_value: Some("legacy-fixed-mode"),
             last_skill_ids: "[]",
@@ -3027,7 +3027,7 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_acp_ack",
+            assistant_definition_id: "asstdef_acp_ack",
             enabled: true,
             sort_order: 0,
             agent_id_override: None,
@@ -3037,7 +3037,7 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_acp_ack",
+            assistant_definition_id: "asstdef_acp_ack",
             last_model_id: Some("legacy-ack-model"),
             last_permission_value: Some("legacy-ack-mode"),
             last_skill_ids: "[]",
@@ -3090,7 +3090,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_aionrs_auto",
+            assistant_definition_id: "asstdef_aionrs_auto",
             enabled: true,
             sort_order: 0,
             agent_id_override: None,
@@ -3100,7 +3100,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_aionrs_auto",
+            assistant_definition_id: "asstdef_aionrs_auto",
             last_model_id: Some("legacy-aionrs-model"),
             last_permission_value: None,
             last_skill_ids: "[]",
@@ -3151,7 +3151,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_aionrs_fixed",
+            assistant_definition_id: "asstdef_aionrs_fixed",
             enabled: true,
             sort_order: 0,
             agent_id_override: None,
@@ -3161,7 +3161,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_aionrs_fixed",
+            assistant_definition_id: "asstdef_aionrs_fixed",
             last_model_id: Some("legacy-aionrs-fixed-model"),
             last_permission_value: None,
             last_skill_ids: "[]",
@@ -4698,8 +4698,8 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
-            definition_id: "asstdef_preset_1",
-            assistant_key: "preset-1",
+            id: "asstdef_preset_1",
+            assistant_id: "preset-1",
             source: "builtin",
             owner_type: "system",
             source_ref: Some("preset-1"),
@@ -4732,7 +4732,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
         .unwrap();
     state_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_preset_1",
+            assistant_definition_id: "asstdef_preset_1",
             enabled: true,
             sort_order: 0,
             agent_id_override: Some("codex"),
@@ -4742,7 +4742,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_preset_1",
+            assistant_definition_id: "asstdef_preset_1",
             last_model_id: Some("old-model"),
             last_permission_value: Some("workspace-write"),
             last_skill_ids: r#"["legacy-skill"]"#,
@@ -4796,7 +4796,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
 
     let snapshot = repo.get_assistant_snapshot(&resp.id).await.unwrap().unwrap();
     assert_eq!(snapshot.assistant_definition_id, "asstdef_preset_1");
-    assert_eq!(snapshot.assistant_key, "preset-1");
+    assert_eq!(snapshot.assistant_id, "preset-1");
     assert_eq!(snapshot.agent_id, "8e1acf31");
     assert_eq!(snapshot.rules_content, "assistant rule body");
     assert_eq!(snapshot.default_model_mode, "auto");
@@ -4860,8 +4860,8 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
-            definition_id: "asstdef_preset_legacy_seed",
-            assistant_key: "preset-1",
+            id: "asstdef_preset_legacy_seed",
+            assistant_id: "preset-1",
             source: "builtin",
             owner_type: "system",
             source_ref: Some("preset-1"),
@@ -4894,7 +4894,7 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
         .unwrap();
     state_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_preset_legacy_seed",
+            assistant_definition_id: "asstdef_preset_legacy_seed",
             enabled: true,
             sort_order: 0,
             agent_id_override: Some("codex"),
@@ -4904,7 +4904,7 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_preset_legacy_seed",
+            assistant_definition_id: "asstdef_preset_legacy_seed",
             last_model_id: Some("preferred-model"),
             last_permission_value: Some("workspace-write"),
             last_skill_ids: r#"["legacy-skill"]"#,
@@ -4966,7 +4966,7 @@ async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_snapshot_identity",
+            assistant_definition_id: "asstdef_snapshot_identity",
             enabled: true,
             sort_order: 0,
             agent_id_override: None,
@@ -5021,8 +5021,8 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
-            definition_id: "asstdef_preset_fixed",
-            assistant_key: "preset-fixed",
+            id: "asstdef_preset_fixed",
+            assistant_id: "preset-fixed",
             source: "builtin",
             owner_type: "system",
             source_ref: Some("preset-fixed"),
@@ -5055,7 +5055,7 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
         .unwrap();
     state_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_preset_fixed",
+            assistant_definition_id: "asstdef_preset_fixed",
             enabled: true,
             sort_order: 0,
             agent_id_override: Some("codex"),
@@ -5065,7 +5065,7 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_preset_fixed",
+            assistant_definition_id: "asstdef_preset_fixed",
             last_model_id: Some("legacy-model"),
             last_permission_value: Some("workspace-write"),
             last_skill_ids: r#"["legacy-skill"]"#,
@@ -5119,8 +5119,8 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
-            definition_id: "asstdef_preset_auto",
-            assistant_key: "preset-auto",
+            id: "asstdef_preset_auto",
+            assistant_id: "preset-auto",
             source: "builtin",
             owner_type: "system",
             source_ref: Some("preset-auto"),
@@ -5153,7 +5153,7 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
         .unwrap();
     state_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_preset_auto",
+            assistant_definition_id: "asstdef_preset_auto",
             enabled: true,
             sort_order: 0,
             agent_id_override: Some("codex"),
@@ -5163,7 +5163,7 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_preset_auto",
+            assistant_definition_id: "asstdef_preset_auto",
             last_model_id: None,
             last_permission_value: None,
             last_skill_ids: "[]",

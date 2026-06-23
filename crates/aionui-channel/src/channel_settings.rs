@@ -248,12 +248,12 @@ impl ChannelSettingsService {
             return Ok(None);
         };
 
-        let Some(definition) = definition_repo.get_by_key(assistant_id).await? else {
+        let Some(definition) = definition_repo.get_by_assistant_id(assistant_id).await? else {
             return Ok(None);
         };
 
         let agent_id = overlay_repo
-            .get(&definition.definition_id)
+            .get(&definition.id)
             .await?
             .and_then(|row| row.agent_id_override)
             .unwrap_or(definition.agent_id);
@@ -292,7 +292,7 @@ impl ChannelSettingsService {
             }
             let runtime_backend = self.runtime_backend_for_agent_id(&definition.agent_id).await?;
             if runtime_backend == legacy_backend {
-                return Ok(Some(definition.assistant_key));
+                return Ok(Some(definition.assistant_id));
             }
         }
 
@@ -363,7 +363,7 @@ impl ChannelSettingsService {
 
         for definition in definitions.iter().filter(|definition| definition.source == "generated") {
             if self.effective_assistant_backend(definition, &overlays).await? == DEFAULT_AGENT_TYPE {
-                return Ok(Some(definition.assistant_key.clone()));
+                return Ok(Some(definition.assistant_id.clone()));
             }
         }
 
@@ -375,7 +375,7 @@ impl ChannelSettingsService {
             }
         }
         if let Some(definition) = any_aionrs {
-            return Ok(Some(definition.assistant_key.clone()));
+            return Ok(Some(definition.assistant_id.clone()));
         }
 
         Ok(None)
@@ -388,7 +388,7 @@ impl ChannelSettingsService {
     ) -> Result<String, ChannelError> {
         let agent_id = overlays
             .iter()
-            .find(|overlay| overlay.definition_id == definition.definition_id)
+            .find(|overlay| overlay.assistant_definition_id == definition.id)
             .and_then(|overlay| overlay.agent_id_override.as_deref())
             .unwrap_or(definition.agent_id.as_str());
         self.runtime_backend_for_agent_id(agent_id).await
@@ -580,12 +580,12 @@ mod tests {
             Ok(self.rows.clone())
         }
 
-        async fn get_by_key(&self, assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
-            Ok(self.rows.iter().find(|row| row.assistant_key == assistant_key).cloned())
+        async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(self.rows.iter().find(|row| row.assistant_id == assistant_id).cloned())
         }
 
-        async fn get_by_definition_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
-            Ok(self.rows.iter().find(|row| row.definition_id == definition_id).cloned())
+        async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(self.rows.iter().find(|row| row.id == definition_id).cloned())
         }
 
         async fn get_by_source_ref(
@@ -619,7 +619,11 @@ mod tests {
     #[async_trait::async_trait]
     impl IAssistantOverlayRepository for MockAssistantOverlayRepo {
         async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
-            Ok(self.rows.iter().find(|row| row.definition_id == definition_id).cloned())
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.assistant_definition_id == definition_id)
+                .cloned())
         }
 
         async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
@@ -635,16 +639,16 @@ mod tests {
         }
     }
 
-    fn make_definition(assistant_key: &str, agent_id: &str) -> AssistantDefinitionRow {
+    fn make_definition(assistant_id: &str, agent_id: &str) -> AssistantDefinitionRow {
         AssistantDefinitionRow {
-            definition_id: format!("def-{assistant_key}"),
-            assistant_key: assistant_key.to_owned(),
+            id: format!("def-{assistant_id}"),
+            assistant_id: assistant_id.to_owned(),
             source: "generated".to_owned(),
             owner_type: "system".to_owned(),
-            source_ref: Some(assistant_key.to_owned()),
+            source_ref: Some(assistant_id.to_owned()),
             source_version: None,
             source_hash: None,
-            name: assistant_key.to_owned(),
+            name: assistant_id.to_owned(),
             name_i18n: "{}".to_owned(),
             description: None,
             description_i18n: "{}".to_owned(),
@@ -674,7 +678,7 @@ mod tests {
 
     fn make_overlay(definition_id: &str, agent_id_override: &str) -> AssistantOverlayRow {
         AssistantOverlayRow {
-            definition_id: definition_id.to_owned(),
+            assistant_definition_id: definition_id.to_owned(),
             enabled: true,
             sort_order: 0,
             agent_id_override: Some(agent_id_override.to_owned()),
@@ -828,7 +832,7 @@ mod tests {
             rows: vec![definition.clone()],
         });
         let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(MockAssistantOverlayRepo {
-            rows: vec![make_overlay(&definition.definition_id, "codex")],
+            rows: vec![make_overlay(&definition.id, "codex")],
         });
         let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
 

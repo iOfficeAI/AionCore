@@ -45,8 +45,8 @@ pub struct AssistantOverrideRow {
 /// Row mapping for the `assistant_definitions` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantDefinitionRow {
-    pub definition_id: String,
-    pub assistant_key: String,
+    pub id: String,
+    pub assistant_id: String,
     pub source: String,
     pub owner_type: String,
     pub source_ref: Option<String>,
@@ -82,7 +82,7 @@ pub struct AssistantDefinitionRow {
 /// Row mapping for the `assistant_overlays` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantOverlayRow {
-    pub definition_id: String,
+    pub assistant_definition_id: String,
     pub enabled: bool,
     pub sort_order: i32,
     pub agent_id_override: Option<String>,
@@ -94,7 +94,7 @@ pub struct AssistantOverlayRow {
 /// Row mapping for the `assistant_preferences` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantPreferenceRow {
-    pub definition_id: String,
+    pub assistant_definition_id: String,
     pub last_model_id: Option<String>,
     pub last_permission_value: Option<String>,
     pub last_skill_ids: String,
@@ -161,8 +161,8 @@ pub struct UpsertOverrideParams<'a> {
 /// Insert-or-update parameters for `assistant_definitions`.
 #[derive(Debug, Clone)]
 pub struct UpsertAssistantDefinitionParams<'a> {
-    pub definition_id: &'a str,
-    pub assistant_key: &'a str,
+    pub id: &'a str,
+    pub assistant_id: &'a str,
     pub source: &'a str,
     pub owner_type: &'a str,
     pub source_ref: Option<&'a str>,
@@ -195,7 +195,7 @@ pub struct UpsertAssistantDefinitionParams<'a> {
 /// Insert-or-update parameters for `assistant_overlays`.
 #[derive(Debug, Clone)]
 pub struct UpsertAssistantOverlayParams<'a> {
-    pub definition_id: &'a str,
+    pub assistant_definition_id: &'a str,
     pub enabled: bool,
     pub sort_order: i32,
     pub agent_id_override: Option<&'a str>,
@@ -205,7 +205,7 @@ pub struct UpsertAssistantOverlayParams<'a> {
 /// Insert-or-update parameters for `assistant_preferences`.
 #[derive(Debug, Clone)]
 pub struct UpsertAssistantPreferenceParams<'a> {
-    pub definition_id: &'a str,
+    pub assistant_definition_id: &'a str,
     pub last_model_id: Option<&'a str>,
     pub last_permission_value: Option<&'a str>,
     pub last_skill_ids: &'a str,

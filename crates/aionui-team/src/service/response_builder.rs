@@ -37,9 +37,9 @@ impl TeamSessionService {
 
     async fn resolve_agent_icon(&self, agent: &TeamAgent) -> Result<Option<String>, TeamError> {
         if let Some(assistant_id) = agent.assistant_id.as_deref()
-            && let Some(definition) = self.assistant_definition_repo.get_by_key(assistant_id).await?
+            && let Some(definition) = self.assistant_definition_repo.get_by_assistant_id(assistant_id).await?
             && let Some(icon) = assistant_icon(
-                definition.assistant_key.as_str(),
+                definition.assistant_id.as_str(),
                 &definition.avatar_type,
                 definition.avatar_value.as_deref(),
             )
@@ -69,13 +69,13 @@ impl TeamSessionService {
     }
 }
 
-fn assistant_icon(assistant_key: &str, avatar_type: &str, avatar_value: Option<&str>) -> Option<String> {
+fn assistant_icon(assistant_id: &str, avatar_type: &str, avatar_value: Option<&str>) -> Option<String> {
     match avatar_type {
         "builtin_asset" | "user_asset" => avatar_value.map(|value| {
             if is_direct_avatar_url(value) {
                 value.to_string()
             } else {
-                format!("/api/assistants/{assistant_key}/avatar")
+                format!("/api/assistants/{assistant_id}/avatar")
             }
         }),
         _ => None,

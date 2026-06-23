@@ -55,7 +55,7 @@ struct Fixture {
 
 async fn insert_generated_bare_assistant(
     fx: &Fixture,
-    assistant_key: &str,
+    assistant_id: &str,
     source_ref: &str,
     backend: &str,
     name: &str,
@@ -66,8 +66,8 @@ async fn insert_generated_bare_assistant(
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
-            definition_id: &format!("asstdef-{assistant_key}"),
-            assistant_key,
+            id: &format!("asstdef-{assistant_id}"),
+            assistant_id,
             source: "generated",
             owner_type: "system",
             source_ref: Some(source_ref),
@@ -100,7 +100,7 @@ async fn insert_generated_bare_assistant(
         .unwrap();
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: &format!("asstdef-{assistant_key}"),
+            assistant_definition_id: &format!("asstdef-{assistant_id}"),
             enabled: true,
             sort_order: 5,
             agent_id_override: None,
@@ -454,12 +454,12 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
     let definition_repo = SqliteAssistantDefinitionRepository::new(pool.clone());
     let state_repo = SqliteAssistantOverlayRepository::new(pool.clone());
     let preference_repo = SqliteAssistantPreferenceRepository::new(pool);
-    let definition = definition_repo.get_by_key("u1").await.unwrap().unwrap();
+    let definition = definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
-            definition_id: &definition.definition_id,
-            assistant_key: &definition.assistant_key,
+            id: &definition.id,
+            assistant_id: &definition.assistant_id,
             source: &definition.source,
             owner_type: &definition.owner_type,
             source_ref: definition.source_ref.as_deref(),
@@ -492,7 +492,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
         .unwrap();
     state_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: &definition.definition_id,
+            assistant_definition_id: &definition.id,
             enabled: false,
             sort_order: 7,
             agent_id_override: Some("8e1acf31"),
@@ -502,7 +502,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: &definition.definition_id,
+            assistant_definition_id: &definition.id,
             last_model_id: Some("gpt-5-mini"),
             last_permission_value: Some("workspace-write"),
             last_skill_ids: r#"["pref-skill"]"#,

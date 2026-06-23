@@ -599,15 +599,15 @@ mod tests {
             Ok(vec![self.row.clone()])
         }
 
-        async fn get_by_key(&self, assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, aionui_db::DbError> {
-            Ok((self.row.assistant_key == assistant_key).then_some(self.row.clone()))
+        async fn get_by_assistant_id(
+            &self,
+            assistant_id: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, aionui_db::DbError> {
+            Ok((self.row.assistant_id == assistant_id).then_some(self.row.clone()))
         }
 
-        async fn get_by_definition_id(
-            &self,
-            definition_id: &str,
-        ) -> Result<Option<AssistantDefinitionRow>, aionui_db::DbError> {
-            Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+        async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, aionui_db::DbError> {
+            Ok((self.row.id == definition_id).then_some(self.row.clone()))
         }
 
         async fn get_by_source_ref(
@@ -637,7 +637,7 @@ mod tests {
     #[async_trait::async_trait]
     impl IAssistantOverlayRepository for SingleAssistantOverlayRepo {
         async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, aionui_db::DbError> {
-            Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+            Ok((self.row.assistant_definition_id == definition_id).then_some(self.row.clone()))
         }
 
         async fn list(&self) -> Result<Vec<AssistantOverlayRow>, aionui_db::DbError> {
@@ -839,8 +839,8 @@ mod tests {
     async fn service_backed_list_models_appends_gemini_to_backends() {
         let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
             row: AssistantDefinitionRow {
-                definition_id: "def-guide-models".into(),
-                assistant_key: "assistant-models".into(),
+                id: "def-guide-models".into(),
+                assistant_id: "assistant-models".into(),
                 source: "user".into(),
                 owner_type: "user".into(),
                 source_ref: None,
@@ -875,7 +875,7 @@ mod tests {
         });
         let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
             row: AssistantOverlayRow {
-                definition_id: "def-guide-models".into(),
+                assistant_definition_id: "def-guide-models".into(),
                 enabled: true,
                 sort_order: 0,
                 agent_id_override: None,
@@ -921,8 +921,8 @@ mod tests {
     async fn create_team_uses_assistant_identity_from_caller_conversation() {
         let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
             row: AssistantDefinitionRow {
-                definition_id: "def-guide-lead".into(),
-                assistant_key: "assistant-lead".into(),
+                id: "def-guide-lead".into(),
+                assistant_id: "assistant-lead".into(),
                 source: "user".into(),
                 owner_type: "user".into(),
                 source_ref: None,
@@ -957,7 +957,7 @@ mod tests {
         });
         let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
             row: AssistantOverlayRow {
-                definition_id: "def-guide-lead".into(),
+                assistant_definition_id: "def-guide-lead".into(),
                 enabled: true,
                 sort_order: 0,
                 agent_id_override: Some("codex".into()),
@@ -1033,8 +1033,8 @@ mod tests {
     async fn create_team_opens_active_team_run_for_assistant_first_tools() {
         let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
             row: AssistantDefinitionRow {
-                definition_id: "def-guide-teamrun".into(),
-                assistant_key: "assistant-teamrun".into(),
+                id: "def-guide-teamrun".into(),
+                assistant_id: "assistant-teamrun".into(),
                 source: "user".into(),
                 owner_type: "user".into(),
                 source_ref: None,
@@ -1069,7 +1069,7 @@ mod tests {
         });
         let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
             row: AssistantOverlayRow {
-                definition_id: "def-guide-teamrun".into(),
+                assistant_definition_id: "def-guide-teamrun".into(),
                 enabled: true,
                 sort_order: 0,
                 agent_id_override: Some("claude".into()),
@@ -1135,8 +1135,8 @@ mod tests {
     async fn create_team_next_step_does_not_echo_backend_only_teammate_plan() {
         let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
             row: AssistantDefinitionRow {
-                definition_id: "def-guide-summary".into(),
-                assistant_key: "assistant-lead".into(),
+                id: "def-guide-summary".into(),
+                assistant_id: "assistant-lead".into(),
                 source: "user".into(),
                 owner_type: "user".into(),
                 source_ref: None,
@@ -1171,7 +1171,7 @@ mod tests {
         });
         let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
             row: AssistantOverlayRow {
-                definition_id: "def-guide-summary".into(),
+                assistant_definition_id: "def-guide-summary".into(),
                 enabled: true,
                 sort_order: 0,
                 agent_id_override: Some("claude".into()),
@@ -1238,8 +1238,8 @@ mod tests {
     async fn create_team_requires_explicit_assistant_id_for_non_assistant_backed_caller() {
         let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
             row: AssistantDefinitionRow {
-                definition_id: "def-guide-non-assistant-caller".into(),
-                assistant_key: "assistant-unused".into(),
+                id: "def-guide-non-assistant-caller".into(),
+                assistant_id: "assistant-unused".into(),
                 source: "user".into(),
                 owner_type: "user".into(),
                 source_ref: None,
@@ -1274,7 +1274,7 @@ mod tests {
         });
         let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
             row: AssistantOverlayRow {
-                definition_id: "def-guide-non-assistant-caller".into(),
+                assistant_definition_id: "def-guide-non-assistant-caller".into(),
                 enabled: true,
                 sort_order: 0,
                 agent_id_override: Some("codex".into()),

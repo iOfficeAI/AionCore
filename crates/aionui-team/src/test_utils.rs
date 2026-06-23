@@ -792,11 +792,11 @@ pub(crate) mod workspace_harness {
             Ok(vec![])
         }
 
-        async fn get_by_key(&self, _assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        async fn get_by_assistant_id(&self, _assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
             Ok(None)
         }
 
-        async fn get_by_definition_id(&self, _definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        async fn get_by_id(&self, _definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
             Ok(None)
         }
 

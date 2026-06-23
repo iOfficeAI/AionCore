@@ -17,7 +17,7 @@ use aionui_api_types::{
     CreateCronJobRequest, CronScheduleDto, ListCronJobsQuery, SaveCronSkillRequest, UpdateCronJobRequest,
     WebSocketMessage,
 };
-use aionui_common::{PaginatedResult, TimestampMs, now_ms};
+use aionui_common::{PaginatedResult, ProviderWithModel, TimestampMs, now_ms};
 use aionui_conversation::ConversationService;
 use aionui_conversation::response_middleware::{CronCreateParams, CronUpdateParams};
 use aionui_db::{
@@ -749,6 +749,7 @@ async fn setup_with_conv_repo() -> (
         "claude",
     )
     .await;
+    seed_bare_assistant_definitions(&assistant_definition_repo).await;
 
     std::mem::forget(db);
     (svc, cron_repo, bc, stub_conv_repo)
@@ -844,6 +845,7 @@ async fn setup_with_assistant_repos() -> (
         "claude",
     )
     .await;
+    seed_bare_assistant_definitions(&assistant_definition_repo).await;
 
     std::mem::forget(db);
     (
@@ -868,12 +870,12 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
         created_by: "user".into(),
         execution_mode: None,
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
-            backend: Some("claude".into()),
             name: "Default Assistant".into(),
             cli_path: None,
             assistant_id: Some("assistant-default".into()),
             mode: Some("default".into()),
             model_id: Some("claude-sonnet-4".into()),
+            model: None,
             config_options: None,
             workspace: None,
         }),
@@ -883,19 +885,19 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
 async fn seed_assistant_definition(
     repo: &Arc<dyn IAssistantDefinitionRepository>,
     definition_id: &str,
-    assistant_key: &str,
+    assistant_id: &str,
     agent_backend: &str,
 ) {
     let agent_id = seeded_agent_id(agent_backend);
     repo.upsert(&UpsertAssistantDefinitionParams {
-        definition_id,
-        assistant_key,
+        id: definition_id,
+        assistant_id,
         source: "user",
         owner_type: "user",
-        source_ref: Some(assistant_key),
+        source_ref: Some(assistant_id),
         source_version: None,
         source_hash: None,
-        name: assistant_key,
+        name: assistant_id,
         name_i18n: "{}",
         description: Some("test assistant"),
         description_i18n: "{}",
@@ -922,6 +924,16 @@ async fn seed_assistant_definition(
     .unwrap();
 }
 
+async fn seed_bare_assistant_definitions(repo: &Arc<dyn IAssistantDefinitionRepository>) {
+    for (definition_id, assistant_id, agent_backend) in [
+        ("asstdef_bare_gemini", "bare:cc126dd5", "gemini"),
+        ("asstdef_bare_codex", "bare:8e1acf31", "codex"),
+        ("asstdef_bare_aionrs", "bare:632f31d2", "aionrs"),
+    ] {
+        seed_assistant_definition(repo, definition_id, assistant_id, agent_backend).await;
+    }
+}
+
 async fn seed_assistant_overlay(
     repo: &Arc<dyn IAssistantOverlayRepository>,
     definition_id: &str,
@@ -929,7 +941,7 @@ async fn seed_assistant_overlay(
 ) {
     let agent_id_override = agent_backend_override.map(seeded_agent_id);
     repo.upsert(&UpsertAssistantOverlayParams {
-        definition_id,
+        assistant_definition_id: definition_id,
         enabled: true,
         sort_order: 0,
         agent_id_override,
@@ -997,12 +1009,12 @@ async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
     seed_assistant_definition(&definition_repo, "asstdef_assistant_1", "assistant-1", "claude").await;
     let mut req = make_create_req("Assistant Only Create", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
-        backend: Some("claude".into()),
         name: "Helper".into(),
         cli_path: None,
         assistant_id: Some("assistant-1".into()),
         mode: Some("default".into()),
         model_id: Some("claude-sonnet-4".into()),
+        model: None,
         config_options: None,
         workspace: None,
     });
@@ -1017,26 +1029,24 @@ async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
 }
 
 #[tokio::test]
-async fn create_job_prefers_assistant_runtime_over_stale_backend_hint() {
+async fn create_job_derives_assistant_runtime_without_backend_hint() {
     let (svc, _, _) = setup().await;
 
     let mut req = make_create_req("Stale Backend Hint", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
-        backend: Some("openclaw-gateway".into()),
         name: "Stale Backend Hint".into(),
         cli_path: None,
         assistant_id: Some("assistant-default".into()),
         mode: Some("default".into()),
         model_id: Some("claude-sonnet-4".into()),
+        model: None,
         config_options: None,
         workspace: None,
     });
 
     let job = svc.add_job(req).await.unwrap();
-    let config = job.agent_config.expect("agent config");
 
     assert_eq!(job.agent_type, "acp");
-    assert_eq!(config.backend, "claude");
 }
 
 #[tokio::test]
@@ -1057,12 +1067,16 @@ async fn create_job_derives_runtime_type_from_aionrs_assistant() {
 
     let mut req = make_create_req("Assistant Aionrs", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
-        backend: Some("provider-gemini".into()),
         name: "Aionrs Assistant".into(),
         cli_path: None,
         assistant_id: Some("assistant-aionrs".into()),
         mode: Some("yolo".into()),
         model_id: Some("gemini-3.1-pro-preview".into()),
+        model: Some(ProviderWithModel {
+            provider_id: "provider-gemini".into(),
+            model: "gemini-3.1-pro-preview".into(),
+            use_model: None,
+        }),
         config_options: None,
         workspace: None,
     });
@@ -1086,12 +1100,16 @@ async fn create_job_derives_runtime_type_from_assistant_overlay_override() {
 
     let mut req = make_create_req("Assistant Override", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
-        backend: Some("provider-openai".into()),
         name: "Override Assistant".into(),
         cli_path: None,
         assistant_id: Some("assistant-override".into()),
         mode: Some("acceptEdits".into()),
         model_id: Some("gpt-5.4".into()),
+        model: Some(ProviderWithModel {
+            provider_id: "provider-openai".into(),
+            model: "gpt-5.4".into(),
+            use_model: None,
+        }),
         config_options: None,
         workspace: None,
     });
@@ -1108,12 +1126,12 @@ async fn create_job_allows_assistant_backed_acp_jobs_without_backend_hint() {
 
     let mut req = make_create_req("Assistant Without Backend", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
-        backend: None,
         name: "Helper".into(),
         cli_path: None,
         assistant_id: Some("assistant-2".into()),
         mode: Some("default".into()),
         model_id: Some("claude-sonnet-4".into()),
+        model: None,
         config_options: None,
         workspace: None,
     });
@@ -1123,7 +1141,6 @@ async fn create_job_allows_assistant_backed_acp_jobs_without_backend_hint() {
 
     assert_eq!(job.agent_type, "acp");
     assert_eq!(config.assistant_id.as_deref(), Some("assistant-2"));
-    assert_eq!(config.backend, "claude");
 }
 
 #[tokio::test]
@@ -1132,12 +1149,12 @@ async fn create_job_rejects_backend_fallback_when_assistant_id_cannot_resolve() 
 
     let mut req = make_create_req("Assistant Missing", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
-        backend: Some("claude".into()),
         name: "Helper".into(),
         cli_path: None,
         assistant_id: Some("missing-assistant".into()),
         mode: Some("default".into()),
         model_id: Some("claude-sonnet-4".into()),
+        model: None,
         config_options: None,
         workspace: None,
     });
@@ -1303,12 +1320,12 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
         message: None,
         execution_mode: None,
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
-            backend: Some("claude".into()),
             name: "Helper".into(),
             cli_path: None,
             assistant_id: Some("assistant-1".into()),
             mode: Some("default".into()),
             model_id: Some("claude-sonnet-4".into()),
+            model: None,
             config_options: None,
             workspace: None,
         }),
@@ -1326,7 +1343,7 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
 }
 
 #[tokio::test]
-async fn update_job_rejects_backend_fallback_when_assistant_id_cannot_resolve() {
+async fn update_job_rejects_when_assistant_id_cannot_resolve() {
     let (svc, _, _) = setup().await;
     let created = svc
         .add_job(make_create_req("Assistant Missing Update", every_60s()))
@@ -1341,12 +1358,12 @@ async fn update_job_rejects_backend_fallback_when_assistant_id_cannot_resolve() 
         message: None,
         execution_mode: None,
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
-            backend: Some("claude".into()),
             name: "Helper".into(),
             cli_path: None,
             assistant_id: Some("missing-assistant".into()),
             mode: Some("default".into()),
             model_id: Some("claude-sonnet-4".into()),
+            model: None,
             config_options: None,
             workspace: None,
         }),
@@ -1361,8 +1378,7 @@ async fn update_job_rejects_backend_fallback_when_assistant_id_cannot_resolve() 
 
     assert!(matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)));
     assert!(
-        err.to_string()
-            .contains("assistant 'missing-assistant' could not resolve a runtime backend"),
+        err.to_string().contains("assistant 'missing-assistant' not found"),
         "unexpected error: {err}"
     );
 }
@@ -1824,7 +1840,7 @@ async fn icron_service_create_job() {
 }
 
 #[tokio::test]
-async fn icron_service_create_job_inherits_conversation_mode_and_backend() {
+async fn icron_service_create_job_inherits_conversation_mode_without_backend() {
     let (svc, _, _) = setup().await;
 
     use aionui_conversation::response_middleware::ICronService;
@@ -1851,7 +1867,6 @@ async fn icron_service_create_job_inherits_conversation_mode_and_backend() {
     let config = job.agent_config.as_ref().expect("agent config should be copied");
     assert_eq!(job.agent_type, "acp");
     assert_eq!(job.conversation_title.as_deref(), Some("Gemini Chat"));
-    assert_eq!(config.backend, "gemini");
     assert_eq!(config.name, "Gemini");
     assert_eq!(config.mode.as_deref(), Some("yolo"));
     assert_eq!(config.model_id.as_deref(), Some("gemini-2.5-pro"));
@@ -1862,7 +1877,7 @@ async fn icron_service_create_job_inherits_conversation_mode_and_backend() {
 }
 
 #[tokio::test]
-async fn icron_service_create_job_prefers_model_provider_over_stale_extra_backend() {
+async fn icron_service_create_job_ignores_stale_extra_backend() {
     let (svc, _, _) = setup().await;
 
     use aionui_conversation::response_middleware::ICronService;
@@ -1888,12 +1903,11 @@ async fn icron_service_create_job_prefers_model_provider_over_stale_extra_backen
     let job = &jobs[0];
     let config = job.agent_config.as_ref().expect("agent config should be copied");
     assert_eq!(job.agent_type, "acp");
-    assert_eq!(config.backend, "gemini");
     assert_eq!(config.model_id.as_deref(), Some("gemini-2.5-pro"));
 }
 
 #[tokio::test]
-async fn icron_service_create_job_prefers_assistant_backend_over_stale_extra_backend() {
+async fn icron_service_create_job_derives_assistant_runtime_over_stale_extra_backend() {
     let (svc, _, _, _, definition_repo, overlay_repo) = setup_with_assistant_repos().await;
     seed_assistant_definition(
         &definition_repo,
@@ -1926,8 +1940,8 @@ async fn icron_service_create_job_prefers_assistant_backend_over_stale_extra_bac
 
     let job = &jobs[0];
     let config = job.agent_config.as_ref().expect("agent config should be copied");
+    assert_eq!(job.agent_type, "aionrs");
     assert_eq!(config.assistant_id.as_deref(), Some("assistant-override"));
-    assert_eq!(config.backend, "aionrs");
     assert_eq!(config.mode.as_deref(), Some("yolo"));
     assert_eq!(config.model_id.as_deref(), Some("gpt-5.4"));
 }
@@ -1939,7 +1953,7 @@ async fn icron_service_create_job_inherits_assistant_snapshot_identity() {
     conv_repo.insert_assistant_snapshot(ConversationAssistantSnapshotRow {
         conversation_id: "conv_mode_assistant_snapshot".into(),
         assistant_definition_id: "asstdef_snapshot".into(),
-        assistant_key: "assistant-snapshot".into(),
+        assistant_id: "assistant-snapshot".into(),
         assistant_source: "bare".into(),
         assistant_name: "Snapshot Assistant".into(),
         assistant_avatar_type: "emoji".into(),
@@ -1979,9 +1993,10 @@ async fn icron_service_create_job_inherits_assistant_snapshot_identity() {
         .unwrap();
     assert_eq!(jobs.len(), 1);
 
-    let config = jobs[0].agent_config.as_ref().expect("agent config should be copied");
+    let job = &jobs[0];
+    let config = job.agent_config.as_ref().expect("agent config should be copied");
+    assert_eq!(job.agent_type, "acp");
     assert_eq!(config.assistant_id.as_deref(), Some("assistant-snapshot"));
-    assert_eq!(config.backend, "codex");
     assert_eq!(config.name, "Snapshot Assistant");
     assert_eq!(config.model_id.as_deref(), Some("gpt-5.1"));
 }

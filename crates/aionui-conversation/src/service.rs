@@ -1050,7 +1050,7 @@ impl ConversationService {
                 .upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {
                     conversation_id: &row.id,
                     assistant_definition_id: &snapshot.assistant_definition_id,
-                    assistant_key: &snapshot.assistant_id,
+                    assistant_id: &snapshot.assistant_id,
                     assistant_source: &snapshot.assistant_source,
                     assistant_name: &snapshot.name,
                     assistant_avatar_type: &snapshot.avatar_type,
@@ -1223,7 +1223,7 @@ impl ConversationService {
         };
 
         let Some(definition) = definition_repo
-            .get_by_key(assistant_id)
+            .get_by_assistant_id(assistant_id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))?
         else {
@@ -1231,11 +1231,11 @@ impl ConversationService {
         };
 
         let state = state_repo
-            .get(&definition.definition_id)
+            .get(&definition.id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant state lookup failed: {e}")))?;
         let preference = preference_repo
-            .get(&definition.definition_id)
+            .get(&definition.id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference lookup failed: {e}")))?;
 
@@ -1316,7 +1316,7 @@ impl ConversationService {
         let agent_binding = self.resolve_assistant_agent_binding(&effective_agent_id).await?;
 
         Ok(Some(AssistantSnapshot {
-            assistant_definition_id: definition.definition_id,
+            assistant_definition_id: definition.id,
             assistant_id: assistant_id.to_owned(),
             assistant_source: definition.source,
             name: definition.name,
@@ -1411,7 +1411,7 @@ impl ConversationService {
 
         preference_repo
             .upsert(&aionui_db::UpsertAssistantPreferenceParams {
-                definition_id: &snapshot.assistant_definition_id,
+                assistant_definition_id: &snapshot.assistant_definition_id,
                 last_model_id: last_model_id.as_deref(),
                 last_permission_value: last_permission_value.as_deref(),
                 last_skill_ids: &last_skill_ids,
@@ -1446,7 +1446,7 @@ impl ConversationService {
             .upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {
                 conversation_id: &snapshot.conversation_id,
                 assistant_definition_id: &snapshot.assistant_definition_id,
-                assistant_key: &snapshot.assistant_key,
+                assistant_id: &snapshot.assistant_id,
                 assistant_source: &snapshot.assistant_source,
                 assistant_name: &snapshot.assistant_name,
                 assistant_avatar_type: &snapshot.assistant_avatar_type,
@@ -1529,7 +1529,7 @@ impl ConversationService {
                 return Ok(());
             };
             let Some(definition) = definition_repo
-                .get_by_key(&assistant_id)
+                .get_by_assistant_id(&assistant_id)
                 .await
                 .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))?
             else {
@@ -1553,7 +1553,7 @@ impl ConversationService {
                 .as_ref()
                 .ok_or_else(|| ConversationError::internal("assistant preference sync fallback missing"))?;
             (
-                definition.definition_id.clone(),
+                definition.id.clone(),
                 legacy_snapshot
                     .as_ref()
                     .map(|value| assistant_snapshot_modes(value, definition))
@@ -1591,7 +1591,7 @@ impl ConversationService {
 
         preference_repo
             .upsert(&aionui_db::UpsertAssistantPreferenceParams {
-                definition_id: &definition_id,
+                assistant_definition_id: &definition_id,
                 last_model_id: last_model_id.as_deref(),
                 last_permission_value: last_permission_value.as_deref(),
                 last_skill_ids: existing_preference

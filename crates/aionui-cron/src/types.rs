@@ -5,7 +5,7 @@ use aionui_api_types::{
     CronAgentConfigReadDto, CronJobMetadataDto, CronJobPayloadDto, CronJobResponse, CronJobStateDto, CronJobTargetDto,
     CronScheduleDto,
 };
-use aionui_common::TimestampMs;
+use aionui_common::{ProviderWithModel, TimestampMs};
 use aionui_db::models::CronJobRow;
 use serde::{Deserialize, Serialize};
 
@@ -125,7 +125,6 @@ impl FromStr for JobStatus {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CronAgentConfig {
-    pub backend: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_path: Option<String>,
@@ -141,6 +140,8 @@ pub struct CronAgentConfig {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ProviderWithModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_options: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,7 +211,7 @@ pub fn cron_job_from_row(row: CronJobRow) -> Result<CronJob, CronError> {
         agent_config,
         conversation_id: row.conversation_id,
         conversation_title: row.conversation_title,
-        agent_type: row.agent_type,
+        agent_type: String::new(),
         created_by,
         skill_content: row.skill_content,
         description: row.description,
@@ -282,7 +283,6 @@ pub fn cron_job_to_row(job: &CronJob) -> Result<CronJobRow, CronError> {
         agent_config: agent_config_json,
         conversation_id: job.conversation_id.clone(),
         conversation_title: job.conversation_title.clone(),
-        agent_type: job.agent_type.clone(),
         created_by: job.created_by.as_str().to_owned(),
         skill_content: job.skill_content.clone(),
         description: job.description.clone(),
@@ -334,9 +334,7 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
     let agent_config_dto = job.agent_config.as_ref().map(|c| {
         let canonical_assistant_id = c.assistant_id.clone().or_else(|| c.custom_agent_id.clone());
         let assistant_backed = canonical_assistant_id.is_some();
-        let preserve_backend = !assistant_backed || job.agent_type == "aionrs";
         CronAgentConfigReadDto {
-            backend: preserve_backend.then(|| c.backend.clone()),
             name: c.name.clone(),
             cli_path: if assistant_backed { None } else { c.cli_path.clone() },
             is_preset: if assistant_backed { None } else { c.is_preset },
@@ -353,6 +351,7 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
             },
             mode: c.mode.clone(),
             model_id: c.model_id.clone(),
+            model: c.model.clone(),
             config_options: c.config_options.clone(),
             workspace: c.workspace.clone(),
         }
@@ -571,7 +570,6 @@ mod tests {
             agent_config: Some(r#"{"backend":"acp","name":"Claude"}"#.into()),
             conversation_id: "conv_1".into(),
             conversation_title: Some("Test Conv".into()),
-            agent_type: "acp".into(),
             created_by: "user".into(),
             skill_content: Some("---\nname: test\n---\nContent".into()),
             description: None,
@@ -599,7 +597,6 @@ mod tests {
             message: "do something".into(),
             execution_mode: ExecutionMode::Existing,
             agent_config: Some(CronAgentConfig {
-                backend: "acp".into(),
                 name: "Claude".into(),
                 cli_path: None,
                 is_preset: None,
@@ -608,6 +605,7 @@ mod tests {
                 preset_agent_type: None,
                 mode: None,
                 model_id: None,
+                model: None,
                 config_options: None,
                 workspace: None,
             }),
@@ -647,7 +645,7 @@ mod tests {
         assert_eq!(job.created_by, CreatedBy::User);
         assert_eq!(job.last_status, Some(JobStatus::Ok));
         assert!(job.agent_config.is_some());
-        assert_eq!(job.agent_config.as_ref().unwrap().backend, "acp");
+        assert_eq!(job.agent_config.as_ref().unwrap().name, "Claude");
     }
 
     #[test]
@@ -832,7 +830,6 @@ mod tests {
     fn domain_to_dto_strips_legacy_agent_fields_for_assistant_backed_jobs() {
         let job = CronJob {
             agent_config: Some(CronAgentConfig {
-                backend: "codex".into(),
                 name: "文件规划助手".into(),
                 cli_path: Some("/tmp/codex".into()),
                 is_preset: Some(true),
@@ -841,6 +838,7 @@ mod tests {
                 preset_agent_type: Some("codex".into()),
                 mode: Some("full-access".into()),
                 model_id: Some("gpt-5-codex".into()),
+                model: None,
                 config_options: Some(HashMap::from([("sandbox_mode".into(), "workspace-write".into())])),
                 workspace: Some("/tmp/project".into()),
             }),
@@ -851,7 +849,6 @@ mod tests {
         let config = resp.metadata.agent_config.expect("assistant config should be present");
 
         assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
-        assert!(config.backend.is_none());
         assert!(config.cli_path.is_none());
         assert!(config.is_preset.is_none());
         assert!(config.custom_agent_id.is_none());
@@ -882,7 +879,6 @@ mod tests {
     fn domain_to_dto_promotes_legacy_custom_agent_id_to_assistant_id() {
         let job = CronJob {
             agent_config: Some(CronAgentConfig {
-                backend: "claude".into(),
                 name: "Legacy Assistant Job".into(),
                 cli_path: Some("/tmp/claude".into()),
                 is_preset: Some(false),
@@ -891,6 +887,7 @@ mod tests {
                 preset_agent_type: None,
                 mode: Some("default".into()),
                 model_id: Some("claude-sonnet-4".into()),
+                model: None,
                 config_options: None,
                 workspace: Some("/tmp/project".into()),
             }),
@@ -901,17 +898,15 @@ mod tests {
         let config = resp.metadata.agent_config.expect("assistant config should be present");
 
         assert_eq!(config.assistant_id.as_deref(), Some("legacy-assistant"));
-        assert!(config.backend.is_none());
         assert!(config.custom_agent_id.is_none());
         assert!(config.cli_path.is_none());
     }
 
     #[test]
-    fn domain_to_dto_keeps_provider_backend_for_aionrs_assistant_jobs() {
+    fn domain_to_dto_keeps_model_for_aionrs_assistant_jobs() {
         let job = CronJob {
             agent_type: "aionrs".into(),
             agent_config: Some(CronAgentConfig {
-                backend: "gemini".into(),
                 name: "Gemini Bare Assistant".into(),
                 cli_path: None,
                 is_preset: None,
@@ -920,6 +915,11 @@ mod tests {
                 preset_agent_type: None,
                 mode: Some("default".into()),
                 model_id: Some("gemini-2.5-pro".into()),
+                model: Some(ProviderWithModel {
+                    provider_id: "gemini".into(),
+                    model: "gemini-2.5-pro".into(),
+                    use_model: None,
+                }),
                 config_options: None,
                 workspace: Some("/tmp/project".into()),
             }),
@@ -930,7 +930,10 @@ mod tests {
         let config = resp.metadata.agent_config.expect("assistant config should be present");
 
         assert_eq!(config.assistant_id.as_deref(), Some("bare-gemini"));
-        assert_eq!(config.backend.as_deref(), Some("gemini"));
+        assert_eq!(
+            config.model.as_ref().map(|model| model.provider_id.as_str()),
+            Some("gemini")
+        );
     }
 
     // -- DTO → Domain schedule ------------------------------------------------

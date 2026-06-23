@@ -9,15 +9,15 @@ use aionui_db::models::AssistantDefinitionRow;
 impl TeamSessionService {
     pub(crate) async fn describe_assistant(
         &self,
-        assistant_key: &str,
+        assistant_id: &str,
         locale: Option<&str>,
     ) -> Result<String, TeamError> {
         let definition = self
             .assistant_definition_repo
-            .get_by_key(assistant_key)
+            .get_by_assistant_id(assistant_id)
             .await?
-            .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_key}")))?;
-        let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+            .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_id}")))?;
+        let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
         let effective_agent_id = overlay
             .as_ref()
             .and_then(|row| row.agent_id_override.as_deref())
@@ -48,7 +48,7 @@ fn render_assistant_description(definition: &AssistantDefinitionRow, effective_b
         .collect::<Vec<_>>();
 
     let mut out = String::new();
-    let _ = writeln!(out, "# {} (`{}`)", name, definition.assistant_key);
+    let _ = writeln!(out, "# {} (`{}`)", name, definition.assistant_id);
     let _ = writeln!(out);
     let _ = writeln!(out, "Backend: {effective_backend}");
     let _ = writeln!(out);
@@ -76,7 +76,7 @@ fn render_assistant_description(definition: &AssistantDefinitionRow, effective_b
     let _ = writeln!(
         out,
         "Use `team_spawn_agent` with `assistant_id=\"{}\"`.",
-        definition.assistant_key
+        definition.assistant_id
     );
     out.trim_end().to_owned()
 }

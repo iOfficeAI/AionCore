@@ -354,7 +354,6 @@ async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
             ),
             conversation_id: String::new(),
             conversation_title: None,
-            agent_type: "acp".into(),
             created_by: "user".into(),
             skill_content: None,
             description: None,
@@ -778,7 +777,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
         .await
         .expect("load assistant snapshot")
         .expect("preset assistant cron conversation should persist snapshot");
-    assert_eq!(snapshot.assistant_key, "u-fixed-mcp");
+    assert_eq!(snapshot.assistant_id, "u-fixed-mcp");
     assert_eq!(snapshot.resolved_mcp_ids, json!([fixed_mcp.id]).to_string());
 }
 

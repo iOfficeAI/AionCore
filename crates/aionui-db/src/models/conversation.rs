@@ -39,7 +39,7 @@ pub struct ConversationRow {
 pub struct ConversationAssistantSnapshotRow {
     pub conversation_id: String,
     pub assistant_definition_id: String,
-    pub assistant_key: String,
+    pub assistant_id: String,
     pub assistant_source: String,
     pub assistant_name: String,
     pub assistant_avatar_type: String,
@@ -64,7 +64,7 @@ pub struct ConversationAssistantSnapshotRow {
 pub struct UpsertConversationAssistantSnapshotParams<'a> {
     pub conversation_id: &'a str,
     pub assistant_definition_id: &'a str,
-    pub assistant_key: &'a str,
+    pub assistant_id: &'a str,
     pub assistant_source: &'a str,
     pub assistant_name: &'a str,
     pub assistant_avatar_type: &'a str,

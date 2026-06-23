@@ -294,7 +294,7 @@ impl IConversationRepository for SqliteConversationRepository {
             "INSERT INTO conversation_assistant_snapshots (
                 conversation_id,
                 assistant_definition_id,
-                assistant_key,
+                assistant_id,
                 assistant_source,
                 assistant_name,
                 assistant_avatar_type,
@@ -315,7 +315,7 @@ impl IConversationRepository for SqliteConversationRepository {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 assistant_definition_id = excluded.assistant_definition_id,
-                assistant_key = excluded.assistant_key,
+                assistant_id = excluded.assistant_id,
                 assistant_source = excluded.assistant_source,
                 assistant_name = excluded.assistant_name,
                 assistant_avatar_type = excluded.assistant_avatar_type,
@@ -335,7 +335,7 @@ impl IConversationRepository for SqliteConversationRepository {
         )
         .bind(params.conversation_id)
         .bind(params.assistant_definition_id)
-        .bind(params.assistant_key)
+        .bind(params.assistant_id)
         .bind(params.assistant_source)
         .bind(params.assistant_name)
         .bind(params.assistant_avatar_type)

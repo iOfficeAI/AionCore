@@ -87,12 +87,12 @@ pub fn snapshot_to_assistant_identity(
     runtime_backend: &str,
 ) -> ConversationAssistantIdentityResponse {
     let avatar = match snapshot.assistant_avatar_type.as_str() {
-        "builtin_asset" | "user_asset" => format!("/api/assistants/{}/avatar", snapshot.assistant_key),
+        "builtin_asset" | "user_asset" => format!("/api/assistants/{}/avatar", snapshot.assistant_id),
         _ => snapshot.assistant_avatar_value.clone().unwrap_or_default(),
     };
 
     ConversationAssistantIdentityResponse {
-        id: snapshot.assistant_key.clone(),
+        id: snapshot.assistant_id.clone(),
         source: snapshot.assistant_source.clone(),
         name: snapshot.assistant_name.clone(),
         avatar,

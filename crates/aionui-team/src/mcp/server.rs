@@ -548,7 +548,7 @@ async fn exec_describe_assistant(args: &Value, service: &Weak<TeamSessionService
             "custom_agent_id is no longer accepted; use assistant_id",
         ));
     }
-    let assistant_key = args
+    let assistant_id = args
         .get("assistant_id")
         .and_then(Value::as_str)
         .map(str::trim)
@@ -560,7 +560,7 @@ async fn exec_describe_assistant(args: &Value, service: &Weak<TeamSessionService
         .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
 
     service
-        .describe_assistant(assistant_key, locale)
+        .describe_assistant(assistant_id, locale)
         .await
         .map_err(|error| ToolCallError::from_message(error.to_string()))
 }

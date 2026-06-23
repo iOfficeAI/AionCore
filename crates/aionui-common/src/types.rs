@@ -40,7 +40,7 @@ pub enum UpdateType {
 }
 
 /// Model selection config — references a provider and a specific model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderWithModel {
     pub provider_id: String,
     pub model: String,

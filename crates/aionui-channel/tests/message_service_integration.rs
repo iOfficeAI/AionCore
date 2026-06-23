@@ -183,18 +183,18 @@ impl IWorkerTaskManager for RecordingTaskManager {
 
 fn bare_assistant_definition_params<'a>(
     definition_id: &'a str,
-    assistant_key: &'a str,
+    assistant_id: &'a str,
     agent_id: &'a str,
 ) -> UpsertAssistantDefinitionParams<'a> {
     UpsertAssistantDefinitionParams {
-        definition_id,
-        assistant_key,
+        id: definition_id,
+        assistant_id,
         source: "generated",
         owner_type: "system",
-        source_ref: Some(assistant_key),
+        source_ref: Some(assistant_id),
         source_version: None,
         source_hash: None,
-        name: assistant_key,
+        name: assistant_id,
         name_i18n: "{}",
         description: Some("Channel bare assistant"),
         description_i18n: "{}",
@@ -356,7 +356,7 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
         .expect("acp_session row should exist for ACP assistant conversations");
     assert_eq!(session_row.agent_backend, "claude");
     assert!(!session_row.agent_id.is_empty());
-    assert_eq!(snapshot.assistant_key, "bare-claude");
+    assert_eq!(snapshot.assistant_id, "bare-claude");
     assert_eq!(snapshot.agent_id, "2d23ff1c");
     assert_eq!(conversation.name, "Claude");
 }
@@ -486,7 +486,7 @@ async fn send_to_agent_without_saved_binding_defaults_to_bare_aionrs_assistant()
         .expect("channel-created conversation should default to a bare assistant snapshot");
     let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
 
-    assert_eq!(snapshot.assistant_key, "bare-aionrs");
+    assert_eq!(snapshot.assistant_id, "bare-aionrs");
     assert_eq!(snapshot.agent_id, "632f31d2");
     assert_eq!(conversation.r#type, AgentType::Aionrs.serde_name());
     assert_eq!(conversation.name, "tg-aionrs-70880480");

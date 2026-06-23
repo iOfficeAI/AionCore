@@ -1181,11 +1181,11 @@ impl IAssistantDefinitionRepository for EmptyAssistantDefinitionRepo {
         Ok(vec![])
     }
 
-    async fn get_by_key(&self, _assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+    async fn get_by_assistant_id(&self, _assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
         Ok(None)
     }
 
-    async fn get_by_definition_id(&self, _definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+    async fn get_by_id(&self, _definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
         Ok(None)
     }
 
@@ -1237,12 +1237,12 @@ impl IAssistantDefinitionRepository for SingleAssistantDefinitionRepo {
         Ok(vec![self.row.clone()])
     }
 
-    async fn get_by_key(&self, assistant_key: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
-        Ok((self.row.assistant_key == assistant_key).then_some(self.row.clone()))
+    async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok((self.row.assistant_id == assistant_id).then_some(self.row.clone()))
     }
 
-    async fn get_by_definition_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
-        Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+    async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok((self.row.id == definition_id).then_some(self.row.clone()))
     }
 
     async fn get_by_source_ref(
@@ -1269,7 +1269,7 @@ struct SingleAssistantOverlayRepo {
 #[async_trait::async_trait]
 impl IAssistantOverlayRepository for SingleAssistantOverlayRepo {
     async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
-        Ok((self.row.definition_id == definition_id).then_some(self.row.clone()))
+        Ok((self.row.assistant_definition_id == definition_id).then_some(self.row.clone()))
     }
 
     async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
@@ -1735,8 +1735,8 @@ fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadata
 
 fn word_creator_definition() -> AssistantDefinitionRow {
     AssistantDefinitionRow {
-        definition_id: "def-word-creator".into(),
-        assistant_key: "word-creator".into(),
+        id: "def-word-creator".into(),
+        assistant_id: "word-creator".into(),
         source: "builtin".into(),
         owner_type: "system".into(),
         source_ref: Some("word-creator".into()),
@@ -1918,8 +1918,8 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
         )]));
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
-            definition_id: "def-team-lead".into(),
-            assistant_key: "assistant-lead".into(),
+            id: "def-team-lead".into(),
+            assistant_id: "assistant-lead".into(),
             source: "builtin".into(),
             owner_type: "system".into(),
             source_ref: Some("assistant-lead".into()),
@@ -1989,8 +1989,8 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
-            definition_id: "def-team-lead".into(),
-            assistant_key: "assistant-lead".into(),
+            id: "def-team-lead".into(),
+            assistant_id: "assistant-lead".into(),
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
@@ -2065,8 +2065,8 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
-            definition_id: "def-team-lead".into(),
-            assistant_key: "assistant-lead".into(),
+            id: "def-team-lead".into(),
+            assistant_id: "assistant-lead".into(),
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
@@ -2101,7 +2101,7 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
     });
     let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
         row: AssistantOverlayRow {
-            definition_id: "def-team-lead".into(),
+            assistant_definition_id: "def-team-lead".into(),
             enabled: true,
             sort_order: 0,
             agent_id_override: Some("codex".into()),
@@ -2152,8 +2152,8 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
-            definition_id: "def-team-lead".into(),
-            assistant_key: "assistant-lead".into(),
+            id: "def-team-lead".into(),
+            assistant_id: "assistant-lead".into(),
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
@@ -2188,7 +2188,7 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
     });
     let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
         row: AssistantOverlayRow {
-            definition_id: "def-team-lead".into(),
+            assistant_definition_id: "def-team-lead".into(),
             enabled: true,
             sort_order: 0,
             agent_id_override: Some("codex".into()),
@@ -2400,8 +2400,8 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
 async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
-            definition_id: "def-team-worker".into(),
-            assistant_key: "assistant-worker".into(),
+            id: "def-team-worker".into(),
+            assistant_id: "assistant-worker".into(),
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
@@ -2436,7 +2436,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
     });
     let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
         row: AssistantOverlayRow {
-            definition_id: "def-team-worker".into(),
+            assistant_definition_id: "def-team-worker".into(),
             enabled: true,
             sort_order: 0,
             agent_id_override: Some("codex".into()),
@@ -2495,8 +2495,8 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
 async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
-            definition_id: "def-team-worker".into(),
-            assistant_key: "assistant-worker".into(),
+            id: "def-team-worker".into(),
+            assistant_id: "assistant-worker".into(),
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
@@ -2531,7 +2531,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
     });
     let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
         row: AssistantOverlayRow {
-            definition_id: "def-team-worker".into(),
+            assistant_definition_id: "def-team-worker".into(),
             enabled: true,
             sort_order: 0,
             agent_id_override: Some("codex".into()),
@@ -3443,8 +3443,8 @@ async fn es1_ensure_session_creates_session() {
 async fn spawn_agent_in_session_succeeds_without_active_team_run() {
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
-            definition_id: "def-spawn-worker".into(),
-            assistant_key: "assistant-worker".into(),
+            id: "def-spawn-worker".into(),
+            assistant_id: "assistant-worker".into(),
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
@@ -3479,7 +3479,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
     });
     let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(SingleAssistantOverlayRepo {
         row: AssistantOverlayRow {
-            definition_id: "def-spawn-worker".into(),
+            assistant_definition_id: "def-spawn-worker".into(),
             enabled: true,
             sort_order: 0,
             agent_id_override: Some("codex".into()),
