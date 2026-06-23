@@ -1031,8 +1031,10 @@ mod tests {
 
     #[test]
     fn aionrs_guide_prompt_hands_off_after_create_team() {
-        let mut overrides = AionrsBuildExtra::default();
-        overrides.system_prompt = Some(team_guide_prompt::build_solo_team_guide_prompt("aionrs"));
+        let overrides = AionrsBuildExtra {
+            system_prompt: Some(team_guide_prompt::build_solo_team_guide_prompt("aionrs")),
+            ..Default::default()
+        };
 
         let prompt = overrides.system_prompt.as_deref().unwrap();
         assert!(prompt.contains("aion_create_team"));

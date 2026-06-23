@@ -1,4 +1,4 @@
-use aion_agent::engine::AgentError as AionrsAgentError;
+use aion_agent::error::AgentError as AionrsAgentError;
 use aion_providers::ProviderError;
 use aionui_api_types::{
     AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, AgentErrorResolutionTarget,

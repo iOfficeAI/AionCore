@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.34](https://github.com/iOfficeAI/AionCore/compare/v0.1.33...v0.1.34) (2026-06-22)
+
+
+### Bug Fixes
+
+* **agent:** expose aionrs mode config option ([#501](https://github.com/iOfficeAI/AionCore/issues/501)) ([d1a360d](https://github.com/iOfficeAI/AionCore/commit/d1a360de17114dad5e1834ab2fc8531672ffd17b))
+* **agent:** surface OpenClaw Gateway unreachable errors ([#498](https://github.com/iOfficeAI/AionCore/issues/498)) ([90d34ae](https://github.com/iOfficeAI/AionCore/commit/90d34aee81d484c949b3fc4358447095752e2b8d))
+* **aionrs:** classify engine errors structurally ([#494](https://github.com/iOfficeAI/AionCore/issues/494)) ([8552b0a](https://github.com/iOfficeAI/AionCore/commit/8552b0a30f0eb323d62032986919170c05374c6a))
+* **aionrs:** drop malformed tool-call events ([#486](https://github.com/iOfficeAI/AionCore/issues/486)) ([67ffbd0](https://github.com/iOfficeAI/AionCore/commit/67ffbd03d3aa17a46b47d6eafe08277edaaacdc4))
+* **channel:** reuse stored credentials when re-enabling a plugin ([#458](https://github.com/iOfficeAI/AionCore/issues/458)) ([3920c58](https://github.com/iOfficeAI/AionCore/commit/3920c583db1c6a49d3209f685a8fb510967ca48a))
+
 ## [0.1.33](https://github.com/iOfficeAI/AionCore/compare/v0.1.32...v0.1.33) (2026-06-19)
 
 

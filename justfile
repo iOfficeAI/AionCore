@@ -7,12 +7,82 @@ setup:
     git config core.hooksPath .githooks
     @echo "✅ Git hooks enabled"
 
+# Run cargo with optional local aionrs SDK patches.
+_cargo *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    cargo_config=()
+    restore_cargo_lock=false
+    cargo_lock_snapshot=""
+
+    restore_local_lockfile() {
+        if [[ "$restore_cargo_lock" == "true" && -n "$cargo_lock_snapshot" && -f "$cargo_lock_snapshot" ]]; then
+            cp "$cargo_lock_snapshot" Cargo.lock
+        fi
+        if [[ -n "$cargo_lock_snapshot" ]]; then
+            rm -f "$cargo_lock_snapshot"
+        fi
+    }
+    trap restore_local_lockfile EXIT
+
+    if [[ -n "${AIONRS:-}" ]]; then
+        if [[ ! -d "$AIONRS" ]]; then
+            echo "AIONRS does not exist or is not a directory: $AIONRS" >&2
+            exit 1
+        fi
+
+        aionrs_root=$(cd "$AIONRS" && pwd -P)
+        crates=(
+            aion-agent
+            aion-providers
+            aion-types
+            aion-protocol
+            aion-config
+            aion-mcp
+        )
+
+        for crate in "${crates[@]}"; do
+            crate_dir="$aionrs_root/crates/$crate"
+            if [[ ! -f "$crate_dir/Cargo.toml" ]]; then
+                echo "AIONRS is missing $crate: $crate_dir/Cargo.toml" >&2
+                exit 1
+            fi
+
+            toml_path=${crate_dir//\\/\\\\}
+            toml_path=${toml_path//\"/\\\"}
+            cargo_config+=(--config "patch.'https://github.com/iOfficeAI/aionrs.git'.$crate.path = \"$toml_path\"")
+        done
+
+        echo "Using local aionrs SDK: $aionrs_root" >&2
+
+        if [[ -f Cargo.lock ]]; then
+            if git diff --quiet -- Cargo.lock && git diff --cached --quiet -- Cargo.lock; then
+                cargo_lock_snapshot=$(mktemp)
+                cp Cargo.lock "$cargo_lock_snapshot"
+                restore_cargo_lock=true
+            else
+                echo "Cargo.lock already has changes; leaving any AIONRS lockfile updates in place." >&2
+            fi
+        fi
+    fi
+
+    set +e
+    if ((${#cargo_config[@]})); then
+        cargo "${cargo_config[@]}" {{ARGS}}
+    else
+        cargo {{ARGS}}
+    fi
+    status=$?
+    set -e
+    exit "$status"
+
 # Build in release mode and install to ~/.cargo/bin
 # Use `just build --force` to skip cache check
 build *FLAGS: lint-fix fmt
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release
+    just _cargo build --release
     new_sum=$(shasum -a 256 target/release/aioncore | cut -d' ' -f1)
     force=false
     for flag in {{FLAGS}}; do
@@ -38,7 +108,7 @@ build *FLAGS: lint-fix fmt
 build-debug *FLAGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build
+    just _cargo build
     new_sum=$(shasum -a 256 target/debug/aioncore | cut -d' ' -f1)
     force=false
     for flag in {{FLAGS}}; do
@@ -63,7 +133,7 @@ install:
 
 # Run all tests
 test:
-    cargo nextest run --workspace
+    just _cargo nextest run --workspace
 
 # Ensure already-shipped database migrations stay immutable
 migration-check:
@@ -75,11 +145,11 @@ migration-check-test:
 
 # Lint (warnings = errors)
 lint:
-    cargo clippy --workspace -- -D warnings
+    just _cargo clippy --workspace -- -D warnings
 
 lint-fix:
-    cargo fix --allow-dirty --allow-staged
-    cargo clippy --fix --workspace --allow-dirty --allow-staged -- -D warnings
+    just _cargo fix --allow-dirty --allow-staged
+    just _cargo clippy --fix --workspace --allow-dirty --allow-staged -- -D warnings
 
 # Format code
 fmt:
@@ -94,11 +164,11 @@ check: migration-check lint fmt-check test
 
 # Run the server (debug)
 run *ARGS:
-    cargo run --bin aioncore -- {{ARGS}}
+    just _cargo run --bin aioncore -- {{ARGS}}
 
 # Run the server (release)
 run-release *ARGS:
-    cargo run --release --bin aioncore -- {{ARGS}}
+    just _cargo run --release --bin aioncore -- {{ARGS}}
 
 # Pre-push gate: migration check, format, lint, auto-commit fixes, test, then push
 push *ARGS: migration-check lint-fix fmt _auto-commit-fixes test
