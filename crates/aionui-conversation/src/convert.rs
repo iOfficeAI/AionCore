@@ -84,6 +84,7 @@ pub fn row_to_response_with_extra(
 
 pub fn snapshot_to_assistant_identity(
     snapshot: &ConversationAssistantSnapshotRow,
+    runtime_backend: &str,
 ) -> ConversationAssistantIdentityResponse {
     let avatar = match snapshot.assistant_avatar_type.as_str() {
         "builtin_asset" | "user_asset" => format!("/api/assistants/{}/avatar", snapshot.assistant_key),
@@ -95,7 +96,7 @@ pub fn snapshot_to_assistant_identity(
         source: snapshot.assistant_source.clone(),
         name: snapshot.assistant_name.clone(),
         avatar,
-        backend: snapshot.agent_backend.clone(),
+        backend: runtime_backend.to_owned(),
     }
 }
 

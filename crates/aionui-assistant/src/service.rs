@@ -19,6 +19,7 @@ use aionui_db::{
     IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
     IProviderRepository, SqlitePool, UpdateAssistantParams, UpsertAssistantDefinitionParams,
     UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, rebuild_legacy_assistant_mirror,
+    resolve_agent_binding,
 };
 use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
 use serde_json;
@@ -135,6 +136,9 @@ impl AssistantService {
             let (definition_id, assistant_key) = self
                 .resolve_definition_identity("builtin", Some(&builtin.id), &builtin.id)
                 .await?;
+            let agent_id = self
+                .resolve_agent_id_for_runtime_backend(&builtin.preset_agent_type)
+                .await?;
 
             self.definition_repo
                 .upsert(&UpsertAssistantDefinitionParams {
@@ -151,7 +155,7 @@ impl AssistantService {
                     description_i18n: &description_i18n,
                     avatar_type: &avatar_type,
                     avatar_value: avatar_value.as_deref(),
-                    agent_backend: &builtin.preset_agent_type,
+                    agent_id: &agent_id,
                     rule_resource_type: if builtin.rule_file.is_some() {
                         "builtin_asset"
                     } else {
@@ -233,12 +237,17 @@ impl AssistantService {
                 continue;
             };
 
+            let agent_id_override = match override_row.preset_agent_type.as_deref() {
+                Some(value) => Some(self.resolve_agent_id_for_runtime_backend(value).await?),
+                None => None,
+            };
+
             self.state_repo
                 .upsert(&UpsertAssistantOverlayParams {
                     definition_id: &definition.definition_id,
                     enabled: override_row.enabled,
                     sort_order: override_row.sort_order,
-                    agent_backend_override: override_row.preset_agent_type.as_deref(),
+                    agent_id_override: agent_id_override.as_deref(),
                     last_used_at: override_row.last_used_at,
                 })
                 .await
@@ -296,18 +305,6 @@ impl AssistantService {
                 .resolve_definition_identity("generated", Some(&row.id), &assistant_key)
                 .await?;
             let avatar_value = row.icon.as_deref().filter(|value| !value.trim().is_empty());
-            // ACP agents expose their engine in `backend` (claude/gemini/…), but
-            // single-engine agents like Aion CLI carry it in `agent_type` and
-            // leave `backend` empty. Fall back to `agent_type` so the bare
-            // assistant always has a concrete `preset_agent_type` for the
-            // frontend to route on; an empty backend would otherwise drop the
-            // top-level model and fail warmup with "Provider '' not found".
-            let backend = row
-                .backend
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| row.agent_type.serde_name());
-
             self.definition_repo
                 .upsert(&UpsertAssistantDefinitionParams {
                     definition_id: &definition_id,
@@ -323,7 +320,7 @@ impl AssistantService {
                     description_i18n: "{}",
                     avatar_type: if avatar_value.is_some() { "emoji" } else { "none" },
                     avatar_value,
-                    agent_backend: backend,
+                    agent_id: &row.id,
                     rule_resource_type: "none",
                     rule_resource_ref: None,
                     rule_inline_content: None,
@@ -360,7 +357,7 @@ impl AssistantService {
                         definition_id: &definition_id,
                         enabled: true,
                         sort_order: initial_generated_sort_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                        agent_backend_override: None,
+                        agent_id_override: None,
                         last_used_at: None,
                     })
                     .await
@@ -385,6 +382,9 @@ impl AssistantService {
             normalize_json_array_string(row.disabled_builtin_skills.as_deref(), "disabled_builtin_skills")?;
         let (avatar_type, avatar_value) = serialize_avatar("user", row.avatar.as_deref());
         let (definition_id, assistant_key) = self.resolve_definition_identity("user", Some(&row.id), &row.id).await?;
+        let agent_id = self
+            .resolve_agent_id_for_runtime_backend(&row.preset_agent_type)
+            .await?;
 
         self.definition_repo
             .upsert(&UpsertAssistantDefinitionParams {
@@ -401,7 +401,7 @@ impl AssistantService {
                 description_i18n: &description_i18n,
                 avatar_type: &avatar_type,
                 avatar_value: avatar_value.as_deref(),
-                agent_backend: &row.preset_agent_type,
+                agent_id: &agent_id,
                 rule_resource_type: "user_file",
                 rule_resource_ref: Some(&row.id),
                 rule_inline_content: None,
@@ -497,7 +497,7 @@ impl AssistantService {
                 description_i18n: &patched.description_i18n,
                 avatar_type: &patched.avatar_type,
                 avatar_value: patched.avatar_value.as_deref(),
-                agent_backend: &patched.agent_backend,
+                agent_id: &patched.agent_id,
                 rule_resource_type: &patched.rule_resource_type,
                 rule_resource_ref: patched.rule_resource_ref.as_deref(),
                 rule_inline_content: patched.rule_inline_content.as_deref(),
@@ -601,8 +601,9 @@ impl AssistantService {
         let mut result = Vec::new();
 
         for definition in &definitions {
-            let projection =
-                assistant_projection_for_definition(definition, state_map.get(&definition.definition_id), &projections);
+            let projection = self
+                .project_definition(definition, state_map.get(&definition.definition_id), &projections)
+                .await?;
             result.push(definition_to_response(
                 definition,
                 state_map.get(&definition.definition_id),
@@ -631,7 +632,9 @@ impl AssistantService {
         let projections = self.reconcile_generated_assistants().await?;
         if let Some(definition) = self.definition_repo.get_by_key(id).await? {
             let state = self.state_repo.get(&definition.definition_id).await?;
-            let projection = assistant_projection_for_definition(&definition, state.as_ref(), &projections);
+            let projection = self
+                .project_definition(&definition, state.as_ref(), &projections)
+                .await?;
             return definition_to_response(&definition, state.as_ref(), &projection);
         }
 
@@ -644,7 +647,9 @@ impl AssistantService {
             let state = self.state_repo.get(&definition.definition_id).await?;
             let preference = self.preference_repo.get(&definition.definition_id).await?;
             let rules_content = self.read_rule(id, locale).await?;
-            let projection = assistant_projection_for_definition(&definition, state.as_ref(), &projections);
+            let projection = self
+                .project_definition(&definition, state.as_ref(), &projections)
+                .await?;
             return definition_to_detail_response(
                 &definition,
                 state.as_ref(),
@@ -693,6 +698,38 @@ impl AssistantService {
                     .into(),
             ))
         }
+    }
+
+    async fn resolve_agent_id_for_runtime_backend(&self, backend: &str) -> Result<String, AssistantError> {
+        let trimmed = backend.trim();
+        let Some(binding) = resolve_agent_binding(&self.pool, trimmed)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
+        else {
+            return Err(AssistantError::BadRequest(format!(
+                "Unknown preset_agent_type '{trimmed}'"
+            )));
+        };
+        Ok(binding.agent_id)
+    }
+
+    async fn project_definition(
+        &self,
+        definition: &AssistantDefinitionRow,
+        state: Option<&AssistantOverlayRow>,
+        agent_rows: &[AgentManagementRow],
+    ) -> Result<AssistantRuntimeProjection, AssistantError> {
+        let effective_agent_id = effective_agent_id_for_definition(definition, state);
+        let runtime_backend = resolve_agent_binding(&self.pool, effective_agent_id)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
+            .map(|binding| binding.runtime_backend);
+        Ok(assistant_projection_for_definition(
+            definition,
+            state,
+            agent_rows,
+            runtime_backend.as_deref(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -803,20 +840,21 @@ impl AssistantService {
                 let enabled = existing.as_ref().is_none_or(|o| o.enabled);
                 let sort_order = existing.as_ref().map(|o| o.sort_order).unwrap_or(0);
                 let last_used_at = existing.as_ref().and_then(|o| o.last_used_at);
-                let current_agent_backend = self
+                let requested_agent_id = self.resolve_agent_id_for_runtime_backend(preset_agent_type).await?;
+                let current_agent_id = self
                     .state_repo
                     .get(&definition.definition_id)
                     .await
                     .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?
-                    .and_then(|row| row.agent_backend_override)
-                    .unwrap_or_else(|| definition.agent_backend.clone());
-                let reset_model_and_permission = current_agent_backend != preset_agent_type;
+                    .and_then(|row| row.agent_id_override)
+                    .unwrap_or_else(|| definition.agent_id.clone());
+                let reset_model_and_permission = current_agent_id != requested_agent_id;
                 self.state_repo
                     .upsert(&UpsertAssistantOverlayParams {
                         definition_id: &definition.definition_id,
                         enabled,
                         sort_order,
-                        agent_backend_override: Some(preset_agent_type),
+                        agent_id_override: Some(&requested_agent_id),
                         last_used_at,
                     })
                     .await
@@ -851,10 +889,13 @@ impl AssistantService {
             .get_by_key(id)
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
-        let reset_model_and_permission = req
-            .preset_agent_type
+        let requested_agent_id = match req.preset_agent_type.as_deref() {
+            Some(preset_agent_type) => Some(self.resolve_agent_id_for_runtime_backend(preset_agent_type).await?),
+            None => None,
+        };
+        let reset_model_and_permission = requested_agent_id
             .as_deref()
-            .is_some_and(|preset_agent_type| preset_agent_type != current_definition.agent_backend);
+            .is_some_and(|agent_id| agent_id != current_definition.agent_id);
         let normalized_avatar = if req.avatar.is_some() {
             Some(self.normalize_user_avatar_input(id, req.avatar.as_deref())?)
         } else {
@@ -1115,17 +1156,24 @@ impl AssistantService {
             .last_used_at
             .or_else(|| existing_state.as_ref().and_then(|state| state.last_used_at))
             .or_else(|| existing.as_ref().and_then(|o| o.last_used_at));
-        let agent_backend_override = existing_state
+        let agent_id_override = if let Some(value) = existing_state
             .as_ref()
-            .and_then(|state| state.agent_backend_override.as_deref())
-            .or_else(|| existing.as_ref().and_then(|o| o.preset_agent_type.as_deref()));
+            .and_then(|state| state.agent_id_override.clone())
+        {
+            Some(value)
+        } else {
+            match existing.as_ref().and_then(|o| o.preset_agent_type.as_deref()) {
+                Some(value) => Some(self.resolve_agent_id_for_runtime_backend(value).await?),
+                None => None,
+            }
+        };
         let state = self
             .state_repo
             .upsert(&UpsertAssistantOverlayParams {
                 definition_id: &definition.definition_id,
                 enabled,
                 sort_order,
-                agent_backend_override,
+                agent_id_override: agent_id_override.as_deref(),
                 last_used_at,
             })
             .await
@@ -1729,9 +1777,7 @@ fn definition_to_response(
         avatar: avatar_display_value(definition),
         enabled: state.is_none_or(|row| row.enabled),
         sort_order: state.map(|row| row.sort_order).unwrap_or(0),
-        preset_agent_type: state
-            .and_then(|row| row.agent_backend_override.clone())
-            .unwrap_or_else(|| definition.agent_backend.clone()),
+        preset_agent_type: projection.runtime_backend.clone(),
         enabled_skills: decode_str_list(Some(definition.default_skill_ids.as_str()))?,
         custom_skill_names: decode_str_list(Some(definition.custom_skill_names.as_str()))?,
         disabled_builtin_skills: decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?,
@@ -1799,9 +1845,7 @@ fn definition_to_detail_response(
             last_used_at: state.and_then(|row| row.last_used_at),
         },
         engine: AssistantEngineResponse {
-            agent_backend: state
-                .and_then(|row| row.agent_backend_override.clone())
-                .unwrap_or_else(|| definition.agent_backend.clone()),
+            agent_backend: projection.runtime_backend.clone(),
         },
         rules: AssistantRulesResponse {
             content: if rules_content.is_empty() {
@@ -1850,6 +1894,7 @@ fn definition_to_detail_response(
 
 #[derive(Debug, Clone)]
 struct AssistantRuntimeProjection {
+    runtime_backend: String,
     agent_status: AgentManagementStatus,
     agent_status_message: Option<String>,
     team_selectable: bool,
@@ -1861,6 +1906,7 @@ fn assistant_projection_for_definition(
     definition: &AssistantDefinitionRow,
     state: Option<&AssistantOverlayRow>,
     agent_rows: &[AgentManagementRow],
+    resolved_runtime_backend: Option<&str>,
 ) -> AssistantRuntimeProjection {
     let enabled = state.is_none_or(|row| row.enabled);
     let source = match definition.source.as_str() {
@@ -1868,29 +1914,41 @@ fn assistant_projection_for_definition(
         "generated" => AssistantSource::Bare,
         _ => AssistantSource::User,
     };
-    let effective_backend = state
-        .and_then(|row| row.agent_backend_override.as_deref())
-        .unwrap_or(definition.agent_backend.as_str());
+    let effective_agent_id = effective_agent_id_for_definition(definition, state);
+    let fallback_runtime_backend = resolved_runtime_backend.unwrap_or(effective_agent_id);
 
     // An agent row identifies its runtime key by `backend` for vendor ACP
     // agents, but aionrs (the built-in Rust agent) has a NULL `backend` and is
     // keyed by its `agent_type` ("aionrs") instead. Match on either so aionrs
     // assistants resolve to the aionrs row rather than falling back to Missing.
     let row_matches_backend = |row: &&AgentManagementRow| {
-        row.backend.as_deref() == Some(effective_backend) || row.agent_type.serde_name() == effective_backend
+        row.backend.as_deref() == Some(effective_agent_id)
+            || row.agent_type.serde_name() == effective_agent_id
+            || row.backend.as_deref() == Some(fallback_runtime_backend)
+            || row.agent_type.serde_name() == fallback_runtime_backend
     };
 
     let agent_row = if matches!(source, AssistantSource::Bare) {
-        definition
-            .source_ref
-            .as_deref()
-            .and_then(|source_ref| agent_rows.iter().find(|row| row.id == source_ref))
+        agent_rows.iter().find(|row| row.id == effective_agent_id).or_else(|| {
+            definition
+                .source_ref
+                .as_deref()
+                .and_then(|source_ref| agent_rows.iter().find(|row| row.id == source_ref))
+        })
     } else {
         agent_rows
             .iter()
-            .find(|row| row_matches_backend(row) && row.agent_source != AgentSource::Custom)
+            .find(|row| row.id == effective_agent_id)
+            .or_else(|| {
+                agent_rows
+                    .iter()
+                    .find(|row| row_matches_backend(row) && row.agent_source != AgentSource::Custom)
+            })
             .or_else(|| agent_rows.iter().find(row_matches_backend))
     };
+    let runtime_backend = agent_row
+        .map(runtime_backend_for_management_row)
+        .unwrap_or_else(|| fallback_runtime_backend.to_owned());
 
     let agent_status = agent_row
         .map(|row| row.status)
@@ -1920,6 +1978,7 @@ fn assistant_projection_for_definition(
     };
 
     AssistantRuntimeProjection {
+        runtime_backend,
         agent_status,
         agent_status_message,
         team_selectable: enabled
@@ -1927,6 +1986,24 @@ fn assistant_projection_for_definition(
         team_block_reason,
         deletable: matches!(source, AssistantSource::User),
     }
+}
+
+fn effective_agent_id_for_definition<'a>(
+    definition: &'a AssistantDefinitionRow,
+    state: Option<&'a AssistantOverlayRow>,
+) -> &'a str {
+    state
+        .and_then(|row| row.agent_id_override.as_deref())
+        .unwrap_or(definition.agent_id.as_str())
+}
+
+fn runtime_backend_for_management_row(row: &AgentManagementRow) -> String {
+    row.backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| row.agent_type.serde_name())
+        .to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -2494,7 +2571,7 @@ mod tests {
                 description_i18n: "{}",
                 avatar_type: "none",
                 avatar_value: None,
-                agent_backend: "claude",
+                agent_id: "agent-claude",
                 rule_resource_type: "none",
                 rule_resource_ref: None,
                 rule_inline_content: None,
@@ -2518,7 +2595,7 @@ mod tests {
                 definition_id: "asstdef-generated",
                 enabled: true,
                 sort_order: 3,
-                agent_backend_override: None,
+                agent_id_override: None,
                 last_used_at: None,
             })
             .await

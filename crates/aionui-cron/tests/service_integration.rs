@@ -716,7 +716,7 @@ async fn setup_with_conv_repo() -> (
         Arc::clone(&agent_metadata_repo),
         acp_session_repo,
     ));
-    let agent_registry = AgentRegistry::new(agent_metadata_repo);
+    let agent_registry = AgentRegistry::new(agent_metadata_repo.clone());
     agent_registry.hydrate().await.unwrap();
     let executor = Arc::new(JobExecutor::new(
         task_manager,
@@ -733,6 +733,7 @@ async fn setup_with_conv_repo() -> (
     let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn EventBroadcaster>);
     let svc = CronService::new(
         cron_repo.clone(),
+        agent_metadata_repo,
         assistant_definition_repo.clone(),
         assistant_overlay_repo.clone(),
         scheduler,
@@ -811,7 +812,7 @@ async fn setup_with_assistant_repos() -> (
         Arc::clone(&agent_metadata_repo),
         acp_session_repo,
     ));
-    let agent_registry = AgentRegistry::new(agent_metadata_repo);
+    let agent_registry = AgentRegistry::new(agent_metadata_repo.clone());
     agent_registry.hydrate().await.unwrap();
     let executor = Arc::new(JobExecutor::new(
         task_manager,
@@ -827,6 +828,7 @@ async fn setup_with_assistant_repos() -> (
     let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn EventBroadcaster>);
     let svc = CronService::new(
         cron_repo.clone(),
+        agent_metadata_repo,
         assistant_definition_repo.clone(),
         assistant_overlay_repo.clone(),
         scheduler,
@@ -884,6 +886,7 @@ async fn seed_assistant_definition(
     assistant_key: &str,
     agent_backend: &str,
 ) {
+    let agent_id = seeded_agent_id(agent_backend);
     repo.upsert(&UpsertAssistantDefinitionParams {
         definition_id,
         assistant_key,
@@ -898,7 +901,7 @@ async fn seed_assistant_definition(
         description_i18n: "{}",
         avatar_type: "emoji",
         avatar_value: Some("🤖"),
-        agent_backend,
+        agent_id,
         rule_resource_type: "inline",
         rule_resource_ref: None,
         rule_inline_content: None,
@@ -924,15 +927,26 @@ async fn seed_assistant_overlay(
     definition_id: &str,
     agent_backend_override: Option<&str>,
 ) {
+    let agent_id_override = agent_backend_override.map(seeded_agent_id);
     repo.upsert(&UpsertAssistantOverlayParams {
         definition_id,
         enabled: true,
         sort_order: 0,
-        agent_backend_override,
+        agent_id_override,
         last_used_at: None,
     })
     .await
     .unwrap();
+}
+
+fn seeded_agent_id(value: &str) -> &str {
+    match value {
+        "claude" => "2d23ff1c",
+        "codex" => "8e1acf31",
+        "gemini" => "cc126dd5",
+        "aionrs" => "632f31d2",
+        other => other,
+    }
 }
 
 fn every_60s() -> CronScheduleDto {
@@ -1930,7 +1944,7 @@ async fn icron_service_create_job_inherits_assistant_snapshot_identity() {
         assistant_name: "Snapshot Assistant".into(),
         assistant_avatar_type: "emoji".into(),
         assistant_avatar_value: Some("S".into()),
-        agent_backend: "codex".into(),
+        agent_id: "8e1acf31".into(),
         rules_content: String::new(),
         default_model_mode: "default".into(),
         resolved_model_id: Some("gpt-5.1".into()),

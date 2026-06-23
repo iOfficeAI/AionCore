@@ -9,7 +9,10 @@ use aionui_api_types::{
 use aionui_common::{
     AgentType, WorkspacePathValidationError, generate_prefixed_id, now_ms, validate_workspace_path_availability,
 };
-use aionui_db::{IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository, UpdateCronJobParams};
+use aionui_db::{
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository,
+    UpdateCronJobParams, resolve_agent_binding_from_rows,
+};
 use tracing::{error, info, warn};
 
 use crate::events::CronEventEmitter;
@@ -40,6 +43,7 @@ const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer suppor
 #[derive(Clone)]
 pub struct CronService {
     repo: Arc<dyn ICronRepository>,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
     scheduler: Arc<CronScheduler>,
@@ -51,6 +55,7 @@ pub struct CronService {
 impl CronService {
     pub fn new(
         repo: Arc<dyn ICronRepository>,
+        agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
         assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
         assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
         scheduler: Arc<CronScheduler>,
@@ -60,6 +65,7 @@ impl CronService {
     ) -> Self {
         Self {
             repo,
+            agent_metadata_repo,
             assistant_definition_repo,
             assistant_overlay_repo,
             scheduler,
@@ -457,12 +463,13 @@ impl CronService {
             .await?
             .ok_or_else(|| CronError::InvalidAgentConfig(format!("assistant '{assistant_id}' not found")))?;
         let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
-        let effective_backend = overlay
+        let effective_agent_id = overlay
             .as_ref()
-            .and_then(|item| item.agent_backend_override.as_deref())
-            .unwrap_or(definition.agent_backend.as_str());
+            .and_then(|item| item.agent_id_override.as_deref())
+            .unwrap_or(definition.agent_id.as_str());
+        let effective_backend = self.runtime_backend_for_agent_id(effective_agent_id).await?;
 
-        Ok(runtime_agent_type_for_backend(effective_backend).to_owned())
+        Ok(runtime_agent_type_for_backend(&effective_backend).to_owned())
     }
 
     async fn bind_existing_conversation_if_needed(&self, job: &CronJob) {
@@ -895,10 +902,20 @@ impl CronService {
             .map(|snapshot| snapshot.assistant_key.trim().to_owned())
             .filter(|value| !value.is_empty());
         let assistant_id = snapshot_assistant_id.or(extra_assistant_id);
-        let snapshot_backend = assistant_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.agent_backend.trim().to_owned())
-            .filter(|value| !value.is_empty());
+        let snapshot_backend = match assistant_snapshot.as_ref() {
+            Some(snapshot) => match self.runtime_backend_for_agent_id(snapshot.agent_id.trim()).await {
+                Ok(value) => Some(value).filter(|value| !value.is_empty()),
+                Err(err) => {
+                    warn!(
+                        conversation_id = %row.id,
+                        error = %err,
+                        "Failed to resolve assistant snapshot agent id for cron agent config"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
         let assistant_backend = snapshot_backend.clone().or(self
             .resolve_assistant_backend(assistant_id.as_deref())
             .await
@@ -1027,14 +1044,19 @@ impl CronService {
             return Ok(None);
         };
         let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+        let effective_agent_id = overlay
+            .as_ref()
+            .and_then(|item| item.agent_id_override.as_deref())
+            .unwrap_or(definition.agent_id.as_str());
 
-        Ok(Some(
-            overlay
-                .as_ref()
-                .and_then(|item| item.agent_backend_override.as_deref())
-                .unwrap_or(definition.agent_backend.as_str())
-                .to_owned(),
-        ))
+        Ok(Some(self.runtime_backend_for_agent_id(effective_agent_id).await?))
+    }
+
+    async fn runtime_backend_for_agent_id(&self, agent_id: &str) -> Result<String, CronError> {
+        let rows = self.agent_metadata_repo.list_all().await?;
+        Ok(resolve_agent_binding_from_rows(&rows, agent_id)
+            .map(|binding| binding.runtime_backend)
+            .unwrap_or_else(|| agent_id.to_owned()))
     }
 }
 

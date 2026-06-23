@@ -299,7 +299,7 @@ impl IConversationRepository for SqliteConversationRepository {
                 assistant_name,
                 assistant_avatar_type,
                 assistant_avatar_value,
-                agent_backend,
+                agent_id,
                 rules_content,
                 default_model_mode,
                 resolved_model_id,
@@ -320,7 +320,7 @@ impl IConversationRepository for SqliteConversationRepository {
                 assistant_name = excluded.assistant_name,
                 assistant_avatar_type = excluded.assistant_avatar_type,
                 assistant_avatar_value = excluded.assistant_avatar_value,
-                agent_backend = excluded.agent_backend,
+                agent_id = excluded.agent_id,
                 rules_content = excluded.rules_content,
                 default_model_mode = excluded.default_model_mode,
                 resolved_model_id = excluded.resolved_model_id,
@@ -340,7 +340,7 @@ impl IConversationRepository for SqliteConversationRepository {
         .bind(params.assistant_name)
         .bind(params.assistant_avatar_type)
         .bind(params.assistant_avatar_value)
-        .bind(params.agent_backend)
+        .bind(params.agent_id)
         .bind(params.rules_content)
         .bind(params.default_model_mode)
         .bind(params.resolved_model_id)

@@ -487,12 +487,16 @@ pub async fn build_channel_state(
     let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
         Arc::new(SqliteClientPreferenceRepository::new(pref_pool));
     let channel_settings = Arc::new(
-        aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo).with_assistant_repos(
-            Arc::new(SqliteAssistantDefinitionRepository::new(
+        aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo)
+            .with_agent_metadata_repo(Arc::new(SqliteAgentMetadataRepository::new(
                 services.database.pool().clone(),
-            )),
-            Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
-        ),
+            )))
+            .with_assistant_repos(
+                Arc::new(SqliteAssistantDefinitionRepository::new(
+                    services.database.pool().clone(),
+                )),
+                Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
+            ),
     );
 
     // Build orchestrator dependencies
@@ -643,7 +647,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         skill_resolver,
         services.worker_task_manager.clone(),
         conv_repo.clone(),
-        agent_metadata_repo,
+        agent_metadata_repo.clone(),
         acp_session_repo,
     )
     .with_runtime_state(services.conversation_runtime_state.clone());
@@ -690,6 +694,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     let assistant_overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone()));
     let cron_service = Arc::new(aionui_cron::service::CronService::new(
         cron_repo,
+        agent_metadata_repo,
         assistant_definition_repo,
         assistant_overlay_repo,
         scheduler,

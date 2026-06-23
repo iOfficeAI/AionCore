@@ -5,7 +5,8 @@ use aionui_api_types::{AddAgentRequest, TeamAgentInput};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::TeamRow;
 use aionui_db::{
-    IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository, ITeamRepository, UpdateTeamParams,
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
+    ITeamRepository, UpdateTeamParams,
 };
 use async_trait::async_trait;
 use tracing::{info, warn};
@@ -13,13 +14,14 @@ use tracing::{info, warn};
 use crate::error::TeamError;
 use crate::mcp::TeamMcpStdioConfig;
 use crate::service::inherit_team_workspace;
-use crate::service::spawn_support::{parse_agent_type, resolve_full_auto_mode};
+use crate::service::spawn_support::{parse_agent_type, resolve_full_auto_mode, resolve_runtime_backend};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::workspace::TeamWorkspaceResolver;
 
 #[derive(Clone)]
 pub struct TeamAgentProvisioner {
     repo: Arc<dyn ITeamRepository>,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
     provider_repo: Arc<dyn IProviderRepository>,
@@ -118,6 +120,7 @@ impl TeamAgentProvisioner {
 
     pub(crate) fn new(
         repo: Arc<dyn ITeamRepository>,
+        agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
         assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
         assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
@@ -125,6 +128,7 @@ impl TeamAgentProvisioner {
     ) -> Self {
         Self {
             repo,
+            agent_metadata_repo,
             assistant_definition_repo,
             assistant_overlay_repo,
             provider_repo,
@@ -291,10 +295,11 @@ impl TeamAgentProvisioner {
                 .await?
                 .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_key}")))?;
             let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
-            return Ok(overlay
-                .and_then(|row| row.agent_backend_override)
+            let effective_agent_id = overlay
+                .and_then(|row| row.agent_id_override)
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or(definition.agent_backend));
+                .unwrap_or(definition.agent_id);
+            return resolve_runtime_backend(&self.agent_metadata_repo, &effective_agent_id).await;
         }
 
         let Some(requested_backend) = requested_backend.map(str::trim).filter(|value| !value.is_empty()) else {

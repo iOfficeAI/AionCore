@@ -3,6 +3,7 @@
 use aionui_common::{TimestampMs, now_ms};
 use sqlx::SqlitePool;
 
+use crate::agent_binding::resolve_agent_binding;
 use crate::error::DbError;
 use crate::models::{
     AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow,
@@ -416,7 +417,7 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
             "INSERT INTO assistant_definitions (
                 definition_id, assistant_key, source, owner_type, source_ref, source_version, source_hash,
                 name, name_i18n, description, description_i18n, avatar_type, avatar_value,
-                agent_backend, rule_resource_type, rule_resource_ref, rule_inline_content,
+                agent_id, rule_resource_type, rule_resource_ref, rule_inline_content,
                 recommended_prompts, recommended_prompts_i18n,
                 default_model_mode, default_model_value,
                 default_permission_mode, default_permission_value,
@@ -437,7 +438,7 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
                 description_i18n = excluded.description_i18n,
                 avatar_type = excluded.avatar_type,
                 avatar_value = excluded.avatar_value,
-                agent_backend = excluded.agent_backend,
+                agent_id = excluded.agent_id,
                 rule_resource_type = excluded.rule_resource_type,
                 rule_resource_ref = excluded.rule_resource_ref,
                 rule_inline_content = excluded.rule_inline_content,
@@ -469,7 +470,7 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         .bind(params.description_i18n)
         .bind(params.avatar_type)
         .bind(params.avatar_value)
-        .bind(params.agent_backend)
+        .bind(params.agent_id)
         .bind(params.rule_resource_type)
         .bind(params.rule_resource_ref)
         .bind(params.rule_inline_content)
@@ -536,19 +537,19 @@ impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
         let now = now_ms();
         sqlx::query(
             "INSERT INTO assistant_overlays (
-                definition_id, enabled, sort_order, agent_backend_override, last_used_at, created_at, updated_at
+                definition_id, enabled, sort_order, agent_id_override, last_used_at, created_at, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(definition_id) DO UPDATE SET
                 enabled = excluded.enabled,
                 sort_order = excluded.sort_order,
-                agent_backend_override = excluded.agent_backend_override,
+                agent_id_override = excluded.agent_id_override,
                 last_used_at = excluded.last_used_at,
                 updated_at = excluded.updated_at",
         )
         .bind(params.definition_id)
         .bind(params.enabled)
         .bind(params.sort_order)
-        .bind(params.agent_backend_override)
+        .bind(params.agent_id_override)
         .bind(params.last_used_at)
         .bind(now)
         .bind(now)
@@ -642,6 +643,10 @@ pub async fn rebuild_legacy_assistant_mirror(
         ("fixed", Some(model)) => serde_json::to_string(&vec![model]).unwrap_or_else(|_| "[]".to_string()),
         _ => "[]".to_string(),
     };
+    let legacy_preset_agent_type = resolve_agent_binding(pool, &definition.agent_id)
+        .await?
+        .map(|resolution| resolution.runtime_backend)
+        .unwrap_or_else(|| definition.agent_id.clone());
 
     if definition.source == "user" {
         sqlx::query(
@@ -669,7 +674,7 @@ pub async fn rebuild_legacy_assistant_mirror(
         .bind(&definition.name)
         .bind(&definition.description)
         .bind(&definition.avatar_value)
-        .bind(&definition.agent_backend)
+        .bind(&legacy_preset_agent_type)
         .bind(&default_skills)
         .bind(&custom_skill_names)
         .bind(&disabled_builtin)
@@ -691,7 +696,15 @@ pub async fn rebuild_legacy_assistant_mirror(
 
     let enabled = state.map(|row| row.enabled).unwrap_or(true);
     let sort_order = state.map(|row| row.sort_order).unwrap_or_default();
-    let agent_backend_override = state.and_then(|row| row.agent_backend_override.clone());
+    let agent_id_override = match state.and_then(|row| row.agent_id_override.as_deref()) {
+        Some(agent_id) => Some(
+            resolve_agent_binding(pool, agent_id)
+                .await?
+                .map(|resolution| resolution.runtime_backend)
+                .unwrap_or_else(|| agent_id.to_owned()),
+        ),
+        None => None,
+    };
     let last_used_at = state.and_then(|row| row.last_used_at);
 
     sqlx::query(
@@ -707,7 +720,7 @@ pub async fn rebuild_legacy_assistant_mirror(
     .bind(&definition.assistant_key)
     .bind(enabled)
     .bind(sort_order)
-    .bind(agent_backend_override)
+    .bind(agent_id_override)
     .bind(last_used_at)
     .bind(state.map(|row| row.updated_at).unwrap_or(definition.updated_at))
     .execute(pool)
@@ -789,7 +802,7 @@ mod tests {
             description_i18n: "{}",
             avatar_type: "emoji",
             avatar_value: Some("🤖"),
-            agent_backend: "gemini",
+            agent_id: "gemini",
             rule_resource_type: "inline",
             rule_resource_ref: None,
             rule_inline_content: Some("# rule"),
@@ -1092,7 +1105,7 @@ mod tests {
             definition_id: &definition.definition_id,
             enabled: false,
             sort_order: 9,
-            agent_backend_override: Some("claude"),
+            agent_id_override: Some("claude"),
             last_used_at: Some(1234),
         })
         .await
@@ -1103,7 +1116,7 @@ mod tests {
         assert_eq!(list[0].definition_id, definition.definition_id);
         assert!(!list[0].enabled);
         assert_eq!(list[0].sort_order, 9);
-        assert_eq!(list[0].agent_backend_override.as_deref(), Some("claude"));
+        assert_eq!(list[0].agent_id_override.as_deref(), Some("claude"));
     }
 
     #[tokio::test]
@@ -1136,7 +1149,7 @@ mod tests {
                 definition_id: &definition.definition_id,
                 enabled: false,
                 sort_order: 7,
-                agent_backend_override: Some("claude"),
+                agent_id_override: Some("claude"),
                 last_used_at: Some(999),
             })
             .await
@@ -1165,6 +1178,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebuild_legacy_mirror_writes_runtime_backend_from_agent_id() {
+        let (d, s, _p, db) = setup_v2().await;
+        let mut params = definition_params("u2", "User Two");
+        params.definition_id = "asstdef_u2";
+        params.agent_id = "cc126dd5";
+        let definition = d.upsert(&params).await.unwrap();
+        let state = s
+            .upsert(&UpsertAssistantOverlayParams {
+                definition_id: &definition.definition_id,
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: Some("2d23ff1c"),
+                last_used_at: None,
+            })
+            .await
+            .unwrap();
+
+        rebuild_legacy_assistant_mirror(db.pool(), &definition, Some(&state))
+            .await
+            .unwrap();
+
+        let legacy_assistant = sqlx::query_as::<_, AssistantRow>("SELECT * FROM assistants WHERE id = 'u2'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(legacy_assistant.preset_agent_type, "gemini");
+
+        let legacy_override =
+            sqlx::query_as::<_, AssistantOverrideRow>("SELECT * FROM assistant_overrides WHERE assistant_id = 'u2'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(legacy_override.preset_agent_type.as_deref(), Some("claude"));
+    }
+
+    #[tokio::test]
     async fn rebuild_legacy_mirror_skips_builtin_assistant_rows() {
         let (d, s, _p, db) = setup_v2().await;
         let definition = d
@@ -1182,7 +1231,7 @@ mod tests {
                 description_i18n: "{}",
                 avatar_type: "builtin_asset",
                 avatar_value: Some("office.svg"),
-                agent_backend: "aionrs",
+                agent_id: "aionrs",
                 rule_resource_type: "builtin_asset",
                 rule_resource_ref: Some("builtin-office"),
                 rule_inline_content: None,
@@ -1206,7 +1255,7 @@ mod tests {
                 definition_id: &definition.definition_id,
                 enabled: false,
                 sort_order: 3,
-                agent_backend_override: Some("claude"),
+                agent_id_override: Some("claude"),
                 last_used_at: Some(42),
             })
             .await

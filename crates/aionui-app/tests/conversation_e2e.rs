@@ -167,7 +167,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             description_i18n: &definition.description_i18n,
             avatar_type: &definition.avatar_type,
             avatar_value: definition.avatar_value.as_deref(),
-            agent_backend: &definition.agent_backend,
+            agent_id: &definition.agent_id,
             rule_resource_type: &definition.rule_resource_type,
             rule_resource_ref: definition.rule_resource_ref.as_deref(),
             rule_inline_content: definition.rule_inline_content.as_deref(),
@@ -191,7 +191,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             definition_id: &definition.definition_id,
             enabled: true,
             sort_order: 0,
-            agent_backend_override: Some("codex"),
+            agent_id_override: Some("8e1acf31"),
             last_used_at: None,
         })
         .await
@@ -258,7 +258,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
         .unwrap()
         .unwrap();
     assert_eq!(snapshot.assistant_key, "u1");
-    assert_eq!(snapshot.agent_backend, "codex");
+    assert_eq!(snapshot.agent_id, "8e1acf31");
     assert_eq!(snapshot.rules_content, "assistant snapshot rule");
     assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
     assert_eq!(snapshot.resolved_skill_ids, r#"["override-skill"]"#);

@@ -3,7 +3,9 @@ use aionui_api_types::BehaviorPolicy;
 use aionui_common::AgentType;
 use aionui_common::constants::{TEAM_CAPABLE_BACKENDS, has_mcp_capability};
 use aionui_db::models::AssistantOverlayRow;
+use aionui_db::{IAgentMetadataRepository, resolve_agent_binding_from_rows};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::prompts::AvailableAssistant;
 
@@ -64,6 +66,16 @@ pub(crate) fn resolve_full_auto_mode(backend: &str) -> &'static str {
     agent_type.full_auto_mode_id(Some(backend))
 }
 
+pub(crate) async fn resolve_runtime_backend(
+    agent_metadata_repo: &Arc<dyn IAgentMetadataRepository>,
+    agent_id: &str,
+) -> Result<String, TeamError> {
+    let rows = agent_metadata_repo.list_all().await?;
+    Ok(resolve_agent_binding_from_rows(&rows, agent_id)
+        .map(|binding| binding.runtime_backend)
+        .unwrap_or_else(|| agent_id.to_owned()))
+}
+
 impl TeamSessionService {
     pub(crate) async fn resolve_spawn_backend_and_model(
         &self,
@@ -79,12 +91,12 @@ impl TeamSessionService {
                 .await?
                 .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_key}")))?;
             let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
-            let backend = overlay
+            let effective_agent_id = overlay
                 .as_ref()
-                .and_then(|row| row.agent_backend_override.as_deref())
+                .and_then(|row| row.agent_id_override.as_deref())
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or(definition.agent_backend.as_str())
-                .to_owned();
+                .unwrap_or(definition.agent_id.as_str());
+            let backend = resolve_runtime_backend(&self.agent_metadata_repo, effective_agent_id).await?;
             let requested_model = requested_model
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -170,10 +182,13 @@ impl TeamSessionService {
                 continue;
             }
 
-            let effective_backend = overlay
-                .and_then(|row| row.agent_backend_override.as_deref())
+            let effective_agent_id = overlay
+                .and_then(|row| row.agent_id_override.as_deref())
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or(definition.agent_backend.as_str());
+                .unwrap_or(definition.agent_id.as_str());
+            let effective_backend = resolve_runtime_backend(&self.agent_metadata_repo, effective_agent_id)
+                .await
+                .unwrap_or_else(|_| effective_agent_id.to_owned());
 
             let agent_row = if source == "generated" {
                 definition
@@ -183,16 +198,18 @@ impl TeamSessionService {
             } else {
                 agent_rows
                     .iter()
-                    .find(|row| row.backend.as_deref() == Some(effective_backend) && row.agent_source != "custom")
+                    .find(|row| {
+                        row.backend.as_deref() == Some(effective_backend.as_str()) && row.agent_source != "custom"
+                    })
                     .or_else(|| {
                         agent_rows
                             .iter()
-                            .find(|row| row.backend.as_deref() == Some(effective_backend))
+                            .find(|row| row.backend.as_deref() == Some(effective_backend.as_str()))
                     })
             };
 
             let is_available = agent_row.is_some_and(|row| row.last_check_status.as_deref() != Some("unavailable"));
-            let is_team_capable = self.is_backend_team_capable(effective_backend).await;
+            let is_team_capable = self.is_backend_team_capable(&effective_backend).await;
             if !(is_available && is_team_capable) {
                 continue;
             }
@@ -242,12 +259,15 @@ impl TeamSessionService {
                     .ok_or_else(|| TeamError::InvalidRequest(format!("Assistant not found: {assistant_key}")))?;
                 let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
                 Some(
-                    overlay
-                        .as_ref()
-                        .and_then(|row| row.agent_backend_override.as_deref())
-                        .filter(|value| !value.trim().is_empty())
-                        .unwrap_or(definition.agent_backend.as_str())
-                        .to_owned(),
+                    resolve_runtime_backend(
+                        &self.agent_metadata_repo,
+                        overlay
+                            .as_ref()
+                            .and_then(|row| row.agent_id_override.as_deref())
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or(definition.agent_id.as_str()),
+                    )
+                    .await?,
                 )
             }
             None => None,
@@ -551,7 +571,7 @@ mod tests {
                     description_i18n: "{}".into(),
                     avatar_type: "emoji".into(),
                     avatar_value: None,
-                    agent_backend: "aionrs".into(),
+                    agent_id: "aionrs".into(),
                     rule_resource_type: "inline".into(),
                     rule_resource_ref: None,
                     rule_inline_content: None,
@@ -577,7 +597,7 @@ mod tests {
                     definition_id: "def-1".into(),
                     enabled: true,
                     sort_order: 0,
-                    agent_backend_override: None,
+                    agent_id_override: None,
                     last_used_at: None,
                     created_at: 0,
                     updated_at: 0,

@@ -5,7 +5,10 @@ use aionui_api_types::{
     ChannelPlatformSettingsResponse,
 };
 use aionui_common::ProviderWithModel;
-use aionui_db::{IAssistantDefinitionRepository, IAssistantOverlayRepository, IClientPreferenceRepository};
+use aionui_db::{
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IClientPreferenceRepository,
+    resolve_agent_binding_from_rows,
+};
 use tracing::debug;
 
 use crate::error::ChannelError;
@@ -20,6 +23,7 @@ const DEFAULT_AGENT_TYPE: &str = "aionrs";
 /// - `assistant.{platform}.defaultModel` → JSON `{"id":"provider_id","use_model":"model_name"}`
 pub struct ChannelSettingsService {
     pref_repo: Arc<dyn IClientPreferenceRepository>,
+    agent_metadata_repo: Option<Arc<dyn IAgentMetadataRepository>>,
     assistant_definition_repo: Option<Arc<dyn IAssistantDefinitionRepository>>,
     assistant_overlay_repo: Option<Arc<dyn IAssistantOverlayRepository>>,
 }
@@ -46,9 +50,15 @@ impl ChannelSettingsService {
     pub fn new(pref_repo: Arc<dyn IClientPreferenceRepository>) -> Self {
         Self {
             pref_repo,
+            agent_metadata_repo: None,
             assistant_definition_repo: None,
             assistant_overlay_repo: None,
         }
+    }
+
+    pub fn with_agent_metadata_repo(mut self, agent_metadata_repo: Arc<dyn IAgentMetadataRepository>) -> Self {
+        self.agent_metadata_repo = Some(agent_metadata_repo);
+        self
     }
 
     pub fn with_assistant_repos(
@@ -242,11 +252,12 @@ impl ChannelSettingsService {
             return Ok(None);
         };
 
-        let agent_backend = overlay_repo
+        let agent_id = overlay_repo
             .get(&definition.definition_id)
             .await?
-            .and_then(|row| row.agent_backend_override)
-            .unwrap_or(definition.agent_backend);
+            .and_then(|row| row.agent_id_override)
+            .unwrap_or(definition.agent_id);
+        let agent_backend = self.runtime_backend_for_agent_id(&agent_id).await?;
         let agent_type = backend_to_agent_type(&agent_backend);
         let backend = if agent_type == "acp" { Some(agent_backend) } else { None };
 
@@ -275,10 +286,17 @@ impl ChannelSettingsService {
 
         let definitions = definition_repo.list().await?;
 
-        Ok(definitions
-            .into_iter()
-            .find(|definition| definition.source == "generated" && definition.agent_backend == legacy_backend)
-            .map(|definition| definition.assistant_key))
+        for definition in definitions {
+            if definition.source != "generated" {
+                continue;
+            }
+            let runtime_backend = self.runtime_backend_for_agent_id(&definition.agent_id).await?;
+            if runtime_backend == legacy_backend {
+                return Ok(Some(definition.assistant_key));
+            }
+        }
+
+        Ok(None)
     }
 
     async fn normalize_channel_assistant_setting_for_response(
@@ -343,18 +361,47 @@ impl ChannelSettingsService {
         let definitions = definition_repo.list().await?;
         let overlays = overlay_repo.list().await?;
 
-        let generated_aionrs = definitions.iter().find(|definition| {
-            definition.source == "generated" && effective_assistant_backend(definition, &overlays) == DEFAULT_AGENT_TYPE
-        });
-        if let Some(definition) = generated_aionrs {
+        for definition in definitions.iter().filter(|definition| definition.source == "generated") {
+            if self.effective_assistant_backend(definition, &overlays).await? == DEFAULT_AGENT_TYPE {
+                return Ok(Some(definition.assistant_key.clone()));
+            }
+        }
+
+        let mut any_aionrs = None;
+        for definition in &definitions {
+            if self.effective_assistant_backend(definition, &overlays).await? == DEFAULT_AGENT_TYPE {
+                any_aionrs = Some(definition);
+                break;
+            }
+        }
+        if let Some(definition) = any_aionrs {
             return Ok(Some(definition.assistant_key.clone()));
         }
 
-        let any_aionrs = definitions
-            .iter()
-            .find(|definition| effective_assistant_backend(definition, &overlays) == DEFAULT_AGENT_TYPE);
+        Ok(None)
+    }
 
-        Ok(any_aionrs.map(|definition| definition.assistant_key.clone()))
+    async fn effective_assistant_backend(
+        &self,
+        definition: &aionui_db::models::AssistantDefinitionRow,
+        overlays: &[aionui_db::models::AssistantOverlayRow],
+    ) -> Result<String, ChannelError> {
+        let agent_id = overlays
+            .iter()
+            .find(|overlay| overlay.definition_id == definition.definition_id)
+            .and_then(|overlay| overlay.agent_id_override.as_deref())
+            .unwrap_or(definition.agent_id.as_str());
+        self.runtime_backend_for_agent_id(agent_id).await
+    }
+
+    async fn runtime_backend_for_agent_id(&self, agent_id: &str) -> Result<String, ChannelError> {
+        let Some(agent_metadata_repo) = self.agent_metadata_repo.as_ref() else {
+            return Ok(agent_id.to_owned());
+        };
+        let rows = agent_metadata_repo.list_all().await?;
+        Ok(resolve_agent_binding_from_rows(&rows, agent_id)
+            .map(|binding| binding.runtime_backend)
+            .unwrap_or_else(|| agent_id.to_owned()))
     }
 }
 
@@ -405,18 +452,6 @@ fn normalize_channel_assistant_setting_for_write(
         agent_type: None,
         name: assistant.name.clone(),
     }
-}
-
-fn effective_assistant_backend(
-    definition: &aionui_db::models::AssistantDefinitionRow,
-    overlays: &[aionui_db::models::AssistantOverlayRow],
-) -> String {
-    overlays
-        .iter()
-        .find(|overlay| overlay.definition_id == definition.definition_id)
-        .and_then(|overlay| overlay.agent_backend_override.as_deref())
-        .unwrap_or(definition.agent_backend.as_str())
-        .to_owned()
 }
 
 fn parse_channel_model_setting(value: &str) -> Option<ChannelDefaultModelSetting> {
@@ -600,7 +635,7 @@ mod tests {
         }
     }
 
-    fn make_definition(assistant_key: &str, agent_backend: &str) -> AssistantDefinitionRow {
+    fn make_definition(assistant_key: &str, agent_id: &str) -> AssistantDefinitionRow {
         AssistantDefinitionRow {
             definition_id: format!("def-{assistant_key}"),
             assistant_key: assistant_key.to_owned(),
@@ -615,7 +650,7 @@ mod tests {
             description_i18n: "{}".to_owned(),
             avatar_type: "emoji".to_owned(),
             avatar_value: None,
-            agent_backend: agent_backend.to_owned(),
+            agent_id: agent_id.to_owned(),
             rule_resource_type: "inline".to_owned(),
             rule_resource_ref: None,
             rule_inline_content: None,
@@ -637,12 +672,12 @@ mod tests {
         }
     }
 
-    fn make_overlay(definition_id: &str, agent_backend_override: &str) -> AssistantOverlayRow {
+    fn make_overlay(definition_id: &str, agent_id_override: &str) -> AssistantOverlayRow {
         AssistantOverlayRow {
             definition_id: definition_id.to_owned(),
             enabled: true,
             sort_order: 0,
-            agent_backend_override: Some(agent_backend_override.to_owned()),
+            agent_id_override: Some(agent_id_override.to_owned()),
             last_used_at: None,
             created_at: 0,
             updated_at: 0,

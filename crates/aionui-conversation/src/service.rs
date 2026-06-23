@@ -26,10 +26,10 @@ use aionui_common::{
 };
 use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
+    AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, SaveRuntimeStateParams, SortOrder,
-    UpsertConversationAssistantSnapshotParams,
+    UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -144,16 +144,24 @@ struct AssistantSnapshot {
     avatar_type: String,
     #[serde(default)]
     avatar: Option<String>,
-    #[serde(default)]
-    agent_id: Option<String>,
-    #[serde(default)]
-    agent_source: Option<String>,
-    agent_backend: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    agent_id: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    agent_source: String,
+    #[serde(default, alias = "agent_backend", deserialize_with = "deserialize_string_or_null")]
+    runtime_backend: String,
     rules: AssistantSnapshotRules,
     #[serde(default)]
     default_modes: AssistantSnapshotDefaultModes,
     resolved_defaults: AssistantSnapshotResolvedDefaults,
     created_at: i64,
+}
+
+fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(<Option<String> as serde::Deserialize>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -211,14 +219,14 @@ fn resolve_create_agent_type(
     assistant_snapshot: Option<&AssistantSnapshot>,
 ) -> Result<AgentType, ConversationError> {
     if let Some(snapshot) = assistant_snapshot {
-        let derived = parse_supported_agent_type_from_backend(snapshot.agent_backend.trim())?;
+        let derived = parse_supported_agent_type_from_backend(snapshot.runtime_backend.trim())?;
         if let Some(explicit) = explicit_type
             && explicit != derived
         {
             warn!(
                 explicit_type = explicit.serde_name(),
                 derived_type = derived.serde_name(),
-                backend = snapshot.agent_backend,
+                backend = snapshot.runtime_backend,
                 assistant_id = snapshot.assistant_id,
                 "assistant-backed create request carried a mismatched explicit type; using assistant-derived type"
             );
@@ -607,7 +615,12 @@ impl ConversationService {
         }
 
         if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(&response.id).await? {
-            response.assistant = Some(snapshot_to_assistant_identity(&snapshot));
+            let runtime_backend = self
+                .resolve_assistant_agent_binding(&snapshot.agent_id)
+                .await?
+                .map(|binding| binding.runtime_backend)
+                .unwrap_or_else(|| snapshot.agent_id.clone());
+            response.assistant = Some(snapshot_to_assistant_identity(&snapshot, &runtime_backend));
         }
 
         Ok(())
@@ -710,7 +723,7 @@ impl ConversationService {
 
         let assistant_backend = assistant_snapshot
             .as_ref()
-            .map(|snapshot| snapshot.agent_backend.clone())
+            .map(|snapshot| snapshot.runtime_backend.clone())
             .filter(|backend| !backend.is_empty());
         let effective_backend = assistant_backend.or_else(|| {
             extra
@@ -762,25 +775,24 @@ impl ConversationService {
             // helpers. Persisting them here keeps one source of truth —
             // the assistant — while preserving the contract those
             // downstreams already depend on.
-            if !snapshot.agent_backend.is_empty() {
+            if !snapshot.runtime_backend.is_empty() {
                 obj.insert(
                     "backend".to_owned(),
-                    serde_json::Value::String(snapshot.agent_backend.clone()),
+                    serde_json::Value::String(snapshot.runtime_backend.clone()),
                 );
             }
-            if let Some(agent_id) = snapshot.agent_id.as_ref()
-                && !agent_id.is_empty()
-            {
-                obj.insert("agent_id".to_owned(), serde_json::Value::String(agent_id.clone()));
+            if !snapshot.agent_id.is_empty() {
+                obj.insert(
+                    "agent_id".to_owned(),
+                    serde_json::Value::String(snapshot.agent_id.clone()),
+                );
             } else {
                 obj.remove("agent_id");
             }
-            if let Some(agent_source) = snapshot.agent_source.as_ref()
-                && !agent_source.is_empty()
-            {
+            if !snapshot.agent_source.is_empty() {
                 obj.insert(
                     "agent_source".to_owned(),
-                    serde_json::Value::String(agent_source.clone()),
+                    serde_json::Value::String(snapshot.agent_source.clone()),
                 );
             } else {
                 obj.remove("agent_source");
@@ -1043,7 +1055,7 @@ impl ConversationService {
                     assistant_name: &snapshot.name,
                     assistant_avatar_type: &snapshot.avatar_type,
                     assistant_avatar_value: snapshot.avatar.as_deref(),
-                    agent_backend: &snapshot.agent_backend,
+                    agent_id: &snapshot.agent_id,
                     rules_content: &snapshot.rules.content,
                     default_model_mode: &snapshot.default_modes.model,
                     resolved_model_id: snapshot.resolved_defaults.model.as_deref(),
@@ -1081,7 +1093,7 @@ impl ConversationService {
                     "builtin_asset" | "user_asset" => format!("/api/assistants/{}/avatar", snapshot.assistant_id),
                     _ => snapshot.avatar.clone().unwrap_or_default(),
                 },
-                backend: snapshot.agent_backend.clone(),
+                backend: snapshot.runtime_backend.clone(),
             });
         }
 
@@ -1108,7 +1120,7 @@ impl ConversationService {
         // payloads may only carry `backend`, so we resolve defensively.
         let agent_id_from_extra = extra.get("agent_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let backend = assistant_snapshot
-            .map(|snapshot| snapshot.agent_backend.as_str())
+            .map(|snapshot| snapshot.runtime_backend.as_str())
             .filter(|value| !value.is_empty())
             .or_else(|| {
                 extra
@@ -1118,7 +1130,7 @@ impl ConversationService {
             })
             .unwrap_or_default();
         let agent_source = assistant_snapshot
-            .and_then(|snapshot| snapshot.agent_source.as_deref())
+            .map(|snapshot| snapshot.agent_source.as_str())
             .filter(|value| !value.is_empty())
             .or_else(|| extra.get("agent_source").and_then(|v| v.as_str()))
             .unwrap_or("builtin");
@@ -1130,7 +1142,7 @@ impl ConversationService {
         // explicitly — custom/extension rows have no unique lookup key
         // from `(backend, agent_source)` alone.
         let resolved_agent_id = match assistant_snapshot
-            .and_then(|snapshot| snapshot.agent_id.as_deref())
+            .map(|snapshot| snapshot.agent_id.as_str())
             .filter(|id| !id.is_empty())
             .or(agent_id_from_extra)
         {
@@ -1181,6 +1193,18 @@ impl ConversationService {
                 .map_err(|e| ConversationError::internal(format!("Failed to seed acp_session runtime state: {e}")))?;
         }
         Ok(())
+    }
+
+    async fn resolve_assistant_agent_binding(
+        &self,
+        value: &str,
+    ) -> Result<Option<AgentBindingResolution>, ConversationError> {
+        let rows = self
+            .agent_metadata_repo
+            .list_all()
+            .await
+            .map_err(|e| ConversationError::internal(format!("agent_metadata lookup failed: {e}")))?;
+        Ok(resolve_agent_binding_from_rows(&rows, value))
     }
 
     async fn resolve_assistant_snapshot(
@@ -1285,22 +1309,11 @@ impl ConversationService {
             .and_then(serde_json::Value::as_str)
             .or_else(|| extra.get("preset_rules").and_then(serde_json::Value::as_str))
             .unwrap_or_default();
-        let agent_backend = state
+        let effective_agent_id = state
             .as_ref()
-            .and_then(|row| row.agent_backend_override.clone())
-            .unwrap_or_else(|| definition.agent_backend.clone());
-        let generated_agent = if definition.source == "generated" {
-            match definition.source_ref.as_deref() {
-                Some(agent_id) => self
-                    .agent_metadata_repo
-                    .get(agent_id)
-                    .await
-                    .map_err(|e| ConversationError::internal(format!("agent_metadata lookup failed: {e}")))?,
-                None => None,
-            }
-        } else {
-            None
-        };
+            .and_then(|row| row.agent_id_override.clone())
+            .unwrap_or_else(|| definition.agent_id.clone());
+        let agent_binding = self.resolve_assistant_agent_binding(&effective_agent_id).await?;
 
         Ok(Some(AssistantSnapshot {
             assistant_definition_id: definition.definition_id,
@@ -1309,9 +1322,17 @@ impl ConversationService {
             name: definition.name,
             avatar_type: definition.avatar_type,
             avatar: definition.avatar_value,
-            agent_id: generated_agent.as_ref().map(|row| row.id.clone()),
-            agent_source: generated_agent.as_ref().map(|row| row.agent_source.clone()),
-            agent_backend,
+            agent_id: agent_binding
+                .as_ref()
+                .map(|binding| binding.agent_id.clone())
+                .unwrap_or(effective_agent_id.clone()),
+            agent_source: agent_binding
+                .as_ref()
+                .map(|binding| binding.agent_source.clone())
+                .unwrap_or_else(|| "builtin".to_owned()),
+            runtime_backend: agent_binding
+                .map(|binding| binding.runtime_backend)
+                .unwrap_or(effective_agent_id),
             rules: AssistantSnapshotRules {
                 content: if rules_content.is_empty() {
                     fallback_rules.to_owned()
@@ -1430,7 +1451,7 @@ impl ConversationService {
                 assistant_name: &snapshot.assistant_name,
                 assistant_avatar_type: &snapshot.assistant_avatar_type,
                 assistant_avatar_value: snapshot.assistant_avatar_value.as_deref(),
-                agent_backend: &snapshot.agent_backend,
+                agent_id: &snapshot.agent_id,
                 rules_content: &snapshot.rules_content,
                 default_model_mode: &snapshot.default_model_mode,
                 resolved_model_id: updates.model.or(snapshot.resolved_model_id.as_deref()),

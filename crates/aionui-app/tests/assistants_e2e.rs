@@ -79,7 +79,7 @@ async fn insert_generated_bare_assistant(
             description_i18n: "{}",
             avatar_type: "none",
             avatar_value: None,
-            agent_backend: backend,
+            agent_id: backend,
             rule_resource_type: "none",
             rule_resource_ref: None,
             rule_inline_content: None,
@@ -103,7 +103,7 @@ async fn insert_generated_bare_assistant(
             definition_id: &format!("asstdef-{assistant_key}"),
             enabled: true,
             sort_order: 5,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
@@ -471,7 +471,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
             description_i18n: &definition.description_i18n,
             avatar_type: &definition.avatar_type,
             avatar_value: definition.avatar_value.as_deref(),
-            agent_backend: &definition.agent_backend,
+            agent_id: &definition.agent_id,
             rule_resource_type: &definition.rule_resource_type,
             rule_resource_ref: definition.rule_resource_ref.as_deref(),
             rule_inline_content: definition.rule_inline_content.as_deref(),
@@ -495,7 +495,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
             definition_id: &definition.definition_id,
             enabled: false,
             sort_order: 7,
-            agent_backend_override: Some("codex"),
+            agent_id_override: Some("8e1acf31"),
             last_used_at: Some(1_725_000_001_234),
         })
         .await

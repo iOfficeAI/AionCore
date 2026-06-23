@@ -1,11 +1,16 @@
 #![warn(clippy::disallowed_types)]
 
 //! SQLite database layer: init, migrations, repository traits, and implementations.
+mod agent_binding;
 mod database;
 mod error;
 pub mod models;
 mod repository;
 
+pub use agent_binding::{
+    AgentBindingResolution, binding_resolution_for_agent, resolve_agent_binding, resolve_agent_binding_from_rows,
+    runtime_backend_for_agent,
+};
 pub use database::{
     Database, DatabaseInitError, init_database, init_database_memory, init_database_staged, maybe_copy_legacy_database,
 };

@@ -333,7 +333,7 @@ impl IConversationRepository for MockRepo {
             assistant_name: params.assistant_name.to_owned(),
             assistant_avatar_type: params.assistant_avatar_type.to_owned(),
             assistant_avatar_value: params.assistant_avatar_value.map(ToOwned::to_owned),
-            agent_backend: params.agent_backend.to_owned(),
+            agent_id: params.agent_id.to_owned(),
             rules_content: params.rules_content.to_owned(),
             default_model_mode: params.default_model_mode.to_owned(),
             resolved_model_id: params.resolved_model_id.map(ToOwned::to_owned),
@@ -568,17 +568,68 @@ impl IConversationRepository for MockRepo {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-/// Stub repository for tests — every lookup returns `None` so the
-/// service falls back to `AgentType::native_skills_dirs()` paths.
+/// Stub repository for tests. Builtin rows mirror the ids used by the
+/// migration seed so assistant id-resolution tests exercise the same
+/// boundary as the SQLite repository.
 struct StubAgentMetadataRepo;
+
+fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
+    [
+        ("2d23ff1c", Some("claude"), "acp", "Claude Code", 100),
+        ("8e1acf31", Some("codex"), "acp", "Codex CLI", 110),
+        ("cc126dd5", Some("gemini"), "acp", "Gemini CLI", 120),
+        ("632f31d2", None, "aionrs", "Aion CLI", 200),
+    ]
+    .into_iter()
+    .map(|(id, backend, agent_type, name, sort_order)| AgentMetadataRow {
+        id: id.to_owned(),
+        icon: None,
+        name: name.to_owned(),
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: backend.map(ToOwned::to_owned),
+        agent_type: agent_type.to_owned(),
+        agent_source: "builtin".to_owned(),
+        agent_source_info: None,
+        enabled: true,
+        command: backend.map(ToOwned::to_owned),
+        args: Some("[]".to_owned()),
+        env: Some("[]".to_owned()),
+        native_skills_dirs: None,
+        behavior_policy: None,
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order,
+        last_check_status: None,
+        last_check_kind: None,
+        last_check_error_code: None,
+        last_check_error_message: None,
+        last_check_guidance: None,
+        last_check_latency_ms: None,
+        last_check_at: None,
+        last_success_at: None,
+        last_failure_at: None,
+        command_override: None,
+        env_override: None,
+        created_at: 1,
+        updated_at: 1,
+    })
+    .collect()
+}
 
 #[async_trait::async_trait]
 impl IAgentMetadataRepository for StubAgentMetadataRepo {
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
-        Ok(Vec::new())
+        Ok(stub_agent_metadata_rows())
     }
-    async fn get(&self, _id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
-        Ok(None)
+    async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(stub_agent_metadata_rows().into_iter().find(|row| row.id == id))
     }
     async fn find_by_source_and_name(
         &self,
@@ -587,8 +638,10 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
-    async fn find_builtin_by_backend(&self, _backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
-        Ok(None)
+    async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(stub_agent_metadata_rows()
+            .into_iter()
+            .find(|row| row.agent_source == "builtin" && row.backend.as_deref() == Some(backend)))
     }
     async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
         Err(DbError::Init("stub".into()))
@@ -889,7 +942,7 @@ async fn upsert_test_assistant_definition(
     repo: &SqliteAssistantDefinitionRepository,
     definition_id: &str,
     assistant_key: &str,
-    agent_backend: &str,
+    agent_id: &str,
     default_model_mode: &str,
     default_permission_mode: &str,
 ) {
@@ -907,7 +960,7 @@ async fn upsert_test_assistant_definition(
         description_i18n: "{}",
         avatar_type: "emoji",
         avatar_value: Some("🤖"),
-        agent_backend,
+        agent_id,
         rule_resource_type: "builtin_asset",
         rule_resource_ref: Some(assistant_key),
         rule_inline_content: None,
@@ -1172,7 +1225,7 @@ async fn create_derives_aionrs_type_from_assistant_backend_when_type_is_missing(
             definition_id: "asstdef_aionrs_missing_type",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
@@ -1223,7 +1276,7 @@ async fn create_derives_acp_type_from_assistant_backend_when_type_is_missing() {
             definition_id: "asstdef_acp_missing_type",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
@@ -2811,7 +2864,7 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
             definition_id: "asstdef_acp_auto",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
@@ -2901,7 +2954,7 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
             definition_id: "asstdef_acp_fixed",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
@@ -2971,7 +3024,7 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
             definition_id: "asstdef_acp_ack",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
@@ -3034,7 +3087,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
             definition_id: "asstdef_aionrs_auto",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
@@ -3095,7 +3148,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
             definition_id: "asstdef_aionrs_fixed",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
@@ -4616,7 +4669,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             description_i18n: "{}",
             avatar_type: "emoji",
             avatar_value: Some("🤖"),
-            agent_backend: "claude",
+            agent_id: "claude",
             rule_resource_type: "builtin_asset",
             rule_resource_ref: Some("preset-1"),
             rule_inline_content: None,
@@ -4640,7 +4693,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             definition_id: "asstdef_preset_1",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: Some("codex"),
+            agent_id_override: Some("codex"),
             last_used_at: None,
         })
         .await
@@ -4688,8 +4741,8 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
         })
     );
     assert!(resp.extra.get("assistant_id").is_none());
-    assert!(resp.extra.get("agent_id").is_none());
-    assert!(resp.extra.get("agent_source").is_none());
+    assert_eq!(resp.extra["agent_id"], json!("8e1acf31"));
+    assert_eq!(resp.extra["agent_source"], json!("builtin"));
     assert!(resp.extra.get("preset_assistant_id").is_none());
     assert!(resp.extra.get("preset_context").is_none());
     assert!(resp.extra.get("preset_rules").is_none());
@@ -4702,7 +4755,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     let snapshot = repo.get_assistant_snapshot(&resp.id).await.unwrap().unwrap();
     assert_eq!(snapshot.assistant_definition_id, "asstdef_preset_1");
     assert_eq!(snapshot.assistant_key, "preset-1");
-    assert_eq!(snapshot.agent_backend, "codex");
+    assert_eq!(snapshot.agent_id, "8e1acf31");
     assert_eq!(snapshot.rules_content, "assistant rule body");
     assert_eq!(snapshot.default_model_mode, "auto");
     assert_eq!(snapshot.resolved_model_id.as_deref(), Some("new-model"));
@@ -4778,7 +4831,7 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
             description_i18n: "{}",
             avatar_type: "emoji",
             avatar_value: Some("🤖"),
-            agent_backend: "claude",
+            agent_id: "claude",
             rule_resource_type: "builtin_asset",
             rule_resource_ref: Some("preset-1"),
             rule_inline_content: None,
@@ -4802,7 +4855,7 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
             definition_id: "asstdef_preset_legacy_seed",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: Some("codex"),
+            agent_id_override: Some("codex"),
             last_used_at: None,
         })
         .await
@@ -4845,7 +4898,7 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
     assert_eq!(resp.extra["current_mode_id"], json!("workspace-write"));
 
     let snapshot = repo.get_assistant_snapshot(&resp.id).await.unwrap().unwrap();
-    assert_eq!(snapshot.agent_backend, "codex");
+    assert_eq!(snapshot.agent_id, "8e1acf31");
     assert_eq!(snapshot.resolved_model_id.as_deref(), Some("override-model"));
     assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
 }
@@ -4874,7 +4927,7 @@ async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
             definition_id: "asstdef_snapshot_identity",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
@@ -4903,13 +4956,13 @@ async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
         Some("codex")
     );
     assert_eq!(resp.extra["backend"], json!("codex"));
-    assert!(resp.extra.get("agent_id").is_none());
+    assert_eq!(resp.extra["agent_id"], json!("8e1acf31"));
 
     let create_calls = acp_repo.create_calls();
     assert_eq!(create_calls.len(), 1);
     assert_eq!(create_calls[0].agent_backend, "codex");
     assert_eq!(create_calls[0].agent_source, "builtin");
-    assert_ne!(create_calls[0].agent_id, "legacy-custom-agent");
+    assert_eq!(create_calls[0].agent_id, "8e1acf31");
 }
 
 #[tokio::test]
@@ -4939,7 +4992,7 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
             description_i18n: "{}",
             avatar_type: "emoji",
             avatar_value: Some("🤖"),
-            agent_backend: "claude",
+            agent_id: "claude",
             rule_resource_type: "builtin_asset",
             rule_resource_ref: Some("preset-fixed"),
             rule_inline_content: None,
@@ -4963,7 +5016,7 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
             definition_id: "asstdef_preset_fixed",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: Some("codex"),
+            agent_id_override: Some("codex"),
             last_used_at: None,
         })
         .await
@@ -5037,7 +5090,7 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
             description_i18n: "{}",
             avatar_type: "emoji",
             avatar_value: Some("🤖"),
-            agent_backend: "claude",
+            agent_id: "claude",
             rule_resource_type: "builtin_asset",
             rule_resource_ref: Some("preset-auto"),
             rule_inline_content: None,
@@ -5061,7 +5114,7 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
             definition_id: "asstdef_preset_auto",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: Some("codex"),
+            agent_id_override: Some("codex"),
             last_used_at: None,
         })
         .await

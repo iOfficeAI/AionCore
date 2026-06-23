@@ -3,7 +3,8 @@ use std::fmt::Write;
 
 use crate::error::TeamError;
 use crate::service::TeamSessionService;
-use aionui_db::models::{AssistantDefinitionRow, AssistantOverlayRow};
+use crate::service::spawn_support::resolve_runtime_backend;
+use aionui_db::models::AssistantDefinitionRow;
 
 impl TeamSessionService {
     pub(crate) async fn describe_assistant(
@@ -17,24 +18,22 @@ impl TeamSessionService {
             .await?
             .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_key}")))?;
         let overlay = self.assistant_overlay_repo.get(&definition.definition_id).await?;
+        let effective_agent_id = overlay
+            .as_ref()
+            .and_then(|row| row.agent_id_override.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(definition.agent_id.as_str());
+        let effective_backend = resolve_runtime_backend(&self.agent_metadata_repo, effective_agent_id).await?;
 
         Ok(render_assistant_description(
             &definition,
-            overlay.as_ref(),
+            &effective_backend,
             locale.unwrap_or("en-US"),
         ))
     }
 }
 
-fn render_assistant_description(
-    definition: &AssistantDefinitionRow,
-    overlay: Option<&AssistantOverlayRow>,
-    locale: &str,
-) -> String {
-    let effective_backend = overlay
-        .and_then(|row| row.agent_backend_override.as_deref())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(definition.agent_backend.as_str());
+fn render_assistant_description(definition: &AssistantDefinitionRow, effective_backend: &str, locale: &str) -> String {
     let name_map = decode_str_map(&definition.name_i18n);
     let description_map = decode_str_map(&definition.description_i18n);
     let prompts_map = decode_list_map(&definition.recommended_prompts_i18n);
