@@ -39,6 +39,7 @@ pub struct AssistantResponse {
     pub avatar: Option<String>,
     pub enabled: bool,
     pub sort_order: i32,
+    pub agent_id: String,
     pub preset_agent_type: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_skills: Vec<String>,
@@ -90,6 +91,7 @@ pub struct AssistantStateResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantEngineResponse {
+    pub agent_id: String,
     pub agent_backend: String,
 }
 
@@ -336,6 +338,7 @@ mod tests {
             avatar: None,
             enabled: true,
             sort_order: 5,
+            agent_id: "agent-gemini".into(),
             preset_agent_type: "gemini".into(),
             enabled_skills: vec![],
             custom_skill_names: vec![],

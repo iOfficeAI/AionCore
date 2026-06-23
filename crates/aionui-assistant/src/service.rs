@@ -1777,6 +1777,7 @@ fn definition_to_response(
         avatar: avatar_display_value(definition),
         enabled: state.is_none_or(|row| row.enabled),
         sort_order: state.map(|row| row.sort_order).unwrap_or(0),
+        agent_id: projection.agent_id.clone(),
         preset_agent_type: projection.runtime_backend.clone(),
         enabled_skills: decode_str_list(Some(definition.default_skill_ids.as_str()))?,
         custom_skill_names: decode_str_list(Some(definition.custom_skill_names.as_str()))?,
@@ -1845,6 +1846,7 @@ fn definition_to_detail_response(
             last_used_at: state.and_then(|row| row.last_used_at),
         },
         engine: AssistantEngineResponse {
+            agent_id: projection.agent_id.clone(),
             agent_backend: projection.runtime_backend.clone(),
         },
         rules: AssistantRulesResponse {
@@ -1894,6 +1896,7 @@ fn definition_to_detail_response(
 
 #[derive(Debug, Clone)]
 struct AssistantRuntimeProjection {
+    agent_id: String,
     runtime_backend: String,
     agent_status: AgentManagementStatus,
     agent_status_message: Option<String>,
@@ -1949,6 +1952,9 @@ fn assistant_projection_for_definition(
     let runtime_backend = agent_row
         .map(runtime_backend_for_management_row)
         .unwrap_or_else(|| fallback_runtime_backend.to_owned());
+    let agent_id = agent_row
+        .map(|row| row.id.clone())
+        .unwrap_or_else(|| effective_agent_id.to_owned());
 
     let agent_status = agent_row
         .map(|row| row.status)
@@ -1978,6 +1984,7 @@ fn assistant_projection_for_definition(
     };
 
     AssistantRuntimeProjection {
+        agent_id,
         runtime_backend,
         agent_status,
         agent_status_message,
