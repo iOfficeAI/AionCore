@@ -274,6 +274,10 @@ impl ConversationTurnOrchestrator {
             }
         }
 
+        if !turn_failed {
+            record_agent_session_success(&self.service, availability_agent_id.as_deref()).await;
+        }
+
         let was_deleting = turn_claim.release_for_turn(&turn_id);
         self.service
             .complete_released_turn(&conv_id, &turn_id, was_deleting)
@@ -326,6 +330,22 @@ async fn record_agent_session_failure(
             code,
             error = %ErrorChain(&error),
             "Failed to record agent availability session failure"
+        );
+    }
+}
+
+async fn record_agent_session_success(service: &ConversationService, agent_id: Option<&str>) {
+    let Some(agent_id) = agent_id else {
+        return;
+    };
+    let Some(feedback) = service.agent_availability_feedback() else {
+        return;
+    };
+    if let Err(error) = feedback.record_session_success(agent_id).await {
+        warn!(
+            agent_id,
+            error = %ErrorChain(&error),
+            "Failed to record agent availability session success"
         );
     }
 }

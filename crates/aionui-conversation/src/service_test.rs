@@ -174,11 +174,17 @@ struct RecordedAvailabilityFailure {
 
 #[derive(Default)]
 struct RecordingAvailabilityFeedback {
+    successes: Mutex<Vec<String>>,
     failures: Mutex<Vec<RecordedAvailabilityFailure>>,
 }
 
 #[async_trait::async_trait]
 impl AgentAvailabilityFeedbackPort for RecordingAvailabilityFeedback {
+    async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
+        self.successes.lock().unwrap().push(agent_id.to_owned());
+        Ok(())
+    }
+
     async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
         self.failures.lock().unwrap().push(RecordedAvailabilityFailure {
             agent_id: agent_id.to_owned(),
@@ -3956,6 +3962,42 @@ async fn send_message_records_agent_availability_feedback_on_send_failure() {
             message: "provider returned 401 invalid api key".into(),
         }]
     );
+}
+
+#[tokio::test]
+async fn send_message_records_agent_availability_feedback_on_send_success() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let feedback = Arc::new(RecordingAvailabilityFeedback::default());
+    svc.with_agent_availability_feedback(feedback.clone());
+
+    let mut create_req = make_create_req();
+    create_req.name = Some("Feedback Success Conversation".into());
+    create_req.source = Some(ConversationSource::Aionui);
+    create_req.extra = json!({
+        "backend": "claude",
+        "agent_id": "agent-feedback-success",
+        "agent_source": "custom",
+        "workspace": ensure_test_workspace_path()
+    });
+
+    let conv = svc.create("user_1", create_req).await.unwrap();
+
+    let scripted_agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let successes = feedback.successes.lock().unwrap().clone();
+    assert_eq!(successes, vec!["agent-feedback-success".to_owned()]);
+    assert!(feedback.failures.lock().unwrap().is_empty());
 }
 
 // ── stop_stream tests ───────────────────────────────────────────

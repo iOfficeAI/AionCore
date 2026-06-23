@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::time::Instant;
 
 use aionui_api_types::{
@@ -16,17 +13,15 @@ use aionui_db::{IProviderRepository, UpdateAgentAvailabilitySnapshotParams};
 use aionui_runtime::{
     ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, resolve_command_path,
 };
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 
 use crate::error::AgentError;
 use crate::protocol::{cli_detect, custom_agent_probe};
 use crate::registry::{AgentRegistry, guidance_for_snapshot_error_code};
 
-const DEFAULT_STARTUP_DELAY: Duration = Duration::from_secs(15);
-const DEFAULT_SCHEDULED_INTERVAL: Duration = Duration::from_secs(300);
-
 #[async_trait::async_trait]
 pub trait AgentAvailabilityFeedbackPort: Send + Sync {
+    async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError>;
     async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError>;
 }
 
@@ -46,9 +41,6 @@ pub struct AgentAvailabilityService {
     // Used to decide aionrs (built-in, no external CLI) availability: it is
     // usable only when at least one model provider is configured & enabled.
     provider_repo: Arc<dyn IProviderRepository>,
-    scheduler_started: Arc<AtomicBool>,
-    startup_delay: Duration,
-    scheduled_interval: Duration,
 }
 
 impl AgentAvailabilityService {
@@ -57,31 +49,7 @@ impl AgentAvailabilityService {
             registry,
             data_dir,
             provider_repo,
-            scheduler_started: Arc::new(AtomicBool::new(false)),
-            startup_delay: DEFAULT_STARTUP_DELAY,
-            scheduled_interval: DEFAULT_SCHEDULED_INTERVAL,
         }
-    }
-
-    pub fn start_background_scheduler(&self) {
-        if self
-            .scheduler_started
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-
-        let service = self.clone();
-        tokio::spawn(async move {
-            sleep(service.startup_delay).await;
-            loop {
-                if let Err(error) = service.run_scheduled_probe_pass().await {
-                    tracing::warn!(error = %error, "agent availability scheduled probe pass failed");
-                }
-                sleep(service.scheduled_interval).await;
-            }
-        });
     }
 
     pub async fn list_management_rows(&self) -> Vec<AgentManagementRow> {
@@ -131,32 +99,25 @@ impl AgentAvailabilityService {
         self.persist_snapshot(agent_id, &snapshot).await
     }
 
+    pub async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
+        let checked_at = now_ms();
+        let snapshot = AvailabilitySnapshot {
+            status: "online",
+            kind: "session",
+            error_code: None,
+            error_message: None,
+            latency_ms: 0,
+            checked_at,
+        };
+        self.persist_snapshot(agent_id, &snapshot).await
+    }
+
     pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
         self.registry
             .list_management_rows()
             .await
             .into_iter()
             .find(|row| row.id == id)
-    }
-
-    async fn run_scheduled_probe_pass(&self) -> Result<(), AgentError> {
-        self.registry.invalidate_and_rehydrate().await?;
-        let rows = self.registry.list_all_including_hidden().await;
-        for meta in rows
-            .into_iter()
-            .filter(|item| item.enabled && item.available && item.agent_type.supports_new_conversation())
-        {
-            let snapshot = run_probe(
-                &self.registry,
-                &self.provider_repo,
-                &meta,
-                &self.data_dir,
-                AgentSnapshotCheckKind::Scheduled,
-            )
-            .await;
-            self.persist_snapshot(&meta.id, &snapshot).await?;
-        }
-        Ok(())
     }
 
     async fn persist_snapshot(&self, id: &str, snapshot: &AvailabilitySnapshot) -> Result<(), AgentError> {
@@ -398,6 +359,10 @@ async fn try_connect_builtin_managed_agent(
 
 #[async_trait::async_trait]
 impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
+    async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
+        AgentAvailabilityService::record_session_success(self, agent_id).await
+    }
+
     async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
         AgentAvailabilityService::record_session_failure(self, agent_id, code, message).await
     }
@@ -405,8 +370,10 @@ impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::Arc;
 
+    use super::{AgentAvailabilityService, probe_aionrs_provider_readiness, run_probe};
+    use crate::registry::AgentRegistry;
     use aionui_api_types::{
         AgentHandshake, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
         AgentSource, AgentSourceInfo, BehaviorPolicy,
@@ -416,10 +383,6 @@ mod tests {
         CreateProviderParams, IAgentMetadataRepository, IProviderRepository, SqliteAgentMetadataRepository,
         SqliteProviderRepository, UpsertAgentMetadataParams, init_database_memory,
     };
-    use tokio::time::Duration;
-
-    use super::{AgentAvailabilityService, probe_aionrs_provider_readiness, run_probe};
-    use crate::registry::AgentRegistry;
 
     fn enabled_provider_params() -> CreateProviderParams<'static> {
         CreateProviderParams {
@@ -534,15 +497,16 @@ mod tests {
         );
         assert!(row.last_failure_at.is_some());
     }
+
     #[tokio::test]
-    async fn background_scheduler_persists_scheduled_snapshot() {
+    async fn record_session_success_persists_online_snapshot() {
         let db = init_database_memory().await.unwrap();
         let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
 
         repo.upsert(&UpsertAgentMetadataParams {
-            id: "agent-scheduled-check",
+            id: "agent-session-success",
             icon: None,
-            name: "Scheduled Check Agent",
+            name: "Session Success Agent",
             name_i18n: None,
             description: None,
             description_i18n: None,
@@ -572,37 +536,35 @@ mod tests {
         registry.hydrate().await.unwrap();
 
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
-        let service = AgentAvailabilityService {
-            registry: registry.clone(),
-            data_dir: std::env::temp_dir(),
-            provider_repo,
-            scheduler_started: Arc::new(AtomicBool::new(false)),
-            startup_delay: Duration::from_millis(10),
-            scheduled_interval: Duration::from_secs(60),
-        };
-        service.start_background_scheduler();
+        let service = AgentAvailabilityService::new(registry.clone(), provider_repo, std::env::temp_dir());
+        service
+            .record_session_failure(
+                "agent-session-success",
+                "session_send_failed",
+                "provider returned 401 invalid api key",
+            )
+            .await
+            .unwrap();
 
-        let mut row = None;
-        for _ in 0..20 {
-            let candidate = service
-                .list_management_rows()
-                .await
-                .into_iter()
-                .find(|item| item.id == "agent-scheduled-check")
-                .unwrap();
-            if candidate.last_check_kind == Some(AgentSnapshotCheckKind::Scheduled) {
-                row = Some(candidate);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        service.record_session_success("agent-session-success").await.unwrap();
 
-        let row = row.expect("scheduled probe should persist a snapshot");
+        let row = service
+            .list_management_rows()
+            .await
+            .into_iter()
+            .find(|item| item.id == "agent-session-success")
+            .unwrap();
 
-        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Scheduled));
-        assert!(row.last_check_status.is_some());
-        assert!(row.last_check_at.is_some());
+        assert_eq!(row.status, AgentManagementStatus::Online);
+        assert_eq!(row.last_check_status, Some(AgentSnapshotCheckStatus::Online));
+        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Session));
+        assert!(row.last_check_error_code.is_none());
+        assert!(row.last_check_error_message.is_none());
+        assert!(row.last_check_guidance.is_none());
+        assert!(row.last_success_at.is_some());
+        assert!(row.last_failure_at.is_some());
     }
+
     #[tokio::test]
     async fn managed_builtin_probe_checks_primary_binary_before_running_bridge_command() {
         let db = init_database_memory().await.unwrap();

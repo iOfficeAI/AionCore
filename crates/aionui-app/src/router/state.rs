@@ -236,7 +236,6 @@ pub async fn build_module_states(
         encryption_key,
         services.data_dir.clone(),
     );
-    agent_service.start_background_scheduler();
     services
         .conversation_service
         .with_agent_availability_feedback(agent_service.availability_feedback_port());

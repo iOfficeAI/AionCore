@@ -69,10 +69,6 @@ impl AgentService {
         &self.broadcaster
     }
 
-    pub fn start_background_scheduler(&self) {
-        self.availability.start_background_scheduler();
-    }
-
     pub fn availability_feedback_port(&self) -> Arc<dyn AgentAvailabilityFeedbackPort> {
         Arc::new(self.availability.clone())
     }

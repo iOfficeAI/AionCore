@@ -34,9 +34,8 @@ use agent_client_protocol::schema::NewSessionRequest;
 const STEP2_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Grace period for the child to exit on its own after stdin close, before
-/// we fall back to SIGKILL on the whole process group. Short because the
-/// availability scheduler runs this every 5 minutes for every agent and any
-/// cleanup latency stacks up.
+/// we fall back to SIGKILL on the whole process group. Keep this short because
+/// manual connection tests should return promptly after the ACP probe finishes.
 const PROBE_KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// Probe a custom ACP agent.
@@ -365,9 +364,9 @@ mod tests {
     /// Regression for the production leak: a probe that talks to a wrapper
     /// CLI (`npm exec ...`, etc.) historically left the wrapper's grandchild
     /// process alive when the probe returned, because cleanup relied on
-    /// `kill_on_drop(true)` which only signals the direct child. Over many
-    /// availability scheduler iterations this accumulated dozens of zombie
-    /// `openclaw-acp` processes per day.
+    /// `kill_on_drop(true)` which only signals the direct child. Repeated
+    /// connection tests could otherwise accumulate zombie `openclaw-acp`
+    /// processes.
     ///
     /// We exercise the public entry point with a CLI that exits immediately
     /// after backgrounding a long-lived grandchild — that's the production
