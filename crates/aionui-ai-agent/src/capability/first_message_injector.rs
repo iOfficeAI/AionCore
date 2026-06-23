@@ -17,18 +17,15 @@ pub struct InjectionConfig<'a> {
     pub skills: &'a [String],
     /// True iff the agent's native CLI reads skills from the workspace
     /// without needing prompt injection. Derived by callers from
-    /// `AcpBackend::native_skills_dirs().is_some()` for ACP, or hardcoded
-    /// `false` for aionrs / custom workspace scenarios.
+    /// `AcpBackend::native_skills_dirs().is_some()` for ACP.
     pub native_skill_support: bool,
-    /// True iff the user chose a custom workspace (symlinks may not exist).
-    pub custom_workspace: bool,
 }
 
 /// Produce the content string to send as the first ACP prompt.
 ///
-/// - If `native_skill_support && !custom_workspace`: **light mode** — only
-///   `preset_context` prepended as an `[Assistant Rules]` block (if present).
-///   The native CLI handles skill discovery via workspace symlinks.
+/// - If `native_skill_support`: **light mode** — only `preset_context`
+///   prepended as an `[Assistant Rules]` block (if present). The native CLI
+///   handles skill discovery via workspace links.
 /// - Else: **heavy mode** — `preset_context` + resolved skills index
 ///   injected via `prepare_first_message_with_skills_index`.
 pub async fn inject_first_message_prefix(
@@ -36,9 +33,7 @@ pub async fn inject_first_message_prefix(
     manager: &Arc<AcpSkillManager>,
     config: InjectionConfig<'_>,
 ) -> String {
-    let use_native = config.native_skill_support && !config.custom_workspace;
-
-    if use_native {
+    if config.native_skill_support {
         return match config.preset_context {
             Some(ctx) if !ctx.is_empty() => {
                 format!("[Assistant Rules]\n{ctx}\n[/Assistant Rules]\n\n{content}")
@@ -97,7 +92,6 @@ mod tests {
                 preset_context: Some("Be concise."),
                 skills: &[],
                 native_skill_support: true,
-                custom_workspace: false,
             },
         )
         .await;
@@ -119,7 +113,6 @@ mod tests {
                 preset_context: None,
                 skills: &[],
                 native_skill_support: true,
-                custom_workspace: false,
             },
         )
         .await;
@@ -139,7 +132,6 @@ mod tests {
                 preset_context: None,
                 skills: &[],
                 native_skill_support: false,
-                custom_workspace: false,
             },
         )
         .await;
@@ -159,7 +151,6 @@ mod tests {
                 preset_context: Some("Rule 1."),
                 skills: &[],
                 native_skill_support: false,
-                custom_workspace: false,
             },
         )
         .await;
@@ -196,7 +187,6 @@ mod tests {
                 preset_context: None,
                 skills: &["cron".to_owned()],
                 native_skill_support: false,
-                custom_workspace: false,
             },
         )
         .await;
@@ -206,7 +196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_workspace_forces_heavy_even_when_native_supported() {
+    async fn native_support_uses_light_mode_even_with_skills() {
         let tmp = TempDir::new().unwrap();
         let _guard = EmptyBuiltinGuard::new(tmp.path());
         let mgr = test_mgr(tmp.path());
@@ -216,14 +206,15 @@ mod tests {
             &mgr,
             InjectionConfig {
                 preset_context: Some("Custom rule"),
-                skills: &[],
+                skills: &["cron".to_owned()],
                 native_skill_support: true,
-                custom_workspace: true, // <-- overrides native
             },
         )
         .await;
 
         assert!(out.contains("[Assistant Rules]"));
         assert!(out.contains("Custom rule"));
+        assert!(!out.contains("Available Skills"));
+        assert!(out.ends_with("Do stuff"));
     }
 }

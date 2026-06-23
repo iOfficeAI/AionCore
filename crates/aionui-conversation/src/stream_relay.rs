@@ -3,7 +3,8 @@ use std::sync::Arc;
 use aionui_ai_agent::protocol::events::TipType;
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
-use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResult};
+use crate::response_middleware::{ICronService, ISkillLoadService, MessageMiddleware, MiddlewareResult};
+use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
@@ -71,6 +72,8 @@ pub struct StreamRelay {
     user_id: String,
     broadcaster: Arc<dyn EventBroadcaster>,
     cron_service: Option<Arc<dyn ICronService>>,
+    skill_resolver: Option<Arc<dyn SkillResolver>>,
+    allowed_skill_names: Vec<String>,
     runtime_state: Option<Arc<ConversationRuntimeStateService>>,
     persistence: Option<RuntimePersistenceCoordinator>,
     adapter: StreamPersistenceAdapter,
@@ -95,6 +98,8 @@ impl StreamRelay {
             user_id,
             broadcaster,
             cron_service,
+            skill_resolver: None,
+            allowed_skill_names: Vec::new(),
             runtime_state: None,
             persistence: None,
             adapter,
@@ -104,6 +109,16 @@ impl StreamRelay {
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = Some(runtime_state);
+        self
+    }
+
+    pub fn with_skill_resolver(mut self, skill_resolver: Arc<dyn SkillResolver>) -> Self {
+        self.skill_resolver = Some(skill_resolver);
+        self
+    }
+
+    pub fn with_allowed_skill_names(mut self, skill_names: Vec<String>) -> Self {
+        self.allowed_skill_names = skill_names;
         self
     }
 
@@ -571,10 +586,16 @@ impl StreamRelay {
     }
 
     async fn process_final_text(&self, text: &str) -> MiddlewareResult {
-        let middleware = MessageMiddleware::new(
+        let middleware = MessageMiddleware::new_with_skill_loader(
             self.cron_service
                 .as_ref()
                 .map(|service| Box::new(SharedCronService(Arc::clone(service))) as Box<dyn ICronService>),
+            self.skill_resolver.as_ref().map(|resolver| {
+                Box::new(SharedSkillResolver {
+                    resolver: Arc::clone(resolver),
+                    allowed_skill_names: self.allowed_skill_names.clone(),
+                }) as Box<dyn ISkillLoadService>
+            }),
         );
 
         middleware.process(text, &self.user_id, &self.conversation_id).await
@@ -646,6 +667,26 @@ impl ICronService for SharedCronService {
     }
 }
 
+struct SharedSkillResolver {
+    resolver: Arc<dyn SkillResolver>,
+    allowed_skill_names: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl ISkillLoadService for SharedSkillResolver {
+    async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
+        if self.allowed_skill_names.is_empty() {
+            return Vec::new();
+        }
+        let filtered: Vec<String> = names
+            .iter()
+            .filter(|name| self.allowed_skill_names.iter().any(|allowed| allowed == *name))
+            .cloned()
+            .collect();
+        self.resolver.load_skill_bodies(&filtered).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +699,58 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // ── run() async tests ─────────────────────────────────────────
+
+    #[derive(Default)]
+    struct RecordingSkillResolverForRelay {
+        requested: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SkillResolver for RecordingSkillResolverForRelay {
+        async fn auto_inject_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn resolve_skills(&self, _names: &[String]) -> Vec<aionui_extension::ResolvedAgentSkill> {
+            Vec::new()
+        }
+
+        async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
+            self.requested.lock().unwrap().extend(names.iter().cloned());
+            names
+                .iter()
+                .map(|name| LoadedAgentSkill {
+                    name: name.clone(),
+                    body: format!("{name} body"),
+                })
+                .collect()
+        }
+
+        async fn link_workspace_skills(
+            &self,
+            _workspace: &std::path::Path,
+            _rel_dirs: &[&str],
+            _skills: &[aionui_extension::ResolvedAgentSkill],
+        ) -> usize {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_skill_resolver_filters_requests_to_allowed_skill_names() {
+        let concrete = Arc::new(RecordingSkillResolverForRelay::default());
+        let resolver: Arc<dyn SkillResolver> = concrete.clone();
+        let loader = SharedSkillResolver {
+            resolver,
+            allowed_skill_names: vec!["cron".into()],
+        };
+
+        let loaded = loader.load_skill_bodies(&["cron".to_owned(), "pdf".to_owned()]).await;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "cron");
+        assert_eq!(concrete.requested.lock().unwrap().as_slice(), ["cron"]);
+    }
 
     #[tokio::test]
     async fn run_text_then_finish_persists_message() {

@@ -723,9 +723,12 @@ pub async fn materialize_skills_for_agent(
 /// native skills directories inside `workspace`.
 ///
 /// For each relative `skills_rel_dir` (e.g. `.claude/skills`):
-/// 1. Ensure `{workspace}/{skills_rel_dir}/` exists.
+/// 1. Resolve the target directory. Existing `{workspace}/{skills_rel_dir}/`
+///    wins; if the requested leaf is `skills` and sibling `skill` already
+///    exists, reuse that singular directory; otherwise create the requested
+///    directory.
 /// 2. For each `{ name, source_path }` in `skills`, create a symlink
-///    `{workspace}/{skills_rel_dir}/{name} -> {source_path}`.
+///    `{target_skills_dir}/{name} -> {source_path}`.
 ///
 /// Existing symlinks/files at the target name are left untouched
 /// (first-write-wins, matches the frontend's lstat-then-skip behavior
@@ -741,7 +744,7 @@ pub async fn link_workspace_skills(
 ) -> Result<usize, ExtensionError> {
     let mut created = 0usize;
     for rel in skills_rel_dirs {
-        let target_skills_dir = workspace.join(rel);
+        let target_skills_dir = resolve_workspace_skills_dir(workspace, rel).await;
         tokio::fs::create_dir_all(&target_skills_dir).await?;
 
         for skill in skills {
@@ -780,6 +783,32 @@ pub async fn link_workspace_skills(
         }
     }
     Ok(created)
+}
+
+async fn resolve_workspace_skills_dir(workspace: &Path, skills_rel_dir: &str) -> PathBuf {
+    let requested = workspace.join(skills_rel_dir);
+    if path_is_dir(&requested).await {
+        return requested;
+    }
+
+    let rel_path = Path::new(skills_rel_dir);
+    if rel_path.file_name() == Some(std::ffi::OsStr::new("skills"))
+        && let Some(parent) = rel_path.parent()
+    {
+        let singular = workspace.join(parent).join("skill");
+        if path_is_dir(&singular).await {
+            return singular;
+        }
+    }
+
+    requested
+}
+
+async fn path_is_dir(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
 }
 
 /// Resolve a skill name to its on-disk source directory using the same
@@ -2088,6 +2117,20 @@ mod tests {
         .unwrap();
     }
 
+    fn create_resolved_test_skill(source_root: &Path, name: &str) -> ResolvedAgentSkill {
+        let source_path = source_root.join(name);
+        std::fs::create_dir_all(&source_path).unwrap();
+        std::fs::write(
+            source_path.join(SKILL_MANIFEST_FILE),
+            format!("---\nname: {name}\ndescription: test\n---\nbody"),
+        )
+        .unwrap();
+        ResolvedAgentSkill {
+            name: name.to_owned(),
+            source_path,
+        }
+    }
+
     fn write_test_zip(path: &Path, entries: &[(&str, &str)]) {
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
@@ -2402,6 +2445,78 @@ mod tests {
         assert!(manifest.contains("name: my-skill"));
         let nested = std::fs::read_to_string(target.join("nested").join("data.txt")).unwrap();
         assert_eq!(nested, "payload");
+    }
+
+    #[tokio::test]
+    async fn link_workspace_skills_uses_existing_singular_skill_dir() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let source_root = tmp.path().join("sources");
+        let existing_skill_dir = workspace.join(".claude").join("skill");
+        std::fs::create_dir_all(&existing_skill_dir).unwrap();
+
+        let resolved = vec![create_resolved_test_skill(&source_root, "my-skill")];
+
+        let created = link_workspace_skills(&workspace, &[".claude/skills"], &resolved)
+            .await
+            .expect("link_workspace_skills should use existing singular skill dir");
+        assert_eq!(created, 1, "exactly one skill should be materialized");
+
+        assert!(
+            existing_skill_dir.join("my-skill").exists(),
+            "existing singular skill dir should receive the skill"
+        );
+        assert!(
+            !workspace.join(".claude").join("skills").exists(),
+            "plural skills dir should not be created when singular skill dir already exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_workspace_skills_creates_requested_dir_inside_existing_agent_dir() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let source_root = tmp.path().join("sources");
+        std::fs::create_dir_all(workspace.join(".codex")).unwrap();
+
+        let resolved = vec![create_resolved_test_skill(&source_root, "my-skill")];
+
+        let created = link_workspace_skills(&workspace, &[".codex/skills"], &resolved)
+            .await
+            .expect("link_workspace_skills should create missing skills dir");
+        assert_eq!(created, 1, "exactly one skill should be materialized");
+
+        assert!(
+            workspace.join(".codex/skills/my-skill").is_dir(),
+            "missing skills dir should be created under the existing agent dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_workspace_skills_prefers_existing_plural_dir_over_singular_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let source_root = tmp.path().join("sources");
+        let plural_dir = workspace.join(".gemini").join("skills");
+        let singular_dir = workspace.join(".gemini").join("skill");
+        std::fs::create_dir_all(&plural_dir).unwrap();
+        std::fs::create_dir_all(&singular_dir).unwrap();
+
+        let resolved = vec![create_resolved_test_skill(&source_root, "my-skill")];
+
+        let created = link_workspace_skills(&workspace, &[".gemini/skills"], &resolved)
+            .await
+            .expect("link_workspace_skills should prefer the requested existing dir");
+        assert_eq!(created, 1, "exactly one skill should be materialized");
+
+        assert!(
+            plural_dir.join("my-skill").is_dir(),
+            "existing plural skills dir should receive the skill"
+        );
+        assert!(
+            !singular_dir.join("my-skill").exists(),
+            "singular sibling should remain untouched when requested dir exists"
+        );
     }
 
     /// Windows-only: directory linking must go through an NTFS junction
