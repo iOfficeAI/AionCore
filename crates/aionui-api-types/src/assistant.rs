@@ -425,6 +425,7 @@ mod tests {
             "name": "X",
             "enabled": true,
             "sort_order": 7,                   // snake required field
+            "agent_id": "agent-gemini",        // snake required field
             "preset_agent_type": "gemini",     // snake required field
             "agent_status": "online",       // snake required field
             "team_selectable": true,           // snake required field
