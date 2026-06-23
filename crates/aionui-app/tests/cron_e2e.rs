@@ -230,7 +230,6 @@ async fn cj3b_create_accepts_workspace_with_whitespace_segment() {
         "created_by": "user",
         "execution_mode": "new_conversation",
         "agent_config": {
-            "backend": "acp",
             "name": "Cron Agent",
             "assistant_id": DEFAULT_CRON_ASSISTANT_ID,
             "workspace": workspace.to_string_lossy()
@@ -260,7 +259,6 @@ async fn cj3c_create_rejects_missing_workspace_path() {
         "created_by": "user",
         "execution_mode": "new_conversation",
         "agent_config": {
-            "backend": "claude",
             "name": "Claude Code",
             "assistant_id": DEFAULT_CRON_ASSISTANT_ID,
             "workspace": "/tmp/cron-job-workspace-missing-path"
@@ -326,6 +324,7 @@ async fn cj5_get_nonexistent() {
 async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_assistant(&mut app, &token, &csrf).await;
     let cron_repo = SqliteCronRepository::new(services.database.pool().clone());
     let now = aionui_common::now_ms();
     let dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", aionui_common::generate_short_id()));
@@ -346,8 +345,8 @@ async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
             execution_mode: "new_conversation".into(),
             agent_config: Some(
                 json!({
-                    "backend": "acp",
                     "name": "Cron Agent",
+                    "assistant_id": DEFAULT_CRON_ASSISTANT_ID,
                     "workspace": workspace.to_string_lossy()
                 })
                 .to_string(),
@@ -709,7 +708,6 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
             "created_by": "user",
             "execution_mode": "new_conversation",
             "agent_config": {
-                "backend": "codex",
                 "name": "Cron MCP Assistant",
                 "assistant_id": "u-fixed-mcp"
             }
