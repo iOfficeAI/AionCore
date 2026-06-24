@@ -418,6 +418,13 @@ async fn list_populated_excludes_extension_assistants() {
     assert!(sources.contains(&"bare"));
     assert!(sources.contains(&"builtin"));
     assert!(!sources.contains(&"extension"));
+    let office = find_id(&json["data"], "builtin-office").expect("builtin-office missing from assistant list");
+    assert_eq!(office["agent_id"], "8e1acf31");
+    assert_eq!(office["agent"]["type"], "acp");
+    assert_eq!(office["agent"]["source"], "builtin");
+    assert_eq!(office["agent"]["acp_backend"], "codex");
+    assert!(office["agent"].get("backend").is_none());
+    assert!(office["agent"].get("id").is_none());
 }
 
 #[tokio::test]
@@ -600,6 +607,8 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
     assert_eq!(data["state"]["sort_order"], 7);
     assert_eq!(data["engine"]["agent_id"], "8e1acf31");
     assert_eq!(data["engine"]["agent"]["acp_backend"], "codex");
+    assert!(data["engine"]["agent"].get("backend").is_none());
+    assert!(data["engine"]["agent"].get("id").is_none());
     assert_eq!(data["engine"]["agent"]["type"], "acp");
     assert_eq!(data["rules"]["content"], "user rule body");
     assert_eq!(data["rules"]["storage_mode"], "user_file");

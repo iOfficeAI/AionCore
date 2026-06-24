@@ -26,7 +26,6 @@ pub enum AssistantSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantAgentResponse {
-    pub id: String,
     #[serde(rename = "type")]
     pub r#type: AgentType,
     pub source: AgentSource,
@@ -353,7 +352,11 @@ mod tests {
             enabled: true,
             sort_order: 5,
             agent_id: "agent-gemini".into(),
-            agent: None,
+            agent: Some(AssistantAgentResponse {
+                r#type: AgentType::Acp,
+                source: AgentSource::Builtin,
+                acp_backend: Some("gemini".into()),
+            }),
             enabled_skills: vec![],
             custom_skill_names: vec![],
             disabled_builtin_skills: vec![],
@@ -373,6 +376,9 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("preset_agent_type").is_none());
         assert_eq!(json["agent_id"], "agent-gemini");
+        assert!(json["agent"].get("id").is_none());
+        assert!(json["agent"].get("backend").is_none());
+        assert_eq!(json["agent"]["acp_backend"], "gemini");
         assert_eq!(json["sort_order"], 5);
         assert_eq!(json["last_used_at"], 1234);
     }

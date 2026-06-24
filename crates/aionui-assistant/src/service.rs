@@ -1981,7 +1981,6 @@ fn assistant_projection_for_definition(
         .map(|row| row.id.clone())
         .unwrap_or_else(|| effective_agent_id.to_owned());
     let agent = agent_row.map(|row| AssistantAgentResponse {
-        id: row.id.clone(),
         r#type: row.agent_type,
         source: row.agent_source,
         acp_backend: row.backend.clone(),
