@@ -45,11 +45,11 @@ mod tests {
 
     fn error_outcome(code: Option<AgentErrorCode>) -> RelayOutcome {
         RelayOutcome {
-            system_responses: Vec::new(),
             terminal: RelayTerminal::Error {
                 code,
                 retryable: Some(true),
             },
+            ..RelayOutcome::default()
         }
     }
 
@@ -98,8 +98,8 @@ mod tests {
     #[test]
     fn channel_closed_does_not_evict_by_default() {
         let outcome = RelayOutcome {
-            system_responses: Vec::new(),
             terminal: RelayTerminal::ChannelClosed,
+            ..RelayOutcome::default()
         };
         assert_eq!(
             AgentHealthPolicy::decide(AgentType::Acp, &outcome, RuntimeLifecycleState::Active),

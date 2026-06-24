@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::protocol::events::TipType;
+use aionui_ai_agent::protocol::events::{ErrorEventData, TipType};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
 use crate::response_middleware::{ICronService, ISkillLoadService, MessageMiddleware, MiddlewareResult};
@@ -23,11 +23,38 @@ use tracing::{debug, info, warn};
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
 
+/// Conservative summary of what happened during one agent send attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnAttemptSummary {
+    pub saw_visible_output: bool,
+    pub saw_tool_or_side_effect: bool,
+    pub persisted_assistant_output: bool,
+    pub terminal_error: Option<ErrorEventData>,
+    pub terminal_error_deferred: bool,
+}
+
+impl TurnAttemptSummary {
+    pub fn safe_to_auto_replay(&self) -> bool {
+        !self.saw_visible_output && !self.saw_tool_or_side_effect && !self.persisted_assistant_output
+    }
+
+    pub fn merge(&mut self, other: &TurnAttemptSummary) {
+        self.saw_visible_output |= other.saw_visible_output;
+        self.saw_tool_or_side_effect |= other.saw_tool_or_side_effect;
+        self.persisted_assistant_output |= other.persisted_assistant_output;
+        if other.terminal_error.is_some() {
+            self.terminal_error = other.terminal_error.clone();
+        }
+        self.terminal_error_deferred |= other.terminal_error_deferred;
+    }
+}
+
 /// Result returned after a relay turn has fully drained and finalized.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelayOutcome {
     pub system_responses: Vec<String>,
     pub terminal: RelayTerminal,
+    pub attempt: TurnAttemptSummary,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -78,6 +105,7 @@ pub struct StreamRelay {
     persistence: Option<RuntimePersistenceCoordinator>,
     adapter: StreamPersistenceAdapter,
     complete_turn: bool,
+    defer_clean_terminal_errors: bool,
 }
 
 impl StreamRelay {
@@ -104,6 +132,7 @@ impl StreamRelay {
             persistence: None,
             adapter,
             complete_turn: true,
+            defer_clean_terminal_errors: false,
         }
     }
 
@@ -130,6 +159,11 @@ impl StreamRelay {
 
     pub fn with_turn_completion(mut self, enabled: bool) -> Self {
         self.complete_turn = enabled;
+        self
+    }
+
+    pub fn with_defer_clean_terminal_errors(mut self, enabled: bool) -> Self {
+        self.defer_clean_terminal_errors = enabled;
         self
     }
 
@@ -185,6 +219,7 @@ impl StreamRelay {
         let mut first_agent_event_logged = false;
         let mut first_visible_output_logged = false;
         let mut send_error_done = send_error_rx.is_none();
+        let mut attempt = TurnAttemptSummary::default();
 
         loop {
             let recv_result = if send_error_done {
@@ -246,6 +281,9 @@ impl StreamRelay {
                                     "StreamRelay received first visible output"
                                 );
                             }
+                            if !data.content.is_empty() {
+                                attempt.saw_visible_output = true;
+                            }
 
                             let segment = active_thinking.get_or_insert_with(|| ThinkingSegmentState {
                                 id: Self::mint_segment_msg_id(&mut used_primary_segment_msg_id, &self.msg_id),
@@ -264,6 +302,9 @@ impl StreamRelay {
                                     elapsed_ms = now_ms().saturating_sub(started_at),
                                     "StreamRelay received first visible output"
                                 );
+                            }
+                            if !data.content.is_empty() {
+                                attempt.saw_visible_output = true;
                             }
 
                             let segment = active_text.get_or_insert_with(|| TextSegmentState {
@@ -311,6 +352,33 @@ impl StreamRelay {
                                 }
                             }
 
+                            let defer_clean_error = self.defer_clean_terminal_errors
+                                && matches!(
+                                    terminal,
+                                    RelayTerminal::Error {
+                                        retryable: Some(true),
+                                        ..
+                                    }
+                                )
+                                && terminal.code() != Some(AgentErrorCode::UserLlmProviderModelNotFound)
+                                && attempt.safe_to_auto_replay();
+
+                            if defer_clean_error {
+                                if let AgentStreamEvent::Error(data) = &event {
+                                    attempt.terminal_error = Some(data.clone());
+                                    attempt.terminal_error_deferred = true;
+                                }
+                                info!(
+                                    event_type,
+                                    elapsed_ms, "StreamRelay deferred clean terminal error for possible auto replay"
+                                );
+                                break RelayOutcome {
+                                    system_responses: Vec::new(),
+                                    terminal,
+                                    attempt,
+                                };
+                            }
+
                             if deleting {
                                 debug!("Skipping terminal DB finalization because conversation is deleting");
                             } else {
@@ -327,14 +395,22 @@ impl StreamRelay {
                                 .await;
                             }
                             self.forward_to_websocket(&event);
-                            let outcome = if deleting {
+                            if let AgentStreamEvent::Error(data) = &event {
+                                attempt.terminal_error = Some(data.clone());
+                            }
+                            let mut outcome = if deleting {
                                 RelayOutcome {
                                     system_responses: Vec::new(),
                                     terminal,
+                                    attempt: attempt.clone(),
                                 }
                             } else {
                                 self.finalize(&full_text_buffer, &text_segments, &event, terminal).await
                             };
+                            outcome.attempt = attempt.clone();
+                            if !full_text_buffer.is_empty() {
+                                outcome.attempt.persisted_assistant_output = true;
+                            }
                             if self.complete_turn && !deleting {
                                 self.adapter
                                     .complete_conversation(&self.broadcaster, &self.turn_id, None)
@@ -343,6 +419,7 @@ impl StreamRelay {
                             break outcome;
                         }
                         AgentStreamEvent::ToolCall(data) => {
+                            attempt.saw_tool_or_side_effect = true;
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
@@ -350,6 +427,7 @@ impl StreamRelay {
                             self.adapter.persist_tool_call(data).await;
                         }
                         AgentStreamEvent::AcpToolCall(data) => {
+                            attempt.saw_tool_or_side_effect = true;
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
@@ -357,6 +435,7 @@ impl StreamRelay {
                             self.adapter.persist_acp_tool_call(data).await;
                         }
                         AgentStreamEvent::ToolGroup(entries) => {
+                            attempt.saw_tool_or_side_effect = true;
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
@@ -364,10 +443,19 @@ impl StreamRelay {
                             self.adapter.persist_tool_group(entries).await;
                         }
                         AgentStreamEvent::Tips(data) => {
+                            if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
+                                attempt.saw_visible_output = true;
+                            }
                             self.forward_to_websocket(&event);
                             if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
                                 self.adapter.persist_tip(data).await;
                             }
+                        }
+                        AgentStreamEvent::CronTrigger(_)
+                        | AgentStreamEvent::Permission(_)
+                        | AgentStreamEvent::AcpPermission(_) => {
+                            attempt.saw_tool_or_side_effect = true;
+                            self.forward_to_websocket(&event);
                         }
                         _ => {
                             self.forward_to_websocket(&event);
@@ -391,10 +479,11 @@ impl StreamRelay {
                             .await;
                     }
                     // Channel closed without finish/error — still finalize
-                    let outcome = if deleting {
+                    let mut outcome = if deleting {
                         RelayOutcome {
                             system_responses: Vec::new(),
                             terminal: RelayTerminal::ChannelClosed,
+                            attempt: attempt.clone(),
                         }
                     } else {
                         self.finalize(
@@ -405,6 +494,10 @@ impl StreamRelay {
                         )
                         .await
                     };
+                    outcome.attempt = attempt.clone();
+                    if !full_text_buffer.is_empty() {
+                        outcome.attempt.persisted_assistant_output = true;
+                    }
                     if self.complete_turn && !deleting {
                         self.adapter
                             .complete_conversation(&self.broadcaster, &self.turn_id, None)
@@ -520,6 +613,7 @@ impl StreamRelay {
         let mut outcome = RelayOutcome {
             system_responses: Vec::new(),
             terminal,
+            attempt: TurnAttemptSummary::default(),
         };
         let status = match event {
             AgentStreamEvent::Error(_) => "error",
@@ -899,6 +993,154 @@ mod tests {
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Something went wrong");
         assert_eq!(content["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn clean_retryable_error_can_be_deferred_for_replay() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, rx) = broadcast::channel(8);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "msg-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        )
+        .with_turn_completion(false)
+        .with_defer_clean_terminal_errors(true);
+
+        tx.send(AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(
+            outcome.terminal,
+            RelayTerminal::Error {
+                code: Some(AgentErrorCode::UnknownUpstreamError),
+                retryable: Some(true),
+            }
+        );
+        assert!(outcome.attempt.safe_to_auto_replay());
+        assert!(
+            ws_rx.try_recv().is_err(),
+            "clean first-attempt errors stay hidden before replay"
+        );
+        assert!(
+            repo.take_inserts().is_empty(),
+            "no assistant error tip is persisted before replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_before_retryable_error_is_not_clean_for_replay() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, rx) = broadcast::channel(8);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "msg-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        )
+        .with_turn_completion(false)
+        .with_defer_clean_terminal_errors(true);
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "partial".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+
+        assert!(outcome.attempt.saw_visible_output);
+        assert!(!outcome.attempt.safe_to_auto_replay());
+        let mut saw_error = false;
+        while let Ok(event) = ws_rx.try_recv() {
+            saw_error |= event.data["type"] == "error";
+        }
+        assert!(saw_error, "unsafe errors are still broadcast");
+    }
+
+    #[tokio::test]
+    async fn tool_call_before_retryable_error_is_not_clean_for_replay() {
+        use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, rx) = broadcast::channel(8);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "msg-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        )
+        .with_turn_completion(false)
+        .with_defer_clean_terminal_errors(true);
+
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "call-1".into(),
+            name: "write_file".into(),
+            args: serde_json::json!({}),
+            status: ToolCallStatus::Running,
+            input: None,
+            output: None,
+            description: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+
+        assert!(outcome.attempt.saw_tool_or_side_effect);
+        assert!(!outcome.attempt.safe_to_auto_replay());
     }
 
     #[tokio::test]

@@ -71,6 +71,7 @@ mod tests {
         let outcome = RelayOutcome {
             system_responses: vec!["one".into(), "two".into()],
             terminal: RelayTerminal::Finish,
+            ..RelayOutcome::default()
         };
 
         assert_eq!(
@@ -91,6 +92,7 @@ mod tests {
                 code: Some(AgentErrorCode::UnknownUpstreamError),
                 retryable: Some(true),
             },
+            ..RelayOutcome::default()
         };
 
         assert_eq!(
@@ -105,6 +107,7 @@ mod tests {
         let outcome = RelayOutcome {
             system_responses: vec!["next".into()],
             terminal: RelayTerminal::Finish,
+            ..RelayOutcome::default()
         };
 
         assert_eq!(
@@ -119,6 +122,7 @@ mod tests {
         let outcome = RelayOutcome {
             system_responses: vec!["next".into()],
             terminal: RelayTerminal::Finish,
+            ..RelayOutcome::default()
         };
 
         assert_eq!(
