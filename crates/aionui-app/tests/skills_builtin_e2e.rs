@@ -120,7 +120,12 @@ async fn builtin_auto_lists_entries_from_embedded_corpus() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let arr = json["data"].as_array().unwrap();
-    assert!(arr.len() >= 4, "expected ≥4 auto-inject entries, got {}", arr.len());
+    assert!(arr.len() >= 3, "expected ≥3 auto-inject entries, got {}", arr.len());
+    let names: Vec<&str> = arr.iter().filter_map(|item| item["name"].as_str()).collect();
+    assert!(
+        !names.contains(&"aionui-skills"),
+        "aionui-skills should not be shipped as an auto-inject builtin skill: {names:?}",
+    );
     for item in arr {
         assert!(item["name"].is_string());
         assert!(item["description"].is_string());

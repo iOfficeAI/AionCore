@@ -1,6 +1,7 @@
 ---
 name: aionui-troubleshooting
-description: Diagnose a running AionUi installation — locate and inspect conversations (including stuck/running ones), read aioncore logs, check LLM provider health, list scheduled cron jobs and their last run status, inspect teams and member state, and check MCP server health. Use when the user reports that AionUi is misbehaving: a conversation is stuck or errored, an LLM/provider call is failing, a scheduled task did not run, an MCP server has no tools, a team member is hung, or they just ask "what's wrong with AionUi" / "排查一下 aionui". Engine-agnostic — works the same for claude / aionrs / gemini / openclaw conversations.
+description: >-
+  Diagnose a running AionUi installation — locate and inspect conversations (including stuck/running ones), read aioncore logs, check LLM provider health, list scheduled cron jobs and their last run status, inspect teams and member state, and check MCP server health. Use when the user reports that AionUi is misbehaving: a conversation is stuck or errored, an LLM/provider call is failing, a scheduled task did not run, an MCP server has no tools, a team member is hung, or they just ask "what's wrong with AionUi" / "排查一下 aionui". Engine-agnostic — works the same for claude / aionrs / gemini / openclaw conversations.
 ---
 
 > **⚠️ Platform note — read before running any command.** The shell snippets in this skill are written for **macOS / Linux** (bash/zsh). Always check which OS you are on first. On **Windows** do **not** run them verbatim — the underlying tool/CLI commands are usually cross-platform, but the surrounding shell syntax is not. Translate it to PowerShell before running:

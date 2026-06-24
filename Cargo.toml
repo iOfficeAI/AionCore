@@ -25,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.35"
+version = "0.1.36"
 edition = "2024"
 license = "MIT"
 
@@ -53,12 +53,12 @@ aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.32" }
-aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.32" }
-aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.32" }
-aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.32" }
-aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.32" }
-aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.32" }
+aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.33" }
+aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.33" }
+aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.33" }
+aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.33" }
+aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.33" }
+aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.33" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
@@ -70,6 +70,7 @@ http = "1"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 
 # Async utilities
 futures-util = "0.3"
