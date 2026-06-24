@@ -9,7 +9,7 @@ use std::time::Duration;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AcpError, AgentError, AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::{AcpError, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
@@ -663,36 +663,59 @@ struct RuntimeStateSaveCall {
 #[derive(Default)]
 struct StubAcpSessionRepo {
     runtime_state_saves: Mutex<Vec<RuntimeStateSaveCall>>,
+    session_id: Mutex<Option<String>>,
 }
 
 impl StubAcpSessionRepo {
+    fn with_session_id(session_id: impl Into<String>) -> Self {
+        Self {
+            runtime_state_saves: Mutex::new(Vec::new()),
+            session_id: Mutex::new(Some(session_id.into())),
+        }
+    }
+
     fn runtime_state_saves(&self) -> Vec<RuntimeStateSaveCall> {
         self.runtime_state_saves.lock().unwrap().clone()
+    }
+
+    fn row_for(&self, conversation_id: &str) -> AcpSessionRow {
+        AcpSessionRow {
+            conversation_id: conversation_id.to_owned(),
+            agent_backend: "codex".into(),
+            agent_source: "builtin".into(),
+            agent_id: "codex".into(),
+            session_id: self.session_id.lock().unwrap().clone(),
+            session_status: "idle".into(),
+            session_config: "{}".into(),
+            last_active_at: None,
+            suspended_at: None,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl IAcpSessionRepository for StubAcpSessionRepo {
-    async fn get(&self, _conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
-        Ok(None)
+    async fn get(&self, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
+        Ok(Some(self.row_for(conversation_id)))
     }
-    async fn create(&self, _params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
+    async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
         // Return a synthetic row so `ConversationService::create` can
         // succeed for ACP conversations in unit tests.
         Ok(AcpSessionRow {
-            conversation_id: "stub".into(),
-            agent_backend: "stub".into(),
-            agent_source: "stub".into(),
-            agent_id: "stub".into(),
-            session_id: None,
+            conversation_id: params.conversation_id.to_owned(),
+            agent_backend: params.agent_backend.to_owned(),
+            agent_source: params.agent_source.to_owned(),
+            agent_id: params.agent_id.to_owned(),
+            session_id: self.session_id.lock().unwrap().clone(),
             session_status: "idle".into(),
             session_config: "{}".into(),
             last_active_at: None,
             suspended_at: None,
         })
     }
-    async fn update_session_id(&self, _conversation_id: &str, _session_id: &str) -> Result<bool, DbError> {
-        Ok(false)
+    async fn update_session_id(&self, _conversation_id: &str, session_id: &str) -> Result<bool, DbError> {
+        *self.session_id.lock().unwrap() = Some(session_id.to_owned());
+        Ok(true)
     }
     async fn delete(&self, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)
@@ -2015,6 +2038,81 @@ impl MockTaskManager {
 
     fn kill_records(&self) -> Vec<(String, Option<AgentKillReason>)> {
         self.kill_records.lock().unwrap().clone()
+    }
+}
+
+struct RebuildingScriptedTaskManager {
+    agents: Mutex<VecDeque<AgentInstance>>,
+    build_count: AtomicUsize,
+    kill_count: AtomicUsize,
+    captured_options: Mutex<Vec<BuildTaskOptions>>,
+}
+
+impl RebuildingScriptedTaskManager {
+    fn new(agents: Vec<AgentInstance>) -> Self {
+        Self {
+            agents: Mutex::new(agents.into()),
+            build_count: AtomicUsize::new(0),
+            kill_count: AtomicUsize::new(0),
+            captured_options: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn build_count(&self) -> usize {
+        self.build_count.load(Ordering::SeqCst)
+    }
+
+    fn kill_count(&self) -> usize {
+        self.kill_count.load(Ordering::SeqCst)
+    }
+
+    fn captured_options(&self) -> Vec<BuildTaskOptions> {
+        self.captured_options.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for RebuildingScriptedTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        None
+    }
+
+    async fn get_or_build_task(
+        &self,
+        _conversation_id: &str,
+        options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        self.build_count.fetch_add(1, Ordering::SeqCst);
+        self.captured_options.lock().unwrap().push(options);
+        self.agents
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| AgentError::bad_gateway("no scripted agent left"))
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        self.kill_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        conversation_id: &str,
+        reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let _ = self.kill(conversation_id, reason);
+        Box::pin(std::future::ready(()))
+    }
+
+    async fn clear(&self) {}
+
+    fn active_count(&self) -> usize {
+        0
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -3763,6 +3861,115 @@ async fn send_message_injects_send_error_when_runtime_terminal_missing() {
     let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
     assert_eq!(content["type"], "error");
     assert_eq!(content["error"]["code"], "USER_LLM_PROVIDER_AUTH_FAILED");
+}
+
+#[tokio::test]
+async fn send_message_auto_replays_clean_retryable_acp_error_once() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData { content: "done".into() }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first.clone()),
+        AgentInstance::Mock(second.clone()),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 2);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert_eq!(first.sent_contents(), vec!["Hello"]);
+    assert_eq!(second.sent_contents(), vec!["Hello"]);
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let users: Vec<_> = messages
+        .iter()
+        .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("right"))
+        .collect();
+    let assistants: Vec<_> = messages
+        .iter()
+        .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("left"))
+        .collect();
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(users.len(), 1, "auto replay must not insert the user message again");
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(
+        tips.len(),
+        0,
+        "first clean retryable error stays hidden when replay succeeds"
+    );
+}
+
+#[tokio::test]
+async fn auto_replay_rebuild_keeps_existing_acp_session_id_in_build_options() {
+    let acp_session_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-existing"));
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_session_repo,
+    );
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 2);
+    for options in options {
+        match options.context.kind {
+            AgentSessionKind::Acp(ctx) => {
+                assert_eq!(ctx.session_id.as_deref(), Some("sess-existing"));
+            }
+            AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+        }
+    }
 }
 
 // ── stop_stream tests ───────────────────────────────────────────
