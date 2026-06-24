@@ -1080,7 +1080,6 @@ impl CronService {
             is_preset: None,
             assistant_id: config.assistant_id,
             custom_agent_id: None,
-            preset_agent_type: None,
             mode: config.mode,
             model_id: config.model_id,
             model: normalize_model(config.model, runtime_agent_type)?,
@@ -1684,7 +1683,6 @@ mod tests {
         let err = serde_json::from_value::<aionui_api_types::CronAgentConfigWriteDto>(serde_json::json!({
             "name": "Helper",
             "custom_agent_id": "legacy-assistant",
-            "preset_agent_type": "claude",
             "mode": "default",
             "model_id": "claude-sonnet-4",
         }))
@@ -1813,7 +1811,6 @@ mod tests {
             is_preset: None,
             assistant_id: Some("assistant-1".into()),
             custom_agent_id: None,
-            preset_agent_type: None,
             mode: Some("default".into()),
             model_id: Some("claude-sonnet-4".into()),
             model: None,
@@ -1847,7 +1844,6 @@ mod tests {
 
         assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
         assert!(config.custom_agent_id.is_none());
-        assert!(config.preset_agent_type.is_none());
         assert!(config.is_preset.is_none());
     }
 
@@ -1856,7 +1852,6 @@ mod tests {
         let err = serde_json::from_value::<aionui_api_types::CronAgentConfigWriteDto>(serde_json::json!({
             "name": "Helper",
             "custom_agent_id": "legacy-assistant",
-            "preset_agent_type": "claude",
             "mode": "default",
             "model_id": "claude-sonnet-4",
         }))

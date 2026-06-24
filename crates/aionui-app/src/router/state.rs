@@ -318,7 +318,7 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
     let override_repo: Arc<dyn IAssistantOverrideRepository> =
         Arc::new(SqliteAssistantOverrideRepository::new(pool.clone()));
     // Used by `AssistantService::resolve_default_agent_type` to infer a
-    // working `preset_agent_type` from the configured provider list when
+    // working `agent_id` from the configured provider list when
     // the caller does not supply one (ELECTRON-1J1 / 1KV).
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let builtin = Arc::new(BuiltinAssistantRegistry::load());

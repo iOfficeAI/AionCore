@@ -14,7 +14,6 @@ pub struct AssistantRow {
     pub name: String,
     pub description: Option<String>,
     pub avatar: Option<String>,
-    pub preset_agent_type: String,
     pub enabled_skills: Option<String>,
     pub custom_skill_names: Option<String>,
     pub disabled_builtin_skills: Option<String>,
@@ -29,16 +28,12 @@ pub struct AssistantRow {
 
 /// Row mapping for the `assistant_overrides` table (per-assistant user state).
 ///
-/// `preset_agent_type` is `Some(_)` when the user has switched the main agent
-/// on a built-in assistant (which cannot be mutated at its source). `None`
-/// means "inherit from the built-in / user row".
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantOverrideRow {
     pub assistant_id: String,
     pub enabled: bool,
     pub sort_order: i32,
     pub last_used_at: Option<TimestampMs>,
-    pub preset_agent_type: Option<String>,
     pub updated_at: TimestampMs,
 }
 
@@ -114,7 +109,6 @@ pub struct CreateAssistantParams<'a> {
     pub name: &'a str,
     pub description: Option<&'a str>,
     pub avatar: Option<&'a str>,
-    pub preset_agent_type: &'a str,
     pub enabled_skills: Option<&'a str>,
     pub custom_skill_names: Option<&'a str>,
     pub disabled_builtin_skills: Option<&'a str>,
@@ -133,7 +127,6 @@ pub struct UpdateAssistantParams<'a> {
     pub name: Option<&'a str>,
     pub description: Option<Option<&'a str>>,
     pub avatar: Option<Option<&'a str>>,
-    pub preset_agent_type: Option<&'a str>,
     pub enabled_skills: Option<Option<&'a str>>,
     pub custom_skill_names: Option<Option<&'a str>>,
     pub disabled_builtin_skills: Option<Option<&'a str>>,
@@ -146,16 +139,12 @@ pub struct UpdateAssistantParams<'a> {
 
 /// Upsert parameters for `IAssistantOverrideRepository::upsert`.
 ///
-/// `preset_agent_type` uses `Option<Option<&str>>`: outer `None` keeps the
-/// current value, outer `Some(inner)` writes `inner` (which itself may be
-/// `None` to clear the override).
 #[derive(Debug, Clone, Default)]
 pub struct UpsertOverrideParams<'a> {
     pub assistant_id: &'a str,
     pub enabled: bool,
     pub sort_order: i32,
     pub last_used_at: Option<TimestampMs>,
-    pub preset_agent_type: Option<Option<&'a str>>,
 }
 
 /// Insert-or-update parameters for `assistant_definitions`.

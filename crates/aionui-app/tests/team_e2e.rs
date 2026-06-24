@@ -38,7 +38,7 @@ async fn ensure_default_team_assistant(app: &mut axum::Router, token: &str, csrf
         json!({
             "id": DEFAULT_TEAM_ASSISTANT_ID,
             "name": "Team E2E Assistant",
-            "preset_agent_type": "claude"
+            "agent_id": "2d23ff1c"
         }),
         token,
         csrf,

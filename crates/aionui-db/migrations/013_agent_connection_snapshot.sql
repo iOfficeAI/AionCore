@@ -21,7 +21,7 @@ ALTER TABLE agent_metadata ADD COLUMN env_override TEXT;
 
 -- Assistant/agent unification: assistant storage now binds to the concrete
 -- agent catalog row. Runtime backend labels remain compatibility/runtime
--- fields on legacy mirrors, conversation extra, and acp_session.
+-- fields on legacy mirrors and conversation extra.
 --
 -- Assistant identity boundary:
 -- - `assistant_definitions.id` is the internal definition row id.
@@ -203,6 +203,116 @@ CREATE INDEX IF NOT EXISTS idx_assistant_overlays_agent_id_override
 
 CREATE INDEX IF NOT EXISTS idx_conversation_assistant_snapshots_agent_id
     ON conversation_assistant_snapshots(agent_id);
+
+-- ACP sessions persist only the concrete agent catalog row. Historical rows
+-- may have only `agent_backend`; recover that into `agent_id` before dropping
+-- the ambiguous runtime label column.
+DROP INDEX IF EXISTS idx_acp_session_status;
+DROP INDEX IF EXISTS idx_acp_session_suspended;
+DROP INDEX IF EXISTS idx_acp_session_agent_id;
+
+CREATE TABLE _acp_session_new (
+    conversation_id TEXT PRIMARY KEY,
+    agent_source    TEXT    NOT NULL,
+    agent_id        TEXT    NOT NULL,
+    session_id      TEXT,
+    session_status  TEXT    NOT NULL DEFAULT 'idle',
+    session_config  TEXT    NOT NULL DEFAULT '{}',
+    last_active_at  INTEGER,
+    suspended_at    INTEGER
+);
+
+INSERT INTO _acp_session_new (
+    conversation_id, agent_source, agent_id, session_id, session_status,
+    session_config, last_active_at, suspended_at
+)
+SELECT
+    conversation_id,
+    agent_source,
+    COALESCE(
+        NULLIF(agent_id, ''),
+        (
+            SELECT am.id
+            FROM agent_metadata am
+            WHERE am.id = acp_session.agent_backend
+               OR am.backend = acp_session.agent_backend
+               OR am.agent_type = acp_session.agent_backend
+            ORDER BY
+                CASE am.agent_source
+                    WHEN 'builtin' THEN 0
+                    ELSE 1
+                END,
+                am.sort_order,
+                am.id
+            LIMIT 1
+        ),
+        ''
+    ),
+    session_id,
+    session_status,
+    session_config,
+    last_active_at,
+    suspended_at
+FROM acp_session;
+
+DROP TABLE acp_session;
+ALTER TABLE _acp_session_new RENAME TO acp_session;
+
+CREATE INDEX IF NOT EXISTS idx_acp_session_status ON acp_session(session_status);
+CREATE INDEX IF NOT EXISTS idx_acp_session_suspended ON acp_session(session_status, suspended_at) WHERE session_status = 'suspended';
+CREATE INDEX IF NOT EXISTS idx_acp_session_agent_id ON acp_session(agent_id);
+
+-- Drop legacy assistant runtime-backend mirror columns after their values have
+-- already been normalized into assistant_definitions.agent_id /
+-- assistant_overlays.agent_id_override above.
+CREATE TABLE IF NOT EXISTS _assistants_new (
+    id                      TEXT PRIMARY KEY,
+    name                    TEXT NOT NULL,
+    description             TEXT,
+    avatar                  TEXT,
+    enabled_skills          TEXT,
+    custom_skill_names      TEXT,
+    disabled_builtin_skills TEXT,
+    prompts                 TEXT,
+    models                  TEXT,
+    name_i18n               TEXT,
+    description_i18n        TEXT,
+    prompts_i18n            TEXT,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO _assistants_new
+    (id, name, description, avatar, enabled_skills, custom_skill_names,
+     disabled_builtin_skills, prompts, models, name_i18n, description_i18n,
+     prompts_i18n, created_at, updated_at)
+SELECT
+    id, name, description, avatar, enabled_skills, custom_skill_names,
+    disabled_builtin_skills, prompts, models, name_i18n, description_i18n,
+    prompts_i18n, created_at, updated_at
+FROM assistants;
+
+ALTER TABLE assistants RENAME TO _assistants_old;
+ALTER TABLE _assistants_new RENAME TO assistants;
+DROP TABLE IF EXISTS _assistants_old;
+CREATE INDEX IF NOT EXISTS idx_assistants_updated_at ON assistants(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS _assistant_overrides_new (
+    assistant_id TEXT PRIMARY KEY,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    sort_order   INTEGER NOT NULL DEFAULT 0,
+    last_used_at INTEGER,
+    updated_at   INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO _assistant_overrides_new
+    (assistant_id, enabled, sort_order, last_used_at, updated_at)
+SELECT assistant_id, enabled, sort_order, last_used_at, updated_at
+FROM assistant_overrides;
+
+ALTER TABLE assistant_overrides RENAME TO _assistant_overrides_old;
+ALTER TABLE _assistant_overrides_new RENAME TO assistant_overrides;
+DROP TABLE IF EXISTS _assistant_overrides_old;
 
 -- Cron assistant-first cleanup:
 -- - `cron_jobs.agent_type` is derived from assistant identity at runtime.

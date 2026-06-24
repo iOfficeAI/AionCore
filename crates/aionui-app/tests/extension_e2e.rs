@@ -100,7 +100,7 @@ fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
                         "id": "legacy-assistant",
                         "name": "Legacy Assistant",
                         "avatar": "assets/assistant.png",
-                        "presetAgentType": "gemini",
+                        "agentId": "cc126dd5",
                         "contextFile": "assistants/context.md",
                         "models": ["gemini-2.0-flash"],
                         "enabledSkills": ["review-skill"],
@@ -112,7 +112,7 @@ fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
                         "id": "legacy-agent",
                         "name": "Legacy Agent",
                         "avatar": "assets/agent.png",
-                        "presetAgentType": "codex",
+                        "agentType": "codex",
                         "contextFile": "agents/context.md",
                         "models": ["codex-mini"],
                         "enabledSkills": ["review-skill"],
@@ -475,7 +475,7 @@ async fn eq16_legacy_assistant_agent_and_theme_endpoints_preserve_contract() {
     let assistants = assistant_json["data"].as_array().unwrap();
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0]["id"], "ext-legacy-assistant");
-    assert_eq!(assistants[0]["presetAgentType"], "gemini");
+    assert_eq!(assistants[0]["agentId"], "cc126dd5");
     assert_eq!(assistants[0]["enabledSkills"][0], "review-skill");
     assert_eq!(assistants[0]["prompts"][0], "Review the diff");
     assert_eq!(assistants[0]["models"][0], "gemini-2.0-flash");
@@ -496,7 +496,7 @@ async fn eq16_legacy_assistant_agent_and_theme_endpoints_preserve_contract() {
     let agents = agent_json["data"].as_array().unwrap();
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0]["id"], "ext-legacy-agent");
-    assert_eq!(agents[0]["presetAgentType"], "codex");
+    assert_eq!(agents[0]["agentType"], "codex");
     assert_eq!(agents[0]["enabledSkills"][0], "review-skill");
     assert_eq!(agents[0]["prompts"][0], "Ship it");
     assert_eq!(agents[0]["models"][0], "codex-mini");

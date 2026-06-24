@@ -73,7 +73,7 @@ async fn ensure_default_assistant(app: &mut axum::Router, token: &str, csrf: &st
         json!({
             "id": DEFAULT_CRON_ASSISTANT_ID,
             "name": "Cron E2E Assistant",
-            "preset_agent_type": "claude"
+            "agent_id": "2d23ff1c"
         }),
         token,
         csrf,
@@ -683,7 +683,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
         json!({
             "id": "u-fixed-mcp",
             "name": "Cron MCP Assistant",
-            "preset_agent_type": "codex",
+            "agent_id": "8e1acf31",
             "defaults": {
                 "mcps": {
                     "mode": "fixed",

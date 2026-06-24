@@ -805,7 +805,6 @@ impl StubAcpSessionRepo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CreateAcpSessionCall {
     conversation_id: String,
-    agent_backend: String,
     agent_source: String,
     agent_id: String,
 }
@@ -818,7 +817,6 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
     async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
         self.create_calls.lock().unwrap().push(CreateAcpSessionCall {
             conversation_id: params.conversation_id.to_owned(),
-            agent_backend: params.agent_backend.to_owned(),
             agent_source: params.agent_source.to_owned(),
             agent_id: params.agent_id.to_owned(),
         });
@@ -826,7 +824,6 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
         // succeed for ACP conversations in unit tests.
         Ok(AcpSessionRow {
             conversation_id: params.conversation_id.to_owned(),
-            agent_backend: params.agent_backend.to_owned(),
             agent_source: params.agent_source.to_owned(),
             agent_id: params.agent_id.to_owned(),
             session_id: None,
@@ -5131,7 +5128,7 @@ async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
 
     let create_calls = acp_repo.create_calls();
     assert_eq!(create_calls.len(), 1);
-    assert_eq!(create_calls[0].agent_backend, "codex");
+    assert_eq!(create_calls[0].agent_id, "8e1acf31");
     assert_eq!(create_calls[0].agent_source, "builtin");
     assert_eq!(create_calls[0].agent_id, "8e1acf31");
 }

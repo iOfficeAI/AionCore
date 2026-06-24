@@ -149,6 +149,15 @@ async fn seed_legacy_assistant_identity(pool: &sqlx::SqlitePool) {
     .execute(pool)
     .await
     .unwrap();
+
+    sqlx::query(
+        "INSERT INTO acp_session (
+            conversation_id, agent_backend, agent_source, agent_id, session_id, session_status, session_config
+        ) VALUES ('conv_snapshot', 'claude', 'builtin', '', 'session-1', 'suspended', '{}')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn insert_legacy_cron(
@@ -227,6 +236,18 @@ async fn migration_013_normalizes_legacy_cron_agent_identity() {
         .await
         .unwrap();
     assert!(!cron_columns.iter().any(|column| column == "agent_type"));
+
+    let acp_session_columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('acp_session')")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(!acp_session_columns.iter().any(|column| column == "agent_backend"));
+    let recovered_session_agent_id: String =
+        sqlx::query_scalar("SELECT agent_id FROM acp_session WHERE conversation_id = 'conv_snapshot'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(recovered_session_agent_id, "agent-claude");
 
     let backend_key_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM cron_jobs

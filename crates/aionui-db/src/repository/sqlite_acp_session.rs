@@ -39,12 +39,11 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         let now = now_ms();
         sqlx::query(
             "INSERT INTO acp_session \
-                (conversation_id, agent_backend, agent_source, agent_id, \
+                (conversation_id, agent_source, agent_id, \
                  session_id, session_status, session_config, last_active_at) \
-             VALUES (?, ?, ?, ?, NULL, 'idle', '{}', ?)",
+             VALUES (?, ?, ?, NULL, 'idle', '{}', ?)",
         )
         .bind(params.conversation_id)
-        .bind(params.agent_backend)
         .bind(params.agent_source)
         .bind(params.agent_id)
         .bind(now)
@@ -220,7 +219,6 @@ mod tests {
     fn create_params<'a>(conversation_id: &'a str) -> CreateAcpSessionParams<'a> {
         CreateAcpSessionParams {
             conversation_id,
-            agent_backend: "claude",
             agent_source: "builtin",
             agent_id: "2d23ff1c",
         }
@@ -231,7 +229,7 @@ mod tests {
         let (repo, _db) = setup().await;
         let row = repo.create(&create_params("conv-1")).await.unwrap();
         assert_eq!(row.conversation_id, "conv-1");
-        assert_eq!(row.agent_backend, "claude");
+        assert_eq!(row.agent_id, "2d23ff1c");
         assert_eq!(row.session_id, None);
         assert_eq!(row.session_status, "idle");
         assert_eq!(row.session_config, "{}");

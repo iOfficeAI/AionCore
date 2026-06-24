@@ -1024,7 +1024,6 @@ async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
 
     assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
     assert!(config.custom_agent_id.is_none());
-    assert!(config.preset_agent_type.is_none());
     assert!(config.is_preset.is_none());
 }
 
@@ -1338,7 +1337,6 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
 
     assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
     assert!(config.custom_agent_id.is_none());
-    assert!(config.preset_agent_type.is_none());
     assert!(config.is_preset.is_none());
 }
 

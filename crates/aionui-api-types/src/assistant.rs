@@ -7,7 +7,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::AgentManagementStatus;
+use aionui_common::AgentType;
+
+use crate::{AgentManagementStatus, AgentSource};
 
 // ---------------------------------------------------------------------------
 // Response + source enum
@@ -20,6 +22,16 @@ pub enum AssistantSource {
     Builtin,
     Bare,
     User,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantAgentResponse {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub r#type: AgentType,
+    pub source: AgentSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 /// Wire shape returned by `GET /api/assistants` (single element) and
@@ -40,7 +52,8 @@ pub struct AssistantResponse {
     pub enabled: bool,
     pub sort_order: i32,
     pub agent_id: String,
-    pub preset_agent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AssistantAgentResponse>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -92,7 +105,8 @@ pub struct AssistantStateResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantEngineResponse {
     pub agent_id: String,
-    pub agent_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AssistantAgentResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,7 +231,7 @@ pub struct CreateAssistantRequest {
     #[serde(default)]
     pub avatar: Option<String>,
     #[serde(default)]
-    pub preset_agent_type: Option<String>,
+    pub agent_id: Option<String>,
     #[serde(default)]
     pub enabled_skills: Option<Vec<String>>,
     #[serde(default)]
@@ -252,7 +266,7 @@ pub struct UpdateAssistantRequest {
     #[serde(default)]
     pub avatar: Option<String>,
     #[serde(default)]
-    pub preset_agent_type: Option<String>,
+    pub agent_id: Option<String>,
     #[serde(default)]
     pub enabled_skills: Option<Vec<String>>,
     #[serde(default)]
@@ -339,7 +353,7 @@ mod tests {
             enabled: true,
             sort_order: 5,
             agent_id: "agent-gemini".into(),
-            preset_agent_type: "gemini".into(),
+            agent: None,
             enabled_skills: vec![],
             custom_skill_names: vec![],
             disabled_builtin_skills: vec![],
@@ -357,7 +371,8 @@ mod tests {
         };
 
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["preset_agent_type"], "gemini");
+        assert!(json.get("preset_agent_type").is_none());
+        assert_eq!(json["agent_id"], "agent-gemini");
         assert_eq!(json["sort_order"], 5);
         assert_eq!(json["last_used_at"], 1234);
     }
@@ -368,7 +383,7 @@ mod tests {
         let req: CreateAssistantRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.name, "X");
         assert!(req.id.is_none());
-        assert!(req.preset_agent_type.is_none());
+        assert!(req.agent_id.is_none());
         assert!(req.defaults.is_none());
     }
 
@@ -426,20 +441,17 @@ mod tests {
             "enabled": true,
             "sort_order": 7,                   // snake required field
             "agent_id": "agent-gemini",        // snake required field
-            "preset_agent_type": "gemini",     // snake required field
             "agent_status": "online",       // snake required field
             "team_selectable": true,           // snake required field
             "deletable": true,                 // snake required field
-            "presetAgentType": "claude",       // legacy camel — must be ignored
+            "agentId": "agent-claude",         // legacy camel — must be ignored
+            "agentId": "agent-claude",         // legacy camel — must be ignored
             "sortOrder": 99,                   // legacy camel — must be ignored
             "lastUsedAt": 111_222,             // legacy camel for optional field — must be ignored
         });
         let resp: AssistantResponse = serde_json::from_value(json).unwrap();
         // If camel were aliased, these would be the camel values.
-        assert_eq!(
-            resp.preset_agent_type, "gemini",
-            "snake_case preset_agent_type must win"
-        );
+        assert_eq!(resp.agent_id, "agent-gemini", "snake_case agent_id must win");
         assert_eq!(resp.sort_order, 7, "snake_case sort_order must win");
         assert!(
             resp.last_used_at.is_none(),

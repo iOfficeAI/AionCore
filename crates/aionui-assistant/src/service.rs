@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aionui_api_types::{
-    AgentManagementRow, AgentManagementStatus, AgentSource, AssistantCapabilitiesResponse, AssistantDefaultListRequest,
-    AssistantDefaultListResponse, AssistantDefaultScalarRequest, AssistantDefaultScalarResponse,
-    AssistantDefaultsRequest, AssistantDefaultsResponse, AssistantDetailResponse, AssistantEngineResponse,
-    AssistantPreferencesResponse, AssistantProfileResponse, AssistantPromptsResponse, AssistantResponse,
-    AssistantRulesResponse, AssistantSource, AssistantStateResponse, CreateAssistantRequest, ImportAssistantsRequest,
-    ImportAssistantsResult, ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
+    AgentManagementRow, AgentManagementStatus, AgentSource, AssistantAgentResponse, AssistantCapabilitiesResponse,
+    AssistantDefaultListRequest, AssistantDefaultListResponse, AssistantDefaultScalarRequest,
+    AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse, AssistantDetailResponse,
+    AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse, AssistantPromptsResponse,
+    AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse, CreateAssistantRequest,
+    ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
@@ -39,8 +39,8 @@ pub struct AssistantService {
     preference_repo: Arc<dyn IAssistantPreferenceRepository>,
     repo: Arc<dyn IAssistantRepository>,
     override_repo: Arc<dyn IAssistantOverrideRepository>,
-    /// Used to infer a sane `preset_agent_type` default when the caller did
-    /// not supply one. The historical default of `"gemini"` 400'd within
+    /// Used to infer a sane `agent_id` default when the caller did not supply
+    /// one. The historical default of `"gemini"` 400'd within
     /// 1 ms on machines without the Gemini CLI (ELECTRON-1J1 / 1KV); we now
     /// pick an agent that actually matches the configured provider list.
     provider_repo: Arc<dyn IProviderRepository>,
@@ -136,9 +136,7 @@ impl AssistantService {
             let (definition_id, assistant_id) = self
                 .resolve_definition_identity("builtin", Some(&builtin.id), &builtin.id)
                 .await?;
-            let agent_id = self
-                .resolve_agent_id_for_runtime_backend(&builtin.preset_agent_type)
-                .await?;
+            let agent_id = self.resolve_agent_id_for_agent_ref(&builtin.agent_ref).await?;
 
             self.definition_repo
                 .upsert(&UpsertAssistantDefinitionParams {
@@ -222,7 +220,7 @@ impl AssistantService {
             if self.builtin.has(&row.id) {
                 continue;
             }
-            self.upsert_definition_from_legacy_user_row(&row).await?;
+            self.upsert_definition_from_legacy_user_row(&row, None).await?;
         }
         Ok(())
     }
@@ -241,17 +239,12 @@ impl AssistantService {
                 continue;
             };
 
-            let agent_id_override = match override_row.preset_agent_type.as_deref() {
-                Some(value) => Some(self.resolve_agent_id_for_runtime_backend(value).await?),
-                None => None,
-            };
-
             self.state_repo
                 .upsert(&UpsertAssistantOverlayParams {
                     assistant_definition_id: &definition.id,
                     enabled: override_row.enabled,
                     sort_order: override_row.sort_order,
-                    agent_id_override: agent_id_override.as_deref(),
+                    agent_id_override: None,
                     last_used_at: override_row.last_used_at,
                 })
                 .await
@@ -372,7 +365,11 @@ impl AssistantService {
         Ok(rows)
     }
 
-    async fn upsert_definition_from_legacy_user_row(&self, row: &AssistantRow) -> Result<(), AssistantError> {
+    async fn upsert_definition_from_legacy_user_row(
+        &self,
+        row: &AssistantRow,
+        requested_agent_id: Option<&str>,
+    ) -> Result<(), AssistantError> {
         // User-defined assistants do not expose locale-aware editing in the
         // current product. Keep the unified definition canonical fields as the
         // single source of truth and leave *_i18n empty for user rows.
@@ -386,9 +383,15 @@ impl AssistantService {
             normalize_json_array_string(row.disabled_builtin_skills.as_deref(), "disabled_builtin_skills")?;
         let (avatar_type, avatar_value) = serialize_avatar("user", row.avatar.as_deref());
         let (definition_id, assistant_id) = self.resolve_definition_identity("user", Some(&row.id), &row.id).await?;
-        let agent_id = self
-            .resolve_agent_id_for_runtime_backend(&row.preset_agent_type)
-            .await?;
+        let existing_definition = self.definition_repo.get_by_assistant_id(&assistant_id).await?;
+        let agent_id = match requested_agent_id {
+            Some(agent_id) => agent_id.to_string(),
+            None => match existing_definition {
+                Some(definition) => definition.agent_id,
+                None => self.resolve_default_agent_id().await?,
+            },
+        };
+        self.resolve_runtime_backend_for_agent_id(&agent_id).await?;
 
         self.definition_repo
             .upsert(&UpsertAssistantDefinitionParams {
@@ -670,8 +673,8 @@ impl AssistantService {
     // Default-agent inference
     // -----------------------------------------------------------------------
 
-    /// Pick a sane `preset_agent_type` default for newly created /
-    /// imported assistants when the caller did not supply one.
+    /// Pick a sane `agent_id` default for newly created / imported assistants
+    /// when the caller did not supply one.
     ///
     /// Inference rule (ELECTRON-1J1 / 1KV):
     /// 1. If any enabled provider exists (Anthropic, OpenAI, custom,
@@ -679,14 +682,14 @@ impl AssistantService {
     ///    OpenAI-compatible and Anthropic-protocol APIs over the
     ///    user-configured base URL and does not require any third-party
     ///    CLI to be installed. CLI-based agents (`claude`, `gemini`)
-    ///    must be opted into explicitly via `preset_agent_type` because
+    ///    must be opted into explicitly via `agent_id` because
     ///    the presence of an Anthropic API key does not imply that the
     ///    Claude Code CLI is on `PATH`.
     /// 2. Otherwise (no providers configured), return a `BadRequest`
     ///    error. The previous code silently fell back to `"gemini"`,
     ///    which on machines without the Gemini CLI 400'd within 1 ms
     ///    with `Agent 'Gemini CLI' CLI not found in PATH`.
-    pub async fn resolve_default_agent_type(&self) -> Result<String, AssistantError> {
+    pub async fn resolve_default_agent_id(&self) -> Result<String, AssistantError> {
         let providers = self
             .provider_repo
             .list()
@@ -694,25 +697,37 @@ impl AssistantService {
             .map_err(|e| AssistantError::Internal(format!("failed to list providers: {e}")))?;
 
         if providers.iter().any(|p| p.enabled) {
-            Ok("aionrs".to_string())
+            self.resolve_agent_id_for_agent_ref("aionrs").await
         } else {
             Err(AssistantError::BadRequest(
                 "Cannot create assistant: no providers configured. Add a provider before creating an assistant, \
-                 or pass an explicit `preset_agent_type` in the request body."
+                 or pass an explicit `agent_id` in the request body."
                     .into(),
             ))
         }
     }
 
-    async fn resolve_agent_id_for_runtime_backend(&self, backend: &str) -> Result<String, AssistantError> {
-        let trimmed = backend.trim();
+    async fn resolve_runtime_backend_for_agent_id(&self, agent_id: &str) -> Result<String, AssistantError> {
+        let trimmed = agent_id.trim();
+        if trimmed.is_empty() {
+            return Err(AssistantError::BadRequest("agent_id is required".into()));
+        }
         let Some(binding) = resolve_agent_binding(&self.pool, trimmed)
             .await
             .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
         else {
-            return Err(AssistantError::BadRequest(format!(
-                "Unknown preset_agent_type '{trimmed}'"
-            )));
+            return Err(AssistantError::BadRequest(format!("Unknown agent_id '{trimmed}'")));
+        };
+        Ok(binding.runtime_backend)
+    }
+
+    async fn resolve_agent_id_for_agent_ref(&self, agent_ref: &str) -> Result<String, AssistantError> {
+        let trimmed = agent_ref.trim();
+        let Some(binding) = resolve_agent_binding(&self.pool, trimmed)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
+        else {
+            return Err(AssistantError::BadRequest(format!("Unknown agent_ref '{trimmed}'")));
         };
         Ok(binding.agent_id)
     }
@@ -760,21 +775,21 @@ impl AssistantService {
 
         let serialized = SerializedFields::from_create(&req)?;
         let detail_overrides = SerializedDetailOverrides::from_create(&req)?;
-        // Resolve the default agent type from the configured provider list
-        // when the caller did not supply one. Avoids the historical
+        // Resolve the default agent id from the configured provider list when
+        // the caller did not supply one. Avoids the historical
         // `"gemini"` fallback that 400'd within 1 ms on machines without
         // the Gemini CLI (ELECTRON-1J1, ELECTRON-1KV).
-        let resolved_agent_type = match req.preset_agent_type.as_deref() {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => self.resolve_default_agent_type().await?,
+        let resolved_agent_id = match req.agent_id.as_deref() {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => self.resolve_default_agent_id().await?,
         };
+        self.resolve_runtime_backend_for_agent_id(&resolved_agent_id).await?;
         let avatar = self.normalize_user_avatar_input(&id, req.avatar.as_deref())?;
         let params = CreateAssistantParams {
             id: &id,
             name: &name,
             description: req.description.as_deref(),
             avatar: avatar.as_deref(),
-            preset_agent_type: &resolved_agent_type,
             enabled_skills: serialized.enabled_skills.as_deref(),
             custom_skill_names: serialized.custom_skill_names.as_deref(),
             disabled_builtin_skills: serialized.disabled_builtin_skills.as_deref(),
@@ -786,7 +801,8 @@ impl AssistantService {
         };
 
         let row = self.repo.create(&params).await?;
-        self.upsert_definition_from_legacy_user_row(&row).await?;
+        self.upsert_definition_from_legacy_user_row(&row, Some(&resolved_agent_id))
+            .await?;
         self.apply_detail_overrides(&row.id, detail_overrides, false).await?;
         if let Some(definition) = self.definition_repo.get_by_assistant_id(&row.id).await? {
             self.sync_preferences_from_defaults_request(&definition, None, req.defaults.as_ref())
@@ -805,7 +821,7 @@ impl AssistantService {
                     .is_some_and(|defaults| defaults.skills.is_some() || defaults.mcps.is_some());
 
                 // Built-in rows are sourced from the embedded bundle and can't
-                // be mutated. Users may still override `preset_agent_type`, and
+                // be mutated. Users may still override `agent_id`, and
                 // product-defined governance allows model/permission defaults
                 // to vary per built-in assistant. Any other field on the
                 // request is rejected so callers don't silently lose data.
@@ -825,15 +841,10 @@ impl AssistantService {
                     || builtin_defaults_forbidden
                 {
                     return Err(AssistantError::Forbidden(
-                        "Only 'preset_agent_type', 'defaults.model', and 'defaults.permission' can be overridden on built-in assistants".into(),
+                        "Only 'agent_id', 'defaults.model', and 'defaults.permission' can be overridden on built-in assistants".into(),
                     ));
                 }
 
-                let preset_agent_type = req.preset_agent_type.as_deref().ok_or_else(|| {
-                    AssistantError::BadRequest(
-                        "'preset_agent_type' is required when updating a built-in assistant".into(),
-                    )
-                })?;
                 let definition = self
                     .definition_repo
                     .get_by_assistant_id(id)
@@ -844,7 +855,7 @@ impl AssistantService {
                 let enabled = existing.as_ref().is_none_or(|o| o.enabled);
                 let sort_order = existing.as_ref().map(|o| o.sort_order).unwrap_or(0);
                 let last_used_at = existing.as_ref().and_then(|o| o.last_used_at);
-                let requested_agent_id = self.resolve_agent_id_for_runtime_backend(preset_agent_type).await?;
+                let requested_agent_id = req.agent_id.as_deref().map(|agent_id| agent_id.trim().to_string());
                 let current_agent_id = self
                     .state_repo
                     .get(&definition.id)
@@ -852,17 +863,22 @@ impl AssistantService {
                     .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?
                     .and_then(|row| row.agent_id_override)
                     .unwrap_or_else(|| definition.agent_id.clone());
-                let reset_model_and_permission = current_agent_id != requested_agent_id;
-                self.state_repo
-                    .upsert(&UpsertAssistantOverlayParams {
-                        assistant_definition_id: &definition.id,
-                        enabled,
-                        sort_order,
-                        agent_id_override: Some(&requested_agent_id),
-                        last_used_at,
-                    })
-                    .await
-                    .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
+                let reset_model_and_permission = requested_agent_id
+                    .as_deref()
+                    .is_some_and(|agent_id| agent_id != current_agent_id);
+                if let Some(requested_agent_id) = requested_agent_id.as_deref() {
+                    self.resolve_runtime_backend_for_agent_id(requested_agent_id).await?;
+                    self.state_repo
+                        .upsert(&UpsertAssistantOverlayParams {
+                            assistant_definition_id: &definition.id,
+                            enabled,
+                            sort_order,
+                            agent_id_override: Some(requested_agent_id),
+                            last_used_at,
+                        })
+                        .await
+                        .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
+                }
                 self.apply_detail_overrides(id, detail_overrides, reset_model_and_permission)
                     .await?;
                 let definition = self
@@ -893,10 +909,14 @@ impl AssistantService {
             .get_by_assistant_id(id)
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
-        let requested_agent_id = match req.preset_agent_type.as_deref() {
-            Some(preset_agent_type) => Some(self.resolve_agent_id_for_runtime_backend(preset_agent_type).await?),
+        let requested_agent_id = match req.agent_id.as_deref() {
+            Some(agent_id) if !agent_id.trim().is_empty() => Some(agent_id.trim().to_string()),
+            Some(_) => return Err(AssistantError::BadRequest("agent_id is required".into())),
             None => None,
         };
+        if let Some(agent_id) = requested_agent_id.as_deref() {
+            self.resolve_runtime_backend_for_agent_id(agent_id).await?;
+        }
         let reset_model_and_permission = requested_agent_id
             .as_deref()
             .is_some_and(|agent_id| agent_id != current_definition.agent_id);
@@ -909,7 +929,6 @@ impl AssistantService {
             name: req.name.as_deref(),
             description: req.description.as_ref().map(|s| Some(s.as_str())),
             avatar: normalized_avatar.as_ref().map(|value| value.as_deref()),
-            preset_agent_type: req.preset_agent_type.as_deref(),
             enabled_skills: serialized.enabled_skills.as_ref().map(|s| Some(s.as_str())),
             custom_skill_names: serialized.custom_skill_names.as_ref().map(|s| Some(s.as_str())),
             disabled_builtin_skills: serialized.disabled_builtin_skills.as_ref().map(|s| Some(s.as_str())),
@@ -925,7 +944,8 @@ impl AssistantService {
             .update(id, &params)
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
-        self.upsert_definition_from_legacy_user_row(&row).await?;
+        self.upsert_definition_from_legacy_user_row(&row, requested_agent_id.as_deref())
+            .await?;
         self.apply_detail_overrides(id, detail_overrides, reset_model_and_permission)
             .await?;
         if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
@@ -1156,17 +1176,9 @@ impl AssistantService {
             .last_used_at
             .or_else(|| existing_state.as_ref().and_then(|state| state.last_used_at))
             .or_else(|| existing.as_ref().and_then(|o| o.last_used_at));
-        let agent_id_override = if let Some(value) = existing_state
+        let agent_id_override = existing_state
             .as_ref()
-            .and_then(|state| state.agent_id_override.clone())
-        {
-            Some(value)
-        } else {
-            match existing.as_ref().and_then(|o| o.preset_agent_type.as_deref()) {
-                Some(value) => Some(self.resolve_agent_id_for_runtime_backend(value).await?),
-                None => None,
-            }
-        };
+            .and_then(|state| state.agent_id_override.clone());
         let state = self
             .state_repo
             .upsert(&UpsertAssistantOverlayParams {
@@ -1195,10 +1207,10 @@ impl AssistantService {
     pub async fn import(&self, req: ImportAssistantsRequest) -> Result<ImportAssistantsResult, AssistantError> {
         let mut result = ImportAssistantsResult::default();
 
-        // Resolved-once cache for the inferred default agent type. We only
+        // Resolved-once cache for the inferred default agent id. We only
         // hit the provider repo when at least one row in the batch omits
-        // `preset_agent_type` AND has cleared all the other skip conditions.
-        let mut cached_default_agent_type: Option<String> = None;
+        // `agent_id` AND has cleared all the other skip conditions.
+        let mut cached_default_agent_id: Option<String> = None;
 
         for entry in req.assistants {
             let id = entry
@@ -1249,15 +1261,23 @@ impl AssistantService {
                 }
             };
 
-            // Mirror the create() path: prefer the caller-supplied value;
+            // Mirror the create() path: prefer the caller-supplied agent id;
             // otherwise infer from the configured provider list.
-            let resolved_agent_type = match entry.preset_agent_type.as_deref() {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => match cached_default_agent_type.as_deref() {
+            let resolved_agent_id = match entry.agent_id.as_deref() {
+                Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+                Some(_) => {
+                    result.failed += 1;
+                    result.errors.push(ImportError {
+                        id,
+                        error: "agent_id is required".into(),
+                    });
+                    continue;
+                }
+                _ => match cached_default_agent_id.as_deref() {
                     Some(v) => v.to_string(),
-                    None => match self.resolve_default_agent_type().await {
+                    None => match self.resolve_default_agent_id().await {
                         Ok(v) => {
-                            cached_default_agent_type = Some(v.clone());
+                            cached_default_agent_id = Some(v.clone());
                             v
                         }
                         Err(e) => {
@@ -1271,6 +1291,14 @@ impl AssistantService {
                     },
                 },
             };
+            if let Err(e) = self.resolve_runtime_backend_for_agent_id(&resolved_agent_id).await {
+                result.failed += 1;
+                result.errors.push(ImportError {
+                    id,
+                    error: e.to_string(),
+                });
+                continue;
+            }
 
             let avatar = match self.normalize_user_avatar_input(&id, entry.avatar.as_deref()) {
                 Ok(value) => value,
@@ -1289,7 +1317,6 @@ impl AssistantService {
                 name: &name,
                 description: entry.description.as_deref(),
                 avatar: avatar.as_deref(),
-                preset_agent_type: &resolved_agent_type,
                 enabled_skills: serialized.enabled_skills.as_deref(),
                 custom_skill_names: serialized.custom_skill_names.as_deref(),
                 disabled_builtin_skills: serialized.disabled_builtin_skills.as_deref(),
@@ -1302,7 +1329,8 @@ impl AssistantService {
 
             match self.repo.create(&params).await {
                 Ok(row) => {
-                    self.upsert_definition_from_legacy_user_row(&row).await?;
+                    self.upsert_definition_from_legacy_user_row(&row, Some(&resolved_agent_id))
+                        .await?;
                     result.imported += 1;
                 }
                 Err(aionui_db::DbError::Conflict(_)) => {
@@ -1778,7 +1806,7 @@ fn definition_to_response(
         enabled: state.is_none_or(|row| row.enabled),
         sort_order: state.map(|row| row.sort_order).unwrap_or(0),
         agent_id: projection.agent_id.clone(),
-        preset_agent_type: projection.runtime_backend.clone(),
+        agent: projection.agent.clone(),
         enabled_skills: decode_str_list(Some(definition.default_skill_ids.as_str()))?,
         custom_skill_names: decode_str_list(Some(definition.custom_skill_names.as_str()))?,
         disabled_builtin_skills: decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?,
@@ -1847,7 +1875,7 @@ fn definition_to_detail_response(
         },
         engine: AssistantEngineResponse {
             agent_id: projection.agent_id.clone(),
-            agent_backend: projection.runtime_backend.clone(),
+            agent: projection.agent.clone(),
         },
         rules: AssistantRulesResponse {
             content: if rules_content.is_empty() {
@@ -1897,7 +1925,7 @@ fn definition_to_detail_response(
 #[derive(Debug, Clone)]
 struct AssistantRuntimeProjection {
     agent_id: String,
-    runtime_backend: String,
+    agent: Option<AssistantAgentResponse>,
     agent_status: AgentManagementStatus,
     agent_status_message: Option<String>,
     team_selectable: bool,
@@ -1949,12 +1977,15 @@ fn assistant_projection_for_definition(
             })
             .or_else(|| agent_rows.iter().find(row_matches_backend))
     };
-    let runtime_backend = agent_row
-        .map(runtime_backend_for_management_row)
-        .unwrap_or_else(|| fallback_runtime_backend.to_owned());
     let agent_id = agent_row
         .map(|row| row.id.clone())
         .unwrap_or_else(|| effective_agent_id.to_owned());
+    let agent = agent_row.map(|row| AssistantAgentResponse {
+        id: row.id.clone(),
+        r#type: row.agent_type,
+        source: row.agent_source,
+        backend: row.backend.clone(),
+    });
 
     let agent_status = agent_row
         .map(|row| row.status)
@@ -1985,7 +2016,7 @@ fn assistant_projection_for_definition(
 
     AssistantRuntimeProjection {
         agent_id,
-        runtime_backend,
+        agent,
         agent_status,
         agent_status_message,
         team_selectable: enabled
@@ -2002,15 +2033,6 @@ fn effective_agent_id_for_definition<'a>(
     state
         .and_then(|row| row.agent_id_override.as_deref())
         .unwrap_or(definition.agent_id.as_str())
-}
-
-fn runtime_backend_for_management_row(row: &AgentManagementRow) -> String {
-    row.backend
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| row.agent_type.serde_name())
-        .to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -2405,7 +2427,7 @@ mod tests {
                     serde_json::json!({
                         "id": b.id,
                         "name": b.name,
-                        "preset_agent_type": b.preset_agent_type,
+                        "agent_ref": b.agent_ref,
                         "rule_file": b.rule_file,
                     })
                 })
@@ -2476,7 +2498,7 @@ mod tests {
             description: None,
             description_i18n: HashMap::new(),
             avatar: None,
-            preset_agent_type: "gemini".into(),
+            agent_ref: "gemini".into(),
             enabled_skills: Vec::new(),
             custom_skill_names: Vec::new(),
             disabled_builtin_skills: Vec::new(),
@@ -2631,7 +2653,7 @@ mod tests {
             .find(|assistant| assistant.id == "bare:agent-claude")
             .unwrap();
         assert_eq!(bare.source, AssistantSource::Bare);
-        assert_eq!(bare.preset_agent_type, "claude");
+        assert_eq!(bare.agent_id, "agent-claude");
         assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Online);
         assert!(bare.team_selectable);
         assert!(!bare.deletable);
@@ -2641,9 +2663,8 @@ mod tests {
     async fn bootstrap_falls_back_to_agent_type_when_backend_is_empty() {
         // Engines like Aion CLI carry their identity in `agent_type` and leave
         // `backend` empty (it is an ACP-vendor label). The bare assistant must
-        // still expose a concrete `preset_agent_type` so the frontend can route
-        // it as an aionrs conversation; otherwise the top-level model is dropped
-        // and warmup fails with "Provider '' not found".
+        // still expose the concrete agent id so the frontend does not bind it
+        // through an overloaded runtime backend label.
         let mut agent_row = mk_agent_row(
             "agent-aionrs",
             "aionrs",
@@ -2663,7 +2684,7 @@ mod tests {
             .iter()
             .find(|assistant| assistant.id == "bare:agent-aionrs")
             .unwrap();
-        assert_eq!(bare.preset_agent_type, "aionrs");
+        assert_eq!(bare.agent_id, "agent-aionrs");
     }
 
     #[tokio::test]
@@ -2681,7 +2702,7 @@ mod tests {
         aionrs_row.agent_type = aionui_common::AgentType::Aionrs;
 
         let mut builtin = mk_builtin("builtin-aionrs", "Aion Assistant");
-        builtin.preset_agent_type = "aionrs".into();
+        builtin.agent_ref = "aionrs".into();
 
         let fx = fixture_with_options(FixtureOpts {
             builtins: vec![builtin],
@@ -2953,21 +2974,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_builtin_preset_agent_type_writes_override() {
+    async fn update_builtin_agent_id_writes_override() {
         let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
         let updated = fx
             .service
             .update(
                 "builtin-office",
                 UpdateAssistantRequest {
-                    preset_agent_type: Some("claude".into()),
+                    agent_id: Some("2d23ff1c".into()),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
         assert_eq!(updated.source, AssistantSource::Builtin);
-        assert_eq!(updated.preset_agent_type, "claude");
+        assert_eq!(updated.agent_id, "2d23ff1c");
         // List view must reflect the override too.
         let listed = fx
             .service
@@ -2977,7 +2998,7 @@ mod tests {
             .into_iter()
             .find(|a| a.id == "builtin-office")
             .unwrap();
-        assert_eq!(listed.preset_agent_type, "claude");
+        assert_eq!(listed.agent_id, "2d23ff1c");
     }
 
     #[tokio::test]
@@ -2988,7 +3009,7 @@ mod tests {
             .update(
                 "builtin-office",
                 UpdateAssistantRequest {
-                    preset_agent_type: Some("gemini".into()),
+                    agent_id: Some("cc126dd5".into()),
                     defaults: Some(AssistantDefaultsRequest {
                         model: Some(AssistantDefaultScalarRequest {
                             mode: "fixed".into(),
@@ -3007,7 +3028,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(updated.source, AssistantSource::Builtin);
-        assert_eq!(updated.preset_agent_type, "gemini");
+        assert_eq!(updated.agent_id, "cc126dd5");
 
         let detail = fx.service.get_detail("builtin-office", Some("en-US")).await.unwrap();
         assert_eq!(detail.defaults.model.mode, "fixed");
@@ -3049,7 +3070,7 @@ mod tests {
             .update(
                 "builtin-office",
                 UpdateAssistantRequest {
-                    preset_agent_type: Some("gemini".into()),
+                    agent_id: Some("cc126dd5".into()),
                     defaults: Some(AssistantDefaultsRequest {
                         model: Some(AssistantDefaultScalarRequest {
                             mode: "fixed".into(),
@@ -3071,7 +3092,7 @@ mod tests {
             .update(
                 "builtin-office",
                 UpdateAssistantRequest {
-                    preset_agent_type: Some("claude".into()),
+                    agent_id: Some("2d23ff1c".into()),
                     ..Default::default()
                 },
             )
@@ -3079,7 +3100,7 @@ mod tests {
             .unwrap();
 
         let detail = fx.service.get_detail("builtin-office", Some("en-US")).await.unwrap();
-        assert_eq!(detail.engine.agent_backend, "claude");
+        assert_eq!(detail.engine.agent_id, "2d23ff1c");
         assert_eq!(detail.defaults.model.mode, "auto");
         assert_eq!(detail.defaults.model.value, None);
         assert_eq!(detail.defaults.permission.mode, "auto");
@@ -3153,7 +3174,7 @@ mod tests {
             .update(
                 "u1",
                 UpdateAssistantRequest {
-                    preset_agent_type: Some("codex".into()),
+                    agent_id: Some("8e1acf31".into()),
                     ..Default::default()
                 },
             )
@@ -3161,7 +3182,7 @@ mod tests {
             .unwrap();
 
         let detail = fx.service.get_detail("u1", Some("en-US")).await.unwrap();
-        assert_eq!(detail.engine.agent_backend, "codex");
+        assert_eq!(detail.engine.agent_id, "8e1acf31");
         assert_eq!(detail.defaults.model.mode, "auto");
         assert_eq!(detail.defaults.model.value, None);
         assert_eq!(detail.defaults.permission.mode, "auto");
@@ -3681,7 +3702,7 @@ mod tests {
             "assistants": [{
                 "id": "builtin-office",
                 "name": "Office",
-                "preset_agent_type": "gemini",
+                "agent_ref": "gemini",
                 "rule_file": "rules/office.{locale}.md",
             }]
         });
@@ -3736,7 +3757,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Default agent-type inference (ELECTRON-1J1 / 1KV regression coverage)
+    // Default agent inference (ELECTRON-1J1 / 1KV regression coverage)
     // -----------------------------------------------------------------------
 
     /// Anthropic provider routes to AionRS, not the Claude Code CLI:
@@ -3744,52 +3765,52 @@ mod tests {
     /// `claude` on `PATH`. CLI-based agents must be opted into
     /// explicitly.
     #[tokio::test]
-    async fn resolve_default_agent_type_routes_anthropic_provider_to_aionrs() {
+    async fn resolve_default_agent_id_routes_anthropic_provider_to_aionrs() {
         let fx = fixture_with_options(FixtureOpts {
             seed_platform: Some("anthropic"),
             ..Default::default()
         })
         .await;
-        let resolved = fx.service.resolve_default_agent_type().await.unwrap();
-        assert_eq!(resolved, "aionrs");
+        let resolved = fx.service.resolve_default_agent_id().await.unwrap();
+        assert_eq!(resolved, "632f31d2");
     }
 
     /// OpenAI / custom provider falls back to AionRS, the only AionUI
     /// agent that doesn't require a third-party CLI.
     #[tokio::test]
-    async fn resolve_default_agent_type_falls_back_to_aionrs_for_openai_provider() {
+    async fn resolve_default_agent_id_falls_back_to_aionrs_for_openai_provider() {
         let fx = fixture_with_options(FixtureOpts {
             seed_platform: Some("openai"),
             ..Default::default()
         })
         .await;
-        let resolved = fx.service.resolve_default_agent_type().await.unwrap();
-        assert_eq!(resolved, "aionrs");
+        let resolved = fx.service.resolve_default_agent_id().await.unwrap();
+        assert_eq!(resolved, "632f31d2");
     }
 
     /// Custom (non-anthropic, non-openai) platform also routes to AionRS,
     /// which handles OpenAI-compatible custom URLs.
     #[tokio::test]
-    async fn resolve_default_agent_type_handles_custom_platform_as_aionrs() {
+    async fn resolve_default_agent_id_handles_custom_platform_as_aionrs() {
         let fx = fixture_with_options(FixtureOpts {
             seed_platform: Some("custom"),
             ..Default::default()
         })
         .await;
-        let resolved = fx.service.resolve_default_agent_type().await.unwrap();
-        assert_eq!(resolved, "aionrs");
+        let resolved = fx.service.resolve_default_agent_id().await.unwrap();
+        assert_eq!(resolved, "632f31d2");
     }
 
     /// No providers → loud BadRequest with actionable text. Crucially,
     /// this no longer silently falls through to `"gemini"`.
     #[tokio::test]
-    async fn resolve_default_agent_type_errors_when_no_providers() {
+    async fn resolve_default_agent_id_errors_when_no_providers() {
         let fx = fixture_with_options(FixtureOpts {
             no_default_provider: true,
             ..Default::default()
         })
         .await;
-        let err = fx.service.resolve_default_agent_type().await.unwrap_err();
+        let err = fx.service.resolve_default_agent_id().await.unwrap_err();
         match err {
             AssistantError::BadRequest(msg) => {
                 assert!(
@@ -3808,7 +3829,7 @@ mod tests {
     /// Disabled providers do not satisfy the inference; the resolver
     /// must treat them as if they were absent.
     #[tokio::test]
-    async fn resolve_default_agent_type_ignores_disabled_providers() {
+    async fn resolve_default_agent_id_ignores_disabled_providers() {
         let fx = fixture_with_options(FixtureOpts {
             no_default_provider: true,
             ..Default::default()
@@ -3837,17 +3858,17 @@ mod tests {
             .await
             .unwrap();
 
-        let err = fx.service.resolve_default_agent_type().await.unwrap_err();
+        let err = fx.service.resolve_default_agent_id().await.unwrap_err();
         assert!(matches!(err, AssistantError::BadRequest(_)));
     }
 
     /// End-to-end regression for ELECTRON-1J1 / 1KV: creating an
-    /// assistant with no `preset_agent_type` and no Gemini CLI installed
+    /// assistant with no `agent_id` and no Gemini CLI installed
     /// must NOT default to `"gemini"`. Any enabled provider — Anthropic
     /// or otherwise — should resolve to `"aionrs"`, the only built-in
     /// agent that doesn't depend on a third-party CLI being on `PATH`.
     #[tokio::test]
-    async fn create_without_preset_does_not_default_to_gemini_when_provider_exists() {
+    async fn create_without_agent_id_does_not_default_to_gemini_when_provider_exists() {
         for platform in ["anthropic", "openai"] {
             let fx = fixture_with_options(FixtureOpts {
                 seed_platform: Some(platform),
@@ -3864,21 +3885,19 @@ mod tests {
                 .await
                 .unwrap();
             assert_ne!(
-                created.preset_agent_type, "gemini",
+                created.agent_id, "gemini",
                 "Gemini default would 400 within 1ms on machines without the CLI"
             );
             assert_eq!(
-                created.preset_agent_type, "aionrs",
+                created.agent_id, "632f31d2",
                 "{platform} provider should resolve to aionrs"
             );
         }
     }
 
-    /// Explicit `preset_agent_type` in the request body wins over the
-    /// inferred default — callers that know what they want stay in
-    /// control.
+    /// Explicit `agent_id` in the request body wins over the inferred default.
     #[tokio::test]
-    async fn create_respects_explicit_preset_agent_type() {
+    async fn create_respects_explicit_agent_id() {
         let fx = fixture_with_options(FixtureOpts {
             seed_platform: Some("anthropic"),
             ..Default::default()
@@ -3889,12 +3908,12 @@ mod tests {
             .create(CreateAssistantRequest {
                 id: Some("u1".into()),
                 name: "Mine".into(),
-                preset_agent_type: Some("codex".into()),
+                agent_id: Some("8e1acf31".into()),
                 ..req_default()
             })
             .await
             .unwrap();
-        assert_eq!(created.preset_agent_type, "codex");
+        assert_eq!(created.agent_id, "8e1acf31");
     }
 
     fn req_default() -> CreateAssistantRequest {
@@ -3903,7 +3922,7 @@ mod tests {
             name: String::new(),
             description: None,
             avatar: None,
-            preset_agent_type: None,
+            agent_id: None,
             enabled_skills: None,
             custom_skill_names: None,
             disabled_builtin_skills: None,

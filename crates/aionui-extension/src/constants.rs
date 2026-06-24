@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn test_preset_agent_types_non_empty() {
+    fn test_agent_ids_non_empty() {
         assert!(!PRESET_AGENT_TYPES.is_empty());
         assert!(PRESET_AGENT_TYPES.contains(&"claude"));
     }

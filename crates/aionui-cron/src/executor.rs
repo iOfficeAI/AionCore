@@ -1257,7 +1257,6 @@ mod tests {
                 is_preset: None,
                 assistant_id: Some("assistant-sample".into()),
                 custom_agent_id: None,
-                preset_agent_type: None,
                 mode: None,
                 model_id: Some("claude-sonnet-4".into()),
                 model: None,
@@ -1544,7 +1543,6 @@ mod tests {
                 is_preset: None,
                 assistant_id: None,
                 custom_agent_id: None,
-                preset_agent_type: None,
                 mode: None,
                 model_id: Some("gpt-5".into()),
                 model: Some(ProviderWithModel {
@@ -1572,7 +1570,6 @@ mod tests {
                 is_preset: None,
                 assistant_id: None,
                 custom_agent_id: None,
-                preset_agent_type: None,
                 mode: None,
                 model_id: None,
                 model: Some(ProviderWithModel {
@@ -1612,7 +1609,6 @@ mod tests {
                 is_preset: None,
                 assistant_id: None,
                 custom_agent_id: None,
-                preset_agent_type: None,
                 mode: None,
                 model_id: Some("gpt-5".into()),
                 model: None,

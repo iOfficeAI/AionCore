@@ -354,8 +354,7 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
         .await
         .unwrap()
         .expect("acp_session row should exist for ACP assistant conversations");
-    assert_eq!(session_row.agent_backend, "claude");
-    assert!(!session_row.agent_id.is_empty());
+    assert_eq!(session_row.agent_id, "2d23ff1c");
     assert_eq!(snapshot.assistant_id, "bare-claude");
     assert_eq!(snapshot.agent_id, "2d23ff1c");
     assert_eq!(conversation.name, "Claude");

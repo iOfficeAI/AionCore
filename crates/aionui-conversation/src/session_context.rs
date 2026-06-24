@@ -233,14 +233,20 @@ impl<'a> SessionContextBuilder<'a> {
         }
 
         if let Some(session_row) = session_row.filter(|row| !row.agent_id.is_empty()) {
+            let metadata = self
+                .agent_metadata_repo
+                .get(&session_row.agent_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?;
             debug!(
                 conversation_id = %row.id,
                 agent_id = %session_row.agent_id,
-                backend = %session_row.agent_backend,
                 "session_context: restored ACP identity from persisted acp_session row"
             );
             config.agent_id = Some(session_row.agent_id.clone());
-            config.backend = Some(session_row.agent_backend.clone());
+            if let Some(metadata) = metadata {
+                config.backend = metadata.backend;
+            }
             return Ok(());
         }
 
@@ -634,7 +640,6 @@ mod tests {
             .acp_session_repo
             .create(&CreateAcpSessionParams {
                 conversation_id: "conv-1",
-                agent_backend: "claude",
                 agent_source: "builtin",
                 agent_id: "builtin-claude-test",
             })
@@ -681,7 +686,6 @@ mod tests {
             .acp_session_repo
             .create(&CreateAcpSessionParams {
                 conversation_id: "conv-1",
-                agent_backend: "codex",
                 agent_source: "builtin",
                 agent_id: "builtin-codex-test",
             })

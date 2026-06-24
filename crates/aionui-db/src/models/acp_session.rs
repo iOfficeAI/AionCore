@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AcpSessionRow {
     pub conversation_id: String,
-    pub agent_backend: String,
     pub agent_source: String,
     pub agent_id: String,
     pub session_id: Option<String>,

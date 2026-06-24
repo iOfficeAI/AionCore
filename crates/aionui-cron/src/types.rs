@@ -135,8 +135,6 @@ pub struct CronAgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset_agent_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
@@ -343,11 +341,6 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
                 None
             } else {
                 c.custom_agent_id.clone()
-            },
-            preset_agent_type: if assistant_backed {
-                None
-            } else {
-                c.preset_agent_type.clone()
             },
             mode: c.mode.clone(),
             model_id: c.model_id.clone(),
@@ -602,7 +595,6 @@ mod tests {
                 is_preset: None,
                 assistant_id: None,
                 custom_agent_id: None,
-                preset_agent_type: None,
                 mode: None,
                 model_id: None,
                 model: None,
@@ -835,7 +827,6 @@ mod tests {
                 is_preset: Some(true),
                 assistant_id: Some("assistant-1".into()),
                 custom_agent_id: Some("legacy-assistant".into()),
-                preset_agent_type: Some("codex".into()),
                 mode: Some("full-access".into()),
                 model_id: Some("gpt-5-codex".into()),
                 model: None,
@@ -852,7 +843,6 @@ mod tests {
         assert!(config.cli_path.is_none());
         assert!(config.is_preset.is_none());
         assert!(config.custom_agent_id.is_none());
-        assert!(config.preset_agent_type.is_none());
         assert_eq!(config.mode.as_deref(), Some("full-access"));
         assert_eq!(config.model_id.as_deref(), Some("gpt-5-codex"));
         assert_eq!(
@@ -884,7 +874,6 @@ mod tests {
                 is_preset: Some(false),
                 assistant_id: None,
                 custom_agent_id: Some("legacy-assistant".into()),
-                preset_agent_type: None,
                 mode: Some("default".into()),
                 model_id: Some("claude-sonnet-4".into()),
                 model: None,
@@ -912,7 +901,6 @@ mod tests {
                 is_preset: None,
                 assistant_id: Some("bare-gemini".into()),
                 custom_agent_id: None,
-                preset_agent_type: None,
                 mode: Some("default".into()),
                 model_id: Some("gemini-2.5-pro".into()),
                 model: Some(ProviderWithModel {

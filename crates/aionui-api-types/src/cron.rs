@@ -48,8 +48,6 @@ pub struct CronAgentConfigReadDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset_agent_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
@@ -244,17 +242,16 @@ mod write_tests {
     }
 
     #[test]
-    fn cron_agent_config_write_rejects_legacy_preset_flags() {
+    fn cron_agent_config_write_rejects_legacy_preset_flag() {
         let err = serde_json::from_value::<CronAgentConfigWriteDto>(serde_json::json!({
             "name": "Helper",
             "assistant_id": "assistant-1",
             "is_preset": true,
-            "preset_agent_type": "claude",
         }))
-        .expect_err("legacy preset fields must be rejected");
+        .expect_err("legacy preset flag must be rejected");
 
         let message = err.to_string();
-        assert!(message.contains("is_preset") || message.contains("preset_agent_type"));
+        assert!(message.contains("is_preset"));
     }
 
     #[test]
@@ -452,7 +449,6 @@ mod tests {
             "is_preset": true,
             "assistant_id": "assistant-1",
             "custom_agent_id": "agent-1",
-            "preset_agent_type": "claude",
             "mode": "auto",
             "model_id": "claude-sonnet-4-6",
             "model": {"provider_id": "provider-1", "model": "claude-sonnet-4-6"},
@@ -491,7 +487,6 @@ mod tests {
             is_preset: None,
             assistant_id: None,
             custom_agent_id: None,
-            preset_agent_type: None,
             mode: None,
             model_id: None,
             model: None,
@@ -512,7 +507,6 @@ mod tests {
             is_preset: Some(false),
             assistant_id: Some("assistant-1".into()),
             custom_agent_id: Some("c1".into()),
-            preset_agent_type: None,
             mode: Some("plan".into()),
             model_id: Some("m1".into()),
             model: Some(ProviderWithModel {
@@ -560,7 +554,6 @@ mod tests {
                     is_preset: None,
                     assistant_id: None,
                     custom_agent_id: None,
-                    preset_agent_type: None,
                     mode: None,
                     model_id: None,
                     model: None,

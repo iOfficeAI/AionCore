@@ -12,8 +12,13 @@ mod common;
 
 use std::sync::Arc;
 
+use aionui_api_types::{
+    AgentManagementRow, AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
+    AgentSourceInfo, BehaviorPolicy,
+};
 use aionui_app::{AppConfig, AppServices, ModuleStates, build_module_states, create_router_with_states};
-use aionui_assistant::{AssistantRouterState, AssistantService, BuiltinAssistantRegistry};
+use aionui_assistant::{AssistantAgentCatalogPort, AssistantRouterState, AssistantService, BuiltinAssistantRegistry};
+use aionui_common::AgentType;
 use aionui_db::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
     IAssistantPreferenceRepository, IAssistantRepository, IProviderRepository, SqliteAssistantDefinitionRepository,
@@ -53,11 +58,67 @@ struct Fixture {
     _ext_tmp: TempDir,
 }
 
+#[derive(Clone)]
+struct TestAgentCatalog {
+    rows: Vec<AgentManagementRow>,
+}
+
+#[async_trait::async_trait]
+impl AssistantAgentCatalogPort for TestAgentCatalog {
+    async fn list_management_agents(&self) -> Result<Vec<AgentManagementRow>, aionui_assistant::AssistantError> {
+        Ok(self.rows.clone())
+    }
+}
+
+fn test_agent_row(id: &str, backend: Option<&str>, agent_type: AgentType, name: &str) -> AgentManagementRow {
+    AgentManagementRow {
+        id: id.to_owned(),
+        icon: None,
+        name: name.to_owned(),
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: backend.map(str::to_owned),
+        agent_type,
+        agent_source: match agent_type {
+            AgentType::Aionrs => AgentSource::Internal,
+            _ => AgentSource::Builtin,
+        },
+        agent_source_info: AgentSourceInfo::default(),
+        enabled: true,
+        installed: true,
+        command: backend.map(str::to_owned),
+        args: Vec::new(),
+        env: Vec::new(),
+        native_skills_dirs: None,
+        behavior_policy: BehaviorPolicy {
+            supports_team: true,
+            ..Default::default()
+        },
+        yolo_id: None,
+        sort_order: 0,
+        team_capable: true,
+        status: AgentManagementStatus::Online,
+        last_check_status: Some(AgentSnapshotCheckStatus::Online),
+        last_check_kind: Some(AgentSnapshotCheckKind::Manual),
+        last_check_error_code: None,
+        last_check_error_message: None,
+        last_check_error_details: None,
+        last_check_guidance: None,
+        last_check_latency_ms: None,
+        last_check_at: None,
+        last_success_at: None,
+        last_failure_at: None,
+        has_command_override: false,
+        env_override_key_count: 0,
+    }
+}
+
 async fn insert_generated_bare_assistant(
     fx: &Fixture,
     assistant_id: &str,
     source_ref: &str,
-    backend: &str,
+    _backend: &str,
     name: &str,
 ) {
     let pool = fx.services.database.pool().clone();
@@ -79,7 +140,7 @@ async fn insert_generated_bare_assistant(
             description_i18n: "{}",
             avatar_type: "none",
             avatar_value: None,
-            agent_id: backend,
+            agent_id: source_ref,
             rule_resource_type: "none",
             rule_resource_ref: None,
             rule_inline_content: None,
@@ -140,14 +201,14 @@ async fn fixture() -> Fixture {
             {
                 "id": "builtin-office",
                 "name": "Office",
-                "preset_agent_type": "gemini",
+                "agent_ref": "codex",
                 "rule_file": "rules/office.{locale}.md",
                 "avatar": "office.png",
             },
             {
                 "id": "builtin-bare",
                 "name": "Bare",
-                "preset_agent_type": "gemini",
+                "agent_ref": "codex",
             }
         ]
     });
@@ -258,7 +319,7 @@ async fn fixture() -> Fixture {
         Arc::new(SqliteAssistantOverrideRepository::new(pool.clone()));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
     // Seed an OpenAI-compatible provider so create / import calls without
-    // an explicit `preset_agent_type` resolve to `"aionrs"` instead of
+    // an explicit `agent_id` resolve to `"aionrs"` instead of
     // erroring out — mirroring a configured production setup.
     provider_repo
         .create(aionui_db::CreateProviderParams {
@@ -290,7 +351,13 @@ async fn fixture() -> Fixture {
             override_repo,
             provider_repo,
             builtin,
-            agent_catalog: None,
+            agent_catalog: Some(Arc::new(TestAgentCatalog {
+                rows: vec![
+                    test_agent_row("8e1acf31", Some("codex"), AgentType::Acp, "Codex CLI"),
+                    test_agent_row("cc126dd5", Some("gemini"), AgentType::Acp, "Gemini CLI"),
+                    test_agent_row("632f31d2", None, AgentType::Aionrs, "Aion CLI"),
+                ],
+            })),
         },
         user_data_dir.clone(),
     ));
@@ -339,12 +406,16 @@ async fn list_populated_excludes_extension_assistants() {
     let list = json["data"].as_array().unwrap();
     // Extension-contributed assistants are no longer part of the unified
     // assistant catalog.
-    assert_eq!(list.len(), 2, "body = {json}");
+    assert_eq!(list.len(), 5, "body = {json}");
     let ids: Vec<&str> = list.iter().map(|a| a["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"bare:8e1acf31"));
+    assert!(ids.contains(&"bare:cc126dd5"));
+    assert!(ids.contains(&"bare:632f31d2"));
     assert!(ids.contains(&"builtin-office"));
     assert!(ids.contains(&"builtin-bare"));
     assert!(!ids.contains(&"ext-helper"));
     let sources: Vec<&str> = list.iter().map(|a| a["source"].as_str().unwrap()).collect();
+    assert!(sources.contains(&"bare"));
     assert!(sources.contains(&"builtin"));
     assert!(!sources.contains(&"extension"));
 }
@@ -428,7 +499,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
             "id": "u1",
             "name": "Mine",
             "description": "hello",
-            "preset_agent_type": "aionrs",
+            "agent_id": "632f31d2",
             "enabled_skills": ["legacy-default"],
             "custom_skill_names": ["custom-note"],
             "disabled_builtin_skills": ["todo-tracker"],
@@ -527,7 +598,9 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
     assert_eq!(data["profile"]["name"], "Mine");
     assert_eq!(data["state"]["enabled"], false);
     assert_eq!(data["state"]["sort_order"], 7);
-    assert_eq!(data["engine"]["agent_backend"], "codex");
+    assert_eq!(data["engine"]["agent_id"], "8e1acf31");
+    assert_eq!(data["engine"]["agent"]["backend"], "codex");
+    assert_eq!(data["engine"]["agent"]["type"], "acp");
     assert_eq!(data["rules"]["content"], "user rule body");
     assert_eq!(data["rules"]["storage_mode"], "user_file");
     assert_eq!(data["defaults"]["model"]["mode"], "fixed");
@@ -566,7 +639,8 @@ async fn get_detail_generated_assistant_exposes_bare_runtime_fields() {
         data["team_block_reason"],
         "This assistant's agent could not be resolved."
     );
-    assert_eq!(data["engine"]["agent_backend"], "droid");
+    assert_eq!(data["engine"]["agent_id"], "agent-droid");
+    assert_eq!(data["engine"]["agent"], Value::Null);
 }
 
 // ===========================================================================
@@ -641,7 +715,7 @@ async fn create_user_avatar_from_local_file_is_served_via_assistant_avatar_route
             "id": "u-avatar",
             "name": "Avatar User",
             "avatar": source_avatar.to_string_lossy(),
-            "preset_agent_type": "aionrs",
+            "agent_id": "632f31d2",
         }),
         &fx.token,
         &fx.csrf,
@@ -688,7 +762,7 @@ async fn create_user_avatar_from_builtin_avatar_route_copies_builtin_asset() {
             "id": "u-avatar-from-builtin",
             "name": "Builtin Avatar Copy",
             "avatar": "/api/assistants/builtin-office/avatar",
-            "preset_agent_type": "aionrs",
+            "agent_id": "632f31d2",
         }),
         &fx.token,
         &fx.csrf,
@@ -738,7 +812,7 @@ async fn create_user_avatar_from_absolute_builtin_avatar_route_copies_builtin_as
             "id": "u-avatar-from-builtin-absolute",
             "name": "Builtin Avatar Absolute Copy",
             "avatar": "http://127.0.0.1:56663/api/assistants/builtin-office/avatar",
-            "preset_agent_type": "aionrs",
+            "agent_id": "632f31d2",
         }),
         &fx.token,
         &fx.csrf,
@@ -775,7 +849,7 @@ async fn update_user_avatar_with_existing_route_preserves_served_file() {
             "id": "u-avatar-stable",
             "name": "Avatar User",
             "avatar": source_avatar.to_string_lossy(),
-            "preset_agent_type": "aionrs",
+            "agent_id": "632f31d2",
         }),
         &fx.token,
         &fx.csrf,

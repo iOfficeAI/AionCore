@@ -123,7 +123,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
         json!({
             "id": "u1",
             "name": "Snapshot Assistant",
-            "preset_agent_type": "codex"
+            "agent_id": "8e1acf31"
         }),
         &token,
         &csrf,
