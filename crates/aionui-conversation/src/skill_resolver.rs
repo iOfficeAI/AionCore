@@ -87,17 +87,6 @@ fn extract_skill_body(content: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_skill_body_removes_frontmatter() {
-        let content = "---\nname: cron\ndescription: Cron\n---\nCron body";
-        assert_eq!(extract_skill_body(content), "Cron body");
-    }
-}
-
 #[async_trait]
 impl SkillResolver for ExtensionSkillResolver {
     async fn auto_inject_names(&self) -> Vec<String> {
@@ -176,5 +165,16 @@ impl SkillResolver for FixedSkillResolver {
         _skills: &[ResolvedAgentSkill],
     ) -> usize {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_skill_body_removes_frontmatter() {
+        let content = "---\nname: cron\ndescription: Cron\n---\nCron body";
+        assert_eq!(extract_skill_body(content), "Cron body");
     }
 }
