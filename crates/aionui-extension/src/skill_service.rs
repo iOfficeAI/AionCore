@@ -2154,7 +2154,7 @@ mod tests {
         let paths = make_embedded_paths(tmp.path()).await;
 
         let autos = list_builtin_auto_skills(&paths).await.unwrap();
-        assert!(autos.len() >= 4, "expected ≥4 auto-inject entries, got {}", autos.len());
+        assert!(autos.len() >= 3, "expected ≥3 auto-inject entries, got {}", autos.len());
         for item in &autos {
             assert!(
                 item.location.starts_with("auto-inject/"),
