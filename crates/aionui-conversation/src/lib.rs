@@ -24,6 +24,7 @@ pub mod stream_relay;
 pub mod task_options;
 mod turn_continuation_policy;
 mod turn_orchestrator;
+mod turn_recovery_policy;
 
 pub use error::ConversationError;
 pub use response_middleware::{
