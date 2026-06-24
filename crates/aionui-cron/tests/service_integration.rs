@@ -33,7 +33,7 @@ use aionui_realtime::EventBroadcaster;
 use aionui_cron::events::CronEventEmitter;
 use aionui_cron::executor::JobExecutor;
 use aionui_cron::scheduler::CronScheduler;
-use aionui_cron::service::CronService;
+use aionui_cron::service::{CronService, CronServiceDeps};
 use aionui_cron::types::JobStatus;
 
 // ── Test infrastructure ────────────────────────────────────────────
@@ -731,16 +731,16 @@ async fn setup_with_conv_repo() -> (
     let scheduler = Arc::new(CronScheduler::new(Arc::new(|_| {})));
 
     let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn EventBroadcaster>);
-    let svc = CronService::new(
-        cron_repo.clone(),
+    let svc = CronService::new(CronServiceDeps {
+        repo: cron_repo.clone(),
         agent_metadata_repo,
-        assistant_definition_repo.clone(),
-        assistant_overlay_repo.clone(),
+        assistant_definition_repo: assistant_definition_repo.clone(),
+        assistant_overlay_repo: assistant_overlay_repo.clone(),
         scheduler,
         executor,
         emitter,
         data_dir,
-    );
+    });
 
     seed_assistant_definition(
         &assistant_definition_repo,
@@ -827,16 +827,16 @@ async fn setup_with_assistant_repos() -> (
 
     let scheduler = Arc::new(CronScheduler::new(Arc::new(|_| {})));
     let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn EventBroadcaster>);
-    let svc = CronService::new(
-        cron_repo.clone(),
+    let svc = CronService::new(CronServiceDeps {
+        repo: cron_repo.clone(),
         agent_metadata_repo,
-        assistant_definition_repo.clone(),
-        assistant_overlay_repo.clone(),
+        assistant_definition_repo: assistant_definition_repo.clone(),
+        assistant_overlay_repo: assistant_overlay_repo.clone(),
         scheduler,
         executor,
         emitter,
         data_dir,
-    );
+    });
 
     seed_assistant_definition(
         &assistant_definition_repo,

@@ -13,7 +13,7 @@ use aionui_assistant::{
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
 use aionui_conversation::{ConversationRouterState, ConversationService};
-use aionui_cron::{CronEventEmitter, CronRouterState};
+use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
     IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
@@ -691,16 +691,16 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         services.database.pool().clone(),
     ));
     let assistant_overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone()));
-    let cron_service = Arc::new(aionui_cron::service::CronService::new(
-        cron_repo,
+    let cron_service = Arc::new(aionui_cron::service::CronService::new(CronServiceDeps {
+        repo: cron_repo,
         agent_metadata_repo,
         assistant_definition_repo,
         assistant_overlay_repo,
         scheduler,
         executor,
         emitter,
-        services.data_dir.clone(),
-    ));
+        data_dir: services.data_dir.clone(),
+    }));
 
     tick_service_ref.0.lock().unwrap().replace(cron_service.clone());
 

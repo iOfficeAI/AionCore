@@ -51,26 +51,28 @@ pub struct CronService {
     data_dir: PathBuf,
 }
 
+pub struct CronServiceDeps {
+    pub repo: Arc<dyn ICronRepository>,
+    pub agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    pub assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    pub assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    pub scheduler: Arc<CronScheduler>,
+    pub executor: Arc<JobExecutor>,
+    pub emitter: CronEventEmitter,
+    pub data_dir: PathBuf,
+}
+
 impl CronService {
-    pub fn new(
-        repo: Arc<dyn ICronRepository>,
-        agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
-        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
-        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
-        scheduler: Arc<CronScheduler>,
-        executor: Arc<JobExecutor>,
-        emitter: CronEventEmitter,
-        data_dir: PathBuf,
-    ) -> Self {
+    pub fn new(deps: CronServiceDeps) -> Self {
         Self {
-            repo,
-            agent_metadata_repo,
-            assistant_definition_repo,
-            assistant_overlay_repo,
-            scheduler,
-            executor,
-            emitter,
-            data_dir,
+            repo: deps.repo,
+            agent_metadata_repo: deps.agent_metadata_repo,
+            assistant_definition_repo: deps.assistant_definition_repo,
+            assistant_overlay_repo: deps.assistant_overlay_repo,
+            scheduler: deps.scheduler,
+            executor: deps.executor,
+            emitter: deps.emitter,
+            data_dir: deps.data_dir,
         }
     }
 
