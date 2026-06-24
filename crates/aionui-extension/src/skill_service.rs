@@ -1223,32 +1223,55 @@ fn zip_error(err: zip::result::ZipError) -> ExtensionError {
 /// Body content here...
 /// ```
 fn parse_frontmatter_fields(content: &str) -> Option<(String, String)> {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return None;
+    #[derive(serde::Deserialize)]
+    struct SkillFrontmatter {
+        #[serde(default)]
+        name: String,
+        description: String,
     }
 
-    let after_open = &trimmed[3..];
-    let close_idx = after_open.find("---")?;
-    let frontmatter = &after_open[..close_idx];
-
-    let mut name = String::new();
-    let mut description = String::new();
-
-    for line in frontmatter.lines() {
-        let line = line.trim();
-        if let Some(val) = line.strip_prefix("name:") {
-            name = val.trim().to_string();
-        } else if let Some(val) = line.strip_prefix("description:") {
-            description = val.trim().to_string();
-        }
-    }
+    let frontmatter = extract_frontmatter_text(content)?;
+    let parsed = serde_yaml::from_str::<SkillFrontmatter>(frontmatter).ok()?;
+    let description = parsed.description.trim().to_string();
 
     if description.is_empty() {
         return None;
     }
 
-    Some((name, description))
+    Some((parsed.name.trim().to_string(), description))
+}
+
+fn extract_frontmatter_text(content: &str) -> Option<&str> {
+    let after_open = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))?;
+
+    let mut pos = 0;
+    for line in after_open.lines() {
+        let raw = &after_open[pos..];
+        let line_len = line.len();
+        let line_with_ending_len = if raw[line_len..].starts_with("\r\n") {
+            line_len + 2
+        } else if raw[line_len..].starts_with('\n') {
+            line_len + 1
+        } else {
+            line_len
+        };
+
+        if line == "---" {
+            let yaml_text = &after_open[..pos];
+            return Some(
+                yaml_text
+                    .strip_suffix("\r\n")
+                    .or_else(|| yaml_text.strip_suffix('\n'))
+                    .unwrap_or(yaml_text),
+            );
+        }
+
+        pos += line_with_ending_len;
+    }
+
+    None
 }
 
 /// Recursively copy a directory.
@@ -1416,6 +1439,43 @@ mod tests {
         let (name, desc) = parse_frontmatter_fields(content).unwrap();
         assert_eq!(name, "my-skill");
         assert_eq!(desc, "A useful skill");
+    }
+
+    #[test]
+    fn parse_frontmatter_rejects_invalid_yaml() {
+        let content = "---\nname: video-skill\ndescription: Download video: supports batch URLs\n---\nBody";
+        assert!(parse_frontmatter_fields(content).is_none());
+    }
+
+    #[test]
+    fn parse_frontmatter_accepts_quoted_yaml_description() {
+        let content = "---\nname: video-skill\ndescription: \"Download video: supports batch URLs\"\n---\nBody";
+        let (name, desc) = parse_frontmatter_fields(content).unwrap();
+        assert_eq!(name, "video-skill");
+        assert_eq!(desc, "Download video: supports batch URLs");
+    }
+
+    #[test]
+    fn parse_frontmatter_accepts_block_scalar_description() {
+        let content = "---\nname: douyin-downloader\ndescription: |\n  Download Douyin videos without watermark.\n  Supports batch downloads.\n---\nBody";
+        let (name, desc) = parse_frontmatter_fields(content).unwrap();
+        assert_eq!(name, "douyin-downloader");
+        assert_eq!(
+            desc,
+            "Download Douyin videos without watermark.\nSupports batch downloads."
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_requires_opening_fence_line() {
+        let content = " ---\nname: test\ndescription: desc\n---\nbody";
+        assert!(parse_frontmatter_fields(content).is_none());
+    }
+
+    #[test]
+    fn parse_frontmatter_requires_closing_fence_line() {
+        let content = "---\nname: test\ndescription: this has --- inside\nbody";
+        assert!(parse_frontmatter_fields(content).is_none());
     }
 
     #[test]
@@ -1974,6 +2034,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_skill_with_symlink_rejects_invalid_yaml_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+
+        let source_dir = tmp.path().join("invalid-frontmatter");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join(SKILL_MANIFEST_FILE),
+            "---\nname: invalid-frontmatter\ndescription: Download video: supports batch URLs\n---\nBody",
+        )
+        .unwrap();
+
+        let result = import_skill_with_symlink(&paths, &source_dir).await;
+        assert!(matches!(result, Err(ExtensionError::InvalidSkillPath(_))));
+        assert!(!paths.user_skills_dir.join("invalid-frontmatter").exists());
+    }
+
+    #[tokio::test]
     async fn delete_custom_skill() {
         let tmp = TempDir::new().unwrap();
         let paths = make_test_paths(tmp.path());
@@ -2147,6 +2225,50 @@ mod tests {
     // -----------------------------------------------------------------------
     // Embedded corpus
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn embedded_builtin_skill_frontmatter_is_valid_yaml() {
+        let mut checked = 0;
+        let mut failures = Vec::new();
+
+        assert_embedded_skill_frontmatter(&BUILTIN_SKILLS, &mut checked, &mut failures);
+
+        assert!(
+            checked >= 20,
+            "expected builtin skill corpus to contain many SKILL.md files, got {checked}"
+        );
+        assert!(
+            failures.is_empty(),
+            "invalid embedded builtin SKILL.md frontmatter:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    fn assert_embedded_skill_frontmatter(dir: &Dir<'static>, checked: &mut usize, failures: &mut Vec<String>) {
+        for file in dir.files() {
+            if file.path().file_name().and_then(|name| name.to_str()) != Some(SKILL_MANIFEST_FILE) {
+                continue;
+            }
+
+            *checked += 1;
+            let path = file.path().display();
+            let content = match std::str::from_utf8(file.contents()) {
+                Ok(content) => content,
+                Err(err) => {
+                    failures.push(format!("{path}: not UTF-8: {err}"));
+                    continue;
+                }
+            };
+
+            if parse_frontmatter_fields(content).is_none() {
+                failures.push(format!("{path}: invalid YAML frontmatter or missing description"));
+            }
+        }
+
+        for subdir in dir.dirs() {
+            assert_embedded_skill_frontmatter(subdir, checked, failures);
+        }
+    }
 
     #[tokio::test]
     async fn embedded_lists_auto_inject_from_corpus() {
