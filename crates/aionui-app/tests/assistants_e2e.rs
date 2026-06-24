@@ -599,7 +599,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
     assert_eq!(data["state"]["enabled"], false);
     assert_eq!(data["state"]["sort_order"], 7);
     assert_eq!(data["engine"]["agent_id"], "8e1acf31");
-    assert_eq!(data["engine"]["agent"]["backend"], "codex");
+    assert_eq!(data["engine"]["agent"]["acp_backend"], "codex");
     assert_eq!(data["engine"]["agent"]["type"], "acp");
     assert_eq!(data["rules"]["content"], "user rule body");
     assert_eq!(data["rules"]["storage_mode"], "user_file");

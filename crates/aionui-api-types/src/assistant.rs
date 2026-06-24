@@ -31,7 +31,7 @@ pub struct AssistantAgentResponse {
     pub r#type: AgentType,
     pub source: AgentSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend: Option<String>,
+    pub acp_backend: Option<String>,
 }
 
 /// Wire shape returned by `GET /api/assistants` (single element) and

@@ -1984,7 +1984,7 @@ fn assistant_projection_for_definition(
         id: row.id.clone(),
         r#type: row.agent_type,
         source: row.agent_source,
-        backend: row.backend.clone(),
+        acp_backend: row.backend.clone(),
     });
 
     let agent_status = agent_row
