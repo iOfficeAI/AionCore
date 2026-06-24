@@ -17,6 +17,7 @@ use crate::stream_persistence::{
 use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
+use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, info, warn};
 
@@ -219,11 +220,34 @@ impl StreamRelay {
         let mut first_agent_event_logged = false;
         let mut first_visible_output_logged = false;
         let mut send_error_done = send_error_rx.is_none();
+        let mut pending_send_error: Option<AgentSendError> = None;
         let mut attempt = TurnAttemptSummary::default();
 
         loop {
             let recv_result = if send_error_done {
-                rx.recv().await
+                if let Some(send_error) = pending_send_error.take() {
+                    match rx.try_recv() {
+                        Ok(event) => {
+                            if !matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) {
+                                pending_send_error = Some(send_error);
+                            } else {
+                                debug!("Runtime terminal event won race with fallback send error");
+                            }
+                            Ok(event)
+                        }
+                        Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => {
+                            warn!(
+                                code = ?send_error.code(),
+                                ownership = ?send_error.ownership(),
+                                "Injecting stream error for failed agent send"
+                            );
+                            Ok(AgentStreamEvent::Error(send_error.into_stream_error()))
+                        }
+                        Err(TryRecvError::Lagged(n)) => Err(broadcast::error::RecvError::Lagged(n)),
+                    }
+                } else {
+                    rx.recv().await
+                }
             } else {
                 tokio::select! {
                     recv = rx.recv() => recv,
@@ -231,12 +255,8 @@ impl StreamRelay {
                         send_error_done = true;
                         match send_error {
                             Ok(send_error) => {
-                                warn!(
-                                    code = ?send_error.code(),
-                                    ownership = ?send_error.ownership(),
-                                    "Injecting stream error for failed agent send"
-                                );
-                                Ok(AgentStreamEvent::Error(send_error.into_stream_error()))
+                                pending_send_error = Some(send_error);
+                                continue;
                             }
                             Err(_) => continue,
                         }

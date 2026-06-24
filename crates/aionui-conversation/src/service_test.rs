@@ -3865,6 +3865,35 @@ async fn send_message_injects_send_error_when_runtime_terminal_missing() {
 }
 
 #[tokio::test]
+async fn send_message_recovers_when_finished_task_has_no_runtime_terminal() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(&conv.id, vec![vec![]])
+            .with_status(Some(ConversationStatus::Finished))
+            .with_send_error(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "acp protocol not connected",
+            ))),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert_eq!(task_mgr.active_count(), 1);
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert!(tips.is_empty());
+}
+
+#[tokio::test]
 async fn send_message_auto_replays_clean_retryable_acp_error_once() {
     let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();

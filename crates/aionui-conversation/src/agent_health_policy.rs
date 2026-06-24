@@ -22,7 +22,10 @@ impl AgentHealthPolicy {
         outcome: &RelayOutcome,
         lifecycle: RuntimeLifecycleState,
     ) -> AgentHealthAction {
-        if lifecycle != RuntimeLifecycleState::Active {
+        if matches!(
+            lifecycle,
+            RuntimeLifecycleState::Deleting | RuntimeLifecycleState::ShuttingDown
+        ) {
             return AgentHealthAction::Keep;
         }
         if agent_type != AgentType::Acp || !outcome.terminal.is_error() {
@@ -105,6 +108,18 @@ mod tests {
             AgentHealthPolicy::decide(AgentType::Acp, &outcome, RuntimeLifecycleState::Active),
             AgentHealthAction::Keep
         );
+    }
+
+    #[test]
+    fn cancelling_acp_terminal_error_evicts_task() {
+        let outcome = error_outcome(Some(AgentErrorCode::UnknownUpstreamError));
+        assert!(matches!(
+            AgentHealthPolicy::decide(AgentType::Acp, &outcome, RuntimeLifecycleState::Cancelling),
+            AgentHealthAction::EvictAcpTask {
+                clear_model_seed: false,
+                ..
+            }
+        ));
     }
 
     #[test]

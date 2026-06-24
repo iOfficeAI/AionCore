@@ -224,19 +224,18 @@ impl ConversationTurnOrchestrator {
                             conversation_id = %conv_id_send,
                             turn_id = %turn_id_for_send,
                             ?agent_type,
-                            "Agent send_message failure already published runtime terminal; skipping fallback stream error"
+                            "Agent send_message failed on finished task; relay will prefer any runtime terminal before fallback"
                         );
-                    } else {
-                        warn!(
-                            conversation_id = %conv_id_send,
-                            turn_id = %turn_id_for_send,
-                            ?agent_type,
-                            code = ?e.code(),
-                            ownership = ?e.ownership(),
-                            "Agent send_message returned error without runtime terminal; injecting fallback stream error"
-                        );
-                        let _ = send_error_tx.send(e);
                     }
+                    warn!(
+                        conversation_id = %conv_id_send,
+                        turn_id = %turn_id_for_send,
+                        ?agent_type,
+                        code = ?e.code(),
+                        ownership = ?e.ownership(),
+                        "Agent send_message returned error; offering fallback stream error to relay"
+                    );
+                    let _ = send_error_tx.send(e);
                 }
             });
 
