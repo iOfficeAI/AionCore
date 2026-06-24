@@ -255,6 +255,7 @@ where
             status: Some("finish".into()),
             hidden: request.visibility.allow_hidden_conversation_message,
             created_at,
+            sequence: 0,
         })
     }
 }

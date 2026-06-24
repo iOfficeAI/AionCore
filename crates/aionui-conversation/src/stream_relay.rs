@@ -2020,17 +2020,15 @@ mod tests {
         ) -> Result<Vec<aionui_db::models::ConversationRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_messages(
+        async fn list_messages_page(
             &self,
             _conv_id: &str,
-            _page: u32,
-            _page_size: u32,
-            _order: aionui_db::SortOrder,
-        ) -> Result<aionui_common::PaginatedResult<MessageRow>, DbError> {
-            Ok(aionui_common::PaginatedResult {
+            _params: &aionui_db::MessagePageParams,
+        ) -> Result<aionui_db::MessagePageResult, DbError> {
+            Ok(aionui_db::MessagePageResult {
                 items: vec![],
-                total: 0,
-                has_more: false,
+                has_more_before: false,
+                has_more_after: false,
             })
         }
         async fn insert_message(&self, row: &MessageRow) -> Result<(), DbError> {

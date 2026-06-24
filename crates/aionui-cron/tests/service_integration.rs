@@ -22,7 +22,7 @@ use aionui_conversation::ConversationService;
 use aionui_conversation::response_middleware::{CronCreateParams, CronUpdateParams};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
-    IConversationRepository, ICronRepository, MessageRowUpdate, MessageSearchRow, SortOrder,
+    IConversationRepository, ICronRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
     SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteCronRepository, init_database_memory,
     models::MessageRow,
 };
@@ -427,17 +427,15 @@ impl IConversationRepository for StubConvRepo {
     ) -> Result<Vec<aionui_db::models::ConversationRow>, aionui_db::DbError> {
         Ok(vec![])
     }
-    async fn get_messages(
+    async fn list_messages_page(
         &self,
         _conv_id: &str,
-        _page: u32,
-        _page_size: u32,
-        _order: SortOrder,
-    ) -> Result<PaginatedResult<aionui_db::models::MessageRow>, aionui_db::DbError> {
-        Ok(PaginatedResult {
+        _params: &MessagePageParams,
+    ) -> Result<MessagePageResult, aionui_db::DbError> {
+        Ok(MessagePageResult {
             items: vec![],
-            total: 0,
-            has_more: false,
+            has_more_before: false,
+            has_more_after: false,
         })
     }
     async fn insert_message(&self, message: &aionui_db::models::MessageRow) -> Result<(), aionui_db::DbError> {

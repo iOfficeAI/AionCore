@@ -875,6 +875,7 @@ async fn t7_1_reset_conversation() {
         status: None,
         hidden: false,
         created_at: 1000,
+        sequence: 0,
     };
     aionui_db::IConversationRepository::insert_message(&repo, &msg)
         .await
@@ -966,6 +967,7 @@ async fn team_owned_conversation_rejects_ordinary_send_but_allows_history_reads(
         status: Some("finish".into()),
         hidden: false,
         created_at: 1000,
+        sequence: 0,
     };
     aionui_db::IConversationRepository::insert_message(&repo, &msg)
         .await

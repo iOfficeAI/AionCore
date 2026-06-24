@@ -17,7 +17,7 @@ use aionui_db::models::{
 };
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IConversationRepository,
-    IProviderRepository, ITeamRepository, MessageRowUpdate, MessageSearchRow, SortOrder,
+    IProviderRepository, ITeamRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -140,17 +140,15 @@ impl IConversationRepository for MockConversationRepo {
     async fn list_associated(&self, _user_id: &str, _conversation_id: &str) -> Result<Vec<ConversationRow>, DbError> {
         Ok(vec![])
     }
-    async fn get_messages(
+    async fn list_messages_page(
         &self,
         _conv_id: &str,
-        _page: u32,
-        _page_size: u32,
-        _order: SortOrder,
-    ) -> Result<PaginatedResult<MessageRow>, DbError> {
-        Ok(PaginatedResult {
+        _params: &MessagePageParams,
+    ) -> Result<MessagePageResult, DbError> {
+        Ok(MessagePageResult {
             items: vec![],
-            total: 0,
-            has_more: false,
+            has_more_before: false,
+            has_more_after: false,
         })
     }
     async fn insert_message(&self, _message: &MessageRow) -> Result<(), DbError> {

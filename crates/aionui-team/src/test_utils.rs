@@ -212,7 +212,8 @@ pub(crate) mod workspace_harness {
     };
     use aionui_db::{
         ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IConversationRepository,
-        IProviderRepository, ITeamRepository, MessageRowUpdate, MessageSearchRow, SortOrder, UpdateTeamParams,
+        IProviderRepository, ITeamRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+        UpdateTeamParams,
     };
     use aionui_realtime::EventBroadcaster;
     use async_trait::async_trait;
@@ -322,17 +323,15 @@ pub(crate) mod workspace_harness {
             Ok(vec![])
         }
 
-        async fn get_messages(
+        async fn list_messages_page(
             &self,
             _conv_id: &str,
-            _page: u32,
-            _page_size: u32,
-            _order: SortOrder,
-        ) -> Result<PaginatedResult<MessageRow>, DbError> {
-            Ok(PaginatedResult {
+            _params: &MessagePageParams,
+        ) -> Result<MessagePageResult, DbError> {
+            Ok(MessagePageResult {
                 items: vec![],
-                total: 0,
-                has_more: false,
+                has_more_before: false,
+                has_more_after: false,
             })
         }
 

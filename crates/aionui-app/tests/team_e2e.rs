@@ -1,6 +1,6 @@
 mod common;
 
-use aionui_db::{IConversationRepository, SortOrder};
+use aionui_db::{IConversationRepository, MessagePageDirection, MessagePageParams};
 use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
@@ -846,7 +846,13 @@ async fn sm1b_team_send_persists_user_bubble_through_projection_adapter() {
 
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
     let messages = repo
-        .get_messages(lead_conversation_id, 1, 50, SortOrder::Asc)
+        .list_messages_page(
+            lead_conversation_id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
         .await
         .unwrap();
     assert!(messages.items.iter().any(|row| {

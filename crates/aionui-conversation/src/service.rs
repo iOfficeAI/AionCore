@@ -7,6 +7,7 @@ use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
 
+use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::response_middleware::ICronService;
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
@@ -28,8 +29,8 @@ use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, SaveRuntimeStateParams, SortOrder,
-    UpsertConversationAssistantSnapshotParams,
+    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageDirection,
+    MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -1813,8 +1814,24 @@ impl ConversationService {
 
 // ── Messages & Artifacts ────────────────────────────────────────────
 
+const DEFAULT_MESSAGE_PAGE_LIMIT: u32 = 50;
+const MAX_MESSAGE_PAGE_LIMIT: u32 = 200;
+
+fn effective_message_limit(limit: Option<u32>) -> u32 {
+    match limit.unwrap_or(DEFAULT_MESSAGE_PAGE_LIMIT) {
+        0 => DEFAULT_MESSAGE_PAGE_LIMIT,
+        n => n.min(MAX_MESSAGE_PAGE_LIMIT),
+    }
+}
+
+fn message_locator_count(query: &ListMessagesQuery) -> usize {
+    usize::from(query.before.is_some())
+        + usize::from(query.after.is_some())
+        + usize::from(query.anchor_message_id.is_some())
+}
+
 impl ConversationService {
-    /// List messages for a conversation with page-based pagination.
+    /// List messages for a conversation with cursor-based pagination.
     pub async fn list_messages(
         &self,
         user_id: &str,
@@ -1830,24 +1847,48 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
-        let page = query.page.unwrap_or(1);
-        let page_size = query.page_size.unwrap_or(50);
-        let order = match query.order.as_deref() {
-            Some("DESC" | "desc") => SortOrder::Desc,
-            _ => SortOrder::Asc,
+        let limit = effective_message_limit(query.limit);
+        if message_locator_count(&query) > 1 {
+            return Err(ConversationError::bad_request(
+                "before, after, and anchor_message_id are mutually exclusive",
+            ));
+        }
+
+        let direction = if let Some(cursor) = query.before.as_deref() {
+            MessagePageDirection::Before {
+                sequence: decode_message_cursor(cursor)?,
+            }
+        } else if let Some(cursor) = query.after.as_deref() {
+            MessagePageDirection::After {
+                sequence: decode_message_cursor(cursor)?,
+            }
+        } else if let Some(message_id) = query.anchor_message_id.clone() {
+            MessagePageDirection::Anchor { message_id }
+        } else {
+            MessagePageDirection::InitialLatest
         };
         let compact_content = matches!(query.content_mode.as_deref(), Some("compact"));
 
-        let result = self
+        let page = self
             .conversation_repo
-            .get_messages(conversation_id, page, page_size, order)
+            .list_messages_page(conversation_id, &MessagePageParams { limit, direction })
             .await?;
 
         let mut compacted_count = 0usize;
         let mut total_original_content_bytes = 0usize;
         let mut total_response_content_bytes = 0usize;
-        let mut items = Vec::with_capacity(result.items.len());
-        for row in result.items {
+        let oldest_cursor = page
+            .items
+            .first()
+            .map(|row| encode_message_cursor(row.sequence))
+            .transpose()?;
+        let newest_cursor = page
+            .items
+            .last()
+            .map(|row| encode_message_cursor(row.sequence))
+            .transpose()?;
+        let mut items = Vec::with_capacity(page.items.len());
+        for row in page.items {
             let original_content_bytes = row.content.len();
             total_original_content_bytes += original_content_bytes;
             let response = if compact_content {
@@ -1874,11 +1915,8 @@ impl ConversationService {
         if compact_content && compacted_count > 0 {
             info!(
                 conversation_id,
-                page,
-                page_size,
-                order = ?order,
+                limit,
                 items = items.len(),
-                total = result.total,
                 compacted = compacted_count,
                 total_original_content_bytes,
                 total_response_content_bytes,
@@ -1886,10 +1924,12 @@ impl ConversationService {
             );
         }
 
-        Ok(PaginatedResult {
+        Ok(MessageListResponse {
             items,
-            total: result.total,
-            has_more: result.has_more,
+            oldest_cursor,
+            newest_cursor,
+            has_more_before: page.has_more_before,
+            has_more_after: page.has_more_after,
         })
     }
 
@@ -2209,6 +2249,7 @@ impl ConversationService {
             status: Some("finish".into()),
             hidden: req.hidden,
             created_at: now_ms(),
+            sequence: 0,
         };
         if !self
             .runtime_persistence()
