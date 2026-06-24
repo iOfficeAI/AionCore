@@ -298,10 +298,12 @@ impl ConversationTurnOrchestrator {
             inject_skills: input.request.inject_skills,
         };
         let mut replayed = false;
+        let mut replay_started_at = None;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
         let final_failed = loop {
+            let attempt_number = if replayed { 2 } else { 1 };
             let attempt_result = match self
                 .run_attempt(TurnAttemptInput {
                     conv_id: conv_id.clone(),
@@ -325,7 +327,28 @@ impl ConversationTurnOrchestrator {
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
+                if replayed {
+                    info!(
+                        conversation_id = %conv_id,
+                        turn_id = %turn_id,
+                        attempt = attempt_number,
+                        elapsed_ms = replay_started_at
+                            .map(|started_at| now_ms().saturating_sub(started_at))
+                            .unwrap_or_default(),
+                        "conversation turn auto replay completed"
+                    );
+                }
                 break false;
+            }
+            if replayed {
+                warn!(
+                    conversation_id = %conv_id,
+                    turn_id = %turn_id,
+                    attempt = attempt_number,
+                    error_code = ?attempt_result.outcome.terminal.code(),
+                    retryable = ?attempt_result.outcome.terminal.retryable(),
+                    "conversation turn auto replay failed"
+                );
             }
 
             let mut recovery_outcome = attempt_result.outcome.clone();
@@ -340,11 +363,17 @@ impl ConversationTurnOrchestrator {
 
             match decision {
                 TurnRecoveryDecision::AutoReplayOnce { reason, .. } => {
+                    replay_started_at = Some(now_ms());
                     info!(
                         conversation_id = %conv_id,
                         turn_id = %turn_id,
+                        attempt = attempt_number,
+                        next_attempt = attempt_number + 1,
+                        backend = attempt_result.backend.as_deref().unwrap_or("unknown"),
+                        error_code = ?attempt_result.outcome.terminal.code(),
+                        retryable = ?attempt_result.outcome.terminal.retryable(),
                         ?reason,
-                        "conversation turn auto replay starting after retryable clean terminal error"
+                        "conversation turn auto replay starting"
                     );
                     self.service
                         .evict_acp_task_after_terminal_error(
@@ -358,13 +387,13 @@ impl ConversationTurnOrchestrator {
                     continue;
                 }
                 TurnRecoveryDecision::None => {
-                    if attempt_result.outcome.attempt.terminal_error_deferred {
-                        if let Some(data) = attempt_result.outcome.attempt.terminal_error.clone() {
-                            let send_error = AgentSendError::from_stream_error_data(data);
-                            self.service
-                                .persist_and_broadcast_send_failure_tip(&conv_id, &turn_id, &send_error, None)
-                                .await;
-                        }
+                    if attempt_result.outcome.attempt.terminal_error_deferred
+                        && let Some(data) = attempt_result.outcome.attempt.terminal_error.clone()
+                    {
+                        let send_error = AgentSendError::from_stream_error_data(data);
+                        self.service
+                            .persist_and_broadcast_send_failure_tip(&conv_id, &turn_id, &send_error, None)
+                            .await;
                     }
 
                     match AgentHealthPolicy::decide(attempt_result.agent_type, &attempt_result.outcome, lifecycle) {
