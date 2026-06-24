@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// (`MessageType`, `MessagePosition`, `MessageStatus`).
 ///
 /// The `content` field is a JSON TEXT column deserialized by the service layer.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MessageRow {
     pub id: String,
     pub conversation_id: String,
@@ -26,4 +26,5 @@ pub struct MessageRow {
     /// Whether this message is hidden (SQLite INTEGER 0/1).
     pub hidden: bool,
     pub created_at: TimestampMs,
+    pub sequence: i64,
 }

@@ -19,7 +19,8 @@ pub use models::{
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, MessageRowUpdate, MessageSearchRow, SortOrder,
+    ConversationFilters, ConversationRowUpdate, MessagePageDirection, MessagePageParams, MessagePageResult,
+    MessageRowUpdate, MessageSearchRow,
 };
 pub use repository::cron::UpdateCronJobParams;
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};

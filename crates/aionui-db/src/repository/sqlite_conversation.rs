@@ -8,7 +8,8 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessageRowUpdate, MessageSearchRow, SortOrder,
+    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageDirection, MessagePageParams,
+    MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
 
 /// SQLite-backed implementation of [`IConversationRepository`].
@@ -20,6 +21,59 @@ pub struct SqliteConversationRepository {
 impl SqliteConversationRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    async fn visible_message_exists_before(&self, conv_id: &str, sequence: i64) -> Result<bool, DbError> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM messages \
+                WHERE conversation_id = ? \
+                  AND sequence < ? \
+                  AND type NOT IN ('cron_trigger', 'skill_suggest') \
+             )",
+        )
+        .bind(conv_id)
+        .bind(sequence)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(exists != 0)
+    }
+
+    async fn visible_message_exists_after(&self, conv_id: &str, sequence: i64) -> Result<bool, DbError> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM messages \
+                WHERE conversation_id = ? \
+                  AND sequence > ? \
+                  AND type NOT IN ('cron_trigger', 'skill_suggest') \
+             )",
+        )
+        .bind(conv_id)
+        .bind(sequence)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(exists != 0)
+    }
+
+    async fn page_with_flags(&self, conv_id: &str, items: Vec<MessageRow>) -> Result<MessagePageResult, DbError> {
+        let Some(first) = items.first() else {
+            return Ok(MessagePageResult {
+                items,
+                has_more_before: false,
+                has_more_after: false,
+            });
+        };
+        let last_sequence = items.last().map(|row| row.sequence).unwrap_or(first.sequence);
+        let has_more_before = self.visible_message_exists_before(conv_id, first.sequence).await?;
+        let has_more_after = self.visible_message_exists_after(conv_id, last_sequence).await?;
+
+        Ok(MessagePageResult {
+            items,
+            has_more_before,
+            has_more_after,
+        })
     }
 }
 
@@ -370,55 +424,132 @@ impl IConversationRepository for SqliteConversationRepository {
 
     // ── Message operations ──────────────────────────────────────────
 
-    async fn get_messages(
+    async fn list_messages_page(
         &self,
         conv_id: &str,
-        page: u32,
-        page_size: u32,
-        order: SortOrder,
-    ) -> Result<PaginatedResult<MessageRow>, DbError> {
-        let effective_page = if page == 0 { 1 } else { page };
-        let effective_size = if page_size == 0 { 50 } else { page_size };
-        let offset = (effective_page - 1) * effective_size;
-        let fetch_limit = effective_size + 1;
+        params: &MessagePageParams,
+    ) -> Result<MessagePageResult, DbError> {
+        let limit = params.limit.max(1) as i64;
+        let fetch_limit = limit + 1;
 
-        let count_row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM messages \
-                 WHERE conversation_id = ? \
-                   AND type NOT IN ('cron_trigger', 'skill_suggest')",
-        )
-        .bind(conv_id)
-        .fetch_one(&self.pool)
-        .await?;
-        let total = count_row.0 as u64;
+        let mut rows = match &params.direction {
+            MessagePageDirection::InitialLatest => {
+                let mut rows = sqlx::query_as::<_, MessageRow>(
+                    "SELECT * FROM messages \
+                     WHERE conversation_id = ? \
+                       AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                     ORDER BY sequence DESC \
+                     LIMIT ?",
+                )
+                .bind(conv_id)
+                .bind(fetch_limit)
+                .fetch_all(&self.pool)
+                .await?;
+                rows.truncate(limit as usize);
+                rows.reverse();
+                rows
+            }
+            MessagePageDirection::Before { sequence } => {
+                let mut rows = sqlx::query_as::<_, MessageRow>(
+                    "SELECT * FROM messages \
+                     WHERE conversation_id = ? \
+                       AND sequence < ? \
+                       AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                     ORDER BY sequence DESC \
+                     LIMIT ?",
+                )
+                .bind(conv_id)
+                .bind(sequence)
+                .bind(fetch_limit)
+                .fetch_all(&self.pool)
+                .await?;
+                rows.truncate(limit as usize);
+                rows.reverse();
+                rows
+            }
+            MessagePageDirection::After { sequence } => {
+                let mut rows = sqlx::query_as::<_, MessageRow>(
+                    "SELECT * FROM messages \
+                     WHERE conversation_id = ? \
+                       AND sequence > ? \
+                       AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                     ORDER BY sequence ASC \
+                     LIMIT ?",
+                )
+                .bind(conv_id)
+                .bind(sequence)
+                .bind(fetch_limit)
+                .fetch_all(&self.pool)
+                .await?;
+                rows.truncate(limit as usize);
+                rows
+            }
+            MessagePageDirection::Anchor { message_id } => {
+                let anchor = sqlx::query_as::<_, MessageRow>(
+                    "SELECT * FROM messages \
+                     WHERE conversation_id = ? \
+                       AND id = ? \
+                       AND type NOT IN ('cron_trigger', 'skill_suggest')",
+                )
+                .bind(conv_id)
+                .bind(message_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| DbError::NotFound(format!("Message '{message_id}' not found")))?;
 
-        let sql = format!(
-            "SELECT * FROM messages \
-             WHERE conversation_id = ? \
-               AND type NOT IN ('cron_trigger', 'skill_suggest') \
-             ORDER BY created_at {}, id {} \
-             LIMIT ? OFFSET ?",
-            order.as_sql(),
-            order.as_sql()
-        );
+                let side_limit = limit;
+                let mut before = sqlx::query_as::<_, MessageRow>(
+                    "SELECT * FROM messages \
+                     WHERE conversation_id = ? \
+                       AND sequence < ? \
+                       AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                     ORDER BY sequence DESC \
+                     LIMIT ?",
+                )
+                .bind(conv_id)
+                .bind(anchor.sequence)
+                .bind(side_limit)
+                .fetch_all(&self.pool)
+                .await?;
+                before.reverse();
 
-        let mut rows = sqlx::query_as::<_, MessageRow>(&sql)
-            .bind(conv_id)
-            .bind(fetch_limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?;
+                let after = sqlx::query_as::<_, MessageRow>(
+                    "SELECT * FROM messages \
+                     WHERE conversation_id = ? \
+                       AND sequence > ? \
+                       AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                     ORDER BY sequence ASC \
+                     LIMIT ?",
+                )
+                .bind(conv_id)
+                .bind(anchor.sequence)
+                .bind(side_limit)
+                .fetch_all(&self.pool)
+                .await?;
 
-        let has_more = rows.len() as u32 > effective_size;
-        if has_more {
-            rows.pop();
-        }
+                let before_target = ((limit - 1) / 2).max(0) as usize;
+                let after_target = (limit as usize).saturating_sub(1 + before_target);
+                let mut before_take = before.len().min(before_target);
+                let mut after_take = after.len().min(after_target);
+                let mut remaining = (limit as usize).saturating_sub(1 + before_take + after_take);
+                if remaining > 0 {
+                    let extra_after = (after.len() - after_take).min(remaining);
+                    after_take += extra_after;
+                    remaining -= extra_after;
+                }
+                if remaining > 0 {
+                    before_take += (before.len() - before_take).min(remaining);
+                }
 
-        Ok(PaginatedResult {
-            items: rows,
-            total,
-            has_more,
-        })
+                let before_start = before.len().saturating_sub(before_take);
+                let mut rows = before[before_start..].to_vec();
+                rows.push(anchor);
+                rows.extend(after.into_iter().take(after_take));
+                rows
+            }
+        };
+        rows.sort_by_key(|row| row.sequence);
+        self.page_with_flags(conv_id, rows).await
     }
 
     async fn get_message(&self, conv_id: &str, message_id: &str) -> Result<Option<MessageRow>, DbError> {
@@ -437,11 +568,18 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let next_sequence: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE conversation_id = ?")
+                .bind(&message.conversation_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
         sqlx::query(
             "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
-                 status, hidden, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 status, hidden, created_at, sequence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&message.id)
         .bind(&message.conversation_id)
@@ -452,18 +590,28 @@ impl IConversationRepository for SqliteConversationRepository {
         .bind(&message.status)
         .bind(message.hidden)
         .bind(message.created_at)
-        .execute(&self.pool)
+        .bind(next_sequence)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
 
     async fn upsert_message(&self, message: &MessageRow) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let next_sequence: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE conversation_id = ?")
+                .bind(&message.conversation_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
         sqlx::query(
             "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
-                 status, hidden, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 status, hidden, created_at, sequence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
                 content = CASE \
                     WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN \
@@ -498,8 +646,11 @@ impl IConversationRepository for SqliteConversationRepository {
         .bind(&message.status)
         .bind(message.hidden)
         .bind(message.created_at)
-        .execute(&self.pool)
+        .bind(next_sequence)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -913,6 +1064,7 @@ mod tests {
             status: Some("finish".to_string()),
             hidden: false,
             created_at: now,
+            sequence: 0,
         }
     }
 
@@ -1036,7 +1188,16 @@ mod tests {
         repo.delete(&conv.id).await.unwrap();
 
         // Messages should be gone due to CASCADE
-        let result = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
+        let result = repo
+            .list_messages_page(
+                &conv.id,
+                &MessagePageParams {
+                    limit: 50,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .unwrap();
         assert!(result.items.is_empty());
     }
 
@@ -1359,14 +1520,23 @@ mod tests {
         let msg = sample_message(&conv.id);
         repo.insert_message(&msg).await.unwrap();
 
-        let result = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
+        let result = repo
+            .list_messages_page(
+                &conv.id,
+                &MessagePageParams {
+                    limit: 50,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(result.items.len(), 1);
-        assert_eq!(result.total, 1);
         assert_eq!(result.items[0].id, msg.id);
+        assert_eq!(result.items[0].sequence, 1);
     }
 
     #[tokio::test]
-    async fn get_messages_pagination() {
+    async fn initial_latest_returns_latest_limit_in_ascending_order() {
         let (repo, _db) = setup().await;
         let conv = sample_conversation(SYSTEM_USER_ID);
         repo.create(&conv).await.unwrap();
@@ -1378,29 +1548,67 @@ mod tests {
             repo.insert_message(&msg).await.unwrap();
         }
 
-        let page1 = repo.get_messages(&conv.id, 1, 3, SortOrder::Desc).await.unwrap();
+        let page1 = repo
+            .list_messages_page(
+                &conv.id,
+                &MessagePageParams {
+                    limit: 3,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(page1.items.len(), 3);
-        assert_eq!(page1.total, 10);
-        assert!(page1.has_more);
-        // DESC: most recent first
-        assert!(page1.items[0].created_at > page1.items[1].created_at);
+        assert_eq!(
+            page1.items.iter().map(|m| m.sequence).collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+        assert!(page1.has_more_before);
+        assert!(!page1.has_more_after);
     }
 
     #[tokio::test]
-    async fn get_messages_asc_order() {
+    async fn before_pages_walk_history_without_duplicates() {
         let (repo, _db) = setup().await;
         let conv = sample_conversation(SYSTEM_USER_ID);
         repo.create(&conv).await.unwrap();
 
-        for i in 0..3 {
+        for i in 0..6 {
             let mut msg = sample_message(&conv.id);
             msg.id = aionui_common::generate_prefixed_id("msg");
             msg.created_at = (i + 1) * 1000;
             repo.insert_message(&msg).await.unwrap();
         }
 
-        let result = repo.get_messages(&conv.id, 1, 50, SortOrder::Asc).await.unwrap();
-        assert!(result.items[0].created_at < result.items[1].created_at);
+        let latest = repo
+            .list_messages_page(
+                &conv.id,
+                &MessagePageParams {
+                    limit: 3,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .unwrap();
+        let older = repo
+            .list_messages_page(
+                &conv.id,
+                &MessagePageParams {
+                    limit: 3,
+                    direction: MessagePageDirection::Before {
+                        sequence: latest.items[0].sequence,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            older.items.iter().map(|m| m.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(!older.has_more_before);
+        assert!(older.has_more_after);
     }
 
     #[tokio::test]
@@ -1422,7 +1630,16 @@ mod tests {
         .await
         .unwrap();
 
-        let result = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
+        let result = repo
+            .list_messages_page(
+                &conv.id,
+                &MessagePageParams {
+                    limit: 50,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(result.items[0].content, r#"{"content":"Updated"}"#);
     }
 
@@ -1456,9 +1673,17 @@ mod tests {
 
         repo.delete_messages_by_conversation(&conv.id).await.unwrap();
 
-        let result = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
+        let result = repo
+            .list_messages_page(
+                &conv.id,
+                &MessagePageParams {
+                    limit: 50,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .unwrap();
         assert!(result.items.is_empty());
-        assert_eq!(result.total, 0);
     }
 
     #[tokio::test]
@@ -1541,19 +1766,6 @@ mod tests {
         assert_eq!(result.items.len(), 2);
         assert_eq!(result.total, 5);
         assert!(result.has_more);
-    }
-
-    // ── Sort order tests ────────────────────────────────────────────
-
-    #[test]
-    fn sort_order_sql_representation() {
-        assert_eq!(SortOrder::Asc.as_sql(), "ASC");
-        assert_eq!(SortOrder::Desc.as_sql(), "DESC");
-    }
-
-    #[test]
-    fn default_sort_order_is_asc() {
-        assert_eq!(SortOrder::default(), SortOrder::Asc);
     }
 
     // ── Filters tests ───────────────────────────────────────────────
