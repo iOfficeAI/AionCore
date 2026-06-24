@@ -23,6 +23,78 @@ impl SqliteConversationRepository {
         Self { pool }
     }
 
+    async fn insert_message_once(&self, message: &MessageRow) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO messages \
+                (id, conversation_id, msg_id, type, content, position, \
+                 status, hidden, created_at, sequence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                (SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE conversation_id = ?))",
+        )
+        .bind(&message.id)
+        .bind(&message.conversation_id)
+        .bind(&message.msg_id)
+        .bind(&message.r#type)
+        .bind(&message.content)
+        .bind(&message.position)
+        .bind(&message.status)
+        .bind(message.hidden)
+        .bind(message.created_at)
+        .bind(&message.conversation_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn upsert_message_once(&self, message: &MessageRow) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO messages \
+                (id, conversation_id, msg_id, type, content, position, \
+                 status, hidden, created_at, sequence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                (SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE conversation_id = ?)) \
+             ON CONFLICT(id) DO UPDATE SET \
+                content = CASE \
+                    WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN \
+                        CASE messages.type \
+                            WHEN 'acp_tool_call' THEN json_set( \
+                                json_patch(messages.content, excluded.content), \
+                                '$.update.status', \
+                                json_extract(messages.content, '$.update.status') \
+                            ) \
+                            ELSE json_set( \
+                                json_patch(messages.content, excluded.content), \
+                                '$.status', \
+                                json_extract(messages.content, '$.status') \
+                            ) \
+                        END \
+                    ELSE json_patch(messages.content, excluded.content) \
+                END, \
+                status = CASE \
+                    WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN messages.status \
+                    ELSE excluded.status \
+                END, \
+                position = COALESCE(messages.position, excluded.position), \
+                hidden = excluded.hidden, \
+                created_at = MIN(messages.created_at, excluded.created_at)",
+        )
+        .bind(&message.id)
+        .bind(&message.conversation_id)
+        .bind(&message.msg_id)
+        .bind(&message.r#type)
+        .bind(&message.content)
+        .bind(&message.position)
+        .bind(&message.status)
+        .bind(message.hidden)
+        .bind(message.created_at)
+        .bind(&message.conversation_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     async fn visible_message_exists_before(&self, conv_id: &str, sequence: i64) -> Result<bool, DbError> {
         let exists: i64 = sqlx::query_scalar(
             "SELECT EXISTS( \
@@ -75,6 +147,21 @@ impl SqliteConversationRepository {
             has_more_after,
         })
     }
+}
+
+fn is_retryable_message_sequence_allocation_error(error: &sqlx::Error) -> bool {
+    let Some(db_error) = error.as_database_error() else {
+        return false;
+    };
+
+    if db_error.constraint() == Some("idx_messages_conv_sequence_unique") {
+        return true;
+    }
+
+    let message = db_error.message();
+    message.contains("idx_messages_conv_sequence_unique")
+        || message.contains("UNIQUE constraint failed: messages.conversation_id, messages.sequence")
+        || message.contains("database is locked")
 }
 
 #[async_trait::async_trait]
@@ -568,91 +655,23 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
-        let mut tx = self.pool.begin().await?;
-        let next_sequence: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE conversation_id = ?")
-                .bind(&message.conversation_id)
-                .fetch_one(&mut *tx)
-                .await?;
-
-        sqlx::query(
-            "INSERT INTO messages \
-                (id, conversation_id, msg_id, type, content, position, \
-                 status, hidden, created_at, sequence) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&message.id)
-        .bind(&message.conversation_id)
-        .bind(&message.msg_id)
-        .bind(&message.r#type)
-        .bind(&message.content)
-        .bind(&message.position)
-        .bind(&message.status)
-        .bind(message.hidden)
-        .bind(message.created_at)
-        .bind(next_sequence)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        Ok(())
+        match self.insert_message_once(message).await {
+            Ok(()) => Ok(()),
+            Err(err) if is_retryable_message_sequence_allocation_error(&err) => {
+                self.insert_message_once(message).await.map_err(DbError::from)
+            }
+            Err(err) => Err(DbError::from(err)),
+        }
     }
 
     async fn upsert_message(&self, message: &MessageRow) -> Result<(), DbError> {
-        let mut tx = self.pool.begin().await?;
-        let next_sequence: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE conversation_id = ?")
-                .bind(&message.conversation_id)
-                .fetch_one(&mut *tx)
-                .await?;
-
-        sqlx::query(
-            "INSERT INTO messages \
-                (id, conversation_id, msg_id, type, content, position, \
-                 status, hidden, created_at, sequence) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET \
-                content = CASE \
-                    WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN \
-                        CASE messages.type \
-                            WHEN 'acp_tool_call' THEN json_set( \
-                                json_patch(messages.content, excluded.content), \
-                                '$.update.status', \
-                                json_extract(messages.content, '$.update.status') \
-                            ) \
-                            ELSE json_set( \
-                                json_patch(messages.content, excluded.content), \
-                                '$.status', \
-                                json_extract(messages.content, '$.status') \
-                            ) \
-                        END \
-                    ELSE json_patch(messages.content, excluded.content) \
-                END, \
-                status = CASE \
-                    WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN messages.status \
-                    ELSE excluded.status \
-                END, \
-                position = COALESCE(messages.position, excluded.position), \
-                hidden = excluded.hidden, \
-                created_at = MIN(messages.created_at, excluded.created_at)",
-        )
-        .bind(&message.id)
-        .bind(&message.conversation_id)
-        .bind(&message.msg_id)
-        .bind(&message.r#type)
-        .bind(&message.content)
-        .bind(&message.position)
-        .bind(&message.status)
-        .bind(message.hidden)
-        .bind(message.created_at)
-        .bind(next_sequence)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        Ok(())
+        match self.upsert_message_once(message).await {
+            Ok(()) => Ok(()),
+            Err(err) if is_retryable_message_sequence_allocation_error(&err) => {
+                self.upsert_message_once(message).await.map_err(DbError::from)
+            }
+            Err(err) => Err(DbError::from(err)),
+        }
     }
 
     async fn update_message(&self, id: &str, updates: &MessageRowUpdate) -> Result<(), DbError> {

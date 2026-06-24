@@ -337,10 +337,10 @@ async fn t8_3_messages_order_asc_default() {
 }
 
 #[tokio::test]
-async fn t8_4_messages_order_asc() {
+async fn t8_4_messages_limit_returns_latest_window_in_ascending_order() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let conv_id = create_conversation(&mut app, &token, &csrf, "ASC Test").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Limit Test").await;
 
     insert_message(&services, &conv_id, "msg-old", "Old", 1000).await;
     insert_message(&services, &conv_id, "msg-mid", "Mid", 2000).await;
@@ -348,16 +348,17 @@ async fn t8_4_messages_order_asc() {
 
     let resp = app
         .oneshot(get_with_token(
-            &format!("/api/conversations/{conv_id}/messages?order=ASC"),
+            &format!("/api/conversations/{conv_id}/messages?limit=2"),
             &token,
         ))
         .await
         .unwrap();
     let json = body_json(resp).await;
     let items = json["data"]["items"].as_array().unwrap();
-    // ASC order: oldest first
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"], "msg-mid");
+    assert_eq!(items[1]["id"], "msg-new");
     assert!(items[0]["created_at"].as_i64().unwrap() < items[1]["created_at"].as_i64().unwrap());
-    assert!(items[1]["created_at"].as_i64().unwrap() < items[2]["created_at"].as_i64().unwrap());
 }
 
 #[tokio::test]

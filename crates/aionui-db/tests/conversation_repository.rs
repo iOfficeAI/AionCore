@@ -551,6 +551,51 @@ async fn sequence_is_per_conversation() {
 }
 
 #[tokio::test]
+async fn concurrent_insert_message_allocates_unique_sequences() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = aionui_db::init_database(&dir.path().join("messages.db")).await.unwrap();
+    let repo = SqliteConversationRepository::new(db.pool().clone());
+    let conv = make_conversation("seq-race");
+    repo.create(&conv).await.unwrap();
+
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(48));
+    let mut handles = Vec::new();
+    for i in 0..48 {
+        let repo = repo.clone();
+        let conv_id = conv.id.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut msg = make_message(&conv_id, &format!("concurrent {i}"));
+            msg.id = format!("msg-concurrent-{i}");
+            msg.msg_id = Some(format!("cmsg-concurrent-{i}"));
+            repo.insert_message(&msg).await
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap().unwrap();
+    }
+
+    let page = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 100,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(page.items.len(), 48);
+    assert_eq!(
+        page.items.iter().map(|m| m.sequence).collect::<Vec<_>>(),
+        (1..=48).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn anchor_window_contains_anchor_and_sets_flags() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("anchor");
