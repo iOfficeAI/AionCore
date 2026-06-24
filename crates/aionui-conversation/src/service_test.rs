@@ -7,6 +7,7 @@ use std::sync::{
 use std::time::Duration;
 
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
+use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AcpError, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager};
@@ -3970,6 +3971,203 @@ async fn auto_replay_rebuild_keeps_existing_acp_session_id_in_build_options() {
             AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
         }
     }
+}
+
+#[tokio::test]
+async fn send_message_does_not_auto_replay_after_visible_output() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData {
+                content: "partial".into(),
+            }),
+            AgentStreamEvent::Error(ErrorEventData {
+                message: "temporary provider failure".into(),
+                code: Some(AgentErrorCode::UnknownUpstreamError),
+                ownership: None,
+                detail: None,
+                workspace_path: None,
+                retryable: Some(true),
+                feedback_recommended: None,
+                resolution: None,
+            }),
+        ]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let assistants: Vec<_> = messages
+        .iter()
+        .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("left"))
+        .collect();
+    assert_eq!(assistants.len(), 1);
+    assert!(assistants[0].content.contains("partial"));
+}
+
+#[tokio::test]
+async fn send_message_does_not_auto_replay_after_tool_side_effect() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::ToolCall(ToolCallEventData {
+                call_id: "call-1".into(),
+                name: "write_file".into(),
+                args: serde_json::json!({ "path": "a.txt" }),
+                status: ToolCallStatus::Running,
+                input: None,
+                output: None,
+                description: None,
+            }),
+            AgentStreamEvent::Error(ErrorEventData {
+                message: "temporary provider failure".into(),
+                code: Some(AgentErrorCode::UnknownUpstreamError),
+                ownership: None,
+                detail: None,
+                workspace_path: None,
+                retryable: Some(true),
+                feedback_recommended: None,
+                resolution: None,
+            }),
+        ]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+}
+
+#[tokio::test]
+async fn send_message_does_not_auto_replay_model_not_found() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "model not found".into(),
+            code: Some(AgentErrorCode::UserLlmProviderModelNotFound),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(
+        tips.len(),
+        1,
+        "model_not_found should remain visible and must not be swallowed by replay deferral"
+    );
+}
+
+#[tokio::test]
+async fn send_message_auto_replay_stops_after_second_retryable_failure() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure one".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure two".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let third = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+        AgentInstance::Mock(third),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 2);
+    assert_eq!(task_mgr.kill_count(), 2);
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(tips.len(), 1, "second failure is final and visible");
+    let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
+    assert_eq!(content["content"], "temporary provider failure two");
 }
 
 // ── stop_stream tests ───────────────────────────────────────────
