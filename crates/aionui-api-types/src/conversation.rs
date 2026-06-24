@@ -152,9 +152,10 @@ pub struct ListConversationsQuery {
 /// Query parameters for `GET /api/conversations/:id/messages`.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListMessagesQuery {
-    pub page: Option<u32>,
-    pub page_size: Option<u32>,
-    pub order: Option<String>,
+    pub limit: Option<u32>,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub anchor_message_id: Option<String>,
     pub content_mode: Option<String>,
 }
 
@@ -225,8 +226,15 @@ pub struct MessageResponse {
     pub created_at: TimestampMs,
 }
 
-/// Paginated list of messages.
-pub type MessageListResponse = PaginatedResult<MessageResponse>;
+/// Cursor-paginated list of messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageListResponse {
+    pub items: Vec<MessageResponse>,
+    pub oldest_cursor: Option<String>,
+    pub newest_cursor: Option<String>,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
+}
 
 /// Response for `GET /api/conversations/active-count`.
 #[derive(Debug, Serialize)]
@@ -481,19 +489,25 @@ mod tests {
     fn deserialize_messages_query_defaults() {
         let raw = json!({});
         let q: ListMessagesQuery = serde_json::from_value(raw).unwrap();
-        assert!(q.page.is_none());
-        assert!(q.page_size.is_none());
-        assert!(q.order.is_none());
+        assert!(q.limit.is_none());
+        assert!(q.before.is_none());
+        assert!(q.after.is_none());
+        assert!(q.anchor_message_id.is_none());
         assert!(q.content_mode.is_none());
     }
 
     #[test]
     fn deserialize_messages_query_with_values() {
-        let raw = json!({ "page": 2, "page_size": 30, "order": "ASC", "content_mode": "compact" });
+        let raw = json!({
+            "limit": 200,
+            "before": "v1.abc",
+            "content_mode": "compact"
+        });
         let q: ListMessagesQuery = serde_json::from_value(raw).unwrap();
-        assert_eq!(q.page, Some(2));
-        assert_eq!(q.page_size, Some(30));
-        assert_eq!(q.order.as_deref(), Some("ASC"));
+        assert_eq!(q.limit, Some(200));
+        assert_eq!(q.before.as_deref(), Some("v1.abc"));
+        assert!(q.after.is_none());
+        assert!(q.anchor_message_id.is_none());
         assert_eq!(q.content_mode.as_deref(), Some("compact"));
     }
 
@@ -804,15 +818,22 @@ mod tests {
     }
 
     #[test]
-    fn message_list_response_serialization() {
-        let list: MessageListResponse = PaginatedResult {
+    fn serialize_message_list_response_cursor_shape() {
+        let resp = MessageListResponse {
             items: vec![],
-            total: 0,
-            has_more: false,
+            oldest_cursor: None,
+            newest_cursor: None,
+            has_more_before: false,
+            has_more_after: false,
         };
-        let json = serde_json::to_value(&list).unwrap();
-        assert!(json["items"].as_array().unwrap().is_empty());
-        assert_eq!(json["total"], 0);
+        let raw = serde_json::to_value(resp).unwrap();
+        assert_eq!(raw["items"], json!([]));
+        assert!(raw["oldest_cursor"].is_null());
+        assert!(raw["newest_cursor"].is_null());
+        assert_eq!(raw["has_more_before"], false);
+        assert_eq!(raw["has_more_after"], false);
+        assert!(raw.get("total").is_none());
+        assert!(raw.get("has_more").is_none());
     }
 
     #[test]
