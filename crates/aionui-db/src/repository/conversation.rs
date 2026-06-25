@@ -192,12 +192,27 @@ pub trait IConversationRepository: Send + Sync {
 
 // ── Supporting types ────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagePageCursor {
+    pub created_at: TimestampMs,
+    pub id: String,
+}
+
+impl From<&MessageRow> for MessagePageCursor {
+    fn from(row: &MessageRow) -> Self {
+        Self {
+            created_at: row.created_at,
+            id: row.id.clone(),
+        }
+    }
+}
+
 /// Direction for cursor-based message pagination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessagePageDirection {
     InitialLatest,
-    Before { sequence: i64 },
-    After { sequence: i64 },
+    Before { cursor: MessagePageCursor },
+    After { cursor: MessagePageCursor },
     Anchor { message_id: String },
 }
 

@@ -8,8 +8,8 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageDirection, MessagePageParams,
-    MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
+    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
 
 /// SQLite-backed implementation of [`IConversationRepository`].
@@ -27,9 +27,8 @@ impl SqliteConversationRepository {
         sqlx::query(
             "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
-                 status, hidden, created_at, sequence) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                (SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE conversation_id = ?))",
+                 status, hidden, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&message.id)
         .bind(&message.conversation_id)
@@ -40,7 +39,6 @@ impl SqliteConversationRepository {
         .bind(&message.status)
         .bind(message.hidden)
         .bind(message.created_at)
-        .bind(&message.conversation_id)
         .execute(&self.pool)
         .await?;
 
@@ -51,9 +49,8 @@ impl SqliteConversationRepository {
         sqlx::query(
             "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
-                 status, hidden, created_at, sequence) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                (SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE conversation_id = ?)) \
+                 status, hidden, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
                 content = CASE \
                     WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN \
@@ -88,41 +85,44 @@ impl SqliteConversationRepository {
         .bind(&message.status)
         .bind(message.hidden)
         .bind(message.created_at)
-        .bind(&message.conversation_id)
         .execute(&self.pool)
         .await?;
 
         Ok(())
     }
 
-    async fn visible_message_exists_before(&self, conv_id: &str, sequence: i64) -> Result<bool, DbError> {
+    async fn visible_message_exists_before(&self, conv_id: &str, cursor: &MessagePageCursor) -> Result<bool, DbError> {
         let exists: i64 = sqlx::query_scalar(
             "SELECT EXISTS( \
                 SELECT 1 FROM messages \
                 WHERE conversation_id = ? \
-                  AND sequence < ? \
+                  AND (created_at < ? OR (created_at = ? AND id < ?)) \
                   AND type NOT IN ('cron_trigger', 'skill_suggest') \
              )",
         )
         .bind(conv_id)
-        .bind(sequence)
+        .bind(cursor.created_at)
+        .bind(cursor.created_at)
+        .bind(&cursor.id)
         .fetch_one(&self.pool)
         .await?;
 
         Ok(exists != 0)
     }
 
-    async fn visible_message_exists_after(&self, conv_id: &str, sequence: i64) -> Result<bool, DbError> {
+    async fn visible_message_exists_after(&self, conv_id: &str, cursor: &MessagePageCursor) -> Result<bool, DbError> {
         let exists: i64 = sqlx::query_scalar(
             "SELECT EXISTS( \
                 SELECT 1 FROM messages \
                 WHERE conversation_id = ? \
-                  AND sequence > ? \
+                  AND (created_at > ? OR (created_at = ? AND id > ?)) \
                   AND type NOT IN ('cron_trigger', 'skill_suggest') \
              )",
         )
         .bind(conv_id)
-        .bind(sequence)
+        .bind(cursor.created_at)
+        .bind(cursor.created_at)
+        .bind(&cursor.id)
         .fetch_one(&self.pool)
         .await?;
 
@@ -137,9 +137,13 @@ impl SqliteConversationRepository {
                 has_more_after: false,
             });
         };
-        let last_sequence = items.last().map(|row| row.sequence).unwrap_or(first.sequence);
-        let has_more_before = self.visible_message_exists_before(conv_id, first.sequence).await?;
-        let has_more_after = self.visible_message_exists_after(conv_id, last_sequence).await?;
+        let first_cursor = MessagePageCursor::from(first);
+        let last_cursor = items
+            .last()
+            .map(MessagePageCursor::from)
+            .unwrap_or(first_cursor.clone());
+        let has_more_before = self.visible_message_exists_before(conv_id, &first_cursor).await?;
+        let has_more_after = self.visible_message_exists_after(conv_id, &last_cursor).await?;
 
         Ok(MessagePageResult {
             items,
@@ -147,21 +151,6 @@ impl SqliteConversationRepository {
             has_more_after,
         })
     }
-}
-
-fn is_retryable_message_sequence_allocation_error(error: &sqlx::Error) -> bool {
-    let Some(db_error) = error.as_database_error() else {
-        return false;
-    };
-
-    if db_error.constraint() == Some("idx_messages_conv_sequence_unique") {
-        return true;
-    }
-
-    let message = db_error.message();
-    message.contains("idx_messages_conv_sequence_unique")
-        || message.contains("UNIQUE constraint failed: messages.conversation_id, messages.sequence")
-        || message.contains("database is locked")
 }
 
 #[async_trait::async_trait]
@@ -523,10 +512,10 @@ impl IConversationRepository for SqliteConversationRepository {
             MessagePageDirection::InitialLatest => {
                 let mut rows = sqlx::query_as::<_, MessageRow>(
                     "SELECT * FROM messages \
-                     WHERE conversation_id = ? \
-                       AND type NOT IN ('cron_trigger', 'skill_suggest') \
-                     ORDER BY sequence DESC \
-                     LIMIT ?",
+                      WHERE conversation_id = ? \
+                        AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                      ORDER BY created_at DESC, id DESC \
+                      LIMIT ?",
                 )
                 .bind(conv_id)
                 .bind(fetch_limit)
@@ -536,17 +525,19 @@ impl IConversationRepository for SqliteConversationRepository {
                 rows.reverse();
                 rows
             }
-            MessagePageDirection::Before { sequence } => {
+            MessagePageDirection::Before { cursor } => {
                 let mut rows = sqlx::query_as::<_, MessageRow>(
                     "SELECT * FROM messages \
-                     WHERE conversation_id = ? \
-                       AND sequence < ? \
-                       AND type NOT IN ('cron_trigger', 'skill_suggest') \
-                     ORDER BY sequence DESC \
-                     LIMIT ?",
+                      WHERE conversation_id = ? \
+                        AND (created_at < ? OR (created_at = ? AND id < ?)) \
+                        AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                      ORDER BY created_at DESC, id DESC \
+                      LIMIT ?",
                 )
                 .bind(conv_id)
-                .bind(sequence)
+                .bind(cursor.created_at)
+                .bind(cursor.created_at)
+                .bind(&cursor.id)
                 .bind(fetch_limit)
                 .fetch_all(&self.pool)
                 .await?;
@@ -554,17 +545,19 @@ impl IConversationRepository for SqliteConversationRepository {
                 rows.reverse();
                 rows
             }
-            MessagePageDirection::After { sequence } => {
+            MessagePageDirection::After { cursor } => {
                 let mut rows = sqlx::query_as::<_, MessageRow>(
                     "SELECT * FROM messages \
-                     WHERE conversation_id = ? \
-                       AND sequence > ? \
-                       AND type NOT IN ('cron_trigger', 'skill_suggest') \
-                     ORDER BY sequence ASC \
-                     LIMIT ?",
+                      WHERE conversation_id = ? \
+                        AND (created_at > ? OR (created_at = ? AND id > ?)) \
+                        AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                      ORDER BY created_at ASC, id ASC \
+                      LIMIT ?",
                 )
                 .bind(conv_id)
-                .bind(sequence)
+                .bind(cursor.created_at)
+                .bind(cursor.created_at)
+                .bind(&cursor.id)
                 .bind(fetch_limit)
                 .fetch_all(&self.pool)
                 .await?;
@@ -587,14 +580,16 @@ impl IConversationRepository for SqliteConversationRepository {
                 let side_limit = limit;
                 let mut before = sqlx::query_as::<_, MessageRow>(
                     "SELECT * FROM messages \
-                     WHERE conversation_id = ? \
-                       AND sequence < ? \
-                       AND type NOT IN ('cron_trigger', 'skill_suggest') \
-                     ORDER BY sequence DESC \
-                     LIMIT ?",
+                      WHERE conversation_id = ? \
+                        AND (created_at < ? OR (created_at = ? AND id < ?)) \
+                        AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                      ORDER BY created_at DESC, id DESC \
+                      LIMIT ?",
                 )
                 .bind(conv_id)
-                .bind(anchor.sequence)
+                .bind(anchor.created_at)
+                .bind(anchor.created_at)
+                .bind(&anchor.id)
                 .bind(side_limit)
                 .fetch_all(&self.pool)
                 .await?;
@@ -602,14 +597,16 @@ impl IConversationRepository for SqliteConversationRepository {
 
                 let after = sqlx::query_as::<_, MessageRow>(
                     "SELECT * FROM messages \
-                     WHERE conversation_id = ? \
-                       AND sequence > ? \
-                       AND type NOT IN ('cron_trigger', 'skill_suggest') \
-                     ORDER BY sequence ASC \
-                     LIMIT ?",
+                      WHERE conversation_id = ? \
+                        AND (created_at > ? OR (created_at = ? AND id > ?)) \
+                        AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                      ORDER BY created_at ASC, id ASC \
+                      LIMIT ?",
                 )
                 .bind(conv_id)
-                .bind(anchor.sequence)
+                .bind(anchor.created_at)
+                .bind(anchor.created_at)
+                .bind(&anchor.id)
                 .bind(side_limit)
                 .fetch_all(&self.pool)
                 .await?;
@@ -635,7 +632,7 @@ impl IConversationRepository for SqliteConversationRepository {
                 rows
             }
         };
-        rows.sort_by_key(|row| row.sequence);
+        rows.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
         self.page_with_flags(conv_id, rows).await
     }
 
@@ -655,23 +652,11 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
-        match self.insert_message_once(message).await {
-            Ok(()) => Ok(()),
-            Err(err) if is_retryable_message_sequence_allocation_error(&err) => {
-                self.insert_message_once(message).await.map_err(DbError::from)
-            }
-            Err(err) => Err(DbError::from(err)),
-        }
+        self.insert_message_once(message).await.map_err(DbError::from)
     }
 
     async fn upsert_message(&self, message: &MessageRow) -> Result<(), DbError> {
-        match self.upsert_message_once(message).await {
-            Ok(()) => Ok(()),
-            Err(err) if is_retryable_message_sequence_allocation_error(&err) => {
-                self.upsert_message_once(message).await.map_err(DbError::from)
-            }
-            Err(err) => Err(DbError::from(err)),
-        }
+        self.upsert_message_once(message).await.map_err(DbError::from)
     }
 
     async fn update_message(&self, id: &str, updates: &MessageRowUpdate) -> Result<(), DbError> {
@@ -1083,7 +1068,6 @@ mod tests {
             status: Some("finish".to_string()),
             hidden: false,
             created_at: now,
-            sequence: 0,
         }
     }
 
@@ -1551,7 +1535,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].id, msg.id);
-        assert_eq!(result.items[0].sequence, 1);
+        assert_eq!(result.items[0].created_at, msg.created_at);
     }
 
     #[tokio::test]
@@ -1579,8 +1563,8 @@ mod tests {
             .unwrap();
         assert_eq!(page1.items.len(), 3);
         assert_eq!(
-            page1.items.iter().map(|m| m.sequence).collect::<Vec<_>>(),
-            vec![8, 9, 10]
+            page1.items.iter().map(|m| m.created_at).collect::<Vec<_>>(),
+            vec![8000, 9000, 10000]
         );
         assert!(page1.has_more_before);
         assert!(!page1.has_more_after);
@@ -1615,7 +1599,7 @@ mod tests {
                 &MessagePageParams {
                     limit: 3,
                     direction: MessagePageDirection::Before {
-                        sequence: latest.items[0].sequence,
+                        cursor: MessagePageCursor::from(&latest.items[0]),
                     },
                 },
             )
@@ -1623,8 +1607,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            older.items.iter().map(|m| m.sequence).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            older.items.iter().map(|m| m.created_at).collect::<Vec<_>>(),
+            vec![1000, 2000, 3000]
         );
         assert!(!older.has_more_before);
         assert!(older.has_more_after);

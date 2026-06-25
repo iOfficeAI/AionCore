@@ -45,7 +45,6 @@ async fn insert_message(
         status: Some("finish".into()),
         hidden: false,
         created_at,
-        sequence: 0,
     };
     aionui_db::IConversationRepository::insert_message(&repo, &msg)
         .await
@@ -99,7 +98,6 @@ async fn insert_acp_tool_message(
         status: Some("finish".into()),
         hidden: false,
         created_at,
-        sequence: 0,
     };
     aionui_db::IConversationRepository::insert_message(&repo, &msg)
         .await
@@ -425,7 +423,6 @@ async fn t8_7_messages_exclude_legacy_cron_rows() {
             status: Some("finish".into()),
             hidden: false,
             created_at: 2000,
-            sequence: 0,
         };
         aionui_db::IConversationRepository::insert_message(&repo, &msg)
             .await

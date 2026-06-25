@@ -37,7 +37,7 @@ use aionui_db::{
     SqliteAssistantPreferenceRepository, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, init_database_memory,
 };
-use aionui_db::{MessagePageDirection, MessagePageParams, MessagePageResult};
+use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult};
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
@@ -183,6 +183,14 @@ impl MockRepo {
             assistant_snapshots: Mutex::new(vec![]),
         }
     }
+}
+
+fn message_is_before_cursor(message: &MessageRow, cursor: &MessagePageCursor) -> bool {
+    message.created_at < cursor.created_at || (message.created_at == cursor.created_at && message.id < cursor.id)
+}
+
+fn message_is_after_cursor(message: &MessageRow, cursor: &MessagePageCursor) -> bool {
+    message.created_at > cursor.created_at || (message.created_at == cursor.created_at && message.id > cursor.id)
 }
 
 #[async_trait::async_trait]
@@ -348,7 +356,7 @@ impl IConversationRepository for MockRepo {
             .filter(|message| !matches!(message.r#type.as_str(), "cron_trigger" | "skill_suggest"))
             .cloned()
             .collect();
-        matched.sort_by_key(|message| message.sequence);
+        matched.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
 
         let limit = params.limit.max(1) as usize;
         let items = match &params.direction {
@@ -356,9 +364,9 @@ impl IConversationRepository for MockRepo {
                 let start = matched.len().saturating_sub(limit);
                 matched[start..].to_vec()
             }
-            MessagePageDirection::Before { sequence } => matched
+            MessagePageDirection::Before { cursor } => matched
                 .iter()
-                .filter(|message| message.sequence < *sequence)
+                .filter(|message| message_is_before_cursor(message, cursor))
                 .rev()
                 .take(limit)
                 .cloned()
@@ -366,9 +374,9 @@ impl IConversationRepository for MockRepo {
                 .into_iter()
                 .rev()
                 .collect(),
-            MessagePageDirection::After { sequence } => matched
+            MessagePageDirection::After { cursor } => matched
                 .iter()
-                .filter(|message| message.sequence > *sequence)
+                .filter(|message| message_is_after_cursor(message, cursor))
                 .take(limit)
                 .cloned()
                 .collect(),
@@ -379,16 +387,17 @@ impl IConversationRepository for MockRepo {
                     .cloned()
                     .ok_or_else(|| aionui_db::DbError::NotFound(format!("Message {message_id}")))?;
                 let before_take = (limit.saturating_sub(1)) / 2;
+                let anchor_cursor = MessagePageCursor::from(&anchor);
                 let before = matched
                     .iter()
-                    .filter(|message| message.sequence < anchor.sequence)
+                    .filter(|message| message_is_before_cursor(message, &anchor_cursor))
                     .rev()
                     .take(before_take)
                     .cloned()
                     .collect::<Vec<_>>();
                 let after = matched
                     .iter()
-                    .filter(|message| message.sequence > anchor.sequence)
+                    .filter(|message| message_is_after_cursor(message, &anchor_cursor))
                     .take(limit.saturating_sub(1 + before.len()))
                     .cloned()
                     .collect::<Vec<_>>();
@@ -400,12 +409,14 @@ impl IConversationRepository for MockRepo {
                     .collect()
             }
         };
-        let has_more_before = items
-            .first()
-            .is_some_and(|first| matched.iter().any(|message| message.sequence < first.sequence));
-        let has_more_after = items
-            .last()
-            .is_some_and(|last| matched.iter().any(|message| message.sequence > last.sequence));
+        let has_more_before = items.first().is_some_and(|first| {
+            let cursor = MessagePageCursor::from(first);
+            matched.iter().any(|message| message_is_before_cursor(message, &cursor))
+        });
+        let has_more_after = items.last().is_some_and(|last| {
+            let cursor = MessagePageCursor::from(last);
+            matched.iter().any(|message| message_is_after_cursor(message, &cursor))
+        });
 
         Ok(MessagePageResult {
             items,
@@ -416,17 +427,7 @@ impl IConversationRepository for MockRepo {
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), aionui_db::DbError> {
         let mut messages = self.messages.lock().unwrap();
-        let mut row = message.clone();
-        if row.sequence < 1 {
-            row.sequence = messages
-                .iter()
-                .filter(|message| message.conversation_id == row.conversation_id)
-                .map(|message| message.sequence)
-                .max()
-                .unwrap_or(0)
-                + 1;
-        }
-        messages.push(row);
+        messages.push(message.clone());
         Ok(())
     }
 
@@ -1679,7 +1680,6 @@ async fn list_artifacts_includes_legacy_cron_trigger_messages() {
         status: Some("finish".into()),
         hidden: false,
         created_at: 1234,
-        sequence: 0,
     })
     .await
     .unwrap();
@@ -3671,7 +3671,6 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
         status: Some("work".into()),
         hidden: false,
         created_at: 1,
-        sequence: 0,
     })
     .await
     .unwrap();
@@ -3685,7 +3684,6 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
         status: Some("pending".into()),
         hidden: false,
         created_at: 2,
-        sequence: 0,
     })
     .await
     .unwrap();
@@ -5245,7 +5243,6 @@ async fn insert_raw_message_persists_row_and_broadcasts_stream() {
         status: Some("finish".into()),
         hidden: false,
         created_at: 1234,
-        sequence: 0,
     };
 
     svc.insert_raw_message(&row).await.unwrap();

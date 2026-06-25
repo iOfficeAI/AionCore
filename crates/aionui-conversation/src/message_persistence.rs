@@ -52,7 +52,6 @@ impl ConversationService {
             status: Some("error".into()),
             hidden: false,
             created_at: now_ms(),
-            sequence: 0,
         };
 
         if let Err(store_err) = self.conversation_repo().insert_message(&row).await {

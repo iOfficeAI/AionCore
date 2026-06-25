@@ -1,6 +1,7 @@
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageDirection, MessagePageParams,
-    MessageRowUpdate, SqliteConversationRepository, init_database_memory, models::ConversationRow, models::MessageRow,
+    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
+    MessagePageParams, MessageRowUpdate, SqliteConversationRepository, init_database_memory, models::ConversationRow,
+    models::MessageRow,
 };
 
 const USER_ID: &str = "system_default_user";
@@ -42,7 +43,6 @@ fn make_message(conv_id: &str, content: &str) -> MessageRow {
         status: Some("finish".to_string()),
         hidden: false,
         created_at: now,
-        sequence: 0,
     }
 }
 
@@ -428,7 +428,10 @@ async fn initial_latest_returns_latest_limit_in_ascending_order() {
         .await
         .unwrap();
     assert_eq!(p1.items.len(), 3);
-    assert_eq!(p1.items.iter().map(|m| m.sequence).collect::<Vec<_>>(), vec![8, 9, 10]);
+    assert_eq!(
+        p1.items.iter().map(|m| m.created_at).collect::<Vec<_>>(),
+        vec![8000, 9000, 10000]
+    );
     assert!(p1.has_more_before);
     assert!(!p1.has_more_after);
 }
@@ -442,6 +445,7 @@ async fn before_pages_walk_history_without_duplicates() {
     for i in 0..6 {
         let mut msg = make_message(&conv.id, &format!("item {i}"));
         msg.id = format!("msg-{i}");
+        msg.created_at = (i + 1) as i64 * 1000;
         repo.insert_message(&msg).await.unwrap();
     }
 
@@ -461,7 +465,7 @@ async fn before_pages_walk_history_without_duplicates() {
             &MessagePageParams {
                 limit: 3,
                 direction: MessagePageDirection::Before {
-                    sequence: latest.items[0].sequence,
+                    cursor: MessagePageCursor::from(&latest.items[0]),
                 },
             },
         )
@@ -478,22 +482,23 @@ async fn before_pages_walk_history_without_duplicates() {
     ids.dedup();
     assert_eq!(ids.len(), 6);
     assert_eq!(
-        older.items.iter().map(|m| m.sequence).collect::<Vec<_>>(),
-        vec![1, 2, 3]
+        older.items.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        vec!["msg-0", "msg-1", "msg-2"]
     );
     assert!(!older.has_more_before);
     assert!(older.has_more_after);
 }
 
 #[tokio::test]
-async fn after_returns_newer_rows() {
+async fn after_returns_newer_rows_with_same_timestamp_tie_breaker() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("after");
     repo.create(&conv).await.unwrap();
 
-    for i in 0..5 {
-        let mut msg = make_message(&conv.id, &format!("item {i}"));
-        msg.id = format!("msg-{i}");
+    for id in ["msg-a", "msg-b", "msg-c", "msg-d", "msg-e"] {
+        let mut msg = make_message(&conv.id, id);
+        msg.id = id.to_string();
+        msg.created_at = 1000;
         repo.insert_message(&msg).await.unwrap();
     }
 
@@ -502,28 +507,47 @@ async fn after_returns_newer_rows() {
             &conv.id,
             &MessagePageParams {
                 limit: 2,
-                direction: MessagePageDirection::After { sequence: 2 },
+                direction: MessagePageDirection::After {
+                    cursor: MessagePageCursor {
+                        created_at: 1000,
+                        id: "msg-b".to_string(),
+                    },
+                },
             },
         )
         .await
         .unwrap();
 
-    assert_eq!(page.items.iter().map(|m| m.sequence).collect::<Vec<_>>(), vec![3, 4]);
+    assert_eq!(
+        page.items.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        vec!["msg-c", "msg-d"]
+    );
     assert!(page.has_more_before);
     assert!(page.has_more_after);
 }
 
 #[tokio::test]
-async fn sequence_is_per_conversation() {
+async fn created_at_id_ordering_is_scoped_per_conversation() {
     let (repo, _db) = setup().await;
     let conv_a = make_conversation("seq-a");
     let conv_b = make_conversation("seq-b");
     repo.create(&conv_a).await.unwrap();
     repo.create(&conv_b).await.unwrap();
 
-    repo.insert_message(&make_message(&conv_a.id, "a1")).await.unwrap();
-    repo.insert_message(&make_message(&conv_a.id, "a2")).await.unwrap();
-    repo.insert_message(&make_message(&conv_b.id, "b1")).await.unwrap();
+    let mut a1 = make_message(&conv_a.id, "a1");
+    a1.id = "a1".to_string();
+    a1.created_at = 1000;
+    repo.insert_message(&a1).await.unwrap();
+
+    let mut a2 = make_message(&conv_a.id, "a2");
+    a2.id = "a2".to_string();
+    a2.created_at = 2000;
+    repo.insert_message(&a2).await.unwrap();
+
+    let mut b1 = make_message(&conv_b.id, "b1");
+    b1.id = "b1".to_string();
+    b1.created_at = 1000;
+    repo.insert_message(&b1).await.unwrap();
 
     let page_a = repo
         .list_messages_page(
@@ -546,12 +570,18 @@ async fn sequence_is_per_conversation() {
         .await
         .unwrap();
 
-    assert_eq!(page_a.items.iter().map(|m| m.sequence).collect::<Vec<_>>(), vec![1, 2]);
-    assert_eq!(page_b.items.iter().map(|m| m.sequence).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(
+        page_a.items.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+        vec![r#"{"content":"a1"}"#, r#"{"content":"a2"}"#]
+    );
+    assert_eq!(
+        page_b.items.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+        vec![r#"{"content":"b1"}"#]
+    );
 }
 
 #[tokio::test]
-async fn concurrent_insert_message_allocates_unique_sequences() {
+async fn concurrent_insert_message_does_not_require_sequence_allocation() {
     let dir = tempfile::tempdir().unwrap();
     let db = aionui_db::init_database(&dir.path().join("messages.db")).await.unwrap();
     let repo = SqliteConversationRepository::new(db.pool().clone());
@@ -589,10 +619,10 @@ async fn concurrent_insert_message_allocates_unique_sequences() {
         .unwrap();
 
     assert_eq!(page.items.len(), 48);
-    assert_eq!(
-        page.items.iter().map(|m| m.sequence).collect::<Vec<_>>(),
-        (1..=48).collect::<Vec<_>>()
-    );
+    let mut ids = page.items.iter().map(|m| m.id.as_str()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids.len(), 48);
+    assert_eq!(ids[0], "msg-concurrent-0");
 }
 
 #[tokio::test]
@@ -604,6 +634,7 @@ async fn anchor_window_contains_anchor_and_sets_flags() {
     for i in 1..=7 {
         let mut msg = make_message(&conv.id, &format!("item {i}"));
         msg.id = format!("msg-{i}");
+        msg.created_at = i as i64 * 1000;
         repo.insert_message(&msg).await.unwrap();
     }
 
@@ -644,7 +675,6 @@ async fn anchor_rejects_legacy_artifact_rows() {
         status: Some("finish".into()),
         hidden: false,
         created_at: 1000,
-        sequence: 0,
     })
     .await
     .unwrap();
@@ -666,7 +696,7 @@ async fn anchor_rejects_legacy_artifact_rows() {
 }
 
 #[tokio::test]
-async fn upsert_preserves_existing_sequence() {
+async fn upsert_preserves_existing_created_at() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("upsert-seq");
     repo.create(&conv).await.unwrap();
@@ -692,7 +722,7 @@ async fn upsert_preserves_existing_sequence() {
         .unwrap();
 
     assert_eq!(page.items.len(), 1);
-    assert_eq!(page.items[0].sequence, 1);
+    assert_eq!(page.items[0].created_at, msg.created_at);
     assert_eq!(page.items[0].content, r#"{"content":"updated"}"#);
 }
 
@@ -1001,7 +1031,6 @@ async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
             status: Some("finish".into()),
             hidden: false,
             created_at: 2000,
-            sequence: 0,
         })
         .await
         .unwrap();
@@ -1037,7 +1066,6 @@ async fn list_legacy_cron_trigger_messages_returns_only_trigger_rows() {
         status: Some("finish".into()),
         hidden: false,
         created_at: 1000,
-        sequence: 0,
     })
     .await
     .unwrap();

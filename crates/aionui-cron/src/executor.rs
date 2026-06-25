@@ -235,7 +235,6 @@ impl JobExecutor {
             status: Some("finish".into()),
             hidden: false,
             created_at: aionui_common::now_ms(),
-            sequence: 0,
         };
 
         self.conversation_repo

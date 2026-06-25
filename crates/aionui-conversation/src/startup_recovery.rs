@@ -106,7 +106,6 @@ mod tests {
             status: Some("work".into()),
             hidden: false,
             created_at: 1,
-            sequence: 0,
         };
 
         assert_eq!(
@@ -127,7 +126,6 @@ mod tests {
             status: Some("work".into()),
             hidden: false,
             created_at: 1,
-            sequence: 0,
         };
 
         assert_eq!(

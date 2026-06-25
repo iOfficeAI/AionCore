@@ -29,8 +29,8 @@ use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageDirection,
-    MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
+    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
+    MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -1856,11 +1856,11 @@ impl ConversationService {
 
         let direction = if let Some(cursor) = query.before.as_deref() {
             MessagePageDirection::Before {
-                sequence: decode_message_cursor(cursor)?,
+                cursor: decode_message_cursor(cursor)?,
             }
         } else if let Some(cursor) = query.after.as_deref() {
             MessagePageDirection::After {
-                sequence: decode_message_cursor(cursor)?,
+                cursor: decode_message_cursor(cursor)?,
             }
         } else if let Some(message_id) = query.anchor_message_id.clone() {
             MessagePageDirection::Anchor { message_id }
@@ -1880,12 +1880,12 @@ impl ConversationService {
         let oldest_cursor = page
             .items
             .first()
-            .map(|row| encode_message_cursor(row.sequence))
+            .map(|row| encode_message_cursor(&MessagePageCursor::from(row)))
             .transpose()?;
         let newest_cursor = page
             .items
             .last()
-            .map(|row| encode_message_cursor(row.sequence))
+            .map(|row| encode_message_cursor(&MessagePageCursor::from(row)))
             .transpose()?;
         let mut items = Vec::with_capacity(page.items.len());
         for row in page.items {
@@ -2249,7 +2249,6 @@ impl ConversationService {
             status: Some("finish".into()),
             hidden: req.hidden,
             created_at: now_ms(),
-            sequence: 0,
         };
         if !self
             .runtime_persistence()

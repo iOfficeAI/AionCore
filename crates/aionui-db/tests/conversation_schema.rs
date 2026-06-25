@@ -229,9 +229,9 @@ async fn messages_accepts_all_columns() {
 
     sqlx::query(
         "INSERT INTO messages \
-         (id, conversation_id, msg_id, type, content, position, status, hidden, created_at, sequence) \
-         VALUES ('msg_1', $1, 'client_msg_1', 'text', \
-                 '{\"content\":\"Hello\"}', 'right', 'finish', 0, 1000, 1)",
+	         (id, conversation_id, msg_id, type, content, position, status, hidden, created_at) \
+	         VALUES ('msg_1', $1, 'client_msg_1', 'text', \
+	                 '{\"content\":\"Hello\"}', 'right', 'finish', 0, 1000)",
     )
     .bind(&conv_id)
     .execute(db.pool())
@@ -249,7 +249,6 @@ async fn messages_accepts_all_columns() {
     assert_eq!(row.get::<String, _>("position"), "right");
     assert_eq!(row.get::<String, _>("status"), "finish");
     assert_eq!(row.get::<i32, _>("hidden"), 0);
-    assert_eq!(row.get::<i64, _>("sequence"), 1);
 }
 
 // -- Messages table: default values --
@@ -261,8 +260,8 @@ async fn messages_defaults() {
     let conv_id = insert_test_conversation(db.pool(), &user_id).await;
 
     sqlx::query(
-        "INSERT INTO messages (id, conversation_id, type, created_at, sequence) \
-         VALUES ('msg_def', $1, 'text', 1000, 1)",
+        "INSERT INTO messages (id, conversation_id, type, created_at) \
+	         VALUES ('msg_def', $1, 'text', 1000)",
     )
     .bind(&conv_id)
     .execute(db.pool())
@@ -294,8 +293,8 @@ async fn messages_position_check_constraint() {
     let conv_id = insert_test_conversation(db.pool(), &user_id).await;
 
     let result = sqlx::query(
-        "INSERT INTO messages (id, conversation_id, type, position, created_at, sequence) \
-         VALUES ('msg_bad_pos', $1, 'text', 'invalid_pos', 1000, 1)",
+        "INSERT INTO messages (id, conversation_id, type, position, created_at) \
+	         VALUES ('msg_bad_pos', $1, 'text', 'invalid_pos', 1000)",
     )
     .bind(&conv_id)
     .execute(db.pool())
@@ -311,8 +310,8 @@ async fn messages_status_check_constraint() {
     let conv_id = insert_test_conversation(db.pool(), &user_id).await;
 
     let result = sqlx::query(
-        "INSERT INTO messages (id, conversation_id, type, status, created_at, sequence) \
-         VALUES ('msg_bad_st', $1, 'text', 'invalid_status', 1000, 1)",
+        "INSERT INTO messages (id, conversation_id, type, status, created_at) \
+	         VALUES ('msg_bad_st', $1, 'text', 'invalid_status', 1000)",
     )
     .bind(&conv_id)
     .execute(db.pool())
@@ -330,13 +329,12 @@ async fn messages_allows_valid_positions() {
     for (i, pos) in ["left", "right", "center", "pop"].iter().enumerate() {
         let id = format!("msg_p{}", i);
         sqlx::query(
-            "INSERT INTO messages (id, conversation_id, type, position, created_at, sequence) \
-             VALUES ($1, $2, 'text', $3, 1000, $4)",
+            "INSERT INTO messages (id, conversation_id, type, position, created_at) \
+	             VALUES ($1, $2, 'text', $3, 1000)",
         )
         .bind(&id)
         .bind(&conv_id)
         .bind(pos)
-        .bind((i + 1) as i64)
         .execute(db.pool())
         .await
         .unwrap_or_else(|e| panic!("position '{pos}' should be valid: {e}"));
@@ -352,13 +350,12 @@ async fn messages_allows_valid_statuses() {
     for (i, status) in ["finish", "pending", "error", "work"].iter().enumerate() {
         let id = format!("msg_s{}", i);
         sqlx::query(
-            "INSERT INTO messages (id, conversation_id, type, status, created_at, sequence) \
-             VALUES ($1, $2, 'text', $3, 1000, $4)",
+            "INSERT INTO messages (id, conversation_id, type, status, created_at) \
+	             VALUES ($1, $2, 'text', $3, 1000)",
         )
         .bind(&id)
         .bind(&conv_id)
         .bind(status)
-        .bind((i + 1) as i64)
         .execute(db.pool())
         .await
         .unwrap_or_else(|e| panic!("status '{status}' should be valid: {e}"));
@@ -372,8 +369,8 @@ async fn messages_fk_conversation_id() {
     let db = init_database_memory().await.unwrap();
 
     let result = sqlx::query(
-        "INSERT INTO messages (id, conversation_id, type, created_at, sequence) \
-         VALUES ('msg_fk', 'nonexistent_conv', 'text', 1000, 1)",
+        "INSERT INTO messages (id, conversation_id, type, created_at) \
+	         VALUES ('msg_fk', 'nonexistent_conv', 'text', 1000)",
     )
     .execute(db.pool())
     .await;
@@ -395,12 +392,11 @@ async fn cascade_delete_conversation_removes_messages() {
     // Insert messages
     for i in 0..3 {
         sqlx::query(
-            "INSERT INTO messages (id, conversation_id, type, content, created_at, sequence) \
-             VALUES ($1, $2, 'text', '{\"content\":\"msg\"}', 1000, $3)",
+            "INSERT INTO messages (id, conversation_id, type, content, created_at) \
+	             VALUES ($1, $2, 'text', '{\"content\":\"msg\"}', 1000)",
         )
         .bind(format!("msg_{}", i))
         .bind(&conv_id)
-        .bind((i + 1) as i64)
         .execute(db.pool())
         .await
         .unwrap();
@@ -439,8 +435,8 @@ async fn cascade_delete_user_removes_conversations_and_messages() {
     let conv_id = insert_test_conversation(db.pool(), &user_id).await;
 
     sqlx::query(
-        "INSERT INTO messages (id, conversation_id, type, created_at, sequence) \
-         VALUES ('msg_cascade', $1, 'text', 1000, 1)",
+        "INSERT INTO messages (id, conversation_id, type, created_at) \
+	         VALUES ('msg_cascade', $1, 'text', 1000)",
     )
     .bind(&conv_id)
     .execute(db.pool())
@@ -544,9 +540,9 @@ async fn message_row_from_row() {
 
     sqlx::query(
         "INSERT INTO messages \
-         (id, conversation_id, msg_id, type, content, position, status, hidden, created_at, sequence) \
-         VALUES ('msg_fr', $1, 'client_42', 'text', '{\"content\":\"Hi\"}', \
-                 'right', 'finish', 1, 1500, 1)",
+	         (id, conversation_id, msg_id, type, content, position, status, hidden, created_at) \
+	         VALUES ('msg_fr', $1, 'client_42', 'text', '{\"content\":\"Hi\"}', \
+	                 'right', 'finish', 1, 1500)",
     )
     .bind(&conv_id)
     .execute(db.pool())
@@ -567,7 +563,6 @@ async fn message_row_from_row() {
     assert_eq!(row.status.as_deref(), Some("finish"));
     assert!(row.hidden);
     assert_eq!(row.created_at, 1500);
-    assert_eq!(row.sequence, 1);
 }
 
 #[tokio::test]
@@ -577,8 +572,8 @@ async fn message_row_nullable_fields() {
     let conv_id = insert_test_conversation(db.pool(), &user_id).await;
 
     sqlx::query(
-        "INSERT INTO messages (id, conversation_id, type, created_at, sequence) \
-         VALUES ('msg_null', $1, 'tips', 2000, 1)",
+        "INSERT INTO messages (id, conversation_id, type, created_at) \
+	         VALUES ('msg_null', $1, 'tips', 2000)",
     )
     .bind(&conv_id)
     .execute(db.pool())
@@ -595,7 +590,6 @@ async fn message_row_nullable_fields() {
     assert!(row.status.is_none());
     assert!(!row.hidden);
     assert_eq!(row.content, "{}");
-    assert_eq!(row.sequence, 1);
 }
 
 // -- Index existence --
@@ -639,25 +633,24 @@ async fn message_indexes_exist() {
     assert!(names.contains(&"idx_messages_type"));
     assert!(names.contains(&"idx_messages_msg_id"));
     assert!(names.contains(&"idx_messages_conv_created"));
-    assert!(names.contains(&"idx_messages_conv_sequence_unique"));
 }
 
 #[tokio::test]
-async fn messages_sequence_column_exists() {
+async fn messages_table_does_not_require_sequence_column() {
     let db = init_database_memory().await.unwrap();
 
     let columns = sqlx::query("PRAGMA table_info(messages)")
         .fetch_all(db.pool())
         .await
         .unwrap();
-    assert!(columns.iter().any(|row| row.get::<String, _>("name") == "sequence"));
+    assert!(!columns.iter().any(|row| row.get::<String, _>("name") == "sequence"));
 
     let indexes = sqlx::query("PRAGMA index_list(messages)")
         .fetch_all(db.pool())
         .await
         .unwrap();
     assert!(
-        indexes
+        !indexes
             .iter()
             .any(|row| row.get::<String, _>("name") == "idx_messages_conv_sequence_unique")
     );

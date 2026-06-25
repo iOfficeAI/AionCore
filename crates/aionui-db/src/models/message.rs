@@ -26,5 +26,4 @@ pub struct MessageRow {
     /// Whether this message is hidden (SQLite INTEGER 0/1).
     pub hidden: bool,
     pub created_at: TimestampMs,
-    pub sequence: i64,
 }
