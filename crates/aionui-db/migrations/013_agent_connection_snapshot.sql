@@ -314,6 +314,126 @@ ALTER TABLE assistant_overrides RENAME TO _assistant_overrides_old;
 ALTER TABLE _assistant_overrides_new RENAME TO assistant_overrides;
 DROP TABLE IF EXISTS _assistant_overrides_old;
 
+-- Some migration-012 databases predate generated "bare" assistant materializing.
+-- Cron rows in that shape can still point at an ACP agent through the
+-- conversation/acp_session runtime identity. Materialize the referenced
+-- generated assistant rows before cron agent_config is rewritten so those jobs
+-- keep a resolvable assistant_id instead of being disabled during migration.
+INSERT OR IGNORE INTO assistant_definitions (
+    id,
+    assistant_id,
+    source,
+    owner_type,
+    source_ref,
+    source_version,
+    source_hash,
+    name,
+    name_i18n,
+    description,
+    description_i18n,
+    avatar_type,
+    avatar_value,
+    agent_id,
+    rule_resource_type,
+    rule_resource_ref,
+    rule_inline_content,
+    recommended_prompts,
+    recommended_prompts_i18n,
+    default_model_mode,
+    default_model_value,
+    default_permission_mode,
+    default_permission_value,
+    default_skills_mode,
+    default_skill_ids,
+    custom_skill_names,
+    default_disabled_builtin_skill_ids,
+    default_mcps_mode,
+    default_mcp_ids,
+    created_at,
+    updated_at,
+    deleted_at
+)
+WITH referenced_agent_ids AS (
+    SELECT DISTINCT agent_id
+    FROM (
+        SELECT NULLIF(TRIM(acp_session.agent_id), '') AS agent_id
+        FROM cron_jobs
+        JOIN acp_session ON acp_session.conversation_id = cron_jobs.conversation_id
+
+        UNION
+
+        SELECT NULLIF(TRIM(json_extract(conversations.extra, '$.agent_id')), '') AS agent_id
+        FROM cron_jobs
+        JOIN conversations ON conversations.id = cron_jobs.conversation_id
+        WHERE json_valid(conversations.extra)
+
+        UNION
+
+        SELECT (
+            SELECT am.id
+            FROM agent_metadata am
+            WHERE am.id = cron_jobs.agent_type
+               OR am.backend = cron_jobs.agent_type
+               OR (cron_jobs.agent_type != 'acp' AND am.agent_type = cron_jobs.agent_type)
+            ORDER BY
+                CASE am.agent_source
+                    WHEN 'builtin' THEN 0
+                    WHEN 'internal' THEN 1
+                    ELSE 2
+                END,
+                am.sort_order ASC,
+                am.name ASC
+            LIMIT 1
+        ) AS agent_id
+        FROM cron_jobs
+    )
+    WHERE agent_id IS NOT NULL
+)
+SELECT
+    'asstdef_generated_' || am.id,
+    'bare:' || am.id,
+    'generated',
+    'system',
+    am.id,
+    NULL,
+    NULL,
+    am.name,
+    '{}',
+    am.description,
+    '{}',
+    CASE
+        WHEN NULLIF(TRIM(COALESCE(am.icon, '')), '') IS NOT NULL THEN 'emoji'
+        ELSE 'none'
+    END,
+    NULLIF(TRIM(COALESCE(am.icon, '')), ''),
+    am.id,
+    'none',
+    NULL,
+    NULL,
+    '[]',
+    '{}',
+    'auto',
+    NULL,
+    'auto',
+    NULL,
+    'auto',
+    '[]',
+    '[]',
+    '[]',
+    'auto',
+    '[]',
+    am.created_at,
+    am.updated_at,
+    NULL
+FROM agent_metadata am
+JOIN referenced_agent_ids rai ON rai.agent_id = am.id
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM assistant_definitions ad
+    WHERE ad.source = 'generated'
+      AND ad.source_ref = am.id
+);
+
 -- Cron assistant-first cleanup:
 -- - `cron_jobs.agent_type` is derived from assistant identity at runtime.
 -- - `agent_config.backend` was overloaded. For aionrs rows it held the LLM
@@ -363,11 +483,24 @@ SET agent_config = json_set(
             WHERE ad.deleted_at IS NULL
               AND ad.agent_id = COALESCE(
                   (
+                      SELECT NULLIF(TRIM(s.agent_id), '')
+                      FROM acp_session s
+                      WHERE s.conversation_id = cron_jobs.conversation_id
+                      LIMIT 1
+                  ),
+                  (
+                      SELECT NULLIF(TRIM(json_extract(c.extra, '$.agent_id')), '')
+                      FROM conversations c
+                      WHERE c.id = cron_jobs.conversation_id
+                        AND json_valid(c.extra)
+                      LIMIT 1
+                  ),
+                  (
                       SELECT am.id
                       FROM agent_metadata am
                       WHERE am.id = cron_jobs.agent_type
                          OR am.backend = cron_jobs.agent_type
-                         OR am.agent_type = cron_jobs.agent_type
+                         OR (cron_jobs.agent_type != 'acp' AND am.agent_type = cron_jobs.agent_type)
                       ORDER BY
                           CASE am.agent_source
                               WHEN 'builtin' THEN 0
@@ -406,11 +539,24 @@ WHERE (agent_config IS NULL OR json_valid(agent_config))
           WHERE ad.deleted_at IS NULL
             AND ad.agent_id = COALESCE(
                 (
+                    SELECT NULLIF(TRIM(s.agent_id), '')
+                    FROM acp_session s
+                    WHERE s.conversation_id = cron_jobs.conversation_id
+                    LIMIT 1
+                ),
+                (
+                    SELECT NULLIF(TRIM(json_extract(c.extra, '$.agent_id')), '')
+                    FROM conversations c
+                    WHERE c.id = cron_jobs.conversation_id
+                      AND json_valid(c.extra)
+                    LIMIT 1
+                ),
+                (
                     SELECT am.id
                     FROM agent_metadata am
                     WHERE am.id = cron_jobs.agent_type
                        OR am.backend = cron_jobs.agent_type
-                       OR am.agent_type = cron_jobs.agent_type
+                       OR (cron_jobs.agent_type != 'acp' AND am.agent_type = cron_jobs.agent_type)
                     ORDER BY
                         CASE am.agent_source
                             WHEN 'builtin' THEN 0
