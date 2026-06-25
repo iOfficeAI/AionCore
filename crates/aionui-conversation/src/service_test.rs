@@ -3739,7 +3739,7 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
     assert_eq!(content["error"]["code"], "UNKNOWN_UPSTREAM_ERROR");
     assert_eq!(content["error"]["ownership"], "unknown_upstream");
     assert_eq!(content["error"]["retryable"], true);
-    assert_eq!(content["error"]["feedback_recommended"], true);
+    assert_eq!(content["error"]["feedback_recommended"], false);
     assert_eq!(content["error"]["detail"], "ACP init failed: config file is invalid");
     assert_eq!(
         content["content"],

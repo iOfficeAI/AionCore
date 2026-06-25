@@ -111,8 +111,19 @@ pub enum AcpError {
     /// Agent requires authentication first.
     AuthRequired,
 
+    /// Agent returned JSON that the protocol layer could not parse.
+    ProtocolParseError { message: String },
+
+    /// Agent rejected a malformed JSON-RPC request object.
+    InvalidRequest { message: String },
+
     /// Agent-side session not found.
     SessionNotFound { session_id: String },
+
+    /// Agent-side resource not found. This is distinct from stale ACP session
+    /// IDs; `session-not-found` payloads are normalized to `SessionNotFound`
+    /// before this variant is constructed.
+    ResourceNotFound { resource: Option<String>, message: String },
 
     /// Agent does not support the requested method.
     MethodNotFound { method: String },
@@ -128,6 +139,15 @@ pub enum AcpError {
     AgentInternal {
         message: String,
         code: i32,
+        data: Option<serde_json::Value>,
+    },
+
+    /// Agent returned a custom JSON-RPC/ACP error code outside the standard
+    /// set. Keep it structured so UI can show a protocol error instead of an
+    /// unknown upstream failure.
+    OtherProtocolError {
+        code: i32,
+        message: String,
         data: Option<serde_json::Value>,
     },
 
@@ -182,9 +202,19 @@ impl std::fmt::Display for AcpError {
                 write!(f, "Agent process disconnected{detail}")
             }
             AcpError::AuthRequired => f.write_str("Authentication required"),
+            AcpError::ProtocolParseError { message } => {
+                write!(f, "Agent protocol parse error: {message}")
+            }
+            AcpError::InvalidRequest { message } => {
+                write!(f, "Agent rejected an invalid protocol request: {message}")
+            }
             AcpError::SessionNotFound { session_id } => {
                 write!(f, "Session not found: {session_id}")
             }
+            AcpError::ResourceNotFound { resource, message } => match resource {
+                Some(resource) => write!(f, "Agent resource not found: {resource} ({message})"),
+                None => write!(f, "Agent resource not found: {message}"),
+            },
             AcpError::MethodNotFound { method } => {
                 write!(f, "Method not supported: {method}")
             }
@@ -203,6 +233,14 @@ impl std::fmt::Display for AcpError {
                 if let Some(data) = data {
                     // serde_json::to_string on a Value cannot actually fail;
                     // the fallback exists only because Display must be infallible.
+                    let compact = serde_json::to_string(data).unwrap_or_else(|_| "<unserializable data>".to_owned());
+                    write!(f, " ({compact})")?;
+                }
+                Ok(())
+            }
+            AcpError::OtherProtocolError { code, message, data } => {
+                write!(f, "Agent protocol error (code {code}): {message}")?;
+                if let Some(data) = data {
                     let compact = serde_json::to_string(data).unwrap_or_else(|_| "<unserializable data>".to_owned());
                     write!(f, " ({compact})")?;
                 }
@@ -243,9 +281,18 @@ impl AcpError {
     pub fn from_sdk(err: SdkError, context: &str) -> Self {
         match err.code {
             ErrorCode::AuthRequired => AcpError::AuthRequired,
-            ErrorCode::ResourceNotFound => AcpError::SessionNotFound {
-                session_id: context.to_owned(),
-            },
+            ErrorCode::ParseError => AcpError::ProtocolParseError { message: err.message },
+            ErrorCode::InvalidRequest => AcpError::InvalidRequest { message: err.message },
+            ErrorCode::ResourceNotFound => {
+                if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
+                    AcpError::SessionNotFound { session_id: sid }
+                } else {
+                    AcpError::ResourceNotFound {
+                        resource: extract_resource_not_found(err.data.as_ref()),
+                        message: err.message,
+                    }
+                }
+            }
             ErrorCode::MethodNotFound => AcpError::MethodNotFound {
                 method: context.to_owned(),
             },
@@ -256,7 +303,7 @@ impl AcpError {
                     AcpError::InvalidParams { message: err.message }
                 }
             }
-            ErrorCode::ParseError | ErrorCode::InvalidRequest | ErrorCode::InternalError => {
+            ErrorCode::InternalError => {
                 if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
                     AcpError::SessionNotFound { session_id: sid }
                 } else {
@@ -269,17 +316,18 @@ impl AcpError {
             }
             _ => {
                 let code = i32::from(err.code);
-                // -32001, -32002: additional session-not-found codes used by some agents
-                if code == -32001 || code == -32002 {
+                // -32001: additional session-not-found code used by some agents.
+                // -32002 is ACP ResourceNotFound and is handled above by ErrorCode.
+                if code == -32001 {
                     AcpError::SessionNotFound {
                         session_id: context.to_owned(),
                     }
                 } else if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
                     AcpError::SessionNotFound { session_id: sid }
                 } else {
-                    AcpError::AgentInternal {
-                        message: err.message,
+                    AcpError::OtherProtocolError {
                         code,
+                        message: err.message,
                         data: err.data,
                     }
                 }
@@ -304,6 +352,16 @@ fn extract_session_not_found(data: Option<&serde_json::Value>) -> Option<String>
     let prefix = "Session not found: ";
     let sid = msg.strip_prefix(prefix)?.trim();
     if sid.is_empty() { None } else { Some(sid.to_owned()) }
+}
+
+fn extract_resource_not_found(data: Option<&serde_json::Value>) -> Option<String> {
+    let value = data?;
+    let obj = match value {
+        serde_json::Value::Object(_) => value.clone(),
+        serde_json::Value::String(s) => serde_json::from_str(s).ok()?,
+        _ => return None,
+    };
+    obj.get("uri").and_then(|uri| uri.as_str()).map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -458,12 +516,28 @@ mod tests {
     }
 
     #[test]
+    fn from_sdk_parse_error_preserves_protocol_error() {
+        let sdk_err = SdkError::parse_error();
+        let acp = AcpError::from_sdk(sdk_err, "initialize");
+        assert!(matches!(acp, AcpError::ProtocolParseError { .. }));
+    }
+
+    #[test]
+    fn from_sdk_invalid_request_preserves_protocol_error() {
+        let sdk_err = SdkError::invalid_request();
+        let acp = AcpError::from_sdk(sdk_err, "session/new");
+        assert!(matches!(acp, AcpError::InvalidRequest { .. }));
+    }
+
+    #[test]
     fn from_sdk_resource_not_found() {
-        let sdk_err = SdkError::resource_not_found(None);
-        let acp = AcpError::from_sdk(sdk_err, "sess-42");
+        let sdk_err = SdkError::resource_not_found(Some("file:///missing.txt".to_owned()));
+        let acp = AcpError::from_sdk(sdk_err, "session/new");
         match acp {
-            AcpError::SessionNotFound { session_id } => assert_eq!(session_id, "sess-42"),
-            other => panic!("Expected SessionNotFound, got {other:?}"),
+            AcpError::ResourceNotFound { resource, .. } => {
+                assert_eq!(resource.as_deref(), Some("file:///missing.txt"));
+            }
+            other => panic!("Expected ResourceNotFound, got {other:?}"),
         }
     }
 
@@ -565,11 +639,11 @@ mod tests {
         let sdk_err = SdkError::new(-32099, "custom error");
         let acp = AcpError::from_sdk(sdk_err, "ctx");
         match acp {
-            AcpError::AgentInternal { code, message, .. } => {
+            AcpError::OtherProtocolError { code, message, .. } => {
                 assert_eq!(code, -32099);
                 assert_eq!(message, "custom error");
             }
-            other => panic!("Expected AgentInternal, got {other:?}"),
+            other => panic!("Expected OtherProtocolError, got {other:?}"),
         }
     }
 
@@ -642,19 +716,19 @@ mod tests {
     }
 
     #[test]
-    fn agent_internal_preserves_code_and_data() {
+    fn other_protocol_error_preserves_code_and_data() {
         let sdk_err = SdkError::new(-32099, "custom upstream error")
             .data(serde_json::json!({"reason": "rate_limited", "retry_after": 30}));
         let acp = AcpError::from_sdk(sdk_err, "context");
         match acp {
-            AcpError::AgentInternal { code, message, data } => {
+            AcpError::OtherProtocolError { code, message, data } => {
                 assert_eq!(code, -32099);
                 assert_eq!(message, "custom upstream error");
                 let data = data.expect("data must be preserved");
                 assert_eq!(data["reason"], "rate_limited");
                 assert_eq!(data["retry_after"], 30);
             }
-            other => panic!("Expected AgentInternal, got {other:?}"),
+            other => panic!("Expected OtherProtocolError, got {other:?}"),
         }
     }
 
