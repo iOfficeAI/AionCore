@@ -16,6 +16,7 @@ use aionui_api_types::{
     GetPermissionsRequest, GetRiskLevelRequest, PermissionDetailResponse, PermissionSummaryResponse,
 };
 use aionui_common::{ApiError, now_ms};
+use serde_json::json;
 
 use crate::asset_paths::normalize_relative_asset_path;
 use crate::error::ExtensionError;
@@ -51,6 +52,65 @@ impl From<ExtensionError> for ApiError {
             }
             ExtensionError::SkillNotFound(name) => ApiError::NotFound(format!("Skill not found: {name}")),
             ExtensionError::InvalidSkillPath(path) => ApiError::BadRequest(format!("Invalid skill path: {path}")),
+            ExtensionError::SkillInvalidFrontmatter(_) => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "SKILL_INVALID_FRONTMATTER",
+                "Skill frontmatter is invalid.",
+                None,
+            ),
+            ExtensionError::SkillImportNoSkillFound(_) => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "SKILL_IMPORT_NO_SKILL_FOUND",
+                "No valid skill was found in the selected path.",
+                None,
+            ),
+            ExtensionError::SkillImportInvalidSource(_) => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "SKILL_IMPORT_INVALID_SOURCE",
+                "Selected path is not a skill directory, SKILL.md, parent directory, or zip archive.",
+                None,
+            ),
+            ExtensionError::SkillImportSymlinkEntry(_) => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "SKILL_IMPORT_SYMLINK_ENTRY",
+                "Skill import cannot contain symlink entries.",
+                None,
+            ),
+            ExtensionError::SkillImportFileTooLarge {
+                file_path,
+                file_bytes,
+                limit_bytes,
+            } => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "SKILL_IMPORT_FILE_TOO_LARGE",
+                "Skill import contains a file that is too large.",
+                Some(json!({
+                    "error_path": file_path,
+                    "file_bytes": file_bytes,
+                    "limit_bytes": limit_bytes,
+                })),
+            ),
+            ExtensionError::SkillImportTotalTooLarge {
+                total_bytes,
+                limit_bytes,
+            } => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "SKILL_IMPORT_TOTAL_TOO_LARGE",
+                "Skill import is too large.",
+                Some(json!({
+                    "total_bytes": total_bytes,
+                    "limit_bytes": limit_bytes,
+                })),
+            ),
+            ExtensionError::SkillImportInvalidZip(_) => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "SKILL_IMPORT_INVALID_ZIP",
+                "Selected zip archive is not a valid skill package.",
+                None,
+            ),
+            ExtensionError::Db(aionui_db::DbError::NotFound(msg)) => ApiError::NotFound(msg),
+            ExtensionError::Db(aionui_db::DbError::Conflict(msg)) => ApiError::Conflict(msg),
+            ExtensionError::Db(err) => ApiError::Internal(err.to_string()),
             ExtensionError::InvalidRequest(msg) => ApiError::BadRequest(msg),
             ExtensionError::Internal(msg) => ApiError::Internal(msg),
             ExtensionError::Io(e) => ApiError::Internal(e.to_string()),

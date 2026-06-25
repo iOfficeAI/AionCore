@@ -1,10 +1,11 @@
 //! Abstraction over "what are the auto-inject skill names right now?" so
 //! `ConversationService` can compute the initial snapshot without forcing
-//! every test setup to stand up a real `SkillPaths`.
+//! every test setup to stand up a real `SkillPaths` and skill repository.
 
 use std::path::Path;
 use std::sync::Arc;
 
+use aionui_db::ISkillRepository;
 pub use aionui_extension::ResolvedAgentSkill;
 use async_trait::async_trait;
 use tracing::warn;
@@ -42,11 +43,12 @@ pub trait SkillResolver: Send + Sync {
 /// Production adapter backed by `aionui_extension::skill_service`.
 pub struct ExtensionSkillResolver {
     paths: Arc<aionui_extension::SkillPaths>,
+    skill_repo: Arc<dyn ISkillRepository>,
 }
 
 impl ExtensionSkillResolver {
-    pub fn new(paths: Arc<aionui_extension::SkillPaths>) -> Self {
-        Self { paths }
+    pub fn new(paths: Arc<aionui_extension::SkillPaths>, skill_repo: Arc<dyn ISkillRepository>) -> Self {
+        Self { paths, skill_repo }
     }
 }
 
@@ -90,16 +92,26 @@ fn extract_skill_body(content: &str) -> String {
 #[async_trait]
 impl SkillResolver for ExtensionSkillResolver {
     async fn auto_inject_names(&self) -> Vec<String> {
-        match aionui_extension::list_builtin_auto_skills(&self.paths).await {
+        match aionui_extension::list_available_skills_with_repo(&self.paths, self.skill_repo.as_ref()).await {
             Ok(items) => {
-                let mut names: Vec<String> = items.into_iter().map(|i| i.name).collect();
+                let mut names: Vec<String> = items
+                    .into_iter()
+                    .filter(|item| {
+                        item.source == aionui_extension::SkillSource::Builtin
+                            && item
+                                .relative_location
+                                .as_deref()
+                                .is_some_and(|location| location.starts_with("auto-inject/"))
+                    })
+                    .map(|item| item.name)
+                    .collect();
                 names.sort();
                 names
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "auto_inject_names: list_builtin_auto_skills failed, falling back to empty"
+                    "auto_inject_names: skill catalog lookup failed, falling back to empty"
                 );
                 Vec::new()
             }
@@ -112,7 +124,14 @@ impl SkillResolver for ExtensionSkillResolver {
         }
         // Conversation_id is validated upstream; we don't use a real one here
         // because this resolver is purely a path-resolution helper.
-        match aionui_extension::materialize_skills_for_agent(&self.paths, "workspace-link", names).await {
+        match aionui_extension::materialize_skills_for_agent_with_repo(
+            &self.paths,
+            self.skill_repo.as_ref(),
+            "workspace-link",
+            names,
+        )
+        .await
+        {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(
@@ -171,10 +190,52 @@ impl SkillResolver for FixedSkillResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_db::SqliteSkillRepository;
+
+    fn write_skill(dir: &Path, name: &str, description: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\nBody"),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn extract_skill_body_removes_frontmatter() {
         let content = "---\nname: cron\ndescription: Cron\n---\nCron body";
         assert_eq!(extract_skill_body(content), "Cron body");
+    }
+
+    #[tokio::test]
+    async fn extension_resolver_reads_auto_inject_names_from_skill_catalog() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Arc::new(aionui_extension::SkillPaths {
+            data_dir: tmp.path().to_path_buf(),
+            user_skills_dir: tmp.path().join("skills"),
+            cron_skills_dir: tmp.path().join("cron").join("skills"),
+            builtin_skills_dir: tmp.path().join("builtin-skills"),
+            builtin_rules_dir: tmp.path().join("builtin-rules"),
+            assistant_rules_dir: tmp.path().join("assistant-rules"),
+            assistant_skills_dir: tmp.path().join("assistant-skills"),
+        });
+        write_skill(&paths.builtin_skills_dir, "review", "Top-level builtin");
+        write_skill(
+            &paths.builtin_skills_dir.join("auto-inject"),
+            "auto-cron",
+            "Auto-injected builtin",
+        );
+        write_skill(&paths.cron_skills_dir, "scheduled-task", "Cron source skill");
+
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(db.pool().clone()));
+        aionui_extension::sync_skill_catalog_into_repo(paths.as_ref(), repo.as_ref())
+            .await
+            .unwrap();
+
+        let resolver = ExtensionSkillResolver::new(paths, repo);
+
+        assert_eq!(resolver.auto_inject_names().await, vec!["auto-cron".to_string()]);
     }
 }

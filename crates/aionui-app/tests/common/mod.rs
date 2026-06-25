@@ -20,16 +20,30 @@ pub async fn build_app() -> (axum::Router, AppServices) {
     (router, services)
 }
 
-/// Build an app whose skill router reads from the given temp directories.
+/// Build an app whose skill router uses the given temp directories.
 ///
 /// Use for HTTP integration tests that need deterministic on-disk layouts
-/// (E1 `/api/skills`, E2 `/api/skills/builtin-auto`, E3/E4 built-in reads,
-/// E5 `/api/skills/info`). Returns the router, services, and the
-/// `SkillPaths` so the test can seed fixtures at known locations.
+/// (E1 `/api/skills`, E3/E4 built-in reads, E5 `/api/skills/info`).
+/// Returns the router, services, and the `SkillPaths` so the test can seed
+/// fixtures at known locations. `/api/skills` reads the database only; tests
+/// that seed skill directories should call `sync_skill_catalog_for_test`.
 #[allow(dead_code)]
 pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router, AppServices, SkillPaths) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let config = AppConfig {
+        data_dir: root.to_path_buf(),
+        work_dir: root.to_path_buf(),
+        ..Default::default()
+    };
+    let services = AppServices::from_config(db, &config).await.unwrap();
+    sqlx::query("DELETE FROM skill_import_records")
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM skills")
+        .execute(services.database.pool())
+        .await
+        .unwrap();
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
 
     let builtin_dir = root.join("builtin-skills");
@@ -55,12 +69,20 @@ pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router
     let ext_paths_mgr = std::sync::Arc::new(ExternalPathsManager::with_file(root.join("paths.json")).await);
     states.skill = SkillRouterState {
         skill_paths: paths.clone(),
+        skill_repo: std::sync::Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone())),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: states.skill.assistant_dispatcher.clone(),
     };
 
     let router = create_router_with_states(&services, states);
     (router, services, paths)
+}
+
+pub async fn sync_skill_catalog_for_test(services: &AppServices, paths: &SkillPaths) {
+    let repo = aionui_db::SqliteSkillRepository::new(services.database.pool().clone());
+    aionui_extension::sync_skill_catalog_into_repo(paths, &repo)
+        .await
+        .expect("sync skill catalog");
 }
 
 pub async fn build_app_with_noop_opener() -> (axum::Router, AppServices) {

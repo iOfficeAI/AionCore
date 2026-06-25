@@ -92,6 +92,13 @@ struct ErrorBody {
     details: Option<Value>,
 }
 
+/// Safe error metadata attached to API error responses for HTTP access logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiErrorLogContext {
+    pub code: &'static str,
+    pub message: String,
+}
+
 impl ApiError {
     pub fn coded(
         status: StatusCode,
@@ -254,13 +261,18 @@ pub fn validate_workspace_path_availability(workspace: &str) -> Result<String, W
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+        let code = self.error_code();
+        let message = self.public_message();
+        let details = self.error_details();
         let body = ErrorBody {
             success: false,
-            error: self.public_message(),
-            code: self.error_code().to_owned(),
-            details: self.error_details(),
+            error: message.clone(),
+            code: code.to_owned(),
+            details,
         };
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        response.extensions_mut().insert(ApiErrorLogContext { code, message });
+        response
     }
 }
 
@@ -423,6 +435,18 @@ mod tests {
         assert_eq!(json["success"], false);
         assert_eq!(json["error"], "user 42");
         assert_eq!(json["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn api_error_response_carries_log_context_extension() {
+        let resp = ApiError::BadRequest("invalid skill".into()).into_response();
+        let context = resp
+            .extensions()
+            .get::<ApiErrorLogContext>()
+            .expect("ApiError responses should expose log context to the access log layer");
+
+        assert_eq!(context.code, "BAD_REQUEST");
+        assert_eq!(context.message, "invalid skill");
     }
 
     #[tokio::test]

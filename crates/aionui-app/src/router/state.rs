@@ -510,6 +510,7 @@ pub async fn build_channel_state(
     );
     let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
         services.skill_paths.clone(),
+        services.skill_repo.clone(),
     ));
     let agent_metadata_repo: Arc<dyn aionui_db::IAgentMetadataRepository> = Arc::new(
         aionui_db::SqliteAgentMetadataRepository::new(services.database.pool().clone()),
@@ -639,6 +640,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
     let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
         services.skill_paths.clone(),
+        services.skill_repo.clone(),
     ));
     let conv_service = ConversationService::new(
         services.work_dir.clone(),
@@ -766,13 +768,6 @@ pub async fn build_extension_states(
     let index_manager = HubIndexManager::new(hub_dir, registry.clone());
     let installer = HubInstaller::new(index_manager.clone(), registry.clone());
 
-    let app_resource_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-        .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let skill_paths = aionui_extension::resolve_skill_paths(&app_resource_dir, &skill_data_dir);
-
     let ext_paths_mgr = Arc::new(ExternalPathsManager::new(&skill_data_dir).await);
 
     let ext_state = ExtensionRouterState {
@@ -785,7 +780,8 @@ pub async fn build_extension_states(
     };
 
     let skill_state = SkillRouterState {
-        skill_paths,
+        skill_paths: services.skill_paths.as_ref().clone(),
+        skill_repo: services.skill_repo.clone(),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None,
     };

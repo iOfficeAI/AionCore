@@ -13,9 +13,10 @@ use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
-    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteConversationRepository,
-    SqliteMcpServerRepository, SqliteProviderRepository, SqliteUserRepository,
+    ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
+    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository,
+    SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 use aionui_team::GuideMcpServer;
@@ -51,6 +52,8 @@ pub struct AppServices {
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
+    /// User skill metadata and import history repository.
+    pub skill_repo: Arc<dyn ISkillRepository>,
     /// Guide MCP server config (port, token, binary_path).
     /// `None` when the server failed to start (graceful degradation).
     pub guide_mcp_config: Option<GuideMcpConfig>,
@@ -69,6 +72,7 @@ impl AppServices {
             work_dir: self.work_dir.clone(),
             event_bus: self.event_bus.clone(),
             skill_paths: self.skill_paths.clone(),
+            skill_repo: self.skill_repo.clone(),
             worker_task_manager: self.worker_task_manager.clone(),
             conversation_runtime_state: self.conversation_runtime_state.clone(),
             conversation_repo: self.conversation_repo.clone(),
@@ -139,6 +143,7 @@ impl AppServices {
 
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+        let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
         // Skill paths need app resource dir (for builtin rules) + data dir
         // (for user skills + materialized views). AcpSkillManager uses these
@@ -149,6 +154,9 @@ impl AppServices {
             .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let skill_paths = Arc::new(aionui_extension::resolve_skill_paths(&app_resource_dir, &data_dir));
+        aionui_extension::sync_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
 
         // Absolute path to this process's binary. Reused as the `command` for
         // the stdio MCP bridge spawned by ACP CLIs when a team session is
@@ -180,7 +188,7 @@ impl AppServices {
         };
 
         let factory = build_agent_factory(AgentFactoryDeps {
-            skill_manager: AcpSkillManager::new(skill_paths.clone()),
+            skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
             provider_repo,
             encryption_key,
             agent_registry: agent_registry.clone(),
@@ -204,6 +212,7 @@ impl AppServices {
             work_dir: work_dir.clone(),
             event_bus: event_bus.clone(),
             skill_paths: skill_paths.clone(),
+            skill_repo: skill_repo.clone(),
             worker_task_manager: worker_task_manager.clone(),
             conversation_runtime_state: conversation_runtime_state.clone(),
             conversation_repo: conversation_repo.clone(),
@@ -231,6 +240,7 @@ impl AppServices {
             local,
             app_version,
             skill_paths,
+            skill_repo,
             guide_mcp_config: guide_mcp_config.clone(),
             _guide_server: guide_server,
         })
@@ -242,6 +252,7 @@ struct ConversationServiceDeps<'a> {
     work_dir: PathBuf,
     event_bus: Arc<BroadcastEventBus>,
     skill_paths: Arc<aionui_extension::SkillPaths>,
+    skill_repo: Arc<dyn ISkillRepository>,
     worker_task_manager: Arc<dyn IWorkerTaskManager>,
     conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -251,6 +262,7 @@ struct ConversationServiceDeps<'a> {
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
     let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
         deps.skill_paths,
+        deps.skill_repo,
     ));
     let service = ConversationService::new(
         deps.work_dir,

@@ -10,7 +10,10 @@ use aionui_common::{decrypt_string, now_ms};
 use aionui_db::{IChannelRepository, SqliteChannelRepository};
 use aionui_extension::{ExtensionSource, ScanPath};
 
-use common::{body_json, build_app, build_app_with_skill_paths, get_with_token, json_with_token, setup_and_login};
+use common::{
+    body_json, build_app, build_app_with_skill_paths, get_with_token, json_with_token, setup_and_login,
+    sync_skill_catalog_for_test,
+};
 
 fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
     let ext_root = tmp.path().join("extensions");
@@ -345,6 +348,7 @@ async fn eq12_get_i18n_for_locale() {
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
     let resp = app
+        .clone()
         .oneshot(json_with_token(
             "POST",
             "/api/extensions/i18n",
@@ -372,6 +376,7 @@ async fn eq13_permissions_not_found() {
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
     let resp = app
+        .clone()
         .oneshot(json_with_token(
             "POST",
             "/api/extensions/permissions",
@@ -1203,6 +1208,120 @@ async fn si3_read_skill_info_returns_not_found_for_missing_path() {
     assert_eq!(json["success"], false);
 }
 
+#[tokio::test]
+async fn skill_import_returns_specific_code_for_oversized_file() {
+    let tmp = TempDir::new().unwrap();
+    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+
+    let skill_dir = tmp.path().join("huge-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: huge-skill\ndescription: Huge skill\n---\nBody",
+    )
+    .unwrap();
+    std::fs::write(skill_dir.join("movie.bin"), vec![0u8; 10 * 1024 * 1024 + 1]).unwrap();
+
+    let resp = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/import",
+            json!({ "skill_path": skill_dir.to_str().unwrap() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    assert!(json["data"].get("skill_names").is_none());
+    assert_eq!(
+        json["data"]["failed"],
+        json!([{
+            "source_name": "huge-skill",
+            "code": "SKILL_IMPORT_FILE_TOO_LARGE",
+            "error_path": "movie.bin",
+            "actual_bytes": 10 * 1024 * 1024 + 1,
+            "limit_bytes": 10 * 1024 * 1024
+        }])
+    );
+}
+
+#[tokio::test]
+async fn skill_batch_import_reports_partial_failures_without_rolling_back_successes() {
+    let tmp = TempDir::new().unwrap();
+    let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+
+    let parent_dir = tmp.path().join("parent-pack");
+    let alpha_dir = parent_dir.join("alpha-skill");
+    let beta_dir = parent_dir.join("beta-skill");
+    std::fs::create_dir_all(&alpha_dir).unwrap();
+    std::fs::create_dir_all(&beta_dir).unwrap();
+    std::fs::write(
+        alpha_dir.join("SKILL.md"),
+        "---\nname: sample-alpha\ndescription: Alpha skill\n---\nBody",
+    )
+    .unwrap();
+    std::fs::write(
+        beta_dir.join("SKILL.md"),
+        "---\nname: sample-beta\ndescription: Beta skill\n---\nBody",
+    )
+    .unwrap();
+    std::fs::write(beta_dir.join("movie.bin"), vec![0u8; 10 * 1024 * 1024 + 1]).unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/import",
+            json!({ "skill_path": parent_dir.to_str().unwrap() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    assert_eq!(json["data"]["skill_names"], json!(["sample-alpha"]));
+    assert_eq!(
+        json["data"]["failed"],
+        json!([{
+            "source_name": "beta-skill",
+            "code": "SKILL_IMPORT_FILE_TOO_LARGE",
+            "error_path": "movie.bin",
+            "actual_bytes": 10 * 1024 * 1024 + 1,
+            "limit_bytes": 10 * 1024 * 1024
+        }])
+    );
+    assert!(paths.user_skills_dir.join("sample-alpha").join("SKILL.md").exists());
+    assert!(!paths.user_skills_dir.join("sample-beta").exists());
+
+    let resp = app
+        .oneshot(get_with_token("/api/skills/import-history", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let records = json["data"].as_array().unwrap();
+    assert!(
+        records.iter().any(|record| {
+            record["source_name"] == "beta-skill"
+                && record["status"] == "failed"
+                && record["error_code"] == "SKILL_IMPORT_FILE_TOO_LARGE"
+                && record["error_path"] == "movie.bin"
+                && record["actual_bytes"] == 10 * 1024 * 1024 + 1
+                && record["limit_bytes"] == 10 * 1024 * 1024
+        }),
+        "history records = {records:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SL — Skill listing (E1 / `GET /api/skills`)
 // ---------------------------------------------------------------------------
@@ -1223,6 +1342,7 @@ async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
     let builtin_dir = paths.builtin_skills_dir.clone();
     write_skill(&builtin_dir, "review", "Built-in review skill");
     write_skill(&paths.user_skills_dir, "my-skill", "A user-imported skill");
+    sync_skill_catalog_for_test(&services, &paths).await;
 
     let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1259,6 +1379,7 @@ async fn sl2_list_skills_user_custom_overrides_builtin() {
     let builtin_dir = paths.builtin_skills_dir.clone();
     write_skill(&builtin_dir, "review", "Built-in review");
     write_skill(&paths.user_skills_dir, "review", "Custom review override");
+    sync_skill_catalog_for_test(&services, &paths).await;
 
     let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1285,11 +1406,11 @@ async fn sl3_list_skills_returns_empty_array_when_no_skills() {
 }
 
 // ---------------------------------------------------------------------------
-// BA — Built-in auto skills (E2 / `GET /api/skills/builtin-auto`)
+// BA — Auto-inject builtins through unified `GET /api/skills`
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn ba1_auto_skills_lists_underscore_builtin_entries() {
+async fn ba1_unified_skill_list_includes_auto_inject_builtin_entries() {
     let tmp = TempDir::new().unwrap();
     let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
@@ -1300,40 +1421,40 @@ async fn ba1_auto_skills_lists_underscore_builtin_entries() {
     write_skill(&auto_dir, "skill-creator", "Scaffold a new skill");
     // A top-level builtin that must NOT appear in the auto list.
     write_skill(&builtin_dir, "review", "Top-level");
+    sync_skill_catalog_for_test(&services, &paths).await;
 
-    let resp = app
-        .oneshot(get_with_token("/api/skills/builtin-auto", &token))
-        .await
-        .unwrap();
+    let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let arr = json["data"].as_array().unwrap();
-    assert_eq!(arr.len(), 2);
-    let names: std::collections::HashSet<_> = arr.iter().map(|v| v["name"].as_str().unwrap()).collect();
-    assert!(names.contains("cron"));
-    assert!(names.contains("skill-creator"));
-    assert!(!names.contains("review"));
-    // Must be `{ name, description, location }` — no path / is_custom leak.
-    for item in arr {
-        assert!(item.get("path").is_none());
-        assert!(item.get("is_custom").is_none());
-        assert!(item.get("is_custom").is_none());
-        assert!(item["description"].is_string());
-    }
+    let by_name: std::collections::HashMap<_, _> = arr
+        .iter()
+        .map(|v| (v["name"].as_str().unwrap().to_owned(), v.clone()))
+        .collect();
+
+    let cron = &by_name["cron"];
+    assert_eq!(cron["source"], "builtin");
+    assert_eq!(cron["relative_location"], "auto-inject/cron/SKILL.md");
+    assert_eq!(cron["description"], "Schedule recurring tasks");
+
+    let skill_creator = &by_name["skill-creator"];
+    assert_eq!(skill_creator["source"], "builtin");
+    assert_eq!(skill_creator["relative_location"], "auto-inject/skill-creator/SKILL.md");
+
+    let review = &by_name["review"];
+    assert_eq!(review["source"], "builtin");
+    assert_eq!(review["relative_location"], "review/SKILL.md");
 }
 
 #[tokio::test]
-async fn ba2_auto_skills_returns_empty_array_when_subdir_missing() {
+async fn ba2_unified_skill_list_excludes_missing_auto_inject_dir() {
     let tmp = TempDir::new().unwrap();
     let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
-    let resp = app
-        .oneshot(get_with_token("/api/skills/builtin-auto", &token))
-        .await
-        .unwrap();
+    let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
@@ -1342,15 +1463,14 @@ async fn ba2_auto_skills_returns_empty_array_when_subdir_missing() {
 }
 
 #[tokio::test]
-async fn ba3_auto_skills_unauthenticated_rejected() {
-    let (app, _) = build_app().await;
+async fn ba3_builtin_auto_skill_list_get_is_not_registered() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
     let resp = app
-        .oneshot(common::get_request("/api/skills/builtin-auto"))
+        .oneshot(get_with_token("/api/skills/builtin-auto", &token))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let json = body_json(resp).await;
-    assert_eq!(json["code"], "UNAUTHORIZED");
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 // ---------------------------------------------------------------------------

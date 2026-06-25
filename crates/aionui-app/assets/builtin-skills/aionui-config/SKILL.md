@@ -217,8 +217,8 @@ python3 scripts/aionui_api.py get /api/skills/paths
 ### Import a skill into the registry
 
 `POST /api/skills/import` copies a skill folder into the user skills dir and
-registers it. `import-symlink` links it instead (good for skills you keep editing
-in an external repo).
+registers it. It also accepts a parent folder containing multiple skills or a
+zip package.
 
 ```bash
 python3 scripts/aionui_api.py post /api/skills/import '{"skill_path":"/abs/path/to/skill-folder"}'
