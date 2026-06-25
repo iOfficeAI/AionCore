@@ -15,16 +15,39 @@ _cargo *ARGS:
     cargo_config=()
     restore_cargo_lock=false
     cargo_lock_snapshot=""
+    aionrs_root=""
 
     restore_local_lockfile() {
-        if [[ "$restore_cargo_lock" == "true" && -n "$cargo_lock_snapshot" && -f "$cargo_lock_snapshot" ]]; then
-            cp "$cargo_lock_snapshot" Cargo.lock
+        local status=$?
+
+        if [[ -n "$cargo_lock_snapshot" && -f "$cargo_lock_snapshot" ]]; then
+            if [[ "$restore_cargo_lock" == "true" || "$status" -ne 0 ]]; then
+                cp "$cargo_lock_snapshot" Cargo.lock || status=$?
+            fi
         fi
         if [[ -n "$cargo_lock_snapshot" ]]; then
             rm -f "$cargo_lock_snapshot"
         fi
+
+        return "$status"
     }
     trap restore_local_lockfile EXIT
+
+    verify_local_aionrs_patch() {
+        local crate expected_path pkgid
+        for crate in "${crates[@]}"; do
+            expected_path="$aionrs_root/crates/$crate"
+            pkgid=$(cargo "${cargo_config[@]}" pkgid -p "$crate")
+
+            if ! python3 -c 'import sys; from pathlib import Path; from urllib.parse import unquote, urlparse; pkgid=sys.argv[1]; expected=str(Path(sys.argv[2]).resolve()); ok=pkgid.startswith("path+file://") and str(Path(unquote(urlparse(pkgid[len("path+"):]).path)).resolve()) == expected; sys.exit(0 if ok else 1)' "$pkgid" "$expected_path"
+            then
+                echo "AIONRS patch was not used for $crate." >&2
+                echo "  resolved: $pkgid" >&2
+                echo "  expected: $expected_path" >&2
+                exit 1
+            fi
+        done
+    }
 
     if [[ -n "${AIONRS:-}" ]]; then
         if [[ ! -d "$AIONRS" ]]; then
@@ -57,14 +80,25 @@ _cargo *ARGS:
         echo "Using local aionrs SDK: $aionrs_root" >&2
 
         if [[ -f Cargo.lock ]]; then
+            cargo_lock_snapshot=$(mktemp)
+            cp Cargo.lock "$cargo_lock_snapshot"
+
             if git diff --quiet -- Cargo.lock && git diff --cached --quiet -- Cargo.lock; then
-                cargo_lock_snapshot=$(mktemp)
-                cp Cargo.lock "$cargo_lock_snapshot"
                 restore_cargo_lock=true
             else
-                echo "Cargo.lock already has changes; leaving any AIONRS lockfile updates in place." >&2
+                echo "Cargo.lock already has changes; leaving successful AIONRS lockfile updates in place." >&2
             fi
         fi
+
+        echo "Resolving Cargo.lock against local aionrs SDK" >&2
+        cargo "${cargo_config[@]}" update \
+            -p aion-agent \
+            -p aion-providers \
+            -p aion-types \
+            -p aion-protocol \
+            -p aion-config \
+            -p aion-mcp
+        verify_local_aionrs_patch
     fi
 
     set +e

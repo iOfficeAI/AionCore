@@ -10,7 +10,7 @@ pub(super) fn aionrs_engine_error_to_send_error(error: &AionrsAgentError) -> Age
     let detail = format!("Aionrs agent error: {error}");
     match error {
         AionrsAgentError::Provider(provider_error) => aionrs_provider_error_to_send_error(provider_error, detail),
-        AionrsAgentError::RepeatedMalformedToolCall { .. } => provider_send_error(
+        AionrsAgentError::ToolCallMalformed { .. } => provider_send_error(
             "The model provider repeatedly returned malformed tool calls",
             AgentErrorCode::UserLlmProviderInvalidRequest,
             detail,
@@ -18,6 +18,7 @@ pub(super) fn aionrs_engine_error_to_send_error(error: &AionrsAgentError) -> Age
             AgentErrorResolutionKind::ChangeModel,
             Some(AgentErrorResolutionTarget::ProviderSettings),
         ),
+        AionrsAgentError::ToolCallFailures { .. } => tool_call_failure_send_error(detail),
         AionrsAgentError::ContextTooLong { .. } => provider_send_error(
             "The request is too large for the configured model context window",
             AgentErrorCode::UserLlmProviderContextTooLarge,
@@ -180,13 +181,25 @@ fn unknown_upstream_send_error(detail: String) -> AgentSendError {
     )
 }
 
+fn tool_call_failure_send_error(detail: String) -> AgentSendError {
+    AgentSendError::new(
+        "The upstream Agent repeatedly failed while executing tool calls",
+        AgentErrorCode::UnknownUpstreamError,
+        AgentErrorOwnership::UnknownUpstream,
+        Some(detail),
+        true,
+        true,
+        Some(AgentErrorResolution::new(AgentErrorResolutionKind::Retry, None)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn aionrs_structured_malformed_tool_call_error_is_provider_error() {
-        let error = AionrsAgentError::RepeatedMalformedToolCall { count: 3, limit: 3 };
+        let error = AionrsAgentError::ToolCallMalformed { count: 3, limit: 3 };
         let send_error = aionrs_engine_error_to_send_error(&error);
 
         assert_eq!(
@@ -274,7 +287,7 @@ mod tests {
 
     #[test]
     fn aionrs_repeated_malformed_tool_call_is_user_llm_provider_error() {
-        let error = AionrsAgentError::RepeatedMalformedToolCall { count: 3, limit: 3 };
+        let error = AionrsAgentError::ToolCallMalformed { count: 3, limit: 3 };
         let send_error = aionrs_engine_error_to_send_error(&error);
 
         assert_eq!(
@@ -286,5 +299,21 @@ mod tests {
             Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
         );
         assert_eq!(send_error.stream_error().retryable, Some(false));
+    }
+
+    #[test]
+    fn aionrs_tool_call_failures_are_unknown_upstream_error() {
+        let error = AionrsAgentError::ToolCallFailures { count: 3, limit: 3 };
+        let send_error = aionrs_engine_error_to_send_error(&error);
+
+        assert_eq!(
+            send_error.code(),
+            Some(aionui_api_types::AgentErrorCode::UnknownUpstreamError)
+        );
+        assert_eq!(
+            send_error.ownership(),
+            Some(aionui_api_types::AgentErrorOwnership::UnknownUpstream)
+        );
+        assert_eq!(send_error.stream_error().retryable, Some(true));
     }
 }

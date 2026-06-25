@@ -3264,6 +3264,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_child_after_internal_conversation_replay_does_not_emit_failed_run() {
+        let (manager, bc) = manager();
+        let ack = manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, Some("msg-user".into()))
+            .await
+            .unwrap();
+        manager
+            .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::UserMessage)
+            .await
+            .unwrap();
+        let reservation = manager
+            .claim_wake_for_turn("lead", TeamRunTargetRole::Lead, "conv-lead")
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .record_child_started(
+                    &reservation.reservation_id,
+                    ActiveChildTurn {
+                        team_run_id: ack.team_run_id,
+                        slot_id: "lead".into(),
+                        role: TeamRunTargetRole::Lead,
+                        conversation_id: "conv-lead".into(),
+                        turn_id: "turn-replayed-in-conversation".into(),
+                        started_at_ms: now_ms(),
+                        last_slow_notified_at_ms: None,
+                    },
+                )
+                .await,
+            ChildStartDecision::Accepted
+        );
+
+        let completed = manager
+            .record_child_completed("lead", "turn-replayed-in-conversation", TeamRunStatus::Completed)
+            .await
+            .expect("run should complete after conversation reports final completed outcome");
+
+        assert_eq!(completed.status, TeamRunStatus::Completed);
+        let names = bc.names();
+        assert!(names.contains(&TEAM_RUN_COMPLETED_EVENT.to_owned()));
+        assert!(
+            !names.contains(&TEAM_RUN_FAILED_EVENT.to_owned()),
+            "internal conversation replay must not surface as an intermediate team_run failed event"
+        );
+    }
+
+    #[tokio::test]
     async fn child_start_failed_releases_reservation_and_fails_run() {
         let (manager, bc) = manager();
         manager

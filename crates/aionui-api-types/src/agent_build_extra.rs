@@ -91,7 +91,9 @@ pub struct AionrsBuildExtra {
     #[serde(default)]
     pub max_turns: Option<usize>,
     #[serde(default)]
-    pub max_malformed_tool_call_turns: Option<usize>,
+    pub max_tool_call_malformed_turns: Option<usize>,
+    #[serde(default)]
+    pub max_tool_call_failure_turns: Option<usize>,
     #[serde(default)]
     pub session_mode: Option<String>,
     #[serde(default)]

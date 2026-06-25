@@ -64,7 +64,9 @@ pub struct AionrsResolvedConfig {
     /// Max agentic turns.
     pub max_turns: Option<usize>,
     /// Max repeated malformed tool-call turns before stopping.
-    pub max_malformed_tool_call_turns: Option<usize>,
+    pub max_tool_call_malformed_turns: Option<usize>,
+    /// Max repeated tool-call failure turns before stopping.
+    pub max_tool_call_failure_turns: Option<usize>,
     /// Provider-specific compat overrides.
     pub compat_overrides: AionrsCompatOverrides,
     /// Directory for aionrs session persistence files.
@@ -195,7 +197,8 @@ mod tests {
         assert!(extra.preset_rules.is_none());
         assert_eq!(extra.max_tokens, 8192);
         assert!(extra.max_turns.is_none());
-        assert!(extra.max_malformed_tool_call_turns.is_none());
+        assert!(extra.max_tool_call_malformed_turns.is_none());
+        assert!(extra.max_tool_call_failure_turns.is_none());
     }
 
     #[test]
@@ -204,13 +207,15 @@ mod tests {
             "system_prompt": "You are a helpful assistant.",
             "max_tokens": 4096,
             "max_turns": 10,
-            "max_malformed_tool_call_turns": 2
+            "max_tool_call_malformed_turns": 2,
+            "max_tool_call_failure_turns": 3
         });
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert_eq!(extra.system_prompt.unwrap(), "You are a helpful assistant.");
         assert_eq!(extra.max_tokens, 4096);
         assert_eq!(extra.max_turns.unwrap(), 10);
-        assert_eq!(extra.max_malformed_tool_call_turns.unwrap(), 2);
+        assert_eq!(extra.max_tool_call_malformed_turns.unwrap(), 2);
+        assert_eq!(extra.max_tool_call_failure_turns.unwrap(), 3);
     }
 
     #[test]
