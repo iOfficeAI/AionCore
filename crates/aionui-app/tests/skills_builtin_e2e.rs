@@ -303,8 +303,15 @@ async fn list_skills_builtin_entries_carry_relative_location() {
             "custom" => {
                 saw_custom = true;
                 assert!(item.get("relative_location").is_none());
-                assert!(item.get("relative_location").is_none());
                 assert_eq!(item["name"], "my-custom");
+            }
+            "cron" => {
+                assert!(item.get("relative_location").is_none());
+                let loc = item["location"].as_str().unwrap();
+                assert!(
+                    loc.ends_with("/SKILL.md"),
+                    "cron skill location should point at SKILL.md: {loc}"
+                );
             }
             other => panic!("unexpected source: {other}"),
         }
