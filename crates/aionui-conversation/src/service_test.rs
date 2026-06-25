@@ -194,6 +194,19 @@ fn message_is_after_cursor(message: &MessageRow, cursor: &MessagePageCursor) -> 
     message.created_at > cursor.created_at || (message.created_at == cursor.created_at && message.id > cursor.id)
 }
 
+async fn repo_messages_asc(repo: &Arc<MockRepo>, conv_id: &str, limit: u32) -> Vec<MessageRow> {
+    repo.list_messages_page(
+        conv_id,
+        &MessagePageParams {
+            limit,
+            direction: MessagePageDirection::InitialLatest,
+        },
+    )
+    .await
+    .unwrap()
+    .items
+}
+
 #[async_trait::async_trait]
 impl IConversationRepository for MockRepo {
     async fn get(&self, id: &str) -> Result<Option<ConversationRow>, aionui_db::DbError> {
@@ -4037,7 +4050,7 @@ async fn send_message_recovers_when_finished_task_has_no_runtime_terminal() {
     assert_eq!(task_mgr.kill_count(), 1);
     assert_eq!(task_mgr.active_count(), 1);
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert!(tips.is_empty());
 }
@@ -4083,7 +4096,7 @@ async fn send_message_auto_replays_clean_retryable_acp_error_once() {
     assert_eq!(first.sent_contents(), vec!["Hello"]);
     assert_eq!(second.sent_contents(), vec!["Hello"]);
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let users: Vec<_> = messages
         .iter()
         .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("right"))
@@ -4191,7 +4204,7 @@ async fn send_message_does_not_auto_replay_after_visible_output() {
 
     assert_eq!(task_mgr.build_count(), 1);
     assert_eq!(task_mgr.kill_count(), 1);
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let assistants: Vec<_> = messages
         .iter()
         .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("left"))
@@ -4283,7 +4296,7 @@ async fn send_message_does_not_auto_replay_model_not_found() {
 
     assert_eq!(task_mgr.build_count(), 1);
     assert_eq!(task_mgr.kill_count(), 1);
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert_eq!(
         tips.len(),
@@ -4341,7 +4354,7 @@ async fn send_message_auto_replay_stops_after_second_retryable_failure() {
 
     assert_eq!(task_mgr.build_count(), 2);
     assert_eq!(task_mgr.kill_count(), 2);
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert_eq!(tips.len(), 1, "second failure is final and visible");
     let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
