@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.37](https://github.com/iOfficeAI/AionCore/compare/v0.1.36...v0.1.37) (2026-06-25)
+
+
+### Features
+
+* **agent:** detect availability via session/new probe and assistant-first identity ([#500](https://github.com/iOfficeAI/AionCore/issues/500)) ([6c9a721](https://github.com/iOfficeAI/AionCore/commit/6c9a721fc4cf2b712f5c7b974f51b2935a0293b7))
+* **conversation:** add cursor pagination for messages ([#515](https://github.com/iOfficeAI/AionCore/issues/515)) ([ba76273](https://github.com/iOfficeAI/AionCore/commit/ba7627328ae8447afb7566e90cbb556fa381dff0))
+
+
+### Bug Fixes
+
+* **agent:** classify ACP and provider errors ([#518](https://github.com/iOfficeAI/AionCore/issues/518)) ([ef573d0](https://github.com/iOfficeAI/AionCore/commit/ef573d0071acc0c9f4671da8a4029abea8ec2a57))
+* **aionrs:** adapt runtime guard config ([#510](https://github.com/iOfficeAI/AionCore/issues/510)) ([464f453](https://github.com/iOfficeAI/AionCore/commit/464f4533822c8959a4d0f4d4d81d2b998152498e))
+* **conversation:** recover dead ACP turns after agent process loss ([#514](https://github.com/iOfficeAI/AionCore/issues/514)) ([e0ce4f4](https://github.com/iOfficeAI/AionCore/commit/e0ce4f4b67c44dff196d122216bd81bb42ca9ea9))
+* **db:** repair legacy handoff schema drift ([#516](https://github.com/iOfficeAI/AionCore/issues/516)) ([292e5f2](https://github.com/iOfficeAI/AionCore/commit/292e5f2d6fc727f41f4164d5f51cfa37c103b060))
+* validate skill frontmatter as yaml ([#512](https://github.com/iOfficeAI/AionCore/issues/512)) ([6b46055](https://github.com/iOfficeAI/AionCore/commit/6b460552b63cdb6242703831c25443d9153fc25e))
+
 ## [0.1.36](https://github.com/iOfficeAI/AionCore/compare/v0.1.35...v0.1.36) (2026-06-23)
 
 
