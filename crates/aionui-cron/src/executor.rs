@@ -1227,8 +1227,8 @@ mod tests {
     use aionui_api_types::{AgentModeResponse, ConfigOptionConfirmation, SetConfigOptionResponse, WebSocketMessage};
     use aionui_common::{AgentKillReason, ConversationStatus, PaginatedResult, TimestampMs};
     use aionui_db::{
-        ConversationArtifactRow, ConversationFilters, ConversationRowUpdate, MessageRowUpdate, MessageSearchRow,
-        SortOrder,
+        ConversationArtifactRow, ConversationFilters, ConversationRowUpdate, MessagePageParams, MessagePageResult,
+        MessageRowUpdate, MessageSearchRow,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2258,17 +2258,15 @@ mod tests {
             ) -> Result<Vec<aionui_db::models::ConversationRow>, aionui_db::DbError> {
                 Ok(vec![])
             }
-            async fn get_messages(
+            async fn list_messages_page(
                 &self,
                 _conv_id: &str,
-                _page: u32,
-                _page_size: u32,
-                _order: SortOrder,
-            ) -> Result<PaginatedResult<aionui_db::models::MessageRow>, aionui_db::DbError> {
-                Ok(PaginatedResult {
+                _params: &MessagePageParams,
+            ) -> Result<MessagePageResult, aionui_db::DbError> {
+                Ok(MessagePageResult {
                     items: vec![],
-                    total: 0,
-                    has_more: false,
+                    has_more_before: false,
+                    has_more_after: false,
                 })
             }
             async fn insert_message(&self, _message: &aionui_db::models::MessageRow) -> Result<(), aionui_db::DbError> {
@@ -2656,17 +2654,15 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn get_messages(
+        async fn list_messages_page(
             &self,
             _conv_id: &str,
-            _page: u32,
-            _page_size: u32,
-            _order: SortOrder,
-        ) -> Result<PaginatedResult<aionui_db::models::MessageRow>, aionui_db::DbError> {
-            Ok(PaginatedResult {
+            _params: &MessagePageParams,
+        ) -> Result<MessagePageResult, aionui_db::DbError> {
+            Ok(MessagePageResult {
                 items: vec![],
-                total: 0,
-                has_more: false,
+                has_more_before: false,
+                has_more_after: false,
             })
         }
 
@@ -2840,17 +2836,15 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn get_messages(
+        async fn list_messages_page(
             &self,
             _conv_id: &str,
-            _page: u32,
-            _page_size: u32,
-            _order: SortOrder,
-        ) -> Result<PaginatedResult<aionui_db::models::MessageRow>, aionui_db::DbError> {
-            Ok(PaginatedResult {
+            _params: &MessagePageParams,
+        ) -> Result<MessagePageResult, aionui_db::DbError> {
+            Ok(MessagePageResult {
                 items: vec![],
-                total: 0,
-                has_more: false,
+                has_more_before: false,
+                has_more_after: false,
             })
         }
 

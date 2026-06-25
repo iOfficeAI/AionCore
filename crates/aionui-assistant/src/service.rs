@@ -2659,6 +2659,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_materializes_bare_assistant_from_available_custom_agent() {
+        let mut custom_row = mk_agent_row(
+            "custom-agent-1",
+            "custom",
+            aionui_api_types::AgentManagementStatus::Online,
+        );
+        custom_row.name = "Custom ACP Agent".into();
+        custom_row.agent_source = aionui_api_types::AgentSource::Custom;
+
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![custom_row],
+            ..Default::default()
+        })
+        .await;
+
+        let list = fx.service.list().await.unwrap();
+        let bare = list
+            .iter()
+            .find(|assistant| assistant.id == "bare:custom-agent-1")
+            .expect("available custom agent should be materialized as a bare assistant");
+        assert_eq!(bare.source, AssistantSource::Bare);
+        assert_eq!(bare.name, "Custom ACP Agent");
+        assert_eq!(bare.agent_id, "custom-agent-1");
+        assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Online);
+        assert!(bare.team_selectable);
+        assert!(!bare.deletable);
+    }
+
+    #[tokio::test]
     async fn bootstrap_falls_back_to_agent_type_when_backend_is_empty() {
         // Engines like Aion CLI carry their identity in `agent_type` and leave
         // `backend` empty (it is an ACP-vendor label). The bare assistant must

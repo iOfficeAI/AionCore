@@ -7,9 +7,12 @@ use std::sync::{
 use std::time::Duration;
 
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
+use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::{
+    AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
+};
 
 use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
@@ -33,11 +36,12 @@ use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
-    SaveRuntimeStateParams, SortOrder, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
     UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
     init_database_memory,
 };
+use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult};
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
@@ -215,6 +219,27 @@ impl MockRepo {
     }
 }
 
+fn message_is_before_cursor(message: &MessageRow, cursor: &MessagePageCursor) -> bool {
+    message.created_at < cursor.created_at || (message.created_at == cursor.created_at && message.id < cursor.id)
+}
+
+fn message_is_after_cursor(message: &MessageRow, cursor: &MessagePageCursor) -> bool {
+    message.created_at > cursor.created_at || (message.created_at == cursor.created_at && message.id > cursor.id)
+}
+
+async fn repo_messages_asc(repo: &Arc<MockRepo>, conv_id: &str, limit: u32) -> Vec<MessageRow> {
+    repo.list_messages_page(
+        conv_id,
+        &MessagePageParams {
+            limit,
+            direction: MessagePageDirection::InitialLatest,
+        },
+    )
+    .await
+    .unwrap()
+    .items
+}
+
 #[async_trait::async_trait]
 impl IConversationRepository for MockRepo {
     async fn get(&self, id: &str) -> Result<Option<ConversationRow>, aionui_db::DbError> {
@@ -366,40 +391,90 @@ impl IConversationRepository for MockRepo {
         Ok(rows.len() != before)
     }
 
-    async fn get_messages(
+    async fn list_messages_page(
         &self,
         conv_id: &str,
-        page: u32,
-        page_size: u32,
-        order: SortOrder,
-    ) -> Result<PaginatedResult<MessageRow>, aionui_db::DbError> {
+        params: &MessagePageParams,
+    ) -> Result<MessagePageResult, aionui_db::DbError> {
         let messages = self.messages.lock().unwrap();
         let mut matched: Vec<_> = messages
             .iter()
             .filter(|message| message.conversation_id == conv_id)
+            .filter(|message| !matches!(message.r#type.as_str(), "cron_trigger" | "skill_suggest"))
             .cloned()
             .collect();
-        matched.sort_by_key(|message| message.created_at);
-        if matches!(order, SortOrder::Desc) {
-            matched.reverse();
-        }
+        matched.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
 
-        let start = page.saturating_sub(1) as usize * page_size as usize;
-        let end = (start + page_size as usize).min(matched.len());
-        let items = if start < matched.len() {
-            matched[start..end].to_vec()
-        } else {
-            Vec::new()
+        let limit = params.limit.max(1) as usize;
+        let items = match &params.direction {
+            MessagePageDirection::InitialLatest => {
+                let start = matched.len().saturating_sub(limit);
+                matched[start..].to_vec()
+            }
+            MessagePageDirection::Before { cursor } => matched
+                .iter()
+                .filter(|message| message_is_before_cursor(message, cursor))
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+            MessagePageDirection::After { cursor } => matched
+                .iter()
+                .filter(|message| message_is_after_cursor(message, cursor))
+                .take(limit)
+                .cloned()
+                .collect(),
+            MessagePageDirection::Anchor { message_id } => {
+                let anchor = matched
+                    .iter()
+                    .find(|message| message.id == *message_id)
+                    .cloned()
+                    .ok_or_else(|| aionui_db::DbError::NotFound(format!("Message {message_id}")))?;
+                let before_take = (limit.saturating_sub(1)) / 2;
+                let anchor_cursor = MessagePageCursor::from(&anchor);
+                let before = matched
+                    .iter()
+                    .filter(|message| message_is_before_cursor(message, &anchor_cursor))
+                    .rev()
+                    .take(before_take)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let after = matched
+                    .iter()
+                    .filter(|message| message_is_after_cursor(message, &anchor_cursor))
+                    .take(limit.saturating_sub(1 + before.len()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                before
+                    .into_iter()
+                    .rev()
+                    .chain(std::iter::once(anchor))
+                    .chain(after)
+                    .collect()
+            }
         };
-        Ok(PaginatedResult {
+        let has_more_before = items.first().is_some_and(|first| {
+            let cursor = MessagePageCursor::from(first);
+            matched.iter().any(|message| message_is_before_cursor(message, &cursor))
+        });
+        let has_more_after = items.last().is_some_and(|last| {
+            let cursor = MessagePageCursor::from(last);
+            matched.iter().any(|message| message_is_after_cursor(message, &cursor))
+        });
+
+        Ok(MessagePageResult {
             items,
-            total: matched.len() as u64,
-            has_more: end < matched.len(),
+            has_more_before,
+            has_more_after,
         })
     }
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), aionui_db::DbError> {
-        self.messages.lock().unwrap().push(message.clone());
+        let mut messages = self.messages.lock().unwrap();
+        messages.push(message.clone());
         Ok(())
     }
 
@@ -790,6 +865,7 @@ struct RuntimeStateSaveCall {
 struct StubAcpSessionRepo {
     create_calls: Mutex<Vec<CreateAcpSessionCall>>,
     runtime_state_saves: Mutex<Vec<RuntimeStateSaveCall>>,
+    session_id: Mutex<Option<String>>,
 }
 
 impl StubAcpSessionRepo {
@@ -797,8 +873,29 @@ impl StubAcpSessionRepo {
         self.create_calls.lock().unwrap().clone()
     }
 
+    fn with_session_id(session_id: impl Into<String>) -> Self {
+        Self {
+            create_calls: Mutex::new(Vec::new()),
+            runtime_state_saves: Mutex::new(Vec::new()),
+            session_id: Mutex::new(Some(session_id.into())),
+        }
+    }
+
     fn runtime_state_saves(&self) -> Vec<RuntimeStateSaveCall> {
         self.runtime_state_saves.lock().unwrap().clone()
+    }
+
+    fn row_for(&self, conversation_id: &str) -> AcpSessionRow {
+        AcpSessionRow {
+            conversation_id: conversation_id.to_owned(),
+            agent_source: "builtin".into(),
+            agent_id: "codex".into(),
+            session_id: self.session_id.lock().unwrap().clone(),
+            session_status: "idle".into(),
+            session_config: "{}".into(),
+            last_active_at: None,
+            suspended_at: None,
+        }
     }
 }
 
@@ -811,8 +908,8 @@ struct CreateAcpSessionCall {
 
 #[async_trait::async_trait]
 impl IAcpSessionRepository for StubAcpSessionRepo {
-    async fn get(&self, _conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
-        Ok(None)
+    async fn get(&self, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
+        Ok(Some(self.row_for(conversation_id)))
     }
     async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
         self.create_calls.lock().unwrap().push(CreateAcpSessionCall {
@@ -826,15 +923,16 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
             conversation_id: params.conversation_id.to_owned(),
             agent_source: params.agent_source.to_owned(),
             agent_id: params.agent_id.to_owned(),
-            session_id: None,
+            session_id: self.session_id.lock().unwrap().clone(),
             session_status: "idle".into(),
             session_config: "{}".into(),
             last_active_at: None,
             suspended_at: None,
         })
     }
-    async fn update_session_id(&self, _conversation_id: &str, _session_id: &str) -> Result<bool, DbError> {
-        Ok(false)
+    async fn update_session_id(&self, _conversation_id: &str, session_id: &str) -> Result<bool, DbError> {
+        *self.session_id.lock().unwrap() = Some(session_id.to_owned());
+        Ok(true)
     }
     async fn delete(&self, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)
@@ -2298,6 +2396,81 @@ impl MockTaskManager {
     }
 }
 
+struct RebuildingScriptedTaskManager {
+    agents: Mutex<VecDeque<AgentInstance>>,
+    build_count: AtomicUsize,
+    kill_count: AtomicUsize,
+    captured_options: Mutex<Vec<BuildTaskOptions>>,
+}
+
+impl RebuildingScriptedTaskManager {
+    fn new(agents: Vec<AgentInstance>) -> Self {
+        Self {
+            agents: Mutex::new(agents.into()),
+            build_count: AtomicUsize::new(0),
+            kill_count: AtomicUsize::new(0),
+            captured_options: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn build_count(&self) -> usize {
+        self.build_count.load(Ordering::SeqCst)
+    }
+
+    fn kill_count(&self) -> usize {
+        self.kill_count.load(Ordering::SeqCst)
+    }
+
+    fn captured_options(&self) -> Vec<BuildTaskOptions> {
+        self.captured_options.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for RebuildingScriptedTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        None
+    }
+
+    async fn get_or_build_task(
+        &self,
+        _conversation_id: &str,
+        options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        self.build_count.fetch_add(1, Ordering::SeqCst);
+        self.captured_options.lock().unwrap().push(options);
+        self.agents
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| AgentError::bad_gateway("no scripted agent left"))
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        self.kill_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        conversation_id: &str,
+        reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let _ = self.kill(conversation_id, reason);
+        Box::pin(std::future::ready(()))
+    }
+
+    async fn clear(&self) {}
+
+    fn active_count(&self) -> usize {
+        0
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 struct FailingBuildTaskManager {
     error: String,
 }
@@ -3362,7 +3535,17 @@ async fn send_message_missing_workspace_persists_message_and_failure_tip() {
 
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+            let messages = repo
+                .list_messages_page(
+                    &conv.id,
+                    &MessagePageParams {
+                        limit: 20,
+                        direction: MessagePageDirection::InitialLatest,
+                    },
+                )
+                .await
+                .unwrap()
+                .items;
             if messages.iter().any(|message| message.r#type == "tips")
                 && messages.iter().any(|message| message.r#type == "text")
             {
@@ -3481,7 +3664,17 @@ async fn send_message_persists_hidden_user_message_when_requested() {
 
     svc.send_message("user_1", &conv.id, req, &task_mgr).await.unwrap();
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     // The user message is the only hidden text row written by the service.
     let user_message = messages
         .iter()
@@ -3511,7 +3704,17 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
 
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+            let messages = repo
+                .list_messages_page(
+                    &conv.id,
+                    &MessagePageParams {
+                        limit: 20,
+                        direction: MessagePageDirection::InitialLatest,
+                    },
+                )
+                .await
+                .unwrap()
+                .items;
             if messages.iter().any(|message| message.r#type == "tips") {
                 return messages;
             }
@@ -3594,7 +3797,17 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
 
     wait_for_turn_released(&svc, &conv.id).await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let tip = messages
         .iter()
         .find(|row| row.r#type == "tips" && row.status.as_deref() == Some("error"))
@@ -3733,7 +3946,17 @@ async fn send_message_rejects_when_runtime_is_shutting_down() {
         .unwrap_err();
     assert!(matches!(err, ConversationError::Busy { .. }));
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     assert!(
         messages.is_empty(),
         "shutdown rejection must not persist a user message"
@@ -3760,7 +3983,17 @@ async fn send_message_build_failure_while_deleting_skips_failure_tip_and_complet
     svc.runtime_state().mark_deleting(&conv.id);
     wait_for_turn_released(&svc, &conv.id).await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     assert!(
         messages.iter().all(|message| message.r#type != "tips"),
         "deleting conversation must skip build-failure tips"
@@ -3851,7 +4084,17 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
 
     svc.recover_stale_runtime_state_on_startup().await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let visible = messages.iter().find(|message| message.id == "visible-stale").unwrap();
     assert_eq!(visible.status.as_deref(), Some("finish"));
     assert!(!visible.hidden);
@@ -4009,7 +4252,17 @@ async fn send_message_does_not_inject_send_error_when_runtime_terminal_exists() 
         .unwrap();
     wait_for_turn_released(&svc, &conv.id).await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert_eq!(tips.len(), 1);
     let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
@@ -4037,7 +4290,17 @@ async fn send_message_injects_send_error_when_runtime_terminal_missing() {
         .unwrap();
     wait_for_turn_released(&svc, &conv.id).await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert_eq!(tips.len(), 1);
     let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
@@ -4124,6 +4387,341 @@ async fn send_message_records_agent_availability_feedback_on_send_success() {
     let successes = feedback.successes.lock().unwrap().clone();
     assert_eq!(successes, vec!["agent-feedback-success".to_owned()]);
     assert!(feedback.failures.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn send_message_recovers_when_finished_task_has_no_runtime_terminal() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(&conv.id, vec![vec![]])
+            .with_status(Some(ConversationStatus::Finished))
+            .with_send_error(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "acp protocol not connected",
+            ))),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert_eq!(task_mgr.active_count(), 1);
+
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert!(tips.is_empty());
+}
+
+#[tokio::test]
+async fn send_message_auto_replays_clean_retryable_acp_error_once() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData { content: "done".into() }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first.clone()),
+        AgentInstance::Mock(second.clone()),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 2);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert_eq!(first.sent_contents(), vec!["Hello"]);
+    assert_eq!(second.sent_contents(), vec!["Hello"]);
+
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let users: Vec<_> = messages
+        .iter()
+        .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("right"))
+        .collect();
+    let assistants: Vec<_> = messages
+        .iter()
+        .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("left"))
+        .collect();
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(users.len(), 1, "auto replay must not insert the user message again");
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(
+        tips.len(),
+        0,
+        "first clean retryable error stays hidden when replay succeeds"
+    );
+}
+
+#[tokio::test]
+async fn auto_replay_rebuild_keeps_existing_acp_session_id_in_build_options() {
+    let acp_session_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-existing"));
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_session_repo,
+    );
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 2);
+    for options in options {
+        match options.context.kind {
+            AgentSessionKind::Acp(ctx) => {
+                assert_eq!(ctx.session_id.as_deref(), Some("sess-existing"));
+            }
+            AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn send_message_does_not_auto_replay_after_visible_output() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData {
+                content: "partial".into(),
+            }),
+            AgentStreamEvent::Error(ErrorEventData {
+                message: "temporary provider failure".into(),
+                code: Some(AgentErrorCode::UnknownUpstreamError),
+                ownership: None,
+                detail: None,
+                workspace_path: None,
+                retryable: Some(true),
+                feedback_recommended: None,
+                resolution: None,
+            }),
+        ]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let assistants: Vec<_> = messages
+        .iter()
+        .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("left"))
+        .collect();
+    assert_eq!(assistants.len(), 1);
+    assert!(assistants[0].content.contains("partial"));
+}
+
+#[tokio::test]
+async fn send_message_does_not_auto_replay_after_tool_side_effect() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::ToolCall(ToolCallEventData {
+                call_id: "call-1".into(),
+                name: "write_file".into(),
+                args: serde_json::json!({ "path": "a.txt" }),
+                status: ToolCallStatus::Running,
+                input: None,
+                output: None,
+                description: None,
+            }),
+            AgentStreamEvent::Error(ErrorEventData {
+                message: "temporary provider failure".into(),
+                code: Some(AgentErrorCode::UnknownUpstreamError),
+                ownership: None,
+                detail: None,
+                workspace_path: None,
+                retryable: Some(true),
+                feedback_recommended: None,
+                resolution: None,
+            }),
+        ]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+}
+
+#[tokio::test]
+async fn send_message_does_not_auto_replay_model_not_found() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "model not found".into(),
+            code: Some(AgentErrorCode::UserLlmProviderModelNotFound),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(
+        tips.len(),
+        1,
+        "model_not_found should remain visible and must not be swallowed by replay deferral"
+    );
+}
+
+#[tokio::test]
+async fn send_message_auto_replay_stops_after_second_retryable_failure() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure one".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure two".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let third = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+        AgentInstance::Mock(third),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 2);
+    assert_eq!(task_mgr.kill_count(), 2);
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(tips.len(), 1, "second failure is final and visible");
+    let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
+    assert_eq!(content["content"], "temporary provider failure two");
 }
 
 // ── stop_stream tests ───────────────────────────────────────────

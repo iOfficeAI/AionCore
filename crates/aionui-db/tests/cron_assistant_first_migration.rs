@@ -330,3 +330,97 @@ async fn migration_013_normalizes_legacy_cron_agent_identity() {
     .unwrap();
     assert_eq!(index_count, 0);
 }
+
+#[tokio::test]
+async fn migration_013_recovers_cron_assistant_from_session_agent_id_without_existing_definition() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    run_migrations_through(&pool, 12).await;
+
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at)
+         VALUES ('user_1', 'user_1', '', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO agent_metadata (
+            id, name, backend, command, agent_type, enabled, agent_source, sort_order, created_at, updated_at
+         ) VALUES ('agent-claude', 'Claude Code', 'claude', 'claude', 'acp', 1, 'builtin', 200, 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at)
+         VALUES (
+            'conv_session_only', 'user_1', 'Session-only cron', 'acp',
+            '{\"agent_id\":\"agent-claude\",\"backend\":\"claude\",\"session_mode\":\"bypassPermissions\"}',
+            1, 1
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO acp_session (
+            conversation_id, agent_backend, agent_source, agent_id, session_id, session_status, session_config
+        ) VALUES (
+            'conv_session_only', 'claude', 'builtin', 'agent-claude', 'session-1', 'idle',
+            '{\"current_mode_id\":\"bypassPermissions\"}'
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    insert_legacy_cron(
+        &pool,
+        "cron_session_only",
+        "conv_session_only",
+        "claude",
+        r#"{"backend":"claude","name":"Claude Code","mode":"bypassPermissions"}"#,
+    )
+    .await;
+
+    run_migration(&pool, 13).await;
+
+    let cron = sqlx::query(
+        "SELECT
+            enabled,
+            json_extract(agent_config, '$.assistant_id') AS assistant_id,
+            json_type(agent_config, '$.backend') AS backend_key_type,
+            last_status,
+            last_error
+         FROM cron_jobs
+         WHERE id = 'cron_session_only'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cron.get::<i64, _>("enabled"), 1);
+    assert_eq!(cron.get::<String, _>("assistant_id"), "bare:agent-claude");
+    assert!(cron.get::<Option<String>, _>("backend_key_type").is_none());
+    assert!(cron.get::<Option<String>, _>("last_status").is_none());
+    assert!(cron.get::<Option<String>, _>("last_error").is_none());
+
+    let generated = sqlx::query(
+        "SELECT source, source_ref, agent_id
+         FROM assistant_definitions
+         WHERE assistant_id = 'bare:agent-claude'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(generated.get::<String, _>("source"), "generated");
+    assert_eq!(generated.get::<String, _>("source_ref"), "agent-claude");
+    assert_eq!(generated.get::<String, _>("agent_id"), "agent-claude");
+}

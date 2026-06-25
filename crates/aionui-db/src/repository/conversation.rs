@@ -79,14 +79,9 @@ pub trait IConversationRepository: Send + Sync {
 
     // ── Message operations ──────────────────────────────────────────
 
-    /// Returns paginated messages for a conversation, ordered by `created_at`.
-    async fn get_messages(
-        &self,
-        conv_id: &str,
-        page: u32,
-        page_size: u32,
-        order: SortOrder,
-    ) -> Result<PaginatedResult<MessageRow>, DbError>;
+    /// Returns cursor-paginated messages for a conversation in ascending display order.
+    async fn list_messages_page(&self, conv_id: &str, params: &MessagePageParams)
+    -> Result<MessagePageResult, DbError>;
 
     /// Returns a single message scoped to a conversation.
     async fn get_message(&self, _conv_id: &str, _message_id: &str) -> Result<Option<MessageRow>, DbError> {
@@ -197,21 +192,41 @@ pub trait IConversationRepository: Send + Sync {
 
 // ── Supporting types ────────────────────────────────────────────────
 
-/// Sort direction for message listing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SortOrder {
-    #[default]
-    Asc,
-    Desc,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagePageCursor {
+    pub created_at: TimestampMs,
+    pub id: String,
 }
 
-impl SortOrder {
-    pub fn as_sql(&self) -> &'static str {
-        match self {
-            SortOrder::Asc => "ASC",
-            SortOrder::Desc => "DESC",
+impl From<&MessageRow> for MessagePageCursor {
+    fn from(row: &MessageRow) -> Self {
+        Self {
+            created_at: row.created_at,
+            id: row.id.clone(),
         }
     }
+}
+
+/// Direction for cursor-based message pagination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessagePageDirection {
+    InitialLatest,
+    Before { cursor: MessagePageCursor },
+    After { cursor: MessagePageCursor },
+    Anchor { message_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagePageParams {
+    pub limit: u32,
+    pub direction: MessagePageDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagePageResult {
+    pub items: Vec<MessageRow>,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
 }
 
 /// Filters for paginated conversation listing.

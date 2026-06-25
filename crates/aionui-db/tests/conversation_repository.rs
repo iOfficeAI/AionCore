@@ -1,6 +1,7 @@
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessageRowUpdate, SortOrder,
-    SqliteConversationRepository, init_database_memory, models::ConversationRow, models::MessageRow,
+    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
+    MessagePageParams, MessageRowUpdate, SqliteConversationRepository, init_database_memory, models::ConversationRow,
+    models::MessageRow,
 };
 
 const USER_ID: &str = "system_default_user";
@@ -115,14 +116,32 @@ async fn delete_conversation_cascades_messages() {
     }
 
     // Verify messages exist
-    let msgs = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
-    assert_eq!(msgs.total, 3);
+    let msgs = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(msgs.items.len(), 3);
 
     // Delete conversation → messages cascade
     repo.delete(&conv.id).await.unwrap();
 
-    let msgs = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
-    assert_eq!(msgs.total, 0);
+    let msgs = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(msgs.items.is_empty());
 }
 
 // ── Cursor pagination ───────────────────────────────────────────────
@@ -387,7 +406,7 @@ async fn list_associated_returns_empty_when_no_workspace() {
 // ── Message operations ──────────────────────────────────────────────
 
 #[tokio::test]
-async fn message_pagination_and_ordering() {
+async fn initial_latest_returns_latest_limit_in_ascending_order() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("msgs");
     repo.create(&conv).await.unwrap();
@@ -398,16 +417,313 @@ async fn message_pagination_and_ordering() {
         repo.insert_message(&msg).await.unwrap();
     }
 
-    // DESC page 1
-    let p1 = repo.get_messages(&conv.id, 1, 3, SortOrder::Desc).await.unwrap();
+    let p1 = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 3,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(p1.items.len(), 3);
-    assert_eq!(p1.total, 10);
-    assert!(p1.has_more);
-    assert!(p1.items[0].created_at > p1.items[1].created_at);
+    assert_eq!(
+        p1.items.iter().map(|m| m.created_at).collect::<Vec<_>>(),
+        vec![8000, 9000, 10000]
+    );
+    assert!(p1.has_more_before);
+    assert!(!p1.has_more_after);
+}
 
-    // ASC page 1
-    let asc = repo.get_messages(&conv.id, 1, 3, SortOrder::Asc).await.unwrap();
-    assert!(asc.items[0].created_at < asc.items[1].created_at);
+#[tokio::test]
+async fn before_pages_walk_history_without_duplicates() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("before");
+    repo.create(&conv).await.unwrap();
+
+    for i in 0..6 {
+        let mut msg = make_message(&conv.id, &format!("item {i}"));
+        msg.id = format!("msg-{i}");
+        msg.created_at = (i + 1) as i64 * 1000;
+        repo.insert_message(&msg).await.unwrap();
+    }
+
+    let latest = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 3,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    let older = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 3,
+                direction: MessagePageDirection::Before {
+                    cursor: MessagePageCursor::from(&latest.items[0]),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut ids = latest
+        .items
+        .iter()
+        .chain(older.items.iter())
+        .map(|m| m.id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 6);
+    assert_eq!(
+        older.items.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        vec!["msg-0", "msg-1", "msg-2"]
+    );
+    assert!(!older.has_more_before);
+    assert!(older.has_more_after);
+}
+
+#[tokio::test]
+async fn after_returns_newer_rows_with_same_timestamp_tie_breaker() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("after");
+    repo.create(&conv).await.unwrap();
+
+    for id in ["msg-a", "msg-b", "msg-c", "msg-d", "msg-e"] {
+        let mut msg = make_message(&conv.id, id);
+        msg.id = id.to_string();
+        msg.created_at = 1000;
+        repo.insert_message(&msg).await.unwrap();
+    }
+
+    let page = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 2,
+                direction: MessagePageDirection::After {
+                    cursor: MessagePageCursor {
+                        created_at: 1000,
+                        id: "msg-b".to_string(),
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        page.items.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        vec!["msg-c", "msg-d"]
+    );
+    assert!(page.has_more_before);
+    assert!(page.has_more_after);
+}
+
+#[tokio::test]
+async fn created_at_id_ordering_is_scoped_per_conversation() {
+    let (repo, _db) = setup().await;
+    let conv_a = make_conversation("seq-a");
+    let conv_b = make_conversation("seq-b");
+    repo.create(&conv_a).await.unwrap();
+    repo.create(&conv_b).await.unwrap();
+
+    let mut a1 = make_message(&conv_a.id, "a1");
+    a1.id = "a1".to_string();
+    a1.created_at = 1000;
+    repo.insert_message(&a1).await.unwrap();
+
+    let mut a2 = make_message(&conv_a.id, "a2");
+    a2.id = "a2".to_string();
+    a2.created_at = 2000;
+    repo.insert_message(&a2).await.unwrap();
+
+    let mut b1 = make_message(&conv_b.id, "b1");
+    b1.id = "b1".to_string();
+    b1.created_at = 1000;
+    repo.insert_message(&b1).await.unwrap();
+
+    let page_a = repo
+        .list_messages_page(
+            &conv_a.id,
+            &MessagePageParams {
+                limit: 10,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    let page_b = repo
+        .list_messages_page(
+            &conv_b.id,
+            &MessagePageParams {
+                limit: 10,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        page_a.items.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+        vec![r#"{"content":"a1"}"#, r#"{"content":"a2"}"#]
+    );
+    assert_eq!(
+        page_b.items.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+        vec![r#"{"content":"b1"}"#]
+    );
+}
+
+#[tokio::test]
+async fn concurrent_insert_message_does_not_require_sequence_allocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = aionui_db::init_database(&dir.path().join("messages.db")).await.unwrap();
+    let repo = SqliteConversationRepository::new(db.pool().clone());
+    let conv = make_conversation("seq-race");
+    repo.create(&conv).await.unwrap();
+
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(48));
+    let mut handles = Vec::new();
+    for i in 0..48 {
+        let repo = repo.clone();
+        let conv_id = conv.id.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut msg = make_message(&conv_id, &format!("concurrent {i}"));
+            msg.id = format!("msg-concurrent-{i}");
+            msg.msg_id = Some(format!("cmsg-concurrent-{i}"));
+            repo.insert_message(&msg).await
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap().unwrap();
+    }
+
+    let page = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 100,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(page.items.len(), 48);
+    let mut ids = page.items.iter().map(|m| m.id.as_str()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids.len(), 48);
+    assert_eq!(ids[0], "msg-concurrent-0");
+}
+
+#[tokio::test]
+async fn anchor_window_contains_anchor_and_sets_flags() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("anchor");
+    repo.create(&conv).await.unwrap();
+
+    for i in 1..=7 {
+        let mut msg = make_message(&conv.id, &format!("item {i}"));
+        msg.id = format!("msg-{i}");
+        msg.created_at = i as i64 * 1000;
+        repo.insert_message(&msg).await.unwrap();
+    }
+
+    let page = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 5,
+                direction: MessagePageDirection::Anchor {
+                    message_id: "msg-4".to_string(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        page.items.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        vec!["msg-2", "msg-3", "msg-4", "msg-5", "msg-6"]
+    );
+    assert!(page.has_more_before);
+    assert!(page.has_more_after);
+}
+
+#[tokio::test]
+async fn anchor_rejects_legacy_artifact_rows() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("anchor-artifact");
+    repo.create(&conv).await.unwrap();
+
+    repo.insert_message(&MessageRow {
+        id: "legacy-cron".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: None,
+        r#type: "cron_trigger".into(),
+        content: "{}".into(),
+        position: Some("center".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 1000,
+    })
+    .await
+    .unwrap();
+
+    let err = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 5,
+                direction: MessagePageDirection::Anchor {
+                    message_id: "legacy-cron".to_string(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, aionui_db::DbError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn upsert_preserves_existing_created_at() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("upsert-seq");
+    repo.create(&conv).await.unwrap();
+
+    let mut msg = make_message(&conv.id, "first");
+    msg.id = "msg-stable".to_string();
+    repo.upsert_message(&msg).await.unwrap();
+
+    let mut updated = msg.clone();
+    updated.content = r#"{"content":"updated"}"#.to_string();
+    updated.created_at = msg.created_at + 5000;
+    repo.upsert_message(&updated).await.unwrap();
+
+    let page = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 10,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].created_at, msg.created_at);
+    assert_eq!(page.items[0].content, r#"{"content":"updated"}"#);
 }
 
 #[tokio::test]
@@ -430,7 +746,16 @@ async fn update_message_fields() {
     .await
     .unwrap();
 
-    let msgs = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
+    let msgs = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
     let updated = &msgs.items[0];
     assert_eq!(updated.content, r#"{"content":"modified"}"#);
     assert!(updated.hidden);
@@ -450,9 +775,17 @@ async fn delete_messages_by_conversation_clears_all() {
 
     repo.delete_messages_by_conversation(&conv.id).await.unwrap();
 
-    let result = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
+    let result = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
     assert!(result.items.is_empty());
-    assert_eq!(result.total, 0);
 }
 
 #[tokio::test]
@@ -703,8 +1036,16 @@ async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
         .unwrap();
     }
 
-    let rows = repo.get_messages(&conv.id, 1, 50, SortOrder::Asc).await.unwrap();
-    assert_eq!(rows.total, 1);
+    let rows = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(rows.items.len(), 1);
     assert_eq!(rows.items[0].r#type, "text");
 }

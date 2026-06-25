@@ -563,6 +563,7 @@ dependencies = [
  "aionui-runtime",
  "async-trait",
  "axum",
+ "base64",
  "regex",
  "serde",
  "serde_json",

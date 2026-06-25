@@ -8,8 +8,8 @@ use aionui_common::now_ms;
 use aionui_conversation::stream_relay::StreamRelay;
 use aionui_db::models::ConversationRow;
 use aionui_db::{
-    IConversationRepository, IUserRepository, SortOrder, SqliteConversationRepository, SqliteUserRepository,
-    init_database_memory,
+    IConversationRepository, IUserRepository, MessagePageDirection, MessagePageParams, SqliteConversationRepository,
+    SqliteUserRepository, init_database_memory,
 };
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -71,7 +71,17 @@ async fn run_acp_tool_call_update_without_insert_creates_placeholder() {
 
     relay.consume(rx).await;
 
-    let messages = repo.get_messages("conv-1", 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            "conv-1",
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     assert!(
         messages
             .iter()
@@ -152,7 +162,17 @@ async fn run_acp_tool_call_late_initial_event_merges_with_update_placeholder() {
 
     relay.consume(rx).await;
 
-    let messages = repo.get_messages("conv-1", 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            "conv-1",
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let msg = messages
         .iter()
         .find(|m| m.id == "atc-out-of-order" && m.r#type == "acp_tool_call")

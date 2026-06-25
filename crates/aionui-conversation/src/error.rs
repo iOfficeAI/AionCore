@@ -86,6 +86,10 @@ impl ConversationError {
         Self::Internal { reason: reason.into() }
     }
 
+    pub(crate) fn bad_request(reason: impl Into<String>) -> Self {
+        Self::BadRequest { reason: reason.into() }
+    }
+
     pub(crate) fn not_found_reason(reason: impl Into<String>) -> Self {
         Self::NotFoundReason { reason: reason.into() }
     }
