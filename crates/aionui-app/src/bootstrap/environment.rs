@@ -120,4 +120,14 @@ mod tests {
 
         assert_eq!(err.stage(), "database.migration");
     }
+
+    #[test]
+    fn database_schema_repair_stage_comes_from_db_boundary_error() {
+        let err = aionui_db::DatabaseInitError::new(
+            "database.schema_repair",
+            aionui_db::DbError::Init("repair failed".into()),
+        );
+
+        assert_eq!(err.stage(), "database.schema_repair");
+    }
 }
