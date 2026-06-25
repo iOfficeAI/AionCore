@@ -3,6 +3,7 @@
 //! SQLite database layer: init, migrations, repository traits, and implementations.
 mod database;
 mod error;
+mod legacy_handoff;
 pub mod models;
 mod repository;
 
