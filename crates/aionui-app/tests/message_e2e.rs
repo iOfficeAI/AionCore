@@ -129,7 +129,10 @@ async fn t8_1_messages_empty() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["data"]["items"].as_array().unwrap().len(), 0);
-    assert_eq!(json["data"]["total"], 0);
+    assert!(json["data"]["oldest_cursor"].is_null());
+    assert!(json["data"]["newest_cursor"].is_null());
+    assert_eq!(json["data"]["has_more_before"], false);
+    assert_eq!(json["data"]["has_more_after"], false);
 }
 
 #[tokio::test]
@@ -150,31 +153,33 @@ async fn t8_2_messages_pagination() {
         .await;
     }
 
-    // Page 1, page_size 3
+    // Latest page, limit 3
     let resp = app
         .clone()
         .oneshot(get_with_token(
-            &format!("/api/conversations/{conv_id}/messages?page=1&page_size=3"),
+            &format!("/api/conversations/{conv_id}/messages?limit=3"),
             &token,
         ))
         .await
         .unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"]["items"].as_array().unwrap().len(), 3);
-    assert_eq!(json["data"]["total"], 10);
-    assert_eq!(json["data"]["has_more"], true);
+    assert_eq!(json["data"]["has_more_before"], true);
+    assert_eq!(json["data"]["has_more_after"], false);
+    let oldest_cursor = json["data"]["oldest_cursor"].as_str().unwrap();
 
-    // Last page
+    // Previous history page
     let resp = app
         .oneshot(get_with_token(
-            &format!("/api/conversations/{conv_id}/messages?page=4&page_size=3"),
+            &format!("/api/conversations/{conv_id}/messages?limit=3&before={oldest_cursor}"),
             &token,
         ))
         .await
         .unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["items"].as_array().unwrap().len(), 1);
-    assert_eq!(json["data"]["has_more"], false);
+    assert_eq!(json["data"]["items"].as_array().unwrap().len(), 3);
+    assert_eq!(json["data"]["has_more_before"], true);
+    assert_eq!(json["data"]["has_more_after"], true);
 }
 
 #[tokio::test]
@@ -330,10 +335,10 @@ async fn t8_3_messages_order_asc_default() {
 }
 
 #[tokio::test]
-async fn t8_4_messages_order_asc() {
+async fn t8_4_messages_limit_returns_latest_window_in_ascending_order() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let conv_id = create_conversation(&mut app, &token, &csrf, "ASC Test").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Limit Test").await;
 
     insert_message(&services, &conv_id, "msg-old", "Old", 1000).await;
     insert_message(&services, &conv_id, "msg-mid", "Mid", 2000).await;
@@ -341,16 +346,17 @@ async fn t8_4_messages_order_asc() {
 
     let resp = app
         .oneshot(get_with_token(
-            &format!("/api/conversations/{conv_id}/messages?order=ASC"),
+            &format!("/api/conversations/{conv_id}/messages?limit=2"),
             &token,
         ))
         .await
         .unwrap();
     let json = body_json(resp).await;
     let items = json["data"]["items"].as_array().unwrap();
-    // ASC order: oldest first
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"], "msg-mid");
+    assert_eq!(items[1]["id"], "msg-new");
     assert!(items[0]["created_at"].as_i64().unwrap() < items[1]["created_at"].as_i64().unwrap());
-    assert!(items[1]["created_at"].as_i64().unwrap() < items[2]["created_at"].as_i64().unwrap());
 }
 
 #[tokio::test]
@@ -435,7 +441,6 @@ async fn t8_7_messages_exclude_legacy_cron_rows() {
     let json = body_json(resp).await;
     let items = json["data"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
-    assert_eq!(json["data"]["total"], 1);
     assert_eq!(items[0]["type"], "text");
     assert_eq!(items[0]["content"]["content"], "Visible");
 }
@@ -820,8 +825,8 @@ async fn t2_1c_send_message_missing_workspace_persists_message_and_failure_tip()
         .unwrap();
     assert_eq!(messages_resp.status(), StatusCode::OK);
     let messages_json = body_json(messages_resp).await;
-    assert_eq!(messages_json["data"]["total"], 2);
     let items = messages_json["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
     assert!(items.iter().any(|item| item["position"] == "right"));
     assert!(items.iter().any(|item| item["type"] == "tips"));
 }

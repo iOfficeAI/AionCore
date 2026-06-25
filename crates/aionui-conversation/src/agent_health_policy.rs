@@ -22,7 +22,10 @@ impl AgentHealthPolicy {
         outcome: &RelayOutcome,
         lifecycle: RuntimeLifecycleState,
     ) -> AgentHealthAction {
-        if lifecycle != RuntimeLifecycleState::Active {
+        if matches!(
+            lifecycle,
+            RuntimeLifecycleState::Deleting | RuntimeLifecycleState::ShuttingDown
+        ) {
             return AgentHealthAction::Keep;
         }
         if agent_type != AgentType::Acp || !outcome.terminal.is_error() {
@@ -45,11 +48,11 @@ mod tests {
 
     fn error_outcome(code: Option<AgentErrorCode>) -> RelayOutcome {
         RelayOutcome {
-            system_responses: Vec::new(),
             terminal: RelayTerminal::Error {
                 code,
                 retryable: Some(true),
             },
+            ..RelayOutcome::default()
         }
     }
 
@@ -98,13 +101,25 @@ mod tests {
     #[test]
     fn channel_closed_does_not_evict_by_default() {
         let outcome = RelayOutcome {
-            system_responses: Vec::new(),
             terminal: RelayTerminal::ChannelClosed,
+            ..RelayOutcome::default()
         };
         assert_eq!(
             AgentHealthPolicy::decide(AgentType::Acp, &outcome, RuntimeLifecycleState::Active),
             AgentHealthAction::Keep
         );
+    }
+
+    #[test]
+    fn cancelling_acp_terminal_error_evicts_task() {
+        let outcome = error_outcome(Some(AgentErrorCode::UnknownUpstreamError));
+        assert!(matches!(
+            AgentHealthPolicy::decide(AgentType::Acp, &outcome, RuntimeLifecycleState::Cancelling),
+            AgentHealthAction::EvictAcpTask {
+                clear_model_seed: false,
+                ..
+            }
+        ));
     }
 
     #[test]

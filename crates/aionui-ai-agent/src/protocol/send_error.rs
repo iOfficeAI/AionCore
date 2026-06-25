@@ -217,6 +217,10 @@ impl AgentSendError {
         self.stream_error
     }
 
+    pub fn from_stream_error_data(stream_error: AgentStreamErrorData) -> Self {
+        Self { stream_error }
+    }
+
     pub fn code(&self) -> Option<AgentErrorCode> {
         self.stream_error.code
     }

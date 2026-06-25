@@ -4,6 +4,7 @@
 mod agent_binding;
 mod database;
 mod error;
+mod legacy_handoff;
 pub mod models;
 mod repository;
 
@@ -24,7 +25,8 @@ pub use models::{
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, MessageRowUpdate, MessageSearchRow, SortOrder,
+    ConversationFilters, ConversationRowUpdate, MessagePageCursor, MessagePageDirection, MessagePageParams,
+    MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
 pub use repository::cron::UpdateCronJobParams;
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};

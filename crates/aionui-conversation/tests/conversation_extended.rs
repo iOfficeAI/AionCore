@@ -222,7 +222,10 @@ async fn t7_1_reset_clears_messages_and_status() {
         .await
         .unwrap();
     assert!(messages.items.is_empty());
-    assert_eq!(messages.total, 0);
+    assert!(messages.oldest_cursor.is_none());
+    assert!(messages.newest_cursor.is_none());
+    assert!(!messages.has_more_before);
+    assert!(!messages.has_more_after);
 }
 
 #[tokio::test]
@@ -244,11 +247,14 @@ async fn t8_1_empty_messages() {
         .await
         .unwrap();
     assert!(result.items.is_empty());
-    assert_eq!(result.total, 0);
+    assert!(result.oldest_cursor.is_none());
+    assert!(result.newest_cursor.is_none());
+    assert!(!result.has_more_before);
+    assert!(!result.has_more_after);
 }
 
 #[tokio::test]
-async fn t8_2_pagination() {
+async fn t8_2_cursor_pagination() {
     let (svc, repo, _b) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
@@ -259,15 +265,32 @@ async fn t8_2_pagination() {
     }
 
     let query = ListMessagesQuery {
-        page: Some(1),
-        page_size: Some(3),
-        order: None,
+        limit: Some(3),
         content_mode: None,
+        ..Default::default()
     };
     let result = svc.list_messages(USER_ID, &conv.id, query).await.unwrap();
     assert_eq!(result.items.len(), 3);
-    assert_eq!(result.total, 10);
-    assert!(result.has_more);
+    assert!(result.oldest_cursor.is_some());
+    assert!(result.newest_cursor.is_some());
+    assert!(result.has_more_before);
+    assert!(!result.has_more_after);
+
+    let older = svc
+        .list_messages(
+            USER_ID,
+            &conv.id,
+            ListMessagesQuery {
+                limit: Some(3),
+                before: result.oldest_cursor.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(older.items.len(), 3);
+    assert!(older.has_more_before);
+    assert!(older.has_more_after);
 }
 
 #[tokio::test]
@@ -285,7 +308,7 @@ async fn t8_3_asc_order_default() {
         .list_messages(USER_ID, &conv.id, ListMessagesQuery::default())
         .await
         .unwrap();
-    // ASC (default): oldest first
+    // Latest page is returned in ascending display order.
     assert!(result.items[0].created_at <= result.items[1].created_at);
     assert!(result.items[1].created_at <= result.items[2].created_at);
 }
@@ -301,11 +324,10 @@ async fn t8_4_asc_order() {
             .unwrap();
     }
 
-    let query = ListMessagesQuery {
-        order: Some("ASC".into()),
-        ..Default::default()
-    };
-    let result = svc.list_messages(USER_ID, &conv.id, query).await.unwrap();
+    let result = svc
+        .list_messages(USER_ID, &conv.id, ListMessagesQuery::default())
+        .await
+        .unwrap();
     assert!(result.items[0].created_at <= result.items[1].created_at);
     assert!(result.items[1].created_at <= result.items[2].created_at);
 }
@@ -318,6 +340,105 @@ async fn t8_5_conversation_not_found() {
         .await
         .unwrap_err();
     assert!(matches!(err, ConversationError::NotFound { .. }));
+}
+
+#[tokio::test]
+async fn t8_6_rejects_before_and_after_together() {
+    let (svc, _repo, _b) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let err = svc
+        .list_messages(
+            USER_ID,
+            &conv.id,
+            ListMessagesQuery {
+                before: Some("v1.bad".into()),
+                after: Some("v1.bad".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ConversationError::BadRequest { reason } if reason == "before, after, and anchor_message_id are mutually exclusive")
+    );
+}
+
+#[tokio::test]
+async fn t8_7_rejects_anchor_with_cursor() {
+    let (svc, _repo, _b) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let err = svc
+        .list_messages(
+            USER_ID,
+            &conv.id,
+            ListMessagesQuery {
+                before: Some("v1.bad".into()),
+                anchor_message_id: Some("msg-1".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ConversationError::BadRequest { reason } if reason == "before, after, and anchor_message_id are mutually exclusive")
+    );
+}
+
+#[tokio::test]
+async fn t8_8_rejects_invalid_cursor() {
+    let (svc, _repo, _b) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let err = svc
+        .list_messages(
+            USER_ID,
+            &conv.id,
+            ListMessagesQuery {
+                before: Some("not-a-cursor".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ConversationError::BadRequest { reason } if reason == "invalid message cursor"));
+}
+
+#[tokio::test]
+async fn t8_9_anchor_returns_window_containing_target() {
+    let (svc, repo, _b) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+    let mut target_id = String::new();
+
+    for i in 0..7 {
+        let msg = make_message(&conv.id, &format!("msg {i}"), i * 100);
+        if i == 3 {
+            target_id = msg.id.clone();
+        }
+        repo.insert_message(&msg).await.unwrap();
+    }
+
+    let page = svc
+        .list_messages(
+            USER_ID,
+            &conv.id,
+            ListMessagesQuery {
+                limit: Some(5),
+                anchor_message_id: Some(target_id.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(page.items.len(), 5);
+    assert!(page.items.iter().any(|item| item.id == target_id));
+    assert!(page.has_more_before);
+    assert!(page.has_more_after);
 }
 
 // ── T9: Message search ─────────────────────────────────────────────
