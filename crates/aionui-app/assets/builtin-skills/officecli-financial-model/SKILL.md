@@ -36,7 +36,7 @@ Verify with `officecli --version` (open a new terminal if PATH hasn't picked up)
 
 ## Help-First Rule
 
-This skill teaches what a financial model requires, not every CLI flag. When a prop name / alias / enum is uncertain, consult help BEFORE guessing: `officecli help xlsx [element] [--json]`. Help is pinned to installed version — when this skill and help disagree, **help wins**. Every `--prop X=` below was verified against `officecli help xlsx <element>` on v1.0.63.
+This skill teaches what a financial model requires, not every CLI flag. When a prop name / alias / enum is uncertain, consult help BEFORE guessing: `officecli help xlsx [element] [--json]`. Help is authoritative for the installed version — when this skill and help disagree, **help wins**. Every `--prop X=` below was verified against `officecli help xlsx <element>`.
 
 ## Mental Model & Inheritance
 
@@ -55,7 +55,7 @@ A financial model is an xlsx with a **decision-grade, formula-driven layer**: ev
 3. **Statements balance every period.** `Assets − Liab − Equity = 0`, `CF.EndingCash = BS.Cash`. Gate 4 fails on `IMBALANCED`.
 4. **Hardcodes audited.** Calc sheets carry zero hardcoded numbers; Gate 6 counts.
 5. **Sensitivity / scenario is first-class.** 2-axis grid, dropdown `INDEX/MATCH` switch, or Base/Upside/Downside cols. Excel Data Tables not reliably supported — manual grids only.
-6. **Cached values on valuation cells load-bearing.** NPV / IRR / XNPV caching `0` ships a wrong number to non-recalculating readers. Gate 5 spot-checks.
+6. **Cached values on valuation cells load-bearing.** A valuation cell that ships with no cached result (or the `#OCLI_NOTEVAL!` sentinel) sends a blank/wrong number to non-recalculating readers. The evaluator now computes NPV / XNPV / IRR / XIRR; verify the cached value with a readback. Gate 5 spot-checks.
 7. **Circularity is a design choice.** Legitimate rings (interest ↔ cash, revolver plug ↔ ending cash) use `calc.iterate=true`. Accidental circularity is broken algebra — never papered with `iterate`.
 8. **Named ranges for ≥ 3-use assumptions.** `WACC`, `TaxRate`, `TerminalGrowth`, `ExitMultiple`, `ChurnRate`. Declared-unused names are dead decoration — Gate 6 flags.
 
@@ -78,7 +78,7 @@ Every model in this skill builds on three zones. **Name them, tab-color them, an
 **Executable zone audit** (run before Gate 4):
 
 ```bash
-# Calc zone: zero numeric hardcodes allowed. NOTE: `:not(:has(formula))` pseudo doesn't filter on v1.0.63+ — filter via jq on .format.formula == null.
+# Calc zone: zero numeric hardcodes allowed. `cell:not(:has(formula))` selects the literal (non-formula) cells; `cell:has(formula)` selects the formula cells.
 HARDCODE=$(officecli query "$FILE" 'cell[type=Number]' --json | jq '[.data.results[] | select(.format.formula == null) | select(.path | test("/(P&L|Balance Sheet|Cash Flow|DCF|Debt|ARR)/"))] | length')
 [ "$HARDCODE" -eq 0 ] && echo "Zone audit OK" || { echo "REJECT: $HARDCODE hardcoded numeric cells on Calc sheets — move to Assumptions"; exit 1; }
 # Assumptions zone: should be non-zero.
@@ -110,7 +110,7 @@ Three facts cause silent wrong numbers: (1) new formulas ship without cached val
 **Discipline (every recipe):**
 - Build order follows the data chain: `P&L → BS → CF` (3-statement); `FCF → WACC → NPV → Sensitivity` (DCF); `S&U → Debt → P&L → CF → Returns` (LBO).
 - After the cross-sheet chain, **cache-refresh pass:** re-issue `set` on every summary / valuation / balance-check cell, non-resident.
-- Spot-check: `officecli get "$FILE" /Summary/B2 --json | jq .format.cachedValue` returns non-zero non-null. `null` ≠ `0`: `null` means Excel will compute on open (OK for delivery); `0` is a cached lie. If `0` persists: close residents, re-set; still `0` → cache-fallback (§Financial function patterns).
+- Spot-check: `officecli get "$FILE" /Summary/B2 --json | jq '.data.results[0].format.cachedValue'` returns a plausible non-null value. `null` means Excel will compute on open (OK for delivery). If a cell shows the `#OCLI_NOTEVAL!` sentinel: close residents, re-set; still unevaluated → cache-fallback (§Financial function patterns).
 
 ## Recipes — three model types
 
@@ -194,12 +194,12 @@ officecli add "$FILE" /Summary --type chart --prop chartType=area --prop dataRan
 **Verification (run all three):**
 
 ```bash
-# Balance check every period must say OK
-officecli get "$FILE" "/Balance Sheet/B18:E18" --json | jq '.data[].cachedValue // .data[].value'
+# Balance check every period must say OK (range get → cells under .data.results[0].children[])
+officecli get "$FILE" "/Balance Sheet/B18:E18" --json | jq '.data.results[0].children[] | .format.cachedValue // .text'
 # Cash recon every period must say OK
-officecli get "$FILE" "/Cash Flow/B21:E21" --json | jq '.data[].cachedValue // .data[].value'
-# Summary KPIs are plausible numbers, not 0 or null
-officecli get "$FILE" "/Summary/B2:B5" --json | jq '.data[].cachedValue'
+officecli get "$FILE" "/Cash Flow/B21:E21" --json | jq '.data.results[0].children[] | .format.cachedValue // .text'
+# Summary KPIs are plausible numbers, not null
+officecli get "$FILE" "/Summary/B2:B5" --json | jq '.data.results[0].children[].format.cachedValue'
 ```
 
 ### Recipe B — DCF valuation
@@ -249,7 +249,7 @@ cat <<'EOF' | officecli batch "$FILE"
 EOF
 ```
 
-**Why `SUMPRODUCT` not `NPV`.** `NPV(rate, cross_sheet_range)` silently caches `0` on v1.0.63 — ships a wrong valuation to any non-recalculating reader. `SUMPRODUCT(values/(1+rate)^periods)` is algebraically equivalent and caches correctly (period row `FCF!B2:K2 = 1..10` is a one-time setup). For irregular dates (`XNPV`), use `SUMPRODUCT(values/(1+rate)^((dates-base_date)/365))`. See §Known Issues.
+**`NPV` vs `SUMPRODUCT` — both cache correctly.** The evaluator computes `NPV(rate, cross_sheet_range)` and caches the right value (verify with a readback). `SUMPRODUCT(values/(1+rate)^periods)` is the algebraic equivalent (period row `FCF!B2:K2 = 1..10` is a one-time setup); it is shown here as an OPTIONAL audit-readability choice — the explicit discounting series is sometimes easier for a reviewer to trace, not a cache workaround. Either form is fine. For irregular dates, `XNPV(rate, values, dates)` likewise caches; the SUMPRODUCT equivalent is `SUMPRODUCT(values/(1+rate)^((dates-base_date)/365))`.
 
 **Step 5 — 2-axis sensitivity grid (WACC × g).** 5×5 grid. Rows = WACC values `7.5% ... 11.5%`, cols = `g` values `1.5% ... 3.5%`. Each cell = one self-contained formula re-running the DCF with the grid's WACC and g substituted. Template:
 
@@ -275,12 +275,12 @@ officecli add "$FILE" /Sensitivity --type conditionalformatting \
 **Verification.**
 
 ```bash
-officecli get "$FILE" "/DCF/C8" --json | jq .format.cachedValue   # equity value, plausible $
-officecli get "$FILE" "/DCF/C9" --json | jq .format.cachedValue   # per-share, in $XX.XX range
-officecli get "$FILE" "/Sensitivity/F17" --json | jq .format.cachedValue   # grid center cell, plausible
+officecli get "$FILE" "/DCF/C8" --json | jq '.data.results[0].format.cachedValue'   # equity value, plausible $
+officecli get "$FILE" "/DCF/C9" --json | jq '.data.results[0].format.cachedValue'   # per-share, in $XX.XX range
+officecli get "$FILE" "/Sensitivity/F17" --json | jq '.data.results[0].format.cachedValue'   # grid center cell, plausible
 ```
 
-If `C8` or `C9` cache `0`, re-set them (non-resident) — see §Build-order & cache-drift.
+If `C8` or `C9` come back `null` or show the `#OCLI_NOTEVAL!` sentinel, re-set them (non-resident) — see §Build-order & cache-drift.
 
 ### Recipe C — LBO model
 
@@ -303,8 +303,8 @@ Sources = Senior_TLB + Mezz + Revolver_drawn + Sponsor_equity
 officecli set "$FILE" /S&U/B12 --prop formula='IF(ABS(SUM(B4:B7)-SUM(B9:B11))<1,"BALANCED","S&U IMBALANCE: "&ROUND(SUM(B4:B7)-SUM(B9:B11),0))' --prop bold=true
 
 # Stated-vs-plug consistency (Gate 4 addendum; only run if you chose pattern (a)).
-STATED=$(officecli get "$FILE" /Assumptions/B12 --json | jq -r '.format.cachedValue // "null"')
-PLUGGED=$(officecli get "$FILE" /S&U/B10 --json | jq -r '.format.cachedValue // "null"')   # B10 = sponsor-equity row on S&U
+STATED=$(officecli get "$FILE" /Assumptions/B12 --json | jq -r '.data.results[0].format.cachedValue // "null"')
+PLUGGED=$(officecli get "$FILE" /S&U/B10 --json | jq -r '.data.results[0].format.cachedValue // "null"')   # B10 = sponsor-equity row on S&U
 DELTA=$(python3 -c "print(abs(float('$STATED') - float('$PLUGGED')))" 2>/dev/null || echo 99999)
 python3 -c "import sys; sys.exit(0 if float('$DELTA') <= 1 else 1)" && echo "S&U sponsor OK (stated=$STATED plug=$PLUGGED)" || { echo "REJECT Gate 4 S&U: stated $STATED ≠ plug $PLUGGED (Δ=$DELTA) — fees silently absorbed"; exit 1; }
 ```
@@ -369,7 +369,7 @@ officecli add "$FILE" /Returns --type comment --prop ref=B4 --prop text='IRR —
 ```
 
 **Callout — labels: `comment` element vs Notes column vs `formula` (three distinct mechanics).**
-- **Hover tooltip** → `officecli add ... --type comment --prop ref=<cell> --prop text='...'`. The **`comment` key is NOT a valid prop on `set cell`** (not in `officecli help xlsx cell` on v1.0.63) — it silently drops when embedded inside a `set cell` props dict. Use the dedicated element.
+- **Hover tooltip** → `officecli add ... --type comment --prop ref=<cell> --prop text='...'`. The **`comment` key is NOT a valid prop on `set cell`** (not in `officecli help xlsx cell`) — it silently drops when embedded inside a `set cell` props dict. Use the dedicated element.
 - **Visible text in an adjacent Notes column** → `{"command":"set","path":"/DCF/D3","props":{"value":"TV = FCF × (1+g) / (WACC−g)"}}` — **`value`, not `formula`**, plain quoted string.
 - **Formula-style prose written as a real formula** → NEVER. `{"formula":"FCF10*(1+g)/(WACC-g)"}` produces `#NAME?` in Excel (`FCF10`, `g`, `WACC` are unbound identifiers in that cell context).
 
@@ -380,9 +380,9 @@ For mid-year dividends or partial exits, use `XIRR({cashflows}, {dates})` instea
 **Verification.**
 
 ```bash
-officecli get "$FILE" /S&U/B12 --json | jq '.data.value // .data.cachedValue'   # must say BALANCED
-officecli get "$FILE" /Returns/B3 --json | jq .format.cachedValue                # MOIC, expect 2.0x-4.0x typical
-officecli get "$FILE" /Returns/B4 --json | jq .format.cachedValue                # IRR, expect 0.15-0.30 typical
+officecli get "$FILE" /S&U/B12 --json | jq '.data.results[0].format.cachedValue // .data.results[0].text'   # must say BALANCED
+officecli get "$FILE" /Returns/B3 --json | jq '.data.results[0].format.cachedValue'                # MOIC, expect 2.0x-4.0x typical
+officecli get "$FILE" /Returns/B4 --json | jq '.data.results[0].format.cachedValue'                # IRR, expect 0.15-0.30 typical
 # Iterate converged?
 officecli query "$FILE" 'cell:contains("#REF!")' --json | jq '.data.results | length'   # must be 0
 ```
@@ -426,13 +426,9 @@ Terse reference — not a finance textbook. If you don't know what these do, pau
 | `INDEX(range, MATCH(lookup, key, 0))` | `VLOOKUP` | Insert-safe (VLOOKUP breaks when a column is inserted in the source range) |
 | `IFERROR(x/y, 0)` or `IF(y=0, 0, x/y)` | bare division | Guard every `/` in a financial model — `#DIV/0!` shipped = delivery failure |
 | `MIRR(values, financeRate, reinvestRate)` | `IRR` with sign flips | When cash-flow pattern has 2+ sign changes |
-| `SUMIFS(sumRange, criteriaRange1, criterion1, ...)` | `SUMPRODUCT((...))` array | Avoids the cached-value trap on array formulas (→ xlsx v2 §Common Workflow Step 5 array-formula fallback) |
+| `SUMIFS(sumRange, criteriaRange1, criterion1, ...)` | `SUMPRODUCT((...))` array | Clearer intent for conditional sums; either evaluates correctly |
 
-**`SUMPRODUCT(1/COUNTIF(...))` distinct-count trap.** The CLI engine caches the inner division per-row → `1/N` (e.g. `0.001543`) rather than the true distinct count. `SUMPRODUCT(--((range<>"")/COUNTIF(range,range&"")))` pattern is likewise affected. **Fallback (from xlsx v2):** hardcode the correct distinct count with a blue font + adjacent comment `"hardcoded distinct count; update if rows change"`, and disclose at delivery. LBO deal-count or portfolio headcount from a transactions list is the typical pattern that hits this.
-
-**Cross-sheet `NPV()` / `XNPV()` cache-0 fallback (preferred).** When the engine caches `0` on a cross-sheet `NPV()` / `XNPV()`, replace the formula with its algebraic equivalent `SUMPRODUCT(values/(1+rate)^periods)` — same result, caches correctly, audits cleanly. This is the first-line fix, used in Recipe B Step 4 by default. For `XNPV`, the period exponent is `(dates - base_date) / 365`.
-
-**Cache fallback on `IRR` / `MOIC` / summary KPI cells (last resort).** If a valuation cell still ships with `cachedValue = 0` after algebraic rewrite + re-set after close, hardcode the computed value with a blue font and add a classic comment via `officecli add "$FILE" /Sheet --type comment --prop ref=<cell> --prop text='cached valuation; refreshes on open in Excel — do not edit'`. Disclose in delivery notes. Prefer re-set after close first.
+**Evaluator coverage — verify, don't preemptively hardcode.** The CLI evaluator computes the finance functions this skill uses — `NPV` / `XNPV` / `IRR` / `XIRR`, array-literal formulas (`IRR({...})`), and `SUMPRODUCT(1/COUNTIF(range,range))` distinct-count — and caches the correct value with `evaluated:true`. There is no `NPV→0` rewrite obligation and no distinct-count `1/N` trap. The honest rule: build the formula you mean, then verify the cached value with a readback (`get ... --json | jq '.data.results[0].format.cachedValue'`). Only if a specific cell genuinely comes back with the `#OCLI_NOTEVAL!` sentinel (formula written before its inputs, or an unsupported function) should you fall back — first re-set non-resident after `close`; if it still won't evaluate, hardcode the computed value with a blue font and a classic comment via `officecli add "$FILE" /Sheet --type comment --prop ref=<cell> --prop text='cached valuation; refreshes on open in Excel — do not edit'`, and disclose in delivery notes.
 
 ## Circular references & iterative calc
 
@@ -453,17 +449,17 @@ officecli set "$FILE" / --prop calc.iterate=true --prop calc.iterateCount=100 --
 2. **Write downstream** — build all non-circular chains (P&L, CF, Exit, Returns, Summary, grid) non-resident, one heredoc per sheet. Everything caches against the zeroed cells.
 3. **Re-ring** — close all residents, re-set each circular cell with its real formula, one `set` per cell, non-resident.
 
-**Acceptance.** `get /Debt/C7 --json | jq .format.cachedValue` returns non-zero non-null. If a cell still deadlocks, leave `=0` + classic comment `"circular; recalculates in Excel on F9"`, flag at delivery. Never paper over with `iterateCount=1000`.
+**Acceptance.** `get /Debt/C7 --json | jq '.data.results[0].format.cachedValue'` returns non-zero non-null. If a cell still deadlocks, leave `=0` + classic comment `"circular; recalculates in Excel on F9"`, flag at delivery. Never paper over with `iterateCount=1000`.
 
 **Do NOT use `iterate` as a band-aid for `#REF!` / divergent values.** Raising `iterateCount` to 1000 hides the bug and ships a plausibly-wrong value; `validate` does not catch it. Break the loop algebraically (e.g. interest on opening balance only, not average).
 
 **Verify convergence.** Read the loop cell, bump a driving assumption and back, re-read — values must match:
 
 ```bash
-V1=$(officecli get "$FILE" /Debt/C9 --json | jq .format.cachedValue)
+V1=$(officecli get "$FILE" /Debt/C9 --json | jq '.data.results[0].format.cachedValue')
 officecli set "$FILE" /Assumptions/B31 --prop value=0.085
 officecli set "$FILE" /Assumptions/B31 --prop value=0.0845
-V2=$(officecli get "$FILE" /Debt/C9 --json | jq .format.cachedValue)
+V2=$(officecli get "$FILE" /Debt/C9 --json | jq '.data.results[0].format.cachedValue')
 [ "$V1" = "$V2" ] && echo "Iterate converged" || echo "WARN: drift V1=$V1 V2=$V2 — tighten iterateDelta or check algebra"
 ```
 
@@ -494,14 +490,14 @@ If any fail, the model is silently wrong — fix the upstream chain before deliv
 
 ### Gate 5 — cached-value sanity on valuation cells
 
-NPV / IRR / XIRR / equity-bridge / MOIC / summary KPI cells cached `0` = wrong number shipped to a reader who does not recalc on open. List every valuation cell and check `cachedValue`:
+NPV / IRR / XIRR / equity-bridge / MOIC / summary KPI cells that ship unevaluated (`#OCLI_NOTEVAL!` sentinel, typically because the formula was written before its inputs) send a blank/wrong number to a reader who does not recalc on open. List every valuation cell and confirm a cached value is present:
 
 ```bash
 # Customize the path list per recipe — this is the DCF example
 for P in "/DCF/C4" "/DCF/C5" "/DCF/C6" "/DCF/C8" "/DCF/C9"; do
-  V=$(officecli get "$FILE" "$P" --json | jq -r '.format.cachedValue // "null"')
-  if [ "$V" = "0" ] || [ "$V" = "null" ]; then
-    echo "REJECT Gate 5: $P cached $V — re-set after close (see §Build-order & cache-drift)"; exit 1
+  V=$(officecli get "$FILE" "$P" --json | jq -r '.data.results[0].format.cachedValue // "null"')
+  if [ "$V" = "null" ] || [ "${V#\#OCLI_NOTEVAL}" != "$V" ]; then
+    echo "REJECT Gate 5: $P unevaluated (cached=$V) — re-set after close (see §Build-order & cache-drift)"; exit 1
   fi
   echo "Gate 5 $P: cached=$V OK"
 done
@@ -514,16 +510,19 @@ For LBO, extend the list: `/Exit/B5`, `/Returns/B3`, `/Returns/B4`. For 3-statem
 Every Calc sheet has zero numeric hardcodes. Executable:
 
 ```bash
-HARDCODE=$(officecli query "$FILE" 'cell[type=Number]:not(:has(formula))' --json \
-  | jq '[.data.results[] | select(.path | test("/(P&L|Balance Sheet|Cash Flow|DCF|Debt|FCF|WACC|Exit|Returns)/"))] | length')
+# `cell:not(:has(formula))` selects the literal cells (and `cell:has(formula)` the formula cells).
+HARDCODE=$(officecli query "$FILE" 'cell[type=Number]' --json \
+  | jq '[.data.results[] | select(.format.formula == null) | select(.path | test("/(P&L|Balance Sheet|Cash Flow|DCF|Debt|FCF|WACC|Exit|Returns)/"))] | length')
 [ "$HARDCODE" -eq 0 ] && echo "Gate 6 OK (no hardcodes on Calc sheets)" || { echo "REJECT Gate 6: $HARDCODE hardcoded numeric cells on Calc zone — move to Assumptions"; exit 1; }
 
 # Named-range coverage + dead-decoration audit: ≥3 ranges declared AND each referenced by ≥1 formula.
 NR=$(officecli query "$FILE" namedrange --json | jq '.data.results | length')
 [ "$NR" -ge 3 ] && echo "Gate 6 OK ($NR named ranges)" || echo "WARN Gate 6: only $NR named ranges"
 DEAD=0
-for NR_NAME in $(officecli query "$FILE" namedrange --json | jq -r '.data.results[].name'); do
-  USES=$(officecli query "$FILE" "cell:has(formula):contains(\"$NR_NAME\")" --json | jq '.data.results | length')
+for NR_NAME in $(officecli query "$FILE" namedrange --json | jq -r '.data.results[].format.name'); do
+  # Match the formula SOURCE (`formula~=`), not the cached/displayed RESULT — `:contains` would scan
+  # the computed value and report every name as dead (false reject).
+  USES=$(officecli query "$FILE" "cell[formula~=$NR_NAME]" --json | jq '.data.results | length')
   [ "$USES" -ge 1 ] && echo "  $NR_NAME: $USES uses OK" || { echo "  WARN: $NR_NAME unused"; DEAD=$((DEAD+1)); }
 done
 [ "$DEAD" -eq 0 ] && echo "Gate 6 named-range audit OK" || { echo "REJECT Gate 6: $DEAD dead-decoration name(s)"; exit 1; }
@@ -565,8 +564,8 @@ Financial-model-specific:
 - **Iterative calc silent non-convergence.** `calc.iterate=true iterateCount=100` converges at whatever the cap lands on — even if the true answer is 2× that. Always run convergence verify (§Circular references). Complex LBO rings (multi-tranche debt + sweep + tax shield) may not converge; when `cachedValue=0` on a ring cell, use §Write-order surgery.
 - **Batch-while-resident deadlock on circular writes.** Writing the closing leg of a cross-sheet ring via `batch` with a resident open deadlocks at 100% CPU. Even single `set` on a ring cell can hang. Fix: close residents, write the ring in two passes per §Write-order surgery. Non-resident single-heredoc is the only safe form.
 - **Cross-sheet cached value stale in `view html`.** Downstream written in the same sequence as upstream caches `0`. Excel resolves on open; HTML preview does NOT. Re-set every downstream non-resident after the chain (§Build-order & cache-drift).
-- **`NPV()` / `XNPV()` cross-sheet caches `0` on v1.0.63.** Rewrite as `SUMPRODUCT(values/(1+rate)^periods)` — algebraically equivalent, caches correctly. Applied by default in Recipe B Step 4.
-- **Sensitivity-grid cache trap.** Grid built before FCF/WACC → every cell caches `0`. Build FCF + WACC + DCF first, then grid in a separate non-resident batch. Fallback: hardcode blue + comment `"hardcoded sensitivity; refresh on assumption change"`.
+- **`NPV()` / `XNPV()` evaluate and cache correctly.** The evaluator computes both (same-sheet and cross-sheet); no rewrite is required. `SUMPRODUCT(values/(1+rate)^periods)` remains an optional audit-readability alternative, not a cache workaround.
+- **Sensitivity-grid build order still matters.** A grid cell written before its FCF/WACC inputs exist evaluates against empty inputs and may cache a wrong/blank value. Build FCF + WACC + DCF first, then the grid in a separate non-resident batch, and verify (`jq '.data.results[0].format.cachedValue'`). This is an ordering discipline, not an evaluator limitation.
 - **`BS.Cash` = CF ending cash always** (including Y1: `BS.Cash = 'Cash Flow'!B19`). Never an independent plug or Assumptions ref — a plugged `BS.Cash` hides balance errors.
 - **Year 2+ `Opening Cash` = prior period `Ending Cash`** (`C17=B19`, `D17=C19`). Independent Y2+ opening-cash inputs silently drift from BS.
 - **Waterfall chart "total" bars.** `chartType=waterfall` cannot mark total programmatically — use `colors=` convention (dark = total, medium = positive, red = negative). See `help xlsx chart`.

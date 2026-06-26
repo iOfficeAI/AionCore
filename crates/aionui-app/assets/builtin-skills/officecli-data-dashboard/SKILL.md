@@ -43,7 +43,7 @@ officecli help xlsx sparkline                # sparklines
 officecli help xlsx conditionalformatting    # all CF rule types
 ```
 
-Help reflects the installed CLI version. When this skill and help disagree, **help wins**. DeferredAddKeys (`preset`, `referenceline`, `trendline`, `axisNumFmt`, `holesize`, `combosplit`) work on `add` only — see Reference.
+Help reflects the installed CLI version. When this skill and help disagree, **help wins**. DeferredAddKeys (`combosplit`, `holesize`) work on `add` only — see Reference.
 
 ## Mental Model & Inheritance
 
@@ -199,7 +199,7 @@ Options, not templates. The user's data and audience drive the choices.
 | Comparison across categories in time order | `column` | Not `bar` — horizontal bars break left-to-right time reading |
 | Part-of-whole breakdown | `doughnut` | Prefer over `pie`: `chartType=pie` has a known LibreOffice blank-render regression |
 | Budget vs actual | `combo` with `combosplit=1` | First series as bars, rest as lines |
-| Correlation | `scatter` | Uses `series1.xValues`, NOT `series1.categories` |
+| Correlation | `scatter` | X-axis via `categories` / `series1.categories` — `series1.xValues` is UNSUPPORTED |
 
 ### Preset options
 
@@ -211,10 +211,10 @@ Four CF rule types; each uses `--type <shorthand>` at `add` time:
 
 | Intent | `--type` | Typical props |
 |---|---|---|
-| Magnitude bar (sales, spend) | `databar` | `sqref=B2:B13 color=4472C4 min=0 max=<plausible>` — always set explicit `min`/`max`; defaults emit invalid XML |
+| Magnitude bar (sales, spend) | `databar` | `sqref=B2:B13 color=4472C4` — explicit `min=0 max=<plausible>` recommended for predictable scaling, but omitting them is valid (defaults to data min/max) |
 | Heat map (rates, growth) | `colorscale` | `sqref=D2:D13 mincolor=FFCDD2 midcolor=FFFFFF maxcolor=C8E6C9` |
 | Status indicator | `iconset` | `sqref=E2:E13 iconset=3Arrows` — see help for the full enum |
-| Custom business rule | `formulacf` | `sqref=B2:B13 'formula=$B2>=100000' fill=C8E6C9 font.color=2E7D32` — NEVER `font.bold` (schema rejects `<b>`) |
+| Custom business rule | `formulacf` | `sqref=B2:B13 'formula=$B2>=100000' fill=C8E6C9 font.color=2E7D32` — `font.bold` works on CF too |
 
 Semantic colors to stay consistent within a dashboard:
 
@@ -230,7 +230,7 @@ A card is a label cell + a value cell. The label is small gray (font.size=9, fon
 
 At the `dashboard` preset's default title font, the chart plot-box width (in column units) must stay ahead of the title string, or the title clips mid-word. Rule of thumb: `chart.width ≥ ceil(title.length × 0.18)`. A 35-character title ("Department: Year-End Headcount vs Attrition Rate") needs `width ≥ 7`; be safer and use 10–12. If the anchor cannot be widened, shorten the title to ≤ 25 characters — clipped titles in a board-ready deliverable are indefensible.
 
-`officecli get chart[N]` does not expose numeric `width` on 1.0.63 — it returns `.data.format.anchor` (e.g. `"A6:K21"`). Derive column span from letters (A→K = 10 cols) for Gate 2.
+`officecli get chart[N]` exposes numeric `width` (e.g. `width=480pt`) alongside `anchor` (e.g. `"A6:K21"`) at `.data.results[0].format`. Either is usable for Gate 2 — derive column span from anchor letters (A→K = 10 cols) when you need a column-unit budget.
 
 ### Print-ready delivery (board-pack / investor-send / one-pager)
 
@@ -276,9 +276,9 @@ CHART_COUNT=$(officecli query "$FILE" chart --json | jq '.data.results | length'
 col_num () { local c=$1 n=0; for ((k=0;k<${#c};k++)); do n=$((n*26+$(printf '%d' "'${c:$k:1}")-64)); done; echo "$n"; }
 for i in $(seq 1 "$CHART_COUNT"); do
   JSON=$(officecli get "$FILE" "/Dashboard/chart[$i]" --json)
-  SC=$(echo "$JSON" | jq -r '.data.format.seriesCount // 0')
-  TITLE=$(echo "$JSON" | jq -r '.data.format.title // ""')
-  ANCHOR=$(echo "$JSON" | jq -r '.data.format.anchor // ""')
+  SC=$(echo "$JSON" | jq -r '.data.results[0].format.seriesCount // 0')
+  TITLE=$(echo "$JSON" | jq -r '.data.results[0].format.title // ""')
+  ANCHOR=$(echo "$JSON" | jq -r '.data.results[0].format.anchor // ""')
   [ "$SC" = "0" ] || [ -z "$TITLE" ] && { echo "REJECT Gate 2: chart[$i] seriesCount=$SC title='$TITLE'"; exit 1; }
   [ -z "$ANCHOR" ] && continue
   LCOL=$(echo "${ANCHOR%%:*}" | sed 's/[0-9]*$//'); RCOL=$(echo "${ANCHOR##*:}" | sed 's/[0-9]*$//')
@@ -294,7 +294,7 @@ Narrower titles at preset `minimal` / `magazine` may clip earlier than the 0.18 
 
 ```bash
 for i in $(seq 1 "$CHART_COUNT"); do
-  BAD=$(officecli get "$FILE" "/Dashboard/chart[$i]" --json | jq '[.data.children[]? | select(.type == "series") | select((.format.name // "") | test("^Series[0-9]+$"; "i"))] | length')
+  BAD=$(officecli get "$FILE" "/Dashboard/chart[$i]" --json | jq '[.data.results[0].children[]? | select(.type == "series") | select((.format.name // "") | test("^Series[0-9]+$"; "i"))] | length')
   [ "$BAD" -gt 0 ] && { echo "REJECT Gate 3: chart[$i] has $BAD auto-named series"; exit 1; }
 done
 ```
@@ -312,8 +312,8 @@ Note: `query conditionalformatting` is the canonical element name; `query cf` re
 
 ```bash
 DASH_IDX=$(officecli query "$FILE" sheet --json | jq '[.data.results[].path] | index("/Dashboard")')
-ACTIVE=$(officecli get "$FILE" /workbook --json | jq '.data.format.activeTab // -1')
-FULLCALC=$(officecli get "$FILE" /workbook --json | jq -r '.data.format["calc.fullCalcOnLoad"] // false')
+ACTIVE=$(officecli get "$FILE" /workbook --json | jq '.data.results[0].format.activeTab // -1')
+FULLCALC=$(officecli get "$FILE" /workbook --json | jq -r '.data.results[0].format["calc.fullCalcOnLoad"] // false')
 [ "$ACTIVE" != "$DASH_IDX" ] && { echo "REJECT Gate 5: activeTab=$ACTIVE Dashboard=$DASH_IDX"; exit 1; }
 [ "$FULLCALC" != "true" ] && { echo "REJECT Gate 5: calc.fullCalcOnLoad=$FULLCALC — stale caches will ship"; exit 1; }
 ```
@@ -341,8 +341,8 @@ If `view html` is blocked (renderer conflict, headless, port busy), Gate 7 is st
 officecli view "$FILE" text 2>/dev/null | grep -nE '###|\{\{|<TODO>|\$fy\$|xxxx' && { echo "REJECT Gate 7: tokens or ### present"; exit 1; }
 # b) Per-KPI: cachedValue length × coef must fit col width. coef=0.55 fit-to-page, 0.85 otherwise.
 for CELL in A2 C2 E2 G2; do
-  CV=$(officecli get "$FILE" "/Dashboard/$CELL" --json | jq -r '.data.format.cachedValue // .data.text // ""')
-  W=$(officecli get "$FILE" "/Dashboard/col[${CELL%%[0-9]*}]" --json | jq -r '.data.format.width // 0')
+  CV=$(officecli get "$FILE" "/Dashboard/$CELL" --json | jq -r '.data.results[0].format.cachedValue // .data.results[0].text // ""')
+  W=$(officecli get "$FILE" "/Dashboard/col[${CELL%%[0-9]*}]" --json | jq -r '.data.results[0].format.width // 0')
   CAP=$(echo "$W * 0.55" | bc -l | awk '{print int($1)}')
   [ "${#CV}" -gt "$CAP" ] && { echo "REJECT Gate 7: $CELL '$CV' (${#CV} chars) > cap $CAP"; exit 1; }
 done
@@ -356,8 +356,15 @@ If scene keywords include print / 一页 / board / 投资人 / 董事会, extend
 ```bash
 if echo "$USER_REQ" | grep -qiE 'print|一页|投资人|董事会|board'; then
   # Every non-Dashboard sheet must be hidden or veryHidden.
-  LEAKING=$(officecli query "$FILE" 'sheet' --json | jq -r '.data.results[] | select(.name != "Dashboard" and (.state // "visible") == "visible") | .name')
-  [ -n "$LEAKING" ] && { echo "REJECT Gate 7 print-scope: visible non-Dashboard sheet(s): $LEAKING — hide before delivery"; exit 1; }
+  # query sheet --json carries the name in .preview (no .name/.state); visibility lives in
+  # each sheet's own get .format.hidden (absent => visible), so iterate + probe per sheet.
+  LEAKING=""
+  while IFS=$'\t' read -r SPATH SNAME; do
+    [ "$SNAME" = "Dashboard" ] && continue
+    HIDDEN=$(officecli get "$FILE" "$SPATH" --json | jq -r '.data.results[0].format.hidden // false')
+    [ "$HIDDEN" != "true" ] && LEAKING="$LEAKING $SNAME"
+  done < <(officecli query "$FILE" 'sheet' --json | jq -r '.data.results[] | [.path, .preview] | @tsv')
+  [ -n "$LEAKING" ] && { echo "REJECT Gate 7 print-scope: visible non-Dashboard sheet(s):$LEAKING — hide before delivery"; exit 1; }
   # Dashboard must carry an explicit Print_Area named range.
   PA=$(officecli query "$FILE" 'namedrange[name="_xlnm.Print_Area"]' --json | jq '.data.results | length')
   [ "$PA" -ge 1 ] || { echo "REJECT Gate 7 print-scope: no _xlnm.Print_Area set"; exit 1; }
@@ -371,8 +378,8 @@ The user opens the file in their target viewer (Office / WPS / Numbers) for the 
 ```bash
 for CELL in A2 C2 E2 G2; do
   JSON=$(officecli get "$FILE" "/Dashboard/$CELL" --json)
-  [ -z "$(echo "$JSON" | jq -r '.data.format.formula // ""')" ] && continue
-  CV=$(echo "$JSON" | jq -r '.data.format.cachedValue // ""')
+  [ -z "$(echo "$JSON" | jq -r '.data.results[0].format.formula // ""')" ] && continue
+  CV=$(echo "$JSON" | jq -r '.data.results[0].format.cachedValue // ""')
   case "$CV" in
     "" | "0" | "#DIV/0!" | "#REF!" | "#N/A" | "#VALUE!" | "#NAME?" | "null")
       echo "REJECT Gate 8: $CELL cachedValue='$CV' — re-issue formula or close+reopen"; exit 1 ;;
@@ -386,13 +393,13 @@ If anything fails, fix at source, re-run the full cycle.
 
 ### Honest limits
 
-Scatter's `series1.xValues` is not exposed in `get --json` (series `values=""`) — use chart-level `seriesCount`. LibreOffice chart color drift / pie-slice collapse / checkbox double-box are viewer artifacts — spot-check in Office / WPS / Numbers first.
+Scatter charts do not accept `series1.xValues` (UNSUPPORTED) — feed the x-axis via `categories` / `series1.categories`. LibreOffice chart color drift / pie-slice collapse / checkbox double-box are viewer artifacts — spot-check in Office / WPS / Numbers first.
 
 ## Reference
 
 - **Shorthand `--type` at `add`:** `chart`, `sparkline`, `databar`, `colorscale`, `iconset`, `formulacf`. CF rules map to `help xlsx conditionalformatting`; path suffix `/Sheet/cf[N]`.
 - **Full schemas live in help:** `officecli help xlsx chart` / `sparkline` / `conditionalformatting`. This skill does not mirror them.
-- **DeferredAddKeys (add-only, ignored on `set`):** `preset`, `trendline`, `referenceline`, `axisNumFmt`, `combosplit`, `holesize`. See D-1.
+- **DeferredAddKeys (add-only):** `combosplit`, `holesize`. See D-1. (`preset`, `trendline`, `referenceline`, `axisNumFmt` now work on `set` too — help shows `[add/set]`.)
 - **Build order:** charts + sparklines + CF + tabColors first → `calc.fullCalcOnLoad=true` via high-level `set` → `raw-set activeTab` **LAST** (after all sheets exist).
 
 ## Known Issues & Pitfalls
@@ -401,23 +408,23 @@ Scatter's `series1.xValues` is not exposed in `get --json` (series `values=""`) 
 
 | # | Issue | Mitigation |
 |---|---|---|
-| D-1 | `preset`, `referenceline`, `trendline`, `axisNumFmt` are DeferredAddKeys — work on `add` only, silently ignored on `set` | Include them at `add` time. Cannot apply after the fact — remove + re-add. |
+| D-1 | `combosplit` is a DeferredAddKey — works on `add` only. (`preset`, `referenceline`, `trendline`, `axisNumFmt` now apply on `set` too — help shows `[add/set]`.) | Set `combosplit` at `add` time; cannot apply after the fact — remove + re-add. The other four can be applied or changed post-creation via `set`. |
 | D-2 | `referenceline` format is `value:color:label:dash` (color BEFORE label). `"0:Break-Even:FF0000:dash"` fails `Invalid color value`. | Order is value, color, label, dash. |
-| D-3 | Scatter charts use `series1.xValues`, not `series1.categories`. `<cat>` inside `<scatterChart>` is schema-invalid. | `--prop series1.xValues="Sheet1!A2:A13"` |
-| D-4 | `formulacf` rejects `font.bold` (dxf/font schema disallows `<b>`). | Use `fill` + `font.color` only; bold is not available via CF. |
+| D-3 | Scatter charts do NOT accept `series1.xValues` (UNSUPPORTED). Feed the x-axis through `categories` / `series1.categories`. | `--prop series1.categories="Sheet1!A2:A13"` (or `--prop categories="Sheet1!A2:A13"`) |
+| D-4 | `formulacf` honors `font.bold` / `font.italic` (written to the dxf font and surfaced on readback), alongside `fill` and `font.color`. | Use any of `fill` / `font.color` / `font.bold` / `font.italic` to signal a CF rule. |
 | D-5 | Dashboard column widths default to 8.43 — KPI values at 24pt bold show `###` | Size by cachedValue bracket: 4–6 digits → 22–24; 7–9 digits (million) → 26–30; 10+ digits (亿 / billion) → 32–36; 百亿 / 10-digit + currency symbol + fit-to-page landscape → **40–44**. Formula `ceil((visible_chars+2)*1.3)` is a starting point; always verify via Gate 7 fallback b). Sparkline columns: 12. |
 | D-6 | `raw-set activeTab` must be the LAST mutation. Inserting before all sheets exist shifts indices. | Finish all sheets / charts / CF / sparklines / tabColors, then `raw-set`. |
 | D-7 | `calc.fullCalcOnLoad` via `raw-set` creates duplicate `<calcPr>` → validate fails | Use `officecli set "$FILE" / --prop calc.fullCalcOnLoad=true`. |
 | D-8 | LibreOffice does not evaluate hidden-column formulas at render → charts referencing hidden cells render blank | Aggregate into a visible Summary sheet, chart reads from Summary. Hide only columns that are not chart sources. |
-| D-9 | `chartType=pie` blank-renders in LibreOffice (v1.0.x) | Use `doughnut` as the safe substitute for part-of-whole breakdowns. |
+| D-9 | `chartType=pie` blank-renders in LibreOffice | Use `doughnut` as the safe substitute for part-of-whole breakdowns. |
 | D-10 | `SUMIFS` / `AVERAGEIFS` with date criteria fails silently if the criterion is a string | Wrap with `DATE()` or `DATEVALUE()`: `=SUMIFS(B2:B13,A2:A13,DATE(2025,1,5))`. |
 | D-11 | Summary sheet percentage formulas display as raw decimals (0.098) without `numFmt` | Set `numFmt="0.0%"` at the same `set` call as the formula. |
-| D-12 | `import --header` sets freeze + AutoFilter but does NOT set column widths; `numFmt` on a `col[]` path is rejected | Set widths on `col[]`; set `numFmt` on the cell range (`A2:A13`), not the column. |
+| D-12 | `import --header` sets freeze + AutoFilter but does NOT set column widths. | Set widths on `col[]`. `numFmt` on a `col[]` path now applies a column-level style (`<col s=...>`, schema-valid, reads back as `numberformat`); it formats blank cells in the column. Cells with their own style still need a per-cell-range `numFmt`. |
 | D-13 | Sparkline `highpoint` is a bool (highlight on/off), not a color. `--prop highpoint=FF0000` errors `Invalid boolean value` | `--prop highPoint=true --prop highMarkerColor=FF0000`. Same pattern for lowPoint / firstPoint / lastPoint and their *MarkerColor. |
 | D-14 | Sparkline cross-sectional data is meaningless (a region or department has no ordering) | Skip sparklines unless rows are a sequential time-series (dates, months, quarters). |
-| D-15 | 1.0.63+ rejects empty chart `add` (`Chart requires data`) at the CLI layer — legacy skills that relied on silent accept will fail here | Always provide `series1.values=` / `dataRange=` / inline `data=` at chart `add` time. Treat Gate 2 seriesCount check as a belt-and-braces verification. |
+| D-15 | Empty chart `add` is rejected (`Chart requires a 'data' property`) at the CLI layer — legacy skills that relied on silent accept will fail here | Always provide `series1.values=` / `dataRange=` / inline `data=` at chart `add` time. Treat Gate 2 seriesCount check as a belt-and-braces verification. |
 | D-16 | `fullCalcOnLoad=true` guarantees a **runtime** recalc when the end user opens the file; it does NOT refresh the build-time `cachedValue` in XML. Build sequence `set B=100 → set E==B+D → fix B=150` leaves `E.cachedValue` stale (board sees "Net Change = 0"). | After all upstream edits are final, re-issue every downstream formula (`officecli set "$FILE" /Sheet/E2 --prop formula==B2+D2`) OR `close` + re-open the file. Gate 8 verifies. |
-| D-17 | 1.0.63 built-in calc engine does NOT evaluate `SUMPRODUCT` with array-predicate form `SUMPRODUCT((A2:A97=X)*C2:C97*D2:D97)` — cachedValue stays `0`/`null`, Gate 8 rejects. Runtime Excel / WPS compute fine, but board-delivered XLSX with stale cache still ships `0`. | Rewrite as helper column + `SUMIF`: `F2==C2*D2` on source sheet, then `=SUMIF(B:B, "Region X", F:F)`. Or pre-aggregate in Summary sheet and chart from there. |
+| D-17 | The built-in calc engine does NOT evaluate `SUMPRODUCT` with array-predicate form `SUMPRODUCT((A2:A97=X)*C2:C97*D2:D97)` — cachedValue stays `0`/`null`, Gate 8 rejects. Runtime Excel / WPS compute fine, but board-delivered XLSX with stale cache still ships `0`. | Rewrite as helper column + `SUMIF`: `F2==C2*D2` on source sheet, then `=SUMIF(B:B, "Region X", F:F)`. Or pre-aggregate in Summary sheet and chart from there. |
 
 ### Inherited (pointer only)
 
