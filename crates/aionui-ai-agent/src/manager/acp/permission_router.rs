@@ -12,8 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info};
 
-const TEAM_GUIDE_MCP_SERVER_NAME: &str = "aionui-team-guide";
-const AUTO_APPROVE_MCP_SERVERS: &[&str] = &[TEAM_MCP_SERVER_NAME, TEAM_GUIDE_MCP_SERVER_NAME];
+const AUTO_APPROVE_MCP_SERVERS: &[&str] = &[TEAM_MCP_SERVER_NAME];
 
 struct PendingPermission {
     responder: oneshot::Sender<PermissionDecision>,
@@ -399,7 +398,7 @@ mod tests {
     #[test]
     fn auto_approve_selects_claude_allow_always_by_kind() {
         let request = permission_request_with_title_and_raw_input(
-            "mcp__aionui-team-guide__guide_write_plan",
+            "mcp__aionui-team__team_write_plan",
             None,
             vec![
                 allow_always_option("allow_always"),
@@ -411,6 +410,17 @@ mod tests {
         // `allow_always` is selected because it is the only AllowAlways option,
         // not because the option id has special meaning in AionCore.
         assert_eq!(auto_approve_option_id(&request).as_deref(), Some("allow_always"));
+    }
+
+    #[test]
+    fn auto_approve_ignores_removed_upgrade_server() {
+        let request = permission_request_with_title_and_raw_input(
+            concat!("mcp__aionui-team", "-guide__guide_write_plan"),
+            None,
+            vec![allow_always_option("allow_always"), reject_option("reject")],
+        );
+
+        assert_eq!(auto_approve_option_id(&request), None);
     }
 
     #[test]

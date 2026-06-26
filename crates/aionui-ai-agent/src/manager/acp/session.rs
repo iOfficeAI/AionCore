@@ -226,6 +226,10 @@ impl AcpSession {
         self.pending_session_new_prelude = true;
     }
 
+    pub fn has_pending_session_new_prelude(&self) -> bool {
+        self.pending_session_new_prelude
+    }
+
     /// Consume the prelude flag. Returns `true` exactly once after
     /// `mark_pending_session_new_prelude`; subsequent calls return `false`.
     pub fn take_pending_session_new_prelude(&mut self) -> bool {

@@ -1,19 +1,18 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, WebSocketMessage};
+use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest};
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
     ConversationService,
 };
 use aionui_db::IConversationRepository;
 use aionui_db::models::MessageRow;
-use aionui_realtime::EventBroadcaster;
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnStarted, AgentTurnStatus, TeamConversationAdoptRequest, TeamConversationBindingLookup,
-    TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationLookupPort,
-    TeamConversationProvisioningPort, TeamError, TeamProjectionMessageStore,
+    AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationCreateRequest,
+    TeamConversationCreateResult, TeamConversationLookupPort, TeamConversationProvisioningPort, TeamError,
+    TeamProjectionMessageStore,
 };
 use async_trait::async_trait;
 use tracing::info;
@@ -21,7 +20,6 @@ use tracing::info;
 pub struct TeamConversationAdapters {
     conversation_service: ConversationService,
     conversation_repo: Arc<dyn IConversationRepository>,
-    broadcaster: Arc<dyn EventBroadcaster>,
     task_manager: Arc<dyn IWorkerTaskManager>,
 }
 
@@ -29,13 +27,11 @@ impl TeamConversationAdapters {
     pub fn new(
         conversation_service: ConversationService,
         conversation_repo: Arc<dyn IConversationRepository>,
-        broadcaster: Arc<dyn EventBroadcaster>,
         task_manager: Arc<dyn IWorkerTaskManager>,
     ) -> Self {
         Self {
             conversation_service,
             conversation_repo,
-            broadcaster,
             task_manager,
         }
     }
@@ -202,21 +198,6 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             conversation_id: response.id,
             workspace,
         })
-    }
-
-    async fn adopt_team_conversation(&self, request: TeamConversationAdoptRequest) -> Result<(), TeamError> {
-        self.conversation_service
-            .update_extra(&request.conversation_id, request.extra)
-            .await
-            .map_err(map_conversation_update_error)?;
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            "conversation.listChanged",
-            serde_json::json!({
-                "conversation_id": request.conversation_id,
-                "action": "updated",
-            }),
-        ));
-        Ok(())
     }
 
     async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {

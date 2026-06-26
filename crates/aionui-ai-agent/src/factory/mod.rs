@@ -7,7 +7,6 @@ mod context;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_api_types::GuideMcpConfig;
 use aionui_db::{IMcpServerRepository, IProviderRepository};
 use aionui_realtime::EventBroadcaster;
 use futures_util::FutureExt;
@@ -30,15 +29,12 @@ pub struct AgentFactoryDeps {
     pub agent_registry: Arc<AgentRegistry>,
     pub acp_agent_service: Arc<AcpSessionSyncService>,
     pub data_dir: PathBuf,
+    pub dump_prompts: bool,
     pub broadcaster: Arc<dyn EventBroadcaster>,
     /// Absolute path to the backend binary, reused as the `command` of the
     /// stdio MCP bridge injected into ACP `session/new` for team sessions.
     /// Captured once at app startup (`std::env::current_exe()`).
     pub backend_binary_path: Arc<PathBuf>,
-    /// Guide MCP server config. When `Some`, injected into solo (non-team)
-    /// ACP agent sessions so the agent gets the `aion_create_team` tool.
-    /// `None` when the Guide server failed to start (graceful degradation).
-    pub guide_mcp_config: Option<GuideMcpConfig>,
     /// User-configured MCP servers repository. Used by ACP factory to
     /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
     /// `None` for tests/composition paths that do not need MCP injection.

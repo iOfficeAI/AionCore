@@ -276,7 +276,7 @@ For any document with 3+ headings:
 officecli add "$FILE" /body --type toc --prop levels="1-3" --prop title="Table of Contents" --prop hyperlinks=true --index 0
 ```
 
-Page numbers render automatically (`--prop pageNumbers=true` toggles them explicitly). Address the TOC directly (1.0.60+): `/toc[1]` or `/tableofcontents` resolve to the first TOC field for `get`/`set`/`remove` without hand-walking XPath.
+Page numbers render automatically (`--prop pageNumbers=true` toggles them explicitly). Address the TOC directly: `/toc[1]` or `/tableofcontents` resolve to the first TOC field for `get`/`set`/`remove` without hand-walking XPath.
 
 **TOC delivery step (mandatory before handoff).** The live TOC field is a placeholder until recalculated. Some viewers populate it on first open; others show the literal `Update field to see table of contents` until the reader recalculates. Pick by recipient:
 
@@ -310,10 +310,10 @@ officecli add "$FILE" /body --type chart --prop chartType=bar --prop title="Reve
 External links go via `hyperlink`:
 
 ```bash
-officecli add "$FILE" "/body/p[2]" --type hyperlink --prop uri="https://example.com" --prop text="our site"
+officecli add "$FILE" "/body/p[2]" --type hyperlink --prop url="https://example.com" --prop text="our site"
 ```
 
-**Internal links** (to a bookmark) use `--prop anchor=bookmarkName` — not a `#fragment` in `uri`:
+**Internal links** (to a bookmark) use `--prop anchor=bookmarkName` — not a `#fragment` in `url`:
 
 ```bash
 officecli add "$FILE" "/body/p[2]" --type hyperlink --prop anchor=chapter1 --prop text="See Chapter 1"
@@ -340,7 +340,7 @@ officecli add "$FILE" /body --type pagebreak --index <N>          # 1. pagebreak
 officecli set "$FILE" "/body/p[<N+1>]" --prop pageBreakBefore=true # 2. on the heading itself
 ```
 
-`--prop break=newPage` (1.0.61+) is a shorter alias for `pageBreakBefore=true` (accepts `newPage|page|nextPage|pageBreak`). Same XML, same belt-and-suspenders rule. Preview with `view html` and count pages.
+`--prop break=newPage` is a shorter alias for `pageBreakBefore=true` (accepts `newPage|page|nextPage|pageBreak`). Same XML, same belt-and-suspenders rule. Preview with `view html` and count pages.
 
 ### Report-level recipes
 
@@ -435,7 +435,7 @@ officecli add "$FILE" /body --type equation --prop formula="\\frac{a}{b} + \\sum
 officecli add "$FILE" "/body/p[3]" --type footnote --prop text="See Appendix A for methodology."
 ```
 
-**Comments and tracked changes.** Bulk accept/reject: `set / --prop accept-changes=all` (or `reject-changes=all`). Locate individual changes with `query ins` and `query del` (`trackedchange` is not a selector). Create tracked changes on a run with `--prop revision.type=ins|del --prop revision.author=…` (`help docx run` for the full `revision.*` set — `format`/`moveFrom`/`moveTo` too). Add a comment: `add "/body/p[4]" --type comment --prop author=… --prop text=…`; reply-thread it with `--prop parentId=N` and mark it resolved with `set "/comments/comment[N]" --prop done=true` (resolve rather than delete to keep the audit trail — `query 'comment[done=false]'` then lists what's still open). Prop schema: `help docx comment` / `help docx run`.
+**Comments and tracked changes.** Bulk accept/reject: `set "$FILE" /revision --prop revision.action=accept` (or `--prop revision.action=reject`); narrow with a selector like `/revision[@author=Alice]` or `/revision[@type=ins]`. Locate individual changes with `query ins` and `query del` (`trackedchange` is not a selector). Create tracked changes on a run with `--prop revision.type=ins|del --prop revision.author=…` (`help docx run` for the full `revision.*` set — `format`/`moveFrom`/`moveTo` too). Add a comment: `add "/body/p[4]" --type comment --prop author=… --prop text=…`; reply-thread it with `--prop parentId=N` and mark it resolved with `set "/comments/comment[N]" --prop done=true` (resolve rather than delete to keep the audit trail — `query 'comment[done=false]'` then lists what's still open). Prop schema: `help docx comment` / `help docx run`.
 
 **Watermark.** `add / --type watermark --prop text="DRAFT" --prop color=BFBFBF --prop opacity=0.8` in one command (default opacity 0.5); `set /watermark --prop opacity=…` adjusts it later.
 
@@ -449,7 +449,7 @@ Three tiers of precision; use the lowest that does the job.
 - **L2 — dotted-attr fallback** (`pbdr.top=`, `ind.left=`, `shd.fill=`, `padding.top=`, `font.size=`): when L1 lacks the knob. Example: `--prop pbdr.bottom="single;6;1F4E79;0"`. Emits schema-valid XML.
 - **L3 — `raw-set` with XML**: last resort, no schema protection. Use for internal hyperlinks, composite fields, and other shapes the typed verbs can't express (see XML appendix).
 
-Borders use the format `style;size;color;space`: `single;4;FF0000;1`. Hex colors never start with `#`: `FF0000`. Scheme color names (`accent1..6`, `dark1`/`dark2`, `light1`/`light2`, `hyperlink`) are accepted anywhere a hex color is (1.0.60+) — prefer hex for stable colors across themes.
+Borders use the format `style;size;color;space`: `single;4;FF0000;1`. Hex colors never start with `#`: `FF0000`. Scheme color names (`accent1..6`, `dark1`/`dark2`, `light1`/`light2`, `hyperlink`) are accepted anywhere a hex color is — prefer hex for stable colors across themes.
 
 ## QA (Required)
 

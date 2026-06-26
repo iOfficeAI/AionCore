@@ -1752,7 +1752,7 @@ mod tests {
             AgentErrorResolutionKind::ReduceContext,
         );
         assert_classification(
-            "API error 400: Invalid schema for function 'aion_list_models': None is not of type 'array'",
+            "API error 400: Invalid schema for function 'team_write_plan': None is not of type 'array'",
             AgentErrorCode::UserLlmProviderInvalidToolSchema,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::Retry,

@@ -1345,7 +1345,7 @@ impl TeamSession {
 
         // Step 4: backend capability check. Hard whitelist passes immediately;
         // otherwise query persisted agent_capabilities for MCP support.
-        if !crate::guide::capability::TEAM_CAPABLE_BACKENDS.contains(&backend.as_str()) {
+        if !crate::capability::TEAM_CAPABLE_BACKENDS.contains(&backend.as_str()) {
             let capable = service.is_backend_team_capable(&backend).await;
             if !capable {
                 return Err(TeamError::BackendNotAllowed(backend));

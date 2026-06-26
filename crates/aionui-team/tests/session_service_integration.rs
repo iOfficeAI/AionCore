@@ -11,7 +11,7 @@ use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
-use aionui_common::{AgentKillReason, AgentType, ConversationStatus, PaginatedResult, ProviderWithModel};
+use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow,
     UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
@@ -24,16 +24,16 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 
-use aionui_team::TeamSessionService;
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
 };
 use aionui_team::session::SpawnAgentRequest;
 use aionui_team::{
-    TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationCreateResult,
-    TeamConversationProvisioningPort, TeamProjectionMessageStore,
+    TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationProvisioningPort,
+    TeamProjectionMessageStore,
 };
+use aionui_team::{TeamError, TeamSessionService};
 use common::MockTeamRepo;
 
 // ---------------------------------------------------------------------------
@@ -271,7 +271,6 @@ fn noop_cancellation_port() -> Arc<dyn AgentTurnCancellationPort> {
 
 struct FakeConversationPorts {
     repo: Arc<MockConversationRepo>,
-    broadcaster: Arc<dyn EventBroadcaster>,
     workspace_root: std::path::PathBuf,
     preset_snapshots: Mutex<HashMap<String, FakePresetAssistantSnapshot>>,
     fail_team_temp_create: std::sync::atomic::AtomicBool,
@@ -286,12 +285,11 @@ struct FakePresetAssistantSnapshot {
 }
 
 impl FakeConversationPorts {
-    fn new(repo: Arc<MockConversationRepo>, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
+    fn new(repo: Arc<MockConversationRepo>) -> Self {
         let workspace_root =
             std::env::temp_dir().join(format!("aionui-team-fake-workspaces-{}", aionui_common::generate_id()));
         Self {
             repo,
-            broadcaster,
             workspace_root,
             preset_snapshots: Mutex::new(HashMap::new()),
             fail_team_temp_create: std::sync::atomic::AtomicBool::new(false),
@@ -379,34 +377,6 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
             conversation_id: id,
             workspace,
         })
-    }
-
-    async fn adopt_team_conversation(
-        &self,
-        request: TeamConversationAdoptRequest,
-    ) -> Result<(), aionui_team::TeamError> {
-        self.repo
-            .update(
-                &request.conversation_id,
-                &ConversationRowUpdate {
-                    name: None,
-                    model: None,
-                    pinned: None,
-                    pinned_at: None,
-                    extra: Some(serde_json::to_string(&request.extra).unwrap()),
-                    status: None,
-                    updated_at: Some(aionui_common::now_ms()),
-                },
-            )
-            .await?;
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            "conversation.listChanged",
-            serde_json::json!({
-                "conversation_id": request.conversation_id,
-                "action": "updated",
-            }),
-        ));
-        Ok(())
     }
 
     async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, aionui_team::TeamError> {
@@ -989,14 +959,6 @@ mod mock_agent {
             Self::with_confirmations_and_status(conversation_id, workspace, confirmations, None)
         }
 
-        pub fn with_status(
-            conversation_id: String,
-            workspace: String,
-            status: std::sync::Arc<std::sync::Mutex<Option<ConversationStatus>>>,
-        ) -> Self {
-            Self::with_confirmations_and_status(conversation_id, workspace, Vec::new(), Some(status))
-        }
-
         fn with_confirmations_and_status(
             conversation_id: String,
             workspace: String,
@@ -1087,27 +1049,6 @@ fn confirmations_factory(count: usize) -> AgentFactory {
                     confirmations,
                 ),
             )))
-        }
-        .boxed()
-    })
-}
-
-fn status_factory_with_event_sender(
-    status: Arc<Mutex<Option<ConversationStatus>>>,
-    event_sender: Arc<Mutex<Option<tokio::sync::broadcast::Sender<aionui_ai_agent::AgentStreamEvent>>>>,
-) -> AgentFactory {
-    use futures_util::FutureExt;
-    Arc::new(move |opts: BuildTaskOptions| {
-        let status = status.clone();
-        let event_sender = event_sender.clone();
-        async move {
-            let agent = mock_agent::MockAgent::with_status(
-                opts.context.conversation.conversation_id,
-                opts.context.workspace.path,
-                status,
-            );
-            *event_sender.lock().unwrap() = Some(agent.event_tx.clone());
-            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(agent)))
         }
         .boxed()
     })
@@ -1321,10 +1262,9 @@ fn setup_with_factory_metadata_team_repo_and_conversation_repo(
     let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone(), broadcaster.clone()));
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
     let task_manager = Arc::new(CountingTaskManager::new(factory));
     let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
@@ -1337,13 +1277,11 @@ fn setup_with_factory_metadata_team_repo_and_conversation_repo(
         provider_repo,
         conversation_port,
         projection_store,
-        lookup_port,
         broadcaster,
         task_manager_dyn,
         noop_turn_port(),
         noop_cancellation_port(),
         backend_binary_path,
-        None,
     );
     (svc, team_repo, task_manager, conv_repo)
 }
@@ -1363,10 +1301,9 @@ fn setup_with_factory_metadata_assistants_and_conversation_repo(
     let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone(), broadcaster.clone()));
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
     let task_manager = Arc::new(CountingTaskManager::new(factory));
     let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
@@ -1379,13 +1316,11 @@ fn setup_with_factory_metadata_assistants_and_conversation_repo(
         provider_repo,
         conversation_port,
         projection_store,
-        lookup_port,
         broadcaster,
         task_manager_dyn,
         noop_turn_port(),
         noop_cancellation_port(),
         backend_binary_path,
-        None,
     );
     (svc, team_repo, task_manager, conv_repo)
 }
@@ -1422,10 +1357,9 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
     let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone(), broadcaster.clone()));
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports.clone();
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(factory));
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
@@ -1437,13 +1371,11 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
         provider_repo,
         conversation_port,
         projection_store,
-        lookup_port,
         broadcaster,
         task_manager,
         noop_turn_port(),
         noop_cancellation_port(),
         backend_binary_path,
-        None,
     );
     (svc, team_repo, conversation_ports, conv_repo)
 }
@@ -1458,10 +1390,9 @@ fn setup_with_recording_turn_port() -> (
     let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone(), broadcaster.clone()));
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
     let turn_port = Arc::new(RecordingTurnPort::default());
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
@@ -1474,13 +1405,11 @@ fn setup_with_recording_turn_port() -> (
         provider_repo,
         conversation_port,
         projection_store,
-        lookup_port,
         broadcaster,
         task_manager,
         turn_port.clone(),
         noop_cancellation_port(),
         backend_binary_path,
-        None,
     );
     (svc, team_repo, turn_port, conv_repo)
 }
@@ -1663,10 +1592,9 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
     let recorder = Arc::new(RecordingBroadcaster::new());
     let broadcaster: Arc<dyn EventBroadcaster> = recorder.clone();
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
-    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo, broadcaster.clone()));
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
@@ -1678,13 +1606,11 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
         provider_repo,
         conversation_port,
         projection_store,
-        lookup_port,
         broadcaster,
         task_manager,
         noop_turn_port(),
         noop_cancellation_port(),
         backend_binary_path,
-        None,
     );
     (svc, recorder)
 }
@@ -1836,6 +1762,35 @@ async fn tc1_create_team_with_multiple_agents() {
     assert_eq!(resp.assistants[1].role, "teammate");
     assert!(resp.leader_assistant_id.is_some());
     assert_eq!(resp.leader_assistant_id, Some(resp.assistants[0].slot_id.clone()));
+}
+
+#[tokio::test]
+async fn create_team_rejects_existing_conversation_id_request_side_adoption() {
+    let svc = setup();
+
+    let err = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "No Adoption".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("claude".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: Some("solo-conv-1".into()),
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, TeamError::InvalidRequest(ref msg) if msg.contains("existing conversations are no longer supported")),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -3994,6 +3949,36 @@ async fn td_delete_team_stops_session() {
 // ===========================================================================
 
 #[tokio::test]
+async fn d9_create_team_auto_start_rebuilds_every_initial_agent() {
+    let (svc, tm) = setup_with_factory(success_factory());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let calls = tm.snapshot();
+    assert_eq!(
+        calls.kill.len(),
+        2,
+        "auto-start should kill every initial agent before rebuild"
+    );
+    assert_eq!(calls.build.len(), 2, "auto-start should warm every initial agent");
+    for (i, agent) in created.assistants.iter().enumerate() {
+        assert_eq!(calls.kill[i].0, agent.conversation_id);
+        assert_eq!(calls.kill[i].1, Some(AgentKillReason::TeamMcpRebuild));
+        assert_eq!(calls.build[i], agent.conversation_id);
+    }
+    assert_eq!(tm.active_count(), 2, "auto-start must register every initial agent");
+}
+
+#[tokio::test]
 async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
     let (svc, tm) = setup_with_factory(success_factory());
     let created = svc
@@ -4021,112 +4006,6 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
         assert_eq!(calls.kill[i].1, Some(AgentKillReason::TeamMcpRebuild));
         assert_eq!(calls.build[i], agent.conversation_id);
     }
-}
-
-#[tokio::test]
-async fn d9_create_team_from_running_solo_leader_rebuilds_leader_after_turn_finishes() {
-    let status = Arc::new(Mutex::new(Some(ConversationStatus::Running)));
-    let event_sender = Arc::new(Mutex::new(None));
-    let (svc, tm, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
-        status_factory_with_event_sender(status.clone(), event_sender.clone()),
-        Arc::new(StubAgentMetadataRepo::empty()),
-    );
-    let lead_conversation_id = "solo-lead";
-    let workspace = "/tmp/aioncore-test-solo-lead";
-    conv_repo
-        .create(&ConversationRow {
-            id: lead_conversation_id.to_owned(),
-            user_id: "user1".to_owned(),
-            name: "Solo Lead".to_owned(),
-            r#type: "acp".to_owned(),
-            pinned: false,
-            pinned_at: None,
-            source: None,
-            channel_chat_id: None,
-            extra: serde_json::json!({
-                "backend": "claude",
-                "current_model_id": "opus",
-                "workspace": workspace,
-            })
-            .to_string(),
-            model: None,
-            status: Some("running".to_owned()),
-            created_at: aionui_common::now_ms(),
-            updated_at: aionui_common::now_ms(),
-        })
-        .await
-        .unwrap();
-    tm.get_or_build_task(
-        lead_conversation_id,
-        test_acp_build_options(lead_conversation_id.to_owned(), workspace.to_owned()),
-    )
-    .await
-    .unwrap();
-
-    let created = svc
-        .create_team(
-            "user1",
-            CreateTeamRequest {
-                name: "Guide Upgrade".into(),
-                agents: vec![TeamAgentInput {
-                    name: "Leader".into(),
-                    role: "lead".into(),
-                    backend: Some("claude".into()),
-                    model: "opus".into(),
-                    assistant_id: None,
-                    conversation_id: Some(lead_conversation_id.to_owned()),
-                }],
-                workspace: None,
-            },
-        )
-        .await
-        .unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(
-        tm.snapshot().kill.is_empty(),
-        "running solo leader must not be killed before the create_team tool turn can finish"
-    );
-
-    *status.lock().unwrap() = Some(ConversationStatus::Finished);
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(
-        tm.snapshot().kill.is_empty(),
-        "leader rebuild should wait for the agent terminal event, not poll status changes"
-    );
-
-    let sender = event_sender
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("mock agent should expose its stream event sender");
-    sender
-        .send(aionui_ai_agent::AgentStreamEvent::Finish(
-            aionui_ai_agent::protocol::events::FinishEventData { session_id: None },
-        ))
-        .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let calls = tm.snapshot();
-            if calls.kill.len() == 1 && calls.build.len() == 2 {
-                break calls;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("leader should be rebuilt after solo turn finishes");
-
-    let calls = tm.snapshot();
-    assert_eq!(
-        calls.kill,
-        vec![(lead_conversation_id.to_owned(), Some(AgentKillReason::TeamMcpRebuild))]
-    );
-    assert_eq!(
-        calls.build,
-        vec![lead_conversation_id.to_owned(), lead_conversation_id.to_owned()]
-    );
-    assert_eq!(created.assistants.len(), 1);
 }
 
 #[tokio::test]

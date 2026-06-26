@@ -42,8 +42,8 @@ use aionui_system::{
     ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService,
 };
 use aionui_team::{
-    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamConversationLookupPort, TeamConversationProvisioningPort,
-    TeamProjectionMessageStore, TeamRouterState, TeamSessionService,
+    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamConversationProvisioningPort, TeamProjectionMessageStore,
+    TeamRouterState, TeamSessionService,
 };
 
 use crate::config::derive_encryption_key;
@@ -267,12 +267,7 @@ pub async fn build_module_states(
         skill: skill_state,
         channel: channel_state,
         team: build_module_state_phase(&boot, "team", || {
-            build_team_state(
-                services,
-                Some(cron.cron_service.clone()),
-                backend_binary_path.clone(),
-                services.guide_mcp_config.clone(),
-            )
+            build_team_state(services, Some(cron.cron_service.clone()), backend_binary_path.clone())
         }),
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
@@ -590,7 +585,6 @@ pub fn build_team_state(
     services: &AppServices,
     _cron_service: Option<Arc<aionui_cron::service::CronService>>,
     backend_binary_path: Arc<std::path::PathBuf>,
-    guide_mcp_config: Option<aionui_api_types::GuideMcpConfig>,
 ) -> TeamRouterState {
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> = Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
@@ -599,12 +593,10 @@ pub fn build_team_state(
     let adapters = Arc::new(TeamConversationAdapters::new(
         conv_service,
         conv_repo,
-        services.event_bus.clone(),
         services.worker_task_manager.clone(),
     ));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = adapters.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = adapters.clone();
-    let lookup_port: Arc<dyn TeamConversationLookupPort> = adapters.clone();
     let turn_port: Arc<dyn AgentTurnExecutionPort> = adapters.clone();
     let cancellation_port: Arc<dyn AgentTurnCancellationPort> = adapters;
     let service = TeamSessionService::new(
@@ -617,13 +609,11 @@ pub fn build_team_state(
         Arc::new(SqliteProviderRepository::new(services.database.pool().clone())),
         conversation_port,
         projection_store,
-        lookup_port,
         services.event_bus.clone(),
         services.worker_task_manager.clone(),
         turn_port,
         cancellation_port,
         backend_binary_path,
-        guide_mcp_config,
     );
     TeamRouterState { service }
 }

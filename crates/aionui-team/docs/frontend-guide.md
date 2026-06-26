@@ -8,6 +8,8 @@
 
 客户端不需要保留任何 team 专属的本地 session、状态复制、wake 逻辑。Team 的调度、状态机、mailbox、任务板全部在后端。全部走 REST + WebSocket 即可。
 
+Team 创建是显式行为：用户通过 Team UI 或 `POST /api/teams` 创建团队。请求侧不再支持把已有单聊 conversation 升级为 Team。
+
 > **关于 MCP**：agent 之间的通信（发消息、任务板、spawn teammate）走的是 MCP，这是**后端进程 ↔ agent 子进程**之间的事，浏览器前端不接触。详情看 [mcp.md](./mcp.md)。
 
 ## 开发进度（实时更新）
@@ -26,7 +28,7 @@
 | 建团自动起 session（MCP 自动注入） | ✅ | `POST /api/teams` 后自动 ensure_session，前端无需额外调用 |
 | WS 事件推送（team.agentStatusChanged 等） | ✅ | |
 | user_id 权限隔离（list/get/remove 按用户过滤） | ✅ | Wave 3 |
-| 单聊→建团（conversation 复用） | ✅ | agents 里传 `conversation_id` 可复用 |
+| 显式建团 | ✅ | 通过 Team UI 或 `POST /api/teams` 创建，每个 agent 拥有自己的 `conversation_id` |
 | rename 规范化 | ✅ | Wave 3 |
 | MCP 协议加固（64MB 帧 + 300s 超时） | ✅ | Wave 3 |
 
@@ -54,17 +56,11 @@
 | D18b-2 `arm_wake_timeout` 任务 | ✅ | |
 | D18c wake lock 接入 | ✅ | |
 
-### Wave 5 — spawn / shutdown / Guide MCP
+### Wave 5 — spawn / shutdown
 
 | 模块 | 状态 | 说明 |
 |------|:---:|------|
-| D26a GuideMcpServer 骨架 | ✅ | 应用级单例，暴露 `aion_create_team` / `aion_list_models` 给 solo agent |
-| D26b-1 `aion_create_team` 参数解析 | ✅ | |
-| D26b-2 `handle_aion_create_team` handler | ✅ | 调 service + 返回结构化 |
-| D26c `aion_list_models` 处理器 | ✅ | |
-| D28a `is_team_capable_backend` 白名单 | ✅ | `guide/capability.rs`，白名单 `claude / codex / gemini / aionrs` |
-| D28b Guide prompt 注入（solo 互斥） | ✅ | solo agent 首轮消息注入 Team Guide prompt |
-| D28c Guide MCP guard（solo 互斥） | ✅ | team 模式下不注入 Guide |
+| D28a `is_team_capable_backend` 白名单 | ✅ | `capability.rs`，白名单 `claude / codex / gemini / aionrs` |
 | D29a-1 `SpawnAgentRequest` + 方法骨架 | ✅ | |
 | D29a-2 caller role==Lead 校验 | ✅ | |
 | D29a-3 name normalize + 唯一性 | ✅ | |
@@ -111,28 +107,6 @@ agent 连接 MCP server 后，以下工具对 agent 可见且可调用：
 | `team_rename_agent` | ✅ Working | 改名 |
 | `team_shutdown_agent` | ✅ Working | Lead 请求 teammate 下线；**已加 target=Lead 校验**（D30c，拒绝关 lead） |
 
-### Team Guide MCP（全局 / Wave 5 新增，落地中）
-
-> 这是 **solo agent**（普通单聊）用来"单聊 → 自动建团"的独立 MCP server，与上面 per-team MCP 不是同一个。
-
-| 工具 | 状态 | 说明 |
-|------|:---:|------|
-| `aion_create_team` | ✅ | handler 已落地（D26b-2），调 service.create_team + 返回结构化 JSON |
-| `aion_list_models` | ✅ | D26c handler 已合入，返回可用 backend + models 列表 |
-
-前端一般不直接感知这个 MCP；但当用户在单聊里说"帮我起一个团队"时，agent 会执行以下流程（由 Team Guide prompt 强制）：
-
-1. 调 `aion_list_models` 查询可用 agent 类型和模型
-2. 向用户展示阵容推荐表（角色/职责/agent type/推荐模型）
-3. **结束回合，等用户确认**（prompt 禁止在同一回合调 `aion_create_team`）
-4. 用户回复"确认" / "go ahead" 后 → 调 `aion_create_team`
-5. 后端自动建 team + 起 session + 注入 MCP
-6. 返回 `next_step` 指引 agent 结束回合（前端收到 WS 事件跳转 team 页）
-
-> **前端需要做的**：收到 `team.listChanged`（或类似事件）后跳转 team 页面。agent 的文本消息中会包含阵容表，前端正常渲染即可，无需特殊 UI。
-
-D28b/c 已合入：solo team-capable agent 的首轮消息里已注入 Team Guide prompt，且 MCP guard 确保 team 模式下不重复注入。前端仍可走 `POST /api/teams` 显式建团（绕过 agent 推荐流程）。
-
 ### shutdown 协议（Wave 5）
 
 Lead 调 `team_shutdown_agent` 后，teammate 可以在下一个回合里用 `team_send_message` 回复，内容以特定字符串开头：
@@ -175,7 +149,7 @@ Payload 类型定义：`aionui-api-types::TeamMcpStatusPayload`、`TeamMcpPhase`
 
 ---
 
-### 单聊→建团接入方式（Wave 3 完成后可用）
+### 显式建团接入方式
 
 ```json
 POST /api/teams
@@ -186,21 +160,19 @@ POST /api/teams
       "name": "Leader",
       "role": "lead",
       "backend": "claude",
-      "model": "claude-sonnet-4",
-      "conversation_id": "existing-conv-id"  // ← 传已有单聊的 conv_id，历史消息保留
+      "model": "claude-sonnet-4"
     },
     {
       "name": "Developer",
       "role": "teammate",
       "backend": "claude",
       "model": "claude-sonnet-4"
-      // 不传 conversation_id → 新建
     }
   ]
 }
 ```
 
-传 `conversation_id` 时后端复用该 conversation（extra 打 teamId 标记），不新建。消息历史完整保留。不传则正常新建。
+请求侧 `agents[].conversation_id` 已废弃。传入非空值会返回 400；创建成功后，响应里的每个 agent 都会带有自己的 `conversation_id`。
 
 ## 必须走 REST 的操作
 

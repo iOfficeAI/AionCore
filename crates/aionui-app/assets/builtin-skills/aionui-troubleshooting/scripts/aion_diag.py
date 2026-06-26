@@ -43,9 +43,8 @@ import glob
 def _ps_aioncore():
     """Return (pid, full_command) for the aioncore backend process, or (None, None).
 
-    The backend is the aioncore launched with --data-dir (the Electron-spawned
-    long-lived core), NOT the short-lived `mcp-guide-stdio` / `mcp-team-stdio`
-    helper subprocesses that share the same binary name.
+    The long-lived backend process is aioncore. Short-lived helper subprocesses
+    may include `mcp-team-stdio` for active Team sessions.
     """
     try:
         out = subprocess.check_output(["ps", "-axo", "pid,command"], text=True)
@@ -355,7 +354,7 @@ def cmd_teams(argv):
     out = []
     for t in data:
         members = []
-        for a in t.get("agents", []) or []:
+        for a in t.get("assistants") or t.get("agents") or []:
             cid = a.get("conversation_id")
             runtime = None
             if cid:

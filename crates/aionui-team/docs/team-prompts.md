@@ -4,7 +4,7 @@
 > 源码路径前缀：`/Volumes/Macintosh HD/Users/zhuqingyu/project/AionUi/src/process/team/prompts/`
 
 **相关文档**：
-- [MCP 通信](./mcp.md) — Team Guide MCP 的工具定义（`aion_create_team` / `aion_list_models`）
+- [MCP 通信](./mcp.md) — Team 内部 MCP 的 `team_*` 工具定义
 - [内部调度](./internals.md) — scheduler 状态机、wake 机制（prompt 里的 "Standing By" 与 wake 紧密关联）
 - [前端接入指南](./frontend-guide.md) — 前端视角的 team 接入
 - [后端 GAP 分析](./backend-current-state-and-gap.md) — 后端缺失的 prompt 能力清单
@@ -12,19 +12,11 @@
 
 ---
 
-## 1. 三层结构
+## 1. 两层结构
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│  Layer 1: Team Guide Prompt (solo agent)               │
-│  注入对象：还没建团的普通单聊 agent                       │
-│  目的：告诉 agent "你有能力建团"，引导建团流程             │
-│  文件：teamGuidePrompt.ts                               │
-└──────────────────────┬─────────────────────────────────┘
-                       │ 建团后，solo agent 变 leader
-                       ▼
-┌────────────────────────────────────────────────────────┐
-│  Layer 2: Leader Prompt                                │
+│  Layer 1: Leader Prompt                                │
 │  注入对象：team leader agent                            │
 │  目的：协调团队，不亲自干活，通过 MCP 工具调度             │
 │  文件：leadPrompt.ts                                    │
@@ -32,7 +24,7 @@
                        │ leader spawn 出 teammate
                        ▼
 ┌────────────────────────────────────────────────────────┐
-│  Layer 3: Teammate Prompt                              │
+│  Layer 2: Teammate Prompt                              │
 │  注入对象：team 里的每个 teammate                        │
 │  目的：接收任务、执行、汇报、等待                         │
 │  文件：teammatePrompt.ts                                │
@@ -45,58 +37,7 @@
 
 ---
 
-## 2. Layer 1: Team Guide Prompt（单聊 → 建团）
-
-**文件**：`teamGuidePrompt.ts` → `getTeamGuidePrompt(options)`
-
-**注入条件**：solo agent（`extra.teamMcpStdioConfig` 为空 且 `shouldInjectTeamGuideMcp(backend)` 为 true）
-
-**注入方式**：拼接进 agent 的 system instructions（不是 MCP 协议）
-
-### 核心规则
-
-| 规则 | 说明 |
-|------|------|
-| **默认 solo** | 不主动推荐 team，即使任务跨多文件/多轮 |
-| **两种触发** | 1) 用户明确要求 2) 任务极端复杂且 agent 判断一人搞不定 |
-| **最多问一次** | 如果是 agent 主动提议（非用户要求），只问一次，拒绝就不再提 |
-
-### 建团 7 步流程（严格顺序，不可跳步）
-
-```
-Step 1: 调 aion_list_models         ← 查可用 agent type + model
-Step 2: 一句话解释为什么需要 team
-Step 3: 输出团队配置表               ← 核心！
-        ┌──────────┬───────────────┬────────┬─────────────────┐
-        │ Role     │ Responsibility│ Type   │ Model           │
-        ├──────────┼───────────────┼────────┼─────────────────┤
-        │ Leader   │ 协调 + 审查   │ claude │ (default)       │
-        │ Developer│ 实现功能      │ claude │ (from list)     │
-        │ Tester   │ 写测试        │ gemini │ (from list)     │
-        └──────────┴───────────────┴────────┴─────────────────┘
-Step 4: **结束 turn，等用户确认**    ← 严禁在出表格的同一 turn 调工具
-Step 5: 用户确认后 → 调 aion_create_team(summary 包含目标 + 阵容)
-Step 6: 系统自动跳转 team 页，agent 读 next_step 并执行
-Step 7: 用户拒绝 → 继续 solo，不再提 team
-```
-
-### 参数化
-
-| 参数 | 来源 | 作用 |
-|------|------|------|
-| `backend` | agent 的 backend type（claude/gemini/codex/...） | 配置表里 Type 列的默认值 |
-| `leaderLabel` | 如果当前会话用了 preset assistant → 传 assistant 的显示名 | Leader 行显示 `Word Creator (claude)` 而非纯 `claude` |
-
-### aion_create_team 工具描述（`getCreateTeamToolDescription()`）
-
-工具描述里再次强调 3 个前置条件：
-1. 用户明确要求或明确同意了建团
-2. agent 已经展示了团队配置表
-3. 用户在**上一条消息**里明确确认了
-
----
-
-## 3. Layer 2: Leader Prompt（团队 leader）
+## 2. Layer 1: Leader Prompt（团队 leader）
 
 **文件**：`leadPrompt.ts` → `buildLeaderPrompt(params)`
 
@@ -115,7 +56,7 @@ Step 7: 用户拒绝 → 继续 solo，不再提 team
 | `## Available Preset Assistants for Spawning` | `availableAssistants` 非空 | preset 的 customAgentId + name + backend + description + skills |
 | `## Team Workspace` | `teamWorkspace` 非空 | 共享工作目录路径 |
 
-### Spawn 阵容确认流程（与 solo 的 Layer 1 类似但更详细）
+### Spawn 阵容确认流程
 
 ```
 Step 1:  收到用户请求
@@ -180,7 +121,7 @@ When the user explicitly asks to dismiss/fire/shut down teammates:
 
 ---
 
-## 4. Layer 3: Teammate Prompt（团队成员）
+## 3. Layer 2: Teammate Prompt（团队成员）
 
 **文件**：`teammatePrompt.ts` → `buildTeammatePrompt(params)`
 
@@ -239,58 +180,11 @@ Step 6: team_send_message → 向 leader 汇报
 
 ---
 
-## 5. MCP Tool Description 原文（后端必须原样复用）
+## 4. MCP Tool Description 原文（后端必须原样复用）
 
 以下是 AionUi 每个 MCP 工具的 description + schema 原文。后端在 `tools/list` 返回的 `ToolDescriptor` 里必须使用这些文本，不要改写。
 
-### 5.1 Team Guide MCP（2 个工具）
-
-#### aion_create_team
-
-**Description**（来自 `getCreateTeamToolDescription()`）：
-```
-Create a multi-agent Team to handle complex tasks collaboratively.
-
-WHEN TO USE (ONLY if one of these is true):
-- The user explicitly asked to create a Team, use multiple agents, or pull in teammates.
-- The task is clearly beyond what one agent can reasonably handle well alone, you asked once whether the user wants a Team, and the user explicitly agreed.
-Do NOT use just because the task is substantial, multi-file, iterative, or would benefit from specialization.
-
-PRECONDITIONS (all must be true before calling — NEVER skip):
-1. Either the user explicitly asked for a Team, or the user explicitly accepted your one optional Team question for an exceptionally hard task.
-2. You presented a team configuration (roles, responsibilities, agent types) to the user.
-3. The user explicitly confirmed in a PREVIOUS message (e.g. "ok", "go ahead", "确认").
-If ANY condition is not met, do NOT call this tool — present the configuration and wait.
-
-This is the ONLY way to create teams — do NOT use any built-in or other team/agent tools.
-The summary MUST include both the task goal and the confirmed team member roles.
-
-IMPORTANT: The system navigates to the team page automatically after creation. Read the response and follow the next_step instructions.
-```
-
-**Schema**：
-```
-summary: string (required) — Task summary or initial instruction to send to the team leader agent.
-name: string (optional) — Optional team name. When omitted the first few words of summary are used.
-workspace: string (optional) — Absolute path to the project workspace directory. Team agents will use this as their shared working directory. When omitted a temporary workspace is created.
-```
-
-#### aion_list_models
-
-**Description**：
-```
-Query available models for team agent types. Returns the real-time model list that matches the frontend model selector.
-
-Use this BEFORE proposing a team configuration to check what models are available for each agent type.
-Pass agent_type to query a specific backend, or omit it to see all.
-```
-
-**Schema**：
-```
-agent_type: string (optional) — Agent type/backend to query (e.g. "gemini", "claude", "codex"). Shows all when omitted.
-```
-
-### 5.2 Team 内部 MCP（10 个工具）
+### 4.1 Team 内部 MCP（10 个工具）
 
 #### team_send_message
 
@@ -482,14 +376,13 @@ agent_type: string (optional) — Agent type/backend to query (e.g. "gemini", "c
 
 ---
 
-## 6. 后端实现现状
+## 5. 后端实现现状
 
 **后端（aionui-backend）已有**：
 - `crates/aionui-team/src/prompts.rs` — leader + teammate prompt 的基础版本
 - `crates/aionui-team/src/mcp/tools.rs` — `team_spawn_agent` 工具描述
 
 **后端缺失**：
-- ⚠️ Team Guide Prompt（`getTeamGuidePrompt`）— 完全没有
 - ⚠️ `availableAgentTypes` / `availableAssistants` 动态注入 — 没有 AgentRegistry
 - ⚠️ `leaderLabel`（preset assistant 显示名） — 没有 preset 机制
 - ⚠️ Preset Assistant 选择逻辑 — 没有 `team_describe_assistant` 工具
@@ -507,7 +400,7 @@ agent_type: string (optional) — Agent type/backend to query (e.g. "gemini", "c
 
 ---
 
-## 7. 关键设计决策（从 prompt 反推的产品意图）
+## 6. 关键设计决策（从 prompt 反推的产品意图）
 
 1. **"先确认再 spawn"不是建议，是硬性要求** — prompt 里用 "STRICT — follow every step, do NOT skip" 强调
 2. **Model 选择是 agent 的职责** — 用户确认的是阵容表（含 model 推荐），agent 要先查 `list_models` 再推荐

@@ -812,6 +812,29 @@ impl ConversationService {
                     );
                 }
             }
+            if !snapshot.rules.content.trim().is_empty() {
+                match effective_type {
+                    AgentType::Acp => {
+                        obj.insert(
+                            "preset_context".to_owned(),
+                            serde_json::Value::String(snapshot.rules.content.clone()),
+                        );
+                        obj.remove("preset_rules");
+                    }
+                    AgentType::Aionrs => {
+                        obj.insert(
+                            "preset_rules".to_owned(),
+                            serde_json::Value::String(snapshot.rules.content.clone()),
+                        );
+                        obj.remove("preset_context");
+                    }
+                    AgentType::Gemini
+                    | AgentType::Codex
+                    | AgentType::OpenclawGateway
+                    | AgentType::Remote
+                    | AgentType::Nanobot => {}
+                }
+            }
         }
 
         // Consume transient skill-shaping inputs and freeze the initial

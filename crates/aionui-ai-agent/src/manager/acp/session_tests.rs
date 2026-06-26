@@ -1274,6 +1274,7 @@ fn pending_session_new_prelude_defaults_to_false() {
 fn mark_pending_session_new_prelude_sets_true() {
     let mut s = make_session();
     s.mark_pending_session_new_prelude();
+    assert!(s.has_pending_session_new_prelude());
     assert!(s.take_pending_session_new_prelude());
 }
 

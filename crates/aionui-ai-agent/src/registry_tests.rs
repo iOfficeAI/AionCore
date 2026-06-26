@@ -265,3 +265,91 @@ async fn hydrate_keeps_valid_utf8_invalid_json_config_options_non_fatal() {
     let persisted = repo.get("2d23ff1c").await.unwrap().expect("row remains in database");
     assert_eq!(persisted.config_options.as_deref(), Some("not json"));
 }
+
+#[tokio::test]
+async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+    repo.upsert(&UpsertAgentMetadataParams {
+        id: "agent-with-catalog",
+        icon: None,
+        name: "Catalog Agent",
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: Some("claude".into()),
+        agent_type: "acp",
+        agent_source: "builtin",
+        agent_source_info: None,
+        enabled: true,
+        command: None,
+        args: Some("[]"),
+        env: Some("[]"),
+        native_skills_dirs: None,
+        behavior_policy: None,
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: Some(
+            r#"{"config_options":[{"id":"model","type":"select","category":"model","options":[{"value":"claude-opus","label":"Claude Opus"}],"current_value":"claude-opus"}]}"#,
+        ),
+        available_modes: Some(
+            r#"{"current_mode_id":"plan","available_modes":[{"id":"plan","name":"Plan"}]}"#,
+        ),
+        available_models: Some(
+            r#"{"current_model_id":"claude-opus","current_model_label":"Claude Opus","available_models":[{"id":"claude-opus","label":"Claude Opus"}]}"#,
+        ),
+        available_commands: None,
+        sort_order: 100,
+    })
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    let row = registry
+        .list_management_rows()
+        .await
+        .into_iter()
+        .find(|item| item.id == "agent-with-catalog")
+        .unwrap();
+    let row_json = serde_json::to_value(&row).unwrap();
+
+    assert_eq!(
+        row_json["available_models"]["current_model_id"].as_str(),
+        Some("claude-opus")
+    );
+    assert_eq!(row_json["available_modes"]["current_mode_id"].as_str(), Some("plan"));
+    assert_eq!(
+        row_json["config_options"]["config_options"][0]["current_value"].as_str(),
+        Some("claude-opus")
+    );
+}
+
+#[tokio::test]
+async fn management_rows_include_aionrs_builtin_mode_catalog() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    let row = registry
+        .list_management_rows()
+        .await
+        .into_iter()
+        .find(|item| item.agent_type == AgentType::Aionrs)
+        .unwrap();
+    let row_json = serde_json::to_value(&row).unwrap();
+
+    assert_eq!(row_json["available_modes"]["current_mode_id"].as_str(), Some("default"));
+    assert_eq!(
+        row_json["available_modes"]["available_modes"][1]["id"].as_str(),
+        Some("auto_edit")
+    );
+    assert_eq!(
+        row_json["config_options"]["config_options"][0]["options"][2]["value"].as_str(),
+        Some("yolo")
+    );
+}

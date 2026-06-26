@@ -280,6 +280,7 @@ impl AgentRegistry {
             .map(|meta| {
                 let status = derive_management_status(&meta);
                 let diagnostics = derive_management_diagnostics(&meta, status);
+                let handshake = meta.handshake;
                 AgentManagementRow {
                     id: meta.id,
                     icon: meta.icon,
@@ -299,6 +300,9 @@ impl AgentRegistry {
                     native_skills_dirs: meta.native_skills_dirs,
                     behavior_policy: meta.behavior_policy,
                     yolo_id: meta.yolo_id,
+                    config_options: handshake.config_options.clone(),
+                    available_modes: handshake.available_modes.clone(),
+                    available_models: handshake.available_models.clone(),
                     sort_order: meta.sort_order,
                     team_capable: meta.team_capable,
                     status,

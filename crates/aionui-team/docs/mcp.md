@@ -4,34 +4,17 @@
 
 ---
 
-## 1. 两套 MCP：一眼看懂
+## 1. Team MCP：一眼看懂
 
-AionUi 参考实现里，MCP 分成两套独立服务：
+Team MCP 是每个 team session 一个的内部服务，只注入给团内 agent（lead / teammate）。它负责团内协作：发消息、任务板、spawn teammate、rename、shutdown 等。
 
-| | Team Guide MCP | Team 内部 MCP |
-|---|---|---|
-| 作用域 | 全局单例 | 每个 team session 一个 |
-| 谁调 | **solo agent**（还没建团的普通单聊 agent） | **团内 agent**（lead / teammate） |
-| 目的 | 把"单聊 → 建团"能力注入到普通 agent | 团内协作（发消息、任务板、spawn） |
-| 关键工具 | `aion_create_team`, `aion_list_models` | 10 个 `team_*` 工具 |
-| 触发入口 | Solo agent 判断需要团队时主动调 | Agent 启动时注入 stdio config，agent 自行调用 |
-| 传输 | stdio MCP（CLI 进程 <-> 后端） | TCP + JSON-RPC 2.0 |
-| 后端状态 | ⚠️ **完全没有实现** | 已有（8 个工具，缺 2 个） |
+Team 创建是显式行为：由 Team UI 或 `/api/teams` REST API 发起。普通单聊 agent 不再挂载全局建团 MCP，也不再把已有 conversation 升级为 Team。
 
 ---
 
 ## 2. 工具清单
 
-### 2.1 Team Guide MCP（⚠️ 后端未实现）
-
-| 工具 | 作用 |
-|------|------|
-| `aion_create_team` | 将当前单聊升级为团队：新建 team，把当前 agent 作为 lead，并可带一批初始 teammate spec。返回 team_id、lead slot_id、会话迁移指令。 |
-| `aion_list_models` | 返回可用 backend × model 列表，供 agent 决定 spawn 谁 |
-
-**触发场景**：用户在单聊里说"帮我拉一个团完成 X"，solo agent 看到后调 `aion_create_team`，后端建团、自动把当前 conversation 绑定到 lead slot、启动 session。前端感知方式：WS 推 `team.created` 或类似事件（⚠️ 事件也未定义）。
-
-### 2.2 Team 内部 MCP
+### 2.1 Team 内部 MCP
 
 | # | 工具 | 后端已实现 | 权限 | 作用 |
 |---|------|:---:|------|------|
@@ -44,7 +27,7 @@ AionUi 参考实现里，MCP 分成两套独立服务：
 | 7 | `team_rename_agent` | ✅ | 任意 agent | 改 slot 显示名 |
 | 8 | `team_shutdown_agent` | ✅ | Lead only | 请求某 teammate 下线（写 `shutdown_request` 到对方 mailbox） |
 | 9 | `team_describe_assistant` | ❌ | — | 描述某个自定义 assistant 的能力/限制（供 spawn 时参考）|
-| 10 | `team_list_models` | ❌ | — | 团内版本的 `aion_list_models` |
+| 10 | `team_list_models` | ❌ | — | 团内模型列表工具 |
 
 后端缺 9、10。9 和 10 主要服务于 lead 做 spawn 决策，缺失会让 lead 只能按硬编码白名单 `["claude","codex"]` 盲选。
 
@@ -314,17 +297,14 @@ bridge 职责（代码量极小）：
 | 9 | `team_spawn_agent` 真实执行 | ✅ | ⚠️ **空壳** | `SpawnAgent` action 只打 log，不创 agent |
 | 10 | `team_describe_assistant` | ✅ | ❌ | 缺 |
 | 11 | `team_list_models` | ✅ | ❌ | 缺 |
-| 12 | Team Guide MCP (单例) | ✅ | ❌ | **完全没做** |
-| 13 | `aion_create_team` | ✅ | ❌ | 无法从单聊升级到团 |
-| 14 | `aion_list_models` (全局) | ✅ | ❌ | 无 |
-| 15 | stdio bridge 二进制 | ✅ | ❌ | 只有数据结构 |
-| 16 | MCP 写 mailbox 后主动 wake | ✅ | ❌ | 导致 agent-to-agent 消息可能悬停（见 internals.md bug #2）|
+| 12 | stdio bridge 二进制 | ✅ | ❌ | 只有数据结构 |
+| 13 | MCP 写 mailbox 后主动 wake | ✅ | ❌ | 导致 agent-to-agent 消息可能悬停（见 internals.md bug #2）|
 
 ### 5.1 GAP 影响面
 
-- **#12-14**：前端不能指望"用户说建团就建团"，必须显式调 `POST /api/teams`
-- **#9, #15**：后端 MCP server 跑着但没人连得上；且 lead 调 `team_spawn_agent` 无效
-- **#16**：teammate 发消息给 lead，lead 可能长时间不醒（除非 teammate 自己触发 `IdleNotification`）
+- Team 创建必须显式走 Team UI 或 `POST /api/teams`。
+- **#9, #12**：后端 MCP server 跑着但没人连得上；且 lead 调 `team_spawn_agent` 无效
+- **#13**：teammate 发消息给 lead，lead 可能长时间不醒（除非 teammate 自己触发 `IdleNotification`）
 
 ---
 

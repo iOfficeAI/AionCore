@@ -16,18 +16,6 @@ use serde::{Deserialize, Serialize};
 /// redundant in the server name.
 pub const TEAM_MCP_SERVER_NAME: &str = "aionui-team";
 
-/// Connection config for the Guide MCP stdio server in solo conversations.
-///
-/// Passed through `AcpBuildExtra::guide_mcp_config` by the factory so that
-/// `build_new_session_request` can inject the Guide as a stdio MCP server
-/// when the backend is team-capable and this is not a team session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GuideMcpConfig {
-    pub port: u16,
-    pub token: String,
-    pub binary_path: String,
-}
-
 /// Stdio connection config for the team session MCP server.
 ///
 /// `team_id` is persisted for diagnostics; the wire-level MCP server name is

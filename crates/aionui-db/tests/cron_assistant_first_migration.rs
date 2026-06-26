@@ -160,6 +160,40 @@ async fn seed_legacy_assistant_identity(pool: &sqlx::SqlitePool) {
     .unwrap();
 }
 
+#[tokio::test]
+async fn migration_015_populates_aionrs_catalog_by_agent_type() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    run_migrations_through(&pool, 14).await;
+    sqlx::query(
+        "INSERT INTO agent_metadata (
+            id, name, backend, command, agent_type, enabled, agent_source, sort_order, created_at, updated_at
+         ) VALUES ('agent-aionrs', 'Aion CLI', NULL, '', 'aionrs', 1, 'internal', 100, 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    run_migration(&pool, 15).await;
+
+    let row = sqlx::query(
+        "SELECT available_modes, config_options
+         FROM agent_metadata
+         WHERE id = 'agent-aionrs'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let available_modes: String = row.get("available_modes");
+    let config_options: String = row.get("config_options");
+    assert!(available_modes.contains("\"auto_edit\""));
+    assert!(config_options.contains("\"yolo\""));
+}
+
 async fn insert_legacy_cron(
     pool: &sqlx::SqlitePool,
     id: &str,

@@ -1,9 +1,6 @@
-pub mod team_guide;
+use std::collections::HashMap;
 
 pub use aionui_team_prompts::AvailableAssistant;
-pub use team_guide::{TEAM_GUIDE_PROMPT_TEMPLATE, build_team_guide_prompt};
-
-use std::collections::HashMap;
 
 use crate::types::{MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask};
 

@@ -156,12 +156,12 @@ mod tests {
 
     #[test]
     fn missing_env_renders_stable_stderr_and_exit_2() {
-        let err = missing_env("mcp-guide-stdio", "AION_MCP_PORT");
+        let err = missing_env("mcp-team-stdio", "TEAM_MCP_PORT");
         assert_eq!(err.code(), CliBoundaryCode::McpEnvMissing);
         assert_eq!(err.exit_code(), ExitCode::from(2));
         assert_eq!(
             err.stderr_line(),
-            "MCP_ENV_MISSING subcommand=mcp-guide-stdio env=AION_MCP_PORT: missing required environment variable"
+            "MCP_ENV_MISSING subcommand=mcp-team-stdio env=TEAM_MCP_PORT: missing required environment variable"
         );
     }
 

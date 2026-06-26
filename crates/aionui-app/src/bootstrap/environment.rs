@@ -49,6 +49,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         work_dir,
         app_version: cli.app_version.clone(),
         local: cli.local,
+        dump_prompts: cli.dump_prompts,
     };
     info!(
         "Running in {} mode — authentication is {}",

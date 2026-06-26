@@ -17,7 +17,7 @@ use aionui_runtime::{
     ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, ensure_runtime_command,
     ensure_runtime_command_with_reporter, resolve_command_path,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation_runtime_reporter};
 
@@ -26,7 +26,6 @@ pub(super) async fn build(
     build_context: AcpSessionBuildContext,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
-    let belongs_to_team = build_context.team.is_some();
     let mut config = build_context.config;
 
     // Resolve the catalog row — prefer explicit agent_id, fall
@@ -48,32 +47,6 @@ pub(super) async fn build(
     // vendor label (builtin path), we preserve it as-is.
     if config.agent_id.is_some() || config.backend.is_none() {
         config.backend.clone_from(&meta.backend);
-    }
-
-    // Inject Guide MCP config for solo (non-team) sessions.
-    // Team sessions already carry `team_mcp_stdio_config`; the
-    // two are mutually exclusive per the build_new_session_request guard.
-    if config.team_mcp_stdio_config.is_some() {
-        debug!(ctx.conversation_id, "guide_mcp: skipped: has team_mcp");
-    } else if belongs_to_team {
-        debug!(
-            ctx.conversation_id,
-            "guide_mcp: skipped: conversation belongs to a team"
-        );
-    } else if config.guide_mcp_config.is_some() {
-        debug!(
-            ctx.conversation_id,
-            "guide_mcp: skipped: caller already set guide_mcp_config"
-        );
-    } else if deps.guide_mcp_config.is_none() {
-        debug!(ctx.conversation_id, "guide_mcp: skipped: guide server not running");
-    } else {
-        config.guide_mcp_config.clone_from(&deps.guide_mcp_config);
-        info!(
-            ctx.conversation_id,
-            guide_mcp_port = deps.guide_mcp_config.as_ref().map(|c| c.port),
-            "guide_mcp: injected into solo session"
-        );
     }
 
     let mut command_spec =
@@ -154,6 +127,7 @@ pub(super) async fn build(
             session_mcp_servers,
             session_snapshot,
             deps.data_dir.clone(),
+            deps.dump_prompts,
         )
         .await,
     );

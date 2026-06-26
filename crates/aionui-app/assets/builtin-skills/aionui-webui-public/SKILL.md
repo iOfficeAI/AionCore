@@ -1,7 +1,7 @@
 ---
 name: aionui-webui-public
 description: >-
-  Expose the user's local AionUi WebUI to the public internet with a near-zero-effort flow. Detects whether the WebUI is running, guides the user to switch it on if needed (the only manual step), self-installs cloudflared cross-platform, opens a Cloudflare quick tunnel, verifies the public URL actually works, then explains the limitations (URL is temporary, must stay running). Use whenever the user wants to reach their AionUi from outside the LAN, over the internet, or share a public link. Distinct from aionui-webui-setup (which covers manual LAN / Tailscale / server config through the settings UI): this skill produces a one-click public link via an automatic tunnel.
+  Expose the user's local AionUi WebUI to the public internet with a near-zero-effort flow. Detects whether the WebUI is running, guides the user to switch it on if needed (the only manual step), self-installs cloudflared cross-platform, opens a Cloudflare quick tunnel, verifies the public URL actually works, then explains the limitations honestly (temporary/random URL, must stay running, password is the only protection, traffic transits Cloudflare). Use whenever the user wants to reach their AionUi from outside the LAN, over the internet, or share a public link. Distinct from aionui-webui-setup (which covers manual LAN / Tailscale / server config through the settings UI): this skill produces a one-click public link via an automatic tunnel.
 ---
 
 > **⚠️ Platform note — read before running any command.** The shell snippets in this skill are written for **macOS / Linux** (bash/zsh). Always check which OS you are on first. On **Windows** do **not** run them verbatim — the underlying tool/CLI commands are usually cross-platform, but the surrounding shell syntax is not. Translate it to PowerShell before running:
@@ -26,7 +26,7 @@ You help a user turn their local AionUi WebUI (LAN-only at best) into a public i
 
 ## Core facts (verified, do not re-derive)
 
-- AionUi WebUI is a local HTTP server on port 25808 (prod; dev 25809). It has built-in user+password / JWT auth, so exposing it publicly is reasonably safe.
+- AionUi WebUI is a local HTTP server on port 25808 (the aioncore default; override with the `--port` CLI flag — so don't hardcode it, confirm with the curl probe below). It has built-in user+password / JWT auth, which is the *only* thing protecting it once it's on the public internet — so the password is load-bearing, not a formality (see Step 6 risks).
 - There is NO HTTP/CLI way to start the desktop WebUI. Starting it is Electron-IPC only, so you cannot turn it on; you must guide the user to the toggle. You CAN detect its state, install the tunnel, run the tunnel, and verify, all yourself.
 - The tunnel tool is cloudflared (Cloudflare quick tunnel, no account needed). It must be forced to --protocol http2 (see Gotcha).
 - Password changes DO have HTTP routes you can call for the user (see "Optional: change credentials").
@@ -103,13 +103,45 @@ Retry 2-3 times with a few seconds between; a freshly created tunnel can return 
 curl -s --max-time 20 "<public-url>/" | grep -i "<title>AionUi</title>"
 ```
 
-### Step 6 - Hand off the URL and explain the limitations clearly
+### Step 6 - Before handing off: check the password is strong
 
-Give the user the public URL, and tell them plainly (in their language):
+The moment this URL is public, the WebUI password is the only thing standing
+between the open internet and the user's AionUi. **Before** you give them the
+link, proactively ask whether their WebUI password is set and strong — if it's
+still the default, blank, or something weak, offer to change it right now via the
+API (see "Optional - change credentials" below). Don't hand over a public URL
+guarding a weak password.
 
-- Log in with your WebUI username + password when you open the link. The WebUI is auth-protected; that is what keeps it safe on the public internet.
-- The URL is temporary. It changes if the tunnel restarts, and if you restart the WebUI service the tunnel breaks too. In either case, ask me again and I will generate a fresh URL.
-- Keep it running. The tunnel is a process on this machine; if you close it (or shut down/sleep the computer), the public URL stops working.
+### Step 7 - Hand off the URL and explain the limitations honestly
+
+Give the user the public URL, then walk them through the trade-offs plainly, in
+their language. Don't bury these or save them for after something breaks.
+
+**Availability (it's temporary by design):**
+
+- Log in with your WebUI username + password when you open the link.
+- The URL is temporary and random. It changes if the tunnel restarts, and if you
+  restart the WebUI service the tunnel breaks too. Ask me again any time and I'll
+  generate a fresh one.
+- Keep it running. The tunnel is a process on this machine; if you close it (or
+  the computer sleeps / shuts down), the public URL stops working.
+- This is a Cloudflare *quick tunnel* — meant for quick sharing and testing, not
+  a production hosting setup. It can be rate-limited or dropped; don't rely on it
+  for anything long-lived or critical.
+
+**Security (you're publishing to the whole internet):**
+
+- Anyone who has the URL can reach the login page from anywhere — the password is
+  the only protection. Use a strong, unique one (offered in Step 6).
+- A random URL is *obscurity, not security*. It can leak through browser history,
+  chat logs, link previews, or the `Referer` header — treat it as discoverable,
+  not secret.
+- Your traffic passes through Cloudflare's edge, where TLS is terminated. That's
+  normal for a tunnel, but it means a third party sits in the path and can in
+  principle see the traffic — fine for casual use, worth knowing for anything
+  sensitive.
+- Turn it off when you're done. The safest public link is one that isn't running:
+  stop the tunnel (and toggle the WebUI off) once you no longer need remote access.
 
 ### Optional - change the WebUI username / password for the user
 

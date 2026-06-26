@@ -98,6 +98,37 @@ async fn tc2_create_single_agent_team() {
     assert_eq!(json["data"]["assistants"].as_array().unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn tc_create_team_rejects_existing_agent_conversation_id() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let body = json!({
+        "name": "No Adoption",
+        "agents": [
+            {
+                "name": "Lead",
+                "role": "lead",
+                "model": "claude",
+                "assistant_id": DEFAULT_TEAM_ASSISTANT_ID,
+                "conversation_id": "solo-conv-1"
+            }
+        ]
+    });
+    let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], false);
+    assert_eq!(json["code"], "BAD_REQUEST");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("existing conversations are no longer supported")
+    );
+}
+
 // TC-3: Each assistant has a conversation
 #[tokio::test]
 async fn tc3_each_agent_has_conversation_id() {

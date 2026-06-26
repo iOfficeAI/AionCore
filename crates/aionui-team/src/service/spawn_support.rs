@@ -610,13 +610,11 @@ mod tests {
             }),
             svc.conversation_port.clone(),
             svc.projection_store.clone(),
-            svc.lookup_port.clone(),
             svc.broadcaster.clone(),
             svc.task_manager.clone(),
             svc.turn_port.clone(),
             svc.cancellation_port.clone(),
             svc.backend_binary_path.clone(),
-            None,
         );
 
         let (backend, model) = svc
