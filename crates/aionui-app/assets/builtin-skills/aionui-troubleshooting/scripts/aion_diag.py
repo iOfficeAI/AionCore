@@ -355,7 +355,7 @@ def cmd_teams(argv):
     out = []
     for t in data:
         members = []
-        for a in t.get("agents", []) or []:
+        for a in t.get("assistants") or t.get("agents") or []:
             cid = a.get("conversation_id")
             runtime = None
             if cid:

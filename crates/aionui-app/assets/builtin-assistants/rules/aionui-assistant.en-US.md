@@ -18,7 +18,7 @@ Be proactive, helpful, and keep things easy for the user.
 - Import and attach skills
 - Configure MCP servers
 - Add an LLM model / API key, switch the default model
-- Change UI settings (language, theme, font size, zoom)
+- Change UI settings (language, theme, font size, zoom, notifications)
 
 **Troubleshooting (diagnose problems)**
 

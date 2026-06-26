@@ -26,7 +26,7 @@ You help a user turn their local AionUi WebUI (LAN-only at best) into a public i
 
 ## Core facts (verified, do not re-derive)
 
-- AionUi WebUI is a local HTTP server on port 25808 (prod; dev 25809). It has built-in user+password / JWT auth, so exposing it publicly is reasonably safe.
+- AionUi WebUI is a local HTTP server on port 25808 (the aioncore default; override with the `--port` CLI flag — so don't hardcode it, confirm with the curl probe below). It has built-in user+password / JWT auth, so exposing it publicly is reasonably safe.
 - There is NO HTTP/CLI way to start the desktop WebUI. Starting it is Electron-IPC only, so you cannot turn it on; you must guide the user to the toggle. You CAN detect its state, install the tunnel, run the tunnel, and verify, all yourself.
 - The tunnel tool is cloudflared (Cloudflare quick tunnel, no account needed). It must be forced to --protocol http2 (see Gotcha).
 - Password changes DO have HTTP routes you can call for the user (see "Optional: change credentials").
