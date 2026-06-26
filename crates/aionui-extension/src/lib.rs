@@ -51,11 +51,13 @@ pub use hub_routes::{HubRouterState, hub_routes};
 pub use routes::{ExtensionRouterState, extension_routes};
 pub use skill_routes::{SkillRouterState, skill_routes};
 pub use skill_service::{
-    BUILTIN_SKILLS_ENV_VAR, BuiltinAutoSkillItem, ExternalSkillSource, NamedPath, ResolvedAgentSkill, ScannedSkill,
-    SkillListItem, SkillPaths, SkillSource, builtin_skills_corpus, delete_skill, detect_and_count_external_skills,
-    detect_common_skill_paths, export_skill_with_symlink, get_skill_paths, import_skill, import_skill_with_symlink,
-    link_workspace_skills, list_available_skills, list_builtin_auto_skills, materialize_skills_for_agent,
+    BUILTIN_SKILLS_ENV_VAR, ExternalSkillSource, NamedPath, ResolvedAgentSkill, ScannedSkill, SkillListItem,
+    SkillPaths, SkillSource, builtin_skills_corpus, delete_skill, delete_skill_with_repo,
+    detect_and_count_external_skills, detect_common_skill_paths, export_skill_with_symlink, get_skill_paths,
+    import_skill, import_skills_with_repo, link_workspace_skills, list_available_skills,
+    list_available_skills_with_repo, materialize_skills_for_agent, materialize_skills_for_agent_with_repo,
     read_builtin_rule, read_builtin_skill, read_skill_info, resolve_skill_paths, scan_for_skills,
+    sync_skill_catalog_into_repo,
 };
 pub use skill_service::{
     delete_assistant_rule, delete_assistant_skill, read_assistant_rule, read_assistant_skill, write_assistant_rule,

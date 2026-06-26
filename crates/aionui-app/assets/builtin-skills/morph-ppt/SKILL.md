@@ -40,12 +40,13 @@ Verify with `officecli --version` (open a new terminal if PATH hasn't picked up)
 
 ```bash
 officecli help pptx slide           # authoritative for: transition, advanceTime, advanceClick, background
+officecli help pptx transition      # transition / transitionDuration / transitionSpeed (Parent: slide)
 officecli help pptx shape           # name, preset, x/y/width/height, fill, rotation, opacity, animation
 officecli help pptx animation       # preset + trigger + duration values
 officecli help pptx <element> --json  # machine-readable schema
 ```
 
-Help reflects the installed CLI version. When skill and help disagree, **help wins.** Every `--prop X=` in this file is grep-verified against `officecli help pptx <element>`. Specific confirmations: `transition=morph` is a listed value on `slide`; `advanceTime` / `advanceClick` are valid. **There is NO standalone `transition` element** — `officecli help pptx transition` returns error. Sub-props such as `duration` / `delay` / `easing` for the transition itself are **not exposed on `slide`** — see §Known Issues for the raw-set path if you need them.
+Help reflects the installed CLI version. When skill and help disagree, **help wins.** Every `--prop X=` in this file is grep-verified against `officecli help pptx <element>`. Specific confirmations: `transition=morph` is a listed value on `slide`; `advanceTime` / `advanceClick` are valid. `transition` is a real element (`officecli help pptx transition`, Parent: slide, set/get) — it exposes `transition`, `transitionDuration`, and `transitionSpeed`. Set the transition with the high-level path `set <slide> --prop transition=morph`; tune speed/duration with the combined shorthand `transition=morph-slow` (or `-fast`, or `transition=morph-<DUR_MS>`). Speed/duration are set only via that shorthand on the `transition` prop, not as independent sub-props. Both round-trip on readback: `transition=morph-slow`/`-fast` reads back as `transitionSpeed=slow`/`fast`, and `transition=morph-<DUR_MS>` (e.g. `morph-1500`) reads back as `transitionDuration=1500`.
 
 ## Mental Model & Inheritance
 
@@ -69,7 +70,7 @@ Help reflects the installed CLI version. When skill and help disagree, **help wi
 - **Cross-slide shape-name binding.** PowerPoint's Morph engine pairs shapes by **identical `name=`** across adjacent slides and interpolates their position / size / rotation / fill / opacity. No matching name ⇒ no animation, silent fade. This is a workflow discipline, not a CLI feature.
 - **Namespace prefixes:** `!!scene-*` (persistent decoration, never ghosted) / `!!actor-*` (content that evolves then exits) / `#sN-*` (per-slide content, ghosted on slide N+1). Plan the names BEFORE you `add`.
 - **Ghost position `x=36cm`** (off the right edge of the 33.87cm canvas). Never delete a `!!`-prefixed shape — move it off-canvas so the morph exit animation still plays.
-- **`transition=morph` auto-prefix quirk.** The CLI auto-prepends `!!` to every shape on a morph slide, which silently breaks `@name=` path selectors. Use `/slide[N]/shape[K]` index paths after morph is set. See §Known Issues.
+- **`transition=morph` auto-prefix quirk.** The CLI auto-prepends `!!` to every shape on a morph slide (`#s1-title` is stored as `!!#s1-title`). `@name=` path selectors **still resolve** — `get .../shape[@name=#s1-title]` returns the shape (matching is suffix/prefix-tolerant). The name you read back is the prefixed form. See §Known Issues.
 - **Adjacent-slide spatial variety.** Displacement ≥ 5cm or rotation ≥ 15° between pairs — otherwise morph interpolates nothing visible.
 - **Renderer reality.** Morph renders in PowerPoint 365 / Keynote / WPS. LibreOffice and many web viewers render as plain fade (runtime feature). Not a skill defect — `[RENDERER-BUG]`.
 
@@ -87,7 +88,7 @@ Stay in **pptx v2 base** for any deck without cross-slide motion (board reviews,
 - **`$` in prop text — single-quote (price tokens).** `--prop text='$9/mo'` and `--prop text='$199/yr'` — NEVER `--prop text="$9/mo"` (zsh/bash eat `$9` as empty var → text rendered as `.` / stray period). Same for `${VAR}`, `$USER`, `\n`, `\r`, `\t` inside a double-quoted prop. Gate 2 morph addendum below greps for the leak signature.
 - **`#` in shell values — safe, but quote anyway.** `#` is a comment leader only at the start of a shell word. `--prop name=#s1-title` works, but `--prop 'name=#s1-title'` is the habit that stops you guessing.
 - **Batch heredoc is the cleanest path for multi-shape slides.** `<<'EOF' | officecli batch $FILE` disables all shell expansion — safe for `$`, `!!`, `#`, `'` inside the JSON body.
-- **`--json` responses wrap the payload in `.data.*`.** `query` returns `.data.results[]` (array of matches); `get` returns `.data.children[]` (direct content); `format` always sits at `.data.results[].format.X` / `.data.children[].format.X`. Always prefix jq paths with `.data.` — bare `.children[]` or `.results[]` returns null silently.
+- **`--json` responses wrap the payload in `.data.results[]`.** Both `query` and `get` return a `.data.results[]` array. A single node's `format` sits at `.data.results[0].format.X`; that node's children sit at `.data.results[0].children[]` (each child's format at `.data.results[0].children[].format.X`). Always go through `.data.results[0]` — bare `.data.children[]` or `.data.format` returns null silently.
 - **Variable:** `FILE="deck.pptx"` at the top of every build script; every example below uses `$FILE`.
 - **Gate shell pattern — COUNT, then if/else.** Never write `grep … && echo LEAK || echo OK` — when grep exits 1 (0 matches), the `||` branch fires with empty stdout and prints "OK" confusingly (or prints "LEAK" from prior pipes). Canonical form: `COUNT=$(cmd | wc -l); if [ "$COUNT" -gt 0 ]; then echo "LEAK: …"; else echo "OK"; fi`.
 
@@ -123,7 +124,7 @@ Morph only runs if slide N+1 carries `transition=morph`. Apply it via `officecli
 
 **Hard rule:** `!!scene-*` and `!!actor-*` names must NEVER collide (e.g., `!!scene-card` + `!!actor-card` in the same deck — morph engine confuses them). Disambiguate: `!!scene-card-bg` vs `!!actor-card-content`.
 
-**Charts are opaque to morph.** `officecli add … --type chart` does NOT accept `--prop name=!!…` (returns `UNSUPPORTED props: name`), so a chart cannot participate in shape-name morph pairing. For bar-grow / line-grow narratives: (a) accept plain fade-in of the chart as-is, OR (b) build N `!!actor-bar-K` rectangles manually sized to the values and morph those — each rect carries the same `!!actor-bar-K` name across adjacent slides while width / height / fill evolves.
+**Charts can be morph-paired.** `officecli add … --type chart` accepts `--prop name=!!…` (the name reads back), so a chart with an identical `!!`-name on adjacent slides participates in shape-name morph pairing — the chart frame interpolates position / size. Note morph cannot interpolate the *plotted data* inside the chart frame. For bar-grow / line-grow narratives where the bars themselves must animate: (a) accept plain fade-in of the chart as-is, OR (b) build N `!!actor-bar-K` rectangles manually sized to the values and morph those — each rect carries the same `!!actor-bar-K` name across adjacent slides while width / height / fill evolves.
 
 **Ghost accumulation is silent.** Once a `!!`-prefixed shape appears on any slide, it stays visible on every subsequent morph slide unless explicitly moved to `x=36cm`. `final-check` helper does NOT detect `!!` shapes lingering in the visible area — **only Gate 5b screenshot audit does.** Plan every actor's exit slide in the pair table BEFORE coding.
 
@@ -215,13 +216,14 @@ officecli add "$FILE" /slide[2] --type shape --prop 'name=!!scene-ring' --prop p
   --prop fill=E94560 --prop opacity=0.6 --prop x=20cm --prop y=2cm --prop width=12cm --prop height=12cm
 officecli add "$FILE" /slide[2] --type shape --prop 'name=!!scene-dot' --prop preset=ellipse \
   --prop fill=0F3460 --prop x=3cm --prop y=16cm --prop width=1.5cm --prop height=1.5cm
-# Ghost slide-1 content
-officecli set "$FILE" "/slide[2]/shape[@name=#s1-title]" --prop x=36cm 2>/dev/null || true  # name path may fail after morph — see Known Issues
+# Ghost slide-1 content (name path still resolves after morph — see Known Issues)
+officecli set "$FILE" "/slide[2]/shape[@name=#s1-title]" --prop x=36cm 2>/dev/null || true
 
 # Verify morph pair: identical names on slides 1 & 2
-officecli get "$FILE" /slide[1] --depth 1 --json | jq -r '.data.children[]?.format.name // empty'
-officecli get "$FILE" /slide[2] --depth 1 --json | jq -r '.data.children[]?.format.name // empty'
+officecli get "$FILE" /slide[1] --depth 1 --json | jq -r '.data.results[0].children[]?.format.name // empty'
+officecli get "$FILE" /slide[2] --depth 1 --json | jq -r '.data.results[0].children[]?.format.name // empty'
 # Compare — `!!scene-ring` and `!!scene-dot` MUST appear on both, byte-identical.
+# Note: morph stores names with a `!!` prefix; compare the prefixed forms.
 ```
 
 ### (c) Continuous multi-slide morph (story arc) — use helpers
@@ -241,9 +243,11 @@ def helper(*args):
 
 # ... assume slide 1 is built with 2 scene actors (!!scene-ring, !!scene-dot) + #s1-title
 # Helper builds slide 2–5 with: clone from previous + apply transition=morph + ghost previous #sN- content
+# `clone` prints the cloned slide's shape list — read it to pick which shape indices carry the
+# previous slide's #s(n-1)- content, then pass those explicit indices to `ghost`.
 for n in range(2, 6):
-    helper("clone", FILE, n - 1, n)          # clone + set transition=morph + list shapes
-    helper("ghost", FILE, n, "all-content")  # ghost all #s(n-1)-* via duplicate-text detection
+    helper("clone", FILE, n - 1, n)          # clone + set transition=morph + list shapes (note the #s(n-1)- indices)
+    helper("ghost", FILE, n, 1, 2)           # ghost the #s(n-1)- content shapes by index (here shapes 1 & 2)
     # …then add THIS slide's #sN- content via officecli add as normal…
 helper("final-check", FILE)                   # structural pass; DOES NOT catch !! lingering in visible area
 ```
@@ -264,7 +268,7 @@ officecli add "$FILE" /slide[2] --type shape --prop 'name=#s2-card' --prop prese
 # Apply simultaneous-with-morph fade entrance to the new card.
 # 'fade-entrance-300-with' = fade in, 300ms, trigger=withPrevious (plays with the morph transition).
 officecli set "$FILE" "/slide[2]/shape[@name=#s2-card]" --prop animation=fade-entrance-300-with
-officecli get "$FILE" "/slide[2]/shape[@name=#s2-card]" --json | jq '.data.format.animation'  # readback sanity
+officecli get "$FILE" "/slide[2]/shape[@name=#s2-card]" --json | jq '.data.results[0].format.animation'  # readback sanity — drops the trigger suffix, reads back as "fade-entrance-300"
 ```
 
 **Why this works.** Morph animates the `!!scene-*` shapes only (they have a pair on slide 1); the new `#s2-card` has no slide-1 counterpart, so morph would default-fade it — `fade-entrance-300-with` makes that fade explicit and timed. Keep the animation per pptx v2 floor: ≤ 600ms, no bounce / swivel / fly-from-edge (`officecli help pptx animation` for the canonical preset list).
@@ -321,7 +325,7 @@ Off-canvas (ghost): x ≥ 33.87cm  (canvas right edge; use x=36cm for explicit g
 
 ```bash
 officecli get "$FILE" "/slide[$N]" --depth 1 --json | \
-  jq -r '.data.children[]? | "\(.format.name // .path)  x=\(.format.x) y=\(.format.y) w=\(.format.width) h=\(.format.height)"'
+  jq -r '.data.results[0].children[]? | "\(.format.name // .path)  x=\(.format.x) y=\(.format.y) w=\(.format.width) h=\(.format.height)"'
 ```
 
 Confirm the actor's target position does not overlap any `#sN-*` content shape's bounding box (`x` to `x + width`, `y` to `y + height`). If it would overlap, lower actor `opacity` ≤ 0.15 OR move it to a safe zone.
@@ -369,7 +373,7 @@ Run `officecli view "$FILE" html` and Read the returned HTML path. For every sli
   NSLIDES=$(officecli query "$FILE" slide --json | jq '.data.results | length')
   for N in $(seq 1 $NSLIDES); do
     officecli get "$FILE" "/slide[$N]" --depth 1 --json | \
-      jq -r --arg n "$N" '.data.children[]? |
+      jq -r --arg n "$N" '.data.results[0].children[]? |
         select(.format.name? // "" | startswith("!!actor-")) |
         select((.format.x // "0cm" | rtrimstr("cm") | tonumber) < 33.87) |
         "slide \($n) leak: \(.format.name) stuck at x=\(.format.x)"'
@@ -381,22 +385,22 @@ Run `officecli view "$FILE" html` and Read the returned HTML path. For every sli
   ```bash
   for K in 1 2 3 4; do
     A=$(officecli get "$FILE" "/slide[$K]" --depth 1 --json | \
-      jq -r '.data.children[]? | select(.format.name? // "" | startswith("!!")) |
+      jq -r '.data.results[0].children[]? | select(.format.name? // "" | startswith("!!")) |
         "\(.format.name)|\(.format.x)|\(.format.y)|\(.format.width)|\(.format.height)|\(.format.rotation // 0)"')
     B=$(officecli get "$FILE" "/slide[$((K+1))]" --depth 1 --json | \
-      jq -r '.data.children[]? | select(.format.name? // "" | startswith("!!")) |
+      jq -r '.data.results[0].children[]? | select(.format.name? // "" | startswith("!!")) |
         "\(.format.name)|\(.format.x)|\(.format.y)|\(.format.width)|\(.format.height)|\(.format.rotation // 0)"')
     VARIES=$(diff <(echo "$A") <(echo "$B") | grep -c '^[<>]')
     if [ "$VARIES" -lt 6 ]; then echo "pair $K→$((K+1)) FLAT: only $VARIES diff-lines (need ≥ 6 = 3 shapes × 2 sides)"; fi
   done
   ```
 
-- **5b-morph-3 — Morph-pair name mismatches.** Adjacent slides must share at least 2 `!!`-prefixed names exactly. Proof (note: `.data.children[]` — bare `.children[]` returns null):
+- **5b-morph-3 — Morph-pair name mismatches.** Adjacent slides must share at least 2 `!!`-prefixed names exactly. Proof (note: children live at `.data.results[0].children[]` — bare `.data.children[]` returns null):
   ```bash
   for N in 1 2 3 4 5; do
     echo "--- slide $N ---"
     officecli get "$FILE" "/slide[$N]" --depth 1 --json | \
-      jq -r '.data.children[]? | select(.format.name? // "" | startswith("!!")) | .format.name'
+      jq -r '.data.results[0].children[]? | select(.format.name? // "" | startswith("!!")) | .format.name'
   done
   ```
   Visually compare sequential blocks — shared `!!` names between N and N+1 are the morph pairs. Zero overlap = the pair is a plain fade.
@@ -407,7 +411,7 @@ Run `officecli view "$FILE" html` and Read the returned HTML path. For every sli
   for N in $(seq 2 $NSLIDES); do
     PREV=$((N-1))
     officecli get "$FILE" "/slide[$N]" --depth 1 --json | \
-      jq -r --arg n "$N" --arg p "$PREV" '.data.children[]? |
+      jq -r --arg n "$N" --arg p "$PREV" '.data.results[0].children[]? |
         select(.format.name? // "" | startswith("#s\($p)-")) |
         select((.format.x // "0cm" | rtrimstr("cm") | tonumber) < 33.87) |
         "slide \($n) leak: \(.format.name) stuck at x=\(.format.x)"'
@@ -483,14 +487,14 @@ Base pptx pitfalls (shell quoting, zsh `[N]` globbing, hex `#` prefix, `\n` in p
 | Placing `!!actor-*` into the content core without planning an exit | Every `!!actor-*` needs a ghost slide. Plan it in the pair table BEFORE coding |
 | **Ghost accumulation (M-2): forgetting to re-ghost `!!actor-*` on later slides** | **CRITICAL:** When you add new content to slide N+1, ALL `!!actor-*` from slide N that should not be visible must be moved to `x=36cm` again. Do NOT assume they stay off-screen once ghosted — each slide is independent. Build pattern: `for each new slide: add content shapes → then loop: set each active !!actor-* to x=36cm`. `morph-helpers.py final-check` will REJECT if ghost count exceeds 50. |
 | Forgetting `transition=morph` on a slide | Silent fade. Gate 5b-morph-2 (no motion) catches it; fix via `set /slide[N] --prop transition=morph` |
-| Using `@name=` path on a morph slide after `transition=morph` was set | Selector breaks (M-1). Switch to index paths `/slide[N]/shape[K]` |
+| Assuming `@name=` paths break on a morph slide | They do not — `@name=` still resolves after `transition=morph` (M-1); only the *readback* name gains a `!!` prefix |
 | Adjacent slides visually identical | Morph has nothing to interpolate — collapses to plain fade. Apply §Scene-actor spatial rule and move ≥ 3 shapes by ≥ 5cm / ≥ 15° |
 | Trying to stagger 2 shapes via per-shape timing | Not supported — split the pair into two transitions with an intermediate keyframe slide |
 | Testing morph motion in LibreOffice or a browser | `[RENDERER-BUG]`, not skill defect. Test in PowerPoint 365 / Keynote / WPS |
 | Deleting a `!!` shape on exit instead of ghosting it | Deletion breaks morph pairing — the shape vanishes without animation. Always ghost to `x=36cm` |
 | Writing `--prop text="$9/mo"` with double quotes | Shell eats `$9` as empty variable → text stored as `/mo` or stray `.`. Use single quotes: `--prop text='$9/mo'`. Gate 2 morph addendum greps this leak. |
 | Using `<a:br/>` literal inside `--prop text='line1<a:br/>line2'` | Stored as 7 literal characters, not a line break. Use `officecli add "/slide[N]/shape[@id=K]" --type paragraph` once per line (M-6). |
-| Using `shape[name^=!!actor-]` selector | `officecli query` has no `^=` operator — returns `invalid_selector`. Use `get /slide[N] --depth 1 --json \| jq '.data.children[]? \| select(.format.name \| startswith("!!actor-"))'`. |
+| Using `shape[name^=!!actor-]` selector | `officecli query` has no `^=` operator — returns `invalid_selector`. Use `get /slide[N] --depth 1 --json \| jq '.data.results[0].children[]? \| select(.format.name \| startswith("!!actor-"))'`. |
 | Running `validate` while resident mode is open | Pptx v2 inherits this trap — `officecli close "$FILE"` BEFORE `validate` |
 
 ## Known Issues & Pitfalls
@@ -501,14 +505,14 @@ Base pptx bugs C-P-1..7 (hyperlink rPr, chart ChartShapeProperties warning, anim
 
 | # | Symptom | Workaround |
 |---|---|---|
-| **M-1** | After `officecli set '/slide[N]' --prop transition=morph`, every shape on that slide has `!!` auto-prepended to its name (`#s1-title` → `!!#s1-title`). Name-path selectors like `/slide[N]/shape[@name=#s1-title]` stop matching silently. **Selector filter caveat:** after auto-prefix, `!!#sN-caption` coexists alongside `!!actor-*` — filtering "scene actors" with `startswith("!!")` produces false matches on auto-prefixed content. Always filter with `startswith("!!actor-")` or `startswith("!!scene-")`, never bare `startswith("!!")`. | Use **index paths** after morph is set: `get /slide[N] --depth 1` to list shapes, then address via `/slide[N]/shape[K]`. Keep a shape-index comment at the top of the build script. |
+| **M-1** | After `officecli set '/slide[N]' --prop transition=morph`, every shape on that slide has `!!` auto-prepended to its name (`#s1-title` → `!!#s1-title`). The readback name is the prefixed form. **Selector filter caveat:** after auto-prefix, `!!#sN-caption` coexists alongside `!!actor-*` — filtering "scene actors" in `jq` with `startswith("!!")` produces false matches on auto-prefixed content. Always filter with `startswith("!!actor-")` or `startswith("!!scene-")`, never bare `startswith("!!")`. | `@name=` path selectors **still resolve** — `/slide[N]/shape[@name=#s1-title]` returns the shape (matching is suffix/prefix-tolerant), so no path rewrite is needed. When you need the prefixed name in a jq filter, account for the leading `!!`. |
 | **M-2 🚨** | **Ghost accumulation — `!!actor-*` introduced on slide 3 stays visible on slides 4, 5, 6 unless EXPLICITLY ghosted every page.** `final-check` helper detects this and rejects if ghost count > 50. | **MANDATORY per-slide rule:** After you add new content to a slide, immediately set ALL active `!!actor-*` from previous slides to `x=36cm` (or explicitly position them visible if they belong in the current context). Example: `officecli set /slide[4]/shape[@name=!!actor-ring] --prop x=36cm`. Run after EVERY slide addition, not just at the end. See §Ghost Discipline & Actor Lifecycle below. |
 | **M-3** | Section-transition boundary — on the first slide of a new topic section, previous-section `!!actor-*` shapes visibly linger. No command errors; only visual clutter. | On every section-start slide, explicitly ghost ALL `!!actor-*` from the previous section to `x=36cm`. Scene shapes (`!!scene-*`) stay. |
-| **M-4** | `officecli help pptx slide` lists `transition=` but NO sub-props for duration / delay / easing of the transition itself. Agents sometimes invent `morph.duration=` / `transition.delay=` — they are rejected as UNSUPPORTED. | Accept defaults (morph ~1s, linear ease). For custom speed, use `raw-set` to add the `spd` attribute on `<p:transition>` — see M-4 example block below. Help does not list sub-props; `raw-set` is the only path. |
+| **M-4** | Agents sometimes invent `morph.duration=` / `transition.delay=` as independent props — they are rejected as UNSUPPORTED. | Use the combined shorthand on the `transition` prop: `transition=morph-slow` / `-fast`, or `transition=morph-<DUR_MS>` (e.g. `transition=morph-1500`). Both round-trip on readback (`transitionSpeed=slow`, `transitionDuration=1500`). Only beyond what the shorthand exposes (fine control of the raw XML), fall back to `raw-set` on `<p:transition>` — see M-4 example block below. |
 | **M-5** | `[RENDERER-BUG]` LibreOffice / Google Slides web viewer render morph slides as plain fade (no interpolation). | Test in PowerPoint 365 / Keynote / WPS. Not a skill defect — do not chase. |
 | **M-6** | `<a:br/>` written inside `--prop text='line1<a:br/>line2'` is stored as the literal 7-character string, NOT interpreted as a line break. Audience sees `line1<a:br/>line2` rendered verbatim. | For multi-line bullets / captions, add one paragraph per line: `officecli add "/slide[N]/shape[@id=K]" --type paragraph --prop text='line1'` then repeat with `text='line2'`. See pptx v2 §Shell escape for the real-newline workflow. |
 
-**M-4 example — slow down all morph transitions** (`raw-set` requires a `<part>` positional arg; `//p:transition` matches both `mc:Choice` and `mc:Fallback` on a morph slide, yielding `2 element(s) affected`):
+**M-4 example — slow down all morph transitions, raw-set fallback** (prefer `transition=morph-slow`; use this only for control beyond the shorthand). Note `//p:transition` matches both `mc:Choice` and `mc:Fallback` on a morph slide, yielding `2 element(s) affected`:
 
 ```bash
 # Per-slide: add spd="slow" to every transition element on slide N (2 XML hits per morph slide)

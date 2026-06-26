@@ -4,7 +4,9 @@ use aionui_common::now_ms;
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{AgentMetadataRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams};
+use crate::models::{
+    AgentMetadataRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+};
 use crate::repository::agent_metadata::IAgentMetadataRepository;
 
 #[derive(Clone, Debug)]
@@ -191,6 +193,67 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         self.get(id).await
     }
 
+    async fn update_availability_snapshot(
+        &self,
+        id: &str,
+        params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        let now = now_ms();
+        let result = sqlx::query(
+            "UPDATE agent_metadata SET \
+                last_check_status = ?, \
+                last_check_kind = ?, \
+                last_check_error_code = ?, \
+                last_check_error_message = ?, \
+                last_check_guidance = ?, \
+                last_check_latency_ms = ?, \
+                last_check_at = ?, \
+                last_success_at = ?, \
+                last_failure_at = ?, \
+                updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(params.last_check_status)
+        .bind(params.last_check_kind)
+        .bind(params.last_check_error_code)
+        .bind(params.last_check_error_message)
+        .bind(params.last_check_guidance)
+        .bind(params.last_check_latency_ms)
+        .bind(params.last_check_at)
+        .bind(params.last_success_at)
+        .bind(params.last_failure_at)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get(id).await
+    }
+
+    async fn update_agent_overrides(
+        &self,
+        id: &str,
+        command_override: Option<&str>,
+        env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE agent_metadata SET command_override = ?, env_override = ?, \
+             updated_at = ? WHERE id = ?",
+        )
+        .bind(command_override)
+        .bind(env_override)
+        .bind(aionui_common::now_ms())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::Query)?;
+        Ok(())
+    }
+
     async fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool, DbError> {
         let now = now_ms();
         let result = sqlx::query("UPDATE agent_metadata SET enabled = ?, updated_at = ? WHERE id = ?")
@@ -301,8 +364,30 @@ mod tests {
         let claude = repo.get("2d23ff1c").await.unwrap().expect("seeded claude row");
         assert_eq!(claude.icon.as_deref(), Some("/api/assets/logos/ai-major/claude.svg"));
 
-        let aionrs = repo.get("632f31d2").await.unwrap().expect("seeded aion cli row");
+        let rows = repo.list_all().await.unwrap();
+        let aionrs = rows
+            .iter()
+            .find(|row| row.agent_type == "aionrs" && row.agent_source == "internal")
+            .expect("seeded aion cli row");
         assert_eq!(aionrs.icon.as_deref(), Some("/api/assets/logos/brand/aion.svg"));
+        let aionrs_modes: serde_json::Value =
+            serde_json::from_str(aionrs.available_modes.as_deref().expect("aionrs modes catalog")).unwrap();
+        assert_eq!(aionrs_modes["current_mode_id"].as_str(), Some("default"));
+        assert_eq!(
+            aionrs_modes["available_modes"]
+                .as_array()
+                .expect("aionrs available modes")
+                .iter()
+                .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["default", "auto_edit", "yolo"]
+        );
+        let aionrs_config_options: serde_json::Value =
+            serde_json::from_str(aionrs.config_options.as_deref().expect("aionrs config options")).unwrap();
+        assert_eq!(
+            aionrs_config_options["config_options"][0]["options"][1]["value"].as_str(),
+            Some("auto_edit")
+        );
 
         let kiro = repo.get("e044000d").await.unwrap().expect("seeded kiro row");
         assert!(kiro.icon.is_none());
@@ -432,6 +517,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_availability_snapshot_persists_last_check_fields() {
+        let (repo, _db) = setup().await;
+        let row = repo
+            .upsert(&UpsertAgentMetadataParams {
+                id: "agent-claude",
+                icon: None,
+                name: "Claude Code",
+                name_i18n: None,
+                description: None,
+                description_i18n: None,
+                backend: Some("claude"),
+                agent_type: "acp",
+                agent_source: "builtin",
+                agent_source_info: None,
+                enabled: true,
+                command: Some("claude"),
+                args: None,
+                env: None,
+                native_skills_dirs: None,
+                behavior_policy: None,
+                yolo_id: None,
+                agent_capabilities: None,
+                auth_methods: None,
+                config_options: None,
+                available_modes: None,
+                available_models: None,
+                available_commands: None,
+                sort_order: 10,
+            })
+            .await
+            .unwrap();
+
+        repo.update_availability_snapshot(
+            &row.id,
+            &crate::models::UpdateAgentAvailabilitySnapshotParams {
+                last_check_status: Some("available"),
+                last_check_kind: Some("manual"),
+                last_check_error_code: None,
+                last_check_error_message: None,
+                last_check_guidance: None,
+                last_check_latency_ms: Some(180),
+                last_check_at: Some(1_750_000_000_000),
+                last_success_at: Some(1_750_000_000_000),
+                last_failure_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let refreshed = repo.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(refreshed.last_check_status.as_deref(), Some("available"));
+        assert_eq!(refreshed.last_check_kind.as_deref(), Some("manual"));
+        assert_eq!(refreshed.last_check_latency_ms, Some(180));
+        assert_eq!(refreshed.last_success_at, Some(1_750_000_000_000));
+    }
+
+    #[tokio::test]
     async fn delete_removes_row() {
         let (repo, _db) = setup().await;
         let p = custom_params("custom-0002", "throwaway");
@@ -457,5 +599,23 @@ mod tests {
             dup_count, 2,
             "both rows should coexist after dropping UNIQUE(agent_source,name)"
         );
+    }
+
+    #[tokio::test]
+    async fn update_agent_overrides_persists_and_leaves_other_columns() {
+        let (repo, _db) = setup().await;
+        // Seed one agent row
+        let p = custom_params("agent-x", "agent-x");
+        repo.upsert(&p).await.unwrap();
+
+        repo.update_agent_overrides("agent-x", Some("/real/bin/x"), Some(r#"[{"name":"K","value":"V"}]"#))
+            .await
+            .unwrap();
+
+        let row = repo.get("agent-x").await.unwrap().unwrap();
+        assert_eq!(row.command_override.as_deref(), Some("/real/bin/x"));
+        assert_eq!(row.env_override.as_deref(), Some(r#"[{"name":"K","value":"V"}]"#));
+        // seed columns untouched
+        assert_eq!(row.name, "agent-x");
     }
 }

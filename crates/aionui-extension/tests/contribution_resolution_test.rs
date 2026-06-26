@@ -175,7 +175,7 @@ fn cr3_assistant_file_reference_resolved() {
             system_prompt: Some("@file:prompts/system.md".into()),
             icon: Some("icons/code.png".into()),
             context: None,
-            preset_agent_type: Some("gemini".into()),
+            agent_id: Some("gemini".into()),
             enabled_skills: vec!["code-review".into()],
             prompts: vec!["Review this patch".into()],
             models: vec!["gemini-2.0-flash".into()],
@@ -193,7 +193,7 @@ fn cr3_assistant_file_reference_resolved() {
         assistant.system_prompt.as_deref(),
         Some("You are a helpful coding assistant.")
     );
-    assert_eq!(assistant.preset_agent_type.as_deref(), Some("gemini"));
+    assert_eq!(assistant.agent_id.as_deref(), Some("gemini"));
     assert_eq!(assistant.enabled_skills, vec!["code-review"]);
     assert_eq!(assistant.prompts, vec!["Review this patch"]);
     assert_eq!(assistant.models, vec!["gemini-2.0-flash"]);

@@ -36,7 +36,7 @@ Verify with `officecli --version` (open a new terminal if PATH hasn't picked up)
 
 ```bash
 officecli help pptx                         # List all pptx elements
-officecli help pptx <element>               # Full element schema (e.g. shape, chart, animation, connector, zoom, group, background)
+officecli help pptx <element>               # Full element schema (e.g. shape, chart, animation, connector, zoom, group)
 officecli help pptx <verb> <element>        # Verb-scoped (e.g. add shape, set slide)
 officecli help pptx <element> --json        # Machine-readable schema
 ```
@@ -308,7 +308,7 @@ A slide is `/slide[N]`. Always pass `layout=blank` for custom designs. Backgroun
 ```bash
 officecli add "$FILE" / --type slide --prop layout=blank --prop background=1E2761                 # solid
 officecli add "$FILE" / --type slide --prop layout=blank --prop "background=1E2761-CADCFC-180"   # gradient (start-end-angle)
-officecli add "$FILE" / --type slide --prop layout=blank --prop "background.image=hero.jpg"      # image background (LEAD)
+officecli add "$FILE" / --type slide --prop layout=blank --prop background=image:/path/to/hero.jpg  # image background (LEAD)
 ```
 
 ### Shapes
@@ -383,10 +383,10 @@ officecli set "$FILE" "/slide[2]/shape[@name=HeroCard]" --prop animation=none   
 
 ### Tables, placeholders, groups, zoom — one-liners
 
-- **Tables** — `--type table --prop rows=N --prop cols=M`. Row-level `set` supports `height`, `header`, `c1/c2/c3`. Cell formatting lives on the cell paragraph / run. Populate rows BEFORE setting table-level font (font cascade gets reset by row ops).
+- **Tables** — `--type table --prop rows=N --prop cols=M`. Row-level `set` supports `height` and `c1/c2/c3` (seed cell text). Header-row styling is table-level (`firstRow=true` / `headerFill=`), not a row prop. Cell formatting lives on the cell paragraph / run. Populate rows BEFORE setting table-level font (font cascade gets reset by row ops).
 - **Placeholders** — `"/slide[N]/placeholder[title]"` / `placeholder[body]`. Available only when the slide uses a layout with placeholders (not `layout=blank`).
 - **Groups** (LEAD) — address children via `"/slide[N]/group[@name=G]/shape[1]"`. Survives reordering better than positional indexes.
-- **Zoom slide** (LEAD) — `--type zoom --prop targets="3,7,15"`. Section-navigation hub. Zoom is a runtime feature — `view html` shows the static geometry; the zoom interaction runs only in a live presentation viewer.
+- **Zoom slide** (LEAD) — `--type zoom --prop target=N` (one link per target; alias `slide`). Emit N separate zoom shapes for a multi-target nav hub. Zoom is a runtime feature — `view html` shows the static geometry; the zoom interaction runs only in a live presentation viewer.
 - **Slide comments** — reviewer annotations anchored at `/slide[N]/comment[M]`. Full lifecycle (`add / set / get / query / remove`). Props: `text`, `author`, `initials` (auto-derived), `date` (ISO 8601, defaults to UtcNow), `x` / `y` (length anchor).
   ```bash
   officecli add "$FILE" "/slide[2]" --type comment --prop author="Alice" --prop text="Tighten this bullet" --prop x=20cm --prop y=3cm

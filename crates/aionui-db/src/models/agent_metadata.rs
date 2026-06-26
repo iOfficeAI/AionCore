@@ -48,6 +48,19 @@ pub struct AgentMetadataRow {
     /// `007_agent_metadata_sort_order` migration for the range scheme.
     pub sort_order: i64,
 
+    pub last_check_status: Option<String>,
+    pub last_check_kind: Option<String>,
+    pub last_check_error_code: Option<String>,
+    pub last_check_error_message: Option<String>,
+    pub last_check_guidance: Option<String>,
+    pub last_check_latency_ms: Option<i64>,
+    pub last_check_at: Option<TimestampMs>,
+    pub last_success_at: Option<TimestampMs>,
+    pub last_failure_at: Option<TimestampMs>,
+
+    pub command_override: Option<String>,
+    pub env_override: Option<String>,
+
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -96,4 +109,18 @@ pub struct UpdateAgentHandshakeParams<'a> {
     pub available_modes: Option<Option<&'a str>>,
     pub available_models: Option<Option<&'a str>>,
     pub available_commands: Option<Option<&'a str>>,
+}
+
+/// Snapshot of the latest availability check or session-feedback result.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateAgentAvailabilitySnapshotParams<'a> {
+    pub last_check_status: Option<&'a str>,
+    pub last_check_kind: Option<&'a str>,
+    pub last_check_error_code: Option<&'a str>,
+    pub last_check_error_message: Option<&'a str>,
+    pub last_check_guidance: Option<&'a str>,
+    pub last_check_latency_ms: Option<i64>,
+    pub last_check_at: Option<TimestampMs>,
+    pub last_success_at: Option<TimestampMs>,
+    pub last_failure_at: Option<TimestampMs>,
 }

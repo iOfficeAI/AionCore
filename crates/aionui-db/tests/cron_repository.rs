@@ -52,7 +52,6 @@ fn make_job(id: &str) -> CronJobRow {
         agent_config: None,
         conversation_id: "conv_1".into(),
         conversation_title: Some("Conv 1".into()),
-        agent_type: "acp".into(),
         created_by: "user".into(),
         skill_content: None,
         description: None,
@@ -85,7 +84,6 @@ async fn cj1_insert_returns_all_fields() {
     assert_eq!(found.payload_message, "Run report");
     assert_eq!(found.execution_mode, "existing");
     assert_eq!(found.conversation_id, "conv_1");
-    assert_eq!(found.agent_type, "acp");
     assert_eq!(found.created_by, "user");
     assert_eq!(found.run_count, 0);
     assert_eq!(found.retry_count, 0);

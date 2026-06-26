@@ -7,11 +7,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, RemoteAgentService};
-use aionui_assistant::{AssistantRouterState, AssistantService, BuiltinAssistantRegistry};
+use aionui_assistant::{
+    AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
+};
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
 use aionui_conversation::{ConversationRouterState, ConversationService};
-use aionui_cron::{CronEventEmitter, CronRouterState};
+use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
     IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
@@ -234,6 +236,9 @@ pub async fn build_module_states(
         encryption_key,
         services.data_dir.clone(),
     );
+    services
+        .conversation_service
+        .with_agent_availability_feedback(agent_service.availability_feedback_port());
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: agent service built");
 
     tracing::info!(
@@ -284,6 +289,19 @@ pub async fn build_module_states(
 
 /// Build the default `AssistantRouterState` from application services.
 pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
+    #[derive(Clone)]
+    struct RegistryAssistantAgentCatalog {
+        registry: Arc<aionui_ai_agent::AgentRegistry>,
+    }
+
+    #[async_trait::async_trait]
+    impl AssistantAgentCatalogPort for RegistryAssistantAgentCatalog {
+        async fn list_management_agents(&self) -> Result<Vec<aionui_api_types::AgentManagementRow>, AssistantError> {
+            self.registry.refresh_availability().await;
+            Ok(self.registry.list_management_rows().await)
+        }
+    }
+
     let pool = services.database.pool().clone();
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> =
         Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
@@ -295,7 +313,7 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
     let override_repo: Arc<dyn IAssistantOverrideRepository> =
         Arc::new(SqliteAssistantOverrideRepository::new(pool.clone()));
     // Used by `AssistantService::resolve_default_agent_type` to infer a
-    // working `preset_agent_type` from the configured provider list when
+    // working `agent_id` from the configured provider list when
     // the caller does not supply one (ELECTRON-1J1 / 1KV).
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let builtin = Arc::new(BuiltinAssistantRegistry::load());
@@ -314,6 +332,9 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
             override_repo,
             provider_repo,
             builtin,
+            agent_catalog: Some(Arc::new(RegistryAssistantAgentCatalog {
+                registry: services.agent_registry.clone(),
+            })),
         },
         services.data_dir.clone(),
     ));
@@ -459,14 +480,24 @@ pub async fn build_channel_state(
     let pref_pool = services.database.pool().clone();
     let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
         Arc::new(SqliteClientPreferenceRepository::new(pref_pool));
-    let channel_settings = Arc::new(aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo));
+    let channel_settings = Arc::new(
+        aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo)
+            .with_agent_metadata_repo(Arc::new(SqliteAgentMetadataRepository::new(
+                services.database.pool().clone(),
+            )))
+            .with_assistant_repos(
+                Arc::new(SqliteAssistantDefinitionRepository::new(
+                    services.database.pool().clone(),
+                )),
+                Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
+            ),
+    );
 
     // Build orchestrator dependencies
     let action_executor = Arc::new(aionui_channel::action::ActionExecutor::new(
         Arc::clone(&pairing_service),
         Arc::clone(&session_manager),
         Arc::clone(&channel_settings),
-        "acp",
     ));
 
     let conv_repo: Arc<dyn aionui_db::IConversationRepository> = Arc::new(
@@ -474,6 +505,7 @@ pub async fn build_channel_state(
     );
     let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
         services.skill_paths.clone(),
+        services.skill_repo.clone(),
     ));
     let agent_metadata_repo: Arc<dyn aionui_db::IAgentMetadataRepository> = Arc::new(
         aionui_db::SqliteAgentMetadataRepository::new(services.database.pool().clone()),
@@ -570,6 +602,10 @@ pub fn build_team_state(
     let service = TeamSessionService::new(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
+        Arc::new(SqliteAssistantDefinitionRepository::new(
+            services.database.pool().clone(),
+        )),
+        Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
         Arc::new(SqliteProviderRepository::new(services.database.pool().clone())),
         conversation_port,
         projection_store,
@@ -594,6 +630,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
     let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
         services.skill_paths.clone(),
+        services.skill_repo.clone(),
     ));
     let conv_service = ConversationService::new(
         services.work_dir.clone(),
@@ -601,7 +638,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         skill_resolver,
         services.worker_task_manager.clone(),
         conv_repo.clone(),
-        agent_metadata_repo,
+        agent_metadata_repo.clone(),
         acp_session_repo,
     )
     .with_runtime_state(services.conversation_runtime_state.clone());
@@ -642,13 +679,20 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     )));
 
     let emitter = CronEventEmitter::new(services.event_bus.clone());
-    let cron_service = Arc::new(aionui_cron::service::CronService::new(
-        cron_repo,
+    let assistant_definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(
+        services.database.pool().clone(),
+    ));
+    let assistant_overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone()));
+    let cron_service = Arc::new(aionui_cron::service::CronService::new(CronServiceDeps {
+        repo: cron_repo,
+        agent_metadata_repo,
+        assistant_definition_repo,
+        assistant_overlay_repo,
         scheduler,
         executor,
         emitter,
-        services.data_dir.clone(),
-    ));
+        data_dir: services.data_dir.clone(),
+    }));
 
     tick_service_ref.0.lock().unwrap().replace(cron_service.clone());
 
@@ -714,13 +758,6 @@ pub async fn build_extension_states(
     let index_manager = HubIndexManager::new(hub_dir, registry.clone());
     let installer = HubInstaller::new(index_manager.clone(), registry.clone());
 
-    let app_resource_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-        .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let skill_paths = aionui_extension::resolve_skill_paths(&app_resource_dir, &skill_data_dir);
-
     let ext_paths_mgr = Arc::new(ExternalPathsManager::new(&skill_data_dir).await);
 
     let ext_state = ExtensionRouterState {
@@ -733,7 +770,8 @@ pub async fn build_extension_states(
     };
 
     let skill_state = SkillRouterState {
-        skill_paths,
+        skill_paths: services.skill_paths.as_ref().clone(),
+        skill_repo: services.skill_repo.clone(),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None,
     };

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 // A. Skill list & info
 // ---------------------------------------------------------------------------
 
-/// Origin of a listed skill — `builtin`, `custom`, or `extension`.
+/// Origin of a listed skill — `builtin`, `custom`, `cron`, or `extension`.
 ///
 /// Matches the renderer contract in
 /// `src/common/adapter/ipcBridge.ts::listAvailableSkills`.
@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub enum SkillSourceResponse {
     Builtin,
     Custom,
+    Cron,
     Extension,
 }
 
@@ -33,17 +34,6 @@ pub struct SkillListItemResponse {
     pub relative_location: Option<String>,
     pub is_custom: bool,
     pub source: SkillSourceResponse,
-}
-
-/// An auto-injected built-in skill (`GET /api/skills/builtin-auto`).
-///
-/// `location` is the relative path the frontend passes back into
-/// `POST /api/skills/builtin-skill` (e.g. `"auto-inject/cron/SKILL.md"`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BuiltinAutoSkillResponse {
-    pub name: String,
-    pub description: String,
-    pub location: String,
 }
 
 /// Request body for `POST /api/skills/info`.
@@ -75,6 +65,54 @@ pub struct ImportSkillResponse {
     pub skill_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skill_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<ImportSkillFailureResponse>,
+}
+
+/// Per-skill failure summary for batch skill import operations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImportSkillFailureResponse {
+    pub source_name: String,
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<i64>,
+}
+
+/// One row in the skill import history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillImportRecordResponse {
+    pub id: String,
+    pub operation_id: String,
+    pub source_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    pub source_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<i64>,
+    pub created_at: i64,
 }
 
 /// Request body for `POST /api/skills/export-symlink`.
@@ -141,6 +179,13 @@ pub struct NamedPathResponse {
 pub struct SkillPathsResponse {
     pub user_skills_dir: String,
     pub builtin_skills_dir: String,
+}
+
+/// Response for `GET /api/skills/import-limits`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillImportLimitsResponse {
+    pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +412,10 @@ mod tests {
             serde_json::json!("custom")
         );
         assert_eq!(
+            serde_json::to_value(SkillSourceResponse::Cron).unwrap(),
+            serde_json::json!("cron")
+        );
+        assert_eq!(
             serde_json::to_value(SkillSourceResponse::Extension).unwrap(),
             serde_json::json!("extension")
         );
@@ -408,10 +457,29 @@ mod tests {
         let resp = ImportSkillResponse {
             skill_name: "imported-skill".into(),
             skill_names: vec!["imported-skill".into(), "second-skill".into()],
+            failed: vec![ImportSkillFailureResponse {
+                source_name: "bad-skill".into(),
+                code: "SKILL_IMPORT_FILE_TOO_LARGE".into(),
+                error_path: Some("assets/movie.mp4".into()),
+                actual_bytes: Some(20),
+                limit_bytes: Some(10),
+                line: None,
+                column: None,
+            }],
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["skill_name"], "imported-skill");
         assert_eq!(json["skill_names"], json!(["imported-skill", "second-skill"]));
+        assert_eq!(
+            json["failed"],
+            json!([{
+                "source_name": "bad-skill",
+                "code": "SKILL_IMPORT_FILE_TOO_LARGE",
+                "error_path": "assets/movie.mp4",
+                "actual_bytes": 20,
+                "limit_bytes": 10
+            }])
+        );
         assert!(json.get("skillName").is_none());
     }
 

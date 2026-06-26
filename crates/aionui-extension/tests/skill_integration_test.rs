@@ -9,9 +9,9 @@ use std::path::Path;
 use aionui_extension::external_paths::ExternalPathsManager;
 use aionui_extension::skill_service::{
     NamedPath, SkillPaths, delete_assistant_rule, delete_assistant_skill, delete_skill,
-    detect_and_count_external_skills, export_skill_with_symlink, import_skill, import_skill_with_symlink,
-    list_available_skills, read_assistant_rule, read_assistant_skill, read_builtin_rule, read_builtin_skill,
-    read_skill_info, resolve_skill_paths, scan_for_skills, write_assistant_rule, write_assistant_skill,
+    detect_and_count_external_skills, export_skill_with_symlink, import_skill, list_available_skills,
+    read_assistant_rule, read_assistant_skill, read_builtin_rule, read_builtin_skill, read_skill_info,
+    resolve_skill_paths, scan_for_skills, write_assistant_rule, write_assistant_skill,
 };
 use tempfile::TempDir;
 
@@ -140,9 +140,9 @@ async fn sm3_import_skill_copy() {
     assert!(imported.join("helper.py").exists());
 }
 
-/// SM-4: Import skill (symlink).
+/// SM-4: Import skill replaces existing imported copy.
 #[tokio::test]
-async fn sm4_import_skill_symlink() {
+async fn sm4_import_skill_replaces_existing_copy() {
     let tmp = TempDir::new().unwrap();
     let paths = make_paths(tmp.path());
 
@@ -154,15 +154,22 @@ async fn sm4_import_skill_symlink() {
     )
     .unwrap();
 
-    let name = import_skill_with_symlink(&paths, &source).await.unwrap();
+    let name = import_skill(&paths, &source).await.unwrap();
     assert_eq!(name, "linked");
 
-    let link = paths.user_skills_dir.join("linked");
-    assert!(link.is_symlink());
+    std::fs::write(
+        source.join(SKILL_MD),
+        "---\nname: linked\ndescription: Linked skill\n---\nUpdated body.",
+    )
+    .unwrap();
 
-    // Verify content is accessible through the symlink
-    let content = std::fs::read_to_string(link.join(SKILL_MD)).unwrap();
-    assert!(content.contains("Linked skill"));
+    let name = import_skill(&paths, &source).await.unwrap();
+    assert_eq!(name, "linked");
+
+    let imported = paths.user_skills_dir.join("linked");
+    assert!(!imported.is_symlink());
+    let content = std::fs::read_to_string(imported.join(SKILL_MD)).unwrap();
+    assert!(content.contains("Updated body"));
 }
 
 /// SM-5: Export skill (symlink).
@@ -196,6 +203,9 @@ async fn sm6_delete_custom_skill() {
 
     delete_skill(&paths, "deletable").await.unwrap();
     assert!(!paths.user_skills_dir.join("deletable").exists());
+
+    let skills = list_available_skills(&paths).await.unwrap();
+    assert!(!skills.iter().any(|skill| skill.name == "deletable"));
 }
 
 /// SM-7: Delete built-in skill → rejected.

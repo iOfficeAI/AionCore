@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
+use aionui_db::ISkillRepository;
 use regex::Regex;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -52,6 +53,9 @@ pub struct AcpSkillManager {
     /// Consumed by `discover_skills` / `get_skill` (Task 4 / 5 of the refactor).
     #[allow(dead_code)]
     paths: Arc<aionui_extension::SkillPaths>,
+    /// User skill state source. When absent, discovery falls back to legacy
+    /// path-based listing for unit tests that do not stand up a database.
+    skill_repo: Option<Arc<dyn ISkillRepository>>,
 }
 
 impl AcpSkillManager {
@@ -60,6 +64,16 @@ impl AcpSkillManager {
             cache: RwLock::new(HashMap::new()),
             discovered: RwLock::new(false),
             paths,
+            skill_repo: None,
+        })
+    }
+
+    pub fn new_with_repo(paths: Arc<aionui_extension::SkillPaths>, skill_repo: Arc<dyn ISkillRepository>) -> Arc<Self> {
+        Arc::new(Self {
+            cache: RwLock::new(HashMap::new()),
+            discovered: RwLock::new(false),
+            paths,
+            skill_repo: Some(skill_repo),
         })
     }
 
@@ -68,8 +82,9 @@ impl AcpSkillManager {
     /// Filtering rules:
     /// - Auto-inject builtin skills (under `auto-inject/` in the corpus) are
     ///   always included unless listed in `exclude_builtin_skills`.
-    /// - Opt-in builtin skills (siblings of `auto-inject/`) and custom/extension
-    ///   skills are included only if `enabled_skills` contains their name.
+    /// - Opt-in builtin skills (siblings of `auto-inject/`) and custom/cron/
+    ///   extension skills are included only if `enabled_skills` contains their
+    ///   name.
     ///
     /// Populates the cache; subsequent `get_skill(name)` calls read body lazily.
     pub async fn discover_skills(
@@ -77,7 +92,7 @@ impl AcpSkillManager {
         enabled_skills: Option<&[String]>,
         exclude_builtin_skills: Option<&[String]>,
     ) -> Vec<SkillIndex> {
-        let items = match aionui_extension::list_available_skills(&self.paths).await {
+        let items = match self.list_available_skills().await {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "Failed to list skills via extension service");
@@ -102,7 +117,9 @@ impl AcpSkillManager {
                         enabled_skills.is_some_and(|en| en.iter().any(|n| n == &item.name))
                     }
                 }
-                aionui_extension::SkillSource::Custom | aionui_extension::SkillSource::Extension => {
+                aionui_extension::SkillSource::Custom
+                | aionui_extension::SkillSource::Cron
+                | aionui_extension::SkillSource::Extension => {
                     enabled_skills.is_some_and(|en| en.iter().any(|n| n == &item.name))
                 }
             };
@@ -150,7 +167,7 @@ impl AcpSkillManager {
             *discovered = true;
             return Vec::new();
         }
-        let items = match aionui_extension::list_available_skills(&self.paths).await {
+        let items = match self.list_available_skills().await {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "discover_by_names: list_available_skills failed");
@@ -188,6 +205,16 @@ impl AcpSkillManager {
             .collect()
     }
 
+    async fn list_available_skills(
+        &self,
+    ) -> Result<Vec<aionui_extension::SkillListItem>, aionui_extension::ExtensionError> {
+        if let Some(repo) = &self.skill_repo {
+            aionui_extension::list_available_skills_with_repo(&self.paths, repo.as_ref()).await
+        } else {
+            aionui_extension::list_available_skills(&self.paths).await
+        }
+    }
+
     /// Return the current skill index without re-scanning.
     pub async fn get_skills_index(&self) -> Vec<SkillIndex> {
         let cache = self.cache.read().await;
@@ -205,7 +232,7 @@ impl AcpSkillManager {
     /// Returns `None` if the skill is unknown. On first access the body is
     /// read via the appropriate channel based on `source`:
     /// - `Builtin` → `aionui_extension::read_builtin_skill(&paths, relative)`
-    /// - `Custom` / `Extension` → direct `tokio::fs::read_to_string(location/SKILL.md)`
+    /// - `Custom` / `Cron` / `Extension` → direct `tokio::fs::read_to_string(location/SKILL.md)`
     pub async fn get_skill(&self, name: &str) -> Option<SkillDefinition> {
         // Fast path: check if body is already cached
         {
@@ -239,7 +266,9 @@ impl AcpSkillManager {
                     String::new()
                 }
             }
-            aionui_extension::SkillSource::Custom | aionui_extension::SkillSource::Extension => {
+            aionui_extension::SkillSource::Custom
+            | aionui_extension::SkillSource::Cron
+            | aionui_extension::SkillSource::Extension => {
                 // `location` for scanned user skills is the directory; append SKILL.md.
                 let skill_file = if def.location.is_dir() {
                     def.location.join("SKILL.md")

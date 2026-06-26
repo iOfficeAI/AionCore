@@ -126,21 +126,16 @@ struct SendMessageParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SpawnAgentParams {
     /// Agent display name.
     name: String,
-    /// AI backend type: "claude" or "codex". Default when omitted.
-    #[serde(default)]
-    agent_type: Option<String>,
     /// Model override for the new agent.
     #[serde(default)]
     model: Option<String>,
-    /// Preset assistant identifier.
+    /// Assistant identifier from the available assistants catalog.
     #[serde(default)]
-    custom_agent_id: Option<String>,
-    /// Legacy backend field (prefer agent_type).
-    #[serde(default)]
-    backend: Option<String>,
+    assistant_id: Option<String>,
     /// Agent role (default: "teammate").
     #[serde(default)]
     role: Option<String>,
@@ -198,15 +193,16 @@ struct ShutdownAgentParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ListModelsParams {
-    /// Agent type/backend to query (e.g. "gemini", "claude", "codex"). Shows all when omitted.
+    /// Assistant ID to query. Shows all backends when omitted.
     #[serde(default)]
-    agent_type: Option<String>,
+    assistant_id: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DescribeAssistantParams {
-    /// The preset assistant ID from the "Available Preset Assistants" catalog.
-    custom_agent_id: String,
+    /// The assistant ID from the "Available Assistants" catalog.
+    assistant_id: String,
     /// Locale for the description (e.g. "en", "zh"). Default when omitted.
     #[serde(default)]
     locale: Option<String>,
@@ -232,17 +228,15 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_spawn_agent",
-        description = "Create a new teammate agent to join the team.\n\nUse this only when one of the following is true:\n- The user explicitly approved the proposed teammate lineup in a previous message\n- The user explicitly instructed you to create a specific teammate immediately\n\nBefore calling this tool in the normal planning flow:\n- Start with one short sentence explaining why additional teammates would help\n- Tell the user which teammate(s) you recommend\n- Present the proposal as a table with: name, responsibility, recommended agent type/backend, and recommended model\n- Include each teammate's responsibility, recommended agent type/backend, and model\n- Ask whether to create them as proposed or change any names, responsibilities, or agent types\n- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well\n- Do NOT call this tool in that same turn; wait for explicit approval in a later user message\n\nWhen calling this tool, provide the model parameter if a specific model was recommended and approved.\n\nThe new agent will be created and added to the team. You can then assign tasks and send messages to it."
+        description = "Create a new teammate agent to join the team.\n\nUse this only when one of the following is true:\n- The user explicitly approved the proposed teammate lineup in a previous message\n- The user explicitly instructed you to create a specific teammate immediately\n\nBefore calling this tool in the normal planning flow:\n- Start with one short sentence explaining why additional teammates would help\n- Tell the user which teammate(s) you recommend\n- Present the proposal as a table with: name, responsibility, recommended assistant, and recommended model\n- Include each teammate's responsibility, recommended assistant, and model\n- Ask whether to create them as proposed or change any names, responsibilities, or assistant choices\n- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well\n- Do NOT call this tool in that same turn; wait for explicit approval in a later user message\n\nWhen calling this tool, always provide assistant_id from the available assistants catalog.\nWhen calling this tool, provide the model parameter if a specific model was recommended and approved.\n\nThe new agent will be created and added to the team. You can then assign tasks and send messages to it."
     )]
     async fn spawn_agent(&self, Parameters(params): Parameters<SpawnAgentParams>) -> CallToolResult {
         self.forward_to_tcp(
             "team_spawn_agent",
             &serde_json::json!({
                 "name": params.name,
-                "agent_type": params.agent_type,
                 "model": params.model,
-                "custom_agent_id": params.custom_agent_id,
-                "backend": params.backend,
+                "assistant_id": params.assistant_id,
                 "role": params.role,
             }),
         )
@@ -316,25 +310,34 @@ impl TeamStdioServer {
     }
 
     #[tool(
+        name = "team_list_assistants",
+        description = "List the assistants available for team spawning. Returns the real assistant catalog with real assistant_id values, names, backends, descriptions, and skills.\n\nUse this before team_spawn_agent when you need the exact assistant_id for a teammate. Do NOT guess from backend names like claude/codex/gemini — only use assistant_id values returned here."
+    )]
+    async fn list_assistants(&self) -> CallToolResult {
+        self.forward_to_tcp("team_list_assistants", &serde_json::json!({}))
+            .await
+    }
+
+    #[tool(
         name = "team_list_models",
-        description = "Query available models for team agent types. Returns the real-time model list that matches the frontend model selector.\n\nUse this to:\n- Check what models are available before spawning an agent with a specific model\n- See all available agent types and their models at once\n- Verify a model ID is valid for a given agent type\n\nPass agent_type to query a specific backend, or omit it to see all."
+        description = "Query available models for assistant backends. Returns the real-time model list that matches the frontend model selector.\n\nUse this to:\n- Check what models are available before spawning an assistant-backed teammate with a specific model\n- See all available backends and their models at once\n- Verify a model ID is valid for the backend behind a chosen assistant or fallback backend\n\nPass assistant_id to query models for a specific assistant, or omit it to see all backends."
     )]
     async fn list_models(&self, Parameters(params): Parameters<ListModelsParams>) -> CallToolResult {
         self.forward_to_tcp(
             "team_list_models",
-            &serde_json::json!({ "agent_type": params.agent_type }),
+            &serde_json::json!({ "assistant_id": params.assistant_id }),
         )
         .await
     }
 
     #[tool(
         name = "team_describe_assistant",
-        description = "Get detailed information about a preset assistant before spawning it as a teammate.\n\nReturns the preset's full description, enabled skills, and example tasks so you can\njudge whether it fits the user's request. Use this when two or more presets look\nrelevant from the one-line catalog in your system prompt.\n\nOnly works on preset assistants listed in \"Available Preset Assistants for Spawning\".\nAfter confirming a match, call team_spawn_agent with the same custom_agent_id."
+        description = "Get detailed information about an assistant before spawning it as a teammate.\n\nReturns the assistant's full description, enabled skills, and example tasks so you can\njudge whether it fits the user's request. Use this when two or more assistants look\nrelevant from the one-line catalog in your system prompt.\n\nOnly works on assistants listed in \"Available Assistants for Spawning\".\nAfter confirming a match, call team_spawn_agent with the same assistant_id."
     )]
     async fn describe_assistant(&self, Parameters(params): Parameters<DescribeAssistantParams>) -> CallToolResult {
         self.forward_to_tcp(
             "team_describe_assistant",
-            &serde_json::json!({ "custom_agent_id": params.custom_agent_id, "locale": params.locale }),
+            &serde_json::json!({ "assistant_id": params.assistant_id, "locale": params.locale }),
         )
         .await
     }
@@ -678,6 +681,46 @@ mod tests {
     }
 
     #[test]
+    fn spawn_agent_params_reject_legacy_custom_agent_id_alias() {
+        let parsed = serde_json::from_value::<SpawnAgentParams>(json!({
+            "name": "helper",
+            "custom_agent_id": "assistant-123",
+        }));
+        assert!(parsed.is_err(), "legacy custom_agent_id alias should be rejected");
+        let err = parsed.err().unwrap();
+
+        assert!(err.to_string().contains("unknown field"));
+        assert!(err.to_string().contains("custom_agent_id"));
+    }
+
+    #[test]
+    fn describe_assistant_params_reject_legacy_custom_agent_id_alias() {
+        let parsed = serde_json::from_value::<DescribeAssistantParams>(json!({
+            "custom_agent_id": "assistant-123",
+        }));
+        assert!(parsed.is_err(), "legacy custom_agent_id alias should be rejected");
+        let err = parsed.err().unwrap();
+
+        assert!(err.to_string().contains("unknown field"));
+        assert!(err.to_string().contains("custom_agent_id"));
+    }
+
+    #[test]
+    fn team_stdio_router_exposes_team_list_assistants() {
+        let router = TeamStdioServer::tool_router();
+        let tools = router.list_all();
+        let team_list_assistants = tools
+            .iter()
+            .find(|tool| tool.name == "team_list_assistants")
+            .expect("team_list_assistants tool missing");
+        let properties = team_list_assistants.input_schema["properties"].as_object().unwrap();
+        assert!(
+            properties.is_empty(),
+            "team_list_assistants should not accept arguments"
+        );
+    }
+
+    #[test]
     fn team_stdio_descriptions_match_prompt_registry() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
@@ -844,6 +887,55 @@ mod tests {
         );
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("conv-secret-123"));
+    }
+
+    #[tokio::test]
+    async fn list_models_forwards_assistant_id_argument() {
+        let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _init = read_frame(&mut socket).await.unwrap();
+            let init_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {}
+            }))
+            .unwrap();
+            write_frame(&mut socket, &init_response).await.unwrap();
+
+            let call = read_frame(&mut socket).await.unwrap();
+            let call_value: serde_json::Value = serde_json::from_slice(&call).unwrap();
+            let arguments = &call_value["params"]["arguments"];
+            assert_eq!(arguments["assistant_id"], json!("assistant-social-job-publisher"));
+            assert!(arguments.get("agent_type").is_none());
+
+            let tool_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{ "type": "text", "text": "ok" }],
+                    "isError": false
+                }
+            }))
+            .unwrap();
+            write_frame(&mut socket, &tool_response).await.unwrap();
+        });
+        let server = TeamStdioServer {
+            port,
+            token: "dummy-token".into(),
+            slot_id: "dummy-slot".into(),
+        };
+
+        let result = server
+            .list_models(Parameters(ListModelsParams {
+                assistant_id: Some("assistant-social-job-publisher".into()),
+            }))
+            .await;
+
+        accept_task.await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(first_text(&result), "ok");
     }
 
     #[test]

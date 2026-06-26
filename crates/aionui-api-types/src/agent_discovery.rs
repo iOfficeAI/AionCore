@@ -11,7 +11,7 @@
 //! depend on the ACP protocol SDK — the ai-agent crate typed-decodes
 //! them when it needs to.
 
-use aionui_common::AgentType;
+use aionui_common::{AgentType, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -106,10 +106,45 @@ pub struct AgentHandshake {
     pub available_commands: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentManagementStatus {
+    Missing,
+    Online,
+    Offline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSnapshotCheckStatus {
+    Online,
+    Offline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSnapshotCheckKind {
+    Startup,
+    Scheduled,
+    Manual,
+    Session,
+}
+
+/// A single `backend → logo URL` pair in the agent logo catalog.
+///
+/// Returned by `GET /api/agents/logos` so business surfaces can resolve
+/// an agent logo from a backend identifier without owning a path map.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentLogoEntry {
+    pub backend: String,
+    pub logo: String,
+}
+
 /// The unified, decoded view of an `agent_metadata` row.
 ///
-/// Also the API response shape: `/api/agents` returns a list of these
-/// directly, no adapter required.
+/// This remains the refresh/logos/custom-agent CRUD read model for the
+/// legacy agent catalog, even though business surfaces now consume
+/// assistants instead of `GET /api/agents`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMetadata {
     pub id: String,
@@ -176,8 +211,106 @@ pub struct AgentMetadata {
     #[serde(default)]
     pub team_capable: bool,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_status: Option<AgentSnapshotCheckStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_kind: Option<AgentSnapshotCheckKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_guidance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_latency_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_at: Option<TimestampMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<TimestampMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<TimestampMs>,
+
     #[serde(default)]
     pub handshake: AgentHandshake,
+
+    /// Internal carrier: whether the agent row has a command override set.
+    /// Computed in decode_row and projected to `AgentManagementRow`.
+    #[serde(skip)]
+    pub has_command_override: bool,
+    /// Internal carrier: count of non-blocked env override keys.
+    /// Computed in decode_row and projected to `AgentManagementRow`.
+    #[serde(skip)]
+    pub env_override_key_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentManagementRow {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_i18n: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_i18n: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    pub agent_type: AgentType,
+    pub agent_source: AgentSource,
+    #[serde(default)]
+    pub agent_source_info: AgentSourceInfo,
+    pub enabled: bool,
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<AgentEnvEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_skills_dirs: Option<Vec<String>>,
+    #[serde(default)]
+    pub behavior_policy: BehaviorPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yolo_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_modes: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_models: Option<serde_json::Value>,
+    pub sort_order: i64,
+    #[serde(default)]
+    pub team_capable: bool,
+    pub status: AgentManagementStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_status: Option<AgentSnapshotCheckStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_kind: Option<AgentSnapshotCheckKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error_details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_guidance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_latency_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_at: Option<TimestampMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<TimestampMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<TimestampMs>,
+    #[serde(default)]
+    pub has_command_override: bool,
+    #[serde(default)]
+    pub env_override_key_count: usize,
 }
 
 #[cfg(test)]
@@ -224,7 +357,19 @@ mod tests {
             yolo_id: None,
             sort_order: 3100,
             team_capable: true,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_error_details: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
             handshake: AgentHandshake::default(),
+            has_command_override: false,
+            env_override_key_count: 0,
         };
         let v = serde_json::to_value(&meta).unwrap();
         assert_eq!(v["id"], "abc12345");
@@ -253,7 +398,14 @@ mod tests {
         assert_eq!(meta.agent_source, AgentSource::Custom);
         assert!(!meta.available);
         assert!(!meta.behavior_policy.supports_side_question);
+        assert!(meta.last_check_status.is_none());
         assert!(meta.handshake.agent_capabilities.is_none());
+    }
+
+    #[test]
+    fn agent_management_status_serializes_snake_case() {
+        let value = serde_json::to_value(AgentManagementStatus::Offline).unwrap();
+        assert_eq!(value, json!("offline"));
     }
 }
 

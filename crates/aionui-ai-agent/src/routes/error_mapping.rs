@@ -28,10 +28,14 @@ fn acp_error_to_api_error(err: AcpError) -> ApiError {
             ApiError::BadGateway(acp_error_public_message(&err))
         }
         AcpError::AuthRequired => ApiError::Unauthorized("Agent requires authentication".into()),
+        AcpError::ProtocolParseError { .. } => ApiError::BadGateway(acp_error_public_message(&err)),
+        AcpError::InvalidRequest { .. } => ApiError::BadRequest(acp_error_public_message(&err)),
         AcpError::SessionNotFound { .. } => ApiError::NotFound(acp_error_public_message(&err)),
+        AcpError::ResourceNotFound { .. } => ApiError::NotFound(acp_error_public_message(&err)),
         AcpError::MethodNotFound { .. } => ApiError::BadRequest(acp_error_public_message(&err)),
         AcpError::InvalidParams { .. } => ApiError::BadRequest(acp_error_public_message(&err)),
         AcpError::AgentInternal { .. } => ApiError::BadGateway(acp_error_public_message(&err)),
+        AcpError::OtherProtocolError { .. } => ApiError::BadGateway(acp_error_public_message(&err)),
         AcpError::NotConnected => ApiError::BadGateway(acp_error_public_message(&err)),
         AcpError::InitTimeout { .. } => ApiError::BadGateway(acp_error_public_message(&err)),
     }
@@ -43,10 +47,14 @@ fn acp_error_public_message(err: &AcpError) -> String {
             "Agent process is unavailable.".to_owned()
         }
         AcpError::AuthRequired => "Agent requires authentication.".to_owned(),
+        AcpError::ProtocolParseError { .. } => "Agent returned malformed protocol data.".to_owned(),
+        AcpError::InvalidRequest { .. } => "Agent rejected an invalid protocol request.".to_owned(),
         AcpError::SessionNotFound { .. } => "Agent session was not found.".to_owned(),
+        AcpError::ResourceNotFound { .. } => "Agent resource was not found.".to_owned(),
         AcpError::MethodNotFound { .. } => "Agent method is not supported.".to_owned(),
         AcpError::InvalidParams { .. } => "Invalid ACP request parameters.".to_owned(),
         AcpError::AgentInternal { code, .. } => format!("Agent internal error (code {code})"),
+        AcpError::OtherProtocolError { code, .. } => format!("Agent protocol error (code {code})"),
         AcpError::NotConnected => "ACP protocol is not connected.".to_owned(),
         AcpError::InitTimeout { .. } => "Agent initialization timed out.".to_owned(),
     }
@@ -63,7 +71,26 @@ mod tests {
             (AcpError::SpawnFailed { message: "x".into() }, StatusCode::BAD_GATEWAY),
             (AcpError::AuthRequired, StatusCode::UNAUTHORIZED),
             (
+                AcpError::ProtocolParseError {
+                    message: "Parse error".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                AcpError::InvalidRequest {
+                    message: "Invalid request".into(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
                 AcpError::SessionNotFound { session_id: "s".into() },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                AcpError::ResourceNotFound {
+                    resource: Some("file:///missing.txt".into()),
+                    message: "Resource not found".into(),
+                },
                 StatusCode::NOT_FOUND,
             ),
             (AcpError::MethodNotFound { method: "m".into() }, StatusCode::BAD_REQUEST),
@@ -72,6 +99,14 @@ mod tests {
                 AcpError::AgentInternal {
                     message: "e".into(),
                     code: -1,
+                    data: None,
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                AcpError::OtherProtocolError {
+                    code: -32099,
+                    message: "custom error".into(),
                     data: None,
                 },
                 StatusCode::BAD_GATEWAY,

@@ -77,6 +77,34 @@ pub enum ExtensionError {
     #[error("Invalid skill path: {0}")]
     InvalidSkillPath(String),
 
+    #[error("Skill frontmatter is invalid: {0}")]
+    SkillInvalidFrontmatter(String),
+
+    #[error("No skill directories found: {0}")]
+    SkillImportNoSkillFound(String),
+
+    #[error("Invalid skill import source: {0}")]
+    SkillImportInvalidSource(String),
+
+    #[error("Skill import does not allow symlink entries: {0}")]
+    SkillImportSymlinkEntry(String),
+
+    #[error("Skill import file is too large: {file_bytes} bytes, limit {limit_bytes} bytes")]
+    SkillImportFileTooLarge {
+        file_path: Option<String>,
+        file_bytes: u64,
+        limit_bytes: u64,
+    },
+
+    #[error("Skill import is too large: {total_bytes} bytes, limit {limit_bytes} bytes")]
+    SkillImportTotalTooLarge { total_bytes: u64, limit_bytes: u64 },
+
+    #[error("Invalid skill zip archive: {0}")]
+    SkillImportInvalidZip(String),
+
+    #[error("{0}")]
+    Db(#[from] aionui_db::DbError),
+
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 

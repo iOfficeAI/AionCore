@@ -50,7 +50,7 @@ fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
         conversation_id: format!("conv-{slot_id}"),
         backend: "acp".into(),
         model: "claude".into(),
-        custom_agent_id: None,
+        assistant_id: None,
         status: None,
         conversation_type: None,
         cli_path: None,
@@ -381,7 +381,7 @@ async fn we2_add_agent_broadcasts_spawned() {
     let events = h.broadcaster.events_by_name("team.agentSpawned");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].data["team_id"], "team-1");
-    assert!(events[0].data["agent"].is_object());
+    assert!(events[0].data["assistant"].is_object());
 }
 
 // -- WE-3: Remove agent broadcasts team.agentRemoved ----------------------

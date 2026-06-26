@@ -15,9 +15,7 @@ use crate::events::{
     TEAM_RUN_ACCEPTED_EVENT, TEAM_RUN_CANCELLED_EVENT, TEAM_RUN_COMPLETED_EVENT, TEAM_RUN_FAILED_EVENT,
     TEAM_RUN_STARTED_EVENT, TEAM_RUN_UPDATED_EVENT, TeamEventEmitter,
 };
-use crate::slot_wake_gate::SlotWakeGate;
-#[cfg(test)]
-use crate::slot_wake_gate::WakeGateDecision;
+use crate::slot_wake_gate::{SlotWakeGate, WakeGateDecision};
 use crate::types::TeammateRole;
 use crate::wake::TeamWakeSource;
 
@@ -74,7 +72,6 @@ pub enum ChildCancelTarget {
     Starting(StartingChildReservation),
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WakeRecordDecision {
     Recorded,
@@ -1055,7 +1052,6 @@ impl TeamRunManager {
             .map(|_| ())
     }
 
-    #[cfg(test)]
     pub(crate) async fn record_or_suppress_wake(
         &self,
         slot_id: &str,

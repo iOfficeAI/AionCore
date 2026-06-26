@@ -1,3 +1,4 @@
+mod describe_support;
 mod response_builder;
 pub(crate) mod spawn_support;
 
@@ -11,7 +12,10 @@ use aionui_api_types::{
 };
 use aionui_common::{AgentKillReason, generate_id, now_ms};
 use aionui_db::models::TeamRow;
-use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
+use aionui_db::{
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
+    ITeamRepository, UpdateTeamParams,
+};
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use tracing::{info, warn};
@@ -41,6 +45,8 @@ struct SessionEntry {
 pub struct TeamSessionService {
     repo: Arc<dyn ITeamRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
     provider_repo: Arc<dyn IProviderRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
     projection_store: Arc<dyn TeamProjectionMessageStore>,
@@ -71,6 +77,8 @@ impl TeamSessionService {
     pub fn new(
         repo: Arc<dyn ITeamRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
         conversation_port: Arc<dyn TeamConversationProvisioningPort>,
         projection_store: Arc<dyn TeamProjectionMessageStore>,
@@ -83,6 +91,8 @@ impl TeamSessionService {
         Arc::new_cyclic(|weak| Self {
             repo,
             agent_metadata_repo,
+            assistant_definition_repo,
+            assistant_overlay_repo,
             provider_repo,
             conversation_port,
             projection_store,
@@ -101,6 +111,9 @@ impl TeamSessionService {
     pub(crate) fn provisioner(&self) -> TeamAgentProvisioner {
         TeamAgentProvisioner::new(
             self.repo.clone(),
+            self.agent_metadata_repo.clone(),
+            self.assistant_definition_repo.clone(),
+            self.assistant_overlay_repo.clone(),
             self.provider_repo.clone(),
             self.conversation_port.clone(),
         )
@@ -839,7 +852,7 @@ impl TeamSessionService {
         Ok(())
     }
 
-    pub(crate) async fn send_agent_message_from_agent(
+    pub async fn send_agent_message_from_agent(
         &self,
         team_id: &str,
         from_slot_id: &str,
@@ -896,6 +909,19 @@ impl TeamSessionService {
         entry
             .session
             .notify_reserved_wake_for_team_work(slot_id, target_role, source);
+    }
+
+    pub(crate) fn notify_mailbox_only_wake(&self, team_id: &str, slot_id: &str, source: TeamWakeSource) {
+        let Some(entry) = self.sessions.get(team_id) else {
+            warn!(
+                team_id,
+                slot_id,
+                wake_source = %source,
+                "mailbox-only wake notify skipped because session is missing"
+            );
+            return;
+        };
+        entry.session.notify_mailbox_only_wake(slot_id, source);
     }
 
     /// Friendly pre-check used before invoking run-scoped team tools. This is

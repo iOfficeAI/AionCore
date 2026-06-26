@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+pub use aionui_team_prompts::AvailableAssistant;
+
 use crate::types::{MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask};
 
 fn to_prompt_role(role: crate::types::TeammateRole) -> aionui_team_prompts::TeamPromptRole {
@@ -26,25 +28,22 @@ fn to_prompt_agent(agent: &TeamAgent) -> aionui_team_prompts::TeamPromptAgent {
 /// A one-line `Team: "<name>"` header is prepended so the leader knows which
 /// team it belongs to.
 ///
-/// `available_agent_types` carries `(backend_id, display_name)` pairs that
-/// feed the `## Available Agent Types for Spawning` section; callers
-/// should source these from the team-capable backend whitelist.
-pub fn build_lead_prompt(team_name: &str, members: &[TeamAgent], available_agent_types: &[(String, String)]) -> String {
+/// `available_assistants` is the assistant catalog the leader may use when
+/// staffing the team. Callers should only include assistants that are both
+/// enabled and team-selectable.
+pub fn build_lead_prompt(
+    team_name: &str,
+    members: &[TeamAgent],
+    available_assistants: &[AvailableAssistant],
+) -> String {
     let prompt_members: Vec<_> = members.iter().map(to_prompt_agent).collect();
-    let agent_types: Vec<_> = available_agent_types
-        .iter()
-        .map(|(backend, display)| aionui_team_prompts::AvailableAgentType {
-            agent_type: backend.clone(),
-            display_name: display.clone(),
-        })
-        .collect();
     let renamed: HashMap<String, String> = HashMap::new();
 
     let body = aionui_team_prompts::build_lead_prompt(&aionui_team_prompts::LeadPromptParams {
         team_name,
         teammates: &prompt_members,
-        available_agent_types: &agent_types,
-        available_assistants: &[],
+        available_agent_types: &[],
+        available_assistants,
         renamed_agents: &renamed,
         team_workspace: None,
     });
@@ -156,7 +155,7 @@ mod tests {
             conversation_id: "conv-1".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -171,7 +170,7 @@ mod tests {
             conversation_id: format!("conv-{slot_id}"),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -211,26 +210,28 @@ mod tests {
 
     // -- Lead prompt ----------------------------------------------------------
 
-    fn default_agent_types() -> Vec<(String, String)> {
-        vec![
-            ("claude".into(), "Claude".into()),
-            ("codex".into(), "Codex".into()),
-            ("gemini".into(), "Gemini".into()),
-        ]
+    fn default_assistants() -> Vec<AvailableAssistant> {
+        vec![AvailableAssistant {
+            assistant_id: "word-creator".into(),
+            name: "Word Creator".into(),
+            backend: "claude".into(),
+            description: "Drafts Word documents".into(),
+            skills: vec!["docx".into(), "formatting".into()],
+        }]
     }
 
     #[test]
     fn lead_prompt_contains_team_name() {
-        let types = default_agent_types();
-        let prompt = build_lead_prompt("Alpha", &[], &types);
+        let assistants = default_assistants();
+        let prompt = build_lead_prompt("Alpha", &[], &assistants);
         assert!(prompt.contains("\"Alpha\""));
     }
 
     #[test]
     fn lead_prompt_contains_member_list() {
-        let types = default_agent_types();
+        let assistants = default_assistants();
         let members = vec![make_lead(), make_teammate("w1", "Worker1")];
-        let prompt = build_lead_prompt("Alpha", &members, &types);
+        let prompt = build_lead_prompt("Alpha", &members, &assistants);
 
         // AionUi bullet format: `- {name} ({backend}, status: {status})`
         assert!(prompt.contains("- Lead (acp, status:"));
@@ -239,12 +240,12 @@ mod tests {
 
     #[test]
     fn lead_prompt_contains_core_sections() {
-        let types = default_agent_types();
-        let prompt = build_lead_prompt("Alpha", &[], &types);
+        let assistants = default_assistants();
+        let prompt = build_lead_prompt("Alpha", &[], &assistants);
 
         // Workflow — 15-step procedure with model listing at step 3
         assert!(prompt.contains("## Workflow"));
-        assert!(prompt.contains("FIRST call `team_list_models`"));
+        assert!(prompt.contains("FIRST call `team_list_assistants`"));
         assert!(prompt.contains("Wait for explicit confirmation before using team_spawn_agent"));
         assert!(prompt.contains("End your turn after the proposal"));
 
@@ -273,40 +274,42 @@ mod tests {
     }
 
     #[test]
-    fn lead_prompt_includes_available_agent_types_section() {
-        let types = default_agent_types();
-        let prompt = build_lead_prompt("Alpha", &[], &types);
+    fn lead_prompt_includes_available_assistants_section() {
+        let assistants = default_assistants();
+        let prompt = build_lead_prompt("Alpha", &[], &assistants);
 
-        assert!(prompt.contains("## Available Agent Types for Spawning"));
-        assert!(prompt.contains("- `claude` — Claude"));
-        assert!(prompt.contains("- `codex` — Codex"));
-        assert!(prompt.contains("- `gemini` — Gemini"));
-        assert!(prompt.contains("Use `team_list_models`"));
+        assert!(prompt.contains("## Available Assistants for Spawning"));
+        assert!(prompt.contains("- `word-creator` (Word Creator) — Drafts Word documents"));
+        assert!(prompt.contains("skills: docx, formatting"));
+        assert!(prompt.contains("Pass the assistant's ID as `assistant_id`"));
+        assert!(!prompt.contains("backend: claude"));
     }
 
     #[test]
-    fn lead_prompt_omits_agent_types_section_when_empty() {
+    fn lead_prompt_omits_available_assistants_section_when_empty() {
         let prompt = build_lead_prompt("Alpha", &[], &[]);
-        assert!(!prompt.contains("## Available Agent Types for Spawning"));
+        assert!(!prompt.contains("## Available Assistants for Spawning"));
     }
 
     #[test]
     fn lead_prompt_no_members_shows_empty_lineup_copy() {
-        let types = default_agent_types();
-        let prompt = build_lead_prompt("Solo", &[], &types);
+        let assistants = default_assistants();
+        let prompt = build_lead_prompt("Solo", &[], &assistants);
         assert!(prompt.contains("(no teammates yet"));
         assert!(prompt.contains("propose the lineup to the user first"));
     }
 
     #[test]
     fn lead_prompt_has_no_unsubstituted_placeholders() {
-        let types = default_agent_types();
+        let assistants = default_assistants();
         let members = vec![make_lead(), make_teammate("w1", "Worker1")];
-        let prompt = build_lead_prompt("Alpha", &members, &types);
+        let prompt = build_lead_prompt("Alpha", &members, &assistants);
         assert!(
             !prompt.contains("${"),
             "unsubstituted template placeholder leaked:\n{prompt}"
         );
+        assert!(!prompt.contains("assistant or backend"));
+        assert!(!prompt.contains("Available Generic Backends"));
     }
 
     // -- Teammate prompt ------------------------------------------------------

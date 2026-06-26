@@ -424,12 +424,12 @@ impl IConversationRepository for SqliteConversationRepository {
             "INSERT INTO conversation_assistant_snapshots (
                 conversation_id,
                 assistant_definition_id,
-                assistant_key,
+                assistant_id,
                 assistant_source,
                 assistant_name,
                 assistant_avatar_type,
                 assistant_avatar_value,
-                agent_backend,
+                agent_id,
                 rules_content,
                 default_model_mode,
                 resolved_model_id,
@@ -445,12 +445,12 @@ impl IConversationRepository for SqliteConversationRepository {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 assistant_definition_id = excluded.assistant_definition_id,
-                assistant_key = excluded.assistant_key,
+                assistant_id = excluded.assistant_id,
                 assistant_source = excluded.assistant_source,
                 assistant_name = excluded.assistant_name,
                 assistant_avatar_type = excluded.assistant_avatar_type,
                 assistant_avatar_value = excluded.assistant_avatar_value,
-                agent_backend = excluded.agent_backend,
+                agent_id = excluded.agent_id,
                 rules_content = excluded.rules_content,
                 default_model_mode = excluded.default_model_mode,
                 resolved_model_id = excluded.resolved_model_id,
@@ -465,12 +465,12 @@ impl IConversationRepository for SqliteConversationRepository {
         )
         .bind(params.conversation_id)
         .bind(params.assistant_definition_id)
-        .bind(params.assistant_key)
+        .bind(params.assistant_id)
         .bind(params.assistant_source)
         .bind(params.assistant_name)
         .bind(params.assistant_avatar_type)
         .bind(params.assistant_avatar_value)
-        .bind(params.agent_backend)
+        .bind(params.agent_id)
         .bind(params.rules_content)
         .bind(params.default_model_mode)
         .bind(params.resolved_model_id)

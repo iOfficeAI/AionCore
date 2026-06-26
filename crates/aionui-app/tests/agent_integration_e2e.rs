@@ -250,7 +250,7 @@ async fn upsert_visible_agent_metadata(services: &aionui_app::AppServices, id: &
 // ── Agent catalog tests ─────────────────────────────────────────
 
 #[tokio::test]
-async fn agents_endpoint_hides_deprecated_runtime_rows() {
+async fn management_endpoint_keeps_deprecated_runtime_rows_for_diagnostics() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
 
@@ -266,7 +266,7 @@ async fn agents_endpoint_hides_deprecated_runtime_rows() {
     }
     services.agent_registry.invalidate_and_rehydrate().await.unwrap();
 
-    let req = get_with_token("/api/agents", &token);
+    let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -276,14 +276,14 @@ async fn agents_endpoint_hides_deprecated_runtime_rows() {
 
     assert!(types.contains(&"acp"));
     assert!(types.contains(&"aionrs"));
-    assert!(!types.contains(&"openclaw-gateway"));
-    assert!(!types.contains(&"nanobot"));
-    assert!(!types.contains(&"remote"));
-    assert!(!types.contains(&"gemini"));
+    assert!(types.contains(&"openclaw-gateway"));
+    assert!(types.contains(&"nanobot"));
+    assert!(types.contains(&"remote"));
+    assert!(types.contains(&"gemini"));
 }
 
 #[tokio::test]
-async fn agents_endpoint_handles_openclaw_as_acp_backend() {
+async fn management_endpoint_handles_openclaw_as_acp_backend() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
 
@@ -298,7 +298,7 @@ async fn agents_endpoint_handles_openclaw_as_acp_backend() {
     assert_eq!(meta.args, vec!["acp"]);
     assert_eq!(meta.agent_source, AgentSource::Builtin);
 
-    let req = get_with_token("/api/agents", &token);
+    let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -307,25 +307,117 @@ async fn agents_endpoint_handles_openclaw_as_acp_backend() {
 
     let openclaw = agents
         .iter()
-        .find(|agent| agent["backend"].as_str() == Some("openclaw"));
-    if meta.available {
-        let openclaw = openclaw.expect("available OpenClaw ACP should be visible from /api/agents");
-        assert_eq!(openclaw["agent_type"], "acp");
-        assert_eq!(openclaw["command"], "openclaw");
-        assert_eq!(openclaw["args"], json!(["acp"]));
-    } else {
+        .find(|agent| agent["backend"].as_str() == Some("openclaw"))
+        .expect("OpenClaw ACP row should be visible from /api/agents/management");
+    assert!(meta.available || openclaw["status"] != "available");
+    assert_eq!(openclaw["agent_type"], "acp");
+    assert_eq!(openclaw["command"], "openclaw");
+    assert_eq!(openclaw["args"], json!(["acp"]));
+}
+
+#[tokio::test]
+async fn agent_logos_endpoint_returns_backend_to_logo_catalog() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+
+    let req = get_with_token("/api/agents/logos", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    let entries = body["data"].as_array().expect("data should be array");
+
+    let logo_for = |backend: &str| -> Option<String> {
+        entries
+            .iter()
+            .find(|entry| entry["backend"].as_str() == Some(backend))
+            .and_then(|entry| entry["logo"].as_str())
+            .map(str::to_owned)
+    };
+
+    // Seeded builtin agents project their stored icon URL.
+    assert_eq!(
+        logo_for("claude").as_deref(),
+        Some("/api/assets/logos/ai-major/claude.svg")
+    );
+    assert_eq!(
+        logo_for("codex").as_deref(),
+        Some("/api/assets/logos/tools/coding/codex.svg")
+    );
+
+    // Aion CLI has no vendor `backend` (NULL); it must still be keyed by its
+    // agent_type ("aionrs") so aionrs conversations resolve a logo.
+    assert_eq!(logo_for("aionrs").as_deref(), Some("/api/assets/logos/brand/aion.svg"));
+
+    // Every entry carries a non-empty backend + logo, and backends are unique.
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        let backend = entry["backend"].as_str().expect("backend present");
+        let logo = entry["logo"].as_str().expect("logo present");
+        assert!(!backend.is_empty(), "backend must not be empty");
+        assert!(!logo.is_empty(), "logo must not be empty");
         assert!(
-            openclaw.is_none(),
-            "unavailable OpenClaw ACP should be hidden from /api/agents"
+            seen.insert(backend.to_owned()),
+            "backend {backend} duplicated in catalog"
         );
     }
+}
 
+#[tokio::test]
+async fn agent_logos_endpoint_includes_disabled_and_missing_rows() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+
+    // A custom/internal row that would be hidden from /api/agents (no command
+    // on PATH) must still contribute its logo so historical conversations
+    // referencing it can render an icon.
+    services
+        .agent_registry
+        .repo_handle()
+        .upsert(&UpsertAgentMetadataParams {
+            id: "logo-only-row",
+            icon: Some("/api/assets/logos/brand/aion.svg"),
+            name: "Logo Only",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("logo-only-backend"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some("{}"),
+            enabled: false,
+            command: None,
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: Some("{}"),
+            yolo_id: Some("yolo"),
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 1,
+        })
+        .await
+        .unwrap();
+    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+
+    let req = get_with_token("/api/agents/logos", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    let entries = body["data"].as_array().expect("data should be array");
+    let entry = entries
+        .iter()
+        .find(|entry| entry["backend"].as_str() == Some("logo-only-backend"));
     assert!(
-        agents
-            .iter()
-            .all(|agent| agent["agent_type"].as_str() != Some("openclaw-gateway")),
-        "old openclaw-gateway row must remain hidden from new conversation catalog"
+        entry.is_some(),
+        "disabled row with an icon must still appear in the logo catalog"
     );
+    assert_eq!(entry.unwrap()["logo"], "/api/assets/logos/brand/aion.svg");
 }
 
 // ── Message flow with mock agent ────────────────────────────────
@@ -523,4 +615,51 @@ async fn side_question_with_mock_agent() {
         status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
         "Expected 200 or 500, got {status}"
     );
+}
+
+// ── Agent overrides roundtrip ───────────────────────────────────
+
+#[tokio::test]
+async fn agent_overrides_roundtrip_and_management_summary() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    upsert_visible_agent_metadata(&services, "ovr-agent", "acp").await;
+    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+
+    // PUT overrides
+    let body = json!({
+        "command_override": "/real/bin/ovr",
+        "env_override": [{"name": "ANTHROPIC_API_KEY", "value": "sk-x"}, {"name": "PATH", "value": "/evil"}]
+    });
+    let req = json_with_token("PUT", "/api/agents/ovr-agent/overrides", body, &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // management row: safe fields, blocked PATH not counted
+    let mreq = get_with_token("/api/agents/management", &token);
+    let mbody = body_json(app.clone().oneshot(mreq).await.unwrap()).await;
+    let mbody_str = serde_json::to_string(&mbody).unwrap();
+    let row = mbody["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "ovr-agent")
+        .expect("row present");
+    assert_eq!(row["has_command_override"], true);
+    assert_eq!(row["env_override_key_count"], 1); // PATH excluded
+    assert!(
+        row["env"].as_array().map_or(true, |arr| arr.is_empty()),
+        "management row env must be empty or absent"
+    );
+    assert!(
+        !mbody_str.contains("sk-x"),
+        "management response must not leak secret values"
+    );
+
+    // GET overrides: plaintext echo
+    let greq = get_with_token("/api/agents/ovr-agent/overrides", &token);
+    let gbody = body_json(app.clone().oneshot(greq).await.unwrap()).await;
+    assert_eq!(gbody["data"]["command_override"], "/real/bin/ovr");
+    let envs = gbody["data"]["env_override"].as_array().unwrap();
+    assert!(envs.iter().any(|e| e["name"] == "ANTHROPIC_API_KEY"));
 }

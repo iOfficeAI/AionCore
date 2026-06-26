@@ -7,17 +7,21 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path as AxumPath, State};
 use axum::routing::{delete, get, post};
+use tracing::warn;
 
 use aionui_api_types::{
-    AddExternalPathRequest, ApiResponse, BuiltinAutoSkillResponse, ExportSkillRequest, ExternalSkillSourceResponse,
+    AddExternalPathRequest, ApiResponse, ExportSkillRequest, ExternalSkillSourceResponse, ImportSkillFailureResponse,
     ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest, MaterializeSkillsResponse, MaterializedSkillRef,
     NamedPathResponse, ReadAssistantRuleRequest, ReadBuiltinResourceRequest, ReadSkillInfoRequest,
     ReadSkillInfoResponse, RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse,
-    ScannedSkillResponse, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
+    ScannedSkillResponse, SkillImportLimitsResponse, SkillImportRecordResponse, SkillListItemResponse,
+    SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
 };
 use aionui_common::ApiError;
+use aionui_db::ISkillRepository;
 
 use crate::classifier::AssistantRuleDispatcher;
+use crate::error::ExtensionError;
 use crate::external_paths::ExternalPathsManager;
 use crate::skill_service::{self, SkillPaths, SkillSource};
 
@@ -25,6 +29,7 @@ fn to_source_response(source: SkillSource) -> SkillSourceResponse {
     match source {
         SkillSource::Builtin => SkillSourceResponse::Builtin,
         SkillSource::Custom => SkillSourceResponse::Custom,
+        SkillSource::Cron => SkillSourceResponse::Cron,
         SkillSource::Extension => SkillSourceResponse::Extension,
     }
 }
@@ -37,6 +42,7 @@ fn to_source_response(source: SkillSource) -> SkillSourceResponse {
 #[derive(Clone)]
 pub struct SkillRouterState {
     pub skill_paths: SkillPaths,
+    pub skill_repo: Arc<dyn ISkillRepository>,
     pub external_paths_manager: Arc<ExternalPathsManager>,
     /// Optional dispatcher that routes assistant-rule / assistant-skill
     /// read/write/delete by source (builtin / extension / user). When
@@ -56,12 +62,12 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
     Router::new()
         // Skill listing & info
         .route("/api/skills", get(list_skills))
-        .route("/api/skills/builtin-auto", get(list_builtin_auto_skills))
+        .route("/api/skills/import-history", get(list_import_history))
+        .route("/api/skills/import-limits", get(get_import_limits))
         .route("/api/skills/info", post(read_skill_info))
         .route("/api/skills/paths", get(get_skill_paths))
         // Import / export / delete
         .route("/api/skills/import", post(import_skill))
-        .route("/api/skills/import-symlink", post(import_skill_symlink))
         .route("/api/skills/export-symlink", post(export_skill_symlink))
         .route("/api/skills/{name}", delete(delete_skill))
         // Scanning & discovery
@@ -102,7 +108,7 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
 async fn list_skills(
     State(state): State<SkillRouterState>,
 ) -> Result<Json<ApiResponse<Vec<SkillListItemResponse>>>, ApiError> {
-    let items = skill_service::list_available_skills(&state.skill_paths).await?;
+    let items = skill_service::list_available_skills_with_repo(&state.skill_paths, state.skill_repo.as_ref()).await?;
     let resp: Vec<SkillListItemResponse> = items
         .into_iter()
         .map(|s| SkillListItemResponse {
@@ -112,22 +118,6 @@ async fn list_skills(
             relative_location: s.relative_location,
             is_custom: s.is_custom,
             source: to_source_response(s.source),
-        })
-        .collect();
-    Ok(Json(ApiResponse::ok(resp)))
-}
-
-/// `GET /api/skills/builtin-auto` — list auto-injected built-in skills.
-async fn list_builtin_auto_skills(
-    State(state): State<SkillRouterState>,
-) -> Result<Json<ApiResponse<Vec<BuiltinAutoSkillResponse>>>, ApiError> {
-    let items = skill_service::list_builtin_auto_skills(&state.skill_paths).await?;
-    let resp: Vec<BuiltinAutoSkillResponse> = items
-        .into_iter()
-        .map(|s| BuiltinAutoSkillResponse {
-            name: s.name,
-            description: s.description,
-            location: s.location,
         })
         .collect();
     Ok(Json(ApiResponse::ok(resp)))
@@ -153,34 +143,70 @@ async fn get_skill_paths(
     })))
 }
 
+/// `GET /api/skills/import-limits` — get server-side skill import limits.
+async fn get_import_limits() -> Result<Json<ApiResponse<SkillImportLimitsResponse>>, ApiError> {
+    let limits = skill_service::skill_import_limits();
+    Ok(Json(ApiResponse::ok(SkillImportLimitsResponse {
+        max_file_bytes: limits.max_file_bytes,
+        max_total_bytes: limits.max_total_bytes,
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // Import / export / delete
 // ---------------------------------------------------------------------------
 
-/// `POST /api/skills/import` — import a skill by copying.
+/// `POST /api/skills/import` — import skill directories or zip packages by copying.
 async fn import_skill(
     State(state): State<SkillRouterState>,
     body: Result<Json<ImportSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let name = skill_service::import_skill(&state.skill_paths, Path::new(&req.skill_path)).await?;
-    Ok(Json(ApiResponse::ok(ImportSkillResponse {
-        skill_name: name.clone(),
-        skill_names: vec![name],
-    })))
-}
-
-/// `POST /api/skills/import-symlink` — import a skill by symlink.
-async fn import_skill_symlink(
-    State(state): State<SkillRouterState>,
-    body: Result<Json<ImportSkillRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let names = skill_service::import_skills_with_symlink(&state.skill_paths, Path::new(&req.skill_path)).await?;
+    let outcome = match skill_service::import_skills_with_repo(
+        &state.skill_paths,
+        state.skill_repo.as_ref(),
+        Path::new(&req.skill_path),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            warn!(
+                source_path = %req.skill_path,
+                error = %err,
+                "skill import failed"
+            );
+            return Err(err.into());
+        }
+    };
+    if !outcome.failed.is_empty() {
+        warn!(
+            source_path = %req.skill_path,
+            imported_count = outcome.imported.len(),
+            failed_count = outcome.failed.len(),
+            failures = ?outcome.failed,
+            "skill batch import completed with failures"
+        );
+    }
+    let names = outcome.imported;
     let first_name = names.first().cloned().unwrap_or_default();
+    let failed = outcome
+        .failed
+        .into_iter()
+        .map(|failure| ImportSkillFailureResponse {
+            source_name: failure.source_name,
+            code: failure.code,
+            error_path: failure.error_path,
+            actual_bytes: failure.actual_bytes,
+            limit_bytes: failure.limit_bytes,
+            line: failure.line,
+            column: failure.column,
+        })
+        .collect();
     Ok(Json(ApiResponse::ok(ImportSkillResponse {
         skill_name: first_name,
         skill_names: names,
+        failed,
     })))
 }
 
@@ -198,8 +224,40 @@ async fn delete_skill(
     State(state): State<SkillRouterState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    skill_service::delete_skill(&state.skill_paths, &name).await?;
+    skill_service::delete_skill_with_repo(&state.skill_paths, state.skill_repo.as_ref(), &name).await?;
     Ok(Json(ApiResponse::success()))
+}
+
+/// `GET /api/skills/import-history` — list recent skill import records.
+async fn list_import_history(
+    State(state): State<SkillRouterState>,
+) -> Result<Json<ApiResponse<Vec<SkillImportRecordResponse>>>, ApiError> {
+    let records = state
+        .skill_repo
+        .list_import_records(100)
+        .await
+        .map_err(ExtensionError::from)?;
+    let resp = records
+        .into_iter()
+        .map(|row| SkillImportRecordResponse {
+            id: row.id,
+            operation_id: row.operation_id,
+            source_label: row.source_label,
+            source_path: row.source_path,
+            source_name: row.source_name,
+            skill_id: row.skill_id,
+            skill_name: row.skill_name,
+            status: row.status,
+            error_code: row.error_code,
+            error_path: row.error_path,
+            actual_bytes: row.actual_bytes,
+            limit_bytes: row.limit_bytes,
+            line: row.line,
+            column: row.column,
+            created_at: row.created_at,
+        })
+        .collect();
+    Ok(Json(ApiResponse::ok(resp)))
 }
 
 // ---------------------------------------------------------------------------
@@ -301,8 +359,13 @@ async fn materialize_for_agent(
     if req.conversation_id.trim().is_empty() {
         return Err(ApiError::BadRequest("conversationId must not be empty".into()));
     }
-    let resolved =
-        skill_service::materialize_skills_for_agent(&state.skill_paths, &req.conversation_id, &req.skills).await?;
+    let resolved = skill_service::materialize_skills_for_agent_with_repo(
+        &state.skill_paths,
+        state.skill_repo.as_ref(),
+        &req.conversation_id,
+        &req.skills,
+    )
+    .await?;
     let skills: Vec<MaterializedSkillRef> = resolved
         .into_iter()
         .map(|s| MaterializedSkillRef {
@@ -498,6 +561,9 @@ async fn disable_skills_market(State(state): State<SkillRouterState>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     async fn make_state() -> SkillRouterState {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -511,9 +577,12 @@ mod tests {
             assistant_skills_dir: tmp.path().join("assistant-skills"),
         };
         let ext_mgr = Arc::new(ExternalPathsManager::with_file(tmp.path().join("paths.json")).await);
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let skill_repo = Arc::new(aionui_db::SqliteSkillRepository::new(db.pool().clone()));
         std::mem::forget(tmp);
         SkillRouterState {
             skill_paths: paths,
+            skill_repo,
             external_paths_manager: ext_mgr,
             assistant_dispatcher: None,
         }
@@ -523,5 +592,22 @@ mod tests {
     async fn skill_routes_builds_router() {
         let state = make_state().await;
         let _router = skill_routes(state);
+    }
+
+    #[tokio::test]
+    async fn builtin_auto_skill_list_get_is_not_registered() {
+        let state = make_state().await;
+        let response = skill_routes(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/skills/builtin-auto")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 }

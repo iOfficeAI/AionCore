@@ -61,7 +61,7 @@ impl TeamEventEmitter {
     pub fn broadcast_agent_spawned(&self, agent: &TeamAgent) {
         let payload = TeamAgentSpawnedPayload {
             team_id: self.team_id.clone(),
-            agent: agent.to_response(),
+            assistant: agent.to_response(),
         };
         let event = WebSocketMessage::new(
             TEAM_AGENT_SPAWNED_EVENT,
@@ -197,7 +197,7 @@ mod tests {
             conversation_id: "conv-2".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: Some(TeammateStatus::Idle),
             conversation_type: None,
             cli_path: None,
@@ -210,9 +210,9 @@ mod tests {
 
         let payload: TeamAgentSpawnedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
-        assert_eq!(payload.agent.slot_id, "slot-2");
-        assert_eq!(payload.agent.name, "Worker");
-        assert_eq!(payload.agent.role, "teammate");
+        assert_eq!(payload.assistant.slot_id, "slot-2");
+        assert_eq!(payload.assistant.name, "Worker");
+        assert_eq!(payload.assistant.role, "teammate");
     }
 
     #[test]

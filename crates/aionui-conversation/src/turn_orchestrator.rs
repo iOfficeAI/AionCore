@@ -83,6 +83,7 @@ impl ConversationTurnOrchestrator {
 
     async fn run_attempt(&self, input: TurnAttemptInput) -> Result<TurnAttemptResult, ConversationTurnResult> {
         let build_started_at = now_ms();
+        let availability_agent_id = availability_agent_id(&input.build_options);
         let backend = acp_backend_from_build_options(&input.build_options).map(str::to_owned);
         info!(
             conversation_id = %input.conv_id,
@@ -122,6 +123,14 @@ impl ConversationTurnOrchestrator {
                     error = %ErrorChain(&err),
                     "Agent task build failed"
                 );
+                let failure_message = err.to_string();
+                record_agent_session_failure(
+                    &self.service,
+                    availability_agent_id.as_deref(),
+                    "session_build_failed",
+                    &failure_message,
+                )
+                .await;
                 self.service
                     .persist_and_broadcast_send_failure_tip(
                         &input.conv_id,
@@ -205,10 +214,20 @@ impl ConversationTurnOrchestrator {
             let send_agent = agent.clone();
             let conv_id_send = input.conv_id.clone();
             let turn_id_for_send = input.turn_id.clone();
+            let feedback_service = self.service.clone();
+            let feedback_agent_id = availability_agent_id.clone();
             let (send_error_tx, send_error_rx) = oneshot::channel();
 
             tokio::spawn(async move {
                 if let Err(e) = send_agent.send_message(current_send).await {
+                    let failure_message = availability_failure_message(&e);
+                    record_agent_session_failure(
+                        &feedback_service,
+                        feedback_agent_id.as_deref(),
+                        "session_send_failed",
+                        &failure_message,
+                    )
+                    .await;
                     let task_status = send_agent.status();
                     let agent_type = send_agent.agent_type();
                     error!(
@@ -413,6 +432,10 @@ impl ConversationTurnOrchestrator {
             }
         };
 
+        if !final_failed {
+            record_agent_session_success(&self.service, availability_agent_id(&input.build_options).as_deref()).await;
+        }
+
         let was_deleting = turn_claim.release_for_turn(&turn_id);
         self.service
             .complete_released_turn(&conv_id, &turn_id, was_deleting)
@@ -425,5 +448,63 @@ impl ConversationTurnOrchestrator {
                 ConversationTurnStatus::Completed
             },
         }
+    }
+}
+
+fn availability_agent_id(options: &BuildTaskOptions) -> Option<String> {
+    match &options.context.kind {
+        AgentSessionKind::Acp(context) => context
+            .config
+            .agent_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        AgentSessionKind::Aionrs(_) => None,
+    }
+}
+
+fn availability_failure_message(error: &AgentSendError) -> String {
+    error
+        .stream_error()
+        .detail
+        .clone()
+        .unwrap_or_else(|| error.stream_error().message.clone())
+}
+
+async fn record_agent_session_failure(
+    service: &ConversationService,
+    agent_id: Option<&str>,
+    code: &str,
+    message: &str,
+) {
+    let Some(agent_id) = agent_id else {
+        return;
+    };
+    let Some(feedback) = service.agent_availability_feedback() else {
+        return;
+    };
+    if let Err(error) = feedback.record_session_failure(agent_id, code, message).await {
+        warn!(
+            agent_id,
+            code,
+            error = %ErrorChain(&error),
+            "Failed to record agent availability session failure"
+        );
+    }
+}
+
+async fn record_agent_session_success(service: &ConversationService, agent_id: Option<&str>) {
+    let Some(agent_id) = agent_id else {
+        return;
+    };
+    let Some(feedback) = service.agent_availability_feedback() else {
+        return;
+    };
+    if let Err(error) = feedback.record_session_success(agent_id).await {
+        warn!(
+            agent_id,
+            error = %ErrorChain(&error),
+            "Failed to record agent availability session success"
+        );
     }
 }

@@ -12,7 +12,7 @@ use aionui_team::message_projection::{
     ProjectedTeamMessage, TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest,
     TeamProjectionSource,
 };
-use aionui_team::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
+use aionui_team::prompts::{AvailableAssistant, build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use aionui_team::types::{
     MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
 };
@@ -97,7 +97,7 @@ fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
         conversation_id: format!("conv-{slot_id}"),
         backend: "acp".into(),
         model: "claude".into(),
-        custom_agent_id: None,
+        assistant_id: None,
         status: None,
         conversation_type: None,
         cli_path: None,
@@ -213,11 +213,29 @@ async fn projection_dedupes_teammate_mirror_and_broadcasts_persisted_msg_id() {
 // Test-plan §9: Prompt Templates
 // ===========================================================================
 
-fn default_agent_types() -> Vec<(String, String)> {
+fn default_assistants() -> Vec<AvailableAssistant> {
     vec![
-        ("claude".into(), "Claude".into()),
-        ("codex".into(), "Codex".into()),
-        ("gemini".into(), "Gemini".into()),
+        AvailableAssistant {
+            assistant_id: "research-assistant".into(),
+            name: "Research Assistant".into(),
+            backend: "claude".into(),
+            description: "General-purpose research assistant".into(),
+            skills: vec!["web-search".into(), "synthesis".into()],
+        },
+        AvailableAssistant {
+            assistant_id: "writer-assistant".into(),
+            name: "Writer Assistant".into(),
+            backend: "codex".into(),
+            description: "Writing-focused assistant".into(),
+            skills: vec!["drafting".into()],
+        },
+        AvailableAssistant {
+            assistant_id: "slides-assistant".into(),
+            name: "Slides Assistant".into(),
+            backend: "gemini".into(),
+            description: "Presentation builder".into(),
+            skills: vec!["slides".into()],
+        },
     ]
 }
 
@@ -230,8 +248,8 @@ fn lp1_lead_prompt_contains_member_list() {
         make_agent("w1", "Alice", TeammateRole::Teammate),
         make_agent("w2", "Bob", TeammateRole::Teammate),
     ];
-    let types = default_agent_types();
-    let prompt = build_lead_prompt("Alpha", &members, &types);
+    let assistants = default_assistants();
+    let prompt = build_lead_prompt("Alpha", &members, &assistants);
 
     // AionUi bullet format: `- {name} ({backend}, status: {status})`
     assert!(prompt.contains("- Lead ("), "lead name missing");
@@ -243,7 +261,7 @@ fn lp1_lead_prompt_contains_member_list() {
 
 #[test]
 fn lp2_lead_prompt_contains_tool_descriptions() {
-    let prompt = build_lead_prompt("Beta", &[], &default_agent_types());
+    let prompt = build_lead_prompt("Beta", &[], &default_assistants());
 
     // AionUi lead prompt references the `team_*` coordination tools that the
     // leader must use; the MCP layer enumerates them with arguments, so the
@@ -267,7 +285,7 @@ fn lp2_lead_prompt_contains_tool_descriptions() {
 
 #[test]
 fn lp3_lead_prompt_contains_task_management_guidance() {
-    let prompt = build_lead_prompt("Gamma", &[], &default_agent_types());
+    let prompt = build_lead_prompt("Gamma", &[], &default_assistants());
 
     assert!(
         prompt.contains("Break the work into tasks"),
@@ -468,8 +486,8 @@ async fn we2_agent_spawned_event() {
 
     let payload: TeamAgentSpawnedPayload = serde_json::from_value(spawned[0].data.clone()).unwrap();
     assert_eq!(payload.team_id, "t1");
-    assert_eq!(payload.agent.slot_id, "w2");
-    assert_eq!(payload.agent.name, "NewWorker");
+    assert_eq!(payload.assistant.slot_id, "w2");
+    assert_eq!(payload.assistant.name, "NewWorker");
 }
 
 // -- WE-3: Agent removed event -----------------------------------------------
@@ -549,7 +567,7 @@ fn event_emitter_uses_typed_payloads() {
     assert_eq!(p1.status, "thinking");
 
     let p2: TeamAgentSpawnedPayload = serde_json::from_value(events[1].data.clone()).unwrap();
-    assert_eq!(p2.agent.slot_id, "s1");
+    assert_eq!(p2.assistant.slot_id, "s1");
 
     let p3: TeamAgentRemovedPayload = serde_json::from_value(events[2].data.clone()).unwrap();
     assert_eq!(p3.slot_id, "s1");

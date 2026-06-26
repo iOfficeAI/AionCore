@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -41,7 +40,6 @@ pub struct ActionExecutor {
     pairing: Arc<PairingService>,
     session_mgr: Arc<SessionManager>,
     settings: Arc<ChannelSettingsService>,
-    default_agent_type: String,
 }
 
 impl ActionExecutor {
@@ -49,13 +47,11 @@ impl ActionExecutor {
         pairing: Arc<PairingService>,
         session_mgr: Arc<SessionManager>,
         settings: Arc<ChannelSettingsService>,
-        default_agent_type: &str,
     ) -> Self {
         Self {
             pairing,
             session_mgr,
             settings,
-            default_agent_type: default_agent_type.to_owned(),
         }
     }
 
@@ -285,10 +281,9 @@ impl ActionExecutor {
             "help.features" => Ok(ActionResponse {
                 text: Some(
                     "Features:\n\
-                         • AI chat with multiple backends\n\
+                         • AI chat through your configured assistant\n\
                          • Tool execution with auto-approval\n\
-                         • Session isolation per chat\n\
-                         • Agent switching"
+                         • Session isolation per chat"
                         .into(),
                 ),
                 parse_mode: None,
@@ -339,52 +334,6 @@ impl ActionExecutor {
                 toast: None,
                 edit_message_id: None,
             }),
-            "agent.show" => Ok(ActionResponse {
-                text: Some("Available agents:".into()),
-                parse_mode: None,
-                buttons: Some(vec![vec![
-                    ActionButton {
-                        label: "Gemini".into(),
-                        action: "agent.select".into(),
-                        params: Some(HashMap::from([("agentType".into(), "gemini".into())])),
-                    },
-                    ActionButton {
-                        label: "ACP".into(),
-                        action: "agent.select".into(),
-                        params: Some(HashMap::from([("agentType".into(), "acp".into())])),
-                    },
-                ]]),
-                keyboard: None,
-                behavior: ActionBehavior::Send,
-                toast: None,
-                edit_message_id: None,
-            }),
-            "agent.select" => {
-                let agent_type = action
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.get("agentType"))
-                    .map(|s| s.as_str())
-                    .unwrap_or(&self.default_agent_type);
-
-                // Persist the agent_type change to the session
-                let chat_id = &action.context.chat_id;
-                let session = self
-                    .session_mgr
-                    .get_or_create_session(internal_user_id, chat_id, agent_type, None)
-                    .await?;
-                self.session_mgr.update_agent_type(&session.id, agent_type).await?;
-
-                Ok(ActionResponse {
-                    text: Some(format!("Agent switched to: {agent_type}")),
-                    parse_mode: None,
-                    buttons: None,
-                    keyboard: None,
-                    behavior: ActionBehavior::Send,
-                    toast: Some(format!("Switched to {agent_type}")),
-                    edit_message_id: None,
-                })
-            }
             other => {
                 warn!(action = %other, "unknown system action");
                 Ok(build_unknown_action_response(other))
@@ -521,11 +470,6 @@ fn build_help_response() -> ActionResponse {
                     params: None,
                 },
             ],
-            vec![ActionButton {
-                label: "Switch Agent".into(),
-                action: "agent.show".into(),
-                params: None,
-            }],
         ]),
         keyboard: None,
         behavior: ActionBehavior::Send,
@@ -557,6 +501,7 @@ mod tests {
     };
     use aionui_db::{DbError, IChannelRepository, IClientPreferenceRepository, UpdatePluginStatusParams};
     use aionui_realtime::EventBroadcaster;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     // ── Mock EventBroadcaster ──────────────────────────────────────────
@@ -751,7 +696,7 @@ mod tests {
         let session_mgr = Arc::new(SessionManager::new(repo.clone()));
         let pref_repo: Arc<dyn IClientPreferenceRepository> = Arc::new(MockPrefRepo);
         let settings = Arc::new(ChannelSettingsService::new(pref_repo));
-        let executor = ActionExecutor::new(pairing, session_mgr, settings, "gemini");
+        let executor = ActionExecutor::new(pairing, session_mgr, settings);
         (executor, repo)
     }
 
@@ -1077,46 +1022,44 @@ mod tests {
                 assert!(resp.buttons.is_some());
                 let buttons = resp.buttons.unwrap();
                 assert!(buttons.len() >= 2); // at least 2 rows
+                assert!(
+                    !buttons.iter().flatten().any(|button| button.action == "agent.show"),
+                    "help menu must not expose direct agent selection"
+                );
             }
             _ => panic!("Expected Action result"),
         }
     }
 
     #[tokio::test]
-    async fn agent_select_with_params() {
+    async fn agent_show_is_treated_as_unknown_action() {
         let (executor, repo) = setup();
         repo.add_authorized_user("tg_42", "telegram");
 
-        let params = HashMap::from([("agentType".into(), "acp".into())]);
         let msg = make_action_message(
             "tg_42",
             "chat_1",
-            "agent.select",
+            "agent.show",
             ActionCategory::System,
             PluginType::Telegram,
-            Some(params),
+            None,
         );
         let result = executor.handle_incoming_message(&msg).await.unwrap();
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
-                assert!(text.contains("acp"));
-                assert!(resp.toast.is_some());
+                assert!(text.contains("Unknown action"));
+                assert!(text.contains("agent.show"));
             }
             _ => panic!("Expected Action result"),
         }
     }
 
     #[tokio::test]
-    async fn agent_select_persists_agent_type() {
+    async fn agent_select_is_treated_as_unknown_action() {
         let (executor, repo) = setup();
         repo.add_authorized_user("tg_42", "telegram");
 
-        // First: send a text to create a session (defaults to "aionrs")
-        let text_msg = make_text_message("tg_42", "chat_1", "Hello", PluginType::Telegram);
-        executor.handle_incoming_message(&text_msg).await.unwrap();
-
-        // Then: switch agent to "acp"
         let params = HashMap::from([("agentType".into(), "acp".into())]);
         let select_msg = make_action_message(
             "tg_42",
@@ -1126,15 +1069,15 @@ mod tests {
             PluginType::Telegram,
             Some(params),
         );
-        executor.handle_incoming_message(&select_msg).await.unwrap();
-
-        // Verify session's agent_type was updated in the repo
-        let sessions = repo.sessions.lock().unwrap();
-        let session = sessions
-            .iter()
-            .find(|s| s.user_id == "user_tg_42" && s.chat_id.as_deref() == Some("chat_1"))
-            .expect("session should exist");
-        assert_eq!(session.agent_type, "acp");
+        let result = executor.handle_incoming_message(&select_msg).await.unwrap();
+        match result {
+            MessageResult::Action(resp) => {
+                let text = resp.text.unwrap();
+                assert!(text.contains("Unknown action"));
+                assert!(text.contains("agent.select"));
+            }
+            _ => panic!("Expected Action result"),
+        }
     }
 
     // ── Chat action tests ──────────────────────────────────────────────

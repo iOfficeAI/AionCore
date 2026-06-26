@@ -123,7 +123,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
         json!({
             "id": "u1",
             "name": "Snapshot Assistant",
-            "preset_agent_type": "codex"
+            "agent_id": "8e1acf31"
         }),
         &token,
         &csrf,
@@ -150,12 +150,12 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
     let state_repo = SqliteAssistantOverlayRepository::new(pool.clone());
     let preference_repo = SqliteAssistantPreferenceRepository::new(pool);
     let conversation_repo = SqliteConversationRepository::new(services.database.pool().clone());
-    let definition = definition_repo.get_by_key("u1").await.unwrap().unwrap();
+    let definition = definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
-            definition_id: &definition.definition_id,
-            assistant_key: &definition.assistant_key,
+            id: &definition.id,
+            assistant_id: &definition.assistant_id,
             source: &definition.source,
             owner_type: &definition.owner_type,
             source_ref: definition.source_ref.as_deref(),
@@ -167,7 +167,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             description_i18n: &definition.description_i18n,
             avatar_type: &definition.avatar_type,
             avatar_value: definition.avatar_value.as_deref(),
-            agent_backend: &definition.agent_backend,
+            agent_id: &definition.agent_id,
             rule_resource_type: &definition.rule_resource_type,
             rule_resource_ref: definition.rule_resource_ref.as_deref(),
             rule_inline_content: definition.rule_inline_content.as_deref(),
@@ -188,17 +188,17 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
         .unwrap();
     state_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: &definition.definition_id,
+            assistant_definition_id: &definition.id,
             enabled: true,
             sort_order: 0,
-            agent_backend_override: Some("codex"),
+            agent_id_override: Some("8e1acf31"),
             last_used_at: None,
         })
         .await
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: &definition.definition_id,
+            assistant_definition_id: &definition.id,
             last_model_id: Some("pref-model"),
             last_permission_value: Some("workspace-write"),
             last_skill_ids: r#"["pref-skill"]"#,
@@ -224,9 +224,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
                     "mcp_ids": ["override-mcp"]
                 }
             },
-            "extra": {
-                "preset_assistant_id": "u1"
-            }
+            "extra": {}
         }),
         &token,
         &csrf,
@@ -236,9 +234,14 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
 
     let json = body_json(resp).await;
     let data = &json["data"];
-    assert_eq!(data["extra"]["assistant_id"], "u1");
-    assert_eq!(data["extra"]["preset_assistant_id"], "u1");
-    assert_eq!(data["extra"]["preset_context"], "assistant snapshot rule");
+    assert_eq!(data["assistant"]["id"], "u1");
+    assert_eq!(data["assistant"]["backend"], "codex");
+    assert!(data["extra"].get("assistant_id").is_none());
+    assert!(data["extra"].get("preset_assistant_id").is_none());
+    assert!(data["extra"].get("preset_context").is_none());
+    assert!(data["extra"].get("preset_rules").is_none());
+    assert_eq!(data["extra"]["session_mode"], "workspace-write");
+    assert_eq!(data["extra"]["current_mode_id"], "workspace-write");
     assert_eq!(data["extra"]["current_model_id"], "override-model");
     assert!(data["extra"].get("assistant_snapshot").is_none());
     assert!(
@@ -254,14 +257,14 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(snapshot.assistant_key, "u1");
-    assert_eq!(snapshot.agent_backend, "codex");
+    assert_eq!(snapshot.assistant_id, "u1");
+    assert_eq!(snapshot.agent_id, "8e1acf31");
     assert_eq!(snapshot.rules_content, "assistant snapshot rule");
     assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
     assert_eq!(snapshot.resolved_skill_ids, r#"["override-skill"]"#);
     assert_eq!(snapshot.resolved_mcp_ids, r#"["override-mcp"]"#);
 
-    let updated_preference = preference_repo.get(&definition.definition_id).await.unwrap().unwrap();
+    let updated_preference = preference_repo.get(&definition.id).await.unwrap().unwrap();
     assert_eq!(updated_preference.last_model_id.as_deref(), Some("override-model"));
     assert_eq!(
         updated_preference.last_permission_value.as_deref(),

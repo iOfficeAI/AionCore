@@ -49,7 +49,7 @@ fn make_agents() -> Vec<TeamAgent> {
             conversation_id: "conv-lead".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -61,7 +61,7 @@ fn make_agents() -> Vec<TeamAgent> {
             conversation_id: "conv-worker".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -223,7 +223,7 @@ async fn mc1_correct_token_connects() {
     send_request(&mut stream, &req).await;
     let resp = read_response(&mut stream).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 10);
+    assert_eq!(tools.len(), 11);
 
     env.server.stop();
 }
@@ -283,12 +283,12 @@ async fn mc3_no_token_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_returns_all_10_tools() {
+async fn tools_list_returns_all_11_tools() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
     let names = list_tools(&mut stream, 10).await;
-    assert_eq!(names.len(), 10);
+    assert_eq!(names.len(), 11);
 
     assert!(names.contains(&"team_send_message".to_owned()));
     assert!(names.contains(&"team_spawn_agent".to_owned()));
@@ -298,6 +298,7 @@ async fn tools_list_returns_all_10_tools() {
     assert!(names.contains(&"team_members".to_owned()));
     assert!(names.contains(&"team_rename_agent".to_owned()));
     assert!(names.contains(&"team_shutdown_agent".to_owned()));
+    assert!(names.contains(&"team_list_assistants".to_owned()));
     assert!(names.contains(&"team_list_models".to_owned()));
     assert!(names.contains(&"team_describe_assistant".to_owned()));
 
@@ -319,6 +320,7 @@ async fn mcp_tools_list_filters_lead_only_tools() {
     assert!(names.contains(&"team_task_update".to_owned()));
     assert!(names.contains(&"team_task_list".to_owned()));
     assert!(names.contains(&"team_members".to_owned()));
+    assert!(names.contains(&"team_list_assistants".to_owned()));
     assert!(names.contains(&"team_list_models".to_owned()));
     assert!(names.contains(&"team_describe_assistant".to_owned()));
 
@@ -470,7 +472,7 @@ async fn sp1_lead_spawn_requires_live_session_service() {
         &mut stream,
         2,
         "team_spawn_agent",
-        json!({"name": "Helper", "role": "worker", "backend": "claude"}),
+        json!({"name": "Helper", "role": "worker", "assistant_id": "word-creator"}),
     )
     .await;
 
@@ -485,7 +487,7 @@ async fn sp1_lead_spawn_requires_live_session_service() {
 }
 
 #[tokio::test]
-async fn sp2_non_whitelisted_backend_rejected() {
+async fn sp2_legacy_backend_alias_rejected() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
@@ -499,9 +501,8 @@ async fn sp2_non_whitelisted_backend_rejected() {
 
     assert!(is_error_response(&resp));
     let text = extract_text(&resp);
-    // Without a live TeamSessionService the spawn fails at capability check or service access.
     assert!(
-        text.contains("not allowed") || text.contains("not available"),
+        text.contains("backend is no longer accepted"),
         "unexpected error: {text}"
     );
 

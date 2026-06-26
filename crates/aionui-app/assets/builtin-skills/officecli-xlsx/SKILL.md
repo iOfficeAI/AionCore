@@ -242,12 +242,12 @@ officecli query "$FILE" 'Sheet1!B[value!=0]'      # sheet-scoped
 
 Operators: `=`, `!=`, `~=` (contains), `>=`, `<=`, `[attr]` (exists).
 
-**Merge cells shortcut.** `officecli query $FILE merge` or `mergedrange` — both are aliases for `mergeCell` (1.0.60+). Returns every merged range in the workbook without hand-walking `<mergeCell>` entries.
+**Merge cells shortcut.** `officecli query $FILE merge` or `mergedrange` — both are aliases for `mergeCell`. Returns every merged range in the workbook without hand-walking `<mergeCell>` entries.
 
 **When the data is big enough that a row-walk is useless**, reach for Excel's own analytical elements:
 
 - Build a **pivot table** with `officecli add` (`--type pivottable`) to group/aggregate without writing 20 SUMIFs. Attach a **slicer** (`--type slicer`) to give the reader a filter UI.
-- Drop a **sparkline** (`--type sparkline`) in a row to show per-row trends — cheaper than one line chart per row and they print inline. `type` is a strict enum: **`line | column | stacked`** (plus aliases `winloss` / `win-loss` → `stacked`). Invalid `type=` values hard-fail on 1.0.58+ — no silent fallback to `line` anymore.
+- Drop a **sparkline** (`--type sparkline`) in a row to show per-row trends — cheaper than one line chart per row and they print inline. `type` is a strict enum: **`line | column | stacked`** (plus aliases `winloss` / `win-loss` → `stacked`). Invalid `type=` values hard-fail — no silent fallback to `line` anymore.
 - Run `officecli help xlsx pivottable`, `officecli help xlsx slicer`, `officecli help xlsx sparkline` for the exact prop names.
 
 ## Creating & Editing
@@ -317,7 +317,7 @@ Three common flavors, each with its own prop shape (consult `officecli help xlsx
 
 - **Color scales**: cells shaded on a gradient by value — `type=colorscale` with `minColor` / `midColor` / `maxColor`.
 - **Data bars**: in-cell bars showing magnitude — `type=databar`. Set explicit `min` / `max` for consistent scaling across a column; defaults are valid if you omit them.
-- **Formula rules**: highlight row when a condition is true — `type=formulacf` with `formula="$C2>1000"` and a fill/font.
+- **Formula rules** (the `formulacf` element): highlight row when a condition is true — `type=formula` with `formula="$C2>1000"` and a fill/font.
 
 Rule: apply CF sparingly. A workbook where every cell is colored tells the reader nothing.
 
@@ -461,7 +461,7 @@ CLI constraints and gaps to work around — not defects in the output file.
 - **Batch + resident for formulas — avoid.** Observed deadlocks (CPU 99%, `main pipe busy`, kill -9 required) for cross-sheet formula batches even at 3-5 ops; the prior "≤ 12 ops safe" guideline is **not reliable**. Rule: **cross-sheet formulas go through non-resident one-big-batch OR individual `set`** (100% reliable). Pure value-set batches (no formulas) stay reliable at 50-80+ ops even in resident. **Multiple officecli resident processes on the same machine also contend** — if another agent/session is running resident, expect non-deterministic hangs.
 - **Conditional formatting naming asymmetry** — the element name for `--type` is `conditionalformatting`; the path suffix is `/cf[N]`. Use `officecli help xlsx conditionalformatting` for schema, `/cf[N]` for paths.
 - **Sheet `position` prop on add** — help says Add processes `position`, but the prop is often ignored. Reorder with `officecli move --index` / `--after` / `--before` after creating the sheet.
-- **`remove /sheet[N]` cascade guard** — 1.0.59+ rejects sheet remove/rename when the sheet is referenced by validation / conditional format / sparkline / hyperlink / named range on another sheet. Remove those dependent elements first, then remove the sheet.
+- **`remove /sheet[N]` cascade guard** — rejects sheet remove/rename when the sheet is referenced by validation / conditional format / sparkline / hyperlink / named range on another sheet. Remove those dependent elements first, then remove the sheet.
 - **Batch JSON rejects cell `color` alias** — inside batch `props`, `"color": "FF0000"` errors `ambiguous in cell context — use 'font.color' (text) or 'fill' (bg)`. The CLI at shell level accepts `--prop color=...` / `--prop size=14` as aliases on non-cell elements, but inside batch JSON on a cell always write the full dotted name: `"font.color"`, `"font.size"`, `"font.name"`.
 
 ### Renderer caveats (cross-viewer color fidelity)

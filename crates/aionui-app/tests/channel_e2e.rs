@@ -5,6 +5,9 @@
 
 mod common;
 
+use aionui_common::now_ms;
+use aionui_db::models::{AssistantSessionRow, AssistantUserRow};
+use aionui_db::{IChannelRepository, SqliteChannelRepository};
 use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
@@ -312,6 +315,196 @@ async fn get_sessions_empty() {
 // ===========================================================================
 // §5 Settings sync
 // ===========================================================================
+
+#[tokio::test]
+async fn get_channel_settings_defaults_to_generated_aionrs_assistant() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = get_with_token("/api/channel/settings/telegram", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert!(json["success"].as_bool().unwrap());
+    assert_eq!(json["data"]["platform"], "telegram");
+    // With no explicit binding the platform now falls back to the generated
+    // aionrs bare assistant (see channel "default to bare assistant bindings");
+    // only the assistant_id is canonical, legacy fields are omitted.
+    let assistant_id = json["data"]["assistant"]["assistant_id"]
+        .as_str()
+        .expect("default channel assistant should be the generated aionrs bare assistant");
+    assert!(
+        assistant_id.starts_with("bare:"),
+        "expected bare assistant id, got {assistant_id}"
+    );
+    assert!(json["data"]["assistant"]["backend"].is_null());
+    assert!(json["data"]["assistant"]["agent_type"].is_null());
+    assert!(json["data"]["default_model"].is_null());
+}
+
+#[tokio::test]
+async fn put_channel_assistant_setting_persists_binding() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "PUT",
+        "/api/channel/settings/telegram/assistant",
+        json!({
+            "assistant_id": "bare-claude",
+            "name": "Claude",
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = get_with_token("/api/channel/settings/telegram", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["data"]["assistant"],
+        json!({
+            "assistant_id": "bare-claude",
+            "name": "Claude",
+        })
+    );
+}
+
+#[tokio::test]
+async fn put_channel_default_model_setting_persists_model_ref() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "PUT",
+        "/api/channel/settings/lark/default-model",
+        json!({
+            "id": "provider-1",
+            "use_model": "gemini-2.5-pro",
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = get_with_token("/api/channel/settings/lark", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["data"]["default_model"],
+        json!({
+            "id": "provider-1",
+            "use_model": "gemini-2.5-pro",
+        })
+    );
+}
+
+#[tokio::test]
+async fn put_channel_assistant_setting_clears_active_sessions() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let repo: std::sync::Arc<dyn IChannelRepository> =
+        std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
+
+    let now = now_ms();
+    repo.create_user(&AssistantUserRow {
+        id: "user-channel-assistant".to_owned(),
+        platform_user_id: "user-channel-assistant".to_owned(),
+        platform_type: "lark".to_owned(),
+        display_name: Some("Channel Assistant User".to_owned()),
+        authorized_at: now,
+        last_active: Some(now),
+        session_id: None,
+    })
+    .await
+    .unwrap();
+    let new_session = AssistantSessionRow {
+        id: "sess-channel-assistant".to_owned(),
+        user_id: "user-channel-assistant".to_owned(),
+        agent_type: "acp".to_owned(),
+        conversation_id: None,
+        workspace: None,
+        chat_id: Some("chat-channel-assistant".to_owned()),
+        created_at: now,
+        last_activity: now,
+    };
+    repo.get_or_create_session("user-channel-assistant", "chat-channel-assistant", &new_session)
+        .await
+        .unwrap();
+    assert_eq!(repo.get_all_sessions().await.unwrap().len(), 1);
+
+    let req = json_with_token(
+        "PUT",
+        "/api/channel/settings/lark/assistant",
+        json!({
+            "assistant_id": "assistant-1",
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert!(repo.get_all_sessions().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn put_channel_default_model_setting_clears_active_sessions() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let repo: std::sync::Arc<dyn IChannelRepository> =
+        std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
+
+    let now = now_ms();
+    repo.create_user(&AssistantUserRow {
+        id: "user-channel-model".to_owned(),
+        platform_user_id: "user-channel-model".to_owned(),
+        platform_type: "lark".to_owned(),
+        display_name: Some("Channel Model User".to_owned()),
+        authorized_at: now,
+        last_active: Some(now),
+        session_id: None,
+    })
+    .await
+    .unwrap();
+    let new_session = AssistantSessionRow {
+        id: "sess-channel-model".to_owned(),
+        user_id: "user-channel-model".to_owned(),
+        agent_type: "acp".to_owned(),
+        conversation_id: None,
+        workspace: None,
+        chat_id: Some("chat-channel-model".to_owned()),
+        created_at: now,
+        last_activity: now,
+    };
+    repo.get_or_create_session("user-channel-model", "chat-channel-model", &new_session)
+        .await
+        .unwrap();
+    assert_eq!(repo.get_all_sessions().await.unwrap().len(), 1);
+
+    let req = json_with_token(
+        "PUT",
+        "/api/channel/settings/lark/default-model",
+        json!({
+            "id": "provider-1",
+            "use_model": "gemini-2.5-pro",
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert!(repo.get_all_sessions().await.unwrap().is_empty());
+}
 
 // SS-1: Sync valid platform clears sessions
 #[tokio::test]

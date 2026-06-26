@@ -1,7 +1,9 @@
 //! Repository trait for the `agent_metadata` catalog.
 
 use crate::error::DbError;
-use crate::models::{AgentMetadataRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams};
+use crate::models::{
+    AgentMetadataRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+};
 
 /// CRUD access for agent metadata rows.
 ///
@@ -40,6 +42,25 @@ pub trait IAgentMetadataRepository: Send + Sync {
         id: &str,
         params: &UpdateAgentHandshakeParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError>;
+
+    /// Persist the latest availability snapshot for an existing row.
+    /// Returns `Ok(None)` if no row matches `id`.
+    async fn update_availability_snapshot(
+        &self,
+        id: &str,
+        params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError>;
+
+    /// Write only the self-repair override columns for an agent, leaving all
+    /// other columns (seed truth + availability snapshot) untouched. Kept
+    /// separate from the full-row upsert so startup reconcile never clobbers
+    /// user overrides.
+    async fn update_agent_overrides(
+        &self,
+        id: &str,
+        command_override: Option<&str>,
+        env_override: Option<&str>,
+    ) -> Result<(), DbError>;
 
     /// Toggle the `enabled` flag. Returns `true` if a row was updated.
     async fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool, DbError>;

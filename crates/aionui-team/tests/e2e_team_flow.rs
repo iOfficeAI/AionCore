@@ -548,7 +548,7 @@ fn two_agents() -> Vec<TeamAgent> {
             conversation_id: "conv-lead".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -560,7 +560,7 @@ fn two_agents() -> Vec<TeamAgent> {
             conversation_id: "conv-worker".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -765,7 +765,7 @@ async fn wait_until_turn_count(turn_requests: &Arc<Mutex<Vec<AgentTurnRequest>>>
 /// Verifies:
 /// - TeamSession::start succeeds
 /// - MCP TCP server is reachable
-/// - tools/list returns all 10 expected tools
+/// - tools/list returns all 11 expected tools
 #[tokio::test]
 async fn s1a_mcp_server_starts_and_tools_available() {
     let (session, _tm, _repo, _sent) = setup_session().await;
@@ -781,12 +781,13 @@ async fn s1a_mcp_server_starts_and_tools_available() {
     let resp = tcp_recv(&mut stream).await;
 
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 10, "expected exactly 10 MCP tools, got {}", tools.len());
+    assert_eq!(tools.len(), 11, "expected exactly 11 MCP tools, got {}", tools.len());
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"team_send_message"), "missing team_send_message");
     assert!(names.contains(&"team_members"), "missing team_members");
     assert!(names.contains(&"team_task_create"), "missing team_task_create");
+    assert!(names.contains(&"team_list_assistants"), "missing team_list_assistants");
 
     session.stop();
 }
@@ -1078,7 +1079,7 @@ async fn s4_dynamic_agent_added_then_finish_propagates() {
         conversation_id: "conv-helper".into(),
         backend: "acp".into(),
         model: "claude".into(),
-        custom_agent_id: None,
+        assistant_id: None,
         status: None,
         conversation_type: None,
         cli_path: None,
@@ -1184,7 +1185,7 @@ async fn s4b_pending_wake_for_unregistered_dynamic_agent_survives_leader_empty_w
         conversation_id: "conv-helper".into(),
         backend: "acp".into(),
         model: "claude".into(),
-        custom_agent_id: None,
+        assistant_id: None,
         status: None,
         conversation_type: None,
         cli_path: None,
@@ -1432,7 +1433,7 @@ async fn s7_team_members_reflects_dynamic_roster() {
         conversation_id: "conv-extra".into(),
         backend: "acp".into(),
         model: "claude".into(),
-        custom_agent_id: None,
+        assistant_id: None,
         status: None,
         conversation_type: None,
         cli_path: None,

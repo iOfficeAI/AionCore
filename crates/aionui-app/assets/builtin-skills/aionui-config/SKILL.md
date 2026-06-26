@@ -83,12 +83,14 @@ Assistant `source` is `builtin` (shipped with the app, limited edits) or
 
 ```bash
 python3 scripts/aionui_api.py get /api/assistants
-# Detail MUST include ?locale=<loc> to inline the rules content:
+# Add ?locale=<loc> to load the per-locale rules file into rules.content:
 python3 scripts/aionui_api.py get "/api/assistants/<id>?locale=zh-CN"
 ```
 
-> Without `?locale=`, `rules.content` comes back empty even when a prompt exists.
-> That's expected — the rules live in a per-locale file, loaded on demand.
+> `?locale=` is optional. Without it, `rules.content` falls back to the
+> assistant's inline rule content (empty if none is stored). With it, content is
+> loaded from the per-locale rule file. Pass `?locale=` whenever you need the
+> locale-specific prompt — it's recommended, not required.
 
 ### Create
 
@@ -98,7 +100,7 @@ python3 scripts/aionui_api.py get "/api/assistants/<id>?locale=zh-CN"
 python3 scripts/aionui_api.py post /api/assistants '{
   "name": "需求梳理官",
   "description": "以新人视角梳理产品需求文档(PRD)",
-  "preset_agent_type": "claude",
+  "agent_id": "<engine-agent-id>",
   "prompts": [
     "我来描述一个需求,你帮我梳理成一份 PRD",
     "review 这份 PRD,挑出对新人不友好的地方"
@@ -111,12 +113,43 @@ Key fields in the create/update body:
 | Field | Meaning |
 | --- | --- |
 | `name`, `description` | display text (required: name) |
-| `preset_agent_type` | engine: `claude`, `aionrs`, `codex`, … |
+| `agent_id` | **engine binding** — the id of an installed agent (see "Picking the engine" below). This, not `preset_agent_type`, is what actually sets the engine |
+| `preset_agent_type` | display/i18n hint only; does **not** bind the engine in the current backend |
 | `prompts` | quick-start prompts shown on the assistant (NOT the system prompt) |
 | `avatar` | emoji, image URL, `data:` URI, or absolute local path |
 | `enabled_skills` | skill names attached to this assistant |
+| `custom_skill_names` | extra custom skill names to attach beyond `enabled_skills` |
+| `disabled_builtin_skills` | builtin skill names to turn OFF for this assistant |
+| `recommended_prompts` (+ `recommended_prompts_i18n`) | optional secondary prompt set |
 | `models`, `name_i18n`, `description_i18n`, `prompts_i18n` | optional |
-| `defaults` | per-assistant defaults — see below |
+| `defaults` | per-assistant defaults — see below (settable on **create**, not just update) |
+
+> The create and update bodies take the same fields. On GET, the assistant also
+> carries read-only `context` / `context_i18n` and `last_used_at` (unix ms) — you
+> can't set those via POST/PUT.
+
+### Picking the engine (`agent_id`)
+
+The engine is bound by the request-body field **`agent_id`**, whose value is an
+installed agent's id — not a friendly name like `"claude"`. Read the available
+agents first and copy the id you want:
+
+```bash
+python3 scripts/aionui_api.py get /api/assistants
+# look at the `engine` block of any existing assistant, e.g.
+#   "engine": {"agent_id": "2d23ff1c", "agent": {"type": "acp", "acp_backend": "claude"}}
+# reuse that agent_id for a new assistant on the same engine:
+python3 scripts/aionui_api.py put /api/assistants/<id> '{"id":"<id>","agent_id":"2d23ff1c"}'
+```
+
+> If you omit `agent_id` on create, the backend does NOT default to a CLI engine:
+> with at least one enabled provider it falls back to `aionrs` (its built-in
+> agent), and with no provider configured it returns a 400. CLI engines
+> (`claude`, `gemini`, `codex`, …) must be opted into explicitly with their
+> `agent_id` — an Anthropic key alone doesn't put the Claude CLI on `PATH`.
+> On read, the bound engine shows up in the assistant's `engine.agent_id` /
+> `engine.agent.acp_backend`; the create-body `preset_agent_type` is display-only
+> and reads back `null`, so don't rely on it to tell you the engine.
 
 ### Per-assistant defaults
 
@@ -126,12 +159,20 @@ means "inherit the global default / let the user pick each time" and carries NO
 while using this assistant). Send only the entries you want to change; read the
 assistant first to keep the others.
 
+Every entry's `mode` is only ever `auto` or `fixed` — those two are the only
+modes the backend accepts. The `value` is what `fixed` locks to:
+
 | Entry | `fixed` → `value` is | Example |
 | --- | --- | --- |
 | `model` | a model name (string) | `{"mode":"fixed","value":"gemini-2.5-pro"}` |
-| `permission` | a permission mode (string): `plan`, `default`, `acceptEdits`, `bypassPermissions` (yolo), `dontAsk` | `{"mode":"fixed","value":"plan"}` |
+| `permission` | a permission-name string (free-form; the backend does not enum-validate it). Common names: `plan`, `default` | `{"mode":"fixed","value":"plan"}` |
 | `skills` | skill names (string[]) | `{"mode":"fixed","value":["aionui-config"]}` |
 | `mcps` | MCP server names (string[]) | `{"mode":"fixed","value":["filesystem"]}` |
+
+> `permission.value` is whatever permission name the active agent/permission
+> system understands — it is stored as an opaque string, not checked against a
+> fixed list. (`acceptEdits` / `bypassPermissions` / `dontAsk` are **agent-level
+> YOLO IDs**, a separate concept — don't assume they're valid here.)
 
 ```bash
 python3 scripts/aionui_api.py put /api/assistants/<id> '{
@@ -185,15 +226,28 @@ no external dependency, renders offline:
 python3 scripts/aionui_api.py put /api/assistants/<id> '{"id":"<id>","avatar":"data:image/svg+xml;base64,<...>"}'
 ```
 
+> `GET /api/assistants/<id>/avatar` also serves the raw avatar binary (Content-Type
+> inferred; 404 if none) — handy for an `<img src>`, but a `data:` URI is still the
+> better default for self-contained config.
+
 ### Enable / disable / reorder
 
-`PATCH /api/assistants/<id>/state` with `enabled` and/or `sort_order`. Disabling
-hides the assistant from the homepage and team picker without deleting it.
+`PATCH /api/assistants/<id>/state` with any of `enabled`, `sort_order`, and
+`last_used_at` (unix ms). Disabling hides the assistant from the homepage and
+team picker without deleting it.
 
 ### Delete
 
 `DELETE /api/assistants/<id>` — only `source: user` assistants can be deleted.
 Builtins can only be disabled.
+
+### Bulk import
+
+`POST /api/assistants/import` inserts many assistants at once (e.g. restoring a
+backup or migrating from a legacy Electron config). Body is `{"assistants":
+[<CreateAssistantRequest>, …]}`; the response reports `imported` / `skipped` /
+`failed` counts plus a per-row `errors` array. It's insert-only — it won't
+overwrite an existing id.
 
 ---
 
@@ -206,28 +260,49 @@ auto-triggers the skill, so write it carefully.
 Three sources: `builtin` (`~/.aionui/builtin-skills/`), `custom`
 (`~/.aionui/skills/`), `extension` (external, symlinked).
 
-### List the registry
+### List / inspect the registry
 
 ```bash
 python3 scripts/aionui_api.py get /api/skills
-# Where skills live:
-python3 scripts/aionui_api.py get /api/skills/paths
+python3 scripts/aionui_api.py get /api/skills/paths          # where skills live on disk
+python3 scripts/aionui_api.py get /api/skills/builtin-auto   # auto-injected builtin skills
+python3 scripts/aionui_api.py post /api/skills/info '{"skill_path":"/abs/path/to/skill-folder"}'  # read a SKILL.md's name/description WITHOUT importing
 ```
 
 ### Import a skill into the registry
 
-`POST /api/skills/import` copies a skill folder into the user skills dir and
-registers it. `import-symlink` links it instead (good for skills you keep editing
-in an external repo).
+Two ways to install a skill — pick by whether you want a copy or a live link:
 
 ```bash
+# copy the folder into the user skills dir and register it
 python3 scripts/aionui_api.py post /api/skills/import '{"skill_path":"/abs/path/to/skill-folder"}'
+
+# symlink instead of copy — good for a skill you keep editing in an external repo.
+# import-symlink (NOT bare import) is also what accepts a PARENT folder of many
+# skills, or a .zip package.
+python3 scripts/aionui_api.py post /api/skills/import-symlink '{"skill_path":"/abs/path/to/skill-or-parent-or-zip"}'
 ```
 
-> Caution: importing from a path that is ALREADY inside the user skills dir can
-> race with the copy step. When editing an installed skill, edit the files in
-> place, then re-import from a separate staging copy — or just verify the
-> SKILL.md is non-empty afterwards. An empty SKILL.md unregisters the skill.
+> Caution: importing (copy) from a path that is ALREADY inside the user skills
+> dir can race with the copy step. When editing an installed skill, edit the
+> files in place, then re-import from a separate staging copy — or just verify
+> the SKILL.md is non-empty afterwards. An empty SKILL.md unregisters the skill.
+
+### Discover & manage skill sources
+
+For skills that live outside the standard dirs:
+
+```bash
+python3 scripts/aionui_api.py post   /api/skills/scan '{"path":"/abs/dir"}'   # find skills under a dir
+python3 scripts/aionui_api.py get    /api/skills/detect-paths                  # candidate skill locations
+python3 scripts/aionui_api.py get    /api/skills/detect-external               # external skill dirs
+python3 scripts/aionui_api.py get    /api/skills/external-paths                # list registered external paths
+python3 scripts/aionui_api.py post   /api/skills/external-paths '{"path":"/abs/dir"}'   # add one
+python3 scripts/aionui_api.py delete /api/skills/external-paths '{"path":"/abs/dir"}'   # remove one
+```
+
+The **skills market** is a separate, app-wide toggle:
+`POST /api/skills/market/enable` and `/disable`.
 
 ### Attach a skill to an assistant
 
@@ -270,8 +345,12 @@ The `transport` object is one of:
 | Type | Fields | For |
 | --- | --- | --- |
 | `stdio` | `command`, `args?` (string[]), `env?` (map) | local process servers (npx/uvx/binaries) |
-| `sse` | `url` | remote Server-Sent-Events servers |
-| `http` / `streamable_http` | `url` | remote HTTP servers |
+| `sse` | `url`, `headers?` (map) | remote Server-Sent-Events servers (legacy) |
+| `http` / `streamable_http` | `url`, `headers?` (map) | remote HTTP servers (Streamable HTTP) |
+
+> `headers` is an optional string→string map for auth (e.g. `{"Authorization":
+> "Bearer …"}`). `streamable_http` is accepted on create/update but always
+> normalizes to `http` in responses — don't expect `streamable_http` echoed back.
 
 ### Create
 
@@ -309,8 +388,10 @@ python3 scripts/aionui_api.py delete /api/mcp/servers/<id>
 ```
 
 > Remote servers may need OAuth: `/api/mcp/oauth/check-status`,
-> `/api/mcp/oauth/login`, `/api/mcp/oauth/logout`. Only touch these if a
-> `test-connection` came back with `needs_auth`.
+> `/api/mcp/oauth/login`, `/api/mcp/oauth/logout` (all `post`), and
+> `GET /api/mcp/oauth/authenticated` which lists the server URLs that already
+> have a stored token. Only touch these if a `test-connection` came back with
+> `needs_auth`.
 
 ---
 
@@ -323,9 +404,11 @@ pick a model from an enabled provider. The whole lifecycle is verified
 end-to-end (list / create / fetch-models / detect-protocol / update / delete).
 
 > **Secret-handling rule:** `GET /api/providers` returns every `api_key` in
-> **plaintext**. Never paste a provider response into chat, a commit, a log, or
-> a memory file. When you must show the user a provider, redact the key
-> (`sk-…last4`). Treat keys the user gives you the same way.
+> **plaintext** (a pre-launch convention for the local-store → backend migration;
+> it may be masked in a future release, so confirm before relying on it). Never
+> paste a provider response into chat, a commit, a log, or a memory file. When
+> you must show the user a provider, redact the key (`sk-…last4`). Treat keys the
+> user gives you the same way.
 
 ### List / inspect
 
@@ -336,9 +419,19 @@ python3 scripts/aionui_api.py get /api/providers
 Each provider: `id`, `platform`, `name`, `base_url`, `api_key`, `models`
 (string[]), `enabled`, `capabilities`, `is_full_url`.
 
-`platform` is one of: `gemini`, `anthropic`, `bedrock`, `custom`. **Any
-OpenAI-compatible endpoint (OpenAI, DeepSeek, OpenRouter, Ollama, vLLM, …) uses
-`custom`** with its `base_url` — there is no per-vendor platform for those.
+`platform` selects how the backend talks to and lists models for the upstream:
+
+- `anthropic` (alias `claude`), `gemini`, `bedrock` — native protocols.
+- `vertex-ai`, `minimax` — known vendors with a hardcoded model list (no live
+  fetch).
+- `new-api` — OpenAI protocol with `/v1` path enforcement.
+- `dashscope-coding` — DashScope coding endpoint.
+- `custom` (the default) → **OpenAI-compatible**. Use this for OpenAI itself,
+  DeepSeek, OpenRouter, Ollama, vLLM, and any other OpenAI-protocol endpoint,
+  with its `base_url`.
+
+When unsure, run `detect-protocol` (below) — it fills `platform` and `models`
+for you instead of guessing.
 
 ### Detect the protocol before creating (recommended)
 
@@ -355,8 +448,20 @@ python3 scripts/aionui_api.py post /api/providers/detect-protocol '{
 # -> {"protocol":"openai","confidence":90,"models":[...]}
 ```
 
+Optional fields on this body: `timeout` (ms), `preferred_protocol` (try a given
+protocol first), and `test_all_keys` (bool — probe every key when `api_key`
+holds several).
+
 `fetch-models` (`POST /api/providers/fetch-models`, same body) returns just the
 model list for a not-yet-saved endpoint.
+
+### Test a provider connection
+
+- `POST /api/agents/provider-health-check` with `{"provider_id":"<id>","model":"<model>"}`
+  checks that a saved provider+model actually answers. (This lives on the agents
+  router — it's what surfaces an assistant's availability.)
+- `POST /api/bedrock/test-connection` validates AWS Bedrock credentials before
+  you save a Bedrock provider.
 
 ### Create
 
@@ -408,9 +513,11 @@ Two stores, both verified:
 
 - `GET /api/settings` — app-level switches: `language`, `notification_enabled`,
   `cron_notification_enabled`, `command_queue_enabled`, `save_upload_to_workspace`.
-- `GET /api/settings/client` / `PUT /api/settings/client` — the larger UI/runtime
-  key-value store: `language`, `theme.activeId` (`light`/`dark`/custom),
-  `ui.zoomFactor`, `ui.fontSize.{chat,markdown,code}`, `webui.desktop.allowRemote`, …
+  Update them with `PATCH /api/settings` (partial — not PUT).
+- `GET /api/settings/client` — read the larger UI/runtime key-value store:
+  `language`, `theme.activeId` (`light`/`dark`/custom), `ui.zoomFactor`,
+  `ui.fontSize.{chat,markdown,code}`, `webui.desktop.allowRemote`, …
+- `PUT /api/settings/client` — batch-update that store.
 
 `PUT /api/settings/client` is a **partial merge** — send only the keys you want
 to change. Read first, change one key, read back.
@@ -427,10 +534,15 @@ python3 scripts/aionui_api.py put /api/settings/client '{"ui.zoomFactor": 1.0}'
 
 ## Engines (agents)
 
-`GET /api/agents` lists the available engines (`aionrs`, `claude`, `codex`, …)
-with `enabled` / `available` flags and capabilities — useful before setting an
-assistant's `preset_agent_type`, to confirm that engine is installed and
-reachable. `POST /api/agents/refresh` re-scans custom agents.
+`GET /api/agents` lists the available engines (`aionrs`, `claude`, `codex`, …).
+Each entry carries `enabled` (toggled on), `available` (installed & reachable),
+`team_capable` (can run in a team), and a `handshake` object describing what the
+engine supports — `agent_capabilities`, `auth_methods`, `config_options`,
+`available_modes`, `available_models`, `available_commands`. Check `available`
+before binding an assistant to that engine (via its `agent_id` — see *Picking the
+engine* above), and inspect `handshake` to see which models/modes that engine
+offers. `POST /api/agents/refresh` re-scans custom
+agents.
 
 ---
 
@@ -464,7 +576,12 @@ LLM providers, and app settings.
 
 ## Not yet covered
 
-Conversation repair (recovering a broken session from its logs) and
-channel/extension management (`/api/channel/*`, `/api/extensions/*`) have
-endpoints in the backend but are not verified in this skill yet. Add them once
-their request bodies are confirmed against the live backend — don't guess.
+Conversation repair (recovering a broken session from its logs) is not covered
+here yet.
+
+Channel and extension management (`/api/channel/*`, `/api/extensions/*`) now have
+stable request bodies and tests in the backend — they're no longer "unverified",
+but they're a large enough surface (plugin pairing, per-extension i18n/permissions,
+theme/assistant/skill extensions) that they belong in a dedicated skill rather
+than bolted onto this one. Document them there with bodies confirmed against the
+live backend — don't guess.

@@ -31,35 +31,41 @@ Use this only when one of the following is true:
 Before calling this tool in the normal planning flow:
 - Start with one short sentence explaining why additional teammates would help
 - Tell the user which teammate(s) you recommend
-- Present the proposal as a table with: name, responsibility, recommended agent type/backend, and recommended model
-- Include each teammate's responsibility, recommended agent type/backend, and model
-- Ask whether to create them as proposed or change any names, responsibilities, or agent types
+- Present the proposal as a table with: name, responsibility, recommended assistant, and recommended model
+- Include each teammate's responsibility, recommended assistant, and model
+- Ask whether to create them as proposed or change any names, responsibilities, or assistant choices
 - In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well
 - Do NOT call this tool in that same turn; wait for explicit approval in a later user message
 
+When calling this tool, always provide assistant_id from the available assistants catalog.
 When calling this tool, provide the model parameter if a specific model was recommended and approved.
 
 The new agent will be created and added to the team. You can then assign tasks and send messages to it."#;
 
 pub const TEAM_LIST_MODELS_DESCRIPTION: &str =
-    "Query available models for team agent types. Returns the real-time model list that matches the frontend model selector.
+    "Query available models for assistant backends. Returns the real-time model list that matches the frontend model selector.
 
 Use this to:
-- Check what models are available before spawning an agent with a specific model
-- See all available agent types and their models at once
-- Verify a model ID is valid for a given agent type
+- Check what models are available before spawning an assistant-backed teammate with a specific model
+- See all available backends and their models at once
+- Verify a model ID is valid for the backend behind a chosen assistant or fallback backend
 
-Pass agent_type to query a specific backend, or omit it to see all.";
+Pass assistant_id to query models for a specific assistant, or omit it to see all backends.";
 
 pub const TEAM_DESCRIBE_ASSISTANT_DESCRIPTION: &str =
-    "Get detailed information about a preset assistant before spawning it as a teammate.
+    "Get detailed information about an assistant before spawning it as a teammate.
 
-Returns the preset's full description, enabled skills, and example tasks so you can
-judge whether it fits the user's request. Use this when two or more presets look
+Returns the assistant's full description, enabled skills, and example tasks so you can
+judge whether it fits the user's request. Use this when two or more assistants look
 relevant from the one-line catalog in your system prompt.
 
-Only works on preset assistants listed in \"Available Preset Assistants for Spawning\".
-After confirming a match, call team_spawn_agent with the same custom_agent_id.";
+Only works on assistants listed in \"Available Assistants for Spawning\".
+After confirming a match, call team_spawn_agent with the same assistant_id.";
+
+pub const TEAM_LIST_ASSISTANTS_DESCRIPTION: &str = "List the assistants available for team spawning. Returns the real assistant catalog with \
+real assistant_id values, names, backends, descriptions, and skills.\n\nUse this before \
+team_spawn_agent when you need the exact assistant_id for a teammate. Do NOT guess from backend \
+names like claude/codex/gemini — only use assistant_id values returned here.";
 
 pub fn team_tool_specs() -> Vec<TeamToolSpec> {
     vec![
@@ -84,13 +90,11 @@ pub fn team_tool_specs() -> Vec<TeamToolSpec> {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Agent display name" },
-                    "agent_type": { "type": "string", "description": "Agent type/backend to use (e.g. \"claude\", \"codex\", \"codebuddy\", \"gemini\"). Query team_list_models first to see available options." },
-                    "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be a valid model for the chosen agent_type. Query team_list_models to see available models." },
-                    "custom_agent_id": { "type": "string", "description": "Preset assistant ID to spawn (from the Available Preset Assistants catalog). When set, agent_type is derived from the preset's backend." },
-                    "backend": { "type": "string", "description": "Legacy alias for agent_type. Prefer agent_type." },
+                    "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be valid for the chosen assistant backend. Query team_list_models to see available models." },
+                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn (from the Available Assistants catalog). The runtime backend is derived from this assistant." },
                     "role": { "type": "string", "description": "Agent role (default: 'teammate')" }
                 },
-                "required": ["name"]
+                "required": ["name", "assistant_id"]
             }),
         },
         TeamToolSpec {
@@ -169,14 +173,12 @@ pub fn team_tool_specs() -> Vec<TeamToolSpec> {
             }),
         },
         TeamToolSpec {
-            name: "team_list_models",
+            name: "team_list_assistants",
             permission: TeamToolPermission::AnyTeamAgent,
-            description: TEAM_LIST_MODELS_DESCRIPTION,
+            description: TEAM_LIST_ASSISTANTS_DESCRIPTION,
             input_schema: json!({
                 "type": "object",
-                "properties": {
-                    "agent_type": { "type": "string", "description": "Agent type/backend to query (e.g. \"gemini\", \"claude\", \"codex\"). Shows all when omitted." }
-                }
+                "properties": {}
             }),
         },
         TeamToolSpec {
@@ -186,10 +188,21 @@ pub fn team_tool_specs() -> Vec<TeamToolSpec> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "custom_agent_id": { "type": "string", "description": "The preset assistant ID from the \"Available Preset Assistants\" catalog (e.g., \"word-creator\")." },
+                    "assistant_id": { "type": "string", "description": "The assistant ID from the available assistants catalog (e.g., \"word-creator\")." },
                     "locale": { "type": "string", "description": "Locale like \"zh-CN\" or \"en-US\". Defaults to the user's current UI language when omitted." }
                 },
-                "required": ["custom_agent_id"]
+                "required": ["assistant_id"]
+            }),
+        },
+        TeamToolSpec {
+            name: "team_list_models",
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: TEAM_LIST_MODELS_DESCRIPTION,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "assistant_id": { "type": "string", "description": "Assistant ID to query. When provided, returns models for the backend behind that assistant. Shows all backends when omitted." }
+                }
             }),
         },
     ]
@@ -256,9 +269,25 @@ mod tests {
                 ("team_members", TeamToolPermission::AnyTeamAgent),
                 ("team_rename_agent", TeamToolPermission::LeadOnly),
                 ("team_shutdown_agent", TeamToolPermission::LeadOnly),
-                ("team_list_models", TeamToolPermission::AnyTeamAgent),
+                ("team_list_assistants", TeamToolPermission::AnyTeamAgent),
                 ("team_describe_assistant", TeamToolPermission::AnyTeamAgent),
+                ("team_list_models", TeamToolPermission::AnyTeamAgent),
             ]
         );
+    }
+
+    #[test]
+    fn spawn_schema_is_assistant_first() {
+        let descriptor = visible_team_tool_descriptors(true)
+            .into_iter()
+            .find(|tool| tool.name == "team_spawn_agent")
+            .expect("team_spawn_agent descriptor");
+        let props = descriptor.input_schema["properties"].as_object().unwrap();
+        let required = descriptor.input_schema["required"].as_array().unwrap();
+        let required_names: Vec<_> = required.iter().filter_map(|value| value.as_str()).collect();
+        assert!(props.contains_key("assistant_id"));
+        assert!(!props.contains_key("agent_type"));
+        assert!(!props.contains_key("backend"));
+        assert!(required_names.contains(&"assistant_id"));
     }
 }

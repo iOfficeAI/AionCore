@@ -14,7 +14,6 @@ pub struct AssistantRow {
     pub name: String,
     pub description: Option<String>,
     pub avatar: Option<String>,
-    pub preset_agent_type: String,
     pub enabled_skills: Option<String>,
     pub custom_skill_names: Option<String>,
     pub disabled_builtin_skills: Option<String>,
@@ -29,24 +28,20 @@ pub struct AssistantRow {
 
 /// Row mapping for the `assistant_overrides` table (per-assistant user state).
 ///
-/// `preset_agent_type` is `Some(_)` when the user has switched the main agent
-/// on a built-in assistant (which cannot be mutated at its source). `None`
-/// means "inherit from the built-in / user row".
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantOverrideRow {
     pub assistant_id: String,
     pub enabled: bool,
     pub sort_order: i32,
     pub last_used_at: Option<TimestampMs>,
-    pub preset_agent_type: Option<String>,
     pub updated_at: TimestampMs,
 }
 
 /// Row mapping for the `assistant_definitions` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantDefinitionRow {
-    pub definition_id: String,
-    pub assistant_key: String,
+    pub id: String,
+    pub assistant_id: String,
     pub source: String,
     pub owner_type: String,
     pub source_ref: Option<String>,
@@ -58,7 +53,7 @@ pub struct AssistantDefinitionRow {
     pub description_i18n: String,
     pub avatar_type: String,
     pub avatar_value: Option<String>,
-    pub agent_backend: String,
+    pub agent_id: String,
     pub rule_resource_type: String,
     pub rule_resource_ref: Option<String>,
     pub rule_inline_content: Option<String>,
@@ -82,10 +77,10 @@ pub struct AssistantDefinitionRow {
 /// Row mapping for the `assistant_overlays` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantOverlayRow {
-    pub definition_id: String,
+    pub assistant_definition_id: String,
     pub enabled: bool,
     pub sort_order: i32,
-    pub agent_backend_override: Option<String>,
+    pub agent_id_override: Option<String>,
     pub last_used_at: Option<TimestampMs>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
@@ -94,7 +89,7 @@ pub struct AssistantOverlayRow {
 /// Row mapping for the `assistant_preferences` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantPreferenceRow {
-    pub definition_id: String,
+    pub assistant_definition_id: String,
     pub last_model_id: Option<String>,
     pub last_permission_value: Option<String>,
     pub last_skill_ids: String,
@@ -114,7 +109,6 @@ pub struct CreateAssistantParams<'a> {
     pub name: &'a str,
     pub description: Option<&'a str>,
     pub avatar: Option<&'a str>,
-    pub preset_agent_type: &'a str,
     pub enabled_skills: Option<&'a str>,
     pub custom_skill_names: Option<&'a str>,
     pub disabled_builtin_skills: Option<&'a str>,
@@ -133,7 +127,6 @@ pub struct UpdateAssistantParams<'a> {
     pub name: Option<&'a str>,
     pub description: Option<Option<&'a str>>,
     pub avatar: Option<Option<&'a str>>,
-    pub preset_agent_type: Option<&'a str>,
     pub enabled_skills: Option<Option<&'a str>>,
     pub custom_skill_names: Option<Option<&'a str>>,
     pub disabled_builtin_skills: Option<Option<&'a str>>,
@@ -146,23 +139,19 @@ pub struct UpdateAssistantParams<'a> {
 
 /// Upsert parameters for `IAssistantOverrideRepository::upsert`.
 ///
-/// `preset_agent_type` uses `Option<Option<&str>>`: outer `None` keeps the
-/// current value, outer `Some(inner)` writes `inner` (which itself may be
-/// `None` to clear the override).
 #[derive(Debug, Clone, Default)]
 pub struct UpsertOverrideParams<'a> {
     pub assistant_id: &'a str,
     pub enabled: bool,
     pub sort_order: i32,
     pub last_used_at: Option<TimestampMs>,
-    pub preset_agent_type: Option<Option<&'a str>>,
 }
 
 /// Insert-or-update parameters for `assistant_definitions`.
 #[derive(Debug, Clone)]
 pub struct UpsertAssistantDefinitionParams<'a> {
-    pub definition_id: &'a str,
-    pub assistant_key: &'a str,
+    pub id: &'a str,
+    pub assistant_id: &'a str,
     pub source: &'a str,
     pub owner_type: &'a str,
     pub source_ref: Option<&'a str>,
@@ -174,7 +163,7 @@ pub struct UpsertAssistantDefinitionParams<'a> {
     pub description_i18n: &'a str,
     pub avatar_type: &'a str,
     pub avatar_value: Option<&'a str>,
-    pub agent_backend: &'a str,
+    pub agent_id: &'a str,
     pub rule_resource_type: &'a str,
     pub rule_resource_ref: Option<&'a str>,
     pub rule_inline_content: Option<&'a str>,
@@ -195,17 +184,17 @@ pub struct UpsertAssistantDefinitionParams<'a> {
 /// Insert-or-update parameters for `assistant_overlays`.
 #[derive(Debug, Clone)]
 pub struct UpsertAssistantOverlayParams<'a> {
-    pub definition_id: &'a str,
+    pub assistant_definition_id: &'a str,
     pub enabled: bool,
     pub sort_order: i32,
-    pub agent_backend_override: Option<&'a str>,
+    pub agent_id_override: Option<&'a str>,
     pub last_used_at: Option<TimestampMs>,
 }
 
 /// Insert-or-update parameters for `assistant_preferences`.
 #[derive(Debug, Clone)]
 pub struct UpsertAssistantPreferenceParams<'a> {
-    pub definition_id: &'a str,
+    pub assistant_definition_id: &'a str,
     pub last_model_id: Option<&'a str>,
     pub last_permission_value: Option<&'a str>,
     pub last_skill_ids: &'a str,

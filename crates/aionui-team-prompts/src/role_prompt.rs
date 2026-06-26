@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::governance::with_team_governance;
+use serde::Serialize;
 
 pub const LEAD_PROMPT_TEMPLATE: &str = include_str!("prompt_templates/lead.txt");
 
@@ -43,12 +44,12 @@ pub struct AvailableAgentType {
     pub display_name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AvailableAssistant {
-    pub custom_agent_id: String,
+    pub assistant_id: String,
     pub name: String,
     pub backend: String,
-    pub description: Option<String>,
+    pub description: String,
     pub skills: Vec<String>,
 }
 
@@ -124,41 +125,30 @@ fn render_teammate_list(teammates: &[TeamPromptAgent], renamed_agents: &HashMap<
 }
 
 fn render_available_types_section(agent_types: &[AvailableAgentType]) -> String {
-    if agent_types.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from("\n\n## Available Agent Types for Spawning\n");
-    for (idx, agent_type) in agent_types.iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-        let _ = write!(out, "- `{}` — {}", agent_type.agent_type, agent_type.display_name);
-    }
-    out.push_str("\n\nUse `team_list_models` to query available models for each agent type before spawning.");
-    out
+    let _ = agent_types;
+    String::new()
 }
 
 fn render_available_assistants_section(assistants: &[AvailableAssistant]) -> String {
     if assistants.is_empty() {
         return String::new();
     }
-    let mut out = String::from("\n\n## Available Preset Assistants for Spawning\n");
+    let mut out = String::from("\n\n## Available Assistants for Spawning\n");
     out.push_str(
-        "These are user-configured assistants with pre-loaded rules and skills for specific \
-         domains (writing, research, PPT building, etc.). When a task matches a preset's \
-         specialty, prefer spawning the preset over a generic CLI agent — you get its domain \
+        "These are available assistants with pre-loaded rules and skills for specific \
+         domains (writing, research, PPT building, etc.). When a task matches an assistant's \
+         specialty, prefer spawning that assistant — you get its domain \
          expertise automatically.\n\n",
     );
     for (idx, assistant) in assistants.iter().enumerate() {
         if idx > 0 {
             out.push('\n');
         }
-        let desc = assistant
-            .description
-            .as_deref()
-            .filter(|description| !description.is_empty())
-            .map(|description| format!(" — {description}"))
-            .unwrap_or_default();
+        let desc = if assistant.description.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", assistant.description)
+        };
         let skills = if assistant.skills.is_empty() {
             String::new()
         } else {
@@ -166,22 +156,22 @@ fn render_available_assistants_section(assistants: &[AvailableAssistant]) -> Str
         };
         let _ = write!(
             out,
-            "- `{}` ({}, backend: {}){}{}",
-            assistant.custom_agent_id, assistant.name, assistant.backend, desc, skills,
+            "- `{}` ({}){}{}",
+            assistant.assistant_id, assistant.name, desc, skills,
         );
     }
     out.push_str(
-        "\n\n### How to pick a preset\n\
+        "\n\n### How to pick an assistant\n\
          1. Scan the one-line descriptions and skills above. If one clearly matches the user's \
          domain (e.g. \"quarterly Word report\" → `word-creator`), spawn it directly with \
          `team_spawn_agent`.\n\
-         2. If two or more presets seem relevant, call `team_describe_assistant` on each \
+         2. If two or more assistants seem relevant, call `team_describe_assistant` on each \
          candidate to see its full description, skills, and example tasks, then choose the best \
          fit.\n\
-         3. If no preset matches the task, fall back to a generic CLI agent from the \
-         \"Available Agent Types\" section.\n\n\
-         Pass the preset's ID as `custom_agent_id` to `team_spawn_agent`. The `agent_type` is \
-         derived from the preset's backend and does not need to be specified.",
+         3. If no assistant is an obvious fit, choose the assistant whose domain and backing \
+         capabilities best match the work.\n\n\
+         Pass the assistant's ID as `assistant_id` to `team_spawn_agent`. The runtime backend \
+         is derived automatically and does not need to be specified.",
     );
     out
 }
@@ -320,22 +310,26 @@ mod tests {
     fn lead_prompt_prepends_governance_and_fills_sections() {
         let renamed = HashMap::new();
         let teammate = prompt_agent("worker-1", "Worker", TeamPromptRole::Teammate);
-        let agent_types = vec![AvailableAgentType {
-            agent_type: "claude".to_owned(),
-            display_name: "Claude".to_owned(),
+        let assistants = vec![AvailableAssistant {
+            assistant_id: "word-creator".to_owned(),
+            name: "Word Creator".to_owned(),
+            backend: "claude".to_owned(),
+            description: "Drafts documents".to_owned(),
+            skills: vec!["docx".to_owned()],
         }];
         let prompt = build_lead_prompt(&LeadPromptParams {
             team_name: "Alpha",
             teammates: &[teammate],
-            available_agent_types: &agent_types,
-            available_assistants: &[],
+            available_agent_types: &[],
+            available_assistants: &assistants,
             renamed_agents: &renamed,
             team_workspace: None,
         });
 
         assert!(prompt.starts_with("## Team Governance"));
         assert!(prompt.contains("- Worker (claude, status: unknown)"));
-        assert!(prompt.contains("## Available Agent Types for Spawning"));
+        assert!(prompt.contains("## Available Assistants for Spawning"));
+        assert!(prompt.contains("Pass the assistant's ID as `assistant_id`"));
         assert!(!prompt.contains("${"));
     }
 

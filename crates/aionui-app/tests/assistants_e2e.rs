@@ -12,8 +12,13 @@ mod common;
 
 use std::sync::Arc;
 
+use aionui_api_types::{
+    AgentManagementRow, AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
+    AgentSourceInfo, BehaviorPolicy,
+};
 use aionui_app::{AppConfig, AppServices, ModuleStates, build_module_states, create_router_with_states};
-use aionui_assistant::{AssistantRouterState, AssistantService, BuiltinAssistantRegistry};
+use aionui_assistant::{AssistantAgentCatalogPort, AssistantRouterState, AssistantService, BuiltinAssistantRegistry};
+use aionui_common::AgentType;
 use aionui_db::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
     IAssistantPreferenceRepository, IAssistantRepository, IProviderRepository, SqliteAssistantDefinitionRepository,
@@ -53,6 +58,122 @@ struct Fixture {
     _ext_tmp: TempDir,
 }
 
+#[derive(Clone)]
+struct TestAgentCatalog {
+    rows: Vec<AgentManagementRow>,
+}
+
+#[async_trait::async_trait]
+impl AssistantAgentCatalogPort for TestAgentCatalog {
+    async fn list_management_agents(&self) -> Result<Vec<AgentManagementRow>, aionui_assistant::AssistantError> {
+        Ok(self.rows.clone())
+    }
+}
+
+fn test_agent_row(id: &str, backend: Option<&str>, agent_type: AgentType, name: &str) -> AgentManagementRow {
+    AgentManagementRow {
+        id: id.to_owned(),
+        icon: None,
+        name: name.to_owned(),
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: backend.map(str::to_owned),
+        agent_type,
+        agent_source: match agent_type {
+            AgentType::Aionrs => AgentSource::Internal,
+            _ => AgentSource::Builtin,
+        },
+        agent_source_info: AgentSourceInfo::default(),
+        enabled: true,
+        installed: true,
+        command: backend.map(str::to_owned),
+        args: Vec::new(),
+        env: Vec::new(),
+        native_skills_dirs: None,
+        behavior_policy: BehaviorPolicy {
+            supports_team: true,
+            ..Default::default()
+        },
+        yolo_id: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        sort_order: 0,
+        team_capable: true,
+        status: AgentManagementStatus::Online,
+        last_check_status: Some(AgentSnapshotCheckStatus::Online),
+        last_check_kind: Some(AgentSnapshotCheckKind::Manual),
+        last_check_error_code: None,
+        last_check_error_message: None,
+        last_check_error_details: None,
+        last_check_guidance: None,
+        last_check_latency_ms: None,
+        last_check_at: None,
+        last_success_at: None,
+        last_failure_at: None,
+        has_command_override: false,
+        env_override_key_count: 0,
+    }
+}
+
+async fn insert_generated_bare_assistant(
+    fx: &Fixture,
+    assistant_id: &str,
+    source_ref: &str,
+    _backend: &str,
+    name: &str,
+) {
+    let pool = fx.services.database.pool().clone();
+    let definition_repo = SqliteAssistantDefinitionRepository::new(pool.clone());
+    let overlay_repo = SqliteAssistantOverlayRepository::new(pool);
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: &format!("asstdef-{assistant_id}"),
+            assistant_id,
+            source: "generated",
+            owner_type: "system",
+            source_ref: Some(source_ref),
+            source_version: None,
+            source_hash: None,
+            name,
+            name_i18n: "{}",
+            description: None,
+            description_i18n: "{}",
+            avatar_type: "none",
+            avatar_value: None,
+            agent_id: source_ref,
+            rule_resource_type: "none",
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: &format!("asstdef-{assistant_id}"),
+            enabled: true,
+            sort_order: 5,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+}
+
 /// Build the whole app with:
 /// - a manifest at `{builtin_tmp}/assets/assistants.json` registering two
 ///   built-ins (`builtin-office` with rule/skill/avatar files on disk, and
@@ -83,14 +204,14 @@ async fn fixture() -> Fixture {
             {
                 "id": "builtin-office",
                 "name": "Office",
-                "preset_agent_type": "gemini",
+                "agent_ref": "codex",
                 "rule_file": "rules/office.{locale}.md",
                 "avatar": "office.png",
             },
             {
                 "id": "builtin-bare",
                 "name": "Bare",
-                "preset_agent_type": "gemini",
+                "agent_ref": "codex",
             }
         ]
     });
@@ -181,6 +302,7 @@ async fn fixture() -> Fixture {
     };
     states.skill = SkillRouterState {
         skill_paths,
+        skill_repo: std::sync::Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone())),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None, // wired below once service is constructed
     };
@@ -201,7 +323,7 @@ async fn fixture() -> Fixture {
         Arc::new(SqliteAssistantOverrideRepository::new(pool.clone()));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
     // Seed an OpenAI-compatible provider so create / import calls without
-    // an explicit `preset_agent_type` resolve to `"aionrs"` instead of
+    // an explicit `agent_id` resolve to `"aionrs"` instead of
     // erroring out — mirroring a configured production setup.
     provider_repo
         .create(aionui_db::CreateProviderParams {
@@ -233,6 +355,13 @@ async fn fixture() -> Fixture {
             override_repo,
             provider_repo,
             builtin,
+            agent_catalog: Some(Arc::new(TestAgentCatalog {
+                rows: vec![
+                    test_agent_row("8e1acf31", Some("codex"), AgentType::Acp, "Codex CLI"),
+                    test_agent_row("cc126dd5", Some("gemini"), AgentType::Acp, "Gemini CLI"),
+                    test_agent_row("632f31d2", None, AgentType::Aionrs, "Aion CLI"),
+                ],
+            })),
         },
         user_data_dir.clone(),
     ));
@@ -281,14 +410,25 @@ async fn list_populated_excludes_extension_assistants() {
     let list = json["data"].as_array().unwrap();
     // Extension-contributed assistants are no longer part of the unified
     // assistant catalog.
-    assert_eq!(list.len(), 2, "body = {json}");
+    assert_eq!(list.len(), 5, "body = {json}");
     let ids: Vec<&str> = list.iter().map(|a| a["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"bare:8e1acf31"));
+    assert!(ids.contains(&"bare:cc126dd5"));
+    assert!(ids.contains(&"bare:632f31d2"));
     assert!(ids.contains(&"builtin-office"));
     assert!(ids.contains(&"builtin-bare"));
     assert!(!ids.contains(&"ext-helper"));
     let sources: Vec<&str> = list.iter().map(|a| a["source"].as_str().unwrap()).collect();
+    assert!(sources.contains(&"generated"));
     assert!(sources.contains(&"builtin"));
     assert!(!sources.contains(&"extension"));
+    let office = find_id(&json["data"], "builtin-office").expect("builtin-office missing from assistant list");
+    assert_eq!(office["agent_id"], "8e1acf31");
+    assert_eq!(office["agent"]["type"], "acp");
+    assert_eq!(office["agent"]["source"], "builtin");
+    assert_eq!(office["agent"]["acp_backend"], "codex");
+    assert!(office["agent"].get("backend").is_none());
+    assert!(office["agent"].get("id").is_none());
 }
 
 #[tokio::test]
@@ -312,6 +452,36 @@ async fn list_builtin_file_avatar_is_served_via_assistant_avatar_route() {
     assert_eq!(
         builtin_office["avatar"].as_str(),
         Some("/api/assistants/builtin-office/avatar")
+    );
+}
+
+#[tokio::test]
+async fn list_generated_assistant_exposes_generated_runtime_fields() {
+    let fx = fixture().await;
+    insert_generated_bare_assistant(&fx, "bare:agent-droid", "agent-droid", "droid", "Droid").await;
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let list = json["data"].as_array().unwrap();
+    let generated = list
+        .iter()
+        .find(|assistant| assistant["id"] == "bare:agent-droid")
+        .expect("generated assistant missing from assistant list");
+
+    assert_eq!(generated["source"], "generated");
+    assert_eq!(generated["deletable"], false);
+    assert_eq!(generated["agent_status"], "missing");
+    assert_eq!(generated["agent_status_message"], Value::Null);
+    assert_eq!(generated["team_selectable"], false);
+    assert_eq!(
+        generated["team_block_reason"],
+        "This assistant's agent could not be resolved."
     );
 }
 
@@ -340,7 +510,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
             "id": "u1",
             "name": "Mine",
             "description": "hello",
-            "preset_agent_type": "aionrs",
+            "agent_id": "632f31d2",
             "enabled_skills": ["legacy-default"],
             "custom_skill_names": ["custom-note"],
             "disabled_builtin_skills": ["todo-tracker"],
@@ -366,12 +536,12 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
     let definition_repo = SqliteAssistantDefinitionRepository::new(pool.clone());
     let state_repo = SqliteAssistantOverlayRepository::new(pool.clone());
     let preference_repo = SqliteAssistantPreferenceRepository::new(pool);
-    let definition = definition_repo.get_by_key("u1").await.unwrap().unwrap();
+    let definition = definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
-            definition_id: &definition.definition_id,
-            assistant_key: &definition.assistant_key,
+            id: &definition.id,
+            assistant_id: &definition.assistant_id,
             source: &definition.source,
             owner_type: &definition.owner_type,
             source_ref: definition.source_ref.as_deref(),
@@ -383,7 +553,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
             description_i18n: &definition.description_i18n,
             avatar_type: &definition.avatar_type,
             avatar_value: definition.avatar_value.as_deref(),
-            agent_backend: &definition.agent_backend,
+            agent_id: &definition.agent_id,
             rule_resource_type: &definition.rule_resource_type,
             rule_resource_ref: definition.rule_resource_ref.as_deref(),
             rule_inline_content: definition.rule_inline_content.as_deref(),
@@ -404,17 +574,17 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
         .unwrap();
     state_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: &definition.definition_id,
+            assistant_definition_id: &definition.id,
             enabled: false,
             sort_order: 7,
-            agent_backend_override: Some("codex"),
+            agent_id_override: Some("8e1acf31"),
             last_used_at: Some(1_725_000_001_234),
         })
         .await
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: &definition.definition_id,
+            assistant_definition_id: &definition.id,
             last_model_id: Some("gpt-5-mini"),
             last_permission_value: Some("workspace-write"),
             last_skill_ids: r#"["pref-skill"]"#,
@@ -439,7 +609,11 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
     assert_eq!(data["profile"]["name"], "Mine");
     assert_eq!(data["state"]["enabled"], false);
     assert_eq!(data["state"]["sort_order"], 7);
-    assert_eq!(data["engine"]["agent_backend"], "codex");
+    assert_eq!(data["engine"]["agent_id"], "8e1acf31");
+    assert_eq!(data["engine"]["agent"]["acp_backend"], "codex");
+    assert!(data["engine"]["agent"].get("backend").is_none());
+    assert!(data["engine"]["agent"].get("id").is_none());
+    assert_eq!(data["engine"]["agent"]["type"], "acp");
     assert_eq!(data["rules"]["content"], "user rule body");
     assert_eq!(data["rules"]["storage_mode"], "user_file");
     assert_eq!(data["defaults"]["model"]["mode"], "fixed");
@@ -448,6 +622,38 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
     assert_eq!(data["capabilities"]["custom_skill_names"], json!(["custom-note"]));
     assert_eq!(data["preferences"]["last_permission_value"], "workspace-write");
     assert_eq!(data["preferences"]["last_skill_ids"], json!(["pref-skill"]));
+}
+
+#[tokio::test]
+async fn get_detail_generated_assistant_exposes_generated_runtime_fields() {
+    let fx = fixture().await;
+    insert_generated_bare_assistant(&fx, "bare:agent-droid", "agent-droid", "droid", "Droid").await;
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token(
+            "/api/assistants/bare:agent-droid?locale=en-US",
+            &fx.token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let data = &json["data"];
+    assert_eq!(data["id"], "bare:agent-droid");
+    assert_eq!(data["source"], "generated");
+    assert_eq!(data["deletable"], false);
+    assert_eq!(data["agent_status"], "missing");
+    assert_eq!(data["agent_status_message"], Value::Null);
+    assert_eq!(data["team_selectable"], false);
+    assert_eq!(
+        data["team_block_reason"],
+        "This assistant's agent could not be resolved."
+    );
+    assert_eq!(data["engine"]["agent_id"], "agent-droid");
+    assert_eq!(data["engine"]["agent"], Value::Null);
 }
 
 // ===========================================================================
@@ -522,7 +728,7 @@ async fn create_user_avatar_from_local_file_is_served_via_assistant_avatar_route
             "id": "u-avatar",
             "name": "Avatar User",
             "avatar": source_avatar.to_string_lossy(),
-            "preset_agent_type": "aionrs",
+            "agent_id": "632f31d2",
         }),
         &fx.token,
         &fx.csrf,
@@ -569,7 +775,7 @@ async fn create_user_avatar_from_builtin_avatar_route_copies_builtin_asset() {
             "id": "u-avatar-from-builtin",
             "name": "Builtin Avatar Copy",
             "avatar": "/api/assistants/builtin-office/avatar",
-            "preset_agent_type": "aionrs",
+            "agent_id": "632f31d2",
         }),
         &fx.token,
         &fx.csrf,
@@ -619,7 +825,7 @@ async fn create_user_avatar_from_absolute_builtin_avatar_route_copies_builtin_as
             "id": "u-avatar-from-builtin-absolute",
             "name": "Builtin Avatar Absolute Copy",
             "avatar": "http://127.0.0.1:56663/api/assistants/builtin-office/avatar",
-            "preset_agent_type": "aionrs",
+            "agent_id": "632f31d2",
         }),
         &fx.token,
         &fx.csrf,
@@ -656,7 +862,7 @@ async fn update_user_avatar_with_existing_route_preserves_served_file() {
             "id": "u-avatar-stable",
             "name": "Avatar User",
             "avatar": source_avatar.to_string_lossy(),
-            "preset_agent_type": "aionrs",
+            "agent_id": "632f31d2",
         }),
         &fx.token,
         &fx.csrf,

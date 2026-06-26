@@ -10,6 +10,8 @@ const MAX_DETAIL_CHARS: usize = 1000;
 const OPENCLAW_BACKEND: &str = "openclaw";
 const OPENCLAW_GATEWAY_MESSAGE: &str = "OpenClaw Gateway is not reachable";
 const OPENCLAW_GATEWAY_DETAIL: &str = "OpenClaw Gateway is not running or cannot be reached at 127.0.0.1:18789.\n\nStart OpenClaw Gateway and try again. You can run:\nopenclaw gateway status\nopenclaw gateway start";
+const AWS_SSO_EXPIRED_DETAIL: &str =
+    "Token is expired. To refresh this SSO session run 'aws sso login' with the corresponding profile.";
 
 #[derive(Debug, Clone)]
 pub struct AgentSendError {
@@ -23,7 +25,7 @@ struct ClassifiedError {
     ownership: AgentErrorOwnership,
     retryable: bool,
     feedback_recommended: bool,
-    resolution_kind: AgentErrorResolutionKind,
+    resolution_kind: Option<AgentErrorResolutionKind>,
     resolution_target: Option<AgentErrorResolutionTarget>,
 }
 
@@ -36,7 +38,8 @@ impl ClassifiedError {
             Some(detail),
             self.retryable,
             self.feedback_recommended,
-            resolution(self.resolution_kind, self.resolution_target),
+            self.resolution_kind
+                .and_then(|kind| resolution(kind, self.resolution_target)),
         )
     }
 }
@@ -129,10 +132,7 @@ impl AgentSendError {
                 Some(detail),
                 true,
                 false,
-                resolution(
-                    AgentErrorResolutionKind::StartNewSession,
-                    Some(AgentErrorResolutionTarget::NewConversation),
-                ),
+                None,
             ),
             AgentError::BadRequest(msg) if msg.contains("Method not supported") => Self::new(
                 "The selected Agent does not support this operation",
@@ -141,10 +141,7 @@ impl AgentSendError {
                 Some(detail),
                 false,
                 false,
-                resolution(
-                    AgentErrorResolutionKind::CheckAgentVersion,
-                    Some(AgentErrorResolutionTarget::AgentSettings),
-                ),
+                None,
             ),
             AgentError::BadRequest(msg) if msg.contains("Invalid parameters") => Self::new(
                 "The selected Agent rejected the request parameters",
@@ -152,11 +149,8 @@ impl AgentSendError {
                 AgentErrorOwnership::UserAgent,
                 Some(detail),
                 false,
-                true,
-                resolution(
-                    AgentErrorResolutionKind::SendFeedback,
-                    Some(AgentErrorResolutionTarget::Feedback),
-                ),
+                false,
+                None,
             ),
             AgentError::Timeout(_) => Self::new(
                 "The model provider did not respond in time",
@@ -294,6 +288,24 @@ impl AgentSendError {
                     Some(AgentErrorResolutionTarget::AgentSettings),
                 ),
             ),
+            AcpError::ProtocolParseError { .. } => Self::new(
+                "The selected Agent reported a protocol parse error",
+                AgentErrorCode::UserAgentProtocolParseError,
+                AgentErrorOwnership::UserAgent,
+                Some(detail),
+                false,
+                false,
+                None,
+            ),
+            AcpError::InvalidRequest { .. } => Self::new(
+                "The selected Agent reported an invalid protocol request",
+                AgentErrorCode::UserAgentInvalidRequest,
+                AgentErrorOwnership::UserAgent,
+                Some(detail),
+                false,
+                false,
+                None,
+            ),
             AcpError::SessionNotFound { .. } => Self::new(
                 "The Agent session was not found",
                 AgentErrorCode::UserAgentSessionNotFound,
@@ -301,10 +313,16 @@ impl AgentSendError {
                 Some(detail),
                 true,
                 false,
-                resolution(
-                    AgentErrorResolutionKind::StartNewSession,
-                    Some(AgentErrorResolutionTarget::NewConversation),
-                ),
+                None,
+            ),
+            AcpError::ResourceNotFound { .. } => Self::new(
+                "The selected Agent could not find a required resource",
+                AgentErrorCode::UserAgentResourceNotFound,
+                AgentErrorOwnership::UserAgent,
+                Some(detail),
+                false,
+                false,
+                None,
             ),
             AcpError::MethodNotFound { .. } => Self::new(
                 "The selected Agent does not support this operation",
@@ -313,10 +331,7 @@ impl AgentSendError {
                 Some(detail),
                 false,
                 false,
-                resolution(
-                    AgentErrorResolutionKind::CheckAgentVersion,
-                    Some(AgentErrorResolutionTarget::AgentSettings),
-                ),
+                None,
             ),
             AcpError::InvalidParams { .. } => Self::new(
                 "The selected Agent rejected the request parameters",
@@ -324,11 +339,8 @@ impl AgentSendError {
                 AgentErrorOwnership::UserAgent,
                 Some(detail),
                 false,
-                true,
-                resolution(
-                    AgentErrorResolutionKind::SendFeedback,
-                    Some(AgentErrorResolutionTarget::Feedback),
-                ),
+                false,
+                None,
             ),
             AcpError::NotConnected => Self::new(
                 "AionUI lost its Agent protocol connection",
@@ -341,6 +353,15 @@ impl AgentSendError {
                     AgentErrorResolutionKind::ReconnectAgent,
                     Some(AgentErrorResolutionTarget::AgentSettings),
                 ),
+            ),
+            AcpError::OtherProtocolError { .. } => Self::new(
+                "The selected Agent returned a non-standard protocol error",
+                AgentErrorCode::UserAgentProtocolError,
+                AgentErrorOwnership::UserAgent,
+                Some(detail),
+                false,
+                false,
+                None,
             ),
             AcpError::AgentInternal { .. } => unknown_upstream_error(detail),
         }
@@ -370,9 +391,9 @@ impl From<AgentError> for AgentSendError {
 fn classify_acp_error(err: &AcpError) -> AgentSendError {
     match err {
         AcpError::AgentInternal { message, code, data } => {
-            let detail = acp_agent_internal_public_detail(*code);
+            let default_detail = acp_agent_internal_public_detail(*code);
             if *code != -32603 {
-                return unknown_upstream_error(detail);
+                return unknown_upstream_error(default_detail);
             }
 
             let classified = acp_agent_internal_texts(message, data.as_ref())
@@ -382,11 +403,15 @@ fn classify_acp_error(err: &AcpError) -> AgentSendError {
                     classify_agent_lifecycle(&lower)
                         .or_else(|| classify_provider_text(&lower))
                         .or_else(|| classify_aionui_state(&lower))
+                        .map(|classification| (classification, text))
                 });
 
             match classified {
-                Some(classification) => classification.into_send_error(detail),
-                None => unknown_upstream_error(detail),
+                Some((classification, text)) => {
+                    let detail = acp_agent_internal_detail_for_classification(*code, classification, text);
+                    classification.into_send_error(detail)
+                }
+                None => unknown_upstream_error(default_detail),
             }
         }
         _ => AgentSendError::from_acp_non_internal(err, err.to_string()),
@@ -395,6 +420,16 @@ fn classify_acp_error(err: &AcpError) -> AgentSendError {
 
 fn acp_agent_internal_public_detail(code: i32) -> String {
     format!("Agent internal error (code {code})")
+}
+
+fn acp_agent_internal_detail_for_classification(code: i32, classification: ClassifiedError, text: &str) -> String {
+    if classification.code == AgentErrorCode::UserLlmProviderAwsSsoExpired
+        && contains_sso_expired_auth_signature(&text.to_ascii_lowercase())
+    {
+        return AWS_SSO_EXPIRED_DETAIL.to_owned();
+    }
+
+    acp_agent_internal_public_detail(code)
 }
 
 fn acp_agent_internal_texts<'a>(message: &'a str, data: Option<&'a serde_json::Value>) -> Vec<&'a str> {
@@ -463,9 +498,9 @@ fn unknown_upstream_classification() -> ClassifiedError {
         code: AgentErrorCode::UnknownUpstreamError,
         ownership: AgentErrorOwnership::UnknownUpstream,
         retryable: true,
-        feedback_recommended: true,
-        resolution_kind: AgentErrorResolutionKind::SendFeedback,
-        resolution_target: Some(AgentErrorResolutionTarget::Feedback),
+        feedback_recommended: false,
+        resolution_kind: None,
+        resolution_target: None,
     }
 }
 
@@ -504,12 +539,15 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
         ));
     }
     if lower.contains("protocol mismatch") || lower.contains("max reconnect attempts") {
-        return Some(agent_error(
-            "The selected Agent protocol is incompatible",
-            AgentErrorCode::UserAgentProtocolMismatch,
-            false,
-            AgentErrorResolutionKind::CheckAgentVersion,
-        ));
+        return Some(ClassifiedError {
+            message: "The selected Agent protocol is incompatible",
+            code: AgentErrorCode::UserAgentProtocolMismatch,
+            ownership: AgentErrorOwnership::UserAgent,
+            retryable: false,
+            feedback_recommended: false,
+            resolution_kind: None,
+            resolution_target: None,
+        });
     }
     if lower.contains("no previous sessions found") {
         return Some(agent_session_error(
@@ -562,6 +600,15 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
 }
 
 fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
+    if contains_sso_expired_auth_signature(lower) {
+        return Some(provider_error(
+            "The model provider rejected the request",
+            AgentErrorCode::UserLlmProviderAwsSsoExpired,
+            false,
+            AgentErrorResolutionKind::CheckProviderCredentials,
+            Some(AgentErrorResolutionTarget::ProviderSettings),
+        ));
+    }
     if contains_any(
         lower,
         &[
@@ -830,7 +877,7 @@ fn classify_aionui_state(lower: &str) -> Option<ClassifiedError> {
             ownership: AgentErrorOwnership::Aionui,
             retryable: true,
             feedback_recommended: false,
-            resolution_kind: AgentErrorResolutionKind::WaitForCurrentResponse,
+            resolution_kind: Some(AgentErrorResolutionKind::WaitForCurrentResponse),
             resolution_target: Some(AgentErrorResolutionTarget::NewConversation),
         });
     }
@@ -850,7 +897,7 @@ fn agent_error(
         ownership: AgentErrorOwnership::UserAgent,
         retryable,
         feedback_recommended: false,
-        resolution_kind,
+        resolution_kind: Some(resolution_kind),
         resolution_target: Some(AgentErrorResolutionTarget::AgentSettings),
     }
 }
@@ -862,8 +909,8 @@ fn agent_session_error(message: &'static str, code: AgentErrorCode) -> Classifie
         ownership: AgentErrorOwnership::UserAgent,
         retryable: true,
         feedback_recommended: false,
-        resolution_kind: AgentErrorResolutionKind::StartNewSession,
-        resolution_target: Some(AgentErrorResolutionTarget::NewConversation),
+        resolution_kind: None,
+        resolution_target: None,
     }
 }
 
@@ -880,7 +927,7 @@ fn provider_error(
         ownership: AgentErrorOwnership::UserLlmProvider,
         retryable,
         feedback_recommended: false,
-        resolution_kind,
+        resolution_kind: Some(resolution_kind),
         resolution_target,
     }
 }
@@ -894,6 +941,10 @@ fn resolution(
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn contains_sso_expired_auth_signature(lower: &str) -> bool {
+    contains_any(lower, &["token is expired", "aws sso login", "sso session"])
 }
 
 fn is_openclaw_backend(backend: Option<&str>) -> bool {
@@ -1064,6 +1115,14 @@ mod tests {
         assert_eq!(err.stream_error().resolution.map(|value| value.kind), Some(resolution));
     }
 
+    fn assert_classification_without_resolution(detail: &str, code: AgentErrorCode, ownership: AgentErrorOwnership) {
+        let err = AgentSendError::from_agent_error(AgentError::bad_gateway(detail));
+        assert_eq!(err.code(), Some(code));
+        assert_eq!(err.ownership(), Some(ownership));
+        assert!(err.stream_error().resolution.is_none());
+        assert_eq!(err.stream_error().feedback_recommended, Some(false));
+    }
+
     fn assert_acp_classification(
         err: AcpError,
         code: AgentErrorCode,
@@ -1193,7 +1252,50 @@ mod tests {
 
         assert_eq!(err.code(), Some(AgentErrorCode::UnknownUpstreamError));
         assert_eq!(err.ownership(), Some(AgentErrorOwnership::UnknownUpstream));
-        assert_eq!(err.stream_error().feedback_recommended, Some(true));
+        assert_eq!(err.stream_error().feedback_recommended, Some(false));
+        assert!(err.stream_error().resolution.is_none());
+    }
+
+    #[test]
+    fn classifies_acp_protocol_errors_without_unknown_upstream_fallback() {
+        let cases = [
+            (
+                AcpError::ProtocolParseError {
+                    message: "Parse error".into(),
+                },
+                AgentErrorCode::UserAgentProtocolParseError,
+            ),
+            (
+                AcpError::InvalidRequest {
+                    message: "Invalid request".into(),
+                },
+                AgentErrorCode::UserAgentInvalidRequest,
+            ),
+            (
+                AcpError::ResourceNotFound {
+                    resource: Some("file:///missing.txt".into()),
+                    message: "Resource not found".into(),
+                },
+                AgentErrorCode::UserAgentResourceNotFound,
+            ),
+            (
+                AcpError::OtherProtocolError {
+                    code: -32099,
+                    message: "custom protocol error".into(),
+                    data: None,
+                },
+                AgentErrorCode::UserAgentProtocolError,
+            ),
+        ];
+
+        for (err, code) in cases {
+            let send_error = AgentSendError::from(err);
+            assert_eq!(send_error.code(), Some(code));
+            assert_eq!(send_error.ownership(), Some(AgentErrorOwnership::UserAgent));
+            assert_ne!(send_error.code(), Some(AgentErrorCode::UnknownUpstreamError));
+            assert!(send_error.stream_error().resolution.is_none());
+            assert_eq!(send_error.stream_error().feedback_recommended, Some(false));
+        }
     }
 
     #[test]
@@ -1403,6 +1505,28 @@ mod tests {
     }
 
     #[test]
+    fn classifies_acp_internal_bedrock_sso_expired_as_dedicated_provider_error() {
+        let err = AgentSendError::from(AcpError::AgentInternal {
+                message: "Internal error: API Error: Token is expired. To refresh this SSO session run 'aws sso login' with the corresponding profile.".into(),
+                code: -32603,
+                data: Some(json!({"errorKind": "unknown"})),
+            });
+
+        let payload = serde_json::to_value(err.stream_error()).expect("serialize stream error");
+        assert_eq!(payload["code"], "USER_LLM_PROVIDER_AWS_SSO_EXPIRED");
+        assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserLlmProvider));
+        assert_eq!(
+            err.stream_error().resolution.map(|value| value.kind),
+            Some(AgentErrorResolutionKind::CheckProviderCredentials)
+        );
+        let detail = err.stream_error().detail.as_deref().expect("detail present");
+        assert!(detail.contains("Token is expired"));
+        assert!(detail.contains("aws sso login"));
+        assert_eq!(err.stream_error().retryable, Some(false));
+        assert_eq!(err.stream_error().feedback_recommended, Some(false));
+    }
+
+    #[test]
     fn classifies_acp_internal_nested_provider_error_message() {
         assert_acp_classification(
             AcpError::AgentInternal {
@@ -1473,23 +1597,20 @@ mod tests {
 
     #[test]
     fn classifies_agent_protocol_and_session_failures() {
-        assert_classification(
+        assert_classification_without_resolution(
             "Connection error: protocol mismatch Connection error: Max reconnect attempts (10) reached",
             AgentErrorCode::UserAgentProtocolMismatch,
             AgentErrorOwnership::UserAgent,
-            AgentErrorResolutionKind::CheckAgentVersion,
         );
-        assert_classification(
+        assert_classification_without_resolution(
             "Agent internal error (code -32603) {\"details\":\"Session not found\"}",
             AgentErrorCode::UserAgentSessionNotFound,
             AgentErrorOwnership::UserAgent,
-            AgentErrorResolutionKind::StartNewSession,
         );
-        assert_classification(
+        assert_classification_without_resolution(
             "Bad gateway: Agent internal error (code -32603) {\"details\":\"No previous sessions found for this project\"}",
             AgentErrorCode::UserAgentNoPreviousSession,
             AgentErrorOwnership::UserAgent,
-            AgentErrorResolutionKind::StartNewSession,
         );
     }
 
@@ -1687,22 +1808,16 @@ mod tests {
             AgentSendError::from_agent_error(AgentError::bad_request("Invalid parameters: malformed request"));
         assert_eq!(api_err.code(), Some(AgentErrorCode::UserAgentInvalidParams));
         assert_eq!(api_err.stream_error().retryable, Some(false));
-        assert_eq!(api_err.stream_error().feedback_recommended, Some(true));
-        assert_eq!(
-            api_err.stream_error().resolution.map(|value| value.kind),
-            Some(AgentErrorResolutionKind::SendFeedback)
-        );
+        assert_eq!(api_err.stream_error().feedback_recommended, Some(false));
+        assert!(api_err.stream_error().resolution.is_none());
 
         let acp_err = AgentSendError::from(AcpError::InvalidParams {
             message: "malformed request".into(),
         });
         assert_eq!(acp_err.code(), Some(AgentErrorCode::UserAgentInvalidParams));
         assert_eq!(acp_err.stream_error().retryable, Some(false));
-        assert_eq!(acp_err.stream_error().feedback_recommended, Some(true));
-        assert_eq!(
-            acp_err.stream_error().resolution.map(|value| value.kind),
-            Some(AgentErrorResolutionKind::SendFeedback)
-        );
+        assert_eq!(acp_err.stream_error().feedback_recommended, Some(false));
+        assert!(acp_err.stream_error().resolution.is_none());
     }
 
     #[test]

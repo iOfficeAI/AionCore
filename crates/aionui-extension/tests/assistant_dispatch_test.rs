@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use aionui_api_types::{ApiResponse, AssistantSource};
+use aionui_api_types::{ApiResponse, AssistantSource, SkillImportLimitsResponse};
 use aionui_extension::classifier::{AssistantClassifier, AssistantRuleDispatcher};
 use aionui_extension::error::ExtensionError;
 use aionui_extension::external_paths::ExternalPathsManager;
@@ -139,10 +139,13 @@ async fn router_with_dispatcher(dispatcher: Arc<FakeDispatcher>) -> axum::Router
         assistant_skills_dir: root.join("assistant-skills"),
     };
     let ext_mgr = Arc::new(ExternalPathsManager::with_file(root.join("paths.json")).await);
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let skill_repo = Arc::new(aionui_db::SqliteSkillRepository::new(db.pool().clone()));
     std::mem::forget(tmp);
 
     let state = SkillRouterState {
         skill_paths: paths,
+        skill_repo,
         external_paths_manager: ext_mgr,
         assistant_dispatcher: Some(dispatcher),
     };
@@ -181,6 +184,31 @@ fn write_body(assistant_id: &str, content: &str, locale: Option<&str>) -> Vec<u8
 // ---------------------------------------------------------------------------
 // Test cases
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn import_limits_route_returns_server_configured_limits() {
+    let dispatcher = Arc::new(FakeDispatcher {
+        rule_content: Default::default(),
+        skill_content: Default::default(),
+        reject_writes_for: Default::default(),
+        log: Mutex::new(CallLog::default()),
+    });
+    let router = router_with_dispatcher(dispatcher).await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/skills/import-limits")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: ApiResponse<SkillImportLimitsResponse> = body_json(resp).await;
+    let limits = body.data.expect("import limits response data");
+    assert_eq!(limits.max_file_bytes, 10 * 1024 * 1024);
+    assert_eq!(limits.max_total_bytes, 50 * 1024 * 1024);
+}
 
 #[tokio::test]
 async fn read_rule_routes_through_dispatcher_for_builtin() {

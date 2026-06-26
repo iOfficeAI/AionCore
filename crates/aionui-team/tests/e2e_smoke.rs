@@ -81,7 +81,7 @@ async fn setup_team_with_lead() -> SmokeEnv {
             conversation_id: "conv-lead".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -93,7 +93,7 @@ async fn setup_team_with_lead() -> SmokeEnv {
             conversation_id: "conv-worker".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -193,7 +193,7 @@ fn is_error_response(resp: &Value) -> bool {
 ///
 /// Flow:
 /// 1. `TeamSessionService::create_team` with a lead + one worker.
-/// 2. Assert the returned team has a `lead_agent_id` and two agents.
+/// 2. Assert the returned team has a `leader_assistant_id` and two assistants.
 /// 3. Assert `TeamMcpServer` is started for that team (ensure_session).
 /// 4. `tools/list` returns the full 10-tool surface.
 /// 5. `team_members` returns both agents.

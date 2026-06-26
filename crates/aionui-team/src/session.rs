@@ -26,11 +26,9 @@ use crate::provisioning::PersistSpawnedAgentRequest;
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
-#[cfg(test)]
-use crate::team_run::WakeRecordDecision;
 use crate::team_run::{
     ChildCancelTarget, RecoveryBacklogResult, RecoveryWakeCandidate, TeamRunManager, TeamRunWakeAcquireOutcome,
-    target_role_for,
+    WakeRecordDecision, target_role_for,
 };
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::wake::TeamWakeSource;
@@ -59,7 +57,7 @@ pub struct WakeInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentMessageQueueResult {
+pub struct AgentMessageQueueResult {
     pub team_run_id: String,
     pub delivery: TeamSendMessageDelivery,
     pub target: TeamSendMessageTargetQueueState,
@@ -70,9 +68,13 @@ pub(crate) struct AgentMessageQueueResult {
 #[derive(Debug, Clone)]
 pub struct SpawnAgentRequest {
     pub name: String,
-    pub agent_type: Option<String>,
-    pub custom_agent_id: Option<String>,
+    pub assistant_id: Option<String>,
     pub model: Option<String>,
+}
+
+enum SpawnWakePlan {
+    RunScoped(TeamRunTargetRole),
+    MailboxOnly,
 }
 
 pub struct TeamSession {
@@ -285,24 +287,14 @@ impl TeamSession {
         let first_message = if needs_role_prompt {
             let role_prompt = match agent.role {
                 TeammateRole::Lead => {
-                    let available_agent_types = match self.service.upgrade() {
-                        Some(svc) => svc.list_team_capable_backends().await,
-                        None => crate::capability::TEAM_CAPABLE_BACKENDS
-                            .iter()
-                            .map(|b| {
-                                let mut c = b.chars();
-                                let display = match c.next() {
-                                    None => String::new(),
-                                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                                };
-                                (b.to_string(), display)
-                            })
-                            .collect(),
+                    let available_assistants = match self.service.upgrade() {
+                        Some(svc) => svc.list_team_selectable_assistants().await,
+                        None => Vec::new(),
                     };
                     build_lead_prompt(
                         &self.team.name,
                         &self.scheduler.list_agents().await,
-                        &available_agent_types,
+                        &available_assistants,
                     )
                 }
                 TeammateRole::Teammate => {
@@ -767,7 +759,28 @@ impl TeamSession {
         Ok(())
     }
 
-    #[cfg(test)]
+    pub(crate) fn notify_mailbox_only_wake(&self, slot_id: &str, source: TeamWakeSource) {
+        if self.event_loops.has(slot_id) {
+            self.event_loops.notify(slot_id);
+            info!(
+                team_id = %self.team.id,
+                slot_id,
+                wake_source = %source,
+                wake_policy = "mailbox_only",
+                "team mailbox-only wake notified"
+            );
+            return;
+        }
+
+        info!(
+            team_id = %self.team.id,
+            slot_id,
+            wake_source = %source,
+            wake_policy = "mailbox_only_deferred",
+            "team mailbox-only wake deferred because event loop is not registered"
+        );
+    }
+
     pub(crate) async fn reserve_wake_for_team_work(
         &self,
         slot_id: &str,
@@ -1271,11 +1284,10 @@ impl TeamSession {
 
     /// Spawn a new teammate at the Lead's request (backing of `team_spawn_agent`).
     ///
-    /// Validation chain mirrors the phase1 interface contract:
+    /// Validation chain mirrors the assistant-first team contract:
     /// 1. Caller must exist and carry `TeammateRole::Lead`.
     /// 2. `name` is normalized and must not collide with any live agent.
-    /// 3. `agent_type` (falling back to the caller's backend when unset) must
-    ///    be in the spawn whitelist.
+    /// 3. `assistant_id` must be present and resolve to a team-capable backend.
     ///
     /// On success, a new conversation is created, the agent slot is persisted
     /// into the team row, the MCP stdio config is written into the conversation
@@ -1307,47 +1319,42 @@ impl TeamSession {
             return Err(TeamError::DuplicateAgentName(requested_name));
         }
 
-        // Step 3: backend capability check. Hard whitelist passes immediately;
-        // otherwise query persisted agent_capabilities for MCP support.
-        let backend = req
-            .agent_type
+        let assistant_id = req
+            .assistant_id
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(caller.backend.as_str())
-            .to_owned();
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| TeamError::InvalidRequest("spawn_agent.assistant_id is required".into()))?;
+
+        let service = self
+            .service
+            .upgrade()
+            .ok_or_else(|| TeamError::InvalidRequest("spawn_agent requires a live TeamSessionService".into()))?;
+
+        // Step 3: resolve the effective assistant/backend/model target before
+        // capability checks. Assistant spawns derive backend from the preset
+        // identity rather than inheriting the caller backend.
+        let (backend, model) = service
+            .resolve_spawn_backend_and_model(
+                Some(assistant_id),
+                req.model.as_deref(),
+                caller.backend.as_str(),
+                caller.model.as_str(),
+            )
+            .await?;
+
+        // Step 4: backend capability check. Hard whitelist passes immediately;
+        // otherwise query persisted agent_capabilities for MCP support.
         if !crate::capability::TEAM_CAPABLE_BACKENDS.contains(&backend.as_str()) {
-            let capable = match self.service.upgrade() {
-                Some(svc) => svc.is_backend_team_capable(&backend).await,
-                None => false,
-            };
+            let capable = service.is_backend_team_capable(&backend).await;
             if !capable {
                 return Err(TeamError::BackendNotAllowed(backend));
             }
         }
 
-        // Step 4: DB side-effects (new conversation + persisted agent slot).
-        let service = self
-            .service
-            .upgrade()
-            .ok_or_else(|| TeamError::InvalidRequest("spawn_agent requires a live TeamSessionService".into()))?;
-        let model = match req.model.as_deref().filter(|m| !m.is_empty()) {
-            Some(m) => m.to_owned(),
-            None => service
-                .default_model_for_backend(&backend)
-                .await
-                .unwrap_or_else(|| caller.model.clone()),
-        };
+        // Step 5: DB side-effects (new conversation + persisted agent slot).
         let new_slot_id = generate_id();
-        let outcome = self
-            .team_run_manager
-            .acquire_run_scoped_wake(&new_slot_id, TeamRunTargetRole::Teammate, TeamWakeSource::SpawnWelcome)
-            .await?;
-        let TeamRunWakeAcquireOutcome::Accepted(lease) = outcome else {
-            return Err(TeamError::InvalidRequest("spawn welcome wake was suppressed".into()));
-        };
-
-        let new_agent = match service
+        let new_agent = service
             .persist_spawned_agent(PersistSpawnedAgentRequest {
                 team_id: self.team.id.clone(),
                 user_id: self.user_id.clone(),
@@ -1355,19 +1362,9 @@ impl TeamSession {
                 name: requested_name,
                 backend,
                 model,
-                custom_agent_id: req.custom_agent_id.clone(),
+                assistant_id: Some(assistant_id.to_owned()),
             })
-            .await
-        {
-            Ok(agent) => agent,
-            Err(err) => {
-                let _ = self
-                    .team_run_manager
-                    .abort_operation_lease(&lease.lease_id, "spawn_persistence_failed")
-                    .await;
-                return Err(err);
-            }
-        };
+            .await?;
 
         // Step 5: attach to the in-memory scheduler so wake-from-lead finds
         // the new slot immediately.
@@ -1397,25 +1394,37 @@ impl TeamSession {
                 } else {
                     let _ = self.scheduler.remove_agent(&new_agent.slot_id).await;
                 }
-                let _ = self
-                    .team_run_manager
-                    .abort_operation_lease(&lease.lease_id, "spawn_welcome_mailbox_write_failed")
-                    .await;
                 return Err(err);
             }
         };
 
-        self.team_run_manager
-            .commit_operation_lease(&lease.lease_id, Some(welcome_message.id.clone()))
-            .await?;
-        let spawn_welcome_role = lease.role.clone();
-        info!(
-            team_id = %self.team.id,
-            slot_id = %new_agent.slot_id,
-            target_role = ?spawn_welcome_role,
-            wake_source = %lease.wake_source,
-            "spawn welcome wake reserved before runtime attach"
-        );
+        let spawn_wake_plan = if self.team_run_manager.active_run_id().await.is_some() {
+            let spawn_welcome_role = self
+                .reserve_wake_for_team_work(
+                    &new_agent.slot_id,
+                    TeamWakeSource::SpawnWelcome,
+                    Some(welcome_message.id),
+                )
+                .await?
+                .ok_or_else(|| TeamError::InvalidRequest("spawn welcome wake was suppressed".into()))?;
+            info!(
+                team_id = %self.team.id,
+                slot_id = %new_agent.slot_id,
+                target_role = ?spawn_welcome_role,
+                wake_source = %TeamWakeSource::SpawnWelcome,
+                "spawn welcome wake reserved before runtime attach"
+            );
+            SpawnWakePlan::RunScoped(spawn_welcome_role)
+        } else {
+            info!(
+                team_id = %self.team.id,
+                slot_id = %new_agent.slot_id,
+                wake_source = %TeamWakeSource::SpawnWelcome,
+                wake_policy = "mailbox_only",
+                "spawn welcome wake will use mailbox-only delivery because no active team run exists"
+            );
+            SpawnWakePlan::MailboxOnly
+        };
 
         // Step 7: attach the CLI process and register the finish subscriber
         // in a background task. This involves spawning the CLI process and
@@ -1466,13 +1475,19 @@ impl TeamSession {
                 // Register the event loop for the newly spawned agent.
                 service.register_event_loop(&team_id, &agent_clone.slot_id);
 
-                // Notify the event loop to drain the welcome message.
-                service.notify_reserved_wake_for_team_work(
-                    &team_id,
-                    &agent_clone.slot_id,
-                    spawn_welcome_role,
-                    TeamWakeSource::SpawnWelcome,
-                );
+                match spawn_wake_plan {
+                    SpawnWakePlan::RunScoped(spawn_welcome_role) => {
+                        service.notify_reserved_wake_for_team_work(
+                            &team_id,
+                            &agent_clone.slot_id,
+                            spawn_welcome_role,
+                            TeamWakeSource::SpawnWelcome,
+                        );
+                    }
+                    SpawnWakePlan::MailboxOnly => {
+                        service.notify_mailbox_only_wake(&team_id, &agent_clone.slot_id, TeamWakeSource::SpawnWelcome);
+                    }
+                }
             });
         }
 
@@ -1852,7 +1867,7 @@ mod tests {
                     conversation_id: "c1".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
-                    custom_agent_id: None,
+                    assistant_id: None,
                     status: None,
                     conversation_type: None,
                     cli_path: None,
@@ -1864,7 +1879,7 @@ mod tests {
                     conversation_id: "c2".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
-                    custom_agent_id: None,
+                    assistant_id: None,
                     status: None,
                     conversation_type: None,
                     cli_path: None,
@@ -2810,7 +2825,7 @@ mod tests {
             conversation_id: "c3".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -2930,8 +2945,7 @@ mod tests {
     fn sample_spawn_req() -> SpawnAgentRequest {
         SpawnAgentRequest {
             name: "Helper".into(),
-            agent_type: None,
-            custom_agent_id: None,
+            assistant_id: Some("word-creator".into()),
             model: None,
         }
     }
@@ -3653,11 +3667,10 @@ mod tests {
         (session, recorder)
     }
 
-    fn spawn_req(agent_type: Option<&str>) -> SpawnAgentRequest {
+    fn spawn_req(assistant_id: Option<&str>) -> SpawnAgentRequest {
         SpawnAgentRequest {
             name: "Helper".into(),
-            agent_type: agent_type.map(str::to_owned),
-            custom_agent_id: None,
+            assistant_id: assistant_id.map(str::to_owned),
             model: None,
         }
     }
@@ -3674,66 +3687,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_accepts_claude_backend() {
-        let session = start_session_with_lead_backend("claude").await;
-        let err = session
-            .spawn_agent("lead-1", spawn_req(Some("claude")))
-            .await
-            .expect_err("unit test has no service wire; spawn stops at DB step");
-        assert_reached_db_step(err);
-        session.stop();
-    }
-
-    #[tokio::test]
-    async fn spawn_agent_accepts_codex_backend() {
-        let session = start_session_with_lead_backend("claude").await;
-        let err = session
-            .spawn_agent("lead-1", spawn_req(Some("codex")))
-            .await
-            .expect_err("unit test has no service wire; spawn stops at DB step");
-        assert_reached_db_step(err);
-        session.stop();
-    }
-
-    #[tokio::test]
-    async fn spawn_agent_rejects_unknown_backend() {
-        let session = start_session_with_lead_backend("claude").await;
-        let err = session
-            .spawn_agent("lead-1", spawn_req(Some("unknown_backend")))
-            .await
-            .expect_err("unknown backend must be rejected");
-        assert!(
-            matches!(&err, TeamError::BackendNotAllowed(b) if b == "unknown_backend"),
-            "expected BackendNotAllowed(\"unknown_backend\"), got {err:?}"
-        );
-        session.stop();
-    }
-
-    #[tokio::test]
-    async fn spawn_agent_inherits_caller_backend_when_unspecified() {
-        // No agent_type on the request -> must fall back to the caller's
-        // backend ("claude"), which passes the whitelist.
+    async fn spawn_agent_requires_assistant_identity() {
         let session = start_session_with_lead_backend("claude").await;
         let err = session
             .spawn_agent("lead-1", spawn_req(None))
             .await
-            .expect_err("unit test has no service wire; spawn stops at DB step");
-        assert_reached_db_step(err);
-        session.stop();
-    }
-
-    #[tokio::test]
-    async fn spawn_agent_rejects_when_inherited_backend_not_whitelisted() {
-        // Caller's backend is "acp" (not whitelisted). With no explicit
-        // agent_type, the inherited backend must be rejected.
-        let session = start_session_with_lead_backend("acp").await;
-        let err = session
-            .spawn_agent("lead-1", spawn_req(None))
-            .await
-            .expect_err("non-whitelisted inherited backend must be rejected");
+            .expect_err("assistant_id must be required");
         assert!(
-            matches!(&err, TeamError::BackendNotAllowed(b) if b == "acp"),
-            "expected BackendNotAllowed(\"acp\"), got {err:?}"
+            matches!(&err, TeamError::InvalidRequest(msg) if msg.contains("assistant_id is required")),
+            "expected InvalidRequest about missing assistant_id, got {err:?}"
         );
         session.stop();
     }
@@ -3742,7 +3704,7 @@ mod tests {
     async fn spawn_agent_rejects_non_lead_caller() {
         let session = start_session_with_lead_backend("claude").await;
         let err = session
-            .spawn_agent("worker-1", spawn_req(Some("claude")))
+            .spawn_agent("worker-1", spawn_req(Some("word-creator")))
             .await
             .expect_err("non-lead caller must be rejected");
         assert!(
@@ -3757,7 +3719,7 @@ mod tests {
         let session = start_session_with_lead_backend("claude").await;
         // The seeded team already has an agent named "Worker". Case + trim
         // normalization means "  worker " collides.
-        let mut req = spawn_req(Some("claude"));
+        let mut req = spawn_req(Some("word-creator"));
         req.name = "  worker ".into();
         let err = session
             .spawn_agent("lead-1", req)
@@ -3773,7 +3735,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_agent_rejects_empty_name() {
         let session = start_session_with_lead_backend("claude").await;
-        let mut req = spawn_req(Some("claude"));
+        let mut req = spawn_req(Some("word-creator"));
         req.name = "   ".into();
         let err = session
             .spawn_agent("lead-1", req)
@@ -3801,7 +3763,7 @@ mod tests {
     async fn spawn_agent_does_not_emit_before_db_step() {
         let (session, recorder) = start_session_with_recorder("claude").await;
         let err = session
-            .spawn_agent("lead-1", spawn_req(Some("claude")))
+            .spawn_agent("lead-1", spawn_req(Some("word-creator")))
             .await
             .expect_err("unit test has no service wire; spawn stops at DB step");
         assert_reached_db_step(err);
@@ -3817,7 +3779,7 @@ mod tests {
     async fn spawn_agent_does_not_emit_on_guard_rejection() {
         let (session, recorder) = start_session_with_recorder("claude").await;
         let err = session
-            .spawn_agent("worker-1", spawn_req(Some("claude")))
+            .spawn_agent("worker-1", spawn_req(Some("word-creator")))
             .await
             .expect_err("non-lead caller must be rejected");
         assert!(matches!(&err, TeamError::LeaderOnly(what) if what == "spawn_agent"));

@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aionui_api_types::{
-    AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
-    AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse,
-    AssistantDetailResponse, AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse,
-    AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse,
-    CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest,
-    UpdateAssistantRequest,
+    AgentManagementRow, AgentManagementStatus, AgentSource, AssistantAgentResponse, AssistantCapabilitiesResponse,
+    AssistantDefaultListRequest, AssistantDefaultListResponse, AssistantDefaultScalarRequest,
+    AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse, AssistantDetailResponse,
+    AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse, AssistantPromptsResponse,
+    AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse, CreateAssistantRequest,
+    ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
@@ -19,11 +19,13 @@ use aionui_db::{
     IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
     IProviderRepository, SqlitePool, UpdateAssistantParams, UpsertAssistantDefinitionParams,
     UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, rebuild_legacy_assistant_mirror,
+    resolve_agent_binding,
 };
 use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
 use serde_json;
 use tracing::{debug, warn};
 
+use crate::agent_catalog::AssistantAgentCatalogPort;
 #[cfg(test)]
 use crate::builtin::BuiltinAssistant;
 use crate::builtin::{AvatarAsset, BuiltinAssistantRegistry};
@@ -37,12 +39,13 @@ pub struct AssistantService {
     preference_repo: Arc<dyn IAssistantPreferenceRepository>,
     repo: Arc<dyn IAssistantRepository>,
     override_repo: Arc<dyn IAssistantOverrideRepository>,
-    /// Used to infer a sane `preset_agent_type` default when the caller did
-    /// not supply one. The historical default of `"gemini"` 400'd within
+    /// Used to infer a sane `agent_id` default when the caller did not supply
+    /// one. The historical default of `"gemini"` 400'd within
     /// 1 ms on machines without the Gemini CLI (ELECTRON-1J1 / 1KV); we now
     /// pick an agent that actually matches the configured provider list.
     provider_repo: Arc<dyn IProviderRepository>,
     builtin: Arc<BuiltinAssistantRegistry>,
+    agent_catalog: Option<Arc<dyn AssistantAgentCatalogPort>>,
     /// Root directory holding user-authored rule/skill md files and avatars.
     /// Defaults to `~/.aionui/` but can be overridden for tests.
     user_data_dir: PathBuf,
@@ -56,6 +59,7 @@ pub struct AssistantServiceDeps {
     pub override_repo: Arc<dyn IAssistantOverrideRepository>,
     pub provider_repo: Arc<dyn IProviderRepository>,
     pub builtin: Arc<BuiltinAssistantRegistry>,
+    pub agent_catalog: Option<Arc<dyn AssistantAgentCatalogPort>>,
 }
 
 impl AssistantService {
@@ -83,6 +87,7 @@ impl AssistantService {
             override_repo,
             provider_repo,
             builtin,
+            agent_catalog,
         } = deps;
         Self {
             pool,
@@ -93,6 +98,7 @@ impl AssistantService {
             override_repo,
             provider_repo,
             builtin,
+            agent_catalog,
             user_data_dir,
         }
     }
@@ -104,6 +110,7 @@ impl AssistantService {
         self.soft_delete_removed_builtin_definitions().await?;
         self.sync_legacy_user_assistants_to_new_tables().await?;
         self.sync_legacy_overrides_to_new_states().await?;
+        self.reconcile_generated_assistants().await?;
         self.rebuild_legacy_mirror_from_new_tables().await?;
         Ok(())
     }
@@ -126,14 +133,15 @@ impl AssistantService {
             let default_disabled_builtin_skill_ids = serde_json::to_string(&builtin.disabled_builtin_skills)
                 .map_err(|e| AssistantError::Internal(format!("encode builtin disabled skills: {e}")))?;
             let (avatar_type, avatar_value) = serialize_avatar("builtin", builtin.avatar.as_deref());
-            let (definition_id, assistant_key) = self
+            let (definition_id, assistant_id) = self
                 .resolve_definition_identity("builtin", Some(&builtin.id), &builtin.id)
                 .await?;
+            let agent_id = self.resolve_agent_id_for_agent_ref(&builtin.agent_ref).await?;
 
             self.definition_repo
                 .upsert(&UpsertAssistantDefinitionParams {
-                    definition_id: &definition_id,
-                    assistant_key: &assistant_key,
+                    id: &definition_id,
+                    assistant_id: &assistant_id,
                     source: "builtin",
                     owner_type: "system",
                     source_ref: Some(&builtin.id),
@@ -145,7 +153,7 @@ impl AssistantService {
                     description_i18n: &description_i18n,
                     avatar_type: &avatar_type,
                     avatar_value: avatar_value.as_deref(),
-                    agent_backend: &builtin.preset_agent_type,
+                    agent_id: &agent_id,
                     rule_resource_type: if builtin.rule_file.is_some() {
                         "builtin_asset"
                     } else {
@@ -188,7 +196,7 @@ impl AssistantService {
 
             let Some(source_ref) = definition.source_ref.as_deref() else {
                 self.definition_repo
-                    .soft_delete(&definition.definition_id, now_ms())
+                    .soft_delete(&definition.id, now_ms())
                     .await
                     .map_err(|e| AssistantError::Internal(format!("soft-delete builtin definition: {e}")))?;
                 continue;
@@ -199,7 +207,7 @@ impl AssistantService {
             }
 
             self.definition_repo
-                .soft_delete(&definition.definition_id, now_ms())
+                .soft_delete(&definition.id, now_ms())
                 .await
                 .map_err(|e| AssistantError::Internal(format!("soft-delete builtin definition: {e}")))?;
         }
@@ -212,14 +220,18 @@ impl AssistantService {
             if self.builtin.has(&row.id) {
                 continue;
             }
-            self.upsert_definition_from_legacy_user_row(&row).await?;
+            self.upsert_definition_from_legacy_user_row(&row, None).await?;
         }
         Ok(())
     }
 
     async fn sync_legacy_overrides_to_new_states(&self) -> Result<(), AssistantError> {
         for override_row in self.override_repo.get_all().await? {
-            let Some(definition) = self.definition_repo.get_by_key(&override_row.assistant_id).await? else {
+            let Some(definition) = self
+                .definition_repo
+                .get_by_assistant_id(&override_row.assistant_id)
+                .await?
+            else {
                 warn!(
                     assistant_id = %override_row.assistant_id,
                     "skip syncing assistant override without unified definition"
@@ -229,10 +241,10 @@ impl AssistantService {
 
             self.state_repo
                 .upsert(&UpsertAssistantOverlayParams {
-                    definition_id: &definition.definition_id,
+                    assistant_definition_id: &definition.id,
                     enabled: override_row.enabled,
                     sort_order: override_row.sort_order,
-                    agent_backend_override: override_row.preset_agent_type.as_deref(),
+                    agent_id_override: None,
                     last_used_at: override_row.last_used_at,
                 })
                 .await
@@ -242,7 +254,162 @@ impl AssistantService {
         Ok(())
     }
 
-    async fn upsert_definition_from_legacy_user_row(&self, row: &AssistantRow) -> Result<(), AssistantError> {
+    async fn reconcile_generated_assistants(&self) -> Result<Vec<AgentManagementRow>, AssistantError> {
+        let Some(agent_catalog) = &self.agent_catalog else {
+            return Ok(Vec::new());
+        };
+
+        let rows = agent_catalog.list_management_agents().await?;
+        let definitions = self.definition_repo.list().await.map_err(|e| {
+            AssistantError::Internal(format!("list assistant definitions for generated reconcile: {e}"))
+        })?;
+        let generated_source_refs: HashSet<String> = definitions
+            .iter()
+            .filter(|definition| definition.source == "generated")
+            .filter_map(|definition| definition.source_ref.clone())
+            .collect();
+        let has_existing_generated = !generated_source_refs.is_empty();
+        let existing_min_sort_order = self
+            .state_repo
+            .list()
+            .await
+            .map_err(|e| AssistantError::Internal(format!("list assistant overlays for generated reconcile: {e}")))?
+            .into_iter()
+            .map(|state| state.sort_order)
+            .min()
+            .unwrap_or_default()
+            .min(0);
+        let generated_rows: Vec<&AgentManagementRow> = rows
+            .iter()
+            .filter(|row| {
+                row.enabled
+                    && row.agent_type.supports_new_conversation()
+                    && matches!(row.status, AgentManagementStatus::Online)
+            })
+            .collect();
+        let missing_generated_count = generated_rows
+            .iter()
+            .filter(|row| !generated_source_refs.contains(&row.id))
+            .count();
+
+        let mut missing_index = 0usize;
+        for row in generated_rows {
+            let existing_definition = definitions
+                .iter()
+                .find(|definition| {
+                    definition.source == "generated" && definition.source_ref.as_deref() == Some(row.id.as_str())
+                })
+                .cloned();
+            let is_missing = existing_definition.is_none();
+            let assistant_id = format!("bare:{}", row.id);
+            let (definition_id, assistant_id) = self
+                .resolve_definition_identity("generated", Some(&row.id), &assistant_id)
+                .await?;
+            let avatar_value = row.icon.as_deref().filter(|value| !value.trim().is_empty());
+            let (definition, should_upsert) = if let Some(mut definition) = existing_definition {
+                let avatar_type = if avatar_value.is_some() { "emoji" } else { "none" };
+                let identity_changed = definition.name != row.name
+                    || definition.avatar_type != avatar_type
+                    || definition.avatar_value.as_deref() != avatar_value
+                    || definition.agent_id != row.id
+                    || definition.source_ref.as_deref() != Some(row.id.as_str());
+
+                definition.name = row.name.clone();
+                definition.avatar_type = avatar_type.to_string();
+                definition.avatar_value = avatar_value.map(ToOwned::to_owned);
+                definition.agent_id = row.id.clone();
+                definition.source_ref = Some(row.id.clone());
+                (definition, identity_changed)
+            } else {
+                (
+                    AssistantDefinitionRow {
+                        id: definition_id.clone(),
+                        assistant_id: assistant_id.clone(),
+                        source: "generated".into(),
+                        owner_type: "system".into(),
+                        source_ref: Some(row.id.clone()),
+                        source_version: None,
+                        source_hash: None,
+                        name: row.name.clone(),
+                        name_i18n: "{}".into(),
+                        description: row.description.clone(),
+                        description_i18n: "{}".into(),
+                        avatar_type: if avatar_value.is_some() {
+                            "emoji".into()
+                        } else {
+                            "none".into()
+                        },
+                        avatar_value: avatar_value.map(ToOwned::to_owned),
+                        agent_id: row.id.clone(),
+                        rule_resource_type: "none".into(),
+                        rule_resource_ref: None,
+                        rule_inline_content: None,
+                        recommended_prompts: "[]".into(),
+                        recommended_prompts_i18n: "{}".into(),
+                        default_model_mode: "auto".into(),
+                        default_model_value: None,
+                        default_permission_mode: "auto".into(),
+                        default_permission_value: None,
+                        default_skills_mode: "auto".into(),
+                        default_skill_ids: "[]".into(),
+                        custom_skill_names: "[]".into(),
+                        default_disabled_builtin_skill_ids: "[]".into(),
+                        default_mcps_mode: "auto".into(),
+                        default_mcp_ids: "[]".into(),
+                        created_at: 0,
+                        updated_at: 0,
+                        deleted_at: None,
+                    },
+                    true,
+                )
+            };
+
+            if should_upsert {
+                self.definition_repo
+                    .upsert(&upsert_params_from_definition(&definition))
+                    .await
+                    .map_err(|e| AssistantError::Internal(format!("upsert generated assistant definition: {e}")))?;
+            }
+
+            if !is_missing {
+                continue;
+            }
+
+            if self
+                .state_repo
+                .get(&definition_id)
+                .await
+                .map_err(|e| AssistantError::Internal(format!("get generated assistant overlay: {e}")))?
+                .is_none()
+            {
+                let current_missing_index = missing_index;
+                missing_index += 1;
+                let initial_generated_sort_order = if !has_existing_generated && missing_generated_count > 0 {
+                    existing_min_sort_order as i64 - missing_generated_count as i64 + current_missing_index as i64
+                } else {
+                    row.sort_order
+                };
+                self.state_repo
+                    .upsert(&UpsertAssistantOverlayParams {
+                        assistant_definition_id: &definition_id,
+                        enabled: true,
+                        sort_order: initial_generated_sort_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                        agent_id_override: None,
+                        last_used_at: None,
+                    })
+                    .await
+                    .map_err(|e| AssistantError::Internal(format!("upsert generated assistant overlay: {e}")))?;
+            }
+        }
+
+        Ok(rows)
+    }
+
+    async fn upsert_definition_from_legacy_user_row(
+        &self,
+        row: &AssistantRow,
+        requested_agent_id: Option<&str>,
+    ) -> Result<(), AssistantError> {
         // User-defined assistants do not expose locale-aware editing in the
         // current product. Keep the unified definition canonical fields as the
         // single source of truth and leave *_i18n empty for user rows.
@@ -255,12 +422,21 @@ impl AssistantService {
         let default_disabled_builtin_skill_ids =
             normalize_json_array_string(row.disabled_builtin_skills.as_deref(), "disabled_builtin_skills")?;
         let (avatar_type, avatar_value) = serialize_avatar("user", row.avatar.as_deref());
-        let (definition_id, assistant_key) = self.resolve_definition_identity("user", Some(&row.id), &row.id).await?;
+        let (definition_id, assistant_id) = self.resolve_definition_identity("user", Some(&row.id), &row.id).await?;
+        let existing_definition = self.definition_repo.get_by_assistant_id(&assistant_id).await?;
+        let agent_id = match requested_agent_id {
+            Some(agent_id) => agent_id.to_string(),
+            None => match existing_definition {
+                Some(definition) => definition.agent_id,
+                None => self.resolve_default_agent_id().await?,
+            },
+        };
+        self.resolve_runtime_backend_for_agent_id(&agent_id).await?;
 
         self.definition_repo
             .upsert(&UpsertAssistantDefinitionParams {
-                definition_id: &definition_id,
-                assistant_key: &assistant_key,
+                id: &definition_id,
+                assistant_id: &assistant_id,
                 source: "user",
                 owner_type: "user",
                 source_ref: Some(&row.id),
@@ -272,7 +448,7 @@ impl AssistantService {
                 description_i18n: &description_i18n,
                 avatar_type: &avatar_type,
                 avatar_value: avatar_value.as_deref(),
-                agent_backend: &row.preset_agent_type,
+                agent_id: &agent_id,
                 rule_resource_type: "user_file",
                 rule_resource_ref: Some(&row.id),
                 rule_inline_content: None,
@@ -307,7 +483,7 @@ impl AssistantService {
 
         let Some(existing) = self
             .definition_repo
-            .get_by_key(assistant_id)
+            .get_by_assistant_id(assistant_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("get assistant definition: {e}")))?
         else {
@@ -315,82 +491,17 @@ impl AssistantService {
         };
 
         let mut patched = existing.clone();
-        if reset_model_and_permission {
-            patched.default_model_mode = "auto".to_string();
-            patched.default_model_value = None;
-            patched.default_permission_mode = "auto".to_string();
-            patched.default_permission_value = None;
-        }
-        if let Some(value) = overrides.recommended_prompts.as_deref() {
-            patched.recommended_prompts = value.to_string();
-        }
-        if let Some(value) = overrides.recommended_prompts_i18n.as_deref() {
-            patched.recommended_prompts_i18n = value.to_string();
-        }
-        if let Some(value) = overrides.default_model_mode.as_deref() {
-            patched.default_model_mode = value.to_string();
-        }
-        if let Some(value) = overrides.default_model_value {
-            patched.default_model_value = value;
-        }
-        if let Some(value) = overrides.default_permission_mode.as_deref() {
-            patched.default_permission_mode = value.to_string();
-        }
-        if let Some(value) = overrides.default_permission_value {
-            patched.default_permission_value = value;
-        }
-        if let Some(value) = overrides.default_skills_mode.as_deref() {
-            patched.default_skills_mode = value.to_string();
-        }
-        if let Some(value) = overrides.default_skill_ids.as_deref() {
-            patched.default_skill_ids = value.to_string();
-        }
-        if let Some(value) = overrides.default_mcps_mode.as_deref() {
-            patched.default_mcps_mode = value.to_string();
-        }
-        if let Some(value) = overrides.default_mcp_ids.as_deref() {
-            patched.default_mcp_ids = value.to_string();
-        }
+        apply_detail_patch_to_definition(&mut patched, &overrides, reset_model_and_permission);
 
         let patched = self
             .definition_repo
-            .upsert(&UpsertAssistantDefinitionParams {
-                definition_id: &patched.definition_id,
-                assistant_key: &patched.assistant_key,
-                source: &patched.source,
-                owner_type: &patched.owner_type,
-                source_ref: patched.source_ref.as_deref(),
-                source_version: patched.source_version.as_deref(),
-                source_hash: patched.source_hash.as_deref(),
-                name: &patched.name,
-                name_i18n: &patched.name_i18n,
-                description: patched.description.as_deref(),
-                description_i18n: &patched.description_i18n,
-                avatar_type: &patched.avatar_type,
-                avatar_value: patched.avatar_value.as_deref(),
-                agent_backend: &patched.agent_backend,
-                rule_resource_type: &patched.rule_resource_type,
-                rule_resource_ref: patched.rule_resource_ref.as_deref(),
-                rule_inline_content: patched.rule_inline_content.as_deref(),
-                recommended_prompts: &patched.recommended_prompts,
-                recommended_prompts_i18n: &patched.recommended_prompts_i18n,
-                default_model_mode: &patched.default_model_mode,
-                default_model_value: patched.default_model_value.as_deref(),
-                default_permission_mode: &patched.default_permission_mode,
-                default_permission_value: patched.default_permission_value.as_deref(),
-                default_skills_mode: &patched.default_skills_mode,
-                default_skill_ids: &patched.default_skill_ids,
-                custom_skill_names: &patched.custom_skill_names,
-                default_disabled_builtin_skill_ids: &patched.default_disabled_builtin_skill_ids,
-                default_mcps_mode: &patched.default_mcps_mode,
-                default_mcp_ids: &patched.default_mcp_ids,
-            })
+            .upsert(&upsert_params_from_definition(&patched))
             .await
             .map_err(|e| AssistantError::Internal(format!("upsert patched assistant definition: {e}")))?;
 
         let state = self
             .state_repo
-            .get(&patched.definition_id)
+            .get(&patched.id)
             .await
             .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?;
         rebuild_legacy_assistant_mirror(&self.pool, &patched, state.as_ref())
@@ -409,7 +520,7 @@ impl AssistantService {
             .map_err(|e| AssistantError::Internal(format!("list assistant overlays: {e}")))?;
         let state_map: HashMap<String, aionui_db::AssistantOverlayRow> = states
             .into_iter()
-            .map(|state| (state.definition_id.clone(), state))
+            .map(|state| (state.assistant_definition_id.clone(), state))
             .collect();
 
         for definition in self
@@ -418,7 +529,7 @@ impl AssistantService {
             .await
             .map_err(|e| AssistantError::Internal(format!("list assistant definitions: {e}")))?
         {
-            rebuild_legacy_assistant_mirror(&self.pool, &definition, state_map.get(&definition.definition_id))
+            rebuild_legacy_assistant_mirror(&self.pool, &definition, state_map.get(&definition.id))
                 .await
                 .map_err(|e| AssistantError::Internal(format!("rebuild legacy mirror: {e}")))?;
         }
@@ -435,6 +546,13 @@ impl AssistantService {
         if self.builtin.has(id) {
             return AssistantSource::Builtin;
         }
+        if let Ok(Some(definition)) = self.definition_repo.get_by_assistant_id(id).await {
+            return match definition.source.as_str() {
+                "builtin" => AssistantSource::Builtin,
+                "generated" => AssistantSource::Generated,
+                _ => AssistantSource::User,
+            };
+        }
         AssistantSource::User
     }
 
@@ -446,6 +564,7 @@ impl AssistantService {
     /// application. Also performs opportunistic orphan cleanup on the
     /// overrides table.
     pub async fn list(&self) -> Result<Vec<AssistantResponse>, AssistantError> {
+        let projections = self.reconcile_generated_assistants().await?;
         let definitions = self
             .definition_repo
             .list()
@@ -458,15 +577,19 @@ impl AssistantService {
             .map_err(|e| AssistantError::Internal(format!("list assistant overlays: {e}")))?;
         let state_map: HashMap<String, AssistantOverlayRow> = states
             .into_iter()
-            .map(|state| (state.definition_id.clone(), state))
+            .map(|state| (state.assistant_definition_id.clone(), state))
             .collect();
 
         let mut result = Vec::new();
 
         for definition in &definitions {
+            let projection = self
+                .project_definition(definition, state_map.get(&definition.id), &projections)
+                .await?;
             result.push(definition_to_response(
                 definition,
-                state_map.get(&definition.definition_id),
+                state_map.get(&definition.id),
+                &projection,
             )?);
         }
 
@@ -488,20 +611,34 @@ impl AssistantService {
     }
 
     pub async fn get(&self, id: &str) -> Result<AssistantResponse, AssistantError> {
-        if let Some(definition) = self.definition_repo.get_by_key(id).await? {
-            let state = self.state_repo.get(&definition.definition_id).await?;
-            return definition_to_response(&definition, state.as_ref());
+        let projections = self.reconcile_generated_assistants().await?;
+        if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
+            let state = self.state_repo.get(&definition.id).await?;
+            let projection = self
+                .project_definition(&definition, state.as_ref(), &projections)
+                .await?;
+            return definition_to_response(&definition, state.as_ref(), &projection);
         }
 
         Err(AssistantError::NotFound(format!("assistant '{id}' not found")))
     }
 
     pub async fn get_detail(&self, id: &str, locale: Option<&str>) -> Result<AssistantDetailResponse, AssistantError> {
-        if let Some(definition) = self.definition_repo.get_by_key(id).await? {
-            let state = self.state_repo.get(&definition.definition_id).await?;
-            let preference = self.preference_repo.get(&definition.definition_id).await?;
+        let projections = self.reconcile_generated_assistants().await?;
+        if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
+            let state = self.state_repo.get(&definition.id).await?;
+            let preference = self.preference_repo.get(&definition.id).await?;
             let rules_content = self.read_rule(id, locale).await?;
-            return definition_to_detail_response(&definition, state.as_ref(), preference.as_ref(), &rules_content);
+            let projection = self
+                .project_definition(&definition, state.as_ref(), &projections)
+                .await?;
+            return definition_to_detail_response(
+                &definition,
+                state.as_ref(),
+                preference.as_ref(),
+                &rules_content,
+                &projection,
+            );
         }
 
         Err(AssistantError::NotFound(format!("assistant '{id}' not found")))
@@ -511,8 +648,8 @@ impl AssistantService {
     // Default-agent inference
     // -----------------------------------------------------------------------
 
-    /// Pick a sane `preset_agent_type` default for newly created /
-    /// imported assistants when the caller did not supply one.
+    /// Pick a sane `agent_id` default for newly created / imported assistants
+    /// when the caller did not supply one.
     ///
     /// Inference rule (ELECTRON-1J1 / 1KV):
     /// 1. If any enabled provider exists (Anthropic, OpenAI, custom,
@@ -520,14 +657,14 @@ impl AssistantService {
     ///    OpenAI-compatible and Anthropic-protocol APIs over the
     ///    user-configured base URL and does not require any third-party
     ///    CLI to be installed. CLI-based agents (`claude`, `gemini`)
-    ///    must be opted into explicitly via `preset_agent_type` because
+    ///    must be opted into explicitly via `agent_id` because
     ///    the presence of an Anthropic API key does not imply that the
     ///    Claude Code CLI is on `PATH`.
     /// 2. Otherwise (no providers configured), return a `BadRequest`
     ///    error. The previous code silently fell back to `"gemini"`,
     ///    which on machines without the Gemini CLI 400'd within 1 ms
     ///    with `Agent 'Gemini CLI' CLI not found in PATH`.
-    pub async fn resolve_default_agent_type(&self) -> Result<String, AssistantError> {
+    pub async fn resolve_default_agent_id(&self) -> Result<String, AssistantError> {
         let providers = self
             .provider_repo
             .list()
@@ -535,14 +672,58 @@ impl AssistantService {
             .map_err(|e| AssistantError::Internal(format!("failed to list providers: {e}")))?;
 
         if providers.iter().any(|p| p.enabled) {
-            Ok("aionrs".to_string())
+            self.resolve_agent_id_for_agent_ref("aionrs").await
         } else {
             Err(AssistantError::BadRequest(
                 "Cannot create assistant: no providers configured. Add a provider before creating an assistant, \
-                 or pass an explicit `preset_agent_type` in the request body."
+                 or pass an explicit `agent_id` in the request body."
                     .into(),
             ))
         }
+    }
+
+    async fn resolve_runtime_backend_for_agent_id(&self, agent_id: &str) -> Result<String, AssistantError> {
+        let trimmed = agent_id.trim();
+        if trimmed.is_empty() {
+            return Err(AssistantError::BadRequest("agent_id is required".into()));
+        }
+        let Some(binding) = resolve_agent_binding(&self.pool, trimmed)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
+        else {
+            return Err(AssistantError::BadRequest(format!("Unknown agent_id '{trimmed}'")));
+        };
+        Ok(binding.runtime_backend)
+    }
+
+    async fn resolve_agent_id_for_agent_ref(&self, agent_ref: &str) -> Result<String, AssistantError> {
+        let trimmed = agent_ref.trim();
+        let Some(binding) = resolve_agent_binding(&self.pool, trimmed)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
+        else {
+            return Err(AssistantError::BadRequest(format!("Unknown agent_ref '{trimmed}'")));
+        };
+        Ok(binding.agent_id)
+    }
+
+    async fn project_definition(
+        &self,
+        definition: &AssistantDefinitionRow,
+        state: Option<&AssistantOverlayRow>,
+        agent_rows: &[AgentManagementRow],
+    ) -> Result<AssistantRuntimeProjection, AssistantError> {
+        let effective_agent_id = effective_agent_id_for_definition(definition, state);
+        let runtime_backend = resolve_agent_binding(&self.pool, effective_agent_id)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
+            .map(|binding| binding.runtime_backend);
+        Ok(assistant_projection_for_definition(
+            definition,
+            state,
+            agent_rows,
+            runtime_backend.as_deref(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -569,21 +750,21 @@ impl AssistantService {
 
         let serialized = SerializedFields::from_create(&req)?;
         let detail_overrides = SerializedDetailOverrides::from_create(&req)?;
-        // Resolve the default agent type from the configured provider list
-        // when the caller did not supply one. Avoids the historical
+        // Resolve the default agent id from the configured provider list when
+        // the caller did not supply one. Avoids the historical
         // `"gemini"` fallback that 400'd within 1 ms on machines without
         // the Gemini CLI (ELECTRON-1J1, ELECTRON-1KV).
-        let resolved_agent_type = match req.preset_agent_type.as_deref() {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => self.resolve_default_agent_type().await?,
+        let resolved_agent_id = match req.agent_id.as_deref() {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => self.resolve_default_agent_id().await?,
         };
+        self.resolve_runtime_backend_for_agent_id(&resolved_agent_id).await?;
         let avatar = self.normalize_user_avatar_input(&id, req.avatar.as_deref())?;
         let params = CreateAssistantParams {
             id: &id,
             name: &name,
             description: req.description.as_deref(),
             avatar: avatar.as_deref(),
-            preset_agent_type: &resolved_agent_type,
             enabled_skills: serialized.enabled_skills.as_deref(),
             custom_skill_names: serialized.custom_skill_names.as_deref(),
             disabled_builtin_skills: serialized.disabled_builtin_skills.as_deref(),
@@ -595,9 +776,10 @@ impl AssistantService {
         };
 
         let row = self.repo.create(&params).await?;
-        self.upsert_definition_from_legacy_user_row(&row).await?;
+        self.upsert_definition_from_legacy_user_row(&row, Some(&resolved_agent_id))
+            .await?;
         self.apply_detail_overrides(&row.id, detail_overrides, false).await?;
-        if let Some(definition) = self.definition_repo.get_by_key(&row.id).await? {
+        if let Some(definition) = self.definition_repo.get_by_assistant_id(&row.id).await? {
             self.sync_preferences_from_defaults_request(&definition, None, req.defaults.as_ref())
                 .await?;
         }
@@ -614,7 +796,7 @@ impl AssistantService {
                     .is_some_and(|defaults| defaults.skills.is_some() || defaults.mcps.is_some());
 
                 // Built-in rows are sourced from the embedded bundle and can't
-                // be mutated. Users may still override `preset_agent_type`, and
+                // be mutated. Users may still override `agent_id`, and
                 // product-defined governance allows model/permission defaults
                 // to vary per built-in assistant. Any other field on the
                 // request is rejected so callers don't silently lose data.
@@ -634,18 +816,13 @@ impl AssistantService {
                     || builtin_defaults_forbidden
                 {
                     return Err(AssistantError::Forbidden(
-                        "Only 'preset_agent_type', 'defaults.model', and 'defaults.permission' can be overridden on built-in assistants".into(),
+                        "Only 'agent_id', 'defaults.model', and 'defaults.permission' can be overridden on built-in assistants".into(),
                     ));
                 }
 
-                let preset_agent_type = req.preset_agent_type.as_deref().ok_or_else(|| {
-                    AssistantError::BadRequest(
-                        "'preset_agent_type' is required when updating a built-in assistant".into(),
-                    )
-                })?;
                 let definition = self
                     .definition_repo
-                    .get_by_key(id)
+                    .get_by_assistant_id(id)
                     .await?
                     .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
 
@@ -653,35 +830,101 @@ impl AssistantService {
                 let enabled = existing.as_ref().is_none_or(|o| o.enabled);
                 let sort_order = existing.as_ref().map(|o| o.sort_order).unwrap_or(0);
                 let last_used_at = existing.as_ref().and_then(|o| o.last_used_at);
-                let current_agent_backend = self
+                let requested_agent_id = req.agent_id.as_deref().map(|agent_id| agent_id.trim().to_string());
+                let current_agent_id = self
                     .state_repo
-                    .get(&definition.definition_id)
+                    .get(&definition.id)
                     .await
                     .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?
-                    .and_then(|row| row.agent_backend_override)
-                    .unwrap_or_else(|| definition.agent_backend.clone());
-                let reset_model_and_permission = current_agent_backend != preset_agent_type;
-                self.state_repo
-                    .upsert(&UpsertAssistantOverlayParams {
-                        definition_id: &definition.definition_id,
-                        enabled,
-                        sort_order,
-                        agent_backend_override: Some(preset_agent_type),
-                        last_used_at,
-                    })
-                    .await
-                    .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
+                    .and_then(|row| row.agent_id_override)
+                    .unwrap_or_else(|| definition.agent_id.clone());
+                let reset_model_and_permission = requested_agent_id
+                    .as_deref()
+                    .is_some_and(|agent_id| agent_id != current_agent_id);
+                if let Some(requested_agent_id) = requested_agent_id.as_deref() {
+                    self.resolve_runtime_backend_for_agent_id(requested_agent_id).await?;
+                    self.state_repo
+                        .upsert(&UpsertAssistantOverlayParams {
+                            assistant_definition_id: &definition.id,
+                            enabled,
+                            sort_order,
+                            agent_id_override: Some(requested_agent_id),
+                            last_used_at,
+                        })
+                        .await
+                        .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
+                }
                 self.apply_detail_overrides(id, detail_overrides, reset_model_and_permission)
                     .await?;
                 let definition = self
                     .definition_repo
-                    .get_by_key(id)
+                    .get_by_assistant_id(id)
                     .await?
                     .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
                 self.sync_preferences_from_defaults_request(&definition, Some(&definition), req.defaults.as_ref())
                     .await?;
-                let state = self.state_repo.get(&definition.definition_id).await?;
+                let state = self.state_repo.get(&definition.id).await?;
                 rebuild_legacy_assistant_mirror(&self.pool, &definition, state.as_ref())
+                    .await
+                    .map_err(|e| AssistantError::Internal(format!("rebuild legacy mirror: {e}")))?;
+                return self.get(id).await;
+            }
+            AssistantSource::Generated => {
+                if req.name.is_some()
+                    || req.name_i18n.is_some()
+                    || req.avatar.is_some()
+                    || req.agent_id.is_some()
+                    || req.models.is_some()
+                {
+                    return Err(AssistantError::Forbidden(
+                        "Generated assistant identity fields cannot be edited".into(),
+                    ));
+                }
+
+                let mut req = req;
+                if req.recommended_prompts.is_none() {
+                    req.recommended_prompts = req.prompts.clone();
+                }
+
+                let serialized = SerializedFields::from_update(&req)?;
+                let detail_overrides = SerializedDetailOverrides::from_update(&req)?;
+                let current_definition = self
+                    .definition_repo
+                    .get_by_assistant_id(id)
+                    .await?
+                    .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
+                let mut patched = current_definition.clone();
+
+                if let Some(description) = req.description {
+                    patched.description = Some(description);
+                }
+                if let Some(value) = serialized.description_i18n {
+                    patched.description_i18n = value;
+                }
+                if let Some(value) = serialized.prompts_i18n {
+                    patched.recommended_prompts_i18n = value;
+                }
+                if let Some(value) = serialized.enabled_skills {
+                    patched.default_skills_mode = "fixed".to_string();
+                    patched.default_skill_ids = value;
+                }
+                if let Some(value) = serialized.custom_skill_names {
+                    patched.custom_skill_names = value;
+                }
+                if let Some(value) = serialized.disabled_builtin_skills {
+                    patched.default_disabled_builtin_skill_ids = value;
+                }
+                apply_detail_patch_to_definition(&mut patched, &detail_overrides, false);
+
+                let patched = self
+                    .definition_repo
+                    .upsert(&upsert_params_from_definition(&patched))
+                    .await
+                    .map_err(|e| AssistantError::Internal(format!("upsert generated assistant definition: {e}")))?;
+                self.sync_preferences_from_defaults_request(&patched, Some(&current_definition), req.defaults.as_ref())
+                    .await?;
+                let state = self.state_repo.get(&patched.id).await?;
+                rebuild_legacy_assistant_mirror(&self.pool, &patched, state.as_ref())
                     .await
                     .map_err(|e| AssistantError::Internal(format!("rebuild legacy mirror: {e}")))?;
                 return self.get(id).await;
@@ -693,13 +936,20 @@ impl AssistantService {
         let detail_overrides = SerializedDetailOverrides::from_update(&req)?;
         let current_definition = self
             .definition_repo
-            .get_by_key(id)
+            .get_by_assistant_id(id)
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
-        let reset_model_and_permission = req
-            .preset_agent_type
+        let requested_agent_id = match req.agent_id.as_deref() {
+            Some(agent_id) if !agent_id.trim().is_empty() => Some(agent_id.trim().to_string()),
+            Some(_) => return Err(AssistantError::BadRequest("agent_id is required".into())),
+            None => None,
+        };
+        if let Some(agent_id) = requested_agent_id.as_deref() {
+            self.resolve_runtime_backend_for_agent_id(agent_id).await?;
+        }
+        let reset_model_and_permission = requested_agent_id
             .as_deref()
-            .is_some_and(|preset_agent_type| preset_agent_type != current_definition.agent_backend);
+            .is_some_and(|agent_id| agent_id != current_definition.agent_id);
         let normalized_avatar = if req.avatar.is_some() {
             Some(self.normalize_user_avatar_input(id, req.avatar.as_deref())?)
         } else {
@@ -709,7 +959,6 @@ impl AssistantService {
             name: req.name.as_deref(),
             description: req.description.as_ref().map(|s| Some(s.as_str())),
             avatar: normalized_avatar.as_ref().map(|value| value.as_deref()),
-            preset_agent_type: req.preset_agent_type.as_deref(),
             enabled_skills: serialized.enabled_skills.as_ref().map(|s| Some(s.as_str())),
             custom_skill_names: serialized.custom_skill_names.as_ref().map(|s| Some(s.as_str())),
             disabled_builtin_skills: serialized.disabled_builtin_skills.as_ref().map(|s| Some(s.as_str())),
@@ -725,10 +974,11 @@ impl AssistantService {
             .update(id, &params)
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
-        self.upsert_definition_from_legacy_user_row(&row).await?;
+        self.upsert_definition_from_legacy_user_row(&row, requested_agent_id.as_deref())
+            .await?;
         self.apply_detail_overrides(id, detail_overrides, reset_model_and_permission)
             .await?;
-        if let Some(definition) = self.definition_repo.get_by_key(id).await? {
+        if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
             self.sync_preferences_from_defaults_request(&definition, Some(&current_definition), req.defaults.as_ref())
                 .await?;
         }
@@ -747,7 +997,7 @@ impl AssistantService {
 
         let existing = self
             .preference_repo
-            .get(&definition.definition_id)
+            .get(&definition.id)
             .await
             .map_err(|e| AssistantError::Internal(format!("get assistant preference: {e}")))?;
 
@@ -851,7 +1101,7 @@ impl AssistantService {
         {
             if existing.is_some() {
                 self.preference_repo
-                    .delete(&definition.definition_id)
+                    .delete(&definition.id)
                     .await
                     .map_err(|e| AssistantError::Internal(format!("delete assistant preference: {e}")))?;
             }
@@ -867,7 +1117,7 @@ impl AssistantService {
 
         self.preference_repo
             .upsert(&UpsertAssistantPreferenceParams {
-                definition_id: &definition.definition_id,
+                assistant_definition_id: &definition.id,
                 last_model_id: last_model_id.as_deref(),
                 last_permission_value: last_permission_value.as_deref(),
                 last_skill_ids: &last_skill_ids_json,
@@ -885,6 +1135,9 @@ impl AssistantService {
             AssistantSource::Builtin => {
                 return Err(AssistantError::Forbidden("Cannot delete built-in assistant".into()));
             }
+            AssistantSource::Generated => {
+                return Err(AssistantError::Forbidden("Cannot delete generated assistant".into()));
+            }
             AssistantSource::User => {}
         }
 
@@ -897,18 +1150,14 @@ impl AssistantService {
         if let Err(e) = self.override_repo.delete(id).await {
             warn!("failed to remove override for deleted assistant '{id}': {e}");
         }
-        if let Some(definition) = self.definition_repo.get_by_key(id).await? {
-            if let Err(e) = self.state_repo.delete(&definition.definition_id).await {
+        if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
+            if let Err(e) = self.state_repo.delete(&definition.id).await {
                 warn!("failed to remove assistant overlay for deleted assistant '{id}': {e}");
             }
-            if let Err(e) = self.preference_repo.delete(&definition.definition_id).await {
+            if let Err(e) = self.preference_repo.delete(&definition.id).await {
                 warn!("failed to remove assistant preferences for deleted assistant '{id}': {e}");
             }
-            if let Err(e) = self
-                .definition_repo
-                .soft_delete(&definition.definition_id, now_ms())
-                .await
-            {
+            if let Err(e) = self.definition_repo.soft_delete(&definition.id, now_ms()).await {
                 warn!("failed to soft-delete assistant definition for deleted assistant '{id}': {e}");
             }
         }
@@ -925,7 +1174,7 @@ impl AssistantService {
         req: SetAssistantStateRequest,
     ) -> Result<AssistantResponse, AssistantError> {
         match self.classify_source(id).await {
-            AssistantSource::Builtin => {}
+            AssistantSource::Builtin | AssistantSource::Generated => {}
             AssistantSource::User => {
                 // Confirm the user row exists (otherwise 404).
                 if self.repo.get(id).await?.is_none() {
@@ -937,10 +1186,10 @@ impl AssistantService {
         // Merge with existing state/override to preserve fields not in this request.
         let definition = self
             .definition_repo
-            .get_by_key(id)
+            .get_by_assistant_id(id)
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
-        let existing_state = self.state_repo.get(&definition.definition_id).await?;
+        let existing_state = self.state_repo.get(&definition.id).await?;
         let existing = self.override_repo.get(id).await?;
         let enabled = req.enabled.unwrap_or_else(|| {
             existing_state
@@ -957,17 +1206,16 @@ impl AssistantService {
             .last_used_at
             .or_else(|| existing_state.as_ref().and_then(|state| state.last_used_at))
             .or_else(|| existing.as_ref().and_then(|o| o.last_used_at));
-        let agent_backend_override = existing_state
+        let agent_id_override = existing_state
             .as_ref()
-            .and_then(|state| state.agent_backend_override.as_deref())
-            .or_else(|| existing.as_ref().and_then(|o| o.preset_agent_type.as_deref()));
+            .and_then(|state| state.agent_id_override.clone());
         let state = self
             .state_repo
             .upsert(&UpsertAssistantOverlayParams {
-                definition_id: &definition.definition_id,
+                assistant_definition_id: &definition.id,
                 enabled,
                 sort_order,
-                agent_backend_override,
+                agent_id_override: agent_id_override.as_deref(),
                 last_used_at,
             })
             .await
@@ -989,10 +1237,10 @@ impl AssistantService {
     pub async fn import(&self, req: ImportAssistantsRequest) -> Result<ImportAssistantsResult, AssistantError> {
         let mut result = ImportAssistantsResult::default();
 
-        // Resolved-once cache for the inferred default agent type. We only
+        // Resolved-once cache for the inferred default agent id. We only
         // hit the provider repo when at least one row in the batch omits
-        // `preset_agent_type` AND has cleared all the other skip conditions.
-        let mut cached_default_agent_type: Option<String> = None;
+        // `agent_id` AND has cleared all the other skip conditions.
+        let mut cached_default_agent_id: Option<String> = None;
 
         for entry in req.assistants {
             let id = entry
@@ -1043,15 +1291,23 @@ impl AssistantService {
                 }
             };
 
-            // Mirror the create() path: prefer the caller-supplied value;
+            // Mirror the create() path: prefer the caller-supplied agent id;
             // otherwise infer from the configured provider list.
-            let resolved_agent_type = match entry.preset_agent_type.as_deref() {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => match cached_default_agent_type.as_deref() {
+            let resolved_agent_id = match entry.agent_id.as_deref() {
+                Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+                Some(_) => {
+                    result.failed += 1;
+                    result.errors.push(ImportError {
+                        id,
+                        error: "agent_id is required".into(),
+                    });
+                    continue;
+                }
+                _ => match cached_default_agent_id.as_deref() {
                     Some(v) => v.to_string(),
-                    None => match self.resolve_default_agent_type().await {
+                    None => match self.resolve_default_agent_id().await {
                         Ok(v) => {
-                            cached_default_agent_type = Some(v.clone());
+                            cached_default_agent_id = Some(v.clone());
                             v
                         }
                         Err(e) => {
@@ -1065,6 +1321,14 @@ impl AssistantService {
                     },
                 },
             };
+            if let Err(e) = self.resolve_runtime_backend_for_agent_id(&resolved_agent_id).await {
+                result.failed += 1;
+                result.errors.push(ImportError {
+                    id,
+                    error: e.to_string(),
+                });
+                continue;
+            }
 
             let avatar = match self.normalize_user_avatar_input(&id, entry.avatar.as_deref()) {
                 Ok(value) => value,
@@ -1083,7 +1347,6 @@ impl AssistantService {
                 name: &name,
                 description: entry.description.as_deref(),
                 avatar: avatar.as_deref(),
-                preset_agent_type: &resolved_agent_type,
                 enabled_skills: serialized.enabled_skills.as_deref(),
                 custom_skill_names: serialized.custom_skill_names.as_deref(),
                 disabled_builtin_skills: serialized.disabled_builtin_skills.as_deref(),
@@ -1096,7 +1359,8 @@ impl AssistantService {
 
             match self.repo.create(&params).await {
                 Ok(row) => {
-                    self.upsert_definition_from_legacy_user_row(&row).await?;
+                    self.upsert_definition_from_legacy_user_row(&row, Some(&resolved_agent_id))
+                        .await?;
                     result.imported += 1;
                 }
                 Err(aionui_db::DbError::Conflict(_)) => {
@@ -1132,20 +1396,21 @@ impl AssistantService {
                     .and_then(|b| String::from_utf8(b).ok())
                     .unwrap_or_default())
             }
-            AssistantSource::User => {
+            AssistantSource::Generated | AssistantSource::User => {
                 let path = self.user_rule_path(id, locale);
                 Ok(read_file_or_empty(&path))
             }
         }
     }
 
-    /// Write an assistant rule file. User only; built-ins reject.
+    /// Write an assistant rule file. User-authored and generated assistants
+    /// keep editable configuration in the local profile; built-ins reject.
     pub async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AssistantError> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot write rule for built-in assistant".into(),
             )),
-            AssistantSource::User => {
+            AssistantSource::Generated | AssistantSource::User => {
                 let path = self.user_rule_path(id, locale);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
@@ -1157,20 +1422,22 @@ impl AssistantService {
         }
     }
 
-    /// Delete all locale versions of an assistant rule. User only.
+    /// Delete all locale versions of an assistant rule.
     pub async fn delete_rule(&self, id: &str) -> Result<bool, AssistantError> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot delete rule for built-in assistant".into(),
             )),
-            AssistantSource::User => Ok(remove_assistant_md_files(&self.user_rules_dir(), id)),
+            AssistantSource::Generated | AssistantSource::User => {
+                Ok(remove_assistant_md_files(&self.user_rules_dir(), id))
+            }
         }
     }
 
     pub async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, AssistantError> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => Ok(String::new()),
-            AssistantSource::User => {
+            AssistantSource::Generated | AssistantSource::User => {
                 let path = self.user_skill_path(id, locale);
                 Ok(read_file_or_empty(&path))
             }
@@ -1182,7 +1449,7 @@ impl AssistantService {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot write skill for built-in assistant".into(),
             )),
-            AssistantSource::User => {
+            AssistantSource::Generated | AssistantSource::User => {
                 let path = self.user_skill_path(id, locale);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
@@ -1199,7 +1466,9 @@ impl AssistantService {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot delete skill for built-in assistant".into(),
             )),
-            AssistantSource::User => Ok(remove_assistant_md_files(&self.user_skills_dir(), id)),
+            AssistantSource::Generated | AssistantSource::User => {
+                Ok(remove_assistant_md_files(&self.user_skills_dir(), id))
+            }
         }
     }
 
@@ -1221,7 +1490,7 @@ impl AssistantService {
     pub async fn avatar_asset(&self, id: &str) -> Option<AvatarAsset> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => self.builtin.avatar_asset(id),
-            AssistantSource::User => {
+            AssistantSource::Generated | AssistantSource::User => {
                 let dir = self.user_avatars_dir();
                 let entries = std::fs::read_dir(&dir).ok()?;
                 for entry in entries.flatten() {
@@ -1376,7 +1645,7 @@ impl AssistantService {
         &self,
         source: &str,
         source_ref: Option<&str>,
-        assistant_key: &str,
+        assistant_id: &str,
     ) -> Result<(String, String), AssistantError> {
         if let Some(source_ref) = source_ref
             && let Some(existing) = self
@@ -1385,19 +1654,19 @@ impl AssistantService {
                 .await
                 .map_err(|e| AssistantError::Internal(format!("get assistant definition by source_ref: {e}")))?
         {
-            return Ok((existing.definition_id, existing.assistant_key));
+            return Ok((existing.id, existing.assistant_id));
         }
 
         if let Some(existing) = self
             .definition_repo
-            .get_by_key(assistant_key)
+            .get_by_assistant_id(assistant_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("get assistant definition by key: {e}")))?
         {
-            return Ok((existing.definition_id, existing.assistant_key));
+            return Ok((existing.id, existing.assistant_id));
         }
 
-        Ok((generate_prefixed_id("asstdef"), assistant_key.to_string()))
+        Ok((generate_prefixed_id("asstdef"), assistant_id.to_string()))
     }
 
     fn cleanup_user_assets(&self, id: &str) {
@@ -1472,7 +1741,7 @@ fn avatar_display_value(definition: &AssistantDefinitionRow) -> Option<String> {
             if is_direct_avatar_url(value) {
                 value.to_string()
             } else {
-                format!("/api/assistants/{}/avatar", definition.assistant_key)
+                format!("/api/assistants/{}/avatar", definition.assistant_id)
             }
         }),
         _ => definition.avatar_value.clone(),
@@ -1534,9 +1803,11 @@ fn parse_assistant_avatar_route(value: &str) -> Option<String> {
 fn definition_to_response(
     definition: &AssistantDefinitionRow,
     state: Option<&AssistantOverlayRow>,
+    projection: &AssistantRuntimeProjection,
 ) -> Result<AssistantResponse, AssistantError> {
     let source = match definition.source.as_str() {
         "builtin" => AssistantSource::Builtin,
+        "generated" => AssistantSource::Generated,
         _ => AssistantSource::User,
     };
     let models = match (
@@ -1548,7 +1819,7 @@ fn definition_to_response(
     };
 
     Ok(AssistantResponse {
-        id: definition.assistant_key.clone(),
+        id: definition.assistant_id.clone(),
         source,
         name: definition.name.clone(),
         name_i18n: decode_str_map(Some(definition.name_i18n.as_str()))?,
@@ -1557,9 +1828,8 @@ fn definition_to_response(
         avatar: avatar_display_value(definition),
         enabled: state.is_none_or(|row| row.enabled),
         sort_order: state.map(|row| row.sort_order).unwrap_or(0),
-        preset_agent_type: state
-            .and_then(|row| row.agent_backend_override.clone())
-            .unwrap_or_else(|| definition.agent_backend.clone()),
+        agent_id: projection.agent_id.clone(),
+        agent: projection.agent.clone(),
         enabled_skills: decode_str_list(Some(definition.default_skill_ids.as_str()))?,
         custom_skill_names: decode_str_list(Some(definition.custom_skill_names.as_str()))?,
         disabled_builtin_skills: decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?,
@@ -1569,6 +1839,11 @@ fn definition_to_response(
         prompts_i18n: decode_list_map(Some(definition.recommended_prompts_i18n.as_str()))?,
         models,
         last_used_at: state.and_then(|row| row.last_used_at),
+        agent_status: projection.agent_status,
+        agent_status_message: projection.agent_status_message.clone(),
+        team_selectable: projection.team_selectable,
+        team_block_reason: projection.team_block_reason.clone(),
+        deletable: projection.deletable,
     })
 }
 
@@ -1577,6 +1852,7 @@ fn definition_to_detail_response(
     state: Option<&AssistantOverlayRow>,
     preference: Option<&aionui_db::AssistantPreferenceRow>,
     rules_content: &str,
+    projection: &AssistantRuntimeProjection,
 ) -> Result<AssistantDetailResponse, AssistantError> {
     let default_skill_ids = decode_str_list(Some(definition.default_skill_ids.as_str()))?;
     let custom_skill_names = decode_str_list(Some(definition.custom_skill_names.as_str()))?;
@@ -1597,11 +1873,17 @@ fn definition_to_detail_response(
         .unwrap_or_default();
 
     Ok(AssistantDetailResponse {
-        id: definition.assistant_key.clone(),
+        id: definition.assistant_id.clone(),
         source: match definition.source.as_str() {
             "builtin" => AssistantSource::Builtin,
+            "generated" => AssistantSource::Generated,
             _ => AssistantSource::User,
         },
+        agent_status: projection.agent_status,
+        agent_status_message: projection.agent_status_message.clone(),
+        team_selectable: projection.team_selectable,
+        team_block_reason: projection.team_block_reason.clone(),
+        deletable: projection.deletable,
         profile: AssistantProfileResponse {
             name: definition.name.clone(),
             name_i18n: decode_str_map(Some(definition.name_i18n.as_str()))?,
@@ -1615,9 +1897,8 @@ fn definition_to_detail_response(
             last_used_at: state.and_then(|row| row.last_used_at),
         },
         engine: AssistantEngineResponse {
-            agent_backend: state
-                .and_then(|row| row.agent_backend_override.clone())
-                .unwrap_or_else(|| definition.agent_backend.clone()),
+            agent_id: projection.agent_id.clone(),
+            agent: projection.agent.clone(),
         },
         rules: AssistantRulesResponse {
             content: if rules_content.is_empty() {
@@ -1662,6 +1943,118 @@ fn definition_to_detail_response(
             last_mcp_ids,
         },
     })
+}
+
+#[derive(Debug, Clone)]
+struct AssistantRuntimeProjection {
+    agent_id: String,
+    agent: Option<AssistantAgentResponse>,
+    agent_status: AgentManagementStatus,
+    agent_status_message: Option<String>,
+    team_selectable: bool,
+    team_block_reason: Option<String>,
+    deletable: bool,
+}
+
+fn assistant_projection_for_definition(
+    definition: &AssistantDefinitionRow,
+    state: Option<&AssistantOverlayRow>,
+    agent_rows: &[AgentManagementRow],
+    resolved_runtime_backend: Option<&str>,
+) -> AssistantRuntimeProjection {
+    let enabled = state.is_none_or(|row| row.enabled);
+    let source = match definition.source.as_str() {
+        "builtin" => AssistantSource::Builtin,
+        "generated" => AssistantSource::Generated,
+        _ => AssistantSource::User,
+    };
+    let effective_agent_id = effective_agent_id_for_definition(definition, state);
+    let fallback_runtime_backend = resolved_runtime_backend.unwrap_or(effective_agent_id);
+
+    // An agent row identifies its runtime key by `backend` for vendor ACP
+    // agents, but aionrs (the built-in Rust agent) has a NULL `backend` and is
+    // keyed by its `agent_type` ("aionrs") instead. Match on either so aionrs
+    // assistants resolve to the aionrs row rather than falling back to Missing.
+    let row_matches_backend = |row: &&AgentManagementRow| {
+        row.backend.as_deref() == Some(effective_agent_id)
+            || row.agent_type.serde_name() == effective_agent_id
+            || row.backend.as_deref() == Some(fallback_runtime_backend)
+            || row.agent_type.serde_name() == fallback_runtime_backend
+    };
+
+    let agent_row = if matches!(source, AssistantSource::Generated) {
+        agent_rows.iter().find(|row| row.id == effective_agent_id).or_else(|| {
+            definition
+                .source_ref
+                .as_deref()
+                .and_then(|source_ref| agent_rows.iter().find(|row| row.id == source_ref))
+        })
+    } else {
+        agent_rows
+            .iter()
+            .find(|row| row.id == effective_agent_id)
+            .or_else(|| {
+                agent_rows
+                    .iter()
+                    .find(|row| row_matches_backend(row) && row.agent_source != AgentSource::Custom)
+            })
+            .or_else(|| agent_rows.iter().find(row_matches_backend))
+    };
+    let agent_id = agent_row
+        .map(|row| row.id.clone())
+        .unwrap_or_else(|| effective_agent_id.to_owned());
+    let agent = agent_row.map(|row| AssistantAgentResponse {
+        r#type: row.agent_type,
+        source: row.agent_source,
+        acp_backend: row.backend.clone(),
+    });
+
+    let agent_status = agent_row
+        .map(|row| row.status)
+        .unwrap_or(AgentManagementStatus::Missing);
+    let agent_status_message = agent_row.and_then(|row| {
+        row.last_check_error_message
+            .clone()
+            .or_else(|| row.last_check_guidance.clone())
+    });
+    let team_block_reason = if !enabled {
+        Some("Assistant is disabled.".to_string())
+    } else {
+        match agent_row {
+            Some(row) if matches!(row.status, AgentManagementStatus::Missing) => {
+                Some("This assistant's agent is not installed.".to_string())
+            }
+            Some(row) if matches!(row.status, AgentManagementStatus::Offline) => Some(
+                row.last_check_error_message
+                    .clone()
+                    .or_else(|| row.last_check_guidance.clone())
+                    .unwrap_or_else(|| "This assistant's agent is unavailable.".to_string()),
+            ),
+            Some(row) if !row.team_capable => Some("This assistant's agent does not support team mode.".to_string()),
+            None => Some("This assistant's agent could not be resolved.".to_string()),
+            _ => None,
+        }
+    };
+
+    AssistantRuntimeProjection {
+        agent_id,
+        agent,
+        agent_status,
+        agent_status_message,
+        team_selectable: enabled
+            && agent_row.is_some_and(|row| matches!(row.status, AgentManagementStatus::Online) && row.team_capable),
+        team_block_reason,
+        deletable: matches!(source, AssistantSource::User),
+    }
+}
+
+fn effective_agent_id_for_definition<'a>(
+    definition: &'a AssistantDefinitionRow,
+    state: Option<&'a AssistantOverlayRow>,
+) -> &'a str {
+    state
+        .and_then(|row| row.agent_id_override.as_deref())
+        .unwrap_or(definition.agent_id.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,6 +2183,83 @@ impl SerializedDetailOverrides {
             || self.default_skill_ids.is_some()
             || self.default_mcps_mode.is_some()
             || self.default_mcp_ids.is_some()
+    }
+}
+
+fn apply_detail_patch_to_definition(
+    definition: &mut AssistantDefinitionRow,
+    overrides: &SerializedDetailOverrides,
+    reset_model_and_permission: bool,
+) {
+    if reset_model_and_permission {
+        definition.default_model_mode = "auto".to_string();
+        definition.default_model_value = None;
+        definition.default_permission_mode = "auto".to_string();
+        definition.default_permission_value = None;
+    }
+    if let Some(value) = overrides.recommended_prompts.as_deref() {
+        definition.recommended_prompts = value.to_string();
+    }
+    if let Some(value) = overrides.recommended_prompts_i18n.as_deref() {
+        definition.recommended_prompts_i18n = value.to_string();
+    }
+    if let Some(value) = overrides.default_model_mode.as_deref() {
+        definition.default_model_mode = value.to_string();
+    }
+    if let Some(value) = overrides.default_model_value.as_ref() {
+        definition.default_model_value = value.clone();
+    }
+    if let Some(value) = overrides.default_permission_mode.as_deref() {
+        definition.default_permission_mode = value.to_string();
+    }
+    if let Some(value) = overrides.default_permission_value.as_ref() {
+        definition.default_permission_value = value.clone();
+    }
+    if let Some(value) = overrides.default_skills_mode.as_deref() {
+        definition.default_skills_mode = value.to_string();
+    }
+    if let Some(value) = overrides.default_skill_ids.as_deref() {
+        definition.default_skill_ids = value.to_string();
+    }
+    if let Some(value) = overrides.default_mcps_mode.as_deref() {
+        definition.default_mcps_mode = value.to_string();
+    }
+    if let Some(value) = overrides.default_mcp_ids.as_deref() {
+        definition.default_mcp_ids = value.to_string();
+    }
+}
+
+fn upsert_params_from_definition(definition: &AssistantDefinitionRow) -> UpsertAssistantDefinitionParams<'_> {
+    UpsertAssistantDefinitionParams {
+        id: &definition.id,
+        assistant_id: &definition.assistant_id,
+        source: &definition.source,
+        owner_type: &definition.owner_type,
+        source_ref: definition.source_ref.as_deref(),
+        source_version: definition.source_version.as_deref(),
+        source_hash: definition.source_hash.as_deref(),
+        name: &definition.name,
+        name_i18n: &definition.name_i18n,
+        description: definition.description.as_deref(),
+        description_i18n: &definition.description_i18n,
+        avatar_type: &definition.avatar_type,
+        avatar_value: definition.avatar_value.as_deref(),
+        agent_id: &definition.agent_id,
+        rule_resource_type: &definition.rule_resource_type,
+        rule_resource_ref: definition.rule_resource_ref.as_deref(),
+        rule_inline_content: definition.rule_inline_content.as_deref(),
+        recommended_prompts: &definition.recommended_prompts,
+        recommended_prompts_i18n: &definition.recommended_prompts_i18n,
+        default_model_mode: &definition.default_model_mode,
+        default_model_value: definition.default_model_value.as_deref(),
+        default_permission_mode: &definition.default_permission_mode,
+        default_permission_value: definition.default_permission_value.as_deref(),
+        default_skills_mode: &definition.default_skills_mode,
+        default_skill_ids: &definition.default_skill_ids,
+        custom_skill_names: &definition.custom_skill_names,
+        default_disabled_builtin_skill_ids: &definition.default_disabled_builtin_skill_ids,
+        default_mcps_mode: &definition.default_mcps_mode,
+        default_mcp_ids: &definition.default_mcp_ids,
     }
 }
 
@@ -1973,6 +2443,7 @@ mod tests {
         SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
         SqliteProviderRepository, init_database_memory,
     };
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     struct Fixture {
@@ -1981,8 +2452,21 @@ mod tests {
         state_repo: Arc<dyn IAssistantOverlayRepository>,
         preference_repo: Arc<dyn IAssistantPreferenceRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
+        agent_rows: Arc<Mutex<Vec<aionui_api_types::AgentManagementRow>>>,
         _tmp: TempDir,
         _db: aionui_db::Database,
+    }
+
+    #[derive(Clone, Default)]
+    struct StubAgentCatalog {
+        rows: Arc<Mutex<Vec<aionui_api_types::AgentManagementRow>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AssistantAgentCatalogPort for StubAgentCatalog {
+        async fn list_management_agents(&self) -> Result<Vec<aionui_api_types::AgentManagementRow>, AssistantError> {
+            Ok(self.rows.lock().expect("agent rows lock poisoned").clone())
+        }
     }
 
     /// Default fixture: seeded with a single OpenAI-compatible provider so
@@ -2011,6 +2495,7 @@ mod tests {
         /// Defaults to `"openai"` so existing tests get an `"aionrs"`
         /// default agent type.
         seed_platform: Option<&'static str>,
+        agent_rows: Vec<aionui_api_types::AgentManagementRow>,
     }
 
     async fn fixture_with_options(opts: FixtureOpts) -> Fixture {
@@ -2043,7 +2528,7 @@ mod tests {
                     serde_json::json!({
                         "id": b.id,
                         "name": b.name,
-                        "preset_agent_type": b.preset_agent_type,
+                        "agent_ref": b.agent_ref,
                         "rule_file": b.rule_file,
                     })
                 })
@@ -2056,6 +2541,7 @@ mod tests {
         .unwrap();
         let builtin_reg = Arc::new(BuiltinAssistantRegistry::load_from_dir(assets_dir));
 
+        let agent_rows = Arc::new(Mutex::new(opts.agent_rows.clone()));
         let service = AssistantService::new(
             db.pool().clone(),
             AssistantServiceDeps {
@@ -2066,6 +2552,9 @@ mod tests {
                 override_repo: orepo,
                 provider_repo: provider_repo.clone(),
                 builtin: builtin_reg,
+                agent_catalog: Some(Arc::new(StubAgentCatalog {
+                    rows: agent_rows.clone(),
+                })),
             },
             tmp.path().to_path_buf(),
         );
@@ -2077,6 +2566,7 @@ mod tests {
             state_repo,
             preference_repo,
             provider_repo,
+            agent_rows,
             _tmp: tmp,
             _db: db,
         }
@@ -2111,7 +2601,7 @@ mod tests {
             description: None,
             description_i18n: HashMap::new(),
             avatar: None,
-            preset_agent_type: "gemini".into(),
+            agent_ref: "gemini".into(),
             enabled_skills: Vec::new(),
             custom_skill_names: Vec::new(),
             disabled_builtin_skills: Vec::new(),
@@ -2119,6 +2609,54 @@ mod tests {
             prompts: Vec::new(),
             prompts_i18n: HashMap::new(),
             models: Vec::new(),
+        }
+    }
+
+    fn mk_agent_row(
+        id: &str,
+        backend: &str,
+        status: aionui_api_types::AgentManagementStatus,
+    ) -> aionui_api_types::AgentManagementRow {
+        aionui_api_types::AgentManagementRow {
+            id: id.into(),
+            icon: Some(format!("/api/assets/{backend}.svg")),
+            name: format!("{backend} agent"),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some(backend.into()),
+            agent_type: aionui_common::AgentType::Acp,
+            agent_source: aionui_api_types::AgentSource::Builtin,
+            agent_source_info: aionui_api_types::AgentSourceInfo::default(),
+            enabled: true,
+            installed: true,
+            command: Some(backend.into()),
+            args: Vec::new(),
+            env: Vec::new(),
+            native_skills_dirs: None,
+            behavior_policy: aionui_api_types::BehaviorPolicy {
+                supports_team: true,
+                ..Default::default()
+            },
+            yolo_id: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            sort_order: 3100,
+            team_capable: true,
+            status,
+            last_check_status: Some(aionui_api_types::AgentSnapshotCheckStatus::Online),
+            last_check_kind: Some(aionui_api_types::AgentSnapshotCheckKind::Manual),
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_error_details: None,
+            last_check_guidance: None,
+            last_check_latency_ms: Some(42),
+            last_check_at: Some(1_750_000_000_000),
+            last_success_at: Some(1_750_000_000_000),
+            last_failure_at: None,
+            has_command_override: false,
+            env_override_key_count: 0,
         }
     }
 
@@ -2151,6 +2689,247 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_maps_generated_definition_to_generated_source() {
+        let fx = fixture().await;
+        fx.definition_repo
+            .upsert(&UpsertAssistantDefinitionParams {
+                id: "asstdef-generated",
+                assistant_id: "bare:claude",
+                source: "generated",
+                owner_type: "system",
+                source_ref: Some("agent-claude"),
+                source_version: None,
+                source_hash: None,
+                name: "Claude",
+                name_i18n: "{}",
+                description: None,
+                description_i18n: "{}",
+                avatar_type: "none",
+                avatar_value: None,
+                agent_id: "agent-claude",
+                rule_resource_type: "none",
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: "[]",
+                recommended_prompts_i18n: "{}",
+                default_model_mode: "auto",
+                default_model_value: None,
+                default_permission_mode: "auto",
+                default_permission_value: None,
+                default_skills_mode: "auto",
+                default_skill_ids: "[]",
+                custom_skill_names: "[]",
+                default_disabled_builtin_skill_ids: "[]",
+                default_mcps_mode: "auto",
+                default_mcp_ids: "[]",
+            })
+            .await
+            .unwrap();
+        fx.state_repo
+            .upsert(&UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef-generated",
+                enabled: true,
+                sort_order: 3,
+                agent_id_override: None,
+                last_used_at: None,
+            })
+            .await
+            .unwrap();
+
+        let list = fx.service.list().await.unwrap();
+        let generated = list.iter().find(|assistant| assistant.id == "bare:claude").unwrap();
+        assert_eq!(generated.source, AssistantSource::Generated);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_materializes_generated_assistant_from_available_agent() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+
+        let list = fx.service.list().await.unwrap();
+        let bare = list
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-claude")
+            .unwrap();
+        assert_eq!(bare.source, AssistantSource::Generated);
+        assert_eq!(bare.agent_id, "agent-claude");
+        assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Online);
+        assert!(bare.team_selectable);
+        assert!(!bare.deletable);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_materializes_generated_assistant_from_available_custom_agent() {
+        let mut custom_row = mk_agent_row(
+            "custom-agent-1",
+            "custom",
+            aionui_api_types::AgentManagementStatus::Online,
+        );
+        custom_row.name = "Custom ACP Agent".into();
+        custom_row.agent_source = aionui_api_types::AgentSource::Custom;
+
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![custom_row],
+            ..Default::default()
+        })
+        .await;
+
+        let list = fx.service.list().await.unwrap();
+        let bare = list
+            .iter()
+            .find(|assistant| assistant.id == "bare:custom-agent-1")
+            .expect("available custom agent should be materialized as a generated assistant");
+        assert_eq!(bare.source, AssistantSource::Generated);
+        assert_eq!(bare.name, "Custom ACP Agent");
+        assert_eq!(bare.agent_id, "custom-agent-1");
+        assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Online);
+        assert!(bare.team_selectable);
+        assert!(!bare.deletable);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_falls_back_to_agent_type_when_backend_is_empty() {
+        // Engines like Aion CLI carry their identity in `agent_type` and leave
+        // `backend` empty (it is an ACP-vendor label). The generated assistant must
+        // still expose the concrete agent id so the frontend does not bind it
+        // through an overloaded runtime backend label.
+        let mut agent_row = mk_agent_row(
+            "agent-aionrs",
+            "aionrs",
+            aionui_api_types::AgentManagementStatus::Online,
+        );
+        agent_row.backend = None;
+        agent_row.agent_type = aionui_common::AgentType::Aionrs;
+
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![agent_row],
+            ..Default::default()
+        })
+        .await;
+
+        let list = fx.service.list().await.unwrap();
+        let bare = list
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-aionrs")
+            .unwrap();
+        assert_eq!(bare.agent_id, "agent-aionrs");
+    }
+
+    #[tokio::test]
+    async fn aionrs_assistant_resolves_agent_status_via_agent_type_not_backend() {
+        // Regression: an assistant whose engine is aionrs must match the aionrs
+        // agent row by `agent_type` ("aionrs"), since that row's `backend` is
+        // NULL. Matching on `backend` alone left the row unresolved and
+        // mislabelled every aionrs assistant as Missing/unavailable.
+        let mut aionrs_row = mk_agent_row(
+            "agent-aionrs",
+            "aionrs",
+            aionui_api_types::AgentManagementStatus::Online,
+        );
+        aionrs_row.backend = None;
+        aionrs_row.agent_type = aionui_common::AgentType::Aionrs;
+
+        let mut builtin = mk_builtin("builtin-aionrs", "Aion Assistant");
+        builtin.agent_ref = "aionrs".into();
+
+        let fx = fixture_with_options(FixtureOpts {
+            builtins: vec![builtin],
+            agent_rows: vec![aionrs_row],
+            ..Default::default()
+        })
+        .await;
+
+        let list = fx.service.list().await.unwrap();
+        let assistant = list
+            .iter()
+            .find(|assistant| assistant.id == "builtin-aionrs")
+            .expect("aionrs builtin assistant should be listed");
+        assert_eq!(
+            assistant.agent_status,
+            aionui_api_types::AgentManagementStatus::Online,
+            "aionrs assistant should resolve to the online aionrs agent row, not Missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_places_new_generated_assistants_before_existing_assistants() {
+        let fx = fixture_with_options(FixtureOpts {
+            builtins: vec![mk_builtin("builtin-office", "Office")],
+            agent_rows: vec![
+                mk_agent_row(
+                    "agent-claude",
+                    "claude",
+                    aionui_api_types::AgentManagementStatus::Online,
+                ),
+                mk_agent_row("agent-codex", "codex", aionui_api_types::AgentManagementStatus::Online),
+            ],
+            ..Default::default()
+        })
+        .await;
+
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "Mine".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        let list = fx.service.list().await.unwrap();
+        let ordered_ids: Vec<&str> = list.iter().map(|assistant| assistant.id.as_str()).collect();
+
+        assert_eq!(ordered_ids[0..2], ["bare:agent-claude", "bare:agent-codex"]);
+        assert!(ordered_ids[2..].contains(&"builtin-office"));
+        assert!(ordered_ids[2..].contains(&"u1"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_generated_assistants_preserves_existing_user_sort_order() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+
+        let first = fx.service.list().await.unwrap();
+        let bare = first
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-claude")
+            .expect("generated assistant should exist after first reconcile");
+        assert_eq!(bare.sort_order, -1);
+
+        fx.service
+            .set_state(
+                "bare:agent-claude",
+                SetAssistantStateRequest {
+                    sort_order: Some(9000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let second = fx.service.list().await.unwrap();
+        let bare_after_reconcile = second
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-claude")
+            .expect("generated assistant should still exist");
+        assert_eq!(bare_after_reconcile.sort_order, 9000);
+    }
+
+    #[tokio::test]
     async fn bootstrap_materializes_builtin_and_syncs_legacy_rows() {
         let mut builtin = mk_builtin("builtin-office", "Office");
         builtin.rule_file = Some("rules/builtin-office.{locale}.md".into());
@@ -2178,13 +2957,18 @@ mod tests {
 
         fx.service.bootstrap_assistant_storage().await.unwrap();
 
-        let builtin = fx.definition_repo.get_by_key("builtin-office").await.unwrap().unwrap();
+        let builtin = fx
+            .definition_repo
+            .get_by_assistant_id("builtin-office")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(builtin.source, "builtin");
         assert_eq!(builtin.rule_resource_type, "builtin_asset");
         assert_eq!(builtin.rule_resource_ref.as_deref(), Some("builtin-office"));
-        let user = fx.definition_repo.get_by_key("u1").await.unwrap().unwrap();
+        let user = fx.definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
         assert_eq!(user.source, "user");
-        let builtin_state = fx.state_repo.get(&builtin.definition_id).await.unwrap().unwrap();
+        let builtin_state = fx.state_repo.get(&builtin.id).await.unwrap().unwrap();
         assert!(!builtin_state.enabled);
         assert_eq!(builtin_state.sort_order, 9);
         assert_eq!(builtin_state.last_used_at, Some(1234));
@@ -2194,12 +2978,23 @@ mod tests {
     async fn bootstrap_soft_deletes_builtin_removed_from_manifest() {
         let mut fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
 
-        let original = fx.definition_repo.get_by_key("builtin-office").await.unwrap().unwrap();
+        let original = fx
+            .definition_repo
+            .get_by_assistant_id("builtin-office")
+            .await
+            .unwrap()
+            .unwrap();
         fx.service.builtin = Arc::new(BuiltinAssistantRegistry::empty());
 
         fx.service.bootstrap_assistant_storage().await.unwrap();
 
-        assert!(fx.definition_repo.get_by_key("builtin-office").await.unwrap().is_none());
+        assert!(
+            fx.definition_repo
+                .get_by_assistant_id("builtin-office")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             fx.service
                 .list()
@@ -2208,13 +3003,7 @@ mod tests {
                 .iter()
                 .all(|assistant| assistant.id != "builtin-office")
         );
-        assert!(
-            fx.definition_repo
-                .get_by_definition_id(&original.definition_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(fx.definition_repo.get_by_id(&original.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2243,7 +3032,7 @@ mod tests {
             .await
             .unwrap();
 
-        let definition = fx.definition_repo.get_by_key("u1").await.unwrap().unwrap();
+        let definition = fx.definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
         assert_eq!(definition.name_i18n, "{}");
         assert_eq!(definition.description_i18n, "{}");
         assert_eq!(definition.recommended_prompts_i18n, "{}");
@@ -2320,21 +3109,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_builtin_preset_agent_type_writes_override() {
+    async fn update_builtin_agent_id_writes_override() {
         let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
         let updated = fx
             .service
             .update(
                 "builtin-office",
                 UpdateAssistantRequest {
-                    preset_agent_type: Some("claude".into()),
+                    agent_id: Some("2d23ff1c".into()),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
         assert_eq!(updated.source, AssistantSource::Builtin);
-        assert_eq!(updated.preset_agent_type, "claude");
+        assert_eq!(updated.agent_id, "2d23ff1c");
         // List view must reflect the override too.
         let listed = fx
             .service
@@ -2344,7 +3133,7 @@ mod tests {
             .into_iter()
             .find(|a| a.id == "builtin-office")
             .unwrap();
-        assert_eq!(listed.preset_agent_type, "claude");
+        assert_eq!(listed.agent_id, "2d23ff1c");
     }
 
     #[tokio::test]
@@ -2355,7 +3144,7 @@ mod tests {
             .update(
                 "builtin-office",
                 UpdateAssistantRequest {
-                    preset_agent_type: Some("gemini".into()),
+                    agent_id: Some("cc126dd5".into()),
                     defaults: Some(AssistantDefaultsRequest {
                         model: Some(AssistantDefaultScalarRequest {
                             mode: "fixed".into(),
@@ -2374,7 +3163,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(updated.source, AssistantSource::Builtin);
-        assert_eq!(updated.preset_agent_type, "gemini");
+        assert_eq!(updated.agent_id, "cc126dd5");
 
         let detail = fx.service.get_detail("builtin-office", Some("en-US")).await.unwrap();
         assert_eq!(detail.defaults.model.mode, "fixed");
@@ -2384,13 +3173,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_generated_rejects() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+
+        let err = fx
+            .service
+            .update(
+                "bare:agent-claude",
+                UpdateAssistantRequest {
+                    name: Some("Nope".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AssistantError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn update_generated_persists_editable_fields() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+
+        fx.service
+            .update(
+                "bare:agent-claude",
+                UpdateAssistantRequest {
+                    description: Some("local cli description".into()),
+                    enabled_skills: Some(vec!["skill-a".into()]),
+                    custom_skill_names: Some(vec!["custom skill".into()]),
+                    disabled_builtin_skills: Some(vec!["builtin-off".into()]),
+                    recommended_prompts: Some(vec!["Start locally".into()]),
+                    defaults: Some(AssistantDefaultsRequest {
+                        model: Some(AssistantDefaultScalarRequest {
+                            mode: "fixed".into(),
+                            value: Some("openai/gpt-5".into()),
+                        }),
+                        permission: Some(AssistantDefaultScalarRequest {
+                            mode: "fixed".into(),
+                            value: Some("strict".into()),
+                        }),
+                        skills: Some(AssistantDefaultListRequest {
+                            mode: "fixed".into(),
+                            value: vec!["skill-a".into()],
+                        }),
+                        mcps: Some(AssistantDefaultListRequest {
+                            mode: "fixed".into(),
+                            value: vec!["mcp-a".into()],
+                        }),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let detail = fx.service.get_detail("bare:agent-claude", Some("en-US")).await.unwrap();
+        assert_eq!(detail.profile.description.as_deref(), Some("local cli description"));
+        assert_eq!(detail.prompts.recommended, vec!["Start locally"]);
+        assert_eq!(detail.defaults.model.mode, "fixed");
+        assert_eq!(detail.defaults.model.value.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(detail.defaults.permission.mode, "fixed");
+        assert_eq!(detail.defaults.permission.value.as_deref(), Some("strict"));
+        assert_eq!(detail.defaults.skills.mode, "fixed");
+        assert_eq!(detail.defaults.skills.value, vec!["skill-a"]);
+        assert_eq!(detail.defaults.mcps.mode, "fixed");
+        assert_eq!(detail.defaults.mcps.value, vec!["mcp-a"]);
+        assert_eq!(detail.capabilities.default_skill_ids, vec!["skill-a"]);
+        assert_eq!(detail.capabilities.custom_skill_names, vec!["custom skill"]);
+        assert_eq!(
+            detail.capabilities.default_disabled_builtin_skill_ids,
+            vec!["builtin-off"]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_generated_rejects_identity_fields() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+
+        let name_err = fx
+            .service
+            .update(
+                "bare:agent-claude",
+                UpdateAssistantRequest {
+                    name: Some("Renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(name_err, AssistantError::Forbidden(_)));
+
+        let avatar_err = fx
+            .service
+            .update(
+                "bare:agent-claude",
+                UpdateAssistantRequest {
+                    avatar: Some("🙂".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(avatar_err, AssistantError::Forbidden(_)));
+
+        let agent_err = fx
+            .service
+            .update(
+                "bare:agent-claude",
+                UpdateAssistantRequest {
+                    agent_id: Some("agent-codex".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(agent_err, AssistantError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn reconcile_generated_assistant_refreshes_identity_without_overwriting_edits() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+
+        fx.service
+            .update(
+                "bare:agent-claude",
+                UpdateAssistantRequest {
+                    description: Some("user edited description".into()),
+                    recommended_prompts: Some(vec!["Keep this prompt".into()]),
+                    defaults: Some(AssistantDefaultsRequest {
+                        model: Some(AssistantDefaultScalarRequest {
+                            mode: "fixed".into(),
+                            value: Some("openai/gpt-5".into()),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        {
+            let mut rows = fx.agent_rows.lock().expect("agent rows lock poisoned");
+            rows[0].name = "Claude Code renamed".into();
+            rows[0].icon = Some("🤖".into());
+            rows[0].description = Some("agent supplied description".into());
+        }
+
+        let listed = fx.service.list().await.unwrap();
+        let assistant = listed
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-claude")
+            .expect("generated assistant remains listed");
+        assert_eq!(assistant.name, "Claude Code renamed");
+        assert_eq!(assistant.avatar.as_deref(), Some("🤖"));
+        assert_eq!(assistant.description.as_deref(), Some("user edited description"));
+
+        let detail = fx.service.get_detail("bare:agent-claude", Some("en-US")).await.unwrap();
+        assert_eq!(detail.profile.name, "Claude Code renamed");
+        assert_eq!(detail.profile.avatar.as_deref(), Some("🤖"));
+        assert_eq!(detail.profile.description.as_deref(), Some("user edited description"));
+        assert_eq!(detail.prompts.recommended, vec!["Keep this prompt"]);
+        assert_eq!(detail.defaults.model.mode, "fixed");
+        assert_eq!(detail.defaults.model.value.as_deref(), Some("openai/gpt-5"));
+    }
+
+    #[tokio::test]
     async fn update_builtin_changing_agent_without_defaults_clears_model_and_permission() {
         let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
         fx.service
             .update(
                 "builtin-office",
                 UpdateAssistantRequest {
-                    preset_agent_type: Some("gemini".into()),
+                    agent_id: Some("cc126dd5".into()),
                     defaults: Some(AssistantDefaultsRequest {
                         model: Some(AssistantDefaultScalarRequest {
                             mode: "fixed".into(),
@@ -2412,7 +3399,7 @@ mod tests {
             .update(
                 "builtin-office",
                 UpdateAssistantRequest {
-                    preset_agent_type: Some("claude".into()),
+                    agent_id: Some("2d23ff1c".into()),
                     ..Default::default()
                 },
             )
@@ -2420,7 +3407,7 @@ mod tests {
             .unwrap();
 
         let detail = fx.service.get_detail("builtin-office", Some("en-US")).await.unwrap();
-        assert_eq!(detail.engine.agent_backend, "claude");
+        assert_eq!(detail.engine.agent_id, "2d23ff1c");
         assert_eq!(detail.defaults.model.mode, "auto");
         assert_eq!(detail.defaults.model.value, None);
         assert_eq!(detail.defaults.permission.mode, "auto");
@@ -2494,7 +3481,7 @@ mod tests {
             .update(
                 "u1",
                 UpdateAssistantRequest {
-                    preset_agent_type: Some("codex".into()),
+                    agent_id: Some("8e1acf31".into()),
                     ..Default::default()
                 },
             )
@@ -2502,7 +3489,7 @@ mod tests {
             .unwrap();
 
         let detail = fx.service.get_detail("u1", Some("en-US")).await.unwrap();
-        assert_eq!(detail.engine.agent_backend, "codex");
+        assert_eq!(detail.engine.agent_id, "8e1acf31");
         assert_eq!(detail.defaults.model.mode, "auto");
         assert_eq!(detail.defaults.model.value, None);
         assert_eq!(detail.defaults.permission.mode, "auto");
@@ -2663,13 +3650,8 @@ mod tests {
             .await
             .unwrap();
 
-        let definition = fx.definition_repo.get_by_key("u1").await.unwrap().unwrap();
-        let pref = fx
-            .preference_repo
-            .get(&definition.definition_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let definition = fx.definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
+        let pref = fx.preference_repo.get(&definition.id).await.unwrap().unwrap();
         assert_eq!(pref.last_model_id.as_deref(), Some("openai/gpt-5"));
         assert_eq!(pref.last_permission_value.as_deref(), Some("strict"));
         assert_eq!(pref.last_skill_ids, r#"["skill-z"]"#);
@@ -2734,14 +3716,8 @@ mod tests {
             .await
             .unwrap();
 
-        let definition = fx.definition_repo.get_by_key("u1").await.unwrap().unwrap();
-        assert!(
-            fx.preference_repo
-                .get(&definition.definition_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let definition = fx.definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
+        assert!(fx.preference_repo.get(&definition.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2953,6 +3929,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_rule_generated_then_read_returns_same() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+        fx.service
+            .write_rule("bare:agent-claude", Some("en-US"), "rule body")
+            .await
+            .unwrap();
+        let content = fx.service.read_rule("bare:agent-claude", Some("en-US")).await.unwrap();
+        assert_eq!(content, "rule body");
+    }
+
+    #[tokio::test]
+    async fn delete_rule_generated_removes_local_rule() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+        fx.service
+            .write_rule("bare:agent-claude", Some("en-US"), "rule body")
+            .await
+            .unwrap();
+        assert!(fx.service.delete_rule("bare:agent-claude").await.unwrap());
+        let content = fx.service.read_rule("bare:agent-claude", Some("en-US")).await.unwrap();
+        assert!(content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_skill_generated_then_read_returns_same() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+        fx.service
+            .write_skill("bare:agent-claude", Some("en-US"), "skill body")
+            .await
+            .unwrap();
+        let content = fx.service.read_skill("bare:agent-claude", Some("en-US")).await.unwrap();
+        assert_eq!(content, "skill body");
+    }
+
+    #[tokio::test]
+    async fn delete_skill_generated_removes_local_skill() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+        fx.service
+            .write_skill("bare:agent-claude", Some("en-US"), "skill body")
+            .await
+            .unwrap();
+        assert!(fx.service.delete_skill("bare:agent-claude").await.unwrap());
+        let content = fx.service.read_skill("bare:agent-claude", Some("en-US")).await.unwrap();
+        assert!(content.is_empty());
+    }
+
+    #[tokio::test]
     async fn read_rule_builtin_dispatches_to_manifest() {
         let tmp = TempDir::new().unwrap();
         let db = init_database_memory().await.unwrap();
@@ -2965,7 +4019,7 @@ mod tests {
             "assistants": [{
                 "id": "builtin-office",
                 "name": "Office",
-                "preset_agent_type": "gemini",
+                "agent_ref": "gemini",
                 "rule_file": "rules/office.{locale}.md",
             }]
         });
@@ -2996,6 +4050,7 @@ mod tests {
                 override_repo: orepo,
                 provider_repo,
                 builtin: builtin_reg,
+                agent_catalog: None,
             },
             tmp.path().to_path_buf(),
         );
@@ -3019,7 +4074,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Default agent-type inference (ELECTRON-1J1 / 1KV regression coverage)
+    // Default agent inference (ELECTRON-1J1 / 1KV regression coverage)
     // -----------------------------------------------------------------------
 
     /// Anthropic provider routes to AionRS, not the Claude Code CLI:
@@ -3027,52 +4082,52 @@ mod tests {
     /// `claude` on `PATH`. CLI-based agents must be opted into
     /// explicitly.
     #[tokio::test]
-    async fn resolve_default_agent_type_routes_anthropic_provider_to_aionrs() {
+    async fn resolve_default_agent_id_routes_anthropic_provider_to_aionrs() {
         let fx = fixture_with_options(FixtureOpts {
             seed_platform: Some("anthropic"),
             ..Default::default()
         })
         .await;
-        let resolved = fx.service.resolve_default_agent_type().await.unwrap();
-        assert_eq!(resolved, "aionrs");
+        let resolved = fx.service.resolve_default_agent_id().await.unwrap();
+        assert_eq!(resolved, "632f31d2");
     }
 
     /// OpenAI / custom provider falls back to AionRS, the only AionUI
     /// agent that doesn't require a third-party CLI.
     #[tokio::test]
-    async fn resolve_default_agent_type_falls_back_to_aionrs_for_openai_provider() {
+    async fn resolve_default_agent_id_falls_back_to_aionrs_for_openai_provider() {
         let fx = fixture_with_options(FixtureOpts {
             seed_platform: Some("openai"),
             ..Default::default()
         })
         .await;
-        let resolved = fx.service.resolve_default_agent_type().await.unwrap();
-        assert_eq!(resolved, "aionrs");
+        let resolved = fx.service.resolve_default_agent_id().await.unwrap();
+        assert_eq!(resolved, "632f31d2");
     }
 
     /// Custom (non-anthropic, non-openai) platform also routes to AionRS,
     /// which handles OpenAI-compatible custom URLs.
     #[tokio::test]
-    async fn resolve_default_agent_type_handles_custom_platform_as_aionrs() {
+    async fn resolve_default_agent_id_handles_custom_platform_as_aionrs() {
         let fx = fixture_with_options(FixtureOpts {
             seed_platform: Some("custom"),
             ..Default::default()
         })
         .await;
-        let resolved = fx.service.resolve_default_agent_type().await.unwrap();
-        assert_eq!(resolved, "aionrs");
+        let resolved = fx.service.resolve_default_agent_id().await.unwrap();
+        assert_eq!(resolved, "632f31d2");
     }
 
     /// No providers → loud BadRequest with actionable text. Crucially,
     /// this no longer silently falls through to `"gemini"`.
     #[tokio::test]
-    async fn resolve_default_agent_type_errors_when_no_providers() {
+    async fn resolve_default_agent_id_errors_when_no_providers() {
         let fx = fixture_with_options(FixtureOpts {
             no_default_provider: true,
             ..Default::default()
         })
         .await;
-        let err = fx.service.resolve_default_agent_type().await.unwrap_err();
+        let err = fx.service.resolve_default_agent_id().await.unwrap_err();
         match err {
             AssistantError::BadRequest(msg) => {
                 assert!(
@@ -3091,7 +4146,7 @@ mod tests {
     /// Disabled providers do not satisfy the inference; the resolver
     /// must treat them as if they were absent.
     #[tokio::test]
-    async fn resolve_default_agent_type_ignores_disabled_providers() {
+    async fn resolve_default_agent_id_ignores_disabled_providers() {
         let fx = fixture_with_options(FixtureOpts {
             no_default_provider: true,
             ..Default::default()
@@ -3120,17 +4175,17 @@ mod tests {
             .await
             .unwrap();
 
-        let err = fx.service.resolve_default_agent_type().await.unwrap_err();
+        let err = fx.service.resolve_default_agent_id().await.unwrap_err();
         assert!(matches!(err, AssistantError::BadRequest(_)));
     }
 
     /// End-to-end regression for ELECTRON-1J1 / 1KV: creating an
-    /// assistant with no `preset_agent_type` and no Gemini CLI installed
+    /// assistant with no `agent_id` and no Gemini CLI installed
     /// must NOT default to `"gemini"`. Any enabled provider — Anthropic
     /// or otherwise — should resolve to `"aionrs"`, the only built-in
     /// agent that doesn't depend on a third-party CLI being on `PATH`.
     #[tokio::test]
-    async fn create_without_preset_does_not_default_to_gemini_when_provider_exists() {
+    async fn create_without_agent_id_does_not_default_to_gemini_when_provider_exists() {
         for platform in ["anthropic", "openai"] {
             let fx = fixture_with_options(FixtureOpts {
                 seed_platform: Some(platform),
@@ -3147,21 +4202,19 @@ mod tests {
                 .await
                 .unwrap();
             assert_ne!(
-                created.preset_agent_type, "gemini",
+                created.agent_id, "gemini",
                 "Gemini default would 400 within 1ms on machines without the CLI"
             );
             assert_eq!(
-                created.preset_agent_type, "aionrs",
+                created.agent_id, "632f31d2",
                 "{platform} provider should resolve to aionrs"
             );
         }
     }
 
-    /// Explicit `preset_agent_type` in the request body wins over the
-    /// inferred default — callers that know what they want stay in
-    /// control.
+    /// Explicit `agent_id` in the request body wins over the inferred default.
     #[tokio::test]
-    async fn create_respects_explicit_preset_agent_type() {
+    async fn create_respects_explicit_agent_id() {
         let fx = fixture_with_options(FixtureOpts {
             seed_platform: Some("anthropic"),
             ..Default::default()
@@ -3172,12 +4225,12 @@ mod tests {
             .create(CreateAssistantRequest {
                 id: Some("u1".into()),
                 name: "Mine".into(),
-                preset_agent_type: Some("codex".into()),
+                agent_id: Some("8e1acf31".into()),
                 ..req_default()
             })
             .await
             .unwrap();
-        assert_eq!(created.preset_agent_type, "codex");
+        assert_eq!(created.agent_id, "8e1acf31");
     }
 
     fn req_default() -> CreateAssistantRequest {
@@ -3186,7 +4239,7 @@ mod tests {
             name: String::new(),
             description: None,
             avatar: None,
-            preset_agent_type: None,
+            agent_id: None,
             enabled_skills: None,
             custom_skill_names: None,
             disabled_builtin_skills: None,

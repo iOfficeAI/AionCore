@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::CreateConversationRequest;
+use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest};
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
     ConversationService,
@@ -175,7 +175,11 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
                     r#type: request.agent_type,
                     name: Some(request.name),
                     model: request.top_level_model,
-                    assistant: None,
+                    assistant: request.assistant_id.map(|assistant_id| AssistantConversationRequest {
+                        id: assistant_id,
+                        locale: None,
+                        conversation_overrides: None,
+                    }),
                     source: None,
                     channel_chat_id: None,
                     extra: request.extra,
@@ -203,6 +207,28 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
         let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
         Ok(extra
             .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned))
+    }
+
+    async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
+        if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(conversation_id).await? {
+            let assistant_id = snapshot.assistant_id.trim();
+            if !assistant_id.is_empty() {
+                return Ok(Some(assistant_id.to_owned()));
+            }
+        }
+
+        let Some(row) = self.conversation_repo.get(conversation_id).await? else {
+            return Ok(None);
+        };
+
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        Ok(extra
+            .get("assistant_id")
+            .or_else(|| extra.get("preset_assistant_id"))
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())

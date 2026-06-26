@@ -56,8 +56,8 @@ async fn create_agent(app: &mut axum::Router, token: &str, csrf: &str, body: Val
     (status, json)
 }
 
-async fn list_agents(app: &mut axum::Router, token: &str) -> Value {
-    let req = get_with_token("/api/agents", token);
+async fn list_management_agents(app: &mut axum::Router, token: &str) -> Value {
+    let req = get_with_token("/api/agents/management", token);
     let resp = app.clone().oneshot(req).await.unwrap();
     body_json(resp).await
 }
@@ -98,11 +98,11 @@ async fn custom_agent_full_roundtrip() {
     assert_eq!(json["data"]["icon"], "🤖");
 
     // List — agent should be visible
-    let listed = list_agents(&mut app, &token).await;
+    let listed = list_management_agents(&mut app, &token).await;
     let agents = listed["data"].as_array().expect("array");
     assert!(
         agents.iter().any(|a| a["id"] == id),
-        "newly created agent should appear in GET /api/agents"
+        "newly created agent should appear in GET /api/agents/management"
     );
 
     // Update — keep "sh" so the row stays available after rehydrate.
@@ -164,11 +164,11 @@ async fn custom_agent_full_roundtrip() {
     assert_eq!(json["data"]["deleted"], true);
 
     // Post-delete list must not contain the id
-    let listed = list_agents(&mut app, &token).await;
+    let listed = list_management_agents(&mut app, &token).await;
     let agents = listed["data"].as_array().unwrap();
     assert!(
         agents.iter().all(|a| a["id"] != id),
-        "deleted agent should disappear from GET /api/agents"
+        "deleted agent should disappear from GET /api/agents/management"
     );
 
     unsafe {
@@ -356,7 +356,7 @@ async fn test_on_save_cli_not_found_blocks_upsert() {
     );
 
     // DB must not have the row.
-    let listed = list_agents(&mut app, &token).await;
+    let listed = list_management_agents(&mut app, &token).await;
     let agents = listed["data"].as_array().unwrap();
     assert!(
         agents.iter().all(|a| a["name"] != "bad"),

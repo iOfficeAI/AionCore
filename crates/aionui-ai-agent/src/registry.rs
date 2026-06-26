@@ -17,14 +17,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_api_types::{AgentEnvEntry, AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};
+use aionui_api_types::{
+    AgentEnvEntry, AgentHandshake, AgentManagementRow, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind,
+    AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy,
+};
 use aionui_common::AgentType;
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
 use aionui_runtime::{
     ManagedAcpToolId, RuntimeCommandProbe, probe_managed_acp_tool_supported, probe_node_runtime_supported,
     probe_runtime_command, resolve_command_path,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
@@ -236,12 +239,12 @@ impl AgentRegistry {
         rows
     }
 
-    /// Snapshot of every row the caller is expected to see — rows
-    /// that are user-disabled (`enabled = 0`) or whose spawn command
-    /// could not be located on `$PATH` (`available = false`) are
-    /// filtered out. `/api/agents` feeds the frontend pill bar, which
-    /// would otherwise render unusable vendor chips that fail the
-    /// moment the user tries to spawn them.
+    /// Snapshot of every visible row — rows that are user-disabled
+    /// (`enabled = 0`) or whose spawn command could not be located on
+    /// `$PATH` (`available = false`) are filtered out. Callers that
+    /// still need a legacy "available agents only" read model (for
+    /// example refresh responses) should use this rather than the
+    /// diagnostics-first management list.
     pub async fn list_all(&self) -> Vec<AgentMetadata> {
         let mut rows: Vec<AgentMetadata> = self
             .by_id
@@ -261,6 +264,63 @@ impl AgentRegistry {
     /// [`Self::list_all`].
     pub async fn list_all_including_hidden(&self) -> Vec<AgentMetadata> {
         let mut rows: Vec<AgentMetadata> = self.by_id.read().await.values().cloned().collect();
+        rows.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)));
+        rows
+    }
+
+    /// Management read model for settings surfaces that need to show
+    /// official/custom rows even when unavailable.
+    pub async fn list_management_rows(&self) -> Vec<AgentManagementRow> {
+        let mut rows: Vec<AgentManagementRow> = self
+            .by_id
+            .read()
+            .await
+            .values()
+            .cloned()
+            .map(|meta| {
+                let status = derive_management_status(&meta);
+                let diagnostics = derive_management_diagnostics(&meta, status);
+                let handshake = meta.handshake;
+                AgentManagementRow {
+                    id: meta.id,
+                    icon: meta.icon,
+                    name: meta.name,
+                    name_i18n: meta.name_i18n,
+                    description: meta.description,
+                    description_i18n: meta.description_i18n,
+                    backend: meta.backend,
+                    agent_type: meta.agent_type,
+                    agent_source: meta.agent_source,
+                    agent_source_info: meta.agent_source_info,
+                    enabled: meta.enabled,
+                    installed: meta.available,
+                    command: meta.command,
+                    args: meta.args,
+                    env: Vec::new(),
+                    native_skills_dirs: meta.native_skills_dirs,
+                    behavior_policy: meta.behavior_policy,
+                    yolo_id: meta.yolo_id,
+                    config_options: handshake.config_options.clone(),
+                    available_modes: handshake.available_modes.clone(),
+                    available_models: handshake.available_models.clone(),
+                    sort_order: meta.sort_order,
+                    team_capable: meta.team_capable,
+                    status,
+                    last_check_status: meta.last_check_status,
+                    last_check_kind: meta.last_check_kind,
+                    last_check_error_code: diagnostics.error_code,
+                    last_check_error_message: diagnostics.error_message,
+                    last_check_error_details: diagnostics.details,
+                    last_check_guidance: diagnostics.guidance,
+                    last_check_latency_ms: meta.last_check_latency_ms,
+                    last_check_at: meta.last_check_at,
+                    last_success_at: meta.last_success_at,
+                    last_failure_at: meta.last_failure_at,
+                    has_command_override: meta.has_command_override,
+                    env_override_key_count: meta.env_override_key_count,
+                }
+            })
+            .collect();
         rows.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)));
         rows
     }
@@ -304,12 +364,30 @@ impl AgentRegistry {
     }
 }
 
-/// A catalog row is visible to callers when the user has it enabled
-/// and the spawn command was resolved at hydrate/refresh time. The
-/// second check is what keeps uninstalled CLIs (e.g. `cursor` when
-/// only `claude` is on PATH) off the pill bar.
+/// A catalog row is visible when the user has it enabled, the spawn
+/// command was resolved at hydrate/refresh time, and the latest known
+/// availability snapshot does not already mark it unavailable. This
+/// keeps both uninstalled CLIs and rows that most recently failed
+/// ACP/session admission out of visible legacy catalog reads.
 fn is_visible(meta: &AgentMetadata) -> bool {
-    meta.enabled && meta.available
+    meta.enabled && matches!(derive_management_status(meta), AgentManagementStatus::Online)
+}
+
+/// Extract and trim a command override, filtering out empty strings.
+fn meta_command_override(raw: &Option<String>) -> Option<String> {
+    raw.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// Parse env_override JSON string into a vector of AgentEnvEntry.
+fn parse_env_override(raw: &Option<String>) -> Option<Vec<AgentEnvEntry>> {
+    let s = raw.as_deref()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Vec<AgentEnvEntry>>(s).ok()
 }
 
 /// Turn a DB row into the public `AgentMetadata`, probing the command
@@ -318,6 +396,10 @@ fn is_visible(meta: &AgentMetadata) -> bool {
 /// uniform `(meta, reason)` line per agent without re-running the
 /// probe.
 fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<UnavailableReason>)> {
+    // Extract override fields before row is partially moved
+    let command_override_raw = row.command_override.clone();
+    let env_override_raw = row.env_override.clone();
+
     let agent_type = parse_agent_type(&row.agent_type)?;
     let agent_source = parse_agent_source(&row.agent_source)?;
     let agent_source_info = decode_json_field(row.agent_source_info.as_deref(), "agent_source_info")
@@ -363,8 +445,42 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
         yolo_id: row.yolo_id,
         sort_order: row.sort_order,
         team_capable,
+        last_check_status: parse_last_check_status(row.last_check_status.as_deref()),
+        last_check_kind: parse_last_check_kind(row.last_check_kind.as_deref()),
+        last_check_error_code: row.last_check_error_code,
+        last_check_error_message: row.last_check_error_message,
+        last_check_error_details: None,
+        last_check_guidance: row.last_check_guidance,
+        last_check_latency_ms: row.last_check_latency_ms,
+        last_check_at: row.last_check_at,
+        last_success_at: row.last_success_at,
+        last_failure_at: row.last_failure_at,
         handshake,
+        has_command_override: false,
+        env_override_key_count: 0,
     };
+
+    // ── Self-repair overrides ──────────────────────────────────────
+    // Layered on top of seed truth at this single projection point so both
+    // the runtime spawn (factory) and the probe (availability) observe the
+    // same merged command/env without either needing extra plumbing.
+    meta.has_command_override = meta_command_override(&command_override_raw).is_some();
+    meta.env_override_key_count = parse_env_override(&env_override_raw)
+        .map(|v| v.iter().filter(|e| !is_blocked_override_env_key(&e.name)).count())
+        .unwrap_or(0);
+
+    if let Some(path) = meta_command_override(&command_override_raw) {
+        meta.command = Some(path);
+    }
+    if let Some(extra) = parse_env_override(&env_override_raw) {
+        for entry in extra {
+            if is_blocked_override_env_key(&entry.name) {
+                tracing::warn!(key = %entry.name, "env override: blocked key skipped");
+                continue;
+            }
+            meta.env.push(entry);
+        }
+    }
 
     let (path, reason) = probe_with_reason(&meta);
     meta.resolved_command = path;
@@ -473,6 +589,202 @@ fn parse_agent_type(raw: &str) -> Option<AgentType> {
 
 fn parse_agent_source(raw: &str) -> Option<AgentSource> {
     serde_json::from_value(Value::String(raw.to_owned())).ok()
+}
+
+fn parse_last_check_status(raw: Option<&str>) -> Option<AgentSnapshotCheckStatus> {
+    raw.and_then(|value| match value {
+        "online" => Some(AgentSnapshotCheckStatus::Online),
+        "offline" => Some(AgentSnapshotCheckStatus::Offline),
+        _ => {
+            warn!(value, "agent_metadata: unknown last_check_status");
+            None
+        }
+    })
+}
+
+fn parse_last_check_kind(raw: Option<&str>) -> Option<AgentSnapshotCheckKind> {
+    raw.and_then(|value| match value {
+        "startup" => Some(AgentSnapshotCheckKind::Startup),
+        "scheduled" => Some(AgentSnapshotCheckKind::Scheduled),
+        "manual" => Some(AgentSnapshotCheckKind::Manual),
+        "session" => Some(AgentSnapshotCheckKind::Session),
+        _ => {
+            warn!(value, "agent_metadata: unknown last_check_kind");
+            None
+        }
+    })
+}
+
+fn derive_management_status(meta: &AgentMetadata) -> AgentManagementStatus {
+    if !meta.available {
+        return AgentManagementStatus::Missing;
+    }
+
+    match meta.last_check_status {
+        Some(AgentSnapshotCheckStatus::Offline) => AgentManagementStatus::Offline,
+        _ => AgentManagementStatus::Online,
+    }
+}
+
+struct ManagementDiagnostics {
+    error_code: Option<String>,
+    error_message: Option<String>,
+    details: Option<Value>,
+    guidance: Option<String>,
+}
+
+fn derive_management_diagnostics(meta: &AgentMetadata, status: AgentManagementStatus) -> ManagementDiagnostics {
+    let derived_reason = if matches!(status, AgentManagementStatus::Missing) {
+        probe_resolved_command(meta).err()
+    } else {
+        None
+    };
+
+    let error_code = meta
+        .last_check_error_code
+        .clone()
+        .or_else(|| derived_reason.as_ref().map(unavailable_reason_code));
+    let error_message = meta
+        .last_check_error_message
+        .clone()
+        .or_else(|| derived_reason.as_ref().map(|reason| reason.to_string()));
+    let details = derived_reason
+        .as_ref()
+        .and_then(diagnostic_details_for_unavailable_reason)
+        .or_else(|| {
+            error_code
+                .as_deref()
+                .and_then(|code| diagnostic_details_for_snapshot_code(meta, code))
+        });
+    let guidance = meta.last_check_guidance.clone().or_else(|| {
+        if let Some(reason) = derived_reason.as_ref() {
+            Some(guidance_for_unavailable_reason(reason))
+        } else {
+            error_code
+                .as_deref()
+                .map(guidance_for_snapshot_error_code)
+                .filter(|guidance| !guidance.is_empty())
+                .map(str::to_owned)
+        }
+    });
+
+    ManagementDiagnostics {
+        error_code,
+        error_message,
+        details,
+        guidance,
+    }
+}
+
+fn diagnostic_details_for_snapshot_code(meta: &AgentMetadata, error_code: &str) -> Option<Value> {
+    match error_code {
+        "command_not_found" => Some(json!({
+            "code": error_code,
+            "command": meta
+                .agent_source_info
+                .binary_name
+                .as_deref()
+                .or(meta.command.as_deref())
+                .unwrap_or("command"),
+        })),
+        "acp_init_failed" | "health_check_failed" | "session_send_failed" => Some(json!({
+            "code": error_code,
+            "agent_name": meta.name,
+            "backend": meta.backend,
+        })),
+        _ => Some(json!({ "code": error_code })),
+    }
+}
+
+fn diagnostic_details_for_unavailable_reason(reason: &UnavailableReason) -> Option<Value> {
+    match reason {
+        UnavailableReason::Disabled => Some(json!({ "code": "disabled" })),
+        UnavailableReason::NoCommand => Some(json!({ "code": "no_command" })),
+        UnavailableReason::BridgeMissing { bridge } => Some(json!({
+            "code": "bridge_missing",
+            "command": bridge,
+        })),
+        UnavailableReason::PrimaryMissing { binary } => Some(json!({
+            "code": "primary_missing",
+            "command": binary,
+        })),
+        UnavailableReason::CommandMissing { command } => Some(json!({
+            "code": "command_missing",
+            "command": command,
+        })),
+        UnavailableReason::ManagedRuntimeUnavailable { resource, .. } => Some(json!({
+            "code": "managed_runtime_unavailable",
+            "resource": resource,
+        })),
+    }
+}
+
+fn unavailable_reason_code(reason: &UnavailableReason) -> String {
+    match reason {
+        UnavailableReason::Disabled => "disabled",
+        UnavailableReason::NoCommand => "no_command",
+        UnavailableReason::BridgeMissing { .. } => "bridge_missing",
+        UnavailableReason::PrimaryMissing { .. } => "primary_missing",
+        UnavailableReason::CommandMissing { .. } => "command_missing",
+        UnavailableReason::ManagedRuntimeUnavailable { .. } => "managed_runtime_unavailable",
+    }
+    .to_owned()
+}
+
+fn guidance_for_unavailable_reason(reason: &UnavailableReason) -> String {
+    match reason {
+        UnavailableReason::Disabled => "Enable this agent to make it available again.".to_owned(),
+        UnavailableReason::NoCommand => {
+            "Configure a spawn command for this agent, then run Test Connection again.".to_owned()
+        }
+        UnavailableReason::BridgeMissing { bridge } => {
+            format!("Install `{bridge}` and make sure it is available on PATH, then run Test Connection again.")
+        }
+        UnavailableReason::PrimaryMissing { binary } => {
+            format!("Install `{binary}` and make sure it is available on PATH, then run Test Connection again.")
+        }
+        UnavailableReason::CommandMissing { command } => {
+            format!("Install `{command}` and make sure it is available on PATH, then run Test Connection again.")
+        }
+        UnavailableReason::ManagedRuntimeUnavailable { resource, .. } => {
+            format!("Repair or reinstall the managed `{resource}` runtime, then run Test Connection again.")
+        }
+    }
+}
+
+/// Keys a user-supplied env override must never set — they would corrupt the
+/// agent's runtime environment or AionUi-internal wiring. Case-insensitive.
+pub(crate) fn is_blocked_override_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    if upper.starts_with("AIONUI_") {
+        return true;
+    }
+    matches!(
+        upper.as_str(),
+        "HOME" | "PATH" | "USER" | "SHELL" | "TERM" | "CODEX_HOME"
+    )
+}
+
+pub(crate) fn guidance_for_snapshot_error_code(error_code: &str) -> &'static str {
+    match error_code {
+        "command_not_found" => {
+            "Install the required CLI and make sure it is available on PATH, then run Test Connection again."
+        }
+        "acp_init_failed" => {
+            "The CLI was found, but ACP initialization failed. Complete sign-in or setup in the CLI, then run Test Connection again."
+        }
+        "auth_required" => {
+            "The agent is reachable but requires sign-in. Log in via the CLI (or add the required API key under Environment Variables), then run Test Connection again."
+        }
+        "health_check_failed" => {
+            "Open the CLI once to finish any first-run setup or sign-in flow, then run Test Connection again."
+        }
+        "session_send_failed" => {
+            "Fix the provider credentials or network issue that caused the last session failure, then start a new conversation."
+        }
+        "no_provider" => "Add and enable a model provider in Settings, then run Test Connection again.",
+        _ => "",
+    }
 }
 
 fn decode_json_field<T: serde::de::DeserializeOwned>(raw: Option<&str>, field: &str) -> Option<T> {
@@ -914,5 +1226,122 @@ mod tests {
             refreshed.handshake.agent_capabilities,
             Some(serde_json::json!({"x": 1}))
         );
+    }
+
+    #[test]
+    fn blocked_override_env_keys() {
+        for k in [
+            "HOME",
+            "PATH",
+            "USER",
+            "SHELL",
+            "TERM",
+            "CODEX_HOME",
+            "AIONUI_FOO",
+            "aionui_bar",
+            "path",
+        ] {
+            assert!(super::is_blocked_override_env_key(k), "{k} should be blocked");
+        }
+        for k in ["ANTHROPIC_API_KEY", "FACTORY_API_KEY", "MY_VAR"] {
+            assert!(!super::is_blocked_override_env_key(k), "{k} should be allowed");
+        }
+    }
+
+    #[test]
+    fn decode_row_applies_command_override() {
+        use aionui_db::AgentMetadataRow;
+        let row = AgentMetadataRow {
+            id: "test-agent".to_string(),
+            icon: None,
+            name: "Test Agent".to_string(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("test".to_string()),
+            agent_type: "acp".to_string(),
+            agent_source: "builtin".to_string(),
+            agent_source_info: None,
+            enabled: true,
+            command: Some("droid".to_string()),
+            command_override: Some("/opt/factory/bin/droid".to_string()),
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            env_override: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let (meta, _) = super::decode_row(row).expect("decodes");
+        assert_eq!(meta.command.as_deref(), Some("/opt/factory/bin/droid"));
+    }
+
+    #[test]
+    fn decode_row_appends_env_override_and_skips_blocked() {
+        use aionui_db::AgentMetadataRow;
+        let row = AgentMetadataRow {
+            id: "test-agent-2".to_string(),
+            icon: None,
+            name: "Test Agent 2".to_string(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("test".to_string()),
+            agent_type: "acp".to_string(),
+            agent_source: "builtin".to_string(),
+            agent_source_info: None,
+            enabled: true,
+            command: Some("test-cmd".to_string()),
+            command_override: None,
+            args: None,
+            env: Some(r#"[{"name":"BASE","value":"seed","description":""}]"#.to_string()),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            env_override: Some(
+                r#"[{"name":"ANTHROPIC_API_KEY","value":"sk-x","description":""},{"name":"PATH","value":"/evil","description":""}]"#.to_string(),
+            ),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let (meta, _) = super::decode_row(row).expect("decodes");
+        let names: Vec<&str> = meta.env.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"BASE"));
+        assert!(names.contains(&"ANTHROPIC_API_KEY"));
+        assert!(!names.contains(&"PATH"), "blocked key must be skipped");
     }
 }

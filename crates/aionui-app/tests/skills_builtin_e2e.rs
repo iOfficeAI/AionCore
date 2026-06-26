@@ -1,6 +1,6 @@
 //! HTTP integration tests for the built-in skills migration surface:
-//! `/api/skills/builtin-auto`, `/api/skills/builtin-skill`, `/api/skills`,
-//! and the symlink-contract `/api/skills/materialize-for-agent` (POST).
+//! `/api/skills/builtin-skill`, `/api/skills`, and the symlink-contract
+//! `/api/skills/materialize-for-agent` (POST).
 //!
 //! Covers the spec's §9.2 scenarios end-to-end through
 //! `aionui_app::create_router_with_states` against an in-memory DB.
@@ -73,11 +73,16 @@ async fn fixture_embedded() -> Fixture {
         assistant_skills_dir: data_dir.join("assistant-skills"),
     };
     let ext_paths_mgr = Arc::new(ExternalPathsManager::with_file(data_dir.join("paths.json")).await);
+    let skill_repo = Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone()));
     states.skill = SkillRouterState {
         skill_paths,
+        skill_repo: skill_repo.clone(),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: states.skill.assistant_dispatcher.clone(),
     };
+    aionui_extension::sync_skill_catalog_into_repo(&states.skill.skill_paths, skill_repo.as_ref())
+        .await
+        .expect("sync embedded builtin skill catalog");
 
     let mut app = create_router_with_states(&services, states);
     let (token, csrf) = setup_and_login(&mut app, &services, "builtin-e2e", "StrongP@ss1").await;
@@ -91,28 +96,18 @@ async fn fixture_embedded() -> Fixture {
     }
 }
 
-fn write_user_skill(dir: &std::path::Path, name: &str, desc: &str) {
-    let skill_dir = dir.join("skills").join(name);
-    std::fs::create_dir_all(&skill_dir).unwrap();
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
-        format!("---\nname: {name}\ndescription: {desc}\n---\nBody for {name}."),
-    )
-    .unwrap();
-}
-
 // ===========================================================================
-// GET /api/skills/builtin-auto — embedded corpus
+// GET /api/skills — embedded corpus
 // ===========================================================================
 
 #[tokio::test]
-async fn builtin_auto_lists_entries_from_embedded_corpus() {
+async fn unified_skill_list_includes_auto_inject_entries_from_embedded_corpus() {
     let fx = fixture_embedded().await;
 
     let resp = fx
         .app
         .clone()
-        .oneshot(get_with_token("/api/skills/builtin-auto", &fx.token))
+        .oneshot(get_with_token("/api/skills", &fx.token))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -120,16 +115,29 @@ async fn builtin_auto_lists_entries_from_embedded_corpus() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let arr = json["data"].as_array().unwrap();
-    assert!(arr.len() >= 3, "expected ≥3 auto-inject entries, got {}", arr.len());
-    let names: Vec<&str> = arr.iter().filter_map(|item| item["name"].as_str()).collect();
+    let auto_items: Vec<&Value> = arr
+        .iter()
+        .filter(|item| {
+            item["source"] == "builtin"
+                && item["relative_location"]
+                    .as_str()
+                    .is_some_and(|location| location.starts_with("auto-inject/"))
+        })
+        .collect();
+    assert!(
+        auto_items.len() >= 3,
+        "expected ≥3 auto-inject entries, got {}",
+        auto_items.len()
+    );
+    let names: Vec<&str> = auto_items.iter().filter_map(|item| item["name"].as_str()).collect();
     assert!(
         !names.contains(&"aionui-skills"),
         "aionui-skills should not be shipped as an auto-inject builtin skill: {names:?}",
     );
-    for item in arr {
+    for item in auto_items {
         assert!(item["name"].is_string());
         assert!(item["description"].is_string());
-        let loc = item["location"].as_str().unwrap();
+        let loc = item["relative_location"].as_str().unwrap();
         assert!(loc.starts_with("auto-inject/"), "location={loc}");
         assert!(loc.ends_with("/SKILL.md"));
     }
@@ -241,7 +249,26 @@ async fn list_skills_builtin_entries_carry_relative_location() {
     let fx = fixture_embedded().await;
 
     // Seed one user skill so the merge is non-trivial.
-    write_user_skill(&fx.data_dir, "my-custom", "Custom skill for test");
+    let source_dir = fx.data_dir.join("import-source").join("my-custom");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(
+        source_dir.join("SKILL.md"),
+        "---\nname: my-custom\ndescription: Custom skill for test\n---\nBody",
+    )
+    .unwrap();
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/import",
+            json!({ "skill_path": source_dir.to_str().unwrap() }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = fx
         .app
@@ -276,8 +303,15 @@ async fn list_skills_builtin_entries_carry_relative_location() {
             "custom" => {
                 saw_custom = true;
                 assert!(item.get("relative_location").is_none());
-                assert!(item.get("relative_location").is_none());
                 assert_eq!(item["name"], "my-custom");
+            }
+            "cron" => {
+                assert!(item.get("relative_location").is_none());
+                let loc = item["location"].as_str().unwrap();
+                assert!(
+                    loc.ends_with("/SKILL.md"),
+                    "cron skill location should point at SKILL.md: {loc}"
+                );
             }
             other => panic!("unexpected source: {other}"),
         }
