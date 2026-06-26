@@ -3143,6 +3143,36 @@ async fn td_delete_team_stops_session() {
 // ===========================================================================
 
 #[tokio::test]
+async fn d9_create_team_auto_start_rebuilds_every_initial_agent() {
+    let (svc, tm) = setup_with_factory(success_factory());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let calls = tm.snapshot();
+    assert_eq!(
+        calls.kill.len(),
+        2,
+        "auto-start should kill every initial agent before rebuild"
+    );
+    assert_eq!(calls.build.len(), 2, "auto-start should warm every initial agent");
+    for (i, agent) in created.agents.iter().enumerate() {
+        assert_eq!(calls.kill[i].0, agent.conversation_id);
+        assert_eq!(calls.kill[i].1, Some(AgentKillReason::TeamMcpRebuild));
+        assert_eq!(calls.build[i], agent.conversation_id);
+    }
+    assert_eq!(tm.active_count(), 2, "auto-start must register every initial agent");
+}
+
+#[tokio::test]
 async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
     let (svc, tm) = setup_with_factory(success_factory());
     let created = svc

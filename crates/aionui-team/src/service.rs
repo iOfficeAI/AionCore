@@ -23,7 +23,7 @@ use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::session::{AgentMessageQueueResult, TeamSession};
-use crate::types::{Team, TeamAgent, TeammateRole};
+use crate::types::{Team, TeamAgent};
 use crate::wake::TeamWakeSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -131,7 +131,7 @@ impl TeamSessionService {
             }
         };
         for team in &teams {
-            if let Err(e) = self.ensure_session_inner(&team.id, false).await {
+            if let Err(e) = self.ensure_session_inner(&team.id).await {
                 tracing::warn!(team_id = %team.id, error = %e, "failed to restore session on startup");
                 continue;
             }
@@ -214,7 +214,7 @@ impl TeamSessionService {
         // Auto-start session so MCP is injected immediately after team creation.
         // Failure only logs — the team is persisted and frontend can retry
         // via POST /api/teams/{id}/session if needed.
-        if let Err(e) = self.ensure_session_inner(&team.id, true).await {
+        if let Err(e) = self.ensure_session_inner(&team.id).await {
             warn!(team_id = %team.id, error = %e, "auto ensure_session after create_team failed");
         }
 
@@ -428,17 +428,17 @@ impl TeamSessionService {
     pub async fn ensure_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
         let row = match self.repo.get_team(team_id).await {
             Ok(Some(row)) => row,
-            Ok(None) | Err(_) => return self.ensure_session_inner(team_id, false).await,
+            Ok(None) | Err(_) => return self.ensure_session_inner(team_id).await,
         };
         if row.user_id != user_id {
             return Err(TeamError::Forbidden(format!(
                 "team {team_id} is not owned by current user"
             )));
         }
-        self.ensure_session_inner(team_id, false).await
+        self.ensure_session_inner(team_id).await
     }
 
-    async fn ensure_session_inner(&self, team_id: &str, skip_leader: bool) -> Result<(), TeamError> {
+    async fn ensure_session_inner(&self, team_id: &str) -> Result<(), TeamError> {
         if self.sessions.contains_key(team_id) {
             return Ok(());
         }
@@ -500,7 +500,7 @@ impl TeamSessionService {
         self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionInjecting, None, |_| {});
 
         if let Err(e) = self
-            .rebuild_agent_processes(team_id, &session, &user_id, &agents_snapshot, skip_leader)
+            .rebuild_agent_processes(team_id, &session, &user_id, &agents_snapshot)
             .await
         {
             session.stop();
@@ -527,13 +527,8 @@ impl TeamSessionService {
             );
         }
 
-        let active_count = if skip_leader {
-            agents_snapshot.iter().filter(|a| a.role != TeammateRole::Lead).count()
-        } else {
-            agents_snapshot.len()
-        };
         self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionReady, None, |p| {
-            p.server_count = Some(active_count);
+            p.server_count = Some(agents_snapshot.len());
         });
 
         Ok(())
@@ -611,26 +606,10 @@ impl TeamSessionService {
         session: &TeamSession,
         user_id: &str,
         agents: &[TeamAgent],
-        skip_leader: bool,
     ) -> Result<(), TeamError> {
         let provisioner = self.provisioner();
         for agent in agents {
             let cfg = session.mcp_stdio_config(&agent.slot_id);
-
-            // Always persist team_mcp_stdio_config into the leader's extra
-            // so subsequent warmups pick it up. Only skip the kill+warmup
-            // when the leader is already running (guide flow).
-            if skip_leader && agent.role == TeammateRole::Lead {
-                if let Err(e) = provisioner.write_team_mcp_runtime_config(agent, cfg).await {
-                    warn!(
-                        team_id,
-                        slot_id = %agent.slot_id,
-                        error = %e,
-                        "failed to persist team_mcp_stdio_config for skipped leader"
-                    );
-                }
-                continue;
-            }
 
             if let Err(e) = provisioner
                 .attach_agent_process(user_id, agent, cfg, &self.task_manager)
@@ -739,7 +718,7 @@ impl TeamSessionService {
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id, false).await?;
+        self.ensure_session_inner(team_id).await?;
         let session = {
             let entry = self
                 .sessions
@@ -759,7 +738,7 @@ impl TeamSessionService {
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id, false).await?;
+        self.ensure_session_inner(team_id).await?;
         let session = {
             let entry = self
                 .sessions
@@ -779,7 +758,7 @@ impl TeamSessionService {
         reason: Option<String>,
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id, false).await?;
+        self.ensure_session_inner(team_id).await?;
         let session = {
             let entry = self
                 .sessions
@@ -799,7 +778,7 @@ impl TeamSessionService {
         reason: Option<String>,
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id, false).await?;
+        self.ensure_session_inner(team_id).await?;
         let session = {
             let entry = self
                 .sessions
@@ -819,7 +798,7 @@ impl TeamSessionService {
         reason: Option<String>,
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id, false).await?;
+        self.ensure_session_inner(team_id).await?;
         let session = {
             let entry = self
                 .sessions
