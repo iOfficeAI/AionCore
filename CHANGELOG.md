@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.38](https://github.com/iOfficeAI/AionCore/compare/v0.1.37...v0.1.38) (2026-06-26)
+
+
+### Features
+
+* remove single-chat team upgrade path ([#524](https://github.com/iOfficeAI/AionCore/issues/524)) ([5c60df3](https://github.com/iOfficeAI/AionCore/commit/5c60df38473b5a566e4f3598f6a36dfb63f52bab))
+
+
+### Bug Fixes
+
+* **agent:** expose runtime catalogs from metadata ([#523](https://github.com/iOfficeAI/AionCore/issues/523)) ([d9c2502](https://github.com/iOfficeAI/AionCore/commit/d9c2502e499a6794476fcdbe63a14573b4fa81d0))
+* **assistant:** expose auto-inject skills and preserve assistant rules ([#525](https://github.com/iOfficeAI/AionCore/issues/525)) ([f2e91fd](https://github.com/iOfficeAI/AionCore/commit/f2e91fde95ef3a84e43fbe22d71960d64686d3b0))
+* repair invalid UTF-8 agent metadata cache fields ([#526](https://github.com/iOfficeAI/AionCore/issues/526)) ([91969cd](https://github.com/iOfficeAI/AionCore/commit/91969cd765dbecf962ba3c986eb271dfc8208c0b))
+* **skills:** sync AionUi Butler skills + rule with current backend ([#520](https://github.com/iOfficeAI/AionCore/issues/520)) ([5603b9a](https://github.com/iOfficeAI/AionCore/commit/5603b9a77857b08d99d45c02eeeeb4d6d1e1e98a))
+
 ## [0.1.37](https://github.com/iOfficeAI/AionCore/compare/v0.1.36...v0.1.37) (2026-06-25)
 
 
