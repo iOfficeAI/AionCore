@@ -2,6 +2,7 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::AgentMetadataRow;
+use crate::repository::{IAgentMetadataRepository, SqliteAgentMetadataRepository};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentBindingResolution {
@@ -52,9 +53,8 @@ pub fn resolve_agent_binding_from_rows(rows: &[AgentMetadataRow], value: &str) -
 }
 
 pub async fn resolve_agent_binding(pool: &SqlitePool, value: &str) -> Result<Option<AgentBindingResolution>, DbError> {
-    let rows = sqlx::query_as::<_, AgentMetadataRow>("SELECT * FROM agent_metadata")
-        .fetch_all(pool)
-        .await?;
+    let repo = SqliteAgentMetadataRepository::new(pool.clone());
+    let rows = repo.list_all().await?;
     Ok(resolve_agent_binding_from_rows(&rows, value))
 }
 
@@ -65,4 +65,28 @@ fn agent_match_rank(row: &AgentMetadataRow) -> (i32, i64, &str) {
         _ => 2,
     };
     (source_rank, row.sort_order, row.name.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::init_database_memory;
+
+    #[tokio::test]
+    async fn resolve_agent_binding_uses_safe_agent_metadata_reads() {
+        let db = init_database_memory().await.unwrap();
+        sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE id = ?")
+            .bind("2d23ff1c")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let binding = resolve_agent_binding(db.pool(), "claude")
+            .await
+            .unwrap()
+            .expect("claude backend resolves");
+
+        assert_eq!(binding.agent_id, "2d23ff1c");
+        assert_eq!(binding.runtime_backend, "claude");
+    }
 }

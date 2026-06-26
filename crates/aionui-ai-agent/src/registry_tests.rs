@@ -173,7 +173,7 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
         name_i18n: None,
         description: None,
         description_i18n: None,
-        backend: Some("custom".into()),
+        backend: Some("custom"),
         agent_type: "acp",
         agent_source: "custom",
         agent_source_info: Some(r#"{"binary_name":"definitely-missing-cli"}"#),
@@ -222,4 +222,46 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
         row_json["last_check_error_details"]["command"].as_str(),
         Some("definitely-missing-cli")
     );
+}
+
+#[tokio::test]
+async fn hydrate_continues_when_agent_metadata_config_options_has_invalid_utf8() {
+    let db = init_database_memory().await.unwrap();
+    sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE id = ?")
+        .bind("2d23ff1c")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let registry = AgentRegistry::new(repo.clone());
+
+    registry.hydrate().await.unwrap();
+
+    let claude = registry.get("2d23ff1c").await.expect("row remains in registry");
+    assert_eq!(claude.name, "Claude Code");
+    assert!(claude.handshake.config_options.is_none());
+    let repaired = repo.get("2d23ff1c").await.unwrap().expect("row remains in database");
+    assert!(repaired.config_options.is_none());
+}
+
+#[tokio::test]
+async fn hydrate_keeps_valid_utf8_invalid_json_config_options_non_fatal() {
+    let db = init_database_memory().await.unwrap();
+    sqlx::query("UPDATE agent_metadata SET config_options = ? WHERE id = ?")
+        .bind("not json")
+        .bind("2d23ff1c")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let registry = AgentRegistry::new(repo.clone());
+
+    registry.hydrate().await.unwrap();
+
+    let claude = registry.get("2d23ff1c").await.expect("row remains in registry");
+    assert!(claude.handshake.config_options.is_none());
+    let persisted = repo.get("2d23ff1c").await.unwrap().expect("row remains in database");
+    assert_eq!(persisted.config_options.as_deref(), Some("not json"));
 }

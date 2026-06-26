@@ -919,7 +919,6 @@ mod tests {
                 enabled: false,
                 sort_order: 5,
                 last_used_at: Some(1000),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -937,7 +936,6 @@ mod tests {
             enabled: true,
             sort_order: 0,
             last_used_at: Some(1000),
-            ..Default::default()
         })
         .await
         .unwrap();
@@ -948,7 +946,6 @@ mod tests {
                 enabled: false,
                 sort_order: 3,
                 last_used_at: None,
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -967,7 +964,6 @@ mod tests {
             enabled: true,
             sort_order: 0,
             last_used_at: None,
-            ..Default::default()
         })
         .await
         .unwrap();
@@ -976,7 +972,6 @@ mod tests {
             enabled: false,
             sort_order: 1,
             last_used_at: None,
-            ..Default::default()
         })
         .await
         .unwrap();
@@ -993,7 +988,6 @@ mod tests {
             enabled: true,
             sort_order: 0,
             last_used_at: None,
-            ..Default::default()
         })
         .await
         .unwrap();
@@ -1010,7 +1004,6 @@ mod tests {
                 enabled: true,
                 sort_order: 0,
                 last_used_at: None,
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -1031,7 +1024,6 @@ mod tests {
             enabled: true,
             sort_order: 0,
             last_used_at: None,
-            ..Default::default()
         })
         .await
         .unwrap();

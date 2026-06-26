@@ -1,7 +1,8 @@
 //! SQLite-backed agent metadata repository.
 
 use aionui_common::now_ms;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
+use tracing::warn;
 
 use crate::error::DbError;
 use crate::models::{
@@ -14,28 +15,316 @@ pub struct SqliteAgentMetadataRepository {
     pool: SqlitePool,
 }
 
+const AGENT_METADATA_SAFE_COLUMNS: &str = "\
+    id, icon, name, name_i18n, description, description_i18n, \
+    backend, agent_type, agent_source, agent_source_info, \
+    enabled, command, args, env, native_skills_dirs, \
+    behavior_policy, yolo_id, \
+    CAST(agent_capabilities AS BLOB) AS agent_capabilities, \
+    CAST(auth_methods AS BLOB) AS auth_methods, \
+    CAST(config_options AS BLOB) AS config_options, \
+    CAST(available_modes AS BLOB) AS available_modes, \
+    CAST(available_models AS BLOB) AS available_models, \
+    CAST(available_commands AS BLOB) AS available_commands, \
+    sort_order, \
+    last_check_status, last_check_kind, last_check_error_code, last_check_error_message, \
+    last_check_guidance, last_check_latency_ms, last_check_at, last_success_at, last_failure_at, \
+    command_override, env_override, created_at, updated_at";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentMetadataCacheField {
+    AgentCapabilities,
+    AuthMethods,
+    ConfigOptions,
+    AvailableModes,
+    AvailableModels,
+    AvailableCommands,
+}
+
+impl AgentMetadataCacheField {
+    fn column_name(self) -> &'static str {
+        match self {
+            Self::AgentCapabilities => "agent_capabilities",
+            Self::AuthMethods => "auth_methods",
+            Self::ConfigOptions => "config_options",
+            Self::AvailableModes => "available_modes",
+            Self::AvailableModels => "available_models",
+            Self::AvailableCommands => "available_commands",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AgentMetadataSafeRow {
+    id: String,
+    icon: Option<String>,
+    name: String,
+    name_i18n: Option<String>,
+    description: Option<String>,
+    description_i18n: Option<String>,
+    backend: Option<String>,
+    agent_type: String,
+    agent_source: String,
+    agent_source_info: Option<String>,
+    enabled: bool,
+    command: Option<String>,
+    args: Option<String>,
+    env: Option<String>,
+    native_skills_dirs: Option<String>,
+    behavior_policy: Option<String>,
+    yolo_id: Option<String>,
+    agent_capabilities: Option<Vec<u8>>,
+    auth_methods: Option<Vec<u8>>,
+    config_options: Option<Vec<u8>>,
+    available_modes: Option<Vec<u8>>,
+    available_models: Option<Vec<u8>>,
+    available_commands: Option<Vec<u8>>,
+    sort_order: i64,
+    last_check_status: Option<String>,
+    last_check_kind: Option<String>,
+    last_check_error_code: Option<String>,
+    last_check_error_message: Option<String>,
+    last_check_guidance: Option<String>,
+    last_check_latency_ms: Option<i64>,
+    last_check_at: Option<aionui_common::TimestampMs>,
+    last_success_at: Option<aionui_common::TimestampMs>,
+    last_failure_at: Option<aionui_common::TimestampMs>,
+    command_override: Option<String>,
+    env_override: Option<String>,
+    created_at: aionui_common::TimestampMs,
+    updated_at: aionui_common::TimestampMs,
+}
+
+impl AgentMetadataSafeRow {
+    fn from_sqlite_row(row: SqliteRow) -> Result<Self, DbError> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            icon: row.try_get("icon")?,
+            name: row.try_get("name")?,
+            name_i18n: row.try_get("name_i18n")?,
+            description: row.try_get("description")?,
+            description_i18n: row.try_get("description_i18n")?,
+            backend: row.try_get("backend")?,
+            agent_type: row.try_get("agent_type")?,
+            agent_source: row.try_get("agent_source")?,
+            agent_source_info: row.try_get("agent_source_info")?,
+            enabled: row.try_get("enabled")?,
+            command: row.try_get("command")?,
+            args: row.try_get("args")?,
+            env: row.try_get("env")?,
+            native_skills_dirs: row.try_get("native_skills_dirs")?,
+            behavior_policy: row.try_get("behavior_policy")?,
+            yolo_id: row.try_get("yolo_id")?,
+            agent_capabilities: row.try_get("agent_capabilities")?,
+            auth_methods: row.try_get("auth_methods")?,
+            config_options: row.try_get("config_options")?,
+            available_modes: row.try_get("available_modes")?,
+            available_models: row.try_get("available_models")?,
+            available_commands: row.try_get("available_commands")?,
+            sort_order: row.try_get("sort_order")?,
+            last_check_status: row.try_get("last_check_status")?,
+            last_check_kind: row.try_get("last_check_kind")?,
+            last_check_error_code: row.try_get("last_check_error_code")?,
+            last_check_error_message: row.try_get("last_check_error_message")?,
+            last_check_guidance: row.try_get("last_check_guidance")?,
+            last_check_latency_ms: row.try_get("last_check_latency_ms")?,
+            last_check_at: row.try_get("last_check_at")?,
+            last_success_at: row.try_get("last_success_at")?,
+            last_failure_at: row.try_get("last_failure_at")?,
+            command_override: row.try_get("command_override")?,
+            env_override: row.try_get("env_override")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+
+    fn into_model(self) -> (AgentMetadataRow, Vec<AgentMetadataCacheField>) {
+        let mut invalid_fields = Vec::new();
+        let agent_capabilities = decode_cache_field(
+            self.agent_capabilities,
+            AgentMetadataCacheField::AgentCapabilities,
+            &mut invalid_fields,
+        );
+        let auth_methods = decode_cache_field(
+            self.auth_methods,
+            AgentMetadataCacheField::AuthMethods,
+            &mut invalid_fields,
+        );
+        let config_options = decode_cache_field(
+            self.config_options,
+            AgentMetadataCacheField::ConfigOptions,
+            &mut invalid_fields,
+        );
+        let available_modes = decode_cache_field(
+            self.available_modes,
+            AgentMetadataCacheField::AvailableModes,
+            &mut invalid_fields,
+        );
+        let available_models = decode_cache_field(
+            self.available_models,
+            AgentMetadataCacheField::AvailableModels,
+            &mut invalid_fields,
+        );
+        let available_commands = decode_cache_field(
+            self.available_commands,
+            AgentMetadataCacheField::AvailableCommands,
+            &mut invalid_fields,
+        );
+
+        (
+            AgentMetadataRow {
+                id: self.id,
+                icon: self.icon,
+                name: self.name,
+                name_i18n: self.name_i18n,
+                description: self.description,
+                description_i18n: self.description_i18n,
+                backend: self.backend,
+                agent_type: self.agent_type,
+                agent_source: self.agent_source,
+                agent_source_info: self.agent_source_info,
+                enabled: self.enabled,
+                command: self.command,
+                args: self.args,
+                env: self.env,
+                native_skills_dirs: self.native_skills_dirs,
+                behavior_policy: self.behavior_policy,
+                yolo_id: self.yolo_id,
+                agent_capabilities,
+                auth_methods,
+                config_options,
+                available_modes,
+                available_models,
+                available_commands,
+                sort_order: self.sort_order,
+                last_check_status: self.last_check_status,
+                last_check_kind: self.last_check_kind,
+                last_check_error_code: self.last_check_error_code,
+                last_check_error_message: self.last_check_error_message,
+                last_check_guidance: self.last_check_guidance,
+                last_check_latency_ms: self.last_check_latency_ms,
+                last_check_at: self.last_check_at,
+                last_success_at: self.last_success_at,
+                last_failure_at: self.last_failure_at,
+                command_override: self.command_override,
+                env_override: self.env_override,
+                created_at: self.created_at,
+                updated_at: self.updated_at,
+            },
+            invalid_fields,
+        )
+    }
+}
+
+fn decode_cache_field(
+    value: Option<Vec<u8>>,
+    field: AgentMetadataCacheField,
+    invalid_fields: &mut Vec<AgentMetadataCacheField>,
+) -> Option<String> {
+    let bytes = value?;
+    match String::from_utf8(bytes) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            invalid_fields.push(field);
+            None
+        }
+    }
+}
+
 impl SqliteAgentMetadataRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    async fn fetch_all_safe(&self, sql: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
+        let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
+        let mut decoded = Vec::with_capacity(rows.len());
+        for row in rows {
+            decoded.push(self.decode_and_repair(row).await?);
+        }
+        Ok(decoded)
+    }
+
+    async fn fetch_optional_safe(&self, sql: &str, bind: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        let row = sqlx::query(sql).bind(bind).fetch_optional(&self.pool).await?;
+        match row {
+            Some(row) => Ok(Some(self.decode_and_repair(row).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn fetch_optional_safe_two_binds(
+        &self,
+        sql: &str,
+        first: &str,
+        second: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        let row = sqlx::query(sql)
+            .bind(first)
+            .bind(second)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => Ok(Some(self.decode_and_repair(row).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn decode_and_repair(&self, row: SqliteRow) -> Result<AgentMetadataRow, DbError> {
+        let safe = AgentMetadataSafeRow::from_sqlite_row(row)?;
+        let (model, invalid_fields) = safe.into_model();
+        if !invalid_fields.is_empty() {
+            self.clear_invalid_utf8_cache_fields(&model.id, &invalid_fields).await;
+        }
+        Ok(model)
+    }
+
+    async fn clear_invalid_utf8_cache_fields(&self, id: &str, fields: &[AgentMetadataCacheField]) {
+        for field in fields {
+            warn!(
+                table = "agent_metadata",
+                row_id = %id,
+                field = field.column_name(),
+                action = "clear_invalid_utf8",
+                "Clearing invalid UTF-8 from rebuildable agent metadata cache field"
+            );
+        }
+
+        for field in fields {
+            let sql = format!(
+                "UPDATE agent_metadata SET {} = NULL, updated_at = ? WHERE id = ?",
+                field.column_name()
+            );
+
+            if let Err(err) = sqlx::query(&sql).bind(now_ms()).bind(id).execute(&self.pool).await {
+                warn!(
+                    table = "agent_metadata",
+                    row_id = %id,
+                    field = field.column_name(),
+                    action = "clear_invalid_utf8_failed",
+                    error = %err,
+                    "Failed to persist invalid UTF-8 cache-field repair"
+                );
+            }
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
-        let rows =
-            sqlx::query_as::<_, AgentMetadataRow>("SELECT * FROM agent_metadata ORDER BY sort_order ASC, name ASC")
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows)
+        self.fetch_all_safe(&format!(
+            "SELECT {AGENT_METADATA_SAFE_COLUMNS} FROM agent_metadata ORDER BY sort_order ASC, name ASC"
+        ))
+        .await
     }
 
     async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
-        let row = sqlx::query_as::<_, AgentMetadataRow>("SELECT * FROM agent_metadata WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row)
+        self.fetch_optional_safe(
+            &format!("SELECT {AGENT_METADATA_SAFE_COLUMNS} FROM agent_metadata WHERE id = ?"),
+            id,
+        )
+        .await
     }
 
     async fn find_by_source_and_name(
@@ -43,25 +332,24 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         agent_source: &str,
         name: &str,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
-        let row =
-            sqlx::query_as::<_, AgentMetadataRow>("SELECT * FROM agent_metadata WHERE agent_source = ? AND name = ?")
-                .bind(agent_source)
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row)
+        self.fetch_optional_safe_two_binds(
+            &format!("SELECT {AGENT_METADATA_SAFE_COLUMNS} FROM agent_metadata WHERE agent_source = ? AND name = ?"),
+            agent_source,
+            name,
+        )
+        .await
     }
 
     async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
-        let row = sqlx::query_as::<_, AgentMetadataRow>(
-            "SELECT * FROM agent_metadata \
-             WHERE agent_source = 'builtin' AND backend = ? \
-             ORDER BY sort_order ASC, name ASC LIMIT 1",
+        self.fetch_optional_safe(
+            &format!(
+                "SELECT {AGENT_METADATA_SAFE_COLUMNS} FROM agent_metadata \
+                 WHERE agent_source = 'builtin' AND backend = ? \
+                 ORDER BY sort_order ASC, name ASC LIMIT 1"
+            ),
+            backend,
         )
-        .bind(backend)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row)
+        .await
     }
 
     async fn upsert(&self, params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
@@ -285,6 +573,44 @@ mod tests {
         (repo, db)
     }
 
+    async fn corrupt_cache_field(db: &crate::Database, id: &str, field: &str, bytes_hex: &str) {
+        assert!(
+            matches!(
+                field,
+                "agent_capabilities"
+                    | "auth_methods"
+                    | "config_options"
+                    | "available_modes"
+                    | "available_models"
+                    | "available_commands"
+            ),
+            "test helper only corrupts rebuildable handshake/cache fields"
+        );
+        let sql = format!("UPDATE agent_metadata SET {field} = CAST(x'{bytes_hex}' AS TEXT) WHERE id = ?");
+        sqlx::query(&sql).bind(id).execute(db.pool()).await.unwrap();
+    }
+
+    async fn cache_field_blob(db: &crate::Database, id: &str, field: &str) -> Option<Vec<u8>> {
+        assert!(
+            matches!(
+                field,
+                "agent_capabilities"
+                    | "auth_methods"
+                    | "config_options"
+                    | "available_modes"
+                    | "available_models"
+                    | "available_commands"
+            ),
+            "test helper only reads rebuildable handshake/cache fields"
+        );
+        let sql = format!("SELECT CAST({field} AS BLOB) FROM agent_metadata WHERE id = ?");
+        sqlx::query_scalar::<_, Option<Vec<u8>>>(&sql)
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
     fn custom_params<'a>(id: &'a str, name: &'a str) -> UpsertAgentMetadataParams<'a> {
         UpsertAgentMetadataParams {
             id,
@@ -343,6 +669,60 @@ mod tests {
             .find(|r| r.name == "Hermes" && r.agent_source == "builtin")
             .expect("seeded hermes row");
         assert_eq!(hermes.yolo_id, None);
+    }
+
+    #[tokio::test]
+    async fn list_all_clears_invalid_utf8_cache_field_and_keeps_row() {
+        let (repo, db) = setup().await;
+        corrupt_cache_field(&db, "2d23ff1c", "config_options", "FF").await;
+
+        let rows = repo.list_all().await.unwrap();
+        let claude = rows
+            .iter()
+            .find(|row| row.id == "2d23ff1c")
+            .expect("corrupted cache field must not remove the row");
+
+        assert!(claude.config_options.is_none());
+        assert_eq!(claude.name, "Claude Code");
+        assert_eq!(cache_field_blob(&db, "2d23ff1c", "config_options").await, None);
+    }
+
+    #[tokio::test]
+    async fn get_clears_invalid_utf8_from_all_rebuildable_cache_fields() {
+        let (repo, db) = setup().await;
+        for field in [
+            "agent_capabilities",
+            "auth_methods",
+            "config_options",
+            "available_modes",
+            "available_models",
+            "available_commands",
+        ] {
+            corrupt_cache_field(&db, "2d23ff1c", field, "C3").await;
+        }
+
+        let row = repo.get("2d23ff1c").await.unwrap().expect("seed row");
+
+        assert!(row.agent_capabilities.is_none());
+        assert!(row.auth_methods.is_none());
+        assert!(row.config_options.is_none());
+        assert!(row.available_modes.is_none());
+        assert!(row.available_models.is_none());
+        assert!(row.available_commands.is_none());
+        for field in [
+            "agent_capabilities",
+            "auth_methods",
+            "config_options",
+            "available_modes",
+            "available_models",
+            "available_commands",
+        ] {
+            assert_eq!(
+                cache_field_blob(&db, "2d23ff1c", field).await,
+                None,
+                "{field} should be cleared"
+            );
+        }
     }
 
     #[tokio::test]
@@ -440,6 +820,28 @@ mod tests {
         assert_eq!(updated.agent_capabilities.as_deref(), Some(r#"{"loadSession":true}"#));
         assert_eq!(updated.auth_methods.as_deref(), Some(r#"[{"id":"oauth"}]"#));
         assert!(updated.config_options.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_handshake_reads_existing_row_through_safe_mapper() {
+        let (repo, db) = setup().await;
+        corrupt_cache_field(&db, "2d23ff1c", "config_options", "FF").await;
+
+        let updated = repo
+            .apply_handshake(
+                "2d23ff1c",
+                &UpdateAgentHandshakeParams {
+                    agent_capabilities: Some(Some(r#"{"loadSession":true}"#)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .expect("seed row");
+
+        assert_eq!(updated.agent_capabilities.as_deref(), Some(r#"{"loadSession":true}"#));
+        assert!(updated.config_options.is_none());
+        assert_eq!(cache_field_blob(&db, "2d23ff1c", "config_options").await, None);
     }
 
     #[tokio::test]
