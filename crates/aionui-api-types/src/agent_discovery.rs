@@ -277,6 +277,12 @@ pub struct AgentManagementRow {
     pub behavior_policy: BehaviorPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yolo_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_modes: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_models: Option<serde_json::Value>,
     pub sort_order: i64,
     #[serde(default)]
     pub team_capable: bool,

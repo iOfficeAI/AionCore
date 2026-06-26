@@ -364,8 +364,30 @@ mod tests {
         let claude = repo.get("2d23ff1c").await.unwrap().expect("seeded claude row");
         assert_eq!(claude.icon.as_deref(), Some("/api/assets/logos/ai-major/claude.svg"));
 
-        let aionrs = repo.get("632f31d2").await.unwrap().expect("seeded aion cli row");
+        let rows = repo.list_all().await.unwrap();
+        let aionrs = rows
+            .iter()
+            .find(|row| row.agent_type == "aionrs" && row.agent_source == "internal")
+            .expect("seeded aion cli row");
         assert_eq!(aionrs.icon.as_deref(), Some("/api/assets/logos/brand/aion.svg"));
+        let aionrs_modes: serde_json::Value =
+            serde_json::from_str(aionrs.available_modes.as_deref().expect("aionrs modes catalog")).unwrap();
+        assert_eq!(aionrs_modes["current_mode_id"].as_str(), Some("default"));
+        assert_eq!(
+            aionrs_modes["available_modes"]
+                .as_array()
+                .expect("aionrs available modes")
+                .iter()
+                .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["default", "auto_edit", "yolo"]
+        );
+        let aionrs_config_options: serde_json::Value =
+            serde_json::from_str(aionrs.config_options.as_deref().expect("aionrs config options")).unwrap();
+        assert_eq!(
+            aionrs_config_options["config_options"][0]["options"][1]["value"].as_str(),
+            Some("auto_edit")
+        );
 
         let kiro = repo.get("e044000d").await.unwrap().expect("seeded kiro row");
         assert!(kiro.icon.is_none());

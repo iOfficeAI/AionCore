@@ -2639,6 +2639,9 @@ mod tests {
                 ..Default::default()
             },
             yolo_id: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
             sort_order: 3100,
             team_capable: true,
             status,
