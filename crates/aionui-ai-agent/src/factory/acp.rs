@@ -127,6 +127,7 @@ pub(super) async fn build(
             session_mcp_servers,
             session_snapshot,
             deps.data_dir.clone(),
+            deps.dump_prompts,
         )
         .await,
     );

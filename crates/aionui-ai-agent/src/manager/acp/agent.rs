@@ -898,8 +898,9 @@ impl AcpAgentManager {
                 .and_then(|commands| matched_slash_command(&raw_user_input, commands))
         };
 
-        let content = {
+        let (content, dump_first_prompt) = {
             let mut s = self.session.write().await;
+            let dump_first_prompt = s.has_pending_session_new_prelude();
             let mut ctx = PromptCtx {
                 session: &mut s,
                 params: &self.params,
@@ -908,8 +909,41 @@ impl AcpAgentManager {
             };
             let transformed = self.pipeline.pre_send(&mut ctx, data.content.clone()).await;
             self.commit_session_changes(&mut s).await;
-            transformed
+            (transformed, dump_first_prompt)
         };
+
+        if dump_first_prompt
+            && let Some(dump_dir) =
+                crate::dev_prompt_dump::dump_dir_for_data_dir(&self.params.data_dir, self.params.dump_prompts)
+        {
+            match crate::dev_prompt_dump::dump_prompt(
+                &dump_dir,
+                crate::dev_prompt_dump::PromptDump {
+                    kind: "acp-first-prompt",
+                    backend: self.backend(),
+                    conversation_id: &self.params.conversation_id,
+                    session_id: Some(&sid),
+                    msg_id: Some(&data.msg_id),
+                    turn_id: data.turn_id.as_deref(),
+                    prompt: &content,
+                },
+            ) {
+                Ok(path) => {
+                    debug!(
+                        conversation_id = %self.params.conversation_id,
+                        path = %path.display(),
+                        "DEV prompt dump written"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        conversation_id = %self.params.conversation_id,
+                        error = %error,
+                        "DEV prompt dump failed"
+                    );
+                }
+            }
+        }
 
         let data = SendMessageData {
             content,

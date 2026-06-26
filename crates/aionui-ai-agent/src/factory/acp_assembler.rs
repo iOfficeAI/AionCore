@@ -32,6 +32,8 @@ pub struct AcpSessionParams {
     /// `CliAgentProcess::spawn_for_sdk` so bun cache / tmp directories
     /// land under the operator-chosen path rather than the OS default.
     pub data_dir: PathBuf,
+    /// Whether prompt diagnostics should be dumped under `data_dir/prompt-dumps`.
+    pub dump_prompts: bool,
 }
 
 impl AcpSessionParams {
@@ -65,6 +67,7 @@ pub async fn assemble_acp_params(
     user_mcp_servers: Vec<McpServer>,
     session_snapshot: Option<PersistedSessionState>,
     data_dir: PathBuf,
+    dump_prompts: bool,
 ) -> AcpSessionParams {
     let mcp_servers = resolve_mcp_servers(&config, user_mcp_servers);
     let preset_context = compose_preset_context(config.preset_context.as_deref());
@@ -79,6 +82,7 @@ pub async fn assemble_acp_params(
         preset_context,
         session_snapshot,
         data_dir,
+        dump_prompts,
     }
 }
 
@@ -195,9 +199,11 @@ mod tests {
             vec![user_stdio("mcp-docs")],
             None,
             PathBuf::from("/tmp/data"),
+            true,
         )
         .await;
 
+        assert!(params.dump_prompts);
         assert_eq!(params.preset_context.as_deref(), Some("frozen rules"));
         assert_eq!(params.config.skills, vec!["pdf"]);
         assert_eq!(

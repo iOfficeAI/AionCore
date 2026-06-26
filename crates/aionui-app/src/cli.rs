@@ -48,6 +48,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub log_level: Option<String>,
 
+    /// Dump prompt diagnostics to {data-dir}/prompt-dumps.
+    #[arg(long)]
+    pub dump_prompts: bool,
+
     /// Managed runtime resource source selection.
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,
@@ -198,6 +202,18 @@ mod tests {
     fn parent_pid_accepts_positive_integer() {
         let cli = Cli::parse_from(["aioncore", "--parent-pid", "4242"]);
         assert_eq!(cli.parent_pid, Some(4242));
+    }
+
+    #[test]
+    fn dump_prompts_defaults_to_false() {
+        let cli = Cli::parse_from(["aioncore"]);
+        assert!(!cli.dump_prompts);
+    }
+
+    #[test]
+    fn dump_prompts_accepts_flag() {
+        let cli = Cli::parse_from(["aioncore", "--dump-prompts"]);
+        assert!(cli.dump_prompts);
     }
 
     #[test]

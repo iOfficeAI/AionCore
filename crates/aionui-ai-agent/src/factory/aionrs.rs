@@ -169,6 +169,38 @@ pub(super) async fn build(
         bedrock_config,
     };
 
+    if let Some(system_prompt) = config.system_prompt.as_deref()
+        && let Some(dump_dir) = crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts)
+    {
+        match crate::dev_prompt_dump::dump_prompt(
+            &dump_dir,
+            crate::dev_prompt_dump::PromptDump {
+                kind: "aionrs-system-prompt",
+                backend: None,
+                conversation_id: &ctx.conversation_id,
+                session_id: None,
+                msg_id: None,
+                turn_id: None,
+                prompt: system_prompt,
+            },
+        ) {
+            Ok(path) => {
+                debug!(
+                    conversation_id = %ctx.conversation_id,
+                    path = %path.display(),
+                    "DEV prompt dump written"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    conversation_id = %ctx.conversation_id,
+                    error = %error,
+                    "DEV prompt dump failed"
+                );
+            }
+        }
+    }
+
     let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
 }

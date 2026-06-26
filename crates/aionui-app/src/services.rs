@@ -73,6 +73,7 @@ impl AppServices {
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
         let local = config.local;
+        let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
 
@@ -146,6 +147,7 @@ impl AppServices {
             agent_registry: agent_registry.clone(),
             acp_agent_service: acp_agent_service.clone(),
             data_dir: data_dir.clone(),
+            dump_prompts,
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
