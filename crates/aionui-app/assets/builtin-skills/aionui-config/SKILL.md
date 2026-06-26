@@ -100,7 +100,7 @@ python3 scripts/aionui_api.py get "/api/assistants/<id>?locale=zh-CN"
 python3 scripts/aionui_api.py post /api/assistants '{
   "name": "需求梳理官",
   "description": "以新人视角梳理产品需求文档(PRD)",
-  "preset_agent_type": "claude",
+  "agent_id": "<engine-agent-id>",
   "prompts": [
     "我来描述一个需求,你帮我梳理成一份 PRD",
     "review 这份 PRD,挑出对新人不友好的地方"
@@ -113,7 +113,8 @@ Key fields in the create/update body:
 | Field | Meaning |
 | --- | --- |
 | `name`, `description` | display text (required: name) |
-| `preset_agent_type` | engine: `claude`, `aionrs`, `codex`, … |
+| `agent_id` | **engine binding** — the id of an installed agent (see "Picking the engine" below). This, not `preset_agent_type`, is what actually sets the engine |
+| `preset_agent_type` | display/i18n hint only; does **not** bind the engine in the current backend |
 | `prompts` | quick-start prompts shown on the assistant (NOT the system prompt) |
 | `avatar` | emoji, image URL, `data:` URI, or absolute local path |
 | `enabled_skills` | skill names attached to this assistant |
@@ -126,6 +127,29 @@ Key fields in the create/update body:
 > The create and update bodies take the same fields. On GET, the assistant also
 > carries read-only `context` / `context_i18n` and `last_used_at` (unix ms) — you
 > can't set those via POST/PUT.
+
+### Picking the engine (`agent_id`)
+
+The engine is bound by the request-body field **`agent_id`**, whose value is an
+installed agent's id — not a friendly name like `"claude"`. Read the available
+agents first and copy the id you want:
+
+```bash
+python3 scripts/aionui_api.py get /api/assistants
+# look at the `engine` block of any existing assistant, e.g.
+#   "engine": {"agent_id": "2d23ff1c", "agent": {"type": "acp", "acp_backend": "claude"}}
+# reuse that agent_id for a new assistant on the same engine:
+python3 scripts/aionui_api.py put /api/assistants/<id> '{"id":"<id>","agent_id":"2d23ff1c"}'
+```
+
+> If you omit `agent_id` on create, the backend does NOT default to a CLI engine:
+> with at least one enabled provider it falls back to `aionrs` (its built-in
+> agent), and with no provider configured it returns a 400. CLI engines
+> (`claude`, `gemini`, `codex`, …) must be opted into explicitly with their
+> `agent_id` — an Anthropic key alone doesn't put the Claude CLI on `PATH`.
+> On read, the bound engine shows up in the assistant's `engine.agent_id` /
+> `engine.agent.acp_backend`; the create-body `preset_agent_type` is display-only
+> and reads back `null`, so don't rely on it to tell you the engine.
 
 ### Per-assistant defaults
 
@@ -515,8 +539,9 @@ Each entry carries `enabled` (toggled on), `available` (installed & reachable),
 `team_capable` (can run in a team), and a `handshake` object describing what the
 engine supports — `agent_capabilities`, `auth_methods`, `config_options`,
 `available_modes`, `available_models`, `available_commands`. Check `available`
-before setting an assistant's `preset_agent_type`, and inspect `handshake` to see
-which models/modes that engine offers. `POST /api/agents/refresh` re-scans custom
+before binding an assistant to that engine (via its `agent_id` — see *Picking the
+engine* above), and inspect `handshake` to see which models/modes that engine
+offers. `POST /api/agents/refresh` re-scans custom
 agents.
 
 ---
