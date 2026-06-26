@@ -5571,6 +5571,89 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
 }
 
 #[tokio::test]
+async fn assistant_backed_acp_build_options_include_snapshot_rule_as_preset_context() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("preset-acp-rule".to_string(), "assistant rule body".to_string())]),
+    });
+    let (svc, _broadcaster, repo, definition_repo, state_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_preset_acp_rule",
+        "preset-acp-rule",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_preset_acp_rule",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "preset-acp-rule").await;
+    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let options = svc.build_task_options(&row).await.unwrap();
+
+    match options.context.kind {
+        AgentSessionKind::Acp(ctx) => {
+            assert_eq!(ctx.config.preset_context.as_deref(), Some("assistant rule body"));
+        }
+        AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+    }
+}
+
+#[tokio::test]
+async fn assistant_backed_aionrs_build_options_include_snapshot_rule_as_preset_rules() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("preset-aionrs-rule".to_string(), "assistant rule body".to_string())]),
+    });
+    let (svc, _broadcaster, repo, definition_repo, state_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_preset_aionrs_rule",
+        "preset-aionrs-rule",
+        "aionrs",
+        "auto",
+        "auto",
+    )
+    .await;
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_preset_aionrs_rule",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let conv =
+        create_assistant_backed_conversation(&svc, "user_1", Some("aionrs"), "aionrs", "preset-aionrs-rule").await;
+    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let options = svc.build_task_options(&row).await.unwrap();
+
+    match options.context.kind {
+        AgentSessionKind::Acp(_) => panic!("test conversation should build Aionrs options"),
+        AgentSessionKind::Aionrs(ctx) => {
+            assert_eq!(ctx.config.preset_rules.as_deref(), Some("assistant rule body"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
     let resolver = Arc::new(FixedSkillResolver {
         names: vec!["cron".into(), "todo-tracker".into()],

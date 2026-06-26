@@ -34,6 +34,10 @@ fn to_source_response(source: SkillSource) -> SkillSourceResponse {
     }
 }
 
+fn is_auto_inject_builtin_skill(source: SkillSource, relative_location: Option<&str>) -> bool {
+    source == SkillSource::Builtin && relative_location.is_some_and(|location| location.starts_with("auto-inject/"))
+}
+
 // ---------------------------------------------------------------------------
 // Router state
 // ---------------------------------------------------------------------------
@@ -112,6 +116,7 @@ async fn list_skills(
     let resp: Vec<SkillListItemResponse> = items
         .into_iter()
         .map(|s| SkillListItemResponse {
+            is_auto_inject: is_auto_inject_builtin_skill(s.source, s.relative_location.as_deref()),
             name: s.name,
             description: s.description,
             location: s.location,

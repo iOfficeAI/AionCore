@@ -48,6 +48,8 @@ pub fn row_to_response_with_extra(
         !ws.is_empty() && Path::new(ws).starts_with(data_dir)
     };
     if let Some(obj) = extra.as_object_mut() {
+        obj.remove("preset_context");
+        obj.remove("preset_rules");
         obj.insert(
             "is_temporary_workspace".to_owned(),
             serde_json::Value::Bool(is_temporary_workspace),

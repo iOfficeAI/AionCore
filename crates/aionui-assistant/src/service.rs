@@ -308,6 +308,9 @@ impl AssistantService {
             let avatar_value = row.icon.as_deref().filter(|value| !value.trim().is_empty());
             let (definition, should_upsert) = if let Some(mut definition) = existing_definition {
                 let avatar_type = if avatar_value.is_some() { "emoji" } else { "none" };
+                let should_upgrade_skill_defaults = definition.default_skills_mode == "auto"
+                    && decode_str_list(Some(definition.default_skill_ids.as_str()))?.is_empty()
+                    && decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?.is_empty();
                 let identity_changed = definition.name != row.name
                     || definition.avatar_type != avatar_type
                     || definition.avatar_value.as_deref() != avatar_value
@@ -319,7 +322,10 @@ impl AssistantService {
                 definition.avatar_value = avatar_value.map(ToOwned::to_owned);
                 definition.agent_id = row.id.clone();
                 definition.source_ref = Some(row.id.clone());
-                (definition, identity_changed)
+                if should_upgrade_skill_defaults {
+                    definition.default_skills_mode = "fixed".into();
+                }
+                (definition, identity_changed || should_upgrade_skill_defaults)
             } else {
                 (
                     AssistantDefinitionRow {
@@ -350,7 +356,7 @@ impl AssistantService {
                         default_model_value: None,
                         default_permission_mode: "auto".into(),
                         default_permission_value: None,
-                        default_skills_mode: "auto".into(),
+                        default_skills_mode: "fixed".into(),
                         default_skill_ids: "[]".into(),
                         custom_skill_names: "[]".into(),
                         default_disabled_builtin_skill_ids: "[]".into(),
@@ -2763,6 +2769,45 @@ mod tests {
         assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Online);
         assert!(bare.team_selectable);
         assert!(!bare.deletable);
+
+        let detail = fx.service.get_detail("bare:agent-claude", Some("en-US")).await.unwrap();
+        assert_eq!(detail.defaults.skills.mode, "fixed");
+        assert!(detail.defaults.skills.value.is_empty());
+        assert!(detail.capabilities.default_disabled_builtin_skill_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_upgrades_empty_generated_auto_skill_defaults_to_fixed() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("bare:agent-claude")
+            .await
+            .unwrap()
+            .expect("generated assistant definition should exist after bootstrap");
+        let mut legacy_definition = definition.clone();
+        legacy_definition.default_skills_mode = "auto".into();
+        legacy_definition.default_skill_ids = "[]".into();
+        legacy_definition.default_disabled_builtin_skill_ids = "[]".into();
+        fx.definition_repo
+            .upsert(&upsert_params_from_definition(&legacy_definition))
+            .await
+            .unwrap();
+
+        let detail = fx.service.get_detail("bare:agent-claude", Some("en-US")).await.unwrap();
+
+        assert_eq!(detail.defaults.skills.mode, "fixed");
+        assert!(detail.defaults.skills.value.is_empty());
+        assert!(detail.capabilities.default_disabled_builtin_skill_ids.is_empty());
     }
 
     #[tokio::test]

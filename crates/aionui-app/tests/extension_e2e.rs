@@ -1360,6 +1360,7 @@ async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
     let review = &by_name["review"];
     assert_eq!(review["source"], "builtin");
     assert_eq!(review["is_custom"], false);
+    assert_eq!(review["is_auto_inject"], false);
     assert!(
         review["location"].as_str().unwrap().contains("review"),
         "location should point at the skill dir",
@@ -1368,6 +1369,7 @@ async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
     let my_skill = &by_name["my-skill"];
     assert_eq!(my_skill["source"], "custom");
     assert_eq!(my_skill["is_custom"], true);
+    assert_eq!(my_skill["is_auto_inject"], false);
 }
 
 #[tokio::test]
@@ -1436,15 +1438,18 @@ async fn ba1_unified_skill_list_includes_auto_inject_builtin_entries() {
 
     let cron = &by_name["cron"];
     assert_eq!(cron["source"], "builtin");
+    assert_eq!(cron["is_auto_inject"], true);
     assert_eq!(cron["relative_location"], "auto-inject/cron/SKILL.md");
     assert_eq!(cron["description"], "Schedule recurring tasks");
 
     let skill_creator = &by_name["skill-creator"];
     assert_eq!(skill_creator["source"], "builtin");
+    assert_eq!(skill_creator["is_auto_inject"], true);
     assert_eq!(skill_creator["relative_location"], "auto-inject/skill-creator/SKILL.md");
 
     let review = &by_name["review"];
     assert_eq!(review["source"], "builtin");
+    assert_eq!(review["is_auto_inject"], false);
     assert_eq!(review["relative_location"], "review/SKILL.md");
 }
 
