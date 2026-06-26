@@ -935,40 +935,6 @@ pub(crate) mod workspace_harness {
         (svc, team_repo, task_manager, conv_repo)
     }
 
-    pub(crate) fn setup_with_assistants_team_repo_and_conversation_repo(
-        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
-        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
-    ) -> (
-        Arc<TeamSessionService>,
-        Arc<FullMockTeamRepo>,
-        Arc<dyn IWorkerTaskManager>,
-        Arc<MockConversationRepo>,
-    ) {
-        let team_repo = Arc::new(FullMockTeamRepo::new());
-        let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
-        let conv_repo = Arc::new(MockConversationRepo::new());
-        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-        let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
-        let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
-        let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
-        let svc = TeamSessionService::new(
-            team_repo_dyn,
-            Arc::new(EmptyAgentMetadataRepo),
-            assistant_definition_repo,
-            assistant_overlay_repo,
-            Arc::new(EmptyProviderRepo),
-            conversation_port,
-            projection_store,
-            broadcaster,
-            task_manager.clone(),
-            Arc::new(NoopTurnPort),
-            Arc::new(NoopCancellationPort),
-            Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
-        );
-        (svc, team_repo, task_manager, conv_repo)
-    }
-
     pub(crate) async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {
         repo.update_team(
             team_id,
