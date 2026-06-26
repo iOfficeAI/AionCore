@@ -416,7 +416,7 @@ async fn list_populated_excludes_extension_assistants() {
     assert!(ids.contains(&"builtin-bare"));
     assert!(!ids.contains(&"ext-helper"));
     let sources: Vec<&str> = list.iter().map(|a| a["source"].as_str().unwrap()).collect();
-    assert!(sources.contains(&"bare"));
+    assert!(sources.contains(&"generated"));
     assert!(sources.contains(&"builtin"));
     assert!(!sources.contains(&"extension"));
     let office = find_id(&json["data"], "builtin-office").expect("builtin-office missing from assistant list");
@@ -453,7 +453,7 @@ async fn list_builtin_file_avatar_is_served_via_assistant_avatar_route() {
 }
 
 #[tokio::test]
-async fn list_generated_assistant_exposes_bare_runtime_fields() {
+async fn list_generated_assistant_exposes_generated_runtime_fields() {
     let fx = fixture().await;
     insert_generated_bare_assistant(&fx, "bare:agent-droid", "agent-droid", "droid", "Droid").await;
 
@@ -466,18 +466,18 @@ async fn list_generated_assistant_exposes_bare_runtime_fields() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let list = json["data"].as_array().unwrap();
-    let bare = list
+    let generated = list
         .iter()
         .find(|assistant| assistant["id"] == "bare:agent-droid")
-        .expect("generated bare assistant missing from assistant list");
+        .expect("generated assistant missing from assistant list");
 
-    assert_eq!(bare["source"], "bare");
-    assert_eq!(bare["deletable"], false);
-    assert_eq!(bare["agent_status"], "missing");
-    assert_eq!(bare["agent_status_message"], Value::Null);
-    assert_eq!(bare["team_selectable"], false);
+    assert_eq!(generated["source"], "generated");
+    assert_eq!(generated["deletable"], false);
+    assert_eq!(generated["agent_status"], "missing");
+    assert_eq!(generated["agent_status_message"], Value::Null);
+    assert_eq!(generated["team_selectable"], false);
     assert_eq!(
-        bare["team_block_reason"],
+        generated["team_block_reason"],
         "This assistant's agent could not be resolved."
     );
 }
@@ -622,7 +622,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
 }
 
 #[tokio::test]
-async fn get_detail_generated_assistant_exposes_bare_runtime_fields() {
+async fn get_detail_generated_assistant_exposes_generated_runtime_fields() {
     let fx = fixture().await;
     insert_generated_bare_assistant(&fx, "bare:agent-droid", "agent-droid", "droid", "Droid").await;
 
@@ -640,7 +640,7 @@ async fn get_detail_generated_assistant_exposes_bare_runtime_fields() {
     let json = body_json(resp).await;
     let data = &json["data"];
     assert_eq!(data["id"], "bare:agent-droid");
-    assert_eq!(data["source"], "bare");
+    assert_eq!(data["source"], "generated");
     assert_eq!(data["deletable"], false);
     assert_eq!(data["agent_status"], "missing");
     assert_eq!(data["agent_status_message"], Value::Null);
