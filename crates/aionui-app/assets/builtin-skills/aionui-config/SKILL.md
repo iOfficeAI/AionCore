@@ -453,8 +453,9 @@ Some backend areas have `/api/*` endpoints but are intentionally NOT this
 skill's job — they already have dedicated tooling, so don't reach for the raw
 API here:
 
-- **Teams** (`/api/teams/*`) — use the team MCP tools (`aion_create_team`,
-  `team_spawn_agent`, `team_send_message`, …), not raw calls.
+- **Teams** (`/api/teams/*`) — create Teams through the Team UI or REST API.
+  Once a Team session is active, Team agents use the `team_*` MCP tools
+  provided by the per-Team `aionui-team` server.
 - **Cron / scheduled jobs** (`/api/cron/*`) — created and managed through their
   own flow (scheduling tools / the AionUi cron UI), not this skill.
 

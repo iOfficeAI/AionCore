@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{GuideMcpConfig, TeamMcpStdioConfig};
+use crate::TeamMcpStdioConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -68,8 +68,6 @@ pub struct AcpBuildExtra {
     #[serde(default)]
     pub team_mcp_stdio_config: Option<TeamMcpStdioConfig>,
     #[serde(default)]
-    pub guide_mcp_config: Option<GuideMcpConfig>,
-    #[serde(default)]
     pub mcp_server_ids: Option<Vec<String>>,
     #[serde(default)]
     pub session_mcp_servers: Vec<SessionMcpServer>,
@@ -98,8 +96,6 @@ pub struct AionrsBuildExtra {
     pub session_mode: Option<String>,
     #[serde(default)]
     pub team_mcp_stdio_config: Option<TeamMcpStdioConfig>,
-    #[serde(default)]
-    pub guide_mcp_config: Option<GuideMcpConfig>,
     #[serde(default)]
     pub mcp_server_ids: Option<Vec<String>>,
     #[serde(default)]
@@ -157,5 +153,39 @@ mod tests {
     fn acp_build_extra_parses_thought_level_seed() {
         let parsed: AcpBuildExtra = serde_json::from_str(r#"{"backend":"codex","thought_level":"high"}"#).unwrap();
         assert_eq!(parsed.thought_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn acp_build_extra_ignores_legacy_guide_config_field() {
+        let legacy_key = concat!("guide", "_mcp_config");
+        let parsed: AcpBuildExtra = serde_json::from_value(serde_json::json!({
+            "backend": "claude",
+            legacy_key: {"port": 1234, "token": "legacy", "binary_path": "/bin/aioncore"}
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.backend.as_deref(), Some("claude"));
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            serialized.get(legacy_key).is_none(),
+            "legacy guide config must be ignored, not re-serialized"
+        );
+    }
+
+    #[test]
+    fn aionrs_build_extra_ignores_legacy_guide_config_field() {
+        let legacy_key = concat!("guide", "_mcp_config");
+        let parsed: AionrsBuildExtra = serde_json::from_value(serde_json::json!({
+            "backend": "aionrs",
+            legacy_key: {"port": 1234, "token": "legacy", "binary_path": "/bin/aioncore"}
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.backend.as_deref(), Some("aionrs"));
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            serialized.get(legacy_key).is_none(),
+            "legacy guide config must be ignored, not re-serialized"
+        );
     }
 }

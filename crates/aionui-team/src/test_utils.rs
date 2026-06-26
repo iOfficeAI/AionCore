@@ -223,8 +223,7 @@ pub(crate) mod workspace_harness {
         AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
     };
     use crate::provisioning::{
-        TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationCreateResult,
-        TeamConversationProvisioningPort,
+        TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationProvisioningPort,
     };
     use crate::{TeamError, TeamProjectionMessageStore, TeamSessionService};
 
@@ -564,10 +563,6 @@ pub(crate) mod workspace_harness {
             })
         }
 
-        async fn adopt_team_conversation(&self, _request: TeamConversationAdoptRequest) -> Result<(), TeamError> {
-            Ok(())
-        }
-
         async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
             Ok(self.repo.get_extra(conversation_id).and_then(|extra| {
                 extra
@@ -835,7 +830,6 @@ pub(crate) mod workspace_harness {
         let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
         let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
         let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-        let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
         let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
         let svc = TeamSessionService::new(
             team_repo_dyn,
@@ -843,13 +837,11 @@ pub(crate) mod workspace_harness {
             Arc::new(EmptyProviderRepo),
             conversation_port,
             projection_store,
-            lookup_port,
             broadcaster,
             task_manager.clone(),
             Arc::new(NoopTurnPort),
             Arc::new(NoopCancellationPort),
             Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
-            None,
         );
         (svc, team_repo, task_manager, conv_repo)
     }

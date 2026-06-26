@@ -64,8 +64,8 @@ python3 scripts/aion_diag.py discover
 ```
 
 How discovery works (and why it's robust):
-- Finds the aioncore process started with `--data-dir` (the long-lived backend,
-  not the short-lived `mcp-guide-stdio` / `mcp-team-stdio` helper subprocesses).
+- The long-lived backend process is `aioncore`; short-lived helper subprocesses
+  may include `mcp-team-stdio` for active Team sessions.
 - Reads `--log-dir`, `--data-dir`, `--app-version` straight from its argv — so
   if the user changed the log directory, **we follow it**, never hardcode it.
 - The REST port is NOT in argv (`--port 0`), so the script probes every port the

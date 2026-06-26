@@ -287,7 +287,7 @@ impl TeamSession {
                 TeammateRole::Lead => {
                     let available_agent_types = match self.service.upgrade() {
                         Some(svc) => svc.list_team_capable_backends().await,
-                        None => crate::guide::capability::TEAM_CAPABLE_BACKENDS
+                        None => crate::capability::TEAM_CAPABLE_BACKENDS
                             .iter()
                             .map(|b| {
                                 let mut c = b.chars();
@@ -1316,7 +1316,7 @@ impl TeamSession {
             .filter(|s| !s.is_empty())
             .unwrap_or(caller.backend.as_str())
             .to_owned();
-        if !crate::guide::capability::TEAM_CAPABLE_BACKENDS.contains(&backend.as_str()) {
+        if !crate::capability::TEAM_CAPABLE_BACKENDS.contains(&backend.as_str()) {
             let capable = match self.service.upgrade() {
                 Some(svc) => svc.is_backend_team_capable(&backend).await,
                 None => false,

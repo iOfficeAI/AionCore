@@ -1,7 +1,3 @@
-pub mod team_guide;
-
-pub use team_guide::{TEAM_GUIDE_PROMPT_TEMPLATE, build_team_guide_prompt};
-
 use std::collections::HashMap;
 
 use crate::types::{MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask};

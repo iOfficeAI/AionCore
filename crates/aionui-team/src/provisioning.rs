@@ -69,19 +69,12 @@ pub struct TeamConversationCreateResult {
     pub workspace: String,
 }
 
-pub struct TeamConversationAdoptRequest {
-    pub conversation_id: String,
-    pub extra: serde_json::Value,
-}
-
 #[async_trait]
 pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn create_team_conversation(
         &self,
         request: TeamConversationCreateRequest,
     ) -> Result<TeamConversationCreateResult, TeamError>;
-
-    async fn adopt_team_conversation(&self, request: TeamConversationAdoptRequest) -> Result<(), TeamError>;
 
     async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
@@ -132,7 +125,7 @@ impl TeamAgentProvisioner {
         let leader_slot_id = generate_id();
         let leader_role = TeammateRole::Lead;
         let leader_conversation = self
-            .create_or_adopt_conversation(
+            .create_team_conversation_for_agent(
                 user_id,
                 team_id,
                 &leader_slot_id,
@@ -141,7 +134,6 @@ impl TeamAgentProvisioner {
                 &leader_input.backend,
                 &leader_input.model,
                 leader_input.custom_agent_id.as_deref(),
-                leader_input.conversation_id.as_deref(),
                 shared_workspace,
             )
             .await?;
@@ -176,7 +168,7 @@ impl TeamAgentProvisioner {
             let slot_id = generate_id();
             let role = TeammateRole::parse(&input.role).unwrap_or(TeammateRole::Teammate);
             let conversation = self
-                .create_or_adopt_conversation(
+                .create_team_conversation_for_agent(
                     user_id,
                     team_id,
                     &slot_id,
@@ -185,7 +177,6 @@ impl TeamAgentProvisioner {
                     &input.backend,
                     &input.model,
                     input.custom_agent_id.as_deref(),
-                    input.conversation_id.as_deref(),
                     Some(&team_workspace),
                 )
                 .await?;
@@ -338,7 +329,7 @@ impl TeamAgentProvisioner {
 
     async fn provision_new_agent(&self, input: NewAgentProvisioning) -> Result<TeamAgent, TeamError> {
         let conversation = self
-            .create_or_adopt_conversation(
+            .create_team_conversation_for_agent(
                 &input.user_id,
                 &input.team_id,
                 &input.slot_id,
@@ -347,7 +338,6 @@ impl TeamAgentProvisioner {
                 &input.backend,
                 &input.model,
                 input.custom_agent_id.as_deref(),
-                None,
                 input.workspace.as_deref(),
             )
             .await?;
@@ -366,7 +356,7 @@ impl TeamAgentProvisioner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn create_or_adopt_conversation(
+    async fn create_team_conversation_for_agent(
         &self,
         user_id: &str,
         team_id: &str,
@@ -376,31 +366,11 @@ impl TeamAgentProvisioner {
         backend: &str,
         model: &str,
         custom_agent_id: Option<&str>,
-        existing_conversation_id: Option<&str>,
         workspace: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
         let extra = self
             .build_team_extra(team_id, slot_id, role, backend, model, custom_agent_id, workspace)
             .await?;
-        if let Some(existing_id) = existing_conversation_id {
-            self.conversation_port
-                .adopt_team_conversation(TeamConversationAdoptRequest {
-                    conversation_id: existing_id.to_owned(),
-                    extra,
-                })
-                .await?;
-            info!(
-                team_id,
-                slot_id,
-                conversation_id = %existing_id,
-                outcome = "adopted",
-                "Team agent provisioned"
-            );
-            return Ok(ProvisionedConversation {
-                conversation_id: existing_id.to_owned(),
-                workspace: workspace.map(str::to_owned),
-            });
-        }
 
         let agent_type = parse_agent_type(backend)?;
         let provider_id = if agent_type == AgentType::Aionrs {
@@ -488,19 +458,6 @@ impl TeamAgentProvisioner {
             );
         }
         Ok(workspace)
-    }
-
-    pub(crate) async fn patch_guide_mcp_config(
-        &self,
-        agent: &TeamAgent,
-        config: &aionui_api_types::GuideMcpConfig,
-    ) -> Result<(), TeamError> {
-        self.conversation_port
-            .patch_runtime_config(
-                &agent.conversation_id,
-                serde_json::json!({ "guide_mcp_config": config }),
-            )
-            .await
     }
 
     #[allow(clippy::too_many_arguments)]

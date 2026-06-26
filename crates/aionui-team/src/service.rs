@@ -4,12 +4,12 @@ pub(crate) mod spawn_support;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
-use aionui_ai_agent::{AgentError, AgentInstance, AgentStreamEvent, IWorkerTaskManager};
+use aionui_ai_agent::{AgentError, AgentInstance, IWorkerTaskManager};
 use aionui_api_types::{
-    AddAgentRequest, CreateTeamRequest, GuideMcpConfig, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload,
-    TeamResponse, TeamRunAckResponse, TeamRunTargetRole, WebSocketMessage,
+    AddAgentRequest, CreateTeamRequest, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload, TeamResponse,
+    TeamRunAckResponse, TeamRunTargetRole, WebSocketMessage,
 };
-use aionui_common::{AgentKillReason, ConversationStatus, generate_id, now_ms};
+use aionui_common::{AgentKillReason, generate_id, now_ms};
 use aionui_db::models::TeamRow;
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
 use aionui_realtime::EventBroadcaster;
@@ -20,9 +20,7 @@ use crate::error::TeamError;
 use crate::event_loop::AgentLoopContext;
 use crate::events::{TEAM_CREATED_EVENT, TEAM_MCP_STATUS_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT};
 use crate::message_projection::TeamProjectionMessageStore;
-use crate::ports::{
-    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamConversationBindingLookup, TeamConversationLookupPort,
-};
+use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::session::{AgentMessageQueueResult, TeamSession};
 use crate::types::{Team, TeamAgent, TeammateRole};
@@ -46,7 +44,6 @@ pub struct TeamSessionService {
     provider_repo: Arc<dyn IProviderRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
     projection_store: Arc<dyn TeamProjectionMessageStore>,
-    lookup_port: Arc<dyn TeamConversationLookupPort>,
     broadcaster: Arc<dyn EventBroadcaster>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     turn_port: Arc<dyn AgentTurnExecutionPort>,
@@ -67,10 +64,6 @@ pub struct TeamSessionService {
     /// the service that owns it. Set once during [`TeamSessionService::new`]
     /// via [`Arc::new_cyclic`].
     self_ref: Weak<TeamSessionService>,
-    /// Guide MCP server config used to refresh the leader's persisted
-    /// `guide_mcp_config` on backend restart (port/token change each restart).
-    /// `None` when the Guide server failed to start.
-    guide_mcp_config: Option<GuideMcpConfig>,
 }
 
 impl TeamSessionService {
@@ -81,13 +74,11 @@ impl TeamSessionService {
         provider_repo: Arc<dyn IProviderRepository>,
         conversation_port: Arc<dyn TeamConversationProvisioningPort>,
         projection_store: Arc<dyn TeamProjectionMessageStore>,
-        lookup_port: Arc<dyn TeamConversationLookupPort>,
         broadcaster: Arc<dyn EventBroadcaster>,
         task_manager: Arc<dyn IWorkerTaskManager>,
         turn_port: Arc<dyn AgentTurnExecutionPort>,
         cancellation_port: Arc<dyn AgentTurnCancellationPort>,
         backend_binary_path: Arc<PathBuf>,
-        guide_mcp_config: Option<GuideMcpConfig>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
             repo,
@@ -95,7 +86,6 @@ impl TeamSessionService {
             provider_repo,
             conversation_port,
             projection_store,
-            lookup_port,
             broadcaster,
             task_manager,
             turn_port,
@@ -105,7 +95,6 @@ impl TeamSessionService {
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
             self_ref: weak.clone(),
-            guide_mcp_config,
         })
     }
 
@@ -115,15 +104,6 @@ impl TeamSessionService {
             self.provider_repo.clone(),
             self.conversation_port.clone(),
         )
-    }
-
-    pub(crate) async fn lookup_team_binding_by_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Result<Option<TeamConversationBindingLookup>, TeamError> {
-        self.lookup_port
-            .lookup_team_binding_by_conversation(conversation_id)
-            .await
     }
 
     async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
@@ -155,29 +135,6 @@ impl TeamSessionService {
                 tracing::warn!(team_id = %team.id, error = %e, "failed to restore session on startup");
                 continue;
             }
-            // Patch the leader's persisted guide_mcp_config so it points at the
-            // current restart's port/token (the Guide server picks a new random
-            // port on every start).
-            if let Some(ref cfg) = self.guide_mcp_config {
-                let row = match self.repo.get_team(&team.id).await {
-                    Ok(Some(r)) => r,
-                    _ => continue,
-                };
-                let team_data = match Team::from_row(&row) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if let Some(leader) = team_data.agents.iter().find(|a| a.role == TeammateRole::Lead)
-                    && let Err(e) = self.provisioner().patch_guide_mcp_config(leader, cfg).await
-                {
-                    warn!(
-                        team_id = %team.id,
-                        conversation_id = %leader.conversation_id,
-                        error = %e,
-                        "failed to patch leader guide_mcp_config on restore"
-                    );
-                }
-            }
         }
         if !teams.is_empty() {
             tracing::info!(count = teams.len(), "team sessions restored on startup");
@@ -188,8 +145,17 @@ impl TeamSessionService {
         if req.agents.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
         }
+        if req
+            .agents
+            .iter()
+            .any(|agent| agent.conversation_id.as_deref().is_some_and(|id| !id.trim().is_empty()))
+        {
+            return Err(TeamError::InvalidRequest(
+                "creating Team agents from existing conversations are no longer supported; omit agents[].conversation_id"
+                    .into(),
+            ));
+        }
 
-        let adopted_leader_conversation_id = req.agents.first().and_then(|agent| agent.conversation_id.clone());
         let shared_workspace = match req.workspace.as_deref() {
             Some(workspace) if !workspace.is_empty() => Some(validate_create_workspace_path(workspace)?),
             _ => None,
@@ -250,14 +216,6 @@ impl TeamSessionService {
         // via POST /api/teams/{id}/session if needed.
         if let Err(e) = self.ensure_session_inner(&team.id, true).await {
             warn!(team_id = %team.id, error = %e, "auto ensure_session after create_team failed");
-        } else if let Some(conversation_id) = adopted_leader_conversation_id
-            && let Some(leader) = team
-                .agents
-                .iter()
-                .find(|agent| agent.role == TeammateRole::Lead && agent.conversation_id == conversation_id)
-                .cloned()
-        {
-            self.schedule_deferred_leader_rebuild(user_id.to_owned(), team.id.clone(), leader);
         }
 
         self.build_team_response(&team).await
@@ -695,77 +653,6 @@ impl TeamSessionService {
         Ok(())
     }
 
-    fn schedule_deferred_leader_rebuild(&self, user_id: String, team_id: String, leader: TeamAgent) {
-        info!(
-            team_id = %team_id,
-            slot_id = %leader.slot_id,
-            conversation_id = %leader.conversation_id,
-            "deferred leader Team MCP rebuild scheduled"
-        );
-        let service = self.self_ref.clone();
-        tokio::spawn(async move {
-            let Some(service) = service.upgrade() else {
-                return;
-            };
-            service.wait_until_agent_not_running(&leader.conversation_id).await;
-            if let Err(error) = service.rebuild_single_agent_process(&user_id, &team_id, &leader).await {
-                warn!(
-                    team_id = %team_id,
-                    slot_id = %leader.slot_id,
-                    conversation_id = %leader.conversation_id,
-                    error = %error,
-                    "deferred leader Team MCP rebuild failed"
-                );
-            }
-        });
-    }
-
-    async fn wait_until_agent_not_running(&self, conversation_id: &str) {
-        let Some(agent) = self.task_manager.get_task(conversation_id) else {
-            return;
-        };
-        if agent.status() != Some(ConversationStatus::Running) {
-            return;
-        }
-        let mut events = agent.subscribe();
-        loop {
-            match events.recv().await {
-                Ok(AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) => return,
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    if agent.status() != Some(ConversationStatus::Running) {
-                        return;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            }
-        }
-    }
-
-    async fn rebuild_single_agent_process(
-        &self,
-        user_id: &str,
-        team_id: &str,
-        agent: &TeamAgent,
-    ) -> Result<(), TeamError> {
-        let session = self
-            .sessions
-            .get(team_id)
-            .map(|entry| Arc::clone(&entry.session))
-            .ok_or_else(|| TeamError::InvalidRequest(format!("no active session for team {team_id}")))?;
-        let cfg = session.mcp_stdio_config(&agent.slot_id);
-        self.provisioner()
-            .attach_agent_process(user_id, agent, cfg, &self.task_manager)
-            .await?;
-        info!(
-            team_id = %team_id,
-            slot_id = %agent.slot_id,
-            conversation_id = %agent.conversation_id,
-            "deferred leader Team MCP rebuild completed"
-        );
-        Ok(())
-    }
-
     /// Spawn per-agent event loops that drain the mailbox whenever notified.
     /// Each agent gets its own tokio task that runs until the session shuts down.
     fn spawn_event_loops(&self, session: &Arc<TeamSession>, user_id: &str, agents: &[TeamAgent]) {
@@ -1032,8 +919,8 @@ impl TeamSessionService {
             .notify_reserved_wake_for_team_work(slot_id, target_role, source);
     }
 
-    /// Friendly pre-check used by Guide MCP to return handoff copy before invoking
-    /// run-scoped team tools. This is not a concurrency guarantee; any operation
+    /// Friendly pre-check used before invoking run-scoped team tools. This is
+    /// not a concurrency guarantee; any operation
     /// that writes mailbox, projection, scheduler, spawn, shutdown, or wake state
     /// must still acquire a TeamRun operation lease in TeamSession/TeamRunManager.
     pub(crate) async fn require_active_team_run_for_team_work(&self, team_id: &str) -> Result<(), TeamError> {

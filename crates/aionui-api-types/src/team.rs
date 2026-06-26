@@ -12,8 +12,6 @@ use crate::TeamMcpStdioConfig;
 /// Each agent gets its own conversation; the first agent in a create
 /// request becomes the team lead.
 ///
-/// When `conversation_id` is supplied the existing conversation is adopted
-/// rather than creating a new one (single-chat → team-chat handoff).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TeamAgentInput {
     pub name: String,
@@ -22,9 +20,10 @@ pub struct TeamAgentInput {
     pub model: String,
     #[serde(default)]
     pub custom_agent_id: Option<String>,
-    /// Adopt an existing conversation instead of creating a new one.
-    /// When present the conversation's `extra` is updated with `teamId`
-    /// and `backend`; no new conversation row is written.
+    /// Deprecated request-side field retained so old clients receive a clear
+    /// validation error instead of silently reusing a solo conversation.
+    ///
+    /// New Team creation requests must omit this field or set it to null/empty.
     #[serde(default)]
     pub conversation_id: Option<String>,
 }

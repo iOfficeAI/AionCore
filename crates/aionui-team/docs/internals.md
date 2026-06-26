@@ -90,20 +90,9 @@ User                HTTP            TeamSession       Scheduler        Mailbox  
 - Agent 通过 JSON-RPC `initialize(auth_token, slot_id)` 鉴权后才能调工具
 - 暴露 8 个工具：`team_send_message / team_spawn_agent / team_task_create / team_task_update / team_task_list / team_members / team_rename_agent / team_shutdown_agent`（AionUi 参考实现有 10 个，差 `team_describe_assistant` 和 `team_list_models`）
 - `team_spawn_agent` 和 `team_shutdown_agent` 仅 Lead 可调用（Wave 5 D29a-2 加 caller guard、D30c 加 target=Lead guard）
-- `team_spawn_agent` 的 backend 白名单：由 `guide::capability::is_team_capable_backend`（W5-D28a）判定，当前允许 `claude / codex / gemini / aionrs`
+- `team_spawn_agent` 的 backend 白名单：由 `capability::is_team_capable_backend` 判定，当前允许 `claude / codex / gemini / aionrs`
 - `team_spawn_agent` 正从 no-op 转为真实创建（W5-D29b）：校验链 D29a-1/2 已合，D29a-3/4 / D29b 待合
 - TCP bind 成功 / 失败时通过 `team.mcpStatus` WS 事件广播 `TcpReady(port)` / `TcpError(error)`（W5-D31b-1）
-
-### Team Guide MCP（全局，Wave 5 新增，落地中）
-
-独立于 per-team MCP 的另一个 MCP server，挂在 solo agent 身上，供"单聊 → 建团"用：
-
-- `aion_list_models` — 列出可用 backend × model（D26c 代码已写，待合）
-- `aion_create_team` — 把当前 conversation 升级为 team（D26a 骨架、D26b-1 参数解析已写，待合 + 接入 handler）
-- D28a `is_team_capable_backend` 已合（`crates/aionui-team/src/guide/capability.rs`）
-- D28b / D28c（prompt 注入 + 把 Guide MCP 挂到 session 的 mcp_servers）待落
-
-Guide MCP 尚未端到端闭环，solo agent 调不到这两个工具。前端暂时仍需走 `POST /api/teams` 显式建团。
 
 ### MCP 与 Mailbox / TaskBoard 的交互
 

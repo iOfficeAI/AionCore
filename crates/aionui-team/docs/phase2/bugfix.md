@@ -111,7 +111,7 @@ Team 成员 conversation extra 里没有 `session_mode`。Claude Code 默认 def
 
 ### 根因
 
-Session resume 时 CLI 重新 spawn `mcp-guide-stdio` 子进程，Guide HTTP server 偶尔在极短时间窗口内不可达（TCP 连接接受但 HTTP 请求体读取失败）。
+Session resume 时 CLI 重新 spawn 已删除的单聊升级 MCP 子进程，Guide HTTP server 偶尔在极短时间窗口内不可达（TCP 连接接受但 HTTP 请求体读取失败）。
 
 ### 修复
 

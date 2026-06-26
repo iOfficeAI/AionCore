@@ -3,11 +3,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::config::{AppConfig, derive_encryption_key};
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager, WorkerTaskManagerImpl,
     build_agent_factory,
 };
-use aionui_api_types::GuideMcpConfig;
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
@@ -18,9 +18,6 @@ use aionui_db::{
     SqliteMcpServerRepository, SqliteProviderRepository, SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
-use aionui_team::GuideMcpServer;
-
-use crate::config::{AppConfig, derive_encryption_key};
 
 pub struct AppServices {
     pub database: Database,
@@ -51,11 +48,6 @@ pub struct AppServices {
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
-    /// Guide MCP server config (port, token, binary_path).
-    /// `None` when the server failed to start (graceful degradation).
-    pub guide_mcp_config: Option<GuideMcpConfig>,
-    /// Guide MCP server instance kept alive for the app lifetime.
-    pub(crate) _guide_server: Option<GuideMcpServer>,
 }
 
 impl AppServices {
@@ -75,15 +67,6 @@ impl AppServices {
             task_manager_delete_hook: self.task_manager_delete_hook.clone(),
         });
         self
-    }
-
-    /// Wire the TeamSessionService into the Guide MCP server so
-    /// `aion_create_team` requests can call `service.create_team(...)`.
-    /// Called from `create_router` after `build_module_states`.
-    pub(crate) async fn inject_guide_service(&self, service: std::sync::Weak<aionui_team::TeamSessionService>) {
-        if let Some(server) = &self._guide_server {
-            server.set_service(service).await;
-        }
     }
 
     pub async fn from_config(database: Database, config: &AppConfig) -> anyhow::Result<Self> {
@@ -156,29 +139,6 @@ impl AppServices {
         let backend_binary_path =
             Arc::new(std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aioncore")));
 
-        // Start Guide MCP server. Failure is non-fatal: solo agents simply
-        // won't get the `aion_create_team` tool.
-        let (guide_server, guide_mcp_config) = match GuideMcpServer::start().await {
-            Ok(srv) => {
-                let config = GuideMcpConfig {
-                    port: srv.http_port(),
-                    token: srv.auth_token().to_owned(),
-                    binary_path: backend_binary_path.to_string_lossy().to_string(),
-                };
-                tracing::info!(port = config.port, "Guide MCP server started");
-                (Some(srv), Some(config))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    code = "BOOTSTRAP_DEGRADED_GUIDE_MCP",
-                    stage = "guide_mcp.start",
-                    error = %e,
-                    "Guide MCP server failed to start; solo create-team disabled"
-                );
-                (None, None)
-            }
-        };
-
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new(skill_paths.clone()),
             provider_repo,
@@ -188,7 +148,6 @@ impl AppServices {
             data_dir: data_dir.clone(),
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
-            guide_mcp_config: guide_mcp_config.clone(),
             mcp_server_repo: Some(mcp_server_repo),
         });
 
@@ -231,8 +190,6 @@ impl AppServices {
             local,
             app_version,
             skill_paths,
-            guide_mcp_config: guide_mcp_config.clone(),
-            _guide_server: guide_server,
         })
     }
 }

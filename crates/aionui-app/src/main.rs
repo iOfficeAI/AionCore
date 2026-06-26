@@ -79,7 +79,6 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
     // MCP stdio helpers must not touch the database, logging setup, or `AppServices`.
     match cli.command {
         Some(Command::McpBridge) => Ok(commands::run_mcp_bridge().await),
-        Some(Command::McpGuideStdio) => Ok(commands::run_team_guide().await),
         Some(Command::McpTeamStdio) => Ok(commands::run_team_stdio().await),
         Some(Command::Doctor) => Ok(commands::run_doctor(&cli, &merged_path).await?),
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),
