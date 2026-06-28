@@ -446,6 +446,47 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
     }
 }
 
+fn build_channel_settings_service(
+    services: &AppServices,
+) -> Arc<aionui_channel::channel_settings::ChannelSettingsService> {
+    let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
+        Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone()));
+
+    Arc::new(
+        aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo)
+            .with_agent_metadata_repo(Arc::new(SqliteAgentMetadataRepository::new(
+                services.database.pool().clone(),
+            )))
+            .with_assistant_repos(
+                Arc::new(SqliteAssistantDefinitionRepository::new(
+                    services.database.pool().clone(),
+                )),
+                Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
+            ),
+    )
+}
+
+async fn build_channel_message_service(
+    services: &AppServices,
+    channel_settings: Arc<aionui_channel::channel_settings::ChannelSettingsService>,
+) -> Arc<aionui_channel::message_service::ChannelMessageService> {
+    let owner_user_id = services
+        .user_repo
+        .get_primary_webui_user()
+        .await
+        .ok()
+        .flatten()
+        .map(|u| u.id)
+        .unwrap_or_else(|| "system_default_user".to_string());
+
+    Arc::new(aionui_channel::message_service::ChannelMessageService::new(
+        Arc::new(services.conversation_service.clone()),
+        services.worker_task_manager.clone(),
+        channel_settings,
+        owner_user_id,
+    ))
+}
+
 /// Build the default `ChannelRouterState` and orchestrator components.
 pub async fn build_channel_state(
     services: &AppServices,
@@ -476,22 +517,8 @@ pub async fn build_channel_state(
     let plugin_factory: Arc<aionui_channel::manager::PluginFactory> =
         Arc::new(Box::new(aionui_channel::plugins::create_plugin));
 
-    // Build channel settings service for per-plugin agent/model configuration
-    let pref_pool = services.database.pool().clone();
-    let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
-        Arc::new(SqliteClientPreferenceRepository::new(pref_pool));
-    let channel_settings = Arc::new(
-        aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo)
-            .with_agent_metadata_repo(Arc::new(SqliteAgentMetadataRepository::new(
-                services.database.pool().clone(),
-            )))
-            .with_assistant_repos(
-                Arc::new(SqliteAssistantDefinitionRepository::new(
-                    services.database.pool().clone(),
-                )),
-                Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
-            ),
-    );
+    // Build channel settings service for per-plugin agent/model configuration.
+    let channel_settings = build_channel_settings_service(services);
 
     // Build orchestrator dependencies
     let action_executor = Arc::new(aionui_channel::action::ActionExecutor::new(
@@ -500,53 +527,7 @@ pub async fn build_channel_state(
         Arc::clone(&channel_settings),
     ));
 
-    let conv_repo: Arc<dyn aionui_db::IConversationRepository> = Arc::new(
-        aionui_db::SqliteConversationRepository::new(services.database.pool().clone()),
-    );
-    let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
-        services.skill_paths.clone(),
-        services.skill_repo.clone(),
-    ));
-    let agent_metadata_repo: Arc<dyn aionui_db::IAgentMetadataRepository> = Arc::new(
-        aionui_db::SqliteAgentMetadataRepository::new(services.database.pool().clone()),
-    );
-    let acp_session_repo: Arc<dyn aionui_db::IAcpSessionRepository> = Arc::new(
-        aionui_db::SqliteAcpSessionRepository::new(services.database.pool().clone()),
-    );
-    let conversation_svc = Arc::new(
-        ConversationService::new(
-            services.work_dir.clone(),
-            services.event_bus.clone(),
-            skill_resolver,
-            services.worker_task_manager.clone(),
-            conv_repo,
-            agent_metadata_repo,
-            acp_session_repo,
-        )
-        .with_runtime_state(services.conversation_runtime_state.clone()),
-    );
-    conversation_svc.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
-        services.database.pool().clone(),
-    )));
-    if let Some(hook) = services.task_manager_delete_hook.clone() {
-        conversation_svc.with_delete_hook(hook);
-    }
-
-    let owner_user_id = services
-        .user_repo
-        .get_primary_webui_user()
-        .await
-        .ok()
-        .flatten()
-        .map(|u| u.id)
-        .unwrap_or_else(|| "system_default_user".to_string());
-
-    let message_service = Arc::new(aionui_channel::message_service::ChannelMessageService::new(
-        conversation_svc,
-        services.worker_task_manager.clone(),
-        Arc::clone(&channel_settings),
-        owner_user_id,
-    ));
+    let message_service = build_channel_message_service(services, Arc::clone(&channel_settings)).await;
 
     let orchestrator = aionui_channel::orchestrator::ChannelOrchestrator::new(
         action_executor,
@@ -807,8 +788,188 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
     use crate::AppConfig;
+    use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+    use aionui_ai_agent::{
+        AgentError, AgentInstance, AgentSendError, AgentStreamEvent, IAgentTask, IMockAgent, IWorkerTaskManager,
+        WorkerTaskManagerImpl,
+    };
+    use aionui_channel::types::PluginType;
+    use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs};
+    use aionui_db::models::{AssistantSessionRow, UpsertAssistantDefinitionParams};
+    use aionui_db::{
+        IAssistantDefinitionRepository, IClientPreferenceRepository, IConversationRepository,
+        SqliteAssistantDefinitionRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
+    };
     use aionui_extension::{ExtensionSource, ScanPath};
+
+    struct ChannelStateNoopAgent {
+        conversation_id: String,
+        workspace: String,
+    }
+
+    #[async_trait::async_trait]
+    impl IAgentTask for ChannelStateNoopAgent {
+        fn agent_type(&self) -> AgentType {
+            AgentType::Aionrs
+        }
+
+        fn conversation_id(&self) -> &str {
+            &self.conversation_id
+        }
+
+        fn workspace(&self) -> &str {
+            &self.workspace
+        }
+
+        fn status(&self) -> Option<ConversationStatus> {
+            Some(ConversationStatus::Finished)
+        }
+
+        fn last_activity_at(&self) -> TimestampMs {
+            0
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentStreamEvent> {
+            let (tx, _) = tokio::sync::broadcast::channel(1);
+            tx.subscribe()
+        }
+
+        async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
+            Ok(())
+        }
+
+        async fn cancel(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    impl IMockAgent for ChannelStateNoopAgent {}
+
+    fn mock_worker_task_manager() -> Arc<dyn IWorkerTaskManager> {
+        let factory = Arc::new(|opts: BuildTaskOptions| {
+            Box::pin(async move {
+                Ok(AgentInstance::Mock(Arc::new(ChannelStateNoopAgent {
+                    conversation_id: opts.conversation_id().to_owned(),
+                    workspace: opts.context.workspace.path,
+                })))
+            }) as futures_util::future::BoxFuture<'static, Result<AgentInstance, AgentError>>
+        });
+
+        Arc::new(WorkerTaskManagerImpl::new(factory))
+    }
+
+    fn channel_state_assistant_definition() -> UpsertAssistantDefinitionParams<'static> {
+        UpsertAssistantDefinitionParams {
+            id: "asstdef-channel-state-aionrs",
+            assistant_id: "bare-channel-aionrs",
+            source: "generated",
+            owner_type: "system",
+            source_ref: Some("bare-channel-aionrs"),
+            source_version: None,
+            source_hash: None,
+            name: "Bare Channel Aionrs",
+            name_i18n: "{}",
+            description: Some("Channel state regression assistant"),
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("A"),
+            agent_id: "632f31d2",
+            rule_resource_type: "inline",
+            rule_resource_ref: None,
+            rule_inline_content: Some(""),
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        }
+    }
+
+    #[tokio::test]
+    async fn build_channel_message_service_uses_app_conversation_service_for_assistant_bindings() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let services = AppServices::from_config(db, &AppConfig::default())
+            .await
+            .unwrap()
+            .with_worker_task_manager(mock_worker_task_manager());
+
+        let pool = services.database.pool().clone();
+        let definition_repo = SqliteAssistantDefinitionRepository::new(pool.clone());
+        definition_repo
+            .upsert(&channel_state_assistant_definition())
+            .await
+            .unwrap();
+
+        let pref_repo = SqliteClientPreferenceRepository::new(pool.clone());
+        pref_repo
+            .upsert_batch(&[(
+                "assistant.weixin.agent",
+                r#"{"assistant_id":"bare-channel-aionrs","name":"Weixin Aionrs"}"#,
+            )])
+            .await
+            .unwrap();
+
+        let settings = build_channel_settings_service(&services);
+        let message_service = build_channel_message_service(&services, settings).await;
+        let session = AssistantSessionRow {
+            id: "session-channel-state".to_owned(),
+            user_id: "channel-user-state".to_owned(),
+            agent_type: "aionrs".to_owned(),
+            conversation_id: None,
+            workspace: None,
+            chat_id: Some("wx-chat-state".to_owned()),
+            created_at: 1,
+            last_activity: 1,
+        };
+
+        let first = message_service
+            .send_to_agent(&session, "hello", PluginType::Weixin)
+            .await
+            .unwrap();
+
+        let conversation_repo = SqliteConversationRepository::new(pool);
+        let snapshot = conversation_repo
+            .get_assistant_snapshot(&first.conversation_id)
+            .await
+            .unwrap()
+            .expect("channel-created conversation should persist assistant snapshot");
+        let conversation = conversation_repo
+            .get(&first.conversation_id)
+            .await
+            .unwrap()
+            .expect("channel-created conversation should be persisted");
+
+        assert_eq!(snapshot.assistant_id, "bare-channel-aionrs");
+        assert_eq!(snapshot.agent_id, "632f31d2");
+        assert_eq!(conversation.r#type, AgentType::Aionrs.serde_name());
+        assert_eq!(conversation.name, "Weixin Aionrs");
+
+        let second_session = AssistantSessionRow {
+            conversation_id: Some(first.conversation_id.clone()),
+            ..session
+        };
+        let second = message_service
+            .send_to_agent(&second_session, "again", PluginType::Weixin)
+            .await
+            .unwrap();
+        assert_eq!(second.conversation_id, first.conversation_id);
+
+        services.database.close().await;
+    }
 
     #[tokio::test]
     async fn build_extension_states_uses_host_app_version_for_engine_filtering() {
