@@ -473,9 +473,19 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
             "Ignoring command override for internal Aion CLI agent"
         );
     }
+    let env_override = parse_env_override(&env_override_raw);
+    if is_internal_aion_cli && env_override.as_ref().is_some_and(|entries| !entries.is_empty()) {
+        warn!(
+            id = %meta.id,
+            name = %meta.name,
+            "Ignoring environment overrides for internal Aion CLI agent"
+        );
+    }
 
     meta.has_command_override = command_override.is_some() && !is_internal_aion_cli;
-    meta.env_override_key_count = parse_env_override(&env_override_raw)
+    meta.env_override_key_count = env_override
+        .as_ref()
+        .filter(|_| !is_internal_aion_cli)
         .map(|v| v.iter().filter(|e| !is_blocked_override_env_key(&e.name)).count())
         .unwrap_or(0);
 
@@ -484,7 +494,7 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
     } else if let Some(path) = command_override {
         meta.command = Some(path);
     }
-    if let Some(extra) = parse_env_override(&env_override_raw) {
+    if !is_internal_aion_cli && let Some(extra) = env_override {
         for entry in extra {
             if is_blocked_override_env_key(&entry.name) {
                 tracing::warn!(key = %entry.name, "env override: blocked key skipped");
@@ -1315,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_row_ignores_internal_aion_cli_command_override() {
+    fn decode_row_ignores_internal_aion_cli_overrides() {
         use aionui_db::AgentMetadataRow;
         let row = AgentMetadataRow {
             id: "632f31d2".to_string(),
@@ -1352,7 +1362,9 @@ mod tests {
             last_check_at: None,
             last_success_at: None,
             last_failure_at: None,
-            env_override: None,
+            env_override: Some(
+                r#"[{"name":"ANTHROPIC_API_KEY","value":"sk-x"},{"name":"PATH","value":"/evil"}]"#.to_string(),
+            ),
             created_at: 0,
             updated_at: 0,
         };
@@ -1361,6 +1373,8 @@ mod tests {
         assert_eq!(meta.agent_source, AgentSource::Internal);
         assert_eq!(meta.command, None);
         assert!(!meta.has_command_override);
+        assert_eq!(meta.env_override_key_count, 0);
+        assert!(meta.env.is_empty());
         assert!(meta.available);
         assert!(reason.is_none());
     }

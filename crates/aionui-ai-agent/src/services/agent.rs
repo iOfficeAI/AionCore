@@ -152,11 +152,13 @@ impl AgentService {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
+        let has_env_override = req
+            .env_override
+            .as_ref()
+            .is_some_and(|entries| entries.iter().any(|entry| !entry.name.trim().is_empty()));
 
-        if command_override.is_some() && is_internal_aion_cli_row(&row) {
-            return Err(AgentError::bad_request(
-                "Internal Aion CLI does not support command overrides",
-            ));
+        if (command_override.is_some() || has_env_override) && is_internal_aion_cli_row(&row) {
+            return Err(AgentError::bad_request("Internal Aion CLI does not support overrides"));
         }
 
         let env_json = match req.env_override {

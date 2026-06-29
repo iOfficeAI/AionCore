@@ -195,7 +195,7 @@ async fn migration_015_populates_aionrs_catalog_by_agent_type() {
 }
 
 #[tokio::test]
-async fn migration_016_clears_internal_aion_cli_command_override_only() {
+async fn migration_016_clears_internal_aion_cli_overrides_only() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -206,7 +206,8 @@ async fn migration_016_clears_internal_aion_cli_command_override_only() {
     sqlx::query(
         "UPDATE agent_metadata
          SET command = 'bad-command',
-             command_override = 'bad-override'
+             command_override = 'bad-override',
+             env_override = '[{\"name\":\"ANTHROPIC_API_KEY\",\"value\":\"sk-x\"}]'
          WHERE agent_type = 'aionrs'
            AND agent_source = 'internal'",
     )
@@ -216,11 +217,12 @@ async fn migration_016_clears_internal_aion_cli_command_override_only() {
 
     sqlx::query(
         "INSERT INTO agent_metadata (
-            id, name, backend, command, command_override, agent_type,
+            id, name, backend, command, command_override, env_override, agent_type,
             enabled, agent_source, sort_order, created_at, updated_at
          ) VALUES (
             'external-override-agent', 'External Override', 'external', 'external-cli',
-            '/opt/bin/external-cli', 'acp', 1, 'builtin', 999, 1, 1
+            '/opt/bin/external-cli', '[{\"name\":\"ANTHROPIC_API_KEY\",\"value\":\"sk-y\"}]',
+            'acp', 1, 'builtin', 999, 1, 1
          )",
     )
     .execute(&pool)
@@ -230,7 +232,7 @@ async fn migration_016_clears_internal_aion_cli_command_override_only() {
     run_migration(&pool, 16).await;
 
     let internal_row = sqlx::query(
-        "SELECT command, command_override
+        "SELECT command, command_override, env_override
          FROM agent_metadata
          WHERE agent_type = 'aionrs'
            AND agent_source = 'internal'
@@ -241,11 +243,13 @@ async fn migration_016_clears_internal_aion_cli_command_override_only() {
     .unwrap();
     let internal_command: Option<String> = internal_row.get("command");
     let internal_command_override: Option<String> = internal_row.get("command_override");
+    let internal_env_override: Option<String> = internal_row.get("env_override");
     assert_eq!(internal_command, None);
     assert_eq!(internal_command_override, None);
+    assert_eq!(internal_env_override, None);
 
     let external_row = sqlx::query(
-        "SELECT command, command_override
+        "SELECT command, command_override, env_override
          FROM agent_metadata
          WHERE id = 'external-override-agent'",
     )
@@ -254,8 +258,13 @@ async fn migration_016_clears_internal_aion_cli_command_override_only() {
     .unwrap();
     let external_command: String = external_row.get("command");
     let external_command_override: String = external_row.get("command_override");
+    let external_env_override: String = external_row.get("env_override");
     assert_eq!(external_command, "external-cli");
     assert_eq!(external_command_override, "/opt/bin/external-cli");
+    assert_eq!(
+        external_env_override,
+        r#"[{"name":"ANTHROPIC_API_KEY","value":"sk-y"}]"#
+    );
 }
 
 async fn insert_legacy_cron(
