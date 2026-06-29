@@ -628,12 +628,15 @@ async fn agent_overrides_roundtrip_and_management_summary() {
 
     // PUT overrides
     let body = json!({
-        "command_override": "/real/bin/ovr",
+        "command_override": "true",
         "env_override": [{"name": "ANTHROPIC_API_KEY", "value": "sk-x"}, {"name": "PATH", "value": "/evil"}]
     });
     let req = json_with_token("PUT", "/api/agents/ovr-agent/overrides", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let put_body = body_json(resp).await;
+    assert_eq!(put_body["data"]["last_check_kind"], "manual");
+    assert_eq!(put_body["data"]["last_check_status"], "offline");
 
     // management row: safe fields, blocked PATH not counted
     let mreq = get_with_token("/api/agents/management", &token);
@@ -659,7 +662,7 @@ async fn agent_overrides_roundtrip_and_management_summary() {
     // GET overrides: plaintext echo
     let greq = get_with_token("/api/agents/ovr-agent/overrides", &token);
     let gbody = body_json(app.clone().oneshot(greq).await.unwrap()).await;
-    assert_eq!(gbody["data"]["command_override"], "/real/bin/ovr");
+    assert_eq!(gbody["data"]["command_override"], "true");
     let envs = gbody["data"]["env_override"].as_array().unwrap();
     assert!(envs.iter().any(|e| e["name"] == "ANTHROPIC_API_KEY"));
 }

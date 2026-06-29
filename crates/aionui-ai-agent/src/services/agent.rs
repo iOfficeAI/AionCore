@@ -172,12 +172,8 @@ impl AgentService {
         repo.update_agent_overrides(id, command_override.as_deref(), env_json.as_deref())
             .await
             .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides: {e}")))?;
-        self.registry.invalidate_and_rehydrate().await?;
 
-        self.availability
-            .management_row_by_id(id)
-            .await
-            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))
+        self.availability.run_manual_health_check(id).await
     }
 
     pub async fn get_agent_overrides(&self, id: &str) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {
