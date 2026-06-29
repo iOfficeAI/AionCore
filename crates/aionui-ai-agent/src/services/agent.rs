@@ -140,7 +140,8 @@ impl AgentService {
         req: aionui_api_types::SetAgentOverridesRequest,
     ) -> Result<AgentManagementRow, AgentError> {
         let repo = self.registry.repo_handle();
-        repo.get(id)
+        let row = repo
+            .get(id)
             .await
             .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
@@ -151,6 +152,12 @@ impl AgentService {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
+
+        if command_override.is_some() && is_internal_aion_cli_row(&row) {
+            return Err(AgentError::bad_request(
+                "Internal Aion CLI does not support command overrides",
+            ));
+        }
 
         let env_json = match req.env_override {
             Some(entries) if !entries.is_empty() => Some(
@@ -187,8 +194,16 @@ impl AgentService {
             .unwrap_or_default();
 
         Ok(aionui_api_types::AgentOverridesResponse {
-            command_override: row.command_override,
+            command_override: if is_internal_aion_cli_row(&row) {
+                None
+            } else {
+                row.command_override
+            },
             env_override,
         })
     }
+}
+
+fn is_internal_aion_cli_row(row: &aionui_db::AgentMetadataRow) -> bool {
+    row.agent_type.eq_ignore_ascii_case("aionrs") && row.agent_source.eq_ignore_ascii_case("internal")
 }

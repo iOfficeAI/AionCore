@@ -194,6 +194,70 @@ async fn migration_015_populates_aionrs_catalog_by_agent_type() {
     assert!(config_options.contains("\"yolo\""));
 }
 
+#[tokio::test]
+async fn migration_016_clears_internal_aion_cli_command_override_only() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    run_migrations_through(&pool, 15).await;
+    sqlx::query(
+        "UPDATE agent_metadata
+         SET command = 'bad-command',
+             command_override = 'bad-override'
+         WHERE agent_type = 'aionrs'
+           AND agent_source = 'internal'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO agent_metadata (
+            id, name, backend, command, command_override, agent_type,
+            enabled, agent_source, sort_order, created_at, updated_at
+         ) VALUES (
+            'external-override-agent', 'External Override', 'external', 'external-cli',
+            '/opt/bin/external-cli', 'acp', 1, 'builtin', 999, 1, 1
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    run_migration(&pool, 16).await;
+
+    let internal_row = sqlx::query(
+        "SELECT command, command_override
+         FROM agent_metadata
+         WHERE agent_type = 'aionrs'
+           AND agent_source = 'internal'
+         LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let internal_command: Option<String> = internal_row.get("command");
+    let internal_command_override: Option<String> = internal_row.get("command_override");
+    assert_eq!(internal_command, None);
+    assert_eq!(internal_command_override, None);
+
+    let external_row = sqlx::query(
+        "SELECT command, command_override
+         FROM agent_metadata
+         WHERE id = 'external-override-agent'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let external_command: String = external_row.get("command");
+    let external_command_override: String = external_row.get("command_override");
+    assert_eq!(external_command, "external-cli");
+    assert_eq!(external_command_override, "/opt/bin/external-cli");
+}
+
 async fn insert_legacy_cron(
     pool: &sqlx::SqlitePool,
     id: &str,

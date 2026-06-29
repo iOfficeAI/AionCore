@@ -191,8 +191,8 @@ impl AgentRegistry {
         for meta in guard.values_mut() {
             let (path, reason) = probe_with_reason(meta);
             meta.resolved_command = path;
-            meta.available = meta.resolved_command.is_some()
-                || (meta.enabled && meta.command.is_none() && meta.agent_source == AgentSource::Internal);
+            meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(meta);
+            let reason = if meta.available { None } else { reason };
             log_probe_result(meta, &reason);
         }
         log_availability_summary(guard.values(), "AgentRegistry refresh_availability complete");
@@ -464,12 +464,24 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
     // Layered on top of seed truth at this single projection point so both
     // the runtime spawn (factory) and the probe (availability) observe the
     // same merged command/env without either needing extra plumbing.
-    meta.has_command_override = meta_command_override(&command_override_raw).is_some();
+    let command_override = meta_command_override(&command_override_raw);
+    let is_internal_aion_cli = is_internal_aion_cli(&meta);
+    if is_internal_aion_cli && command_override.is_some() {
+        warn!(
+            id = %meta.id,
+            name = %meta.name,
+            "Ignoring command override for internal Aion CLI agent"
+        );
+    }
+
+    meta.has_command_override = command_override.is_some() && !is_internal_aion_cli;
     meta.env_override_key_count = parse_env_override(&env_override_raw)
         .map(|v| v.iter().filter(|e| !is_blocked_override_env_key(&e.name)).count())
         .unwrap_or(0);
 
-    if let Some(path) = meta_command_override(&command_override_raw) {
+    if is_internal_aion_cli {
+        meta.command = None;
+    } else if let Some(path) = command_override {
         meta.command = Some(path);
     }
     if let Some(extra) = parse_env_override(&env_override_raw) {
@@ -484,9 +496,17 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
 
     let (path, reason) = probe_with_reason(&meta);
     meta.resolved_command = path;
-    meta.available = meta.resolved_command.is_some()
-        || (meta.enabled && meta.command.is_none() && meta.agent_source == AgentSource::Internal);
+    meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(&meta);
+    let reason = if meta.available { None } else { reason };
     Some((meta, reason))
+}
+
+fn is_internal_aion_cli(meta: &AgentMetadata) -> bool {
+    meta.agent_type == AgentType::Aionrs && meta.agent_source == AgentSource::Internal
+}
+
+fn is_internal_commandless_agent(meta: &AgentMetadata) -> bool {
+    meta.enabled && meta.command.is_none() && meta.agent_source == AgentSource::Internal
 }
 
 /// Wrapper around [`probe_resolved_command`] that returns both the
@@ -1292,6 +1312,57 @@ mod tests {
         };
         let (meta, _) = super::decode_row(row).expect("decodes");
         assert_eq!(meta.command.as_deref(), Some("/opt/factory/bin/droid"));
+    }
+
+    #[test]
+    fn decode_row_ignores_internal_aion_cli_command_override() {
+        use aionui_db::AgentMetadataRow;
+        let row = AgentMetadataRow {
+            id: "632f31d2".to_string(),
+            icon: None,
+            name: "Aion CLI".to_string(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: None,
+            agent_type: "aionrs".to_string(),
+            agent_source: "internal".to_string(),
+            agent_source_info: None,
+            enabled: true,
+            command: None,
+            command_override: Some("irm https://claude.ai/install.ps1 | iex".to_string()),
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            env_override: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let (meta, reason) = super::decode_row(row).expect("decodes");
+        assert_eq!(meta.agent_type, AgentType::Aionrs);
+        assert_eq!(meta.agent_source, AgentSource::Internal);
+        assert_eq!(meta.command, None);
+        assert!(!meta.has_command_override);
+        assert!(meta.available);
+        assert!(reason.is_none());
     }
 
     #[test]
