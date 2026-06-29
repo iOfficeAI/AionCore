@@ -36,8 +36,8 @@ mod tests {
     fn display_messages() {
         assert_eq!(OfficeError::OfficecliNotFound.to_string(), "officecli not found");
         assert_eq!(
-            OfficeError::InstallFailed("npm error".into()).to_string(),
-            "officecli install failed: npm error"
+            OfficeError::InstallFailed("installer error".into()).to_string(),
+            "officecli install failed: installer error"
         );
         assert_eq!(
             OfficeError::PortTimeout("/a.docx".into()).to_string(),

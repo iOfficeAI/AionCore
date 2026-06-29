@@ -67,15 +67,12 @@ mod tests {
             code: "MCP_ENV_MISSING",
             message: "missing required environment variable",
             exit_kind: ExitKind::Config,
-            fields: vec![
-                ("subcommand", "mcp-guide-stdio".into()),
-                ("env", "AION_MCP_PORT".into()),
-            ],
+            fields: vec![("subcommand", "mcp-team-stdio".into()), ("env", "TEAM_MCP_PORT".into())],
         };
 
         assert_eq!(
             report.stderr_line(),
-            "MCP_ENV_MISSING subcommand=mcp-guide-stdio env=AION_MCP_PORT: missing required environment variable"
+            "MCP_ENV_MISSING subcommand=mcp-team-stdio env=TEAM_MCP_PORT: missing required environment variable"
         );
         assert_eq!(report.exit_kind.exit_code(), ExitCode::from(2));
     }

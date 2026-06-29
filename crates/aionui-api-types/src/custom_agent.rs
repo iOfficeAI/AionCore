@@ -10,6 +10,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_discovery::{AgentEnvEntry, BehaviorPolicy};
 
+/// Request body for `PUT /api/agents/{id}/overrides`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetAgentOverridesRequest {
+    #[serde(default)]
+    pub command_override: Option<String>,
+    #[serde(default)]
+    pub env_override: Option<Vec<AgentEnvEntry>>,
+}
+
+/// Response body for `GET /api/agents/{id}/overrides`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentOverridesResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_override: Option<String>,
+    pub env_override: Vec<AgentEnvEntry>,
+}
+
 /// Payload shared by `POST /api/agents/custom` and
 /// `PUT  /api/agents/custom/{id}`.
 ///

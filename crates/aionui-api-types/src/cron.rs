@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use aionui_common::TimestampMs;
+use aionui_common::{ProviderWithModel, TimestampMs};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -37,21 +37,42 @@ pub enum CronScheduleDto {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CronAgentConfigDto {
-    pub backend: String,
+pub struct CronAgentConfigReadDto {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_preset: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub custom_agent_id: Option<String>,
+    pub assistant_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset_agent_type: Option<String>,
+    pub custom_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ProviderWithModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CronAgentConfigWriteDto {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ProviderWithModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_options: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,7 +107,7 @@ pub struct CronJobMetadataDto {
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_config: Option<CronAgentConfigDto>,
+    pub agent_config: Option<CronAgentConfigReadDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,6 +143,7 @@ pub struct CronJobResponse {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCronJobRequest {
     pub name: String,
     #[serde(default)]
@@ -134,12 +156,11 @@ pub struct CreateCronJobRequest {
     pub conversation_id: String,
     #[serde(default)]
     pub conversation_title: Option<String>,
-    pub agent_type: String,
     pub created_by: String,
     #[serde(default)]
     pub execution_mode: Option<String>,
     #[serde(default)]
-    pub agent_config: Option<CronAgentConfigDto>,
+    pub agent_config: Option<CronAgentConfigWriteDto>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,7 +178,7 @@ pub struct UpdateCronJobRequest {
     #[serde(default)]
     pub execution_mode: Option<String>,
     #[serde(default)]
-    pub agent_config: Option<CronAgentConfigDto>,
+    pub agent_config: Option<CronAgentConfigWriteDto>,
     #[serde(default)]
     pub conversation_title: Option<String>,
     #[serde(default)]
@@ -202,6 +223,59 @@ pub struct CronJobExecutedEvent {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::CronAgentConfigWriteDto;
+
+    #[test]
+    fn cron_agent_config_write_rejects_legacy_custom_agent_id() {
+        let err = serde_json::from_value::<CronAgentConfigWriteDto>(serde_json::json!({
+            "name": "Helper",
+            "assistant_id": "assistant-1",
+            "custom_agent_id": "legacy-agent",
+        }))
+        .expect_err("legacy custom_agent_id must be rejected");
+
+        assert!(err.to_string().contains("custom_agent_id"));
+    }
+
+    #[test]
+    fn cron_agent_config_write_rejects_legacy_preset_flag() {
+        let err = serde_json::from_value::<CronAgentConfigWriteDto>(serde_json::json!({
+            "name": "Helper",
+            "assistant_id": "assistant-1",
+            "is_preset": true,
+        }))
+        .expect_err("legacy preset flag must be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("is_preset"));
+    }
+
+    #[test]
+    fn cron_agent_config_write_rejects_legacy_backend() {
+        let err = serde_json::from_value::<CronAgentConfigWriteDto>(serde_json::json!({
+            "backend": "claude",
+            "name": "Helper",
+            "assistant_id": "assistant-1",
+        }))
+        .expect_err("legacy backend must be rejected");
+
+        assert!(err.to_string().contains("backend"));
+    }
+
+    #[test]
+    fn cron_agent_config_write_allows_assistant_only_payload() {
+        let parsed = serde_json::from_value::<CronAgentConfigWriteDto>(serde_json::json!({
+            "name": "Helper",
+            "assistant_id": "assistant-1",
+        }))
+        .expect("assistant-backed writes should not require backend");
+
+        assert_eq!(parsed.assistant_id.as_deref(), Some("assistant-1"));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -365,37 +439,40 @@ mod tests {
         }
     }
 
-    // -- B. CronAgentConfigDto ------------------------------------------------
+    // -- B. CronAgentConfigReadDto -------------------------------------------
 
     #[test]
     fn agent_config_full() {
         let raw = json!({
-            "backend": "acp",
             "name": "Claude Agent",
             "cli_path": "/usr/bin/claude",
             "is_preset": true,
+            "assistant_id": "assistant-1",
             "custom_agent_id": "agent-1",
-            "preset_agent_type": "claude",
             "mode": "auto",
             "model_id": "claude-sonnet-4-6",
+            "model": {"provider_id": "provider-1", "model": "claude-sonnet-4-6"},
             "config_options": {"key": "value"},
             "workspace": "/tmp/ws"
         });
-        let c: CronAgentConfigDto = serde_json::from_value(raw).unwrap();
-        assert_eq!(c.backend, "acp");
+        let c: CronAgentConfigReadDto = serde_json::from_value(raw).unwrap();
         assert_eq!(c.name, "Claude Agent");
         assert_eq!(c.cli_path.as_deref(), Some("/usr/bin/claude"));
         assert_eq!(c.is_preset, Some(true));
+        assert_eq!(c.assistant_id.as_deref(), Some("assistant-1"));
         assert_eq!(c.custom_agent_id.as_deref(), Some("agent-1"));
         assert_eq!(c.model_id.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(
+            c.model.as_ref().map(|model| model.provider_id.as_str()),
+            Some("provider-1")
+        );
         assert_eq!(c.config_options.as_ref().unwrap()["key"], "value");
     }
 
     #[test]
     fn agent_config_minimal() {
-        let raw = json!({"backend": "openai", "name": "GPT"});
-        let c: CronAgentConfigDto = serde_json::from_value(raw).unwrap();
-        assert_eq!(c.backend, "openai");
+        let raw = json!({"name": "GPT"});
+        let c: CronAgentConfigReadDto = serde_json::from_value(raw).unwrap();
         assert_eq!(c.name, "GPT");
         assert!(c.cli_path.is_none());
         assert!(c.is_preset.is_none());
@@ -404,15 +481,15 @@ mod tests {
 
     #[test]
     fn agent_config_serialize_omits_none() {
-        let c = CronAgentConfigDto {
-            backend: "acp".into(),
+        let c = CronAgentConfigReadDto {
             name: "Test".into(),
             cli_path: None,
             is_preset: None,
+            assistant_id: None,
             custom_agent_id: None,
-            preset_agent_type: None,
             mode: None,
             model_id: None,
+            model: None,
             config_options: None,
             workspace: None,
         };
@@ -424,20 +501,24 @@ mod tests {
 
     #[test]
     fn agent_config_roundtrip() {
-        let c = CronAgentConfigDto {
-            backend: "acp".into(),
+        let c = CronAgentConfigReadDto {
             name: "Agent".into(),
             cli_path: Some("/bin/x".into()),
             is_preset: Some(false),
+            assistant_id: Some("assistant-1".into()),
             custom_agent_id: Some("c1".into()),
-            preset_agent_type: None,
             mode: Some("plan".into()),
             model_id: Some("m1".into()),
+            model: Some(ProviderWithModel {
+                provider_id: "p1".into(),
+                model: "m1".into(),
+                use_model: None,
+            }),
             config_options: Some(HashMap::from([("a".into(), "b".into())])),
             workspace: Some("/ws".into()),
         };
         let json = serde_json::to_string(&c).unwrap();
-        let parsed: CronAgentConfigDto = serde_json::from_str(&json).unwrap();
+        let parsed: CronAgentConfigReadDto = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, c);
     }
 
@@ -467,15 +548,15 @@ mod tests {
                 created_by: "user".into(),
                 created_at: 1700000000000,
                 updated_at: 1700001000000,
-                agent_config: Some(CronAgentConfigDto {
-                    backend: "acp".into(),
+                agent_config: Some(CronAgentConfigReadDto {
                     name: "Claude".into(),
                     cli_path: None,
                     is_preset: None,
+                    assistant_id: None,
                     custom_agent_id: None,
-                    preset_agent_type: None,
                     mode: None,
                     model_id: None,
+                    model: None,
                     config_options: None,
                     workspace: None,
                 }),
@@ -576,16 +657,14 @@ mod tests {
             "message": "Do the thing",
             "conversation_id": "conv_1",
             "conversation_title": "Tasks",
-            "agent_type": "acp",
             "created_by": "user",
             "execution_mode": "new_conversation",
-            "agent_config": {"backend": "acp", "name": "Claude"}
+            "agent_config": {"name": "Claude", "assistant_id": "assistant-1"}
         });
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name, "Daily task");
         assert_eq!(req.message.as_deref(), Some("Do the thing"));
         assert_eq!(req.conversation_id, "conv_1");
-        assert_eq!(req.agent_type, "acp");
         assert_eq!(req.created_by, "user");
         assert_eq!(req.execution_mode.as_deref(), Some("new_conversation"));
         assert!(req.agent_config.is_some());
@@ -597,7 +676,6 @@ mod tests {
             "name": "Ping",
             "schedule": {"kind": "every", "every_ms": 60000},
             "conversation_id": "conv_1",
-            "agent_type": "acp",
             "created_by": "agent"
         });
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
@@ -615,7 +693,6 @@ mod tests {
             "schedule": {"kind": "at", "at_ms": 1000},
             "prompt": "Do something",
             "conversation_id": "conv_1",
-            "agent_type": "gemini",
             "created_by": "user"
         });
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
@@ -628,7 +705,6 @@ mod tests {
         let raw = json!({
             "schedule": {"kind": "every", "every_ms": 1000},
             "conversation_id": "c1",
-            "agent_type": "acp",
             "created_by": "user"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
@@ -639,7 +715,6 @@ mod tests {
         let raw = json!({
             "name": "X",
             "conversation_id": "c1",
-            "agent_type": "acp",
             "created_by": "user"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
@@ -650,21 +725,22 @@ mod tests {
         let raw = json!({
             "name": "X",
             "schedule": {"kind": "every", "every_ms": 1000},
-            "agent_type": "acp",
             "created_by": "user"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
     }
 
     #[test]
-    fn create_request_missing_agent_type() {
+    fn create_request_rejects_legacy_agent_type() {
         let raw = json!({
             "name": "X",
             "schedule": {"kind": "every", "every_ms": 1000},
             "conversation_id": "c1",
+            "agent_type": "acp",
             "created_by": "user"
         });
-        assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
+        let err = serde_json::from_value::<CreateCronJobRequest>(raw).expect_err("legacy agent_type must be rejected");
+        assert!(err.to_string().contains("agent_type"));
     }
 
     #[test]
@@ -673,7 +749,6 @@ mod tests {
             "name": "X",
             "schedule": {"kind": "every", "every_ms": 1000},
             "conversation_id": "c1",
-            "agent_type": "acp"
         });
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
     }

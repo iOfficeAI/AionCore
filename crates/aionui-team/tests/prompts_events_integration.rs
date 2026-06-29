@@ -5,13 +5,20 @@ use std::sync::Arc;
 use aionui_api_types::{
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, WebSocketMessage,
 };
+use aionui_db::models::MessageRow;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::events::TeamEventEmitter;
-use aionui_team::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
+use aionui_team::message_projection::{
+    ProjectedTeamMessage, TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest,
+    TeamProjectionSource,
+};
+use aionui_team::prompts::{AvailableAssistant, build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use aionui_team::types::{
     MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
 };
+use aionui_team::visibility::TeamVisibilityPolicy;
 use aionui_team::{Mailbox, TaskBoard, TeammateManager};
+use async_trait::async_trait;
 use common::MockTeamRepo;
 
 // ---------------------------------------------------------------------------
@@ -40,6 +47,48 @@ impl EventBroadcaster for RecordingBroadcaster {
     }
 }
 
+#[derive(Default)]
+struct RecordingProjectionStore {
+    rows: std::sync::Mutex<Vec<MessageRow>>,
+}
+
+impl RecordingProjectionStore {
+    fn rows(&self) -> Vec<MessageRow> {
+        self.rows.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl TeamProjectionMessageStore for RecordingProjectionStore {
+    fn mint_message_id(&self) -> String {
+        format!("msg-recorded-{}", self.rows.lock().unwrap().len())
+    }
+
+    async fn find_projected_message(
+        &self,
+        conversation_id: &str,
+        msg_id: &str,
+        msg_type: &str,
+    ) -> Result<Option<MessageRow>, aionui_team::TeamError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row.conversation_id == conversation_id
+                    && row.msg_id.as_deref() == Some(msg_id)
+                    && row.r#type == msg_type
+            })
+            .cloned())
+    }
+
+    async fn insert_projected_message(&self, row: &MessageRow) -> Result<(), aionui_team::TeamError> {
+        self.rows.lock().unwrap().push(row.clone());
+        Ok(())
+    }
+}
+
 fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
     TeamAgent {
         slot_id: slot_id.into(),
@@ -48,7 +97,7 @@ fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
         conversation_id: format!("conv-{slot_id}"),
         backend: "acp".into(),
         model: "claude".into(),
-        custom_agent_id: None,
+        assistant_id: None,
         status: None,
         conversation_type: None,
         cli_path: None,
@@ -56,14 +105,137 @@ fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
 }
 
 // ===========================================================================
+// Round 2: Visibility policy and Team message projection
+// ===========================================================================
+
+#[test]
+fn visibility_policy_user_message_has_explicit_decisions() {
+    let policy = TeamVisibilityPolicy::user_message();
+
+    assert!(policy.write_mailbox);
+    assert!(policy.insert_user_visible_bubble);
+    assert!(!policy.insert_teammate_visible_bubble);
+    assert!(!policy.allow_hidden_conversation_message);
+    assert!(policy.strip_system_notes);
+}
+
+#[test]
+fn projection_request_for_teammate_mirror_uses_stable_mailbox_dedupe_key() {
+    let req = TeamProjectionRequest::teammate_visible(
+        "team-1",
+        "lead-1",
+        "conv-lead",
+        "worker-1",
+        "Worker",
+        "Done",
+        "mailbox-123",
+    );
+
+    assert_eq!(
+        req.dedupe_key.as_deref(),
+        Some("team:team-1:mailbox:mailbox-123:conversation:conv-lead")
+    );
+    assert!(req.visibility.insert_teammate_visible_bubble);
+    assert!(!req.visibility.allow_hidden_conversation_message);
+}
+
+#[tokio::test]
+async fn projection_inserts_user_visible_bubble_with_stripped_system_notes() {
+    let store = Arc::new(RecordingProjectionStore::default());
+    let bc = Arc::new(RecordingBroadcaster::new());
+    let projection = TeamMessageProjection::new(store.clone(), bc.clone());
+    let req = TeamProjectionRequest {
+        team_id: "team-1".into(),
+        slot_id: "lead-1".into(),
+        conversation_id: "conv-lead".into(),
+        source: TeamProjectionSource::User,
+        content: "Visible\n[SYSTEM NOTE: internal]\ntext".into(),
+        files: vec![],
+        visibility: TeamVisibilityPolicy::user_message(),
+        dedupe_key: None,
+    };
+
+    let projected = projection.project(req).await.unwrap();
+
+    assert!(matches!(projected, ProjectedTeamMessage::Inserted { .. }));
+    let rows = store.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].position.as_deref(), Some("right"));
+    assert!(!rows[0].hidden);
+    let content: serde_json::Value = serde_json::from_str(&rows[0].content).unwrap();
+    assert_eq!(content["content"], "Visible\ntext");
+    assert!(!rows[0].content.contains("SYSTEM NOTE"));
+    assert!(bc.events().is_empty(), "user projection should rely on message.stream");
+}
+
+#[tokio::test]
+async fn projection_dedupes_teammate_mirror_and_broadcasts_persisted_msg_id() {
+    let store = Arc::new(RecordingProjectionStore::default());
+    let bc = Arc::new(RecordingBroadcaster::new());
+    let projection = TeamMessageProjection::new(store.clone(), bc.clone());
+    let req = TeamProjectionRequest::teammate_visible(
+        "team-1",
+        "lead-1",
+        "conv-lead",
+        "worker-1",
+        "Worker",
+        "Done",
+        "mailbox-123",
+    );
+
+    let first = projection.project(req.clone()).await.unwrap();
+    let second = projection.project(req).await.unwrap();
+
+    let first_msg_id = match first {
+        ProjectedTeamMessage::Inserted { msg_id } => msg_id,
+        other => panic!("expected insert, got {other:?}"),
+    };
+    assert!(matches!(
+        second,
+        ProjectedTeamMessage::AlreadyProjected { ref msg_id } if msg_id == &first_msg_id
+    ));
+    assert_eq!(
+        store.rows().len(),
+        1,
+        "duplicate projection must not insert a second row"
+    );
+
+    let events = bc.events();
+    assert_eq!(events.len(), 1, "duplicate projection must not re-broadcast");
+    assert_eq!(events[0].name, "team.teammateMessage");
+    assert_eq!(events[0].data["conversation_id"], "conv-lead");
+    assert_eq!(events[0].data["msg_id"], first_msg_id);
+    assert_eq!(events[0].data["from_slot_id"], "worker-1");
+    assert_eq!(events[0].data["from_name"], "Worker");
+}
+
+// ===========================================================================
 // Test-plan §9: Prompt Templates
 // ===========================================================================
 
-fn default_agent_types() -> Vec<(String, String)> {
+fn default_assistants() -> Vec<AvailableAssistant> {
     vec![
-        ("claude".into(), "Claude".into()),
-        ("codex".into(), "Codex".into()),
-        ("gemini".into(), "Gemini".into()),
+        AvailableAssistant {
+            assistant_id: "research-assistant".into(),
+            name: "Research Assistant".into(),
+            backend: "claude".into(),
+            description: "General-purpose research assistant".into(),
+            skills: vec!["web-search".into(), "synthesis".into()],
+        },
+        AvailableAssistant {
+            assistant_id: "writer-assistant".into(),
+            name: "Writer Assistant".into(),
+            backend: "codex".into(),
+            description: "Writing-focused assistant".into(),
+            skills: vec!["drafting".into()],
+        },
+        AvailableAssistant {
+            assistant_id: "slides-assistant".into(),
+            name: "Slides Assistant".into(),
+            backend: "gemini".into(),
+            description: "Presentation builder".into(),
+            skills: vec!["slides".into()],
+        },
     ]
 }
 
@@ -76,8 +248,8 @@ fn lp1_lead_prompt_contains_member_list() {
         make_agent("w1", "Alice", TeammateRole::Teammate),
         make_agent("w2", "Bob", TeammateRole::Teammate),
     ];
-    let types = default_agent_types();
-    let prompt = build_lead_prompt("Alpha", &members, &types);
+    let assistants = default_assistants();
+    let prompt = build_lead_prompt("Alpha", &members, &assistants);
 
     // AionUi bullet format: `- {name} ({backend}, status: {status})`
     assert!(prompt.contains("- Lead ("), "lead name missing");
@@ -89,7 +261,7 @@ fn lp1_lead_prompt_contains_member_list() {
 
 #[test]
 fn lp2_lead_prompt_contains_tool_descriptions() {
-    let prompt = build_lead_prompt("Beta", &[], &default_agent_types());
+    let prompt = build_lead_prompt("Beta", &[], &default_assistants());
 
     // AionUi lead prompt references the `team_*` coordination tools that the
     // leader must use; the MCP layer enumerates them with arguments, so the
@@ -113,7 +285,7 @@ fn lp2_lead_prompt_contains_tool_descriptions() {
 
 #[test]
 fn lp3_lead_prompt_contains_task_management_guidance() {
-    let prompt = build_lead_prompt("Gamma", &[], &default_agent_types());
+    let prompt = build_lead_prompt("Gamma", &[], &default_assistants());
 
     assert!(
         prompt.contains("Break the work into tasks"),
@@ -132,13 +304,20 @@ fn lp3_lead_prompt_contains_task_management_guidance() {
 #[test]
 fn tp1_teammate_prompt_contains_execution_guidance() {
     let agent = make_agent("w1", "Worker1", TeammateRole::Teammate);
-    let prompt = build_teammate_prompt(&agent, "Alpha");
+    let members = vec![make_agent("lead-1", "Lead", TeammateRole::Lead), agent.clone()];
+    let prompt = build_teammate_prompt(&agent, "Alpha", &members);
 
-    assert!(prompt.contains("execute tasks"), "missing execution guidance");
+    assert!(prompt.contains("## Team Governance"), "missing governance");
+    assert!(
+        prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."),
+        "missing canonical coordination rule"
+    );
+    assert!(prompt.contains("## How to Work"), "missing execution guidance");
     assert!(prompt.contains("team_send_message"), "missing communication tool");
     assert!(prompt.contains("team_task_update"), "missing task update tool");
     assert!(prompt.contains("shutdown_request"), "missing shutdown protocol");
     assert!(prompt.contains("shutdown_approved"), "missing shutdown_approved");
+    assert!(prompt.contains("STOP GENERATING"), "missing stop protocol");
 }
 
 // -- TP-2: Teammate prompt contains team name --------------------------------
@@ -146,9 +325,10 @@ fn tp1_teammate_prompt_contains_execution_guidance() {
 #[test]
 fn tp2_teammate_prompt_contains_team_name() {
     let agent = make_agent("w1", "Worker1", TeammateRole::Teammate);
-    let prompt = build_teammate_prompt(&agent, "Project Falcon");
+    let members = vec![make_agent("lead-1", "Lead", TeammateRole::Lead), agent.clone()];
+    let prompt = build_teammate_prompt(&agent, "Project Falcon", &members);
 
-    assert!(prompt.contains("\"Project Falcon\""));
+    assert!(prompt.contains("Team: Project Falcon"));
 }
 
 // -- WP-1: Wake payload includes unread messages -----------------------------
@@ -275,7 +455,7 @@ async fn we1_agent_status_change_event() {
 
     let events = bc.events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].name, "team.agent.status");
+    assert_eq!(events[0].name, "team.agentStatusChanged");
 
     let payload: TeamAgentStatusPayload = serde_json::from_value(events[0].data.clone()).unwrap();
     assert_eq!(payload.team_id, "t1");
@@ -300,14 +480,14 @@ async fn we2_agent_spawned_event() {
     let spawned: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.spawned")
+        .filter(|e| e.name == "team.agentSpawned")
         .collect();
     assert_eq!(spawned.len(), 1);
 
     let payload: TeamAgentSpawnedPayload = serde_json::from_value(spawned[0].data.clone()).unwrap();
     assert_eq!(payload.team_id, "t1");
-    assert_eq!(payload.agent.slot_id, "w2");
-    assert_eq!(payload.agent.name, "NewWorker");
+    assert_eq!(payload.assistant.slot_id, "w2");
+    assert_eq!(payload.assistant.name, "NewWorker");
 }
 
 // -- WE-3: Agent removed event -----------------------------------------------
@@ -329,7 +509,7 @@ async fn we3_agent_removed_event() {
     let removed: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.removed")
+        .filter(|e| e.name == "team.agentRemoved")
         .collect();
     assert_eq!(removed.len(), 1);
 
@@ -357,7 +537,7 @@ async fn we4_agent_renamed_event() {
     let renamed: Vec<_> = bc
         .events()
         .into_iter()
-        .filter(|e| e.name == "team.agent.renamed")
+        .filter(|e| e.name == "team.agentRenamed")
         .collect();
     assert_eq!(renamed.len(), 1);
 
@@ -387,7 +567,7 @@ fn event_emitter_uses_typed_payloads() {
     assert_eq!(p1.status, "thinking");
 
     let p2: TeamAgentSpawnedPayload = serde_json::from_value(events[1].data.clone()).unwrap();
-    assert_eq!(p2.agent.slot_id, "s1");
+    assert_eq!(p2.assistant.slot_id, "s1");
 
     let p3: TeamAgentRemovedPayload = serde_json::from_value(events[2].data.clone()).unwrap();
     assert_eq!(p3.slot_id, "s1");

@@ -10,13 +10,18 @@ aionui-system.workspace = true
 aionui-runtime.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
+futures-util.workspace = true
 open.workspace = true
 which.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

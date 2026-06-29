@@ -17,8 +17,8 @@
         "ru-RU": "Создаёт, редактирует и анализирует профессиональные документы Word с помощью officecli: отчёты, предложения, письма, служебные записки и другое.",
         "uk-UA": "Створюйте, редагуйте та аналізуйте професійні документи Word за допомогою officecli: звіти, пропозиції, листи, нотатки тощо."
       },
-      "avatar": "📝",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/word-creator.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "officecli-docx"
       ],
@@ -70,8 +70,8 @@
         "ru-RU": "Создаёт, редактирует и анализирует профессиональные презентации PowerPoint с помощью officecli: выразительный дизайн, разнообразные макеты и сильная визуальная подача.",
         "uk-UA": "Створюйте, редагуйте та аналізуйте професійні презентації PowerPoint за допомогою officecli: виразний дизайн, різноманітні макети та візуальний вплив."
       },
-      "avatar": "📊",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/ppt-creator.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "officecli-pptx"
       ],
@@ -123,8 +123,8 @@
         "ru-RU": "Создаёт, редактирует и анализирует профессиональные таблицы Excel с помощью officecli: финансовые модели, дашборды, трекеры и анализ данных.",
         "uk-UA": "Створюйте, редагуйте та аналізуйте професійні таблиці Excel за допомогою officecli: фінансові моделі, дашборди, трекери та аналіз даних."
       },
-      "avatar": "📈",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/excel-creator.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "officecli-xlsx"
       ],
@@ -176,8 +176,8 @@
         "ru-RU": "Создаёт профессиональные презентации с анимацией Morph через officecli. Поддерживает разные визуальные стили и полный цикл от идеи до готовых слайдов.",
         "uk-UA": "Створюйте професійні презентації з анімацією Morph за допомогою officecli. Підтримує різні візуальні стилі та повний робочий процес від ідеї до готових слайдів."
       },
-      "avatar": "✨",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/morph-ppt.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "morph-ppt"
       ],
@@ -225,8 +225,8 @@
         "en-US": "Turn a GLB 3D model into a cinematic Morph presentation. The model is the visual hero — close-up for details, bird's eye for structure, low angle for drama, with smooth Morph transitions between every shot. Note: 3D models and Morph transitions require Microsoft PowerPoint to display correctly.",
         "zh-CN": "把 GLB 3D 模型变成电影感 Morph 演示文稿。模型是视觉主角——特写看细节、俯视看结构、仰拍看气势，每页之间用 Morph 转场做流畅的镜头运动。注意：3D 模型和 Morph 转场效果需要在微软 PowerPoint 中打开才能正常显示。"
       },
-      "avatar": "🎬",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/morph-ppt-3d.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "morph-ppt-3d",
         "morph-ppt"
@@ -269,8 +269,8 @@
         "ru-RU": "Создаёт инвесторские питч-деки, презентации запусков и корпоративные продажи: градиентный дизайн, графики, таблицы конкурентов, слайды команды и заметки спикера. Подходит для стадий от seed до Series A и выше.",
         "uk-UA": "Створюйте інвесторські пітч-деки, презентації продуктів та корпоративні продажі: градієнтний дизайн, графіки, таблиці конкурентів, слайди команди та нотатки доповідача. Підходить для стадій від Seed до Series A+."
       },
-      "avatar": "🎯",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/pitch-deck-creator.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "officecli-pitch-deck"
       ],
@@ -322,8 +322,8 @@
         "ru-RU": "Преобразует CSV и табличные данные в аккуратные Excel-дашборды: KPI-карточки, графики с привязкой к данным, спарклайны и условное форматирование. Масштабирует сложность под объём данных - от краткой сводки до полноценной аналитической панели.",
         "uk-UA": "Перетворюйте CSV або табличні дані на професійні дашборди Excel: KPI-картки, графіки з прив'язкою до даних, спарклайни та умовне форматування. Автоматично масштабує складність під обсяг даних."
       },
-      "avatar": "📊",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/dashboard-creator.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "officecli-data-dashboard"
       ],
@@ -375,8 +375,8 @@
         "ru-RU": "Создаёт академические статьи, научные работы и white paper со строгой структурой: нативное оглавление Word, формулы LaTeX в OMML, библиография в форматах APA/Physics/Chicago, сноски, многоколоночная вёрстка и стили под тип работы.",
         "uk-UA": "Створюйте структуровані академічні статті, наукові роботи та White Papers: зміст Word, формули LaTeX в OMML, бібліографія (APA/Physics/Chicago), виноски та багатоколонкова верстка."
       },
-      "avatar": "📚",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/academic-paper.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "officecli-academic-paper"
       ],
@@ -428,8 +428,8 @@
         "ru-RU": "Строит финансовые модели на основе текстового запроса: три финансовые формы, DCF-оценка, cap table, сценарный анализ, таблицы чувствительности и долговые графики. Все значения выводятся через связные формульные цепочки от исходных предположений.",
         "uk-UA": "Будуйте фінансові моделі на основі формул за текстовим запитом: три фінансові форми, DCF-оцінка, Cap Tables, сценарний аналіз та графіки боргів."
       },
-      "avatar": "💰",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/financial-model-creator.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "officecli-financial-model"
       ],
@@ -466,59 +466,6 @@
       "models": []
     },
     {
-      "id": "star-office-helper",
-      "name": "Star Office Helper",
-      "name_i18n": {
-        "en-US": "Star Office Helper",
-        "zh-CN": "Star Office 助手",
-        "ru-RU": "Помощник Star Office",
-        "uk-UA": "Помічник Star Office"
-      },
-      "description": "Install, connect, and troubleshoot Star-Office-UI visualization for Aion preview.",
-      "description_i18n": {
-        "en-US": "Install, connect, and troubleshoot Star-Office-UI visualization for Aion preview.",
-        "zh-CN": "用于在 Aion 预览中安装、连接并排查 Star-Office-UI 可视化问题。",
-        "ru-RU": "Помогает установить, подключить и диагностировать визуализацию Star-Office-UI для предпросмотра в Aion.",
-        "uk-UA": "Допомагає встановлювати, підключати та діагностувати візуалізацію Star-Office-UI для попереднього перегляду в Aion."
-      },
-      "avatar": "📺",
-      "preset_agent_type": "aionrs",
-      "enabled_skills": [
-        "star-office-helper"
-      ],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/star-office-helper.{locale}.md",
-      "prompts": [
-        "Set up Star Office on my machine",
-        "Fix Unauthorized on Star Office page",
-        "Connect Aion preview to http://127.0.0.1:19000"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Set up Star Office on my machine",
-          "Fix Unauthorized on Star Office page",
-          "Connect Aion preview to http://127.0.0.1:19000"
-        ],
-        "zh-CN": [
-          "帮我安装 Star Office",
-          "排查 Star Office Unauthorized",
-          "把 Aion 预览连接到 http://127.0.0.1:19000"
-        ],
-        "ru-RU": [
-          "Настрой Star Office на моём компьютере",
-          "Исправь ошибку Unauthorized на странице Star Office",
-          "Подключи предпросмотр Aion к http://127.0.0.1:19000"
-        ],
-        "uk-UA": [
-          "Налаштувати Star Office на моєму комп'ютері",
-          "Виправити помилку Unauthorized на сторінці Star Office",
-          "Підключити попередній перегляд Aion до http://127.0.0.1:19000"
-        ]
-      },
-      "models": []
-    },
-    {
       "id": "openclaw-setup",
       "name": "OpenClaw Setup Expert",
       "name_i18n": {
@@ -534,8 +481,8 @@
         "ru-RU": "Эксперт по установке, развёртыванию, настройке и устранению неполадок OpenClaw. Помогает пройти настройку, диагностирует проблемы и подсказывает безопасные практики.",
         "uk-UA": "Експертний посібник зі встановлення, розгортання, налаштування та усунення несправностей OpenClaw. Допомагає з налаштуванням та безпекою."
       },
-      "avatar": "🦞",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/openclaw-setup.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "openclaw-setup",
         "aionui-webui-setup"
@@ -588,8 +535,8 @@
         "ru-RU": "Автономный помощник для выполнения задач с работой с файлами, обработкой документов и многошаговым планированием.",
         "uk-UA": "Автономне виконання завдань з роботою з файлами, обробкою документів та багатокроковим плануванням робочих процесів."
       },
-      "avatar": "cowork.svg",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/cowork.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "skill-creator",
         "officecli-pptx",
@@ -627,8 +574,7 @@
           "Витягти та узагальнити ключову інформацію з усіх файлів PDF"
         ]
       },
-      "models": [],
-      "skill_file": "skills/cowork-skills.{locale}.md"
+      "models": []
     },
     {
       "id": "game-3d",
@@ -646,8 +592,8 @@
         "ru-RU": "Генерирует полноценную 3D-игру-платформер со сбором предметов в одном HTML-файле.",
         "uk-UA": "Генеруйте повноцінну 3D-гру-платформер зі збором предметів в одному HTML-файлі."
       },
-      "avatar": "🎮",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/game-3d.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],
@@ -697,8 +643,8 @@
         "ru-RU": "Профессиональный UI/UX-помощник с 57 стилями, 95 цветовыми палитрами, 56 сочетаниями шрифтов и лучшими практиками для разных стеков.",
         "uk-UA": "Професійний UI/UX-помічник з 57 стилями, 95 кольоровими палітрами, 56 поєднаннями шрифтів та найкращими практиками для різних технологій."
       },
-      "avatar": "🎨",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/ui-ux-pro-max.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],
@@ -748,8 +694,8 @@
         "ru-RU": "Файловое планирование в стиле Manus для сложных задач. Использует task_plan.md, findings.md и progress.md для сохранения устойчивого контекста.",
         "uk-UA": "Файлове планування в стилі Manus для складних завдань. Використовує task_plan.md, findings.md та progress.md для збереження контексту."
       },
-      "avatar": "📋",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/planning-with-files.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],
@@ -799,8 +745,8 @@
         "ru-RU": "Коуч по личному развитию на основе фреймворка HUMAN 3.0: 4 квадранта (ум, тело, дух, призвание), 3 уровня и 3 фазы роста.",
         "uk-UA": "Коуч з особистого розвитку на основі фреймворка HUMAN 3.0: 4 квадранти (Розум/Тіло/Дух/Призвання), 3 рівні та 3 фази росту."
       },
-      "avatar": "🧭",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/human-3-coach.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],
@@ -850,8 +796,8 @@
         "ru-RU": "Разворачивает запрос на найм в полноценное описание вакансии и изображения, а затем публикует это в соцсетях через коннекторы.",
         "uk-UA": "Розгортає запит на найм у повноцінний опис вакансії та зображення, а потім публікує це в соцмережах через конектори."
       },
-      "avatar": "📣",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/social-job-publisher.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "xiaohongshu-recruiter",
         "x-recruiter"
@@ -886,8 +832,7 @@
           "Створити пост про вакансію для кількох платформ (LinkedIn, X)"
         ]
       },
-      "models": [],
-      "skill_file": "skills/social-job-publisher-skills.{locale}.md"
+      "models": []
     },
     {
       "id": "moltbook",
@@ -905,8 +850,8 @@
         "ru-RU": "Социальная сеть для AI-агентов: публикации, комментарии, голосования и создание сообществ.",
         "uk-UA": "Соціальна мережа для AI-агентів. Публікації, коментарі, голосування та створення спільнот."
       },
-      "avatar": "🦞",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/moltbook.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "moltbook"
       ],
@@ -940,8 +885,7 @@
           "Перевірити нові особисті повідомлення"
         ]
       },
-      "models": [],
-      "skill_file": "skills/moltbook-skills.{locale}.md"
+      "models": []
     },
     {
       "id": "beautiful-mermaid",
@@ -959,8 +903,8 @@
         "ru-RU": "Создаёт блок-схемы, sequence-, state-, class- и ER-диаграммы с красивыми темами оформления.",
         "uk-UA": "Створюйте блок-схеми, діаграми послідовності, станів, класів та ER-діаграми з красивими темами оформлення."
       },
-      "avatar": "📈",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/beautiful-mermaid.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "mermaid"
       ],
@@ -1012,8 +956,8 @@
         "ru-RU": "Иммерсивный сюжетный ролевой режим. Можно начать тремя способами: описать персонажей словами, вставить PNG-изображения или открыть папку с карточками персонажей и лором мира.",
         "uk-UA": "Іммерсивний сюжетний рольовий режим. Можна почати трьома способами: описати персонажів словами, вставити PNG-зображення або відкрити папку з картками персонажів та лором світу."
       },
-      "avatar": "📖",
-      "preset_agent_type": "aionrs",
+      "avatar": "avatars/story-roleplay.jpg",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "story-roleplay"
       ],
@@ -1066,7 +1010,7 @@
         "uk-UA": "Створюйте заповнювані форми Word (.docx) зі справжніми елементами керування вмістом, полями-прапорцями, MERGEFIELD для злиття пошти та захистом документа — редагуються лише задані поля, решта залишається заблокованою. HR-анкети, опитування, шаблони контрактів / SOW, комплаєнс-чеклисти, медичні анкети."
       },
       "avatar": "📋",
-      "preset_agent_type": "aionrs",
+      "agent_ref": "aionrs",
       "enabled_skills": [
         "officecli-word-form"
       ],
@@ -1098,6 +1042,66 @@
           "Зроби .docx-форму прийому нового співробітника з полями ПІБ, дата початку, відділ, керівник, чек-листом навчання за посадою та прапорцями запиту обладнання; редагуються лише поля.",
           "Створи шаблон контракту SOW .docx з MERGEFIELD-плейсхолдерами для імені клієнта, дати набрання чинності, обсягу робіт, загальної суми та блоку підписів; захисти все, крім області підпису.",
           "Зроби .docx-анкету медичного прийому з випадаючим списком причини візиту, текстовими полями для алергій / прийнятих ліків, сіткою прапорців за минулими станами та рядком підпису внизу."
+        ]
+      },
+      "models": []
+    },
+    {
+      "id": "aionui-assistant",
+      "name": "AionUi Butler",
+      "name_i18n": {
+        "en-US": "AionUi Butler",
+        "zh-CN": "AionUi管家",
+        "ru-RU": "Дворецкий AionUi",
+        "uk-UA": "Дворецький AionUi"
+      },
+      "description": "Your all-in-one AionUi butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach AionUi from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
+      "description_i18n": {
+        "en-US": "Your all-in-one AionUi butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach AionUi from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
+        "zh-CN": "你的 AionUi 全能管家：配置助手、技能、MCP 服务器与 LLM 模型；设置远程访问，让你在手机或外网也能打开 AionUi、生成分享链接；还能诊断卡住的会话、失败的模型调用，或定时任务为何没执行。",
+        "ru-RU": "Ваш универсальный дворецкий AionUi: настройка ассистентов, навыков, серверов MCP и провайдеров LLM; настройка удалённого доступа, чтобы открывать AionUi с телефона или делиться ссылкой; и диагностика проблем — зависших разговоров, сбоев моделей или почему не выполнилась запланированная задача.",
+        "uk-UA": "Ваш універсальний дворецький AionUi: налаштування асистентів, навичок, серверів MCP і провайдерів LLM; налаштування віддаленого доступу, щоб відкривати AionUi з телефона або ділитися посиланням; і діагностика проблем — зависань розмов, збоїв моделей або чому не виконалося заплановане завдання."
+      },
+      "avatar": "avatars/aionui-assistant.jpg",
+      "agent_ref": "aionrs",
+      "enabled_skills": [
+        "aionui-config",
+        "aionui-troubleshooting",
+        "aionui-webui-public"
+      ],
+      "custom_skill_names": [],
+      "disabled_builtin_skills": [],
+      "rule_file": "rules/aionui-assistant.{locale}.md",
+      "prompts": [
+        "Add a new LLM provider and API key, then set it as the default model",
+        "Set up remote access for me, so I can open AionUi from my phone when I'm out",
+        "A conversation is stuck — please diagnose what's wrong",
+        "Create a new assistant and attach a skill to it"
+      ],
+      "prompts_i18n": {
+        "en-US": [
+          "Add a new LLM provider and API key, then set it as the default model",
+          "Set up remote access for me, so I can open AionUi from my phone when I'm out",
+          "A conversation is stuck — please diagnose what's wrong",
+          "Create a new assistant and attach a skill to it"
+        ],
+        "zh-CN": [
+          "添加一个新的 LLM 模型和 API Key，并设为默认模型",
+          "帮我配置远程访问，让我在外面用手机也能打开 AionUi",
+          "有个会话卡住了，帮我诊断哪里出了问题",
+          "创建一个新助手，并给它绑定一个技能"
+        ],
+        "ru-RU": [
+          "Добавь нового провайдера LLM и API-ключ, затем сделай его моделью по умолчанию",
+          "Настрой удалённый доступ, чтобы я мог открывать AionUi с телефона, когда меня нет",
+          "Разговор завис — пожалуйста, диагностируй, что не так",
+          "Создай нового ассистента и подключи к нему навык"
+        ],
+        "uk-UA": [
+          "Додай нового провайдера LLM та API-ключ, потім зроби його моделлю за замовчуванням",
+          "Налаштуй віддалений доступ, щоб я міг відкривати AionUi з телефона, коли мене немає",
+          "Розмова зависла — будь ласка, діагностуй, що не так",
+          "Створи нового асистента й підключи до нього навичку"
         ]
       },
       "models": []

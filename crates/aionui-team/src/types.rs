@@ -98,8 +98,15 @@ pub struct TeamAgent {
     pub backend: String,
     #[serde(default)]
     pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "customAgentId")]
-    pub custom_agent_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "assistant_id",
+        alias = "assistantId",
+        alias = "custom_agent_id",
+        alias = "customAgentId"
+    )]
+    pub assistant_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<TeammateStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "conversationType")]
@@ -116,13 +123,15 @@ impl TeamAgent {
     pub fn to_response_with_icon(&self, icon: Option<String>) -> TeamAgentResponse {
         TeamAgentResponse {
             slot_id: self.slot_id.clone(),
+            assistant_name: self.name.clone(),
             name: self.name.clone(),
             role: self.role.to_string(),
             conversation_id: self.conversation_id.clone(),
+            assistant_backend: self.backend.clone(),
             backend: self.backend.clone(),
             icon,
             model: self.model.clone(),
-            custom_agent_id: self.custom_agent_id.clone(),
+            assistant_id: self.assistant_id.clone(),
             status: self.status.map(|s| s.to_string()),
             pending_confirmations: 0,
         }
@@ -137,6 +146,7 @@ impl TeamAgent {
 pub struct Team {
     pub id: String,
     pub name: String,
+    pub workspace: String,
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
@@ -268,6 +278,7 @@ impl Team {
         Ok(Self {
             id: row.id.clone(),
             name: row.name.clone(),
+            workspace: row.workspace.clone(),
             agents,
             lead_agent_id: row.lead_agent_id.clone(),
             created_at: row.created_at,
@@ -279,8 +290,9 @@ impl Team {
         TeamResponse {
             id: self.id.clone(),
             name: self.name.clone(),
-            agents: self.agents.iter().map(|a| a.to_response()).collect(),
-            lead_agent_id: self.lead_agent_id.clone(),
+            workspace: self.workspace.clone(),
+            assistants: self.agents.iter().map(|a| a.to_response()).collect(),
+            leader_assistant_id: self.lead_agent_id.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -508,7 +520,7 @@ mod tests {
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: Some("custom-1".into()),
+            assistant_id: Some("custom-1".into()),
             status: Some(TeammateStatus::Working),
             conversation_type: None,
             cli_path: None,
@@ -518,7 +530,7 @@ mod tests {
         assert_eq!(resp.role, "lead");
         assert!(resp.icon.is_none());
         assert_eq!(resp.status.as_deref(), Some("working"));
-        assert_eq!(resp.custom_agent_id.as_deref(), Some("custom-1"));
+        assert_eq!(resp.assistant_id.as_deref(), Some("custom-1"));
     }
 
     #[test]
@@ -530,7 +542,7 @@ mod tests {
             conversation_id: "c1".into(),
             backend: "claude".into(),
             model: "opus".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -550,7 +562,7 @@ mod tests {
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -569,7 +581,7 @@ mod tests {
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: Some("x".into()),
+            assistant_id: Some("x".into()),
             status: Some(TeammateStatus::Idle),
             conversation_type: None,
             cli_path: None,
@@ -577,7 +589,8 @@ mod tests {
         let val = serde_json::to_value(&agent).unwrap();
         assert!(val.get("slot_id").is_some());
         assert!(val.get("conversation_id").is_some());
-        assert!(val.get("custom_agent_id").is_some());
+        assert!(val.get("assistant_id").is_some());
+        assert!(val.get("custom_agent_id").is_none());
     }
 
     #[test]
@@ -598,6 +611,7 @@ mod tests {
         assert_eq!(agent.role, TeammateRole::Lead);
         assert_eq!(agent.status, Some(TeammateStatus::Working));
         assert_eq!(agent.conversation_type.as_deref(), Some("acp"));
+        assert_eq!(agent.assistant_id.as_deref(), Some("custom-1"));
     }
 
     // -- Team from_row --------------------------------------------------------
@@ -611,7 +625,7 @@ mod tests {
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -642,6 +656,7 @@ mod tests {
         let team = Team {
             id: "t1".into(),
             name: "Alpha".into(),
+            workspace: "/workspace/team".into(),
             agents: vec![TeamAgent {
                 slot_id: "s1".into(),
                 name: "Lead".into(),
@@ -649,7 +664,7 @@ mod tests {
                 conversation_id: "c1".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
-                custom_agent_id: None,
+                assistant_id: None,
                 status: Some(TeammateStatus::Idle),
                 conversation_type: None,
                 cli_path: None,
@@ -661,9 +676,9 @@ mod tests {
         let resp = team.to_response();
         assert_eq!(resp.id, "t1");
         assert_eq!(resp.name, "Alpha");
-        assert_eq!(resp.agents.len(), 1);
-        assert_eq!(resp.agents[0].slot_id, "s1");
-        assert_eq!(resp.lead_agent_id.as_deref(), Some("s1"));
+        assert_eq!(resp.assistants.len(), 1);
+        assert_eq!(resp.assistants[0].slot_id, "s1");
+        assert_eq!(resp.leader_assistant_id.as_deref(), Some("s1"));
         assert_eq!(resp.created_at, 1000);
         assert_eq!(resp.updated_at, 2000);
     }

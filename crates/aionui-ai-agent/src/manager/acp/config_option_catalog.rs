@@ -31,40 +31,6 @@ pub(crate) fn derive_models_from_config_options(options: &[SessionConfigOption])
         return None;
     }
 
-    if let Some(thought_select) = find_select(
-        options,
-        &["thought_level", "reasoning_effort"],
-        &SessionConfigOptionCategory::ThoughtLevel,
-    ) {
-        let thought_options = flatten_select_options(&thought_select.options);
-        if !thought_options.is_empty() {
-            let current_model =
-                non_empty_or_first(select.current_value.to_string(), &model_options[0].value.to_string());
-            let current_thought = non_empty_or_first(
-                thought_select.current_value.to_string(),
-                &thought_options[0].value.to_string(),
-            );
-            let available_models: Vec<ModelInfo> = model_options
-                .into_iter()
-                .flat_map(|model| {
-                    thought_options.iter().map(move |thought| {
-                        let thought_value = thought.value.to_string();
-                        ModelInfo::new(
-                            format!("{}/{}", model.value, thought.value),
-                            format!("{} ({thought_value})", model.name),
-                        )
-                        .description(model.description.clone())
-                    })
-                })
-                .collect();
-
-            return Some(SessionModelState::new(
-                format!("{current_model}/{current_thought}"),
-                available_models,
-            ));
-        }
-    }
-
     let available_models: Vec<ModelInfo> = model_options
         .into_iter()
         .map(|option| {
@@ -354,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn derives_codex_model_variants_from_model_and_thought_level_options() {
+    fn derives_models_without_thought_level_cartesian_product() {
         let options = vec![
             SessionConfigOption::select(
                 "model",
@@ -380,14 +346,12 @@ mod tests {
 
         let models = derive_models_from_config_options(&options).expect("combined model catalog");
 
-        assert_eq!(models.current_model_id.to_string(), "gpt-5.5/medium");
-        assert_eq!(models.available_models.len(), 4);
-        assert_eq!(models.available_models[0].model_id.to_string(), "gpt-5.5/low");
-        assert_eq!(models.available_models[0].name, "GPT-5.5 (low)");
-        assert_eq!(models.available_models[1].model_id.to_string(), "gpt-5.5/medium");
-        assert_eq!(models.available_models[1].name, "GPT-5.5 (medium)");
-        assert_eq!(models.available_models[3].model_id.to_string(), "gpt-5.4/medium");
-        assert_eq!(models.available_models[3].name, "gpt-5.4 (medium)");
+        assert_eq!(models.current_model_id.to_string(), "gpt-5.5");
+        assert_eq!(models.available_models.len(), 2);
+        assert_eq!(models.available_models[0].model_id.to_string(), "gpt-5.5");
+        assert_eq!(models.available_models[0].name, "GPT-5.5");
+        assert_eq!(models.available_models[1].model_id.to_string(), "gpt-5.4");
+        assert_eq!(models.available_models[1].name, "gpt-5.4");
     }
 
     #[test]

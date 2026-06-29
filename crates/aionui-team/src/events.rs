@@ -1,12 +1,35 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentShutdownPayload, TeamAgentSpawnedPayload,
-    TeamAgentStatusPayload, WebSocketMessage,
+    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload,
+    TeamChildTurnPayload, TeamRunPayload, WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
+use tracing::debug;
 
 use crate::types::{TeamAgent, TeammateStatus};
+
+pub const TEAMMATE_MESSAGE_EVENT: &str = "team.teammateMessage";
+pub const TEAM_AGENT_STATUS_CHANGED_EVENT: &str = "team.agentStatusChanged";
+pub const TEAM_AGENT_SPAWNED_EVENT: &str = "team.agentSpawned";
+pub const TEAM_AGENT_REMOVED_EVENT: &str = "team.agentRemoved";
+pub const TEAM_AGENT_RENAMED_EVENT: &str = "team.agentRenamed";
+pub const TEAM_LIST_CHANGED_EVENT: &str = "team.listChanged";
+pub const TEAM_CREATED_EVENT: &str = "team.created";
+pub const TEAM_REMOVED_EVENT: &str = "team.removed";
+pub const TEAM_RENAMED_EVENT: &str = "team.renamed";
+pub const TEAM_MCP_STATUS_EVENT: &str = "team.mcpStatus";
+pub const TEAM_TASK_CHANGED_EVENT: &str = "team.taskChanged";
+pub const TEAM_SESSION_CHANGED_EVENT: &str = "team.sessionChanged";
+pub const TEAM_RUN_ACCEPTED_EVENT: &str = "team.runAccepted";
+pub const TEAM_RUN_STARTED_EVENT: &str = "team.runStarted";
+pub const TEAM_RUN_UPDATED_EVENT: &str = "team.runUpdated";
+pub const TEAM_RUN_COMPLETED_EVENT: &str = "team.runCompleted";
+pub const TEAM_RUN_CANCELLED_EVENT: &str = "team.runCancelled";
+pub const TEAM_RUN_FAILED_EVENT: &str = "team.runFailed";
+pub const TEAM_CHILD_TURN_STARTED_EVENT: &str = "team.childTurnStarted";
+pub const TEAM_CHILD_TURN_COMPLETED_EVENT: &str = "team.childTurnCompleted";
+pub const TEAM_CHILD_TURN_CANCELLED_EVENT: &str = "team.childTurnCancelled";
 
 pub struct TeamEventEmitter {
     team_id: String,
@@ -29,7 +52,7 @@ impl TeamEventEmitter {
             status: status.to_string(),
         };
         let event = WebSocketMessage::new(
-            "team.agent.status",
+            TEAM_AGENT_STATUS_CHANGED_EVENT,
             serde_json::to_value(payload).expect("serialize status payload"),
         );
         self.broadcaster.broadcast(event);
@@ -38,10 +61,10 @@ impl TeamEventEmitter {
     pub fn broadcast_agent_spawned(&self, agent: &TeamAgent) {
         let payload = TeamAgentSpawnedPayload {
             team_id: self.team_id.clone(),
-            agent: agent.to_response(),
+            assistant: agent.to_response(),
         };
         let event = WebSocketMessage::new(
-            "team.agent.spawned",
+            TEAM_AGENT_SPAWNED_EVENT,
             serde_json::to_value(payload).expect("serialize spawned payload"),
         );
         self.broadcaster.broadcast(event);
@@ -53,24 +76,8 @@ impl TeamEventEmitter {
             slot_id: slot_id.to_owned(),
         };
         let event = WebSocketMessage::new(
-            "team.agent.removed",
+            TEAM_AGENT_REMOVED_EVENT,
             serde_json::to_value(payload).expect("serialize removed payload"),
-        );
-        self.broadcaster.broadcast(event);
-    }
-
-    /// Emit `team.agent.shutdown` to signal that the named teammate has
-    /// acknowledged a Lead-initiated shutdown request. The actual removal
-    /// (and `team.agent.removed`) follows once the agent process is killed
-    /// and scheduler state is cleared.
-    pub fn broadcast_agent_shutdown(&self, slot_id: &str) {
-        let payload = TeamAgentShutdownPayload {
-            team_id: self.team_id.clone(),
-            slot_id: slot_id.to_owned(),
-        };
-        let event = WebSocketMessage::new(
-            "team.agent.shutdown",
-            serde_json::to_value(payload).expect("serialize shutdown payload"),
         );
         self.broadcaster.broadcast(event);
     }
@@ -82,8 +89,48 @@ impl TeamEventEmitter {
             name: name.to_owned(),
         };
         let event = WebSocketMessage::new(
-            "team.agent.renamed",
+            TEAM_AGENT_RENAMED_EVENT,
             serde_json::to_value(payload).expect("serialize renamed payload"),
+        );
+        self.broadcaster.broadcast(event);
+    }
+
+    pub fn broadcast_team_run(&self, event_name: &'static str, payload: TeamRunPayload) {
+        debug!(
+            event_name = event_name,
+            team_id = %payload.team_id,
+            team_run_id = %payload.team_run_id,
+            target_slot_id = %payload.target_slot_id,
+            target_role = ?payload.target_role,
+            status = ?payload.status,
+            active_child_count = payload.active_child_count,
+            pending_wake_count = payload.pending_wake_count,
+            starting_child_count = payload.starting_child_count,
+            slot_work_count = payload.slot_work.len(),
+            "team websocket event emitted"
+        );
+        let event = WebSocketMessage::new(
+            event_name,
+            serde_json::to_value(payload).expect("serialize team run payload"),
+        );
+        self.broadcaster.broadcast(event);
+    }
+
+    pub fn broadcast_child_turn(&self, event_name: &'static str, payload: TeamChildTurnPayload) {
+        debug!(
+            event_name = event_name,
+            team_id = %payload.team_id,
+            team_run_id = %payload.team_run_id,
+            slot_id = %payload.slot_id,
+            role = ?payload.role,
+            conversation_id = %payload.conversation_id,
+            turn_id = %payload.turn_id,
+            status = ?payload.status,
+            "team websocket event emitted"
+        );
+        let event = WebSocketMessage::new(
+            event_name,
+            serde_json::to_value(payload).expect("serialize team child turn payload"),
         );
         self.broadcaster.broadcast(event);
     }
@@ -94,8 +141,7 @@ mod tests {
     use super::*;
     use crate::types::TeammateRole;
     use aionui_api_types::{
-        TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentShutdownPayload, TeamAgentSpawnedPayload,
-        TeamAgentStatusPayload,
+        TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload,
     };
 
     struct RecordingBroadcaster {
@@ -133,7 +179,7 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "team.agent.status");
+        assert_eq!(events[0].name, "team.agentStatusChanged");
 
         let payload: TeamAgentStatusPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
@@ -151,7 +197,7 @@ mod tests {
             conversation_id: "conv-2".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: Some(TeammateStatus::Idle),
             conversation_type: None,
             cli_path: None,
@@ -160,13 +206,13 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "team.agent.spawned");
+        assert_eq!(events[0].name, "team.agentSpawned");
 
         let payload: TeamAgentSpawnedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
-        assert_eq!(payload.agent.slot_id, "slot-2");
-        assert_eq!(payload.agent.name, "Worker");
-        assert_eq!(payload.agent.role, "teammate");
+        assert_eq!(payload.assistant.slot_id, "slot-2");
+        assert_eq!(payload.assistant.name, "Worker");
+        assert_eq!(payload.assistant.role, "teammate");
     }
 
     #[test]
@@ -176,25 +222,11 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "team.agent.removed");
+        assert_eq!(events[0].name, "team.agentRemoved");
 
         let payload: TeamAgentRemovedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
         assert_eq!(payload.slot_id, "slot-3");
-    }
-
-    #[test]
-    fn shutdown_event_has_correct_shape() {
-        let (emitter, bc) = make_emitter();
-        emitter.broadcast_agent_shutdown("slot-9");
-
-        let events = bc.events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "team.agent.shutdown");
-
-        let payload: TeamAgentShutdownPayload = serde_json::from_value(events[0].data.clone()).unwrap();
-        assert_eq!(payload.team_id, "team-1");
-        assert_eq!(payload.slot_id, "slot-9");
     }
 
     #[test]
@@ -204,7 +236,7 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name, "team.agent.renamed");
+        assert_eq!(events[0].name, "team.agentRenamed");
 
         let payload: TeamAgentRenamedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
@@ -227,9 +259,68 @@ mod tests {
 
         let events = bc.events();
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].name, "team.agent.status");
-        assert_eq!(events[1].name, "team.agent.status");
-        assert_eq!(events[2].name, "team.agent.removed");
+        assert_eq!(events[0].name, "team.agentStatusChanged");
+        assert_eq!(events[1].name, "team.agentStatusChanged");
+        assert_eq!(events[2].name, "team.agentRemoved");
+    }
+
+    #[test]
+    fn team_run_event_has_correct_shape() {
+        let (emitter, bc) = make_emitter();
+        emitter.broadcast_team_run(
+            TEAM_RUN_ACCEPTED_EVENT,
+            aionui_api_types::TeamRunPayload {
+                team_id: "team-1".into(),
+                team_run_id: "run-1".into(),
+                source: aionui_api_types::TeamRunSource::UserMessage,
+                has_user_intervention: true,
+                target_slot_id: "lead-1".into(),
+                target_role: aionui_api_types::TeamRunTargetRole::Lead,
+                status: aionui_api_types::TeamRunStatus::Accepted,
+                active_child_count: 0,
+                pending_wake_count: 1,
+                starting_child_count: 0,
+                slot_work: Vec::new(),
+            },
+        );
+
+        let events = bc.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "team.runAccepted");
+
+        let payload: aionui_api_types::TeamRunPayload = serde_json::from_value(events[0].data.clone()).unwrap();
+        assert_eq!(payload.team_id, "team-1");
+        assert_eq!(payload.team_run_id, "run-1");
+        assert_eq!(payload.target_role, aionui_api_types::TeamRunTargetRole::Lead);
+        assert_eq!(payload.status, aionui_api_types::TeamRunStatus::Accepted);
+        assert_eq!(payload.starting_child_count, 0);
+    }
+
+    #[test]
+    fn child_turn_event_has_correct_shape() {
+        let (emitter, bc) = make_emitter();
+        emitter.broadcast_child_turn(
+            TEAM_CHILD_TURN_STARTED_EVENT,
+            aionui_api_types::TeamChildTurnPayload {
+                team_id: "team-1".into(),
+                team_run_id: "run-1".into(),
+                slot_id: "worker-1".into(),
+                role: aionui_api_types::TeamRunTargetRole::Teammate,
+                conversation_id: "conv-1".into(),
+                turn_id: "turn-1".into(),
+                status: aionui_api_types::TeamRunStatus::Running,
+            },
+        );
+
+        let events = bc.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "team.childTurnStarted");
+
+        let payload: aionui_api_types::TeamChildTurnPayload = serde_json::from_value(events[0].data.clone()).unwrap();
+        assert_eq!(payload.team_id, "team-1");
+        assert_eq!(payload.team_run_id, "run-1");
+        assert_eq!(payload.slot_id, "worker-1");
+        assert_eq!(payload.status, aionui_api_types::TeamRunStatus::Running);
     }
 
     #[test]

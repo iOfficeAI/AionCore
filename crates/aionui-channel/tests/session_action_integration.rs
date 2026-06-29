@@ -57,7 +57,7 @@ async fn setup() -> (
     let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
         Arc::new(aionui_db::SqliteClientPreferenceRepository::new(db.pool().clone()));
     let settings = Arc::new(ChannelSettingsService::new(pref_repo));
-    let executor = ActionExecutor::new(pairing_arc, session_mgr_arc, settings, "gemini");
+    let executor = ActionExecutor::new(pairing_arc, session_mgr_arc, settings);
 
     // Keep db alive
     std::mem::forget(db);
@@ -414,67 +414,10 @@ async fn action_session_new_resets_existing() {
     assert_eq!(user_sessions.len(), 1);
 }
 
-// ── ActionExecutor: agent.select persists agent_type (H-3 fix) ───
-
-#[tokio::test]
-async fn action_agent_select_persists() {
-    let (_, executor, pairing, repo) = setup().await;
-
-    authorize_user(&pairing, "tg_42", "telegram").await;
-
-    // Create a session (default agent is "gemini")
-    let msg1 = make_text_message("tg_42", "chat1", "Hello");
-    executor.handle_incoming_message(&msg1).await.unwrap();
-
-    // Switch agent to "acp"
-    let select_msg = UnifiedIncomingMessage {
-        id: format!("msg_{}", now_ms()),
-        platform: PluginType::Telegram,
-        chat_id: "chat1".into(),
-        user: UnifiedUser {
-            id: "tg_42".into(),
-            username: None,
-            display_name: "Test User".into(),
-            avatar_url: None,
-        },
-        content: UnifiedMessageContent {
-            content_type: MessageContentType::Action,
-            text: String::new(),
-            attachments: None,
-        },
-        timestamp: now_ms(),
-        reply_to_message_id: None,
-        action: Some(UnifiedAction {
-            action: "agent.select".into(),
-            category: ActionCategory::System,
-            params: Some(std::collections::HashMap::from([("agentType".into(), "acp".into())])),
-            context: ActionContext {
-                platform: PluginType::Telegram,
-                user_id: "tg_42".into(),
-                chat_id: "chat1".into(),
-                message_id: None,
-                session_id: None,
-            },
-        }),
-        raw: None,
-    };
-    let r = executor.handle_incoming_message(&select_msg).await.unwrap();
-    match r {
-        MessageResult::Action(resp) => {
-            let text = resp.text.unwrap();
-            assert!(text.contains("acp"));
-        }
-        _ => panic!("Expected Action result"),
-    }
-
-    // Verify the session's agent_type in DB
-    let all = repo.get_all_sessions().await.unwrap();
-    let session = all
-        .iter()
-        .find(|s| s.chat_id.as_deref() == Some("chat1"))
-        .expect("session should exist");
-    assert_eq!(session.agent_type, "acp");
-}
+// NOTE: the former `action_agent_select_persists` test was removed. Direct
+// `agent.select` channel actions are no longer supported under the
+// assistant-first model — the handler now treats them as unknown actions
+// (covered by `action::tests::agent_select_is_treated_as_unknown_action`).
 
 // ── ActionExecutor: session isolation across messages ───────────────
 

@@ -5,6 +5,7 @@ mod acp_error_recovery;
 mod agent_health_policy;
 mod convert;
 pub mod error;
+pub(crate) mod message_cursor;
 mod message_persistence;
 pub mod response_middleware;
 pub mod routes;
@@ -24,6 +25,7 @@ pub mod stream_relay;
 pub mod task_options;
 mod turn_continuation_policy;
 mod turn_orchestrator;
+mod turn_recovery_policy;
 
 pub use error::ConversationError;
 pub use response_middleware::{
@@ -32,7 +34,10 @@ pub use response_middleware::{
 };
 pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;
-pub use service::ConversationService;
+pub use service::{
+    ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
+    ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
+};
 pub use state::ConversationRouterState;
 
 #[cfg(test)]

@@ -1,0 +1,5 @@
+[advisories]
+# RUSTSEC-2023-0071 (rsa: Marvin timing sidechannel): pre-existing lockfile-only
+# entry pulled in by a target/feature-gated dependency; `cargo tree -i rsa`
+# resolves to nothing in our build graph, and no patched release exists yet.
+ignore = ["RUSTSEC-2023-0071"]

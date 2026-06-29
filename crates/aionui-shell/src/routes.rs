@@ -1,18 +1,25 @@
 #![allow(clippy::disallowed_types)]
 
-use axum::extract::{Multipart, State};
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{Multipart, State, WebSocketUpgrade};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 
 use aionui_api_types::{
     ApiResponse, CheckToolInstalledRequest, CheckToolInstalledResponse, OpenExternalRequest, OpenFileRequest,
-    OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig,
+    OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig, SttStreamServerMessage,
 };
 use aionui_common::ApiError;
+use aionui_system::ClientPrefService;
 
 use crate::error::{ShellError, SttError};
 use crate::state::ShellRouterState;
+use crate::stt_stream::{ClientFrame, run_stream_session};
+use crate::stt_stream_provider::ProviderUpstreamFactory;
 
 impl From<ShellError> for ApiError {
     fn from(err: ShellError) -> Self {
@@ -35,6 +42,7 @@ impl From<SttError> for ApiError {
             }
             SttError::RequestFailed(_) => ApiError::BadGateway(err.to_string()),
             SttError::Unknown(_) => ApiError::Internal(err.to_string()),
+            SttError::StreamUnsupported | SttError::StreamProtocol(_) => ApiError::BadRequest(err.to_string()),
         }
     }
 }
@@ -47,6 +55,7 @@ pub fn shell_routes(state: ShellRouterState) -> Router {
         .route("/api/shell/check-tool-installed", post(check_tool_installed))
         .route("/api/shell/open-folder-with", post(open_folder_with))
         .route("/api/stt", post(speech_to_text))
+        .route("/api/stt/stream", get(speech_to_text_stream))
         .with_state(state)
 }
 
@@ -115,7 +124,17 @@ async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartF
     {
         let name = field.name().unwrap_or("").to_owned();
         match name.as_str() {
-            "file" => {
+            "file" | "audio" => {
+                if file_name.is_none()
+                    && let Some(name) = field.file_name().filter(|name| !name.is_empty())
+                {
+                    file_name = Some(name.to_owned());
+                }
+                if mime_type.is_none()
+                    && let Some(content_type) = field.content_type().filter(|value| !value.is_empty())
+                {
+                    mime_type = Some(content_type.to_owned());
+                }
                 file_data = Some(
                     field
                         .bytes()
@@ -179,31 +198,16 @@ async fn speech_to_text(
         (status, Json(body))
     })?;
 
-    let prefs = state
-        .client_pref_service
-        .get_preferences(Some(&["speechToText"]))
-        .await
-        .map_err(|e| {
-            let e = ApiError::from(e);
-            let status = e.status_code();
-            let body = serde_json::json!({
-                "success": false,
-                "error": e.to_string(),
-                "code": e.error_code(),
-            });
-            (status, Json(body))
-        })?;
-
-    let config: SpeechToTextConfig = prefs
-        .get("speechToText")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or(SpeechToTextConfig {
-            enabled: false,
-            provider: aionui_api_types::SpeechToTextProvider::Openai,
-            auto_send: None,
-            openai: None,
-            deepgram: None,
+    let config = load_stt_config(&state.client_pref_service).await.map_err(|e| {
+        let e = ApiError::from(e);
+        let status = e.status_code();
+        let body = serde_json::json!({
+            "success": false,
+            "error": e.to_string(),
+            "code": e.error_code(),
         });
+        (status, Json(body))
+    })?;
 
     let result = state
         .stt_service
@@ -232,6 +236,121 @@ fn stt_error_response(err: &SttError) -> (StatusCode, Json<serde_json::Value>) {
         "code": err.error_code(),
     });
     (status, Json(body))
+}
+
+/// Load the stored STT config from client preferences.
+///
+/// Key mismatch fix: the AionUI frontend stores the config under
+/// "tools.speechToText" while older backends used "speechToText"; both keys
+/// are queried and the namespaced key wins. A missing or malformed config
+/// falls back to a disabled default so callers surface a uniform
+/// `STT_DISABLED` error.
+pub(crate) async fn load_stt_config(
+    client_pref_service: &ClientPrefService,
+) -> Result<SpeechToTextConfig, aionui_system::SystemError> {
+    let prefs = client_pref_service
+        .get_preferences(Some(&["speechToText", "tools.speechToText"]))
+        .await?;
+    Ok(prefs
+        .get("tools.speechToText")
+        .or_else(|| prefs.get("speechToText"))
+        .and_then(|v| match serde_json::from_value(v.clone()) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                // Fall back to disabled, but leave a trace — a silent fallback
+                // makes a malformed config indistinguishable from a missing one.
+                tracing::warn!("ignoring malformed speechToText config: {e}");
+                None
+            }
+        })
+        .unwrap_or(SpeechToTextConfig {
+            enabled: false,
+            provider: aionui_api_types::SpeechToTextProvider::Openai,
+            auto_send: None,
+            openai: None,
+            deepgram: None,
+        }))
+}
+
+/// Per-direction frame buffer for the streaming session channels. Audio
+/// chunks arrive every ~100ms, so 32 frames of backpressure is ample.
+const STT_STREAM_CHANNEL_CAPACITY: usize = 32;
+
+/// `GET /api/stt/stream` — WebSocket endpoint for streaming transcription.
+///
+/// The upgrade is accepted unconditionally (auth already ran in middleware):
+/// config loading and validation happen after the upgrade so every failure
+/// reaches the client as a uniform `{"type":"error",...}` WS frame
+/// (`STT_DISABLED`, `STT_*_NOT_CONFIGURED`, ...) emitted by the session,
+/// instead of a mix of HTTP handshake statuses and protocol frames.
+async fn speech_to_text_stream(State(state): State<ShellRouterState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| speech_to_text_stream_socket(socket, state))
+}
+
+/// Pump WebSocket frames in/out of the transport-agnostic streaming session.
+///
+/// This stays a pure frame adapter: all protocol and business logic lives in
+/// `stt_stream::run_stream_session`.
+async fn speech_to_text_stream_socket(socket: WebSocket, state: ShellRouterState) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    let config = match load_stt_config(&state.client_pref_service).await {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(error = %e, "stt stream: failed to load config");
+            let frame = SttStreamServerMessage::Error {
+                code: "STT_UNKNOWN".to_owned(),
+                msg: "failed to load speech-to-text configuration".to_owned(),
+            };
+            if let Ok(text) = serde_json::to_string(&frame) {
+                let _ = ws_tx.send(Message::Text(text.into())).await;
+            }
+            let _ = ws_tx.send(Message::Close(None)).await;
+            return;
+        }
+    };
+
+    let (client_tx, client_rx) = mpsc::channel(STT_STREAM_CHANNEL_CAPACITY);
+    let (server_tx, mut server_rx) = mpsc::channel(STT_STREAM_CHANNEL_CAPACITY);
+
+    // Inbound pump: WS messages → ClientFrame, ending with `Closed` when the
+    // client goes away. A send failure means the session already returned.
+    let read_task = tokio::spawn(async move {
+        while let Some(msg) = ws_rx.next().await {
+            let frame = match msg {
+                Ok(Message::Text(text)) => ClientFrame::Text(text.to_string()),
+                Ok(Message::Binary(bytes)) => ClientFrame::Binary(bytes.to_vec()),
+                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(_) => continue, // ping/pong are answered by axum itself
+            };
+            if client_tx.send(frame).await.is_err() {
+                return;
+            }
+        }
+        let _ = client_tx.send(ClientFrame::Closed).await;
+    });
+
+    // Outbound pump: server frames → WS text, then a clean close once the
+    // session drops its sender.
+    let write_task = tokio::spawn(async move {
+        while let Some(msg) = server_rx.recv().await {
+            let Ok(text) = serde_json::to_string(&msg) else {
+                break;
+            };
+            if ws_tx.send(Message::Text(text.into())).await.is_err() {
+                return;
+            }
+        }
+        let _ = ws_tx.send(Message::Close(None)).await;
+    });
+
+    run_stream_session(client_rx, server_tx, config, &ProviderUpstreamFactory).await;
+    // `server_tx` was moved into the session and dropped on return: the write
+    // pump drains any remaining frames and closes the socket cleanly.
+    let _ = write_task.await;
+    // The session no longer reads `client_rx`; stop the reader (abort is safe
+    // mid-await — the WS read half is simply dropped).
+    read_task.abort();
 }
 
 #[cfg(test)]
@@ -445,5 +564,17 @@ mod tests {
     fn stt_unknown_maps_to_internal() {
         let err = ApiError::from(SttError::Unknown("unexpected".into()));
         assert!(matches!(err, ApiError::Internal(msg) if msg.contains("unexpected")));
+    }
+
+    #[test]
+    fn stt_stream_unsupported_maps_to_bad_request() {
+        let err = ApiError::from(SttError::StreamUnsupported);
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("not supported")));
+    }
+
+    #[test]
+    fn stt_stream_protocol_maps_to_bad_request() {
+        let err = ApiError::from(SttError::StreamProtocol("bad frame".into()));
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("bad frame")));
     }
 }

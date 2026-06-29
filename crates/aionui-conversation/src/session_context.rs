@@ -8,7 +8,7 @@ use aionui_ai_agent::session_context::{
 };
 use aionui_ai_agent::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState};
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra};
+use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, TeamSessionBinding};
 use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
 use aionui_db::models::ConversationRow;
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
@@ -69,7 +69,10 @@ impl<'a> SessionContextBuilder<'a> {
         let workspace = self.resolve_workspace(row, &agent_type, &extra, workspace_override)?;
         let model = provider_model_from_conversation_row(row);
         let skills = parse_string_array(extra.get("skills").cloned()).unwrap_or_default();
-        let kind = self.build_kind(row, &agent_type, extra).await?;
+        let team = TeamSessionBinding::from_extra_value(&extra).map_err(|e| ConversationError::BadRequest {
+            reason: format!("Invalid Team runtime context: {e}"),
+        })?;
+        let kind = self.build_kind(row, &agent_type, extra, team.clone()).await?;
 
         Ok(AgentSessionContext {
             conversation: ConversationContext {
@@ -81,6 +84,7 @@ impl<'a> SessionContextBuilder<'a> {
             workspace,
             model,
             skills,
+            team,
             kind,
         })
     }
@@ -149,13 +153,16 @@ impl<'a> SessionContextBuilder<'a> {
         row: &ConversationRow,
         agent_type: &AgentType,
         extra: serde_json::Value,
+        team: Option<TeamSessionBinding>,
     ) -> Result<AgentSessionKind, ConversationError> {
         match agent_type {
             AgentType::Acp => self
-                .build_acp_context(row, extra)
+                .build_acp_context(row, extra, team)
                 .await
                 .map(|context| AgentSessionKind::Acp(Box::new(context))),
-            AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(row, extra)))),
+            AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(
+                row, extra, team,
+            )))),
             AgentType::Gemini
             | AgentType::Codex
             | AgentType::OpenclawGateway
@@ -170,12 +177,14 @@ impl<'a> SessionContextBuilder<'a> {
         &self,
         row: &ConversationRow,
         extra: serde_json::Value,
+        team: Option<TeamSessionBinding>,
     ) -> Result<AcpSessionBuildContext, ConversationError> {
         let mut config: AcpBuildExtra =
             serde_json::from_value(extra.clone()).map_err(|e| ConversationError::BadRequest {
                 reason: format!("Invalid ACP build options: {e}"),
             })?;
         config.user_id.get_or_insert_with(|| row.user_id.clone());
+        apply_team_seed_to_acp_config(&team, &mut config);
         normalize_cron_alias(row, &extra, &mut config.cron_job_id);
 
         if config.session_mode.is_none()
@@ -191,23 +200,20 @@ impl<'a> SessionContextBuilder<'a> {
             config.session_mode = Some(mode.to_owned());
         }
 
-        self.resolve_acp_identity(row, &mut config, &extra).await?;
-
-        let belongs_to_team = extra
-            .get("teamId")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.is_empty());
-
+        let belongs_to_team = team.is_some();
         let session_row = self
             .acp_session_repo
             .get(&row.id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load acp_session row: {e}")))?;
+        self.resolve_acp_identity(row, &mut config, &extra, session_row.as_ref())
+            .await?;
         let session_id = session_row.and_then(|row| row.session_id);
         let session_snapshot = self.load_acp_session_snapshot(row, &config).await?;
 
         Ok(AcpSessionBuildContext {
             config,
+            team,
             belongs_to_team,
             session_id,
             session_snapshot,
@@ -219,9 +225,28 @@ impl<'a> SessionContextBuilder<'a> {
         row: &ConversationRow,
         config: &mut AcpBuildExtra,
         extra: &serde_json::Value,
+        session_row: Option<&aionui_db::models::AcpSessionRow>,
     ) -> Result<(), ConversationError> {
         let agent_id = config.agent_id.as_deref().filter(|value| !value.is_empty());
         if agent_id.is_some() {
+            return Ok(());
+        }
+
+        if let Some(session_row) = session_row.filter(|row| !row.agent_id.is_empty()) {
+            let metadata = self
+                .agent_metadata_repo
+                .get(&session_row.agent_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?;
+            debug!(
+                conversation_id = %row.id,
+                agent_id = %session_row.agent_id,
+                "session_context: restored ACP identity from persisted acp_session row"
+            );
+            config.agent_id = Some(session_row.agent_id.clone());
+            if let Some(metadata) = metadata {
+                config.backend = metadata.backend;
+            }
             return Ok(());
         }
 
@@ -293,7 +318,11 @@ impl<'a> SessionContextBuilder<'a> {
     }
 }
 
-fn build_aionrs_context(row: &ConversationRow, extra: serde_json::Value) -> AionrsSessionBuildContext {
+fn build_aionrs_context(
+    row: &ConversationRow,
+    extra: serde_json::Value,
+    team: Option<TeamSessionBinding>,
+) -> AionrsSessionBuildContext {
     let mut config: AionrsBuildExtra = match serde_json::from_value(extra.clone()) {
         Ok(config) => config,
         Err(err) => {
@@ -306,13 +335,45 @@ fn build_aionrs_context(row: &ConversationRow, extra: serde_json::Value) -> Aion
         }
     };
     config.user_id.get_or_insert_with(|| row.user_id.clone());
-    let belongs_to_team = extra
-        .get("teamId")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.is_empty());
+    apply_team_seed_to_aionrs_config(&team, &mut config);
+    let belongs_to_team = team.is_some();
     AionrsSessionBuildContext {
         config,
+        team,
         belongs_to_team,
+    }
+}
+
+fn apply_team_seed_to_acp_config(team: &Option<TeamSessionBinding>, config: &mut AcpBuildExtra) {
+    let Some(team) = team else {
+        return;
+    };
+    if config.backend.as_deref().is_none_or(str::is_empty) {
+        config.backend.clone_from(&team.runtime_seed.backend);
+    }
+    if config.session_mode.as_deref().is_none_or(str::is_empty) {
+        config.session_mode.clone_from(&team.runtime_seed.session_mode);
+    }
+    if config.current_model_id.as_deref().is_none_or(str::is_empty) {
+        config.current_model_id.clone_from(&team.runtime_seed.current_model_id);
+    }
+    if config.team_mcp_stdio_config.is_none() {
+        config.team_mcp_stdio_config = team.mcp.as_ref().map(|mcp| mcp.stdio.clone());
+    }
+}
+
+fn apply_team_seed_to_aionrs_config(team: &Option<TeamSessionBinding>, config: &mut AionrsBuildExtra) {
+    let Some(team) = team else {
+        return;
+    };
+    if config.backend.as_deref().is_none_or(str::is_empty) {
+        config.backend.clone_from(&team.runtime_seed.backend);
+    }
+    if config.session_mode.as_deref().is_none_or(str::is_empty) {
+        config.session_mode.clone_from(&team.runtime_seed.session_mode);
+    }
+    if config.team_mcp_stdio_config.is_none() {
+        config.team_mcp_stdio_config = team.mcp.as_ref().map(|mcp| mcp.stdio.clone());
     }
 }
 
@@ -508,6 +569,13 @@ mod tests {
         }
     }
 
+    fn aionrs_context(context: AgentSessionContext) -> AionrsSessionBuildContext {
+        match context.kind {
+            AgentSessionKind::Aionrs(aionrs) => *aionrs,
+            other => panic!("expected Aionrs context, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn acp_agent_id_takes_priority_over_backend() {
         let repos = setup().await;
@@ -572,7 +640,6 @@ mod tests {
             .acp_session_repo
             .create(&CreateAcpSessionParams {
                 conversation_id: "conv-1",
-                agent_backend: "claude",
                 agent_source: "builtin",
                 agent_id: "builtin-claude-test",
             })
@@ -611,6 +678,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_session_identity_takes_priority_over_legacy_backend_seed() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        repos
+            .acp_session_repo
+            .create(&CreateAcpSessionParams {
+                conversation_id: "conv-1",
+                agent_source: "builtin",
+                agent_id: "builtin-codex-test",
+            })
+            .await
+            .unwrap();
+        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.agent_id.as_deref(), Some("builtin-codex-test"));
+        assert_eq!(acp.config.backend.as_deref(), Some("codex"));
+    }
+
+    #[tokio::test]
     async fn acp_legacy_current_mode_becomes_startup_seed_without_runtime() {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-claude-test", "claude").await;
@@ -624,6 +713,103 @@ mod tests {
         let acp = acp_context(context);
         assert_eq!(acp.config.session_mode.as_deref(), Some("legacy-mode"));
         assert!(acp.session_snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_extra_thought_level_is_exposed_as_typed_context() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "codex",
+                "thought_level": "high"
+            }),
+            None,
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.thought_level.as_deref(), Some("high"));
+        assert!(acp.session_snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_team_extra_is_exposed_as_typed_context() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "teamId": "team-1",
+                "slot_id": "lead-1",
+                "role": "lead",
+                "backend": "claude",
+                "session_mode": "yolo",
+                "current_model_id": "claude-opus",
+                "team_mcp_stdio_config": {
+                    "team_id": "team-1",
+                    "port": 4242,
+                    "token": "tok-1",
+                    "slot_id": "lead-1",
+                    "binary_path": "/tmp/aioncore"
+                }
+            }),
+            None,
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let team = context.team.as_ref().expect("team context");
+        assert_eq!(team.team_id, "team-1");
+        assert_eq!(team.slot_id.as_deref(), Some("lead-1"));
+        assert_eq!(team.role.as_deref(), Some("lead"));
+        assert_eq!(team.runtime_seed.backend.as_deref(), Some("claude"));
+        assert_eq!(team.runtime_seed.session_mode.as_deref(), Some("yolo"));
+        assert_eq!(team.runtime_seed.current_model_id.as_deref(), Some("claude-opus"));
+        let mcp = team.mcp.as_ref().expect("typed team mcp");
+        assert_eq!(mcp.stdio.port, 4242);
+        assert_eq!(mcp.stdio.slot_id, "lead-1");
+
+        let acp = acp_context(context);
+        assert!(acp.belongs_to_team);
+        assert_eq!(acp.config.team_mcp_stdio_config.unwrap().port, 4242);
+    }
+
+    #[tokio::test]
+    async fn aionrs_team_extra_is_exposed_as_typed_context() {
+        let repos = setup().await;
+        let row = row(
+            "aionrs",
+            serde_json::json!({
+                "teamId": "team-2",
+                "slot_id": "worker-1",
+                "role": "teammate",
+                "backend": "aionrs",
+                "session_mode": "yolo",
+                "team_mcp_stdio_config": {
+                    "team_id": "team-2",
+                    "port": 5252,
+                    "token": "tok-2",
+                    "slot_id": "worker-1",
+                    "binary_path": "/tmp/aioncore"
+                }
+            }),
+            Some(serde_json::json!({
+                "provider_id": "provider-1",
+                "model": "gpt-5"
+            })),
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let team = context.team.as_ref().expect("team context");
+        assert_eq!(team.team_id, "team-2");
+        assert_eq!(team.slot_id.as_deref(), Some("worker-1"));
+        assert_eq!(team.runtime_seed.backend.as_deref(), Some("aionrs"));
+        assert_eq!(team.mcp.as_ref().unwrap().stdio.port, 5252);
+
+        let aionrs = aionrs_context(context);
+        assert!(aionrs.belongs_to_team);
+        assert_eq!(aionrs.config.team_mcp_stdio_config.unwrap().port, 5252);
     }
 
     #[tokio::test]

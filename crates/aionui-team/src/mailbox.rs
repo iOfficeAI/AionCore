@@ -95,6 +95,25 @@ impl Mailbox {
         Ok(())
     }
 
+    /// Runtime-only cancel helper: mark currently unread mailbox rows as read
+    /// for the provided agents so a cancelled run does not consume them later.
+    pub async fn mark_all_unread_for_agents_read(
+        &self,
+        team_id: &str,
+        agent_ids: &[String],
+    ) -> Result<usize, TeamError> {
+        let mut ids = Vec::new();
+        for agent_id in agent_ids {
+            let unread = self.peek_unread(team_id, agent_id).await?;
+            ids.extend(unread.into_iter().map(|message| message.id));
+        }
+        let count = ids.len();
+        if !ids.is_empty() {
+            self.mark_read_batch(&ids).await?;
+        }
+        Ok(count)
+    }
+
     pub async fn get_history(
         &self,
         team_id: &str,

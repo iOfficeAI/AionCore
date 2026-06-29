@@ -39,5 +39,5 @@
 1. **Team/Agent 所有增删改，都是普通 REST**，客户端不需要任何专属调度/状态机逻辑。
 2. **用户→agent 发消息 = 单聊**：走 `POST /api/conversations/{conversation_id}/messages`，`conversation_id` 从 `TeamAgentResponse.conversation_id` 取。team 模块不提供消息端点。
 3. **Agent 消息历史也走单聊**：`GET /api/conversations/{conversation_id}/messages`。
-4. **实时状态只走 WebSocket**（`team.agent.status` / `team.agent.spawned` / ...），HTTP 不提供轮询状态接口。
+4. **实时状态只走 WebSocket**（`team.agentStatusChanged` / `team.agentSpawned` / ...），HTTP 不提供轮询状态接口。
 5. **MCP 是后端 ↔ agent 进程之间的事，浏览器不直接接触**（见 [mcp.md](./mcp.md)）；但要知道"单聊 → 自动建团"和 lead 的 `team_spawn_agent` 在后端 ⚠️ 都未实现，建团必须显式调 `POST /api/teams`。

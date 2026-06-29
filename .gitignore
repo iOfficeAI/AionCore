@@ -576,3 +576,4 @@ graphify-out/
 .graphify_*
 
 .tmp/
+.playwright-mcp/

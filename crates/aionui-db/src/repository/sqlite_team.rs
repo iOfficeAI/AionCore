@@ -49,6 +49,14 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(rows)
     }
 
+    async fn list_teams_by_user(&self, user_id: &str) -> Result<Vec<TeamRow>, DbError> {
+        let rows = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE user_id = ? ORDER BY created_at ASC")
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
     async fn get_team(&self, team_id: &str) -> Result<Option<TeamRow>, DbError> {
         let row = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE id = ?")
             .bind(team_id)
@@ -61,6 +69,9 @@ impl ITeamRepository for SqliteTeamRepository {
         let mut set_clauses = Vec::new();
         if params.name.is_some() {
             set_clauses.push("name = ?");
+        }
+        if params.workspace.is_some() {
+            set_clauses.push("workspace = ?");
         }
         if params.agents.is_some() {
             set_clauses.push("agents = ?");
@@ -79,6 +90,9 @@ impl ITeamRepository for SqliteTeamRepository {
         let mut query = sqlx::query(&sql);
         if let Some(ref name) = params.name {
             query = query.bind(name);
+        }
+        if let Some(ref workspace) = params.workspace {
+            query = query.bind(workspace);
         }
         if let Some(ref agents) = params.agents {
             query = query.bind(agents);

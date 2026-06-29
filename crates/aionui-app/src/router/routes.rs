@@ -1,6 +1,5 @@
 //! Top-level router assembly: middleware stack + module route merges.
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
@@ -23,6 +22,7 @@ use aionui_auth::{
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
 use aionui_channel::weixin_login_route;
+use aionui_common::ApiErrorLogContext;
 use aionui_conversation::{conversation_ops_routes, conversation_routes};
 use aionui_cron::cron_routes;
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
@@ -36,7 +36,7 @@ use aionui_team::team_routes;
 
 use crate::services::AppServices;
 
-use super::health::{guide_mcp_status, health_check};
+use super::health::health_check;
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
 use super::trace::with_access_log;
 
@@ -62,15 +62,6 @@ pub async fn create_router(services: &AppServices) -> Result<Router, RouterBuild
 
     let (states, channel_components) = build_module_states(services).await?;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
-
-    // Wire TeamSessionService into Guide MCP server now that both are available.
-    services
-        .inject_guide_service(Arc::downgrade(&states.team.service))
-        .await;
-    tracing::info!(
-        elapsed_ms = boot.elapsed().as_millis(),
-        "startup: guide MCP service injected"
-    );
 
     // Start channel orchestrator (message loop)
     tokio::spawn(
@@ -215,12 +206,6 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let assistant_authenticated =
         assistant_routes(states.assistant).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
-    // Guide MCP diagnostic endpoint protected by auth middleware
-    let guide_mcp_authenticated = Router::new()
-        .route("/api/system/guide-mcp", get(guide_mcp_status))
-        .with_state(services.guide_mcp_config.clone())
-        .route_layer(from_fn_with_state(auth_mw_state, auth_middleware));
-
     // Office proxy routes — exempt from auth (serve iframe content)
     let office_proxy = office_proxy_routes(states.office);
     let public_assets = asset_routes(AssetRouterState::default());
@@ -249,8 +234,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(cron_authenticated)
         .merge(office_authenticated)
         .merge(shell_authenticated)
-        .merge(assistant_authenticated)
-        .merge(guide_mcp_authenticated);
+        .merge(assistant_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]
@@ -312,6 +296,10 @@ async fn normalize_boundary_error_response(request: Request, next: Next) -> Resp
 
     let original_headers = response.headers().clone();
     let mut normalized = (status, Json(ErrorResponse::new(error, code))).into_response();
+    normalized.extensions_mut().insert(ApiErrorLogContext {
+        code,
+        message: error.to_owned(),
+    });
     for (name, value) in original_headers.iter() {
         if *name != header::CONTENT_TYPE && *name != header::CONTENT_LENGTH {
             normalized.headers_mut().insert(name, value.clone());

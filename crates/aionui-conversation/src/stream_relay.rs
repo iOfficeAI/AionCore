@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::protocol::events::TipType;
+use aionui_ai_agent::protocol::events::{ErrorEventData, TipType};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
-use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResult};
+use crate::response_middleware::{ICronService, ISkillLoadService, MessageMiddleware, MiddlewareResult};
+use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
@@ -16,17 +17,45 @@ use crate::stream_persistence::{
 use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
+use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, info, warn};
 
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
 
+/// Conservative summary of what happened during one agent send attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnAttemptSummary {
+    pub saw_visible_output: bool,
+    pub saw_tool_or_side_effect: bool,
+    pub persisted_assistant_output: bool,
+    pub terminal_error: Option<ErrorEventData>,
+    pub terminal_error_deferred: bool,
+}
+
+impl TurnAttemptSummary {
+    pub fn safe_to_auto_replay(&self) -> bool {
+        !self.saw_visible_output && !self.saw_tool_or_side_effect && !self.persisted_assistant_output
+    }
+
+    pub fn merge(&mut self, other: &TurnAttemptSummary) {
+        self.saw_visible_output |= other.saw_visible_output;
+        self.saw_tool_or_side_effect |= other.saw_tool_or_side_effect;
+        self.persisted_assistant_output |= other.persisted_assistant_output;
+        if other.terminal_error.is_some() {
+            self.terminal_error = other.terminal_error.clone();
+        }
+        self.terminal_error_deferred |= other.terminal_error_deferred;
+    }
+}
+
 /// Result returned after a relay turn has fully drained and finalized.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelayOutcome {
     pub system_responses: Vec<String>,
     pub terminal: RelayTerminal,
+    pub attempt: TurnAttemptSummary,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -71,10 +100,13 @@ pub struct StreamRelay {
     user_id: String,
     broadcaster: Arc<dyn EventBroadcaster>,
     cron_service: Option<Arc<dyn ICronService>>,
+    skill_resolver: Option<Arc<dyn SkillResolver>>,
+    allowed_skill_names: Vec<String>,
     runtime_state: Option<Arc<ConversationRuntimeStateService>>,
     persistence: Option<RuntimePersistenceCoordinator>,
     adapter: StreamPersistenceAdapter,
     complete_turn: bool,
+    defer_clean_terminal_errors: bool,
 }
 
 impl StreamRelay {
@@ -95,15 +127,28 @@ impl StreamRelay {
             user_id,
             broadcaster,
             cron_service,
+            skill_resolver: None,
+            allowed_skill_names: Vec::new(),
             runtime_state: None,
             persistence: None,
             adapter,
             complete_turn: true,
+            defer_clean_terminal_errors: false,
         }
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = Some(runtime_state);
+        self
+    }
+
+    pub fn with_skill_resolver(mut self, skill_resolver: Arc<dyn SkillResolver>) -> Self {
+        self.skill_resolver = Some(skill_resolver);
+        self
+    }
+
+    pub fn with_allowed_skill_names(mut self, skill_names: Vec<String>) -> Self {
+        self.allowed_skill_names = skill_names;
         self
     }
 
@@ -115,6 +160,11 @@ impl StreamRelay {
 
     pub fn with_turn_completion(mut self, enabled: bool) -> Self {
         self.complete_turn = enabled;
+        self
+    }
+
+    pub fn with_defer_clean_terminal_errors(mut self, enabled: bool) -> Self {
+        self.defer_clean_terminal_errors = enabled;
         self
     }
 
@@ -170,10 +220,34 @@ impl StreamRelay {
         let mut first_agent_event_logged = false;
         let mut first_visible_output_logged = false;
         let mut send_error_done = send_error_rx.is_none();
+        let mut pending_send_error: Option<AgentSendError> = None;
+        let mut attempt = TurnAttemptSummary::default();
 
         loop {
             let recv_result = if send_error_done {
-                rx.recv().await
+                if let Some(send_error) = pending_send_error.take() {
+                    match rx.try_recv() {
+                        Ok(event) => {
+                            if !matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) {
+                                pending_send_error = Some(send_error);
+                            } else {
+                                debug!("Runtime terminal event won race with fallback send error");
+                            }
+                            Ok(event)
+                        }
+                        Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => {
+                            warn!(
+                                code = ?send_error.code(),
+                                ownership = ?send_error.ownership(),
+                                "Injecting stream error for failed agent send"
+                            );
+                            Ok(AgentStreamEvent::Error(send_error.into_stream_error()))
+                        }
+                        Err(TryRecvError::Lagged(n)) => Err(broadcast::error::RecvError::Lagged(n)),
+                    }
+                } else {
+                    rx.recv().await
+                }
             } else {
                 tokio::select! {
                     recv = rx.recv() => recv,
@@ -181,12 +255,8 @@ impl StreamRelay {
                         send_error_done = true;
                         match send_error {
                             Ok(send_error) => {
-                                warn!(
-                                    code = ?send_error.code(),
-                                    ownership = ?send_error.ownership(),
-                                    "Injecting stream error for failed agent send"
-                                );
-                                Ok(AgentStreamEvent::Error(send_error.into_stream_error()))
+                                pending_send_error = Some(send_error);
+                                continue;
                             }
                             Err(_) => continue,
                         }
@@ -231,6 +301,9 @@ impl StreamRelay {
                                     "StreamRelay received first visible output"
                                 );
                             }
+                            if !data.content.is_empty() {
+                                attempt.saw_visible_output = true;
+                            }
 
                             let segment = active_thinking.get_or_insert_with(|| ThinkingSegmentState {
                                 id: Self::mint_segment_msg_id(&mut used_primary_segment_msg_id, &self.msg_id),
@@ -249,6 +322,9 @@ impl StreamRelay {
                                     elapsed_ms = now_ms().saturating_sub(started_at),
                                     "StreamRelay received first visible output"
                                 );
+                            }
+                            if !data.content.is_empty() {
+                                attempt.saw_visible_output = true;
                             }
 
                             let segment = active_text.get_or_insert_with(|| TextSegmentState {
@@ -296,6 +372,33 @@ impl StreamRelay {
                                 }
                             }
 
+                            let defer_clean_error = self.defer_clean_terminal_errors
+                                && matches!(
+                                    terminal,
+                                    RelayTerminal::Error {
+                                        retryable: Some(true),
+                                        ..
+                                    }
+                                )
+                                && terminal.code() != Some(AgentErrorCode::UserLlmProviderModelNotFound)
+                                && attempt.safe_to_auto_replay();
+
+                            if defer_clean_error {
+                                if let AgentStreamEvent::Error(data) = &event {
+                                    attempt.terminal_error = Some(data.clone());
+                                    attempt.terminal_error_deferred = true;
+                                }
+                                info!(
+                                    event_type,
+                                    elapsed_ms, "StreamRelay deferred clean terminal error for possible auto replay"
+                                );
+                                break RelayOutcome {
+                                    system_responses: Vec::new(),
+                                    terminal,
+                                    attempt,
+                                };
+                            }
+
                             if deleting {
                                 debug!("Skipping terminal DB finalization because conversation is deleting");
                             } else {
@@ -312,14 +415,22 @@ impl StreamRelay {
                                 .await;
                             }
                             self.forward_to_websocket(&event);
-                            let outcome = if deleting {
+                            if let AgentStreamEvent::Error(data) = &event {
+                                attempt.terminal_error = Some(data.clone());
+                            }
+                            let mut outcome = if deleting {
                                 RelayOutcome {
                                     system_responses: Vec::new(),
                                     terminal,
+                                    attempt: attempt.clone(),
                                 }
                             } else {
                                 self.finalize(&full_text_buffer, &text_segments, &event, terminal).await
                             };
+                            outcome.attempt = attempt.clone();
+                            if !full_text_buffer.is_empty() {
+                                outcome.attempt.persisted_assistant_output = true;
+                            }
                             if self.complete_turn && !deleting {
                                 self.adapter
                                     .complete_conversation(&self.broadcaster, &self.turn_id, None)
@@ -328,6 +439,7 @@ impl StreamRelay {
                             break outcome;
                         }
                         AgentStreamEvent::ToolCall(data) => {
+                            attempt.saw_tool_or_side_effect = true;
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
@@ -335,6 +447,7 @@ impl StreamRelay {
                             self.adapter.persist_tool_call(data).await;
                         }
                         AgentStreamEvent::AcpToolCall(data) => {
+                            attempt.saw_tool_or_side_effect = true;
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
@@ -342,6 +455,7 @@ impl StreamRelay {
                             self.adapter.persist_acp_tool_call(data).await;
                         }
                         AgentStreamEvent::ToolGroup(entries) => {
+                            attempt.saw_tool_or_side_effect = true;
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
@@ -349,10 +463,19 @@ impl StreamRelay {
                             self.adapter.persist_tool_group(entries).await;
                         }
                         AgentStreamEvent::Tips(data) => {
+                            if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
+                                attempt.saw_visible_output = true;
+                            }
                             self.forward_to_websocket(&event);
                             if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
                                 self.adapter.persist_tip(data).await;
                             }
+                        }
+                        AgentStreamEvent::CronTrigger(_)
+                        | AgentStreamEvent::Permission(_)
+                        | AgentStreamEvent::AcpPermission(_) => {
+                            attempt.saw_tool_or_side_effect = true;
+                            self.forward_to_websocket(&event);
                         }
                         _ => {
                             self.forward_to_websocket(&event);
@@ -376,10 +499,11 @@ impl StreamRelay {
                             .await;
                     }
                     // Channel closed without finish/error — still finalize
-                    let outcome = if deleting {
+                    let mut outcome = if deleting {
                         RelayOutcome {
                             system_responses: Vec::new(),
                             terminal: RelayTerminal::ChannelClosed,
+                            attempt: attempt.clone(),
                         }
                     } else {
                         self.finalize(
@@ -390,6 +514,10 @@ impl StreamRelay {
                         )
                         .await
                     };
+                    outcome.attempt = attempt.clone();
+                    if !full_text_buffer.is_empty() {
+                        outcome.attempt.persisted_assistant_output = true;
+                    }
                     if self.complete_turn && !deleting {
                         self.adapter
                             .complete_conversation(&self.broadcaster, &self.turn_id, None)
@@ -505,6 +633,7 @@ impl StreamRelay {
         let mut outcome = RelayOutcome {
             system_responses: Vec::new(),
             terminal,
+            attempt: TurnAttemptSummary::default(),
         };
         let status = match event {
             AgentStreamEvent::Error(_) => "error",
@@ -571,10 +700,16 @@ impl StreamRelay {
     }
 
     async fn process_final_text(&self, text: &str) -> MiddlewareResult {
-        let middleware = MessageMiddleware::new(
+        let middleware = MessageMiddleware::new_with_skill_loader(
             self.cron_service
                 .as_ref()
                 .map(|service| Box::new(SharedCronService(Arc::clone(service))) as Box<dyn ICronService>),
+            self.skill_resolver.as_ref().map(|resolver| {
+                Box::new(SharedSkillResolver {
+                    resolver: Arc::clone(resolver),
+                    allowed_skill_names: self.allowed_skill_names.clone(),
+                }) as Box<dyn ISkillLoadService>
+            }),
         );
 
         middleware.process(text, &self.user_id, &self.conversation_id).await
@@ -646,6 +781,26 @@ impl ICronService for SharedCronService {
     }
 }
 
+struct SharedSkillResolver {
+    resolver: Arc<dyn SkillResolver>,
+    allowed_skill_names: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl ISkillLoadService for SharedSkillResolver {
+    async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
+        if self.allowed_skill_names.is_empty() {
+            return Vec::new();
+        }
+        let filtered: Vec<String> = names
+            .iter()
+            .filter(|name| self.allowed_skill_names.iter().any(|allowed| allowed == *name))
+            .cloned()
+            .collect();
+        self.resolver.load_skill_bodies(&filtered).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +813,58 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // ── run() async tests ─────────────────────────────────────────
+
+    #[derive(Default)]
+    struct RecordingSkillResolverForRelay {
+        requested: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SkillResolver for RecordingSkillResolverForRelay {
+        async fn auto_inject_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn resolve_skills(&self, _names: &[String]) -> Vec<aionui_extension::ResolvedAgentSkill> {
+            Vec::new()
+        }
+
+        async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
+            self.requested.lock().unwrap().extend(names.iter().cloned());
+            names
+                .iter()
+                .map(|name| LoadedAgentSkill {
+                    name: name.clone(),
+                    body: format!("{name} body"),
+                })
+                .collect()
+        }
+
+        async fn link_workspace_skills(
+            &self,
+            _workspace: &std::path::Path,
+            _rel_dirs: &[&str],
+            _skills: &[aionui_extension::ResolvedAgentSkill],
+        ) -> usize {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_skill_resolver_filters_requests_to_allowed_skill_names() {
+        let concrete = Arc::new(RecordingSkillResolverForRelay::default());
+        let resolver: Arc<dyn SkillResolver> = concrete.clone();
+        let loader = SharedSkillResolver {
+            resolver,
+            allowed_skill_names: vec!["cron".into()],
+        };
+
+        let loaded = loader.load_skill_bodies(&["cron".to_owned(), "pdf".to_owned()]).await;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "cron");
+        assert_eq!(concrete.requested.lock().unwrap().as_slice(), ["cron"]);
+    }
 
     #[tokio::test]
     async fn run_text_then_finish_persists_message() {
@@ -806,6 +1013,154 @@ mod tests {
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Something went wrong");
         assert_eq!(content["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn clean_retryable_error_can_be_deferred_for_replay() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, rx) = broadcast::channel(8);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "msg-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        )
+        .with_turn_completion(false)
+        .with_defer_clean_terminal_errors(true);
+
+        tx.send(AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(
+            outcome.terminal,
+            RelayTerminal::Error {
+                code: Some(AgentErrorCode::UnknownUpstreamError),
+                retryable: Some(true),
+            }
+        );
+        assert!(outcome.attempt.safe_to_auto_replay());
+        assert!(
+            ws_rx.try_recv().is_err(),
+            "clean first-attempt errors stay hidden before replay"
+        );
+        assert!(
+            repo.take_inserts().is_empty(),
+            "no assistant error tip is persisted before replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_before_retryable_error_is_not_clean_for_replay() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, rx) = broadcast::channel(8);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "msg-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        )
+        .with_turn_completion(false)
+        .with_defer_clean_terminal_errors(true);
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "partial".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+
+        assert!(outcome.attempt.saw_visible_output);
+        assert!(!outcome.attempt.safe_to_auto_replay());
+        let mut saw_error = false;
+        while let Ok(event) = ws_rx.try_recv() {
+            saw_error |= event.data["type"] == "error";
+        }
+        assert!(saw_error, "unsafe errors are still broadcast");
+    }
+
+    #[tokio::test]
+    async fn tool_call_before_retryable_error_is_not_clean_for_replay() {
+        use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, rx) = broadcast::channel(8);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "msg-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        )
+        .with_turn_completion(false)
+        .with_defer_clean_terminal_errors(true);
+
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "call-1".into(),
+            name: "write_file".into(),
+            args: serde_json::json!({}),
+            status: ToolCallStatus::Running,
+            input: None,
+            output: None,
+            description: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+
+        assert!(outcome.attempt.saw_tool_or_side_effect);
+        assert!(!outcome.attempt.safe_to_auto_replay());
     }
 
     #[tokio::test]
@@ -1445,6 +1800,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_acp_image_tool_call_update_persists_finish_without_base64() {
+        use aionui_ai_agent::protocol::events::tool_call::{
+            AcpToolCallEventData, AcpToolCallKind, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
+            AcpToolCallUpdateData,
+        };
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
+            session_id: "sess-1".into(),
+            update: AcpToolCallUpdateData {
+                session_update: AcpToolCallSessionUpdateKind::ToolCall,
+                tool_call_id: "ig_test_image".into(),
+                status: Some(AcpToolCallStatus::InProgress),
+                title: Some("Image generation".into()),
+                kind: Some(AcpToolCallKind::Execute),
+                raw_input: Some(json!({"prompt": "一只小猫"})),
+                raw_output: None,
+                content: None,
+                locations: None,
+            },
+            meta: None,
+        }))
+        .unwrap();
+
+        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
+            session_id: "sess-1".into(),
+            update: AcpToolCallUpdateData {
+                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
+                tool_call_id: "ig_test_image".into(),
+                status: Some(AcpToolCallStatus::Completed),
+                title: None,
+                kind: Some(AcpToolCallKind::Execute),
+                raw_input: None,
+                raw_output: Some(json!({
+                    "saved_path": "/Users/test/.codex/generated_images/session/ig_test_image.png",
+                    "image": {
+                        "path": "/Users/test/.codex/generated_images/session/ig_test_image.png",
+                        "mime_type": "image/png",
+                        "source": "codex_image_generation"
+                    },
+                    "result_omitted": true,
+                    "result_omitted_reason": "image_base64",
+                    "result_bytes": 131_083
+                })),
+                content: None,
+                locations: None,
+            },
+            meta: None,
+        }))
+        .unwrap();
+
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let updates = repo.take_updates();
+        let acp_update = updates.iter().find(|(id, _)| id == "ig_test_image");
+        assert!(acp_update.is_some());
+        let (_, upd) = acp_update.unwrap();
+        assert_eq!(upd.status, Some(Some("finish".to_owned())));
+
+        let content = upd.content.as_deref().unwrap();
+        assert!(!content.contains("iVBORw0KGgo"));
+        assert!(content.contains("result_omitted"));
+
+        let merged: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_eq!(
+            merged["update"]["raw_output"]["image"]["path"],
+            "/Users/test/.codex/generated_images/session/ig_test_image.png"
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_group_persists_message() {
         use aionui_ai_agent::protocol::events::tool_call::{ToolCallStatus, ToolGroupEntry};
 
@@ -1717,6 +2160,75 @@ mod tests {
         fn take_updates(&self) -> Vec<(String, aionui_db::MessageRowUpdate)> {
             std::mem::take(&mut self.updates.lock().unwrap())
         }
+
+        fn merged_row(existing: &MessageRow, incoming: &MessageRow) -> MessageRow {
+            let preserve_terminal_status = matches!(existing.status.as_deref(), Some("finish" | "error"))
+                && incoming.status.as_deref() == Some("work");
+            let mut content = Self::merge_json_content(&existing.content, &incoming.content);
+            if preserve_terminal_status {
+                content = Self::preserve_json_status(&content, &existing.content, &existing.r#type);
+            }
+
+            let mut merged = existing.clone();
+            merged.content = content;
+            merged.status = if preserve_terminal_status {
+                existing.status.clone()
+            } else {
+                incoming.status.clone()
+            };
+            merged.hidden = incoming.hidden;
+            merged
+        }
+
+        fn merge_json_content(existing_json: &str, incoming_json: &str) -> String {
+            let mut existing: serde_json::Value = serde_json::from_str(existing_json).unwrap_or_default();
+            let incoming: serde_json::Value = serde_json::from_str(incoming_json).unwrap_or_default();
+            Self::merge_json_value(&mut existing, incoming);
+            existing.to_string()
+        }
+
+        fn merge_json_value(existing: &mut serde_json::Value, incoming: serde_json::Value) {
+            match (existing, incoming) {
+                (serde_json::Value::Object(existing_obj), serde_json::Value::Object(incoming_obj)) => {
+                    for (key, value) in incoming_obj {
+                        if !value.is_null() {
+                            if let Some(existing_value) = existing_obj.get_mut(&key) {
+                                Self::merge_json_value(existing_value, value);
+                            } else {
+                                existing_obj.insert(key, value);
+                            }
+                        }
+                    }
+                }
+                (existing_value, incoming_value) => {
+                    if !incoming_value.is_null() {
+                        *existing_value = incoming_value;
+                    }
+                }
+            }
+        }
+
+        fn preserve_json_status(merged_json: &str, existing_json: &str, msg_type: &str) -> String {
+            let mut merged: serde_json::Value = serde_json::from_str(merged_json).unwrap_or_default();
+            let existing: serde_json::Value = serde_json::from_str(existing_json).unwrap_or_default();
+            let status = if msg_type == "acp_tool_call" {
+                existing.pointer("/update/status").cloned()
+            } else {
+                existing.get("status").cloned()
+            };
+
+            if let Some(status) = status {
+                if msg_type == "acp_tool_call" {
+                    if let Some(update) = merged.get_mut("update").and_then(|value| value.as_object_mut()) {
+                        update.insert("status".into(), status);
+                    }
+                } else if let Some(object) = merged.as_object_mut() {
+                    object.insert("status".into(), status);
+                }
+            }
+
+            merged.to_string()
+        }
     }
 
     #[async_trait::async_trait]
@@ -1770,17 +2282,15 @@ mod tests {
         ) -> Result<Vec<aionui_db::models::ConversationRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_messages(
+        async fn list_messages_page(
             &self,
             _conv_id: &str,
-            _page: u32,
-            _page_size: u32,
-            _order: aionui_db::SortOrder,
-        ) -> Result<aionui_common::PaginatedResult<MessageRow>, DbError> {
-            Ok(aionui_common::PaginatedResult {
+            _params: &aionui_db::MessagePageParams,
+        ) -> Result<aionui_db::MessagePageResult, DbError> {
+            Ok(aionui_db::MessagePageResult {
                 items: vec![],
-                total: 0,
-                has_more: false,
+                has_more_before: false,
+                has_more_after: false,
             })
         }
         async fn insert_message(&self, row: &MessageRow) -> Result<(), DbError> {
@@ -1791,6 +2301,30 @@ mod tests {
                 return Err(DbError::Init("FOREIGN KEY constraint failed".into()));
             }
             self.inserts.lock().unwrap().push(row.clone());
+            Ok(())
+        }
+        async fn upsert_message(&self, row: &MessageRow) -> Result<(), DbError> {
+            if self.not_found.load(Ordering::Acquire) {
+                return Err(DbError::NotFound(format!("Message '{}'", row.id)));
+            }
+            if self.foreign_key_failure.load(Ordering::Acquire) {
+                return Err(DbError::Init("FOREIGN KEY constraint failed".into()));
+            }
+
+            let mut inserts = self.inserts.lock().unwrap();
+            if let Some(existing) = inserts.iter().find(|message| message.id == row.id) {
+                let merged = Self::merged_row(existing, row);
+                self.updates.lock().unwrap().push((
+                    row.id.clone(),
+                    aionui_db::MessageRowUpdate {
+                        content: Some(merged.content),
+                        status: Some(merged.status),
+                        hidden: Some(merged.hidden),
+                    },
+                ));
+            } else {
+                inserts.push(row.clone());
+            }
             Ok(())
         }
         async fn update_message(&self, id: &str, updates: &aionui_db::MessageRowUpdate) -> Result<(), DbError> {

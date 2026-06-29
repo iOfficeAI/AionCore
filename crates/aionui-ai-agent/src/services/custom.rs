@@ -230,6 +230,13 @@ async fn probe_or_reject(req: &CustomAgentUpsertRequest, data_dir: &Path) -> Res
     let env_map: HashMap<String, String> = req.env.iter().map(|e| (e.name.clone(), e.value.clone())).collect();
     match probe(&req.command, &req.args, &env_map, data_dir, None).await {
         TryConnectCustomAgentResponse::Success => Ok(()),
+        // Reachable but not authorized is a valid agent the user simply hasn't
+        // logged into yet — accept the save so it lands in the list (offline,
+        // needs-login), where a later "test connection" confirms recovery.
+        TryConnectCustomAgentResponse::FailAuth { error } => {
+            tracing::info!(%error, "custom agent reachable but requires auth; accepting save");
+            Ok(())
+        }
         TryConnectCustomAgentResponse::FailCli { error } => {
             Err(AgentError::bad_request(format!("cli_not_found: {error}")))
         }

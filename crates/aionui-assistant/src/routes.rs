@@ -5,14 +5,14 @@
 use axum::Router;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Path, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
-    ApiResponse, AssistantResponse, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult,
-    SetAssistantStateRequest, UpdateAssistantRequest,
+    ApiResponse, AssistantDetailResponse, AssistantResponse, CreateAssistantRequest, ImportAssistantsRequest,
+    ImportAssistantsResult, SetAssistantStateRequest, UpdateAssistantRequest,
 };
 use aionui_common::ApiError;
 
@@ -23,11 +23,16 @@ pub use crate::state::AssistantRouterState;
 pub fn assistant_routes(state: AssistantRouterState) -> Router {
     Router::new()
         .route("/api/assistants", get(list).post(create))
-        .route("/api/assistants/{id}", axum::routing::put(update).delete(delete_one))
+        .route("/api/assistants/{id}", get(get_one).put(update).delete(delete_one))
         .route("/api/assistants/{id}/state", patch(set_state))
         .route("/api/assistants/{id}/avatar", get(get_avatar))
         .route("/api/assistants/import", post(import))
         .with_state(state)
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct GetAssistantDetailQuery {
+    locale: Option<String>,
 }
 
 impl From<AssistantError> for ApiError {
@@ -56,6 +61,15 @@ async fn create(
     let Json(req) = body.map_err(ApiError::from)?;
     let created = state.service.create(req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
+}
+
+async fn get_one(
+    State(state): State<AssistantRouterState>,
+    Path(id): Path<String>,
+    Query(query): Query<GetAssistantDetailQuery>,
+) -> Result<Json<ApiResponse<AssistantDetailResponse>>, ApiError> {
+    let detail = state.service.get_detail(&id, query.locale.as_deref()).await?;
+    Ok(Json(ApiResponse::ok(detail)))
 }
 
 async fn update(

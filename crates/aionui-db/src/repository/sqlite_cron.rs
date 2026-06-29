@@ -23,11 +23,11 @@ impl ICronRepository for SqliteCronRepository {
             "INSERT INTO cron_jobs (\
                 id, name, enabled, schedule_kind, schedule_value, schedule_tz, \
                 schedule_description, payload_message, execution_mode, agent_config, \
-                conversation_id, conversation_title, agent_type, created_by, \
+                conversation_id, conversation_title, created_by, \
                 skill_content, description, created_at, updated_at, next_run_at, last_run_at, \
                 last_status, last_error, run_count, retry_count, max_retries\
             ) VALUES (\
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
             )",
         )
         .bind(&row.id)
@@ -42,7 +42,6 @@ impl ICronRepository for SqliteCronRepository {
         .bind(&row.agent_config)
         .bind(&row.conversation_id)
         .bind(&row.conversation_title)
-        .bind(&row.agent_type)
         .bind(&row.created_by)
         .bind(&row.skill_content)
         .bind(&row.description)
@@ -115,7 +114,6 @@ impl ICronRepository for SqliteCronRepository {
         push_opt_str!(agent_config);
         push_str!(conversation_id);
         push_opt_str!(conversation_title);
-        push_str!(agent_type);
         push_opt_str!(skill_content);
         push_opt_str!(description);
         push_opt_i64!(next_run_at);
@@ -266,7 +264,6 @@ mod tests {
             agent_config: None,
             conversation_id: "conv_1".into(),
             conversation_title: Some("Test Conv".into()),
-            agent_type: "acp".into(),
             created_by: "user".into(),
             skill_content: None,
             description: None,
@@ -520,12 +517,11 @@ mod tests {
     async fn insert_with_agent_config_json() {
         let (repo, _db) = setup().await;
         let mut row = make_row("cron_ac");
-        row.agent_config = Some(r#"{"backend":"openai","name":"GPT","modelId":"gpt-4"}"#.into());
+        row.agent_config = Some(r#"{"name":"GPT","model_id":"gpt-4"}"#.into());
         repo.insert(&row).await.unwrap();
 
         let found = repo.get_by_id("cron_ac").await.unwrap().unwrap();
         let config = found.agent_config.unwrap();
-        assert!(config.contains("openai"));
         assert!(config.contains("gpt-4"));
     }
 }

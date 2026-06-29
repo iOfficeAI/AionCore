@@ -5,6 +5,7 @@ use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 #[derive(Debug, Clone, Default)]
 pub struct UpdateTeamParams {
     pub name: Option<String>,
+    pub workspace: Option<String>,
     pub agents: Option<String>,
     pub lead_agent_id: Option<String>,
 }
@@ -33,6 +34,9 @@ pub trait ITeamRepository: Send + Sync {
 
     /// Returns all teams ordered by creation time ascending.
     async fn list_teams(&self) -> Result<Vec<TeamRow>, DbError>;
+
+    /// Returns teams owned by `user_id`, ordered by creation time ascending.
+    async fn list_teams_by_user(&self, user_id: &str) -> Result<Vec<TeamRow>, DbError>;
 
     /// Returns a single team by id, or `None` if not found.
     async fn get_team(&self, team_id: &str) -> Result<Option<TeamRow>, DbError>;

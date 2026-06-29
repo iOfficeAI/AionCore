@@ -256,6 +256,19 @@ async fn handler(
 新增事件必须遵循上述两级 camelCase 规范，
 现有不一致的事件在相关模块迭代时逐步统一。
 
+### ACP 工具输出清洗
+
+ACP Agent 的工具调用事件在 `aionui-ai-agent` 翻译层进入统一
+`AgentStreamEvent`。该边界必须保证 WebSocket 和 SQLite 消息内容
+是可控大小，不能把工具返回的大型二进制或 inline base64 原样透传。
+
+Codex 图片生成工具可能同时返回 `saved_path` 和 `raw_output.result`
+中的 PNG/JPEG/WebP base64。翻译层会在转发和持久化之前移除
+`result`，保留 `saved_path`、`image.path`、`result_omitted`、
+`result_bytes` 等小型结构化字段；如果图片已经落盘，则把工具状态
+归一化为 `completed`。前端应通过文件路径按需加载图片，不应依赖
+inline base64。
+
 ## 数据层
 
 ### Repository Trait 模式
@@ -376,7 +389,6 @@ pub struct CronRouterState {
 pub struct OfficeRouterState {
     pub watch_manager: Arc<OfficecliWatchManager>,
     pub snapshot_service: Arc<SnapshotService>,
-    pub star_office_detector: Arc<StarOfficeDetector>,
     pub conversion_service: Arc<ConversionService>,
     pub proxy_service: Arc<ProxyService>,
 }

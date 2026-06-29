@@ -49,6 +49,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         work_dir,
         app_version: cli.app_version.clone(),
         local: cli.local,
+        dump_prompts: cli.dump_prompts,
     };
     info!(
         "Running in {} mode — authentication is {}",
@@ -119,5 +120,15 @@ mod tests {
         );
 
         assert_eq!(err.stage(), "database.migration");
+    }
+
+    #[test]
+    fn database_schema_repair_stage_comes_from_db_boundary_error() {
+        let err = aionui_db::DatabaseInitError::new(
+            "database.schema_repair",
+            aionui_db::DbError::Init("repair failed".into()),
+        );
+
+        assert_eq!(err.stage(), "database.schema_repair");
     }
 }

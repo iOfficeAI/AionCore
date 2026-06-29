@@ -23,7 +23,6 @@ use crate::models::AcpSessionRow;
 #[derive(Debug, Clone)]
 pub struct CreateAcpSessionParams<'a> {
     pub conversation_id: &'a str,
-    pub agent_backend: &'a str,
     pub agent_source: &'a str,
     pub agent_id: &'a str,
 }

@@ -97,6 +97,8 @@ fn make_aionrs_config() -> AionrsResolvedConfig {
         system_prompt: None,
         max_tokens: 4096,
         max_turns: None,
+        max_tool_call_malformed_turns: None,
+        max_tool_call_failure_turns: None,
         compat_overrides: Default::default(),
         session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
         session_mode: None,
@@ -176,12 +178,14 @@ async fn collect_idle_ignores_aionrs_agent_type() {
         let kind = match agent_type {
             AgentType::Acp => AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
                 config: Default::default(),
+                team: None,
                 belongs_to_team: false,
                 session_id: None,
                 session_snapshot: None,
             })),
             AgentType::Aionrs => AgentSessionKind::Aionrs(Box::new(AionrsSessionBuildContext {
                 config: Default::default(),
+                team: None,
                 belongs_to_team: false,
             })),
             AgentType::Gemini
@@ -210,6 +214,7 @@ async fn collect_idle_ignores_aionrs_agent_type() {
                 use_model: None,
             },
             skills: vec![],
+            team: None,
             kind,
         })
     };

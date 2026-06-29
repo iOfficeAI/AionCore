@@ -12,6 +12,9 @@ pub struct SendMessageData {
     pub content: String,
     /// Client-generated message ID for correlation.
     pub msg_id: String,
+    /// Runtime turn ID for backend logs and tests. Not part of the ACP wire protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     /// File paths attached to the message.
     #[serde(default)]
     pub files: Vec<String>,
@@ -60,6 +63,10 @@ pub struct AionrsResolvedConfig {
     pub max_tokens: u32,
     /// Max agentic turns.
     pub max_turns: Option<usize>,
+    /// Max repeated malformed tool-call turns before stopping.
+    pub max_tool_call_malformed_turns: Option<usize>,
+    /// Max repeated tool-call failure turns before stopping.
+    pub max_tool_call_failure_turns: Option<usize>,
     /// Provider-specific compat overrides.
     pub compat_overrides: AionrsCompatOverrides,
     /// Directory for aionrs session persistence files.
@@ -90,6 +97,13 @@ mod tests {
         let with_field = r#"{"backend":"claude","skills":["cron","pdf"]}"#;
         let parsed: AcpBuildExtra = serde_json::from_str(with_field).unwrap();
         assert_eq!(parsed.skills, vec!["cron".to_owned(), "pdf".to_owned()]);
+    }
+
+    #[test]
+    fn acp_build_extra_accepts_thought_level_seed() {
+        let with_field = r#"{"backend":"codex","thought_level":"high"}"#;
+        let parsed: AcpBuildExtra = serde_json::from_str(with_field).unwrap();
+        assert_eq!(parsed.thought_level.as_deref(), Some("high"));
     }
 
     #[test]
@@ -124,24 +138,28 @@ mod tests {
         let data = SendMessageData {
             content: "Hello".into(),
             msg_id: "msg-001".into(),
+            turn_id: Some("turn-001".into()),
             files: vec!["/tmp/a.txt".into()],
             inject_skills: vec!["review".into()],
         };
         let json = serde_json::to_value(&data).unwrap();
         assert_eq!(json["content"], "Hello");
         assert_eq!(json["msg_id"], "msg-001");
+        assert_eq!(json["turn_id"], "turn-001");
         assert_eq!(json["files"], json!(["/tmp/a.txt"]));
         assert_eq!(json["inject_skills"], json!(["review"]));
 
         let parsed: SendMessageData = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.content, "Hello");
         assert_eq!(parsed.msg_id, "msg-001");
+        assert_eq!(parsed.turn_id.as_deref(), Some("turn-001"));
     }
 
     #[test]
     fn send_message_data_defaults_optional_fields() {
         let json = json!({ "content": "Hi", "msg_id": "m1" });
         let data: SendMessageData = serde_json::from_value(json).unwrap();
+        assert!(data.turn_id.is_none());
         assert!(data.files.is_empty());
         assert!(data.inject_skills.is_empty());
     }
@@ -179,6 +197,8 @@ mod tests {
         assert!(extra.preset_rules.is_none());
         assert_eq!(extra.max_tokens, 8192);
         assert!(extra.max_turns.is_none());
+        assert!(extra.max_tool_call_malformed_turns.is_none());
+        assert!(extra.max_tool_call_failure_turns.is_none());
     }
 
     #[test]
@@ -186,12 +206,16 @@ mod tests {
         let json = json!({
             "system_prompt": "You are a helpful assistant.",
             "max_tokens": 4096,
-            "max_turns": 10
+            "max_turns": 10,
+            "max_tool_call_malformed_turns": 2,
+            "max_tool_call_failure_turns": 3
         });
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert_eq!(extra.system_prompt.unwrap(), "You are a helpful assistant.");
         assert_eq!(extra.max_tokens, 4096);
         assert_eq!(extra.max_turns.unwrap(), 10);
+        assert_eq!(extra.max_tool_call_malformed_turns.unwrap(), 2);
+        assert_eq!(extra.max_tool_call_failure_turns.unwrap(), 3);
     }
 
     #[test]
@@ -203,5 +227,15 @@ mod tests {
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert!(extra.system_prompt.is_none());
         assert_eq!(extra.preset_rules.unwrap(), "You are a data analyst.");
+    }
+
+    #[test]
+    fn aionrs_build_extra_accepts_frozen_skills_snapshot() {
+        let json = json!({
+            "preset_rules": "Rules",
+            "skills": ["pdf", "cron"]
+        });
+        let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
+        assert_eq!(extra.skills, vec!["pdf".to_owned(), "cron".to_owned()]);
     }
 }

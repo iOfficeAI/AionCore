@@ -18,6 +18,18 @@ use stderr_monitor::force_kill;
 /// Maximum stderr ring-buffer size in bytes.
 pub(super) const STDERR_BUFFER_MAX: usize = 8192;
 
+/// Trim `buf` from the front so it holds at most the last `max` bytes.
+///
+/// The raw cut point can land inside a multi-byte UTF-8 character, where
+/// `String::drain` would panic; rounding up to the next char boundary keeps
+/// the buffer valid and never exceeds `max` (issue #392).
+pub(super) fn trim_to_tail(buf: &mut String, max: usize) {
+    if buf.len() > max {
+        let cut = buf.ceil_char_boundary(buf.len() - max);
+        buf.drain(..cut);
+    }
+}
+
 pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AgentError> {
     if cwd.trim().is_empty() {
         return Err(AgentError::bad_request("Workspace directory is empty"));
@@ -80,38 +92,44 @@ impl CliAgentProcess {
         }
     }
 
-    /// Gracefully terminate the subprocess.
+    /// Gracefully terminate the subprocess **and any descendants in its
+    /// process group**.
     ///
     /// 1. Close stdin
-    /// 2. Wait up to `grace_period` for the process to exit on its own
-    /// 3. If still running after grace period, send SIGKILL
+    /// 2. Wait up to `grace_period` for the leader to exit on its own
+    /// 3. SIGKILL the whole process group regardless of whether the leader
+    ///    has already exited — wrapper CLIs (`npm exec ...`) routinely fork
+    ///    a grandchild (`openclaw-acp`) that survives leader exit, and only
+    ///    a group-wide kill reaps it
     pub async fn kill(&self, grace_period: Duration) -> Result<(), AgentError> {
         // Close stdin first to signal the child
         self.close_stdin().await;
 
-        // Wait for graceful exit within the grace period
+        // Wait up to the grace period for the leader to exit on its own.
+        // Even if it does, we still issue a group-wide SIGKILL below — the
+        // leader exiting tells us nothing about its grandchildren.
         let mut rx = self.exit_rx.clone();
-        let exited = tokio::time::timeout(grace_period, async {
-            // If already exited, return immediately
+        let _ = tokio::time::timeout(grace_period, async {
             if rx.borrow().is_some() {
                 return;
             }
-            // Wait for state change
             let _ = rx.changed().await;
         })
         .await;
 
-        if exited.is_ok() && self.exit_rx.borrow().is_some() {
-            debug!(pid = self.pid, "CLI process exited gracefully");
-            return Ok(());
+        // Always sweep the process group. `force_kill` treats ESRCH as
+        // success, so this is idempotent when the leader (and group) are
+        // already gone.
+        if self.exit_rx.borrow().is_some() {
+            debug!(pid = self.pid, "CLI leader already exited; sweeping process group");
+        } else {
+            warn!(pid = self.pid, "Grace period expired, sending SIGKILL");
         }
-
-        // Force kill
-        warn!(pid = self.pid, "Grace period expired, sending SIGKILL");
         force_kill(self.pid, self.process_group_id)?;
 
         // Wait for the exit monitor to observe process termination so callers
-        // do not race a still-live child after force-kill returns.
+        // do not race a still-live leader after force-kill returns. Skip the
+        // wait if the leader had already exited before our sweep.
         let mut rx = self.exit_rx.clone();
         tokio::time::timeout(Duration::from_secs(5), async {
             if rx.borrow().is_some() {
@@ -123,6 +141,24 @@ impl CliAgentProcess {
         .map_err(|_| AgentError::internal(format!("Process {} did not exit after force_kill", self.pid)))?;
 
         Ok(())
+    }
+
+    /// Unconditionally force-kill this process and its entire process group.
+    ///
+    /// Unlike [`kill`](Self::kill), this neither closes stdin first nor waits
+    /// for a graceful exit, and it does **not** short-circuit when the direct
+    /// child has already exited. It always signals the process *group*, so a
+    /// descendant reparented to init after the launcher exited (e.g. an
+    /// npx-spawned ACP grandchild) is still reaped.
+    ///
+    /// Used by throwaway probe connections: the node/npx launcher exits on its
+    /// own once the ACP transport closes, but `kill_on_drop` reaps only the
+    /// direct child, leaving the grandchild (`codex-acp`, `codebuddy --acp`, …)
+    /// to leak as an orphan.
+    pub fn force_kill_tree(&self) {
+        if let Err(e) = force_kill(self.pid, self.process_group_id) {
+            warn!(pid = self.pid, error = %e, "force_kill_tree failed");
+        }
     }
 
     /// Check whether the subprocess is still running.
@@ -236,6 +272,46 @@ pub(super) mod tests {
     pub(super) async fn spawn_sdk_test_process(config: CommandSpec) -> CliAgentProcess {
         let data_dir = tempfile::tempdir().unwrap();
         CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap()
+    }
+
+    // ── trim_to_tail ─────────────────────────────────────────────────
+
+    #[test]
+    fn trim_to_tail_does_not_panic_when_cut_lands_inside_multibyte_char() {
+        // "ab" (2 bytes) + "中中中" (9 bytes) = 11 bytes; max 8 puts the raw
+        // cut point at byte 3, inside the first '中' (bytes 2..5).
+        let mut buf = String::from("ab中中中");
+        trim_to_tail(&mut buf, 8);
+        assert_eq!(buf, "中中");
+        assert!(buf.len() <= 8);
+    }
+
+    #[test]
+    fn trim_to_tail_keeps_exactly_max_bytes_for_ascii() {
+        let mut buf = String::from("abcdefghij");
+        trim_to_tail(&mut buf, 8);
+        assert_eq!(buf, "cdefghij");
+    }
+
+    #[test]
+    fn trim_to_tail_is_noop_when_under_max() {
+        let mut buf = String::from("short");
+        trim_to_tail(&mut buf, 8);
+        assert_eq!(buf, "short");
+    }
+
+    #[test]
+    fn trim_to_tail_never_exceeds_max_with_emoji_flood() {
+        // Regression for the production panic: emoji-rich stderr lines pushed
+        // the buffer over STDERR_BUFFER_MAX with cut points off-boundary.
+        let mut buf = String::new();
+        for _ in 0..600 {
+            buf.push_str("⚠️ API call failed 🌐\n");
+        }
+        let original = buf.clone();
+        trim_to_tail(&mut buf, STDERR_BUFFER_MAX);
+        assert!(buf.len() <= STDERR_BUFFER_MAX);
+        assert!(original.ends_with(buf.as_str()));
     }
 
     // ── Lifecycle tests (apply to both modes) ────────────────────────
@@ -395,6 +471,64 @@ pub(super) mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_kill_tree_reaps_grandchild_after_leader_exits() {
+        // Reproduces the probe leak: the spawned launcher backgrounds a
+        // long-lived grandchild then exits 0 on its own (mirrors node/npx
+        // forking the real ACP binary then returning once the transport
+        // closes). `kill_on_drop` would only reap the direct child; the
+        // grandchild reparents to init and leaks. `force_kill_tree` must
+        // signal the whole process group and take the grandchild with it.
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_string_lossy().into_owned();
+
+        let config = CommandSpec {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "sleep 60 & child=$!; printf '%s' \"$child\" > \"$1\"; exit 0".into(),
+                "probe-grandchild-cleanup".into(),
+                marker_path.clone(),
+            ],
+            env: vec![],
+            cwd: None,
+        };
+        let proc = spawn_sdk_test_process(config).await;
+
+        // Leader exits on its own; wait for the exit monitor to observe it.
+        timeout(Duration::from_secs(5), proc.wait_for_exit())
+            .await
+            .expect("leader should exit promptly");
+
+        let child_pid: u32 = std::fs::read_to_string(marker.path())
+            .expect("grandchild pid marker should exist")
+            .trim()
+            .parse()
+            .expect("grandchild pid should be numeric");
+
+        fn is_pid_alive(pid: u32) -> bool {
+            let result = unsafe { libc::kill(pid as i32, 0) };
+            if result == 0 {
+                return true;
+            }
+            !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
+        }
+
+        assert!(is_pid_alive(child_pid), "grandchild pid={child_pid} should be alive");
+
+        proc.force_kill_tree();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while is_pid_alive(child_pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !is_pid_alive(child_pid),
+            "grandchild pid={child_pid} should be reaped by force_kill_tree",
+        );
     }
 
     #[tokio::test]

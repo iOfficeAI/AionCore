@@ -19,7 +19,6 @@ pub struct UpdateCronJobParams {
     pub agent_config: Option<Option<String>>,
     pub conversation_id: Option<String>,
     pub conversation_title: Option<Option<String>>,
-    pub agent_type: Option<String>,
     pub skill_content: Option<Option<String>>,
     pub description: Option<Option<String>>,
     pub next_run_at: Option<Option<TimestampMs>>,

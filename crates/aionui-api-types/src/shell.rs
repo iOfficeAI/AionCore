@@ -105,6 +105,36 @@ pub struct SpeechToTextConfig {
     pub deepgram: Option<DeepgramSpeechToTextConfig>,
 }
 
+// ---------------------------------------------------------------------------
+// STT streaming WebSocket protocol types
+// ---------------------------------------------------------------------------
+
+/// Client → server control frames for the STT streaming WebSocket.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SttStreamClientMessage {
+    Start {
+        format: String,
+        #[serde(rename = "sampleRate")]
+        sample_rate: u32,
+        channels: u32,
+        #[serde(rename = "languageHint", default)]
+        language_hint: Option<String>,
+    },
+    Stop,
+}
+
+/// Server → client frames for the STT streaming WebSocket.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SttStreamServerMessage {
+    Ready,
+    Partial { text: String },
+    Final { text: String },
+    Done,
+    Error { code: String, msg: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +349,110 @@ mod tests {
         let raw = json!({ "enabled": true });
         let result = serde_json::from_value::<SpeechToTextConfig>(raw);
         assert!(result.is_err());
+    }
+
+    // -- SttStreamClientMessage --
+
+    #[test]
+    fn stt_stream_client_start_full() {
+        let raw = json!({
+            "type": "start",
+            "format": "pcm16",
+            "sampleRate": 24000,
+            "channels": 1,
+            "languageHint": "zh"
+        });
+        let msg: SttStreamClientMessage = serde_json::from_value(raw).unwrap();
+        match msg {
+            SttStreamClientMessage::Start {
+                format,
+                sample_rate,
+                channels,
+                language_hint,
+            } => {
+                assert_eq!(format, "pcm16");
+                assert_eq!(sample_rate, 24000);
+                assert_eq!(channels, 1);
+                assert_eq!(language_hint, Some("zh".to_owned()));
+            }
+            _ => panic!("expected Start variant"),
+        }
+    }
+
+    #[test]
+    fn stt_stream_client_start_without_language_hint() {
+        let raw = json!({
+            "type": "start",
+            "format": "pcm16",
+            "sampleRate": 16000,
+            "channels": 1
+        });
+        let msg: SttStreamClientMessage = serde_json::from_value(raw).unwrap();
+        match msg {
+            SttStreamClientMessage::Start { language_hint, .. } => {
+                assert_eq!(language_hint, None);
+            }
+            _ => panic!("expected Start variant"),
+        }
+    }
+
+    #[test]
+    fn stt_stream_client_stop() {
+        let raw = json!({ "type": "stop" });
+        let msg: SttStreamClientMessage = serde_json::from_value(raw).unwrap();
+        assert!(matches!(msg, SttStreamClientMessage::Stop));
+    }
+
+    #[test]
+    fn stt_stream_client_garbage_type_rejected() {
+        let raw = json!({ "type": "garbage" });
+        let result = serde_json::from_value::<SttStreamClientMessage>(raw);
+        assert!(result.is_err());
+    }
+
+    // -- SttStreamServerMessage --
+
+    #[test]
+    fn stt_stream_server_ready_serializes() {
+        let msg = SttStreamServerMessage::Ready;
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json, json!({ "type": "ready" }));
+    }
+
+    #[test]
+    fn stt_stream_server_partial_serializes() {
+        let msg = SttStreamServerMessage::Partial { text: "hel".to_owned() };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json, json!({ "type": "partial", "text": "hel" }));
+    }
+
+    #[test]
+    fn stt_stream_server_final_serializes() {
+        let msg = SttStreamServerMessage::Final {
+            text: "hello world".to_owned(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json, json!({ "type": "final", "text": "hello world" }));
+    }
+
+    #[test]
+    fn stt_stream_server_done_serializes() {
+        let msg = SttStreamServerMessage::Done;
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json, json!({ "type": "done" }));
+    }
+
+    #[test]
+    fn stt_stream_server_error_serializes() {
+        let msg = SttStreamServerMessage::Error {
+            code: "STT_STREAM_UNSUPPORTED".to_owned(),
+            msg: "not supported".to_owned(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            json,
+            json!({ "type": "error", "code": "STT_STREAM_UNSUPPORTED", "msg": "not supported" })
+        );
     }
 
     // -- OpenAISpeechToTextConfig --

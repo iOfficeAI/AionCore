@@ -5,52 +5,10 @@ use serde_json::{Value, json};
 use crate::scheduler::SchedulerAction;
 use crate::types::TeammateRole;
 
-// ---------------------------------------------------------------------------
-// Tool description constants (原样复用 AionUi `toolDescriptions.ts`)
-// ---------------------------------------------------------------------------
-
-/// `team_spawn_agent` 工具描述 — 原样复制自 AionUi `toolDescriptions.ts`
-/// 对应 team-prompts.md §5.2 `team_spawn_agent` Description 原文。
-/// 禁止翻译、改写；aionui-audit §8 #5 硬约束。
-pub const TEAM_SPAWN_AGENT_DESCRIPTION: &str = r#"Create a new teammate agent to join the team.
-
-Use this only when one of the following is true:
-- The user explicitly approved the proposed teammate lineup in a previous message
-- The user explicitly instructed you to create a specific teammate immediately
-
-Before calling this tool in the normal planning flow:
-- Start with one short sentence explaining why additional teammates would help
-- Tell the user which teammate(s) you recommend
-- Present the proposal as a table with: name, responsibility, recommended agent type/backend, and recommended model
-- Include each teammate's responsibility, recommended agent type/backend, and model
-- Ask whether to create them as proposed or change any names, responsibilities, or agent types
-- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well
-- Do NOT call this tool in that same turn; wait for explicit approval in a later user message
-
-When calling this tool, provide the model parameter if a specific model was recommended and approved.
-
-The new agent will be created and added to the team. You can then assign tasks and send messages to it."#;
-
-/// Description for `team_list_models` — verbatim from team-prompts.md §5.2.
-pub const TEAM_LIST_MODELS_DESCRIPTION: &str = "Query available models for team agent types. Returns the real-time model list that matches the frontend model selector.
-
-Use this to:
-- Check what models are available before spawning an agent with a specific model
-- See all available agent types and their models at once
-- Verify a model ID is valid for a given agent type
-
-Pass agent_type to query a specific backend, or omit it to see all.";
-
-/// Description for `team_describe_assistant` — verbatim from team-prompts.md §5.2.
-pub const TEAM_DESCRIBE_ASSISTANT_DESCRIPTION: &str =
-    "Get detailed information about a preset assistant before spawning it as a teammate.
-
-Returns the preset's full description, enabled skills, and example tasks so you can
-judge whether it fits the user's request. Use this when two or more presets look
-relevant from the one-line catalog in your system prompt.
-
-Only works on preset assistants listed in \"Available Preset Assistants for Spawning\".
-After confirming a match, call team_spawn_agent with the same custom_agent_id.";
+pub use aionui_team_prompts::tools::{
+    TEAM_DESCRIBE_ASSISTANT_DESCRIPTION, TEAM_LIST_ASSISTANTS_DESCRIPTION, TEAM_LIST_MODELS_DESCRIPTION,
+    TEAM_SPAWN_AGENT_DESCRIPTION,
+};
 
 // ---------------------------------------------------------------------------
 // Tool descriptors (returned by tools/list)
@@ -63,129 +21,23 @@ pub struct ToolDescriptor {
     pub input_schema: Value,
 }
 
+pub fn all_tool_descriptors_for_role(caller_role: TeammateRole) -> Vec<ToolDescriptor> {
+    aionui_team_prompts::visible_team_tool_descriptors(caller_role == TeammateRole::Lead)
+        .into_iter()
+        .map(|descriptor| ToolDescriptor {
+            name: descriptor.name,
+            description: descriptor.description,
+            input_schema: descriptor.input_schema,
+        })
+        .collect()
+}
+
 pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
-    vec![
-        ToolDescriptor {
-            name: "team_send_message".into(),
-            description: "Send a message to a teammate or broadcast to all (to=\"*\").".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "to": { "type": "string", "description": "Target agent slot_id or \"*\" for broadcast" },
-                    "message": { "type": "string", "description": "Message content" }
-                },
-                "required": ["to", "message"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_spawn_agent".into(),
-            description: TEAM_SPAWN_AGENT_DESCRIPTION.into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Agent display name" },
-                    "agent_type": { "type": "string", "description": "Agent type/backend to use (e.g. \"claude\", \"codex\", \"codebuddy\", \"gemini\"). Query team_list_models first to see available options." },
-                    "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be a valid model for the chosen agent_type. Query team_list_models to see available models." },
-                    "custom_agent_id": { "type": "string", "description": "Preset assistant ID to spawn (from the Available Preset Assistants catalog). When set, agent_type is derived from the preset's backend." },
-                    "backend": { "type": "string", "description": "Legacy alias for agent_type. Prefer agent_type." },
-                    "role": { "type": "string", "description": "Agent role (default: 'teammate')" }
-                },
-                "required": ["name"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_task_create".into(),
-            description: "Create a new task on the team task board.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "subject": { "type": "string", "description": "Task subject" },
-                    "description": { "type": "string", "description": "Task description" },
-                    "owner": { "type": "string", "description": "Owning agent slotId" },
-                    "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Task IDs this task depends on" }
-                },
-                "required": ["subject"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_task_update".into(),
-            description: "Update an existing task on the team task board.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "Task ID to update" },
-                    "status": { "type": "string", "description": "New status: pending, in_progress, completed, deleted" },
-                    "description": { "type": "string", "description": "New description" },
-                    "owner": { "type": "string", "description": "New owning agent slotId" },
-                    "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "New dependency list" }
-                },
-                "required": ["task_id"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_task_list".into(),
-            description: "List all tasks on the team task board.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDescriptor {
-            name: "team_members".into(),
-            description: "List all team members with their roles and current status.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDescriptor {
-            name: "team_rename_agent".into(),
-            description: "Rename a team member.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "slot_id": { "type": "string", "description": "Agent slot_id to rename" },
-                    "new_name": { "type": "string", "description": "New display name" }
-                },
-                "required": ["slot_id", "new_name"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_shutdown_agent".into(),
-            description: "Initiate shutdown of a teammate (Lead only). Sends a shutdown_request to the target agent."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "slot_id": { "type": "string", "description": "Agent slot_id to shut down" },
-                    "reason": { "type": "string", "description": "Reason for shutdown" }
-                },
-                "required": ["slot_id"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_describe_assistant".into(),
-            description: TEAM_DESCRIBE_ASSISTANT_DESCRIPTION.into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "custom_agent_id": { "type": "string", "description": "The preset assistant ID from the \"Available Preset Assistants\" catalog (e.g., \"word-creator\")." },
-                    "locale": { "type": "string", "description": "Locale like \"zh-CN\" or \"en-US\". Defaults to the user's current UI language when omitted." }
-                },
-                "required": ["custom_agent_id"]
-            }),
-        },
-        ToolDescriptor {
-            name: "team_list_models".into(),
-            description: TEAM_LIST_MODELS_DESCRIPTION.into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_type": { "type": "string", "description": "Agent type/backend to query (e.g. \"gemini\", \"claude\", \"codex\"). Shows all when omitted." }
-                }
-            }),
-        },
-    ]
+    all_tool_descriptors_for_role(TeammateRole::Lead)
+}
+
+pub fn authorize_tool(caller_role: TeammateRole, tool_name: &str) -> Result<(), String> {
+    aionui_team_prompts::authorize_team_tool(caller_role == TeammateRole::Lead, tool_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -200,22 +52,16 @@ pub struct SendMessageInput {
 
 /// Arguments for the `team_spawn_agent` MCP tool call.
 ///
-/// The AionUi contract (`docs/teams/phase1/aionui-audit.md` §2.1) names the
-/// agent-type field `agent_type` and adds `custom_agent_id` + `model`. The
-/// phase-1 Rust dispatch originally exposed `backend` (and `role`); those are
-/// preserved for back-compat and used as fallbacks when the modern fields
-/// are not provided — `backend` is treated as an alias for `agent_type`.
+/// Team spawning is assistant-first. The MCP tool only accepts
+/// `assistant_id`, optional `model`, and optional `role`.
 #[derive(Debug, Default, Deserialize)]
 pub struct SpawnAgentInput {
     pub name: String,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
-    pub backend: Option<String>,
-    #[serde(default)]
-    pub agent_type: Option<String>,
-    #[serde(default)]
-    pub custom_agent_id: Option<String>,
+    #[serde(alias = "assistantId")]
+    pub assistant_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -265,7 +111,7 @@ pub fn is_whitelisted_backend(backend: &str) -> bool {
 pub fn parse_tool_call(
     tool_name: &str,
     arguments: &Value,
-    caller_role: TeammateRole,
+    _caller_role: TeammateRole,
 ) -> Result<SchedulerAction, String> {
     match tool_name {
         "team_send_message" => {
@@ -276,30 +122,7 @@ pub fn parse_tool_call(
                 message: input.message,
             })
         }
-        "team_spawn_agent" => {
-            if caller_role != TeammateRole::Lead {
-                return Err("Only Lead can spawn agents".into());
-            }
-            let input: SpawnAgentInput = serde_json::from_value(arguments.clone())
-                .map_err(|e| format!("Invalid arguments for team_spawn_agent: {e}"))?;
-            let backend = input
-                .agent_type
-                .clone()
-                .or(input.backend.clone())
-                .ok_or_else(|| "Missing 'agent_type' (or legacy 'backend') for team_spawn_agent".to_string())?;
-            if !is_whitelisted_backend(&backend) {
-                return Err(format!(
-                    "Backend '{}' not in hard whitelist. Whitelist: {}",
-                    backend,
-                    aionui_common::constants::TEAM_CAPABLE_BACKENDS.join(", ")
-                ));
-            }
-            Ok(SchedulerAction::SpawnAgent {
-                name: input.name,
-                role: input.role.unwrap_or_else(|| "teammate".into()),
-                backend,
-            })
-        }
+        "team_spawn_agent" => Err("handled directly by server".into()),
         "team_task_create" => {
             let input: TaskCreateInput = serde_json::from_value(arguments.clone())
                 .map_err(|e| format!("Invalid arguments for team_task_create: {e}"))?;
@@ -325,6 +148,7 @@ pub fn parse_tool_call(
         | "team_members"
         | "team_rename_agent"
         | "team_shutdown_agent"
+        | "team_list_assistants"
         | "team_list_models"
         | "team_describe_assistant" => Err("handled directly by server".into()),
         _ => Err(format!("Unknown tool: {tool_name}")),
@@ -336,16 +160,16 @@ pub fn parse_tool_call(
 // ---------------------------------------------------------------------------
 
 /// Phase-1 minimal `team_list_models` handler. Returns a hard-coded
-/// agent-type → models mapping. Used as fallback when DB is unavailable.
+/// backend → models mapping. Used as fallback when DB is unavailable.
 pub fn handle_team_list_models(_args: &Value) -> Value {
     json!({
-        "agent_types": [
+        "backends": [
             {
-                "type": "claude",
+                "backend": "claude",
                 "models": ["claude-sonnet-4", "claude-opus-4"]
             },
             {
-                "type": "codex",
+                "backend": "codex",
                 "models": ["codex-mini-latest"]
             }
         ]
@@ -354,17 +178,17 @@ pub fn handle_team_list_models(_args: &Value) -> Value {
 
 /// Build `team_list_models` response from DB rows. Reads each enabled,
 /// team-capable backend's `available_models` column. Filters by
-/// `agent_type` if provided. For internal agents (backend=NULL),
+/// `backend` if provided. For internal agents (backend=NULL),
 /// `provider_models` supplies the aggregated models from the providers table.
 pub fn build_list_models_from_rows(
     rows: &[AgentMetadataRow],
-    agent_type_filter: Option<&str>,
+    backend_filter: Option<&str>,
     provider_models: &[String],
 ) -> Value {
     use aionui_api_types::BehaviorPolicy;
     use aionui_common::constants::is_team_capable;
 
-    let mut agent_types: Vec<Value> = Vec::new();
+    let mut backends: Vec<Value> = Vec::new();
 
     for row in rows {
         if !row.enabled {
@@ -393,8 +217,8 @@ pub fn build_list_models_from_rows(
             }
         }
 
-        // Apply agent_type filter
-        if let Some(filter) = agent_type_filter
+        // Apply backend filter
+        if let Some(filter) = backend_filter
             && key != filter
         {
             continue;
@@ -402,8 +226,8 @@ pub fn build_list_models_from_rows(
 
         // For internal agents (aionrs), use provider models
         if is_internal && !provider_models.is_empty() {
-            agent_types.push(json!({
-                "type": key,
+            backends.push(json!({
+                "backend": key,
                 "models": provider_models,
             }));
             continue;
@@ -443,19 +267,13 @@ pub fn build_list_models_from_rows(
             })
             .unwrap_or_default();
 
-        agent_types.push(json!({
-            "type": key,
+        backends.push(json!({
+            "backend": key,
             "models": models,
         }));
     }
 
-    json!({ "agent_types": agent_types })
-}
-
-/// Phase-1 minimal `team_describe_assistant` handler. Backend has no preset
-/// assistants wired yet, so every call returns the not-found text.
-pub fn handle_team_describe_assistant(_args: &Value) -> String {
-    "Preset assistant not found".to_owned()
+    json!({ "backends": backends })
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +286,7 @@ mod tests {
 
     #[test]
     fn all_descriptors_count() {
-        assert_eq!(all_tool_descriptors().len(), 10);
+        assert_eq!(all_tool_descriptors().len(), 11);
     }
 
     #[test]
@@ -477,7 +295,7 @@ mod tests {
         let mut names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
     }
 
     #[test]
@@ -508,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn team_spawn_agent_schema_exposes_model_and_agent_type() {
+    fn team_spawn_agent_schema_exposes_model_and_assistant_id_only() {
         let desc = all_tool_descriptors()
             .into_iter()
             .find(|d| d.name == "team_spawn_agent")
@@ -516,17 +334,17 @@ mod tests {
         let props = desc.input_schema["properties"].as_object().unwrap();
         assert!(props.contains_key("model"), "schema must expose 'model' field");
         assert!(
-            props.contains_key("agent_type"),
-            "schema must expose 'agent_type' field"
+            props.contains_key("assistant_id"),
+            "schema must expose 'assistant_id' field"
         );
         assert!(
-            props.contains_key("custom_agent_id"),
-            "schema must expose 'custom_agent_id' field"
+            !props.contains_key("agent_type"),
+            "assistant-first schema must not expose 'agent_type'"
         );
     }
 
     #[test]
-    fn team_spawn_agent_schema_required_is_only_name() {
+    fn team_spawn_agent_schema_requires_name_and_assistant_id() {
         let desc = all_tool_descriptors()
             .into_iter()
             .find(|d| d.name == "team_spawn_agent")
@@ -534,9 +352,10 @@ mod tests {
         let required = desc.input_schema["required"].as_array().unwrap();
         let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
         assert!(names.contains(&"name"), "name must be required");
+        assert!(names.contains(&"assistant_id"), "assistant_id must be required");
         assert!(
             !names.contains(&"backend"),
-            "backend should not be required (agent_type is preferred, backend is legacy alias)"
+            "backend should not appear in the assistant-first schema"
         );
     }
 
@@ -552,30 +371,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_spawn_agent_lead_ok() {
-        let args = json!({"name": "Helper", "backend": "claude"});
-        let action = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead).unwrap();
-        assert!(matches!(
-            action,
-            SchedulerAction::SpawnAgent { name, backend, role }
-            if name == "Helper" && backend == "claude" && role == "teammate"
-        ));
+    fn parse_spawn_agent_is_handled_directly_by_server() {
+        let args = json!({"name": "Helper", "assistant_id": "word-creator"});
+        let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("handled directly by server"));
     }
 
     #[test]
     fn parse_spawn_agent_teammate_rejected() {
-        let args = json!({"name": "X", "backend": "claude"});
+        let args = json!({"name": "X", "assistant_id": "word-creator"});
         let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Teammate);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Only Lead"));
+        assert!(result.unwrap_err().contains("handled directly by server"));
     }
 
     #[test]
-    fn parse_spawn_agent_bad_backend() {
-        let args = json!({"name": "X", "backend": "malicious"});
+    fn parse_spawn_agent_with_legacy_agent_type_is_handled_directly_by_server() {
+        let args = json!({"name": "X", "agent_type": "malicious"});
         let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not in hard whitelist"));
+        assert!(result.unwrap_err().contains("handled directly by server"));
     }
 
     #[test]
@@ -622,14 +438,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_spawn_with_explicit_role() {
-        let args = json!({"name": "W", "role": "worker", "backend": "codex"});
-        let action = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead).unwrap();
-        assert!(matches!(
-            action,
-            SchedulerAction::SpawnAgent { role, .. }
-            if role == "worker"
-        ));
+    fn parse_spawn_with_explicit_role_is_handled_directly_by_server() {
+        let args = json!({"name": "W", "role": "worker", "assistant_id": "word-creator"});
+        let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("handled directly by server"));
     }
 
     #[test]
@@ -673,7 +486,7 @@ mod tests {
         assert!(result.unwrap_err().contains("handled directly by server"));
     }
 
-    // ---- D4 descriptor text matches team-prompts.md §5.2 verbatim ----
+    // ---- D4 descriptor text remains aligned with assistant-first MCP contract ----
 
     #[test]
     fn team_list_models_descriptor_text_matches() {
@@ -684,12 +497,25 @@ mod tests {
         assert_eq!(desc.description, TEAM_LIST_MODELS_DESCRIPTION);
         assert!(
             desc.description
-                .starts_with("Query available models for team agent types.")
+                .starts_with("Query available models for assistant backends.")
         );
         assert!(
-            desc.description
-                .contains("Pass agent_type to query a specific backend, or omit it to see all.")
+            desc.description.contains(
+                "Pass assistant_id to query models for a specific assistant, or omit it to see all backends."
+            )
         );
+    }
+
+    #[test]
+    fn team_list_models_schema_prefers_assistant_id() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_list_models")
+            .unwrap();
+        let props = desc.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("assistant_id"));
+        assert!(!props.contains_key("agent_type"));
+        assert!(!props.contains_key("backend"));
     }
 
     #[test]
@@ -701,12 +527,104 @@ mod tests {
         assert_eq!(desc.description, TEAM_DESCRIBE_ASSISTANT_DESCRIPTION);
         assert!(
             desc.description
-                .starts_with("Get detailed information about a preset assistant")
+                .starts_with("Get detailed information about an assistant")
         );
         assert!(
             desc.description
-                .contains("After confirming a match, call team_spawn_agent with the same custom_agent_id.")
+                .contains("After confirming a match, call team_spawn_agent with the same assistant_id.")
         );
+    }
+
+    #[test]
+    fn team_describe_assistant_schema_prefers_assistant_id() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_describe_assistant")
+            .unwrap();
+        let props = desc.input_schema["properties"].as_object().unwrap();
+        let required = desc.input_schema["required"].as_array().unwrap();
+        let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(props.contains_key("assistant_id"));
+        assert!(!props.contains_key("custom_agent_id"));
+        assert!(names.contains(&"assistant_id"));
+        assert!(!names.contains(&"custom_agent_id"));
+    }
+
+    #[test]
+    fn team_list_assistants_descriptor_guides_real_assistant_ids() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_list_assistants")
+            .expect("team_list_assistants descriptor missing");
+        assert!(
+            desc.description
+                .starts_with("List the assistants available for team spawning."),
+            "unexpected descriptor text: {}",
+            desc.description
+        );
+        assert!(desc.description.contains("real assistant_id values"));
+    }
+
+    #[test]
+    fn team_list_assistants_schema_is_empty_object() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_list_assistants")
+            .expect("team_list_assistants descriptor missing");
+        let props = desc.input_schema["properties"].as_object().unwrap();
+        assert!(props.is_empty(), "team_list_assistants should not accept arguments");
+        assert!(desc.input_schema["required"].is_null());
+    }
+
+    #[test]
+    fn parse_spawn_agent_requires_explicit_assistant_id_field() {
+        let input: SpawnAgentInput = serde_json::from_value(json!({
+            "name": "Preset helper",
+            "assistant_id": "word-creator",
+        }))
+        .unwrap();
+        assert_eq!(input.assistant_id.as_deref(), Some("word-creator"));
+    }
+
+    #[test]
+    fn team_spawn_agent_schema_requires_assistant_id_only() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_spawn_agent")
+            .unwrap();
+        let props = desc.input_schema["properties"].as_object().unwrap();
+        let assistant_desc = props["assistant_id"]["description"].as_str().unwrap();
+        assert!(assistant_desc.starts_with("Assistant ID to spawn"));
+        assert!(!props.contains_key("agent_type"));
+        assert!(!props.contains_key("backend"));
+    }
+
+    #[test]
+    fn team_spawn_agent_description_uses_assistant_first_staffing_language() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_spawn_agent")
+            .unwrap();
+        assert!(
+            desc.description
+                .contains("recommended assistant, and recommended model")
+        );
+        assert!(!desc.description.contains("recommended assistant or backend"));
+    }
+
+    #[test]
+    fn team_describe_assistant_description_uses_assistant_only_wording() {
+        let desc = all_tool_descriptors()
+            .into_iter()
+            .find(|d| d.name == "team_describe_assistant")
+            .unwrap();
+        let props = desc.input_schema["properties"].as_object().unwrap();
+        let assistant_desc = props["assistant_id"]["description"].as_str().unwrap();
+        assert!(desc.description.contains("Get detailed information about an assistant"));
+        assert!(!desc.description.contains("preset assistant"));
+        assert!(!desc.description.contains("Available Preset Assistants"));
+        assert!(assistant_desc.starts_with("The assistant ID from the available assistants catalog"));
+        assert!(!assistant_desc.contains("preset assistant ID"));
     }
 
     // ---- D4 handlers return non-error payloads ----
@@ -714,14 +632,14 @@ mod tests {
     #[test]
     fn team_list_models_handler_returns_non_error() {
         let value = handle_team_list_models(&json!({}));
-        let agent_types = value
-            .get("agent_types")
+        let backends = value
+            .get("backends")
             .and_then(|v| v.as_array())
-            .expect("agent_types array missing");
-        assert!(!agent_types.is_empty());
-        let types: Vec<&str> = agent_types
+            .expect("backends array missing");
+        assert!(!backends.is_empty());
+        let types: Vec<&str> = backends
             .iter()
-            .filter_map(|e| e.get("type").and_then(|v| v.as_str()))
+            .filter_map(|e| e.get("backend").and_then(|v| v.as_str()))
             .collect();
         assert!(types.contains(&"claude"));
         assert!(types.contains(&"codex"));
@@ -735,11 +653,11 @@ mod tests {
             make_agent_row("disabled-one", false, r#"[{"id":"m1","name":"M1"}]"#),
         ];
         let value = build_list_models_from_rows(&rows, None, &[]);
-        let types: Vec<&str> = value["agent_types"]
+        let types: Vec<&str> = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|e| e["type"].as_str())
+            .filter_map(|e| e["backend"].as_str())
             .collect();
         assert!(types.contains(&"claude"));
         assert!(types.contains(&"codebuddy"));
@@ -754,11 +672,11 @@ mod tests {
             r#"[{"id":"claude-opus-4","name":"Opus 4"},{"id":"claude-sonnet-4","name":"Sonnet 4"}]"#,
         )];
         let value = build_list_models_from_rows(&rows, None, &[]);
-        let claude_entry = value["agent_types"]
+        let claude_entry = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["type"].as_str() == Some("claude"))
+            .find(|e| e["backend"].as_str() == Some("claude"))
             .expect("claude entry");
         let models: Vec<&str> = claude_entry["models"]
             .as_array()
@@ -770,17 +688,17 @@ mod tests {
     }
 
     #[test]
-    fn build_list_models_from_rows_filters_by_agent_type() {
+    fn build_list_models_from_rows_filters_by_backend() {
         let rows = vec![
             make_agent_row("claude", true, r#"[{"id":"claude-sonnet-4","name":"Sonnet 4"}]"#),
             make_agent_row("codebuddy", true, r#"[{"id":"cb-pro","name":"Pro"}]"#),
         ];
         let value = build_list_models_from_rows(&rows, Some("codebuddy"), &[]);
-        let types: Vec<&str> = value["agent_types"]
+        let types: Vec<&str> = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|e| e["type"].as_str())
+            .filter_map(|e| e["backend"].as_str())
             .collect();
         assert_eq!(types, vec!["codebuddy"]);
     }
@@ -792,11 +710,11 @@ mod tests {
             make_agent_row_no_models("gemini", true),
         ];
         let value = build_list_models_from_rows(&rows, None, &[]);
-        let types: Vec<&str> = value["agent_types"]
+        let types: Vec<&str> = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|e| e["type"].as_str())
+            .filter_map(|e| e["backend"].as_str())
             .collect();
         // gemini has no available_models in DB → should still appear but with empty models
         assert!(types.contains(&"gemini"));
@@ -828,6 +746,17 @@ mod tests {
             available_models: Some(available_models.to_owned()),
             available_commands: None,
             sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            command_override: None,
+            env_override: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -861,11 +790,11 @@ mod tests {
             aionrs_row,
         ];
         let value = build_list_models_from_rows(&rows, None, &[]);
-        let types: Vec<&str> = value["agent_types"]
+        let types: Vec<&str> = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|e| e["type"].as_str())
+            .filter_map(|e| e["backend"].as_str())
             .collect();
         assert!(types.contains(&"claude"));
         assert!(
@@ -875,7 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn build_list_models_from_rows_filters_null_backend_by_agent_type() {
+    fn build_list_models_from_rows_filters_null_backend_by_backend() {
         let mut aionrs_row = make_agent_row("aionrs", true, r#"[{"id":"aionrs-default","name":"AionRS"}]"#);
         aionrs_row.backend = None;
         aionrs_row.agent_type = "aionrs".to_owned();
@@ -888,11 +817,11 @@ mod tests {
         ];
         // Filter by "aionrs" should only return aionrs
         let value = build_list_models_from_rows(&rows, Some("aionrs"), &[]);
-        let types: Vec<&str> = value["agent_types"]
+        let types: Vec<&str> = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|e| e["type"].as_str())
+            .filter_map(|e| e["backend"].as_str())
             .collect();
         assert_eq!(types, vec!["aionrs"]);
     }
@@ -902,11 +831,11 @@ mod tests {
         let model_info_json = r#"{"current_model_id":"DeepSeek-V3.2","current_model_label":"DeepSeek-V3.2","available_models":[{"id":"GLM-5.0","label":"GLM-5.0"},{"id":"GLM-5.0-Turbo","label":"GLM-5.0-Turbo"},{"id":"DeepSeek-V3.2","label":"DeepSeek-V3.2"}]}"#;
         let rows = vec![make_agent_row("codebuddy", true, model_info_json)];
         let value = build_list_models_from_rows(&rows, None, &[]);
-        let cb_entry = value["agent_types"]
+        let cb_entry = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["type"].as_str() == Some("codebuddy"))
+            .find(|e| e["backend"].as_str() == Some("codebuddy"))
             .expect("codebuddy entry");
         let models: Vec<&str> = cb_entry["models"]
             .as_array()
@@ -941,11 +870,11 @@ mod tests {
             aionrs_row,
         ];
         let value = build_list_models_from_rows(&rows, None, &provider_models);
-        let aionrs_entry = value["agent_types"]
+        let aionrs_entry = value["backends"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["type"].as_str() == Some("aionrs"))
+            .find(|e| e["backend"].as_str() == Some("aionrs"))
             .expect("aionrs entry");
         let models: Vec<&str> = aionrs_entry["models"]
             .as_array()
@@ -954,11 +883,5 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(models, vec!["gemini-3.1-pro-preview", "gpt-5.4", "gpt-5.2"]);
-    }
-
-    #[test]
-    fn team_describe_assistant_handler_returns_non_error() {
-        let text = handle_team_describe_assistant(&json!({"custom_agent_id": "unknown"}));
-        assert_eq!(text, "Preset assistant not found");
     }
 }

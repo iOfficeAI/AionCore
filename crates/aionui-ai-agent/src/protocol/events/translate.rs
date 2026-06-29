@@ -63,16 +63,20 @@ pub(crate) fn session_notification_to_events(notif: &SessionNotification) -> Vec
         }
 
         SessionUpdate::ToolCallUpdate(tcu) => {
+            let mut raw_output = sanitize_raw_output(tcu.fields.raw_output.clone());
+            let status = normalize_tool_status(tcu.fields.status.as_ref(), raw_output.as_ref());
+            normalize_raw_output_status(&mut raw_output, status.as_ref());
+
             events.push(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
                 session_id,
                 update: AcpToolCallUpdateData {
                     session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
                     tool_call_id: tcu.tool_call_id.to_string(),
-                    status: tcu.fields.status.as_ref().map(map_sdk_tool_status),
+                    status,
                     title: tcu.fields.title.clone(),
                     kind: tcu.fields.kind.as_ref().map(map_sdk_tool_kind),
                     raw_input: tcu.fields.raw_input.clone(),
-                    raw_output: tcu.fields.raw_output.clone(),
+                    raw_output,
                     content: tcu
                         .fields
                         .content
@@ -155,6 +159,135 @@ fn map_sdk_tool_status(sdk: &SdkToolCallStatus) -> AcpToolCallStatus {
         SdkToolCallStatus::Failed => AcpToolCallStatus::Failed,
         _ => AcpToolCallStatus::Pending,
     }
+}
+
+const ACP_RAW_OUTPUT_INLINE_IMAGE_LIMIT: usize = 64 * 1024;
+
+fn sanitize_raw_output(raw_output: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let mut value = raw_output?;
+    sanitize_inline_image_result(&mut value);
+    Some(value)
+}
+
+fn sanitize_inline_image_result(value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+
+    let saved_path = obj
+        .get("saved_path")
+        .and_then(|v| v.as_str())
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
+    // Strip any oversized inline-image `result` regardless of whether the image was
+    // saved to disk. Older codex versions and interrupted/failed generations may emit
+    // the multi-MB base64 without a `saved_path`; that payload must never reach the
+    // WebSocket broadcast or SQLite either. `saved_path` only decides whether we attach
+    // the structured `image { path, mime_type, source }` object below.
+    let should_omit = obj
+        .get("result")
+        .and_then(|v| v.as_str())
+        .map(is_probably_inline_image_result)
+        .unwrap_or(false);
+
+    if !should_omit {
+        if obj.get("image").is_none()
+            && let Some(path) = saved_path.as_deref().filter(|path| is_probably_image_path(path))
+        {
+            insert_image_output(obj, path);
+        }
+        return;
+    }
+
+    let result_len = obj.get("result").and_then(|v| v.as_str()).map(str::len).unwrap_or(0);
+    obj.remove("result");
+    obj.insert("result_omitted".to_owned(), serde_json::Value::Bool(true));
+    obj.insert(
+        "result_omitted_reason".to_owned(),
+        serde_json::Value::String("image_base64".to_owned()),
+    );
+    obj.insert(
+        "result_bytes".to_owned(),
+        serde_json::Value::Number(serde_json::Number::from(result_len)),
+    );
+
+    if let Some(path) = saved_path {
+        insert_image_output(obj, &path);
+    }
+}
+
+fn is_probably_inline_image_result(value: &str) -> bool {
+    value.len() > ACP_RAW_OUTPUT_INLINE_IMAGE_LIMIT
+        && (value.starts_with("iVBORw0KGgo")
+            || value.starts_with("/9j/")
+            || value.starts_with("UklGR")
+            || value.starts_with("data:image/"))
+}
+
+fn mime_type_from_image_path(path: &str) -> &'static str {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else {
+        "image/png"
+    }
+}
+
+fn is_probably_image_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".gif")
+}
+
+fn insert_image_output(obj: &mut serde_json::Map<String, serde_json::Value>, path: &str) {
+    let mime_type = mime_type_from_image_path(path);
+    obj.insert(
+        "image".to_owned(),
+        serde_json::json!({
+            "path": path,
+            "mime_type": mime_type,
+            "source": "codex_image_generation"
+        }),
+    );
+}
+
+fn normalize_tool_status(
+    sdk_status: Option<&SdkToolCallStatus>,
+    raw_output: Option<&serde_json::Value>,
+) -> Option<AcpToolCallStatus> {
+    let image_saved = raw_output
+        .and_then(|v| v.get("image"))
+        .and_then(|v| v.get("path"))
+        .and_then(|v| v.as_str())
+        .filter(|path| !path.is_empty())
+        .is_some();
+
+    // Only force `completed` when the image is on disk AND the agent did not already
+    // report a terminal status. Codex stalls by leaving the final event as
+    // `generating`/`in_progress`, but a genuine `failed` must be preserved as-is.
+    match (image_saved, sdk_status.map(map_sdk_tool_status)) {
+        (true, None | Some(AcpToolCallStatus::Pending | AcpToolCallStatus::InProgress)) => {
+            Some(AcpToolCallStatus::Completed)
+        }
+        (_, status) => status,
+    }
+}
+
+fn normalize_raw_output_status(raw_output: &mut Option<serde_json::Value>, status: Option<&AcpToolCallStatus>) {
+    let Some(AcpToolCallStatus::Completed) = status else {
+        return;
+    };
+    let Some(obj) = raw_output.as_mut().and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    obj.insert("status".to_owned(), serde_json::Value::String("completed".to_owned()));
 }
 
 fn map_sdk_tool_kind(kind: &SdkToolKind) -> AcpToolCallKind {

@@ -4,14 +4,15 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, State};
-use axum::routing::{get, post};
+use axum::extract::{Json, Path, State};
+use axum::routing::{get, post, put};
 use tracing::warn;
 
 use aionui_api_types::{
-    ApiResponse, ApprovePairingRequest, BridgeResponse, ChannelSessionResponse, ChannelUserResponse,
-    DisablePluginRequest, EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest,
-    RevokeUserRequest, SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
+    ApiResponse, ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelDefaultModelSetting,
+    ChannelPlatformSettingsResponse, ChannelSessionResponse, ChannelUserResponse, DisablePluginRequest,
+    EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
+    SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
 };
 use aionui_common::ApiError;
 use aionui_db::{DbError, IChannelRepository};
@@ -101,6 +102,15 @@ pub fn channel_routes(state: ChannelRouterState) -> Router {
         // Session management
         .route("/api/channel/sessions", get(get_active_sessions))
         // Settings sync
+        .route("/api/channel/settings/{platform}", get(get_channel_settings))
+        .route(
+            "/api/channel/settings/{platform}/assistant",
+            put(set_channel_assistant_setting),
+        )
+        .route(
+            "/api/channel/settings/{platform}/default-model",
+            put(set_channel_default_model_setting),
+        )
         .route("/api/channel/settings/sync", post(sync_channel_settings))
         .with_state(state)
 }
@@ -549,6 +559,62 @@ async fn get_active_sessions(
         })
         .collect();
     Ok(Json(ApiResponse::ok(responses)))
+}
+
+// ---------------------------------------------------------------------------
+// Channel settings handlers
+// ---------------------------------------------------------------------------
+
+/// `GET /api/channel/settings/:platform` — return backend-owned channel settings.
+async fn get_channel_settings(
+    State(state): State<ChannelRouterState>,
+    Path(platform): Path<String>,
+) -> Result<Json<ApiResponse<ChannelPlatformSettingsResponse>>, ApiError> {
+    let platform = PluginType::from_str_opt(&platform)
+        .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
+
+    let settings = state.settings_service.get_platform_settings(platform).await?;
+    Ok(Json(ApiResponse::ok(settings)))
+}
+
+/// `PUT /api/channel/settings/:platform/assistant` — persist assistant binding for a platform.
+async fn set_channel_assistant_setting(
+    State(state): State<ChannelRouterState>,
+    Path(platform): Path<String>,
+    body: Result<Json<ChannelAssistantSettingRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
+    let platform = PluginType::from_str_opt(&platform)
+        .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
+    let Json(req) = body.map_err(ApiError::from)?;
+
+    state.settings_service.set_assistant_setting(platform, &req).await?;
+    state.session_manager.clear_all_sessions().await?;
+
+    Ok(Json(ApiResponse::ok(BridgeResponse {
+        success: true,
+        message: Some("Assistant setting updated".into()),
+        error: None,
+    })))
+}
+
+/// `PUT /api/channel/settings/:platform/default-model` — persist default model for a platform.
+async fn set_channel_default_model_setting(
+    State(state): State<ChannelRouterState>,
+    Path(platform): Path<String>,
+    body: Result<Json<ChannelDefaultModelSetting>, JsonRejection>,
+) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
+    let platform = PluginType::from_str_opt(&platform)
+        .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
+    let Json(req) = body.map_err(ApiError::from)?;
+
+    state.settings_service.set_model_setting(platform, &req).await?;
+    state.session_manager.clear_all_sessions().await?;
+
+    Ok(Json(ApiResponse::ok(BridgeResponse {
+        success: true,
+        message: Some("Default model setting updated".into()),
+        error: None,
+    })))
 }
 
 // ---------------------------------------------------------------------------

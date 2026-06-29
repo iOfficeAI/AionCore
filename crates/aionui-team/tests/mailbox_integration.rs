@@ -35,6 +35,29 @@ async fn mw1_write_text_message() {
 }
 
 #[tokio::test]
+async fn mw1b_write_text_message_preserves_files_in_mailbox() {
+    let (mailbox, _db) = setup().await;
+    let files = vec!["/tmp/a.txt".to_string(), "/tmp/b.txt".to_string()];
+    let msg = mailbox
+        .write_with_files(
+            "t1",
+            "a1",
+            "user",
+            MailboxMessageType::Message,
+            "hello",
+            None,
+            Some(&files),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(msg.files.as_deref(), Some(files.as_slice()));
+    let unread = mailbox.peek_unread("t1", "a1").await.unwrap();
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0].files.as_deref(), Some(files.as_slice()));
+}
+
+#[tokio::test]
 async fn mw2_write_idle_notification_with_summary() {
     let (mailbox, _db) = setup().await;
     let msg = mailbox

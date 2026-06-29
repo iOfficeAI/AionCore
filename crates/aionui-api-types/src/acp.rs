@@ -19,22 +19,6 @@ pub struct DetectCliResponse {
     pub path: Option<String>,
 }
 
-/// Request body for ACP health check.
-#[derive(Debug, Deserialize)]
-pub struct AcpHealthCheckRequest {
-    pub backend: String,
-}
-
-/// Response for ACP health check.
-#[derive(Debug, Serialize)]
-pub struct AcpHealthCheckResponse {
-    pub available: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latency: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 /// Response for ACP environment variables.
 #[derive(Debug, Serialize)]
 pub struct AcpEnvResponse {
@@ -76,6 +60,61 @@ pub struct GetModelInfoResponse {
     pub model_info: Option<ModelInfoPayload>,
 }
 
+/// A single select option inside an ACP config option.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpConfigSelectOptionDto {
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Frontend-facing ACP config option. Always serializes with snake_case field names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpConfigOptionDto {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(rename = "type")]
+    pub option_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_value: Option<String>,
+    #[serde(default)]
+    pub options: Vec<AcpConfigSelectOptionDto>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigOptionConfirmation {
+    Observed,
+    CommandAck,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SetConfigOptionRequest {
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetConfigOptionsResponse {
+    pub config_options: Vec<AcpConfigOptionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetConfigOptionResponse {
+    pub confirmation: ConfigOptionConfirmation,
+    pub config_options: Option<Vec<AcpConfigOptionDto>>,
+}
+
 /// Inner model info payload matching the frontend's `AcpModelInfo` type.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelInfoPayload {
@@ -109,16 +148,22 @@ pub struct TryConnectCustomAgentRequest {
 
 /// Outcome of [`TryConnectCustomAgentRequest`].
 ///
-/// Tagged enum: `step` distinguishes the three states the frontend's
-/// Alert component renders (success → green, fail_cli → red,
-/// fail_acp → yellow). `error` carries a human-readable reason for the
-/// two failure variants.
+/// Tagged enum: `step` distinguishes the states the frontend's Alert component
+/// renders (success → green, fail_cli → red, fail_acp → yellow, fail_auth →
+/// yellow with a "needs login" hint). `error` carries a human-readable reason
+/// for the failure variants.
+///
+/// The probe reaches `session/new` (not just `initialize`), so `fail_auth`
+/// distinguishes "reachable but not authorized" (ACP `auth_required`,
+/// JSON-RPC `-32000`) from other ACP failures — `initialize` alone cannot
+/// tell these apart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
 pub enum TryConnectCustomAgentResponse {
     Success,
     FailCli { error: String },
     FailAcp { error: String },
+    FailAuth { error: String },
 }
 
 /// Query parameters for workspace browse.
@@ -180,31 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn health_check_response_available() {
-        let resp = AcpHealthCheckResponse {
-            available: true,
-            latency: Some(120),
-            error: None,
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["available"], true);
-        assert_eq!(json["latency"], 120);
-        assert!(json.get("error").is_none());
-    }
-
-    #[test]
-    fn health_check_response_unavailable() {
-        let resp = AcpHealthCheckResponse {
-            available: false,
-            latency: None,
-            error: Some("CLI not found".into()),
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["available"], false);
-        assert_eq!(json["error"], "CLI not found");
-    }
-
-    #[test]
     fn set_mode_request_serde() {
         let json = json!({ "mode": "code" });
         let req: SetModeRequest = serde_json::from_value(json).unwrap();
@@ -216,6 +236,44 @@ mod tests {
         let json = json!({ "model_id": "claude-sonnet-4" });
         let req: SetModelRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.model_id, "claude-sonnet-4");
+    }
+
+    #[test]
+    fn config_options_response_serializes_snake_case() {
+        let resp = GetConfigOptionsResponse {
+            config_options: vec![AcpConfigOptionDto {
+                id: "reasoning_effort".to_owned(),
+                name: Some("Reasoning Effort".to_owned()),
+                label: None,
+                description: None,
+                category: Some("thought_level".to_owned()),
+                option_type: "select".to_owned(),
+                current_value: Some("high".to_owned()),
+                options: vec![AcpConfigSelectOptionDto {
+                    value: "high".to_owned(),
+                    name: Some("High".to_owned()),
+                    label: None,
+                    description: None,
+                }],
+            }],
+        };
+
+        let value = serde_json::to_value(resp).unwrap();
+        assert_eq!(value["config_options"][0]["current_value"], "high");
+        assert_eq!(value["config_options"][0]["type"], "select");
+        assert!(value["config_options"][0].get("currentValue").is_none());
+    }
+
+    #[test]
+    fn set_config_option_response_serializes_command_ack_without_snapshot() {
+        let resp = SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::CommandAck,
+            config_options: None,
+        };
+
+        let value = serde_json::to_value(resp).unwrap();
+        assert_eq!(value["confirmation"], "command_ack");
+        assert!(value["config_options"].is_null());
     }
 
     #[test]
@@ -257,6 +315,16 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&fail).unwrap(),
             serde_json::json!({"step":"fail_cli","error":"not found"})
+        );
+
+        // Reachable-but-unauthorized is its own tag so the UI can show a
+        // "needs login" hint instead of a generic ACP failure.
+        let auth = TryConnectCustomAgentResponse::FailAuth {
+            error: "requires login".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&auth).unwrap(),
+            serde_json::json!({"step":"fail_auth","error":"requires login"})
         );
     }
 

@@ -3,6 +3,22 @@ name: officecli-pitch-deck
 description: "Use this skill when the user is building a fundraising / investor pitch deck — seed, Series A / B / C, convertible note, SAFE round, strategic raise. Trigger on: 'pitch deck', 'investor deck', 'Series A deck', 'Series B deck', 'Series C deck', 'fundraising deck', 'seed pitch', 'VC deck', 'raising capital', 'term sheet presentation'. Output is a single .pptx. This skill is a scene layer on top of officecli-pptx — inherits every pptx v2 rule (visual floor, grid, palettes, connector canon, Delivery Gate). DO NOT invoke for a generic board review, sales deck, all-hands, or product launch — route those to officecli-pptx base."
 ---
 
+> **⚠️ Platform note — read before running any command.** The shell snippets in this skill are written for **macOS / Linux** (bash/zsh). Always check which OS you are on first. On **Windows** do **not** run them verbatim — the underlying tool/CLI commands are usually cross-platform, but the surrounding shell syntax is not. Translate it to PowerShell before running:
+>
+> | bash (macOS / Linux) | PowerShell (Windows) |
+> | --- | --- |
+> | `a && b` | run as two steps, or `a; if ($?) { b }` |
+> | `cat <<'EOF' \| tool …` (heredoc) | write the text to a temp file, then pipe/pass that file to the tool |
+> | `VAR=$(cmd)` … `$VAR` | `$VAR = cmd` … `$VAR` |
+> | `cmd > /dev/null` | `cmd > $null` |
+> | `… \| grep PAT` | `… \| Select-String PAT` |
+> | `… \| jq …` | `… \| ConvertFrom-Json`, then read the fields |
+> | `python3 x.py` | `python x.py` (or `py x.py`) |
+> | `~/dir`, `/tmp` | `$env:USERPROFILE\dir`, `$env:TEMP` |
+> | `cp` / `mkdir -p` / `rm -rf` | `Copy-Item` / `New-Item -ItemType Directory -Force` / `Remove-Item -Recurse -Force` |
+>
+> If a command has no obvious Windows equivalent, prefer the built-in file/HTTP tools over raw shell.
+
 # OfficeCLI Pitch Deck Skill
 
 **This skill is a scene layer on top of `officecli-pptx`.** Every pptx hard rule — visual delivery floor (title ≥ 36pt / body ≥ 18pt / title ≥ 2× body), 12-column grid on 33.87×19.05cm, 4 canonical palettes, chart-choice decision table, connector canon (`shape` / `from` / `to` / `tailEnd=triangle`), shell escape, resident + batch, Delivery Gate 1–5a — is inherited, not re-taught. This file adds only what **fundraising** needs on top: stage diagnosis (A / B / C), 5 赛道 arc templates, 10 key-slide recipes (cover / problem / solution / market / product / model / traction / team / financials / ask), pitch-specific numbers convention, a VC ship-check, and a pitch-specific fresh-eyes Gate 6.
@@ -286,6 +302,8 @@ Sub-labels ≥ 16pt (H4 floor). For 5 stats stacked, drop number size to 44pt; 6
 The 10 slides every pitch deck carries. Each recipe below gives: **visual outcome** (what the slide looks like from 3m away) + **runnable block** (≤ 18 lines) + **QA one-liner**. All recipes inherit pptx v2 palettes, grid math, type hierarchy, and `--prop tailEnd=triangle` on every connector. Recipes reference the Slide Patterns above: Cover reuses C.1; Problem / Why-Now reuse C.2; Traction / Financials reuse C.4; Feature / pillar slides reuse C.5b. `$FILE` is your deck file.
 
 **Long-title wrap rule.** A 36pt+ title that wraps to 2 lines: add `height` (e.g. 2cm → 3.5cm) — never drop the font below 36pt. Titles < 36pt on a pitch deck read as timid regardless of content.
+
+> **Chart `series1.color=` on `add` works** (applies to every chart recipe below). Passing `--prop series1.color=` (or `series2.color=`, …) on chart `add` applies the series color and exits 0. Verify with a readback if you like: `officecli get "$FILE" "/slide[N]/chart[1]/series[1]" --json | jq '.data.results[0].format.color'`.
 
 ### (1) Cover slide — company · tagline · round · date
 
@@ -616,7 +634,7 @@ officecli add "$FILE" / --type slide --prop layout=blank --prop background=FFFFF
 officecli add "$FILE" "/slide[$SLIDE]" --type shape --prop text="Competitive landscape" \
   --prop x=1.5cm --prop y=1.2cm --prop width=30.87cm --prop height=2cm \
   --prop font=Georgia --prop size=36 --prop bold=true --prop color=1E2761 --prop fill=none
-# Inline table via --prop data= (confirmed on v1.0.63; per-cell r#c# rejected). Single-quote the data value — '$15/host' would strip.
+# Inline table via --prop data= (per-cell r#c# is silently ignored / not honored — use data=). Single-quote the data value — '$15/host' would strip.
 officecli add "$FILE" "/slide[$SLIDE]" --type table \
   --prop data='Competitor,Speed,Price,Integrations,Margin;Datadog,12 min,$15/host,680,75%;New Relic,18 min,$25/host,520,68%;Splunk,45 min,$45/GB,310,62%;You (Acme DevOps),90 sec,$8/host,1200,82%' \
   --prop style=medium1 --prop headerFill=1E2761 \
@@ -781,7 +799,7 @@ AXISMIN_HIT=$(officecli query "$FILE" 'chart' --json | jq '[.data.results[]? | s
 echo "Delivery Gate 6 PASS (token + narrative checks) — proceed to Gate 5b fresh-eyes (MANDATORY)"
 ```
 
-**Readback key note.** CLI accepts lowercase `axismin` as input (on `--prop axismin=0`) but emits camelCase `axisMin` in `query --json` on v1.0.63. The jq above accepts both for forward-compat.
+**Readback key note.** CLI accepts lowercase `axismin` as input (on `--prop axismin=0`) but emits camelCase `axisMin` in `query --json` readback. The jq above accepts both for forward-compat.
 
 Gate 6 is a grep floor. Gate 5b is the visual ceiling. Ship only when both print PASS.
 

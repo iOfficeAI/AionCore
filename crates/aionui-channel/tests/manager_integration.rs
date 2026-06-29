@@ -309,6 +309,34 @@ async fn ep2_re_enable_updates_config() {
     assert_eq!(config.credentials.token.as_deref(), Some("bot:new_token_456"));
 }
 
+// ── EP-6: Re-enable with empty config reuses stored credentials ───
+
+#[tokio::test]
+async fn ep6_re_enable_empty_config_reuses_stored_credentials() {
+    let (mgr, repo, _bc) = setup().await;
+    let factory = make_factory();
+
+    // First enable persists the token, then the user disables the channel.
+    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+        .await
+        .unwrap();
+    mgr.disable_plugin("telegram").await.unwrap();
+
+    // The Settings re-enable toggle sends an empty config and relies on the
+    // previously stored credentials being reused instead of erroring out.
+    mgr.enable_plugin("telegram", &serde_json::json!({}), &factory)
+        .await
+        .unwrap();
+
+    assert!(mgr.is_plugin_running("telegram"));
+
+    let row = repo.get_plugin("telegram").await.unwrap().unwrap();
+    assert!(row.enabled);
+    let decrypted = decrypt_string(&row.config, &test_key()).unwrap();
+    let config: PluginConfig = serde_json::from_str(&decrypted).unwrap();
+    assert_eq!(config.credentials.token.as_deref(), Some("bot:valid123"));
+}
+
 // ── EP-5: Invalid plugin ID ──────────────────────────────────────
 
 #[tokio::test]

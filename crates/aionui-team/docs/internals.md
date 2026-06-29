@@ -44,7 +44,7 @@ User                HTTP            TeamSession       Scheduler        Mailbox  
  │                   │                  │                 │                │              │                │── 结果 ────▶│
  │                   │                  │                 │◀─ finalize_turn(actions) ─────│                │             │
  │                   │                  │                 │─ mark_idle ────│              │                │             │
- │                   │                  │                 │ broadcast team.agent.status   │                │             │
+ │                   │                  │                 │ broadcast team.agentStatusChanged   │                │             │
  │                   │                  │                 │ maybe_wake_lead (若都 idle)   │                │             │
 ```
 
@@ -53,7 +53,7 @@ User                HTTP            TeamSession       Scheduler        Mailbox  
 关键点：
 - HTTP 立刻 200 返回，agent 回合在 `tokio::spawn` 里跑，失败会把 agent rollback 到 Idle。
 - `read_unread_and_mark` 是**原子**的：一次 SQL 拿走所有未读并标记已读（见 bug #1）。
-- 所有 WS 事件由 `TeamEventEmitter` 发：`team.agent.status / spawned / removed / renamed`。
+- 所有 WS 事件由 `TeamEventEmitter` 发：`team.agentStatusChanged / spawned / removed / renamed`。
 
 ## Mailbox
 
@@ -90,20 +90,9 @@ User                HTTP            TeamSession       Scheduler        Mailbox  
 - Agent 通过 JSON-RPC `initialize(auth_token, slot_id)` 鉴权后才能调工具
 - 暴露 8 个工具：`team_send_message / team_spawn_agent / team_task_create / team_task_update / team_task_list / team_members / team_rename_agent / team_shutdown_agent`（AionUi 参考实现有 10 个，差 `team_describe_assistant` 和 `team_list_models`）
 - `team_spawn_agent` 和 `team_shutdown_agent` 仅 Lead 可调用（Wave 5 D29a-2 加 caller guard、D30c 加 target=Lead guard）
-- `team_spawn_agent` 的 backend 白名单：由 `guide::capability::is_team_capable_backend`（W5-D28a）判定，当前允许 `claude / codex / gemini / aionrs`
+- `team_spawn_agent` 的 backend 白名单：由 `capability::is_team_capable_backend` 判定，当前允许 `claude / codex / gemini / aionrs`
 - `team_spawn_agent` 正从 no-op 转为真实创建（W5-D29b）：校验链 D29a-1/2 已合，D29a-3/4 / D29b 待合
 - TCP bind 成功 / 失败时通过 `team.mcpStatus` WS 事件广播 `TcpReady(port)` / `TcpError(error)`（W5-D31b-1）
-
-### Team Guide MCP（全局，Wave 5 新增，落地中）
-
-独立于 per-team MCP 的另一个 MCP server，挂在 solo agent 身上，供"单聊 → 建团"用：
-
-- `aion_list_models` — 列出可用 backend × model（D26c 代码已写，待合）
-- `aion_create_team` — 把当前 conversation 升级为 team（D26a 骨架、D26b-1 参数解析已写，待合 + 接入 handler）
-- D28a `is_team_capable_backend` 已合（`crates/aionui-team/src/guide/capability.rs`）
-- D28b / D28c（prompt 注入 + 把 Guide MCP 挂到 session 的 mcp_servers）待落
-
-Guide MCP 尚未端到端闭环，solo agent 调不到这两个工具。前端暂时仍需走 `POST /api/teams` 显式建团。
 
 ### MCP 与 Mailbox / TaskBoard 的交互
 
@@ -114,7 +103,7 @@ Guide MCP 尚未端到端闭环，solo agent 调不到这两个工具。前端�
 | `IdleNotification` action（非 MCP 工具，是 agent 回合结束时 scheduler 自动触发） | Mailbox.write() (`idle_notification`) → `mark_idle` → 可能 wake lead | ✅ 是 |
 | `team_task_create / update / list` | TaskBoard（SQLite `team_tasks`） | 不涉及 wake |
 | `team_members / team_rename_agent` | 内存 slots（+ WS 广播） | 不涉及 wake |
-| `team_spawn_agent` | 🔄 W5-D29b：从空壳切为调 `add_agent`（会广播 `team.agent.spawned`） | — |
+| `team_spawn_agent` | 🔄 W5-D29b：从空壳切为调 `add_agent`（会广播 `team.agentSpawned`） | — |
 
 **问题**：MCP 写完 mailbox 后没有调 `wake_and_dispatch`，与单聊 API 路径（`POST /api/conversations/{id}/messages` 会走 `TeamSession.wake_and_dispatch`）不一致。agent-to-agent 消息当前靠"下一次外部触发 wake"才被看到。见 bug #2。
 
@@ -132,7 +121,7 @@ Guide MCP 尚未端到端闭环，solo agent 调不到这两个工具。前端�
 完整路径（全部合入后）：
 1. kill agent 进程（`task_manager.kill`，D30d-1 🔄）
 2. 清 scheduler 的 `active_wakes` / `wake_timeouts` / `finalized_turns`（D30d-2 ✅）
-3. 从 `slots` 删除 + 广播 `team.agent.removed`（D30d-3 🔄）
+3. 从 `slots` 删除 + 广播 `team.agentRemoved`（D30d-3 🔄）
 
 shutdown 协议：lead 调 `team_shutdown_agent` → 写 `shutdown_request` 给 teammate → teammate 回 `team_send_message(shutdown_approved)` → scheduler 拦截字符串 → 触发 `remove_agent`。`shutdown_rejected:<reason>` 则取消 pending shutdown（已实现，`mcp/server.rs`）。
 

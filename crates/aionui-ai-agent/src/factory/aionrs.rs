@@ -4,7 +4,7 @@ use std::sync::Arc;
 use aion_agent::session::SessionManager;
 use aion_config::config::{McpServerConfig, TransportType};
 use aionui_api_types::{
-    AionrsBuildExtra, GuideMcpConfig, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
+    AionrsBuildExtra, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
@@ -14,7 +14,6 @@ use aionui_runtime::ensure_runtime_command_with_reporter;
 use tracing::{debug, info, warn};
 
 use crate::agent_task::AgentInstance;
-use crate::capability::team_guide_prompt;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
@@ -22,21 +21,21 @@ use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
-
-const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionrs", "codebuddy"];
-
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AionrsSessionBuildContext,
     model: ProviderWithModel,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
-    let belongs_to_team = build_context.belongs_to_team;
     let mut overrides = build_context.config;
 
     // Merge preset assistant rules into system_prompt (used as custom_prompt
     // in aionrs's build_system_prompt). Mirrors the old architecture's
     // `init_history` injection of `[Assistant System Rules]`.
+    // AionrsBuildExtra parses `skills` so Team preset snapshots preserve the
+    // target contract. Native skill materialization for Aionrs is tracked as a
+    // separate follow-up because this factory currently has no stable Aionrs
+    // skill-loading path.
     if let Some(rules) = overrides.preset_rules.take() {
         overrides.system_prompt = Some(match overrides.system_prompt.take() {
             Some(existing) => format!("{existing}\n\n{rules}"),
@@ -44,18 +43,7 @@ pub(super) async fn build(
         });
     }
 
-    // Inject Guide MCP config for solo (non-team) sessions, mirroring acp.rs.
-    // Skip if the conversation already belongs to a team (extra.teamId set).
-    if overrides.team_mcp_stdio_config.is_none()
-        && overrides.guide_mcp_config.is_none()
-        && deps.guide_mcp_config.is_some()
-        && !belongs_to_team
-    {
-        overrides.guide_mcp_config.clone_from(&deps.guide_mcp_config);
-        overrides.backend.get_or_insert_with(|| "aionrs".to_owned());
-    }
-
-    let mut extra_mcp_servers = resolve_mcp_servers(&overrides, &ctx.conversation_id);
+    let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
     if let Some(repo) = deps.mcp_server_repo.as_ref() {
         for (name, config) in load_user_mcp_servers(
             repo.as_ref(),
@@ -75,19 +63,6 @@ pub(super) async fn build(
         deps.broadcaster.clone(),
     )
     .await;
-
-    // Inject team guide system prompt for solo sessions with guide MCP
-    if overrides.team_mcp_stdio_config.is_none()
-        && overrides.guide_mcp_config.is_some()
-        && team_guide_prompt::is_solo_team_guide_backend(overrides.backend.as_deref().unwrap_or("aionrs"))
-    {
-        let guide_prompt =
-            team_guide_prompt::build_solo_team_guide_prompt(overrides.backend.as_deref().unwrap_or("aionrs"));
-        overrides.system_prompt = Some(match overrides.system_prompt.take() {
-            Some(existing) => format!("{existing}\n\n{guide_prompt}"),
-            None => guide_prompt,
-        });
-    }
 
     if !extra_mcp_servers.is_empty() {
         info!(
@@ -185,12 +160,46 @@ pub(super) async fn build(
         system_prompt: overrides.system_prompt,
         max_tokens: overrides.max_tokens,
         max_turns: overrides.max_turns,
+        max_tool_call_malformed_turns: overrides.max_tool_call_malformed_turns,
+        max_tool_call_failure_turns: overrides.max_tool_call_failure_turns,
         compat_overrides,
         session_directory,
         session_mode: overrides.session_mode,
         extra_mcp_servers,
         bedrock_config,
     };
+
+    if let Some(system_prompt) = config.system_prompt.as_deref()
+        && let Some(dump_dir) = crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts)
+    {
+        match crate::dev_prompt_dump::dump_prompt(
+            &dump_dir,
+            crate::dev_prompt_dump::PromptDump {
+                kind: "aionrs-system-prompt",
+                backend: None,
+                conversation_id: &ctx.conversation_id,
+                session_id: None,
+                msg_id: None,
+                turn_id: None,
+                prompt: system_prompt,
+            },
+        ) {
+            Ok(path) => {
+                debug!(
+                    conversation_id = %ctx.conversation_id,
+                    path = %path.display(),
+                    "DEV prompt dump written"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    conversation_id = %ctx.conversation_id,
+                    error = %error,
+                    "DEV prompt dump failed"
+                );
+            }
+        }
+    }
 
     let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
@@ -564,17 +573,9 @@ async fn ensure_stdio_launch(
     Ok((resolved.program.to_string_lossy().into_owned(), final_args, final_env))
 }
 
-fn resolve_mcp_servers(overrides: &AionrsBuildExtra, conversation_id: &str) -> HashMap<String, McpServerConfig> {
+fn resolve_mcp_servers(overrides: &AionrsBuildExtra) -> HashMap<String, McpServerConfig> {
     if let Some(cfg) = &overrides.team_mcp_stdio_config {
         return team_mcp_to_config(cfg);
-    }
-    if let Some(guide_cfg) = &overrides.guide_mcp_config
-        && overrides
-            .backend
-            .as_deref()
-            .is_some_and(|b| TEAM_CAPABLE_BACKENDS.contains(&b))
-    {
-        return guide_mcp_to_config(guide_cfg, overrides, conversation_id);
     }
     HashMap::new()
 }
@@ -597,32 +598,6 @@ fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConf
     };
 
     HashMap::from([(TEAM_MCP_SERVER_NAME.to_owned(), server)])
-}
-
-fn guide_mcp_to_config(
-    cfg: &GuideMcpConfig,
-    overrides: &AionrsBuildExtra,
-    conversation_id: &str,
-) -> HashMap<String, McpServerConfig> {
-    let mut env = HashMap::new();
-    env.insert("AION_MCP_PORT".into(), cfg.port.to_string());
-    env.insert("AION_MCP_TOKEN".into(), cfg.token.clone());
-    env.insert("AION_MCP_BACKEND".into(), overrides.backend.clone().unwrap_or_default());
-    env.insert("AION_MCP_CONVERSATION_ID".into(), conversation_id.to_owned());
-    env.insert("AION_MCP_USER_ID".into(), overrides.user_id.clone().unwrap_or_default());
-
-    let server = McpServerConfig {
-        transport: TransportType::Stdio,
-        command: Some(cfg.binary_path.clone()),
-        args: Some(vec!["mcp-guide-stdio".into()]),
-        env: Some(env),
-        url: None,
-        headers: None,
-        deferred: Some(false),
-        startup_timeout_ms: None,
-    };
-
-    HashMap::from([("aionui-team-guide".into(), server)])
 }
 
 #[cfg(test)]
@@ -695,8 +670,86 @@ mod tests {
         }
     }
 
+    struct MockMcpRepo {
+        rows: Vec<McpServerRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl IMcpServerRepository for MockMcpRepo {
+        async fn list(&self) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().find(|row| row.id == id).cloned())
+        }
+
+        async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().find(|row| row.name == name).cloned())
+        }
+
+        async fn create(
+            &self,
+            _params: aionui_db::CreateMcpServerParams<'_>,
+        ) -> Result<McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+
+        async fn update(
+            &self,
+            _id: &str,
+            _params: aionui_db::UpdateMcpServerParams<'_>,
+        ) -> Result<McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+
+        async fn batch_upsert(
+            &self,
+            _servers: &[aionui_db::CreateMcpServerParams<'_>],
+        ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+
+        async fn update_status(
+            &self,
+            _id: &str,
+            _status: &str,
+            _last_connected: Option<aionui_common::TimestampMs>,
+        ) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+
+        async fn update_tools(&self, _id: &str, _tools: Option<&str>) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for factory tests")
+        }
+    }
+
     fn test_broadcaster() -> Arc<dyn EventBroadcaster> {
         Arc::new(BroadcastEventBus::new(16))
+    }
+
+    #[tokio::test]
+    async fn aionrs_loads_mcp_servers_from_frozen_selection_snapshot() {
+        let mut row = make_row(
+            "mcp-docs",
+            "http",
+            r#"{"url":"http://localhost:54321/mcp","headers":{"Authorization":"Bearer frozen"}}"#,
+            false,
+            false,
+        );
+        row.id = "mcp-docs".into();
+        let repo = MockMcpRepo { rows: vec![row] };
+        let selected = vec!["mcp-docs".to_owned()];
+
+        let extra_mcp_servers =
+            load_user_mcp_servers(&repo, Some(&selected), "conv-frozen-mcp", test_broadcaster()).await;
+
+        assert!(extra_mcp_servers.contains_key("mcp-docs"));
+        assert_eq!(extra_mcp_servers["mcp-docs"].transport, TransportType::StreamableHttp);
     }
 
     #[cfg(unix)]
@@ -890,16 +943,11 @@ mod tests {
                 slot_id: "slot-1".into(),
                 binary_path: "/usr/bin/backend".into(),
             }),
-            guide_mcp_config: Some(GuideMcpConfig {
-                port: 8000,
-                token: "guide-tok".into(),
-                binary_path: "/usr/bin/backend".into(),
-            }),
             backend: Some("aionrs".into()),
             ..Default::default()
         };
 
-        let result = resolve_mcp_servers(&overrides, "conv-1");
+        let result = resolve_mcp_servers(&overrides);
         assert_eq!(result.len(), 1);
         assert!(result.contains_key(TEAM_MCP_SERVER_NAME));
 
@@ -916,72 +964,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mcp_servers_guide_when_no_team() {
+    fn resolve_mcp_servers_without_team_returns_empty_map() {
         let overrides = AionrsBuildExtra {
-            guide_mcp_config: Some(GuideMcpConfig {
-                port: 8000,
-                token: "guide-tok".into(),
-                binary_path: "/usr/bin/backend".into(),
-            }),
             backend: Some("aionrs".into()),
-            user_id: Some("user-1".into()),
             ..Default::default()
         };
 
-        let result = resolve_mcp_servers(&overrides, "conv-2");
-        assert_eq!(result.len(), 1);
-        assert!(result.contains_key("aionui-team-guide"));
-
-        let server = &result["aionui-team-guide"];
-        assert_eq!(server.transport, TransportType::Stdio);
-        assert_eq!(server.command.as_deref(), Some("/usr/bin/backend"));
-        assert_eq!(server.args.as_deref(), Some(&["mcp-guide-stdio".to_owned()][..]));
-        assert_eq!(server.deferred, Some(false));
-
-        let env = server.env.as_ref().unwrap();
-        assert_eq!(env.get("AION_MCP_PORT"), Some(&"8000".to_owned()));
-        assert_eq!(env.get("AION_MCP_TOKEN"), Some(&"guide-tok".to_owned()));
-        assert_eq!(env.get("AION_MCP_BACKEND"), Some(&"aionrs".to_owned()));
-        assert_eq!(env.get("AION_MCP_CONVERSATION_ID"), Some(&"conv-2".to_owned()));
-        assert_eq!(env.get("AION_MCP_USER_ID"), Some(&"user-1".to_owned()));
+        let result = resolve_mcp_servers(&overrides);
+        assert!(result.is_empty());
     }
 
     #[test]
     fn resolve_mcp_servers_empty_when_no_config() {
         let overrides = AionrsBuildExtra::default();
-        let result = resolve_mcp_servers(&overrides, "conv-3");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn resolve_mcp_servers_guide_skipped_for_unknown_backend() {
-        let overrides = AionrsBuildExtra {
-            guide_mcp_config: Some(GuideMcpConfig {
-                port: 8000,
-                token: "tok".into(),
-                binary_path: "/bin/x".into(),
-            }),
-            backend: Some("unknown-vendor".into()),
-            ..Default::default()
-        };
-
-        let result = resolve_mcp_servers(&overrides, "conv-4");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn resolve_mcp_servers_guide_skipped_when_backend_none() {
-        let overrides = AionrsBuildExtra {
-            guide_mcp_config: Some(GuideMcpConfig {
-                port: 8000,
-                token: "tok".into(),
-                binary_path: "/bin/x".into(),
-            }),
-            backend: None,
-            ..Default::default()
-        };
-
-        let result = resolve_mcp_servers(&overrides, "conv-5");
+        let result = resolve_mcp_servers(&overrides);
         assert!(result.is_empty());
     }
 

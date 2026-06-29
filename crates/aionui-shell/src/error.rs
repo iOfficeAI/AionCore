@@ -35,6 +35,12 @@ pub enum SttError {
 
     #[error("STT unknown error: {0}")]
     Unknown(String),
+
+    #[error("STT streaming is not supported for this model or endpoint")]
+    StreamUnsupported,
+
+    #[error("STT stream protocol error: {0}")]
+    StreamProtocol(String),
 }
 
 impl SttError {
@@ -45,6 +51,8 @@ impl SttError {
             Self::DeepgramNotConfigured => "STT_DEEPGRAM_NOT_CONFIGURED",
             Self::RequestFailed(_) => "STT_REQUEST_FAILED",
             Self::Unknown(_) => "STT_UNKNOWN",
+            Self::StreamUnsupported => "STT_STREAM_UNSUPPORTED",
+            Self::StreamProtocol(_) => "STT_STREAM_PROTOCOL",
         }
     }
 
@@ -53,6 +61,7 @@ impl SttError {
             Self::Disabled | Self::OpenaiNotConfigured | Self::DeepgramNotConfigured => 400,
             Self::RequestFailed(_) => 502,
             Self::Unknown(_) => 500,
+            Self::StreamUnsupported | Self::StreamProtocol(_) => 400,
         }
     }
 }
@@ -92,6 +101,11 @@ mod tests {
         );
         assert_eq!(SttError::RequestFailed("x".into()).error_code(), "STT_REQUEST_FAILED");
         assert_eq!(SttError::Unknown("x".into()).error_code(), "STT_UNKNOWN");
+        assert_eq!(SttError::StreamUnsupported.error_code(), "STT_STREAM_UNSUPPORTED");
+        assert_eq!(
+            SttError::StreamProtocol("bad frame".into()).error_code(),
+            "STT_STREAM_PROTOCOL"
+        );
     }
 
     #[test]
@@ -101,6 +115,8 @@ mod tests {
         assert_eq!(SttError::DeepgramNotConfigured.status_code(), 400);
         assert_eq!(SttError::RequestFailed("x".into()).status_code(), 502);
         assert_eq!(SttError::Unknown("x".into()).status_code(), 500);
+        assert_eq!(SttError::StreamUnsupported.status_code(), 400);
+        assert_eq!(SttError::StreamProtocol("x".into()).status_code(), 400);
     }
 
     #[test]
@@ -119,5 +135,13 @@ mod tests {
             "STT request failed: timeout"
         );
         assert_eq!(SttError::Unknown("oops".into()).to_string(), "STT unknown error: oops");
+        assert_eq!(
+            SttError::StreamUnsupported.to_string(),
+            "STT streaming is not supported for this model or endpoint"
+        );
+        assert_eq!(
+            SttError::StreamProtocol("unexpected frame".into()).to_string(),
+            "STT stream protocol error: unexpected frame"
+        );
     }
 }

@@ -48,6 +48,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub log_level: Option<String>,
 
+    /// Dump prompt diagnostics to {data-dir}/prompt-dumps.
+    #[arg(long)]
+    pub dump_prompts: bool,
+
     /// Managed runtime resource source selection.
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,
@@ -72,15 +76,13 @@ impl From<ManagedResourcesModeArg> for aionui_runtime::ManagedResourcesMode {
 }
 
 // `Mcp` prefix is load-bearing on Mcp* variants — clap derives kebab-case
-// subcommand names (`mcp-bridge`, `mcp-guide-stdio`, `mcp-team-stdio`)
+// subcommand names (`mcp-bridge`, `mcp-team-stdio`)
 // that external callers (ACP agent CLI, team MCP bridge spec) depend on
 // verbatim.
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
     McpBridge,
-    /// MCP stdio server for team-guide tools (spawned by the ACP agent CLI).
-    McpGuideStdio,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
     McpTeamStdio,
     /// Self-check: hydrate the agent registry, probe every CLI on `$PATH`,
@@ -97,7 +99,6 @@ impl Command {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::McpBridge => "mcp-bridge",
-            Self::McpGuideStdio => "mcp-guide-stdio",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
@@ -204,6 +205,18 @@ mod tests {
     }
 
     #[test]
+    fn dump_prompts_defaults_to_false() {
+        let cli = Cli::parse_from(["aioncore"]);
+        assert!(!cli.dump_prompts);
+    }
+
+    #[test]
+    fn dump_prompts_accepts_flag() {
+        let cli = Cli::parse_from(["aioncore", "--dump-prompts"]);
+        assert!(cli.dump_prompts);
+    }
+
+    #[test]
     fn command_as_str_returns_clap_subcommand_names() {
         let prepare_args = PrepareManagedResourcesArgs {
             bundle_out: PathBuf::from("/tmp/aioncore-bundle"),
@@ -211,7 +224,6 @@ mod tests {
 
         let cases = [
             (Command::McpBridge, "mcp-bridge"),
-            (Command::McpGuideStdio, "mcp-guide-stdio"),
             (Command::McpTeamStdio, "mcp-team-stdio"),
             (Command::Doctor, "doctor"),
             (

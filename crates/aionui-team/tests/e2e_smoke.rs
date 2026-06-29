@@ -50,7 +50,6 @@ impl EventBroadcaster for NullBroadcaster {
 /// a smoke test might need to assert a side effect.
 struct SmokeEnv {
     server: TeamMcpServer,
-    mailbox: Arc<Mailbox>,
     task_board: Arc<TaskBoard>,
     repo: Arc<MockTeamRepo>,
     #[allow(dead_code)]
@@ -82,7 +81,7 @@ async fn setup_team_with_lead() -> SmokeEnv {
             conversation_id: "conv-lead".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -94,7 +93,7 @@ async fn setup_team_with_lead() -> SmokeEnv {
             conversation_id: "conv-worker".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            custom_agent_id: None,
+            assistant_id: None,
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -121,7 +120,6 @@ async fn setup_team_with_lead() -> SmokeEnv {
 
     SmokeEnv {
         server,
-        mailbox,
         task_board,
         repo,
         scheduler,
@@ -186,20 +184,6 @@ fn is_error_response(resp: &Value) -> bool {
     resp["result"]["isError"].as_bool().unwrap_or(false)
 }
 
-/// Assert the given agent's mailbox contains at least one message whose
-/// content includes `needle`. Reads the DB-level history so it does not
-/// mutate the unread flag (unlike `read_unread`).
-async fn assert_mailbox_contains(mailbox: &Mailbox, team_id: &str, agent_id: &str, needle: &str) {
-    let history = mailbox
-        .get_history(team_id, agent_id, None)
-        .await
-        .expect("mailbox.get_history");
-    assert!(
-        history.iter().any(|m| m.content.contains(needle)),
-        "expected mailbox[{team_id}/{agent_id}] to contain {needle:?}, got {history:?}"
-    );
-}
-
 // ===========================================================================
 // Scenario 1: create team → lead agent exists → MCP tools available
 // ===========================================================================
@@ -209,7 +193,7 @@ async fn assert_mailbox_contains(mailbox: &Mailbox, team_id: &str, agent_id: &st
 ///
 /// Flow:
 /// 1. `TeamSessionService::create_team` with a lead + one worker.
-/// 2. Assert the returned team has a `lead_agent_id` and two agents.
+/// 2. Assert the returned team has a `leader_assistant_id` and two assistants.
 /// 3. Assert `TeamMcpServer` is started for that team (ensure_session).
 /// 4. `tools/list` returns the full 10-tool surface.
 /// 5. `team_members` returns both agents.
@@ -253,11 +237,11 @@ async fn smoke_spawn_agent_creates_real_session() {
 /// 3. Worker's mailbox receives a `shutdown_request`.
 /// 4. Worker replies `shutdown_approved` via `team_send_message`.
 /// 5. Worker is removed from the team roster.
-/// 6. `team.agent.removed` WebSocket event is broadcast.
+/// 6. `team.agentRemoved` WebSocket event is broadcast.
 #[tokio::test]
 #[ignore = "unblocks when shutdown_request/approved round-trip is wired (W5-D30a/b/c/d series)"]
 async fn smoke_shutdown_agent_full_protocol() {
-    todo!("scenario 3: fill once shutdown round-trip + team.agent.removed event are wired");
+    todo!("scenario 3: fill once shutdown round-trip + team.agentRemoved event are wired");
 }
 
 // ===========================================================================
@@ -280,7 +264,7 @@ async fn smoke_agent_crash_recovery() {
 }
 
 // ===========================================================================
-// Scenario 5: MCP tool execution is not a no-op
+// Scenario 5: MCP tool execution has explicit runtime contracts
 // ===========================================================================
 //
 // This is the anchor scenario that guards against the core failure mode
@@ -293,7 +277,7 @@ async fn smoke_mcp_tool_execution_not_noop() {
     let env = setup_team_with_lead().await;
     let mut stream = mcp_connect(&env, &env.lead_slot_id).await;
 
-    // --- team_send_message → mailbox side effect -------------------------
+    // --- team_send_message requires a live active Team Run ----------------
     let msg_resp = mcp_call(
         &mut stream,
         10,
@@ -302,11 +286,16 @@ async fn smoke_mcp_tool_execution_not_noop() {
     )
     .await;
     assert!(
-        !is_error_response(&msg_resp),
-        "team_send_message returned error: {msg_resp}"
+        is_error_response(&msg_resp),
+        "standalone team_send_message must not succeed without TeamSessionService: {msg_resp}"
     );
-    // Guard against the exact failure mode: success envelope, nothing written.
-    assert_mailbox_contains(&env.mailbox, &env.team_id, &env.worker_slot_id, "hello worker").await;
+    assert!(
+        msg_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Team service not available"),
+        "unexpected team_send_message error: {msg_resp}"
+    );
 
     // --- team_task_create → task board side effect -----------------------
     let task_resp = mcp_call(
@@ -326,11 +315,10 @@ async fn smoke_mcp_tool_execution_not_noop() {
         "team_task_create did not persist task, got {tasks:?}"
     );
 
-    // --- repo-level cross-check: mailbox/task rows actually hit storage --
+    // --- repo-level cross-check: task rows actually hit storage --
     // Even if the service layer lies, the repo-level mock's state is the
     // ground truth for "did data move through the stack".
     let repo_state = env.repo.state.lock().unwrap();
-    assert!(!repo_state.messages.is_empty(), "no mailbox rows reached the repo");
     assert!(!repo_state.tasks.is_empty(), "no task rows reached the repo");
     drop(repo_state);
 

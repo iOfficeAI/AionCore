@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use agent_client_protocol::schema::{
-    AgentCapabilities, AuthMethod, AvailableCommand, SessionConfigKind, SessionConfigOption, SessionModeState,
-    SessionModelState, UsageUpdate,
+    AgentCapabilities, AuthMethod, AvailableCommand, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionModeState, SessionModelState, UsageUpdate,
 };
 
 use super::agent_event_tracker::AcpSessionEvent;
@@ -10,6 +10,7 @@ use super::agent_reconcile::ReconcileAction;
 use super::config_option_catalog::{
     derive_models_from_config_options, derive_modes_from_config_options, merge_config_options,
 };
+use super::config_options::ConfigSnapshot;
 use crate::protocol::error::CloseReason;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState, SessionId};
 
@@ -19,6 +20,7 @@ struct Desired {
     mode_id: Option<ModeId>,
     model_id: Option<ModelId>,
     config_selections: HashMap<ConfigKey, ConfigValue>,
+    pending_startup_config: Vec<PendingStartupConfigSeed>,
 }
 
 /// What the CLI last reported (ground truth from the backend).
@@ -58,6 +60,7 @@ pub struct AcpSession {
     desired: Desired,
     observed: Observed,
     advertised: Advertised,
+    config_set_in_flight: bool,
     pending_events: Vec<AcpSessionEvent>,
     /// Whether `open_session_new` has just completed and the next prompt
     /// should receive preset_context / skill-index injection.
@@ -71,13 +74,6 @@ pub struct AcpSession {
     /// Starts `false` so resume paths, warmup-only flows, and aborted
     /// session/new attempts all correctly observe "no prelude pending".
     pending_session_new_prelude: bool,
-    /// Model id the next prompt should announce to the CLI via an
-    /// injected `<system-reminder>`. Written when the CLI bakes
-    /// model identity into its cached system prompt (see
-    /// `BehaviorPolicy::self_identity_sticky`) and `session/set_model`
-    /// therefore does not refresh the LLM's self-description.
-    /// Taken (drained) on the next prompt.
-    pending_model_notice: Option<ModelId>,
     /// Why the session most recently terminated, if at all.
     ///
     /// Lifecycle (see also `CloseReason` doc comment):
@@ -90,6 +86,29 @@ pub struct AcpSession {
     /// - invalidation: cleared on `clear_session_id` so a rebuilt session
     ///   does not inherit the previous turn's close reason.
     last_close_reason: Option<CloseReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigSetGuardToken;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingStartupConfigSeed {
+    category: SessionConfigOptionCategory,
+    value: ConfigValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingStartupConfigSeedResult {
+    Applied {
+        category: SessionConfigOptionCategory,
+        option_id: ConfigKey,
+    },
+    OptionNotAdvertised {
+        category: SessionConfigOptionCategory,
+    },
+    ValueNotSelectable {
+        category: SessionConfigOptionCategory,
+    },
 }
 
 impl AcpSession {
@@ -106,13 +125,28 @@ impl AcpSession {
                 mode_id: initial_mode,
                 model_id: initial_model,
                 config_selections,
+                pending_startup_config: Vec::new(),
             },
             observed: Observed::default(),
             advertised: Advertised::default(),
+            config_set_in_flight: false,
             pending_events: Vec::new(),
-            pending_model_notice: None,
             last_close_reason: None,
         }
+    }
+}
+
+impl AcpSession {
+    pub fn try_begin_config_set(&mut self) -> Option<ConfigSetGuardToken> {
+        if self.config_set_in_flight {
+            return None;
+        }
+        self.config_set_in_flight = true;
+        Some(ConfigSetGuardToken)
+    }
+
+    pub fn end_config_set(&mut self, _token: ConfigSetGuardToken) {
+        self.config_set_in_flight = false;
     }
 }
 
@@ -190,6 +224,10 @@ impl AcpSession {
     /// post-`session/new` payload. Idempotent.
     pub fn mark_pending_session_new_prelude(&mut self) {
         self.pending_session_new_prelude = true;
+    }
+
+    pub fn has_pending_session_new_prelude(&self) -> bool {
+        self.pending_session_new_prelude
     }
 
     /// Consume the prelude flag. Returns `true` exactly once after
@@ -284,9 +322,6 @@ impl AcpSession {
             return None;
         }
         self.desired.model_id = None;
-        if self.pending_model_notice.as_ref() == Some(&model) {
-            self.pending_model_notice = None;
-        }
         Some(model)
     }
 
@@ -312,6 +347,93 @@ impl AcpSession {
             let selections = self.desired.config_selections.clone();
             self.pending_events
                 .push(AcpSessionEvent::DesiredConfigChanged { selections });
+        }
+    }
+
+    pub(crate) fn seed_pending_startup_config(&mut self, category: SessionConfigOptionCategory, value: ConfigValue) {
+        if value.as_str().is_empty() {
+            return;
+        }
+        if self
+            .desired
+            .pending_startup_config
+            .iter()
+            .any(|seed| seed.category == category && seed.value == value)
+        {
+            return;
+        }
+        self.desired
+            .pending_startup_config
+            .push(PendingStartupConfigSeed { category, value });
+    }
+
+    pub(crate) fn resolve_pending_startup_config_seeds(&mut self) -> Vec<PendingStartupConfigSeedResult> {
+        let seeds = std::mem::take(&mut self.desired.pending_startup_config);
+        if seeds.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let Some(options) = self.advertised.config_options.as_ref() else {
+                self.handle_unresolved_startup_config_seed(&seed, false);
+                results.push(PendingStartupConfigSeedResult::OptionNotAdvertised {
+                    category: seed.category,
+                });
+                continue;
+            };
+
+            let Some(option) = select_option_for_startup_seed(options, &seed.category) else {
+                self.handle_unresolved_startup_config_seed(&seed, false);
+                results.push(PendingStartupConfigSeedResult::OptionNotAdvertised {
+                    category: seed.category,
+                });
+                continue;
+            };
+
+            if !select_option_contains_value(&option.kind, seed.value.as_str()) {
+                self.handle_unresolved_startup_config_seed(&seed, true);
+                results.push(PendingStartupConfigSeedResult::ValueNotSelectable {
+                    category: seed.category,
+                });
+                continue;
+            }
+
+            let option_id = ConfigKey::new(option.id.to_string());
+            self.clear_legacy_desired_for_config_category(&seed.category);
+            self.set_desired_config(option_id.clone(), seed.value);
+            results.push(PendingStartupConfigSeedResult::Applied {
+                category: seed.category,
+                option_id,
+            });
+        }
+        results
+    }
+
+    fn clear_legacy_desired_for_config_category(&mut self, category: &SessionConfigOptionCategory) {
+        match category {
+            SessionConfigOptionCategory::Mode => {
+                self.desired.mode_id = None;
+            }
+            SessionConfigOptionCategory::Model => {
+                self.desired.model_id = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_unresolved_startup_config_seed(&mut self, seed: &PendingStartupConfigSeed, option_was_advertised: bool) {
+        match seed.category {
+            SessionConfigOptionCategory::Mode | SessionConfigOptionCategory::Model if !option_was_advertised => {
+                // Keep legacy desired mode/model so old ACP implementations still use set_mode/set_model.
+            }
+            SessionConfigOptionCategory::Mode | SessionConfigOptionCategory::Model => {
+                self.clear_legacy_desired_for_config_category(&seed.category);
+            }
+            SessionConfigOptionCategory::ThoughtLevel if !option_was_advertised => {
+                self.seed_pending_startup_config(seed.category.clone(), seed.value.clone());
+            }
+            _ => {}
         }
     }
 }
@@ -347,6 +469,13 @@ impl AcpSession {
 
     pub fn config_options(&self) -> Option<&[SessionConfigOption]> {
         self.advertised.config_options.as_deref()
+    }
+
+    pub(crate) fn config_snapshot(&self) -> ConfigSnapshot {
+        if let Some(options) = self.advertised.config_options.clone() {
+            return ConfigSnapshot::from_real_options(options);
+        }
+        ConfigSnapshot::from_legacy_catalogs(self.advertised.modes.as_ref(), self.advertised.models.as_ref())
     }
 
     pub fn context_usage(&self) -> Option<&UsageUpdate> {
@@ -606,19 +735,6 @@ impl AcpSession {
         std::mem::take(&mut self.pending_events)
     }
 
-    /// Record the model id that the next prompt should announce to the
-    /// CLI via a `<system-reminder>`. See `pending_model_notice` for the
-    /// motivating invariant.
-    pub fn set_pending_model_notice(&mut self, model: ModelId) {
-        self.pending_model_notice = Some(model);
-    }
-
-    /// Drain the pending model notice (if any). Callers consume the
-    /// value before sending the next prompt so it is not re-injected.
-    pub fn take_pending_model_notice(&mut self) -> Option<ModelId> {
-        self.pending_model_notice.take()
-    }
-
     // ─── Private helpers ───────────────────────────────────────────────
 
     fn is_mode_valid(&self, mode_id: &str) -> bool {
@@ -645,6 +761,53 @@ fn extract_config_current_value(kind: &SessionConfigKind) -> Option<String> {
     match kind {
         SessionConfigKind::Select(sel) => Some(sel.current_value.to_string()),
         _ => None,
+    }
+}
+
+fn select_option_for_startup_seed<'a>(
+    options: &'a [SessionConfigOption],
+    category: &SessionConfigOptionCategory,
+) -> Option<&'a SessionConfigOption> {
+    options
+        .iter()
+        .find(|option| option.category.as_ref() == Some(category))
+        .or_else(|| {
+            let aliases = config_option_aliases_for_category(category);
+            options.iter().find(|option| {
+                let option_id = option.id.to_string();
+                aliases.iter().any(|alias| *alias == option_id)
+            })
+        })
+}
+
+fn config_option_aliases_for_category(category: &SessionConfigOptionCategory) -> &'static [&'static str] {
+    match category {
+        SessionConfigOptionCategory::Mode => &["mode", "modes"],
+        SessionConfigOptionCategory::Model => &["model", "models"],
+        SessionConfigOptionCategory::ThoughtLevel => &[
+            "thought_level",
+            "reasoning_effort",
+            "effort",
+            "thinking_budget",
+            "thinking",
+        ],
+        _ => &[],
+    }
+}
+
+fn select_option_contains_value(kind: &SessionConfigKind, value: &str) -> bool {
+    match kind {
+        SessionConfigKind::Select(select) => match &select.options {
+            SessionConfigSelectOptions::Ungrouped(options) => {
+                options.iter().any(|option| option.value.to_string() == value)
+            }
+            SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .any(|option| option.value.to_string() == value),
+            _ => false,
+        },
+        _ => false,
     }
 }
 

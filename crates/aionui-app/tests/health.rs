@@ -40,6 +40,31 @@ async fn health_check_returns_ok() {
 }
 
 #[tokio::test]
+async fn health_check_returns_ok_when_agent_metadata_cache_field_has_invalid_utf8() {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE id = ?")
+        .bind("2d23ff1c")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let services = AppServices::from_config(db, &AppConfig::default())
+        .await
+        .expect("services init should repair invalid UTF-8 agent cache data");
+    let app = aionui_app::create_router(&services).await.expect("build router");
+
+    let response = app
+        .oneshot(build_request("GET", "/health"))
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let json = response_json(response.into_body()).await;
+    assert_eq!(json["status"], "ok");
+}
+
+#[tokio::test]
 async fn health_check_post_blocked_by_csrf() {
     let app = build_app().await;
 
@@ -109,4 +134,31 @@ async fn health_check_has_security_headers() {
         response.headers().get("referrer-policy").unwrap(),
         "strict-origin-when-cross-origin"
     );
+}
+
+#[tokio::test]
+async fn office_proxy_routes_allow_same_origin_framing() {
+    // Regression for iOfficeAI/AionUi#3177: the global security headers
+    // middleware must not overwrite the office preview proxies' framing
+    // policy with DENY, or the preview iframe is blanked in browsers.
+    let app = build_app().await;
+
+    for uri in ["/api/ppt-proxy/59999", "/api/office-watch-proxy/59999"] {
+        let response = app
+            .clone()
+            .oneshot(build_request("GET", uri))
+            .await
+            .expect("request failed");
+
+        assert_eq!(
+            response.headers().get("x-frame-options").unwrap(),
+            "SAMEORIGIN",
+            "{uri} must stay frameable by the same-origin web UI"
+        );
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            "frame-ancestors 'self'",
+            "{uri} should carry the modern frame-ancestors policy"
+        );
+    }
 }

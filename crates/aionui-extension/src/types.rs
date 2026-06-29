@@ -146,8 +146,8 @@ pub struct ExtAssistant {
     pub icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "presetAgentType")]
-    pub preset_agent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "agentId")]
+    pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "enabledSkills")]
     pub enabled_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -537,7 +537,7 @@ pub struct ResolvedAssistant {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset_agent_type: Option<String>,
+    pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

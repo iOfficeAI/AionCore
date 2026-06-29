@@ -5,6 +5,7 @@ use std::{
 
 use aionui_api_types::{ConversationRuntimeStateKind, ConversationRuntimeSummary};
 use aionui_common::ConversationStatus;
+use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::ConversationError;
@@ -12,6 +13,7 @@ use crate::ConversationError;
 #[derive(Debug, Default)]
 pub struct ConversationRuntimeStateService {
     state: Mutex<ConversationRuntimeState>,
+    release_notify: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +112,16 @@ impl ConversationRuntimeStateService {
             .lock()
             .ok()
             .and_then(|state| state.active_turns.get(conversation_id).cloned())
+    }
+
+    pub async fn wait_until_unclaimed(&self, conversation_id: &str) {
+        loop {
+            let notified = self.release_notify.notified();
+            if !self.is_claimed(conversation_id) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn mark_deleting(&self, conversation_id: &str) -> bool {
@@ -236,11 +248,22 @@ impl ConversationRuntimeStateService {
         has_task: bool,
         pending_confirmations: usize,
     ) -> ConversationRuntimeSummary {
-        let active_turn_id = self.active_turn_id_for(conversation_id);
+        let (active_turn_id, cancelling) = self
+            .state
+            .lock()
+            .map(|state| {
+                (
+                    state.active_turns.get(conversation_id).cloned(),
+                    state.cancelling_conversations.contains(conversation_id),
+                )
+            })
+            .unwrap_or((None, false));
         let claimed = active_turn_id.is_some();
 
         let state = if pending_confirmations > 0 {
             ConversationRuntimeStateKind::WaitingConfirmation
+        } else if cancelling {
+            ConversationRuntimeStateKind::Cancelling
         } else if claimed && task_status != Some(ConversationStatus::Running) {
             ConversationRuntimeStateKind::Starting
         } else if claimed || task_status == Some(ConversationStatus::Running) {
@@ -294,6 +317,8 @@ impl ConversationRuntimeStateService {
                     deleting = was_deleting,
                     "conversation runtime turn claim released"
                 );
+                drop(state);
+                self.release_notify.notify_waiters();
                 was_deleting
             }
             Err(_) => {
@@ -406,6 +431,39 @@ mod tests {
         assert!(state.try_claim_turn("conv-1", "turn-2").is_ok());
     }
 
+    #[tokio::test]
+    async fn wait_until_unclaimed_completes_after_active_claim_releases() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let mut claim = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect("claim should be created");
+
+        let waiter = {
+            let state = state.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                state.wait_until_unclaimed("conv-1").await;
+                let _ = tx.send(());
+            });
+            rx
+        };
+        tokio::pin!(waiter);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err(),
+            "waiter must stay pending while the claim is active"
+        );
+
+        let _ = claim.release();
+        assert!(!state.is_claimed("conv-1"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter)
+            .await
+            .expect("waiter should finish after release")
+            .expect("waiter task should send completion");
+    }
+
     #[test]
     fn deleting_rejects_new_turn_claims() {
         let state = Arc::new(ConversationRuntimeStateService::default());
@@ -496,6 +554,22 @@ mod tests {
         let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 1);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::WaitingConfirmation);
+        assert!(summary.is_processing);
+        assert!(!summary.can_send_message);
+    }
+
+    #[test]
+    fn cancelling_summary_keeps_processing_and_disables_send() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = state
+            .try_claim_turn("conv-1", "turn-a")
+            .expect("claim should be created");
+        state.mark_cancelling("conv-1");
+
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 0);
+
+        assert_eq!(summary.state, ConversationRuntimeStateKind::Cancelling);
+        assert_eq!(summary.turn_id.as_deref(), Some("turn-a"));
         assert!(summary.is_processing);
         assert!(!summary.can_send_message);
     }

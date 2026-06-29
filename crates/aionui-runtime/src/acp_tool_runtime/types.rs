@@ -20,7 +20,7 @@ impl ManagedAcpToolId {
 
     pub fn version(self) -> &'static str {
         match self {
-            Self::CodexAcp => "0.14.0",
+            Self::CodexAcp => "0.16.0",
             Self::ClaudeAgentAcp => "0.39.0",
         }
     }
@@ -215,6 +215,17 @@ pub struct ManagedAcpToolSupport {
 impl ManagedAcpToolSupport {
     pub fn is_supported(&self) -> bool {
         self.supported
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ManagedAcpToolId;
+
+    #[test]
+    fn managed_acp_tool_versions_match_current_pins() {
+        assert_eq!(ManagedAcpToolId::CodexAcp.version(), "0.16.0");
+        assert_eq!(ManagedAcpToolId::ClaudeAgentAcp.version(), "0.39.0");
     }
 }
 

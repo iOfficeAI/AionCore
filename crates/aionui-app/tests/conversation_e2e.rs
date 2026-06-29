@@ -2,11 +2,20 @@
 
 mod common;
 
+use aionui_db::{
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantPreferenceRepository,
+    IConversationRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantPreferenceRepository, SqliteConversationRepository, UpsertAssistantDefinitionParams,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
+};
 use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app, delete_with_token, get_request, get_with_token, json_with_token, setup_and_login};
+use common::{
+    body_json, build_app, build_app_with_mock_agents, delete_with_token, get_request, get_with_token, json_with_token,
+    setup_and_login,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -101,6 +110,172 @@ async fn t1_3_create_with_optional_fields() {
     let json = body_json(resp).await;
     assert_eq!(json["data"]["source"], "telegram");
     assert_eq!(json["data"]["channel_chat_id"], "user:123");
+}
+
+#[tokio::test]
+async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let create_assistant_req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "u1",
+            "name": "Snapshot Assistant",
+            "agent_id": "8e1acf31"
+        }),
+        &token,
+        &csrf,
+    );
+    let create_assistant_resp = app.clone().oneshot(create_assistant_req).await.unwrap();
+    assert_eq!(create_assistant_resp.status(), StatusCode::CREATED);
+
+    let write_rule_req = json_with_token(
+        "POST",
+        "/api/skills/assistant-rule/write",
+        json!({
+            "assistant_id": "u1",
+            "content": "assistant snapshot rule",
+            "locale": "en-US"
+        }),
+        &token,
+        &csrf,
+    );
+    let write_rule_resp = app.clone().oneshot(write_rule_req).await.unwrap();
+    assert_eq!(write_rule_resp.status(), StatusCode::OK);
+
+    let pool = services.database.pool().clone();
+    let definition_repo = SqliteAssistantDefinitionRepository::new(pool.clone());
+    let state_repo = SqliteAssistantOverlayRepository::new(pool.clone());
+    let preference_repo = SqliteAssistantPreferenceRepository::new(pool);
+    let conversation_repo = SqliteConversationRepository::new(services.database.pool().clone());
+    let definition = definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: &definition.id,
+            assistant_id: &definition.assistant_id,
+            source: &definition.source,
+            owner_type: &definition.owner_type,
+            source_ref: definition.source_ref.as_deref(),
+            source_version: definition.source_version.as_deref(),
+            source_hash: definition.source_hash.as_deref(),
+            name: &definition.name,
+            name_i18n: &definition.name_i18n,
+            description: definition.description.as_deref(),
+            description_i18n: &definition.description_i18n,
+            avatar_type: &definition.avatar_type,
+            avatar_value: definition.avatar_value.as_deref(),
+            agent_id: &definition.agent_id,
+            rule_resource_type: &definition.rule_resource_type,
+            rule_resource_ref: definition.rule_resource_ref.as_deref(),
+            rule_inline_content: definition.rule_inline_content.as_deref(),
+            recommended_prompts: &definition.recommended_prompts,
+            recommended_prompts_i18n: &definition.recommended_prompts_i18n,
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: r#"[]"#,
+            custom_skill_names: &definition.custom_skill_names,
+            default_disabled_builtin_skill_ids: r#"[]"#,
+            default_mcps_mode: "auto",
+            default_mcp_ids: r#"[]"#,
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: &definition.id,
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: Some("8e1acf31"),
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            assistant_definition_id: &definition.id,
+            last_model_id: Some("pref-model"),
+            last_permission_value: Some("workspace-write"),
+            last_skill_ids: r#"["pref-skill"]"#,
+            last_disabled_builtin_skill_ids: r#"["pref-disabled"]"#,
+            last_mcp_ids: r#"["pref-mcp"]"#,
+        })
+        .await
+        .unwrap();
+
+    let create_req = json_with_token(
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "name": "Snapshot Flow",
+            "assistant": {
+                "id": "u1",
+                "locale": "en-US",
+                "conversation_overrides": {
+                    "model": "override-model",
+                    "skill_ids": ["override-skill"],
+                    "disabled_builtin_skill_ids": ["override-disabled"],
+                    "mcp_ids": ["override-mcp"]
+                }
+            },
+            "extra": {}
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json = body_json(resp).await;
+    let data = &json["data"];
+    assert_eq!(data["assistant"]["id"], "u1");
+    assert_eq!(data["assistant"]["backend"], "codex");
+    assert!(data["extra"].get("assistant_id").is_none());
+    assert!(data["extra"].get("preset_assistant_id").is_none());
+    assert!(data["extra"].get("preset_context").is_none());
+    assert!(data["extra"].get("preset_rules").is_none());
+    assert_eq!(data["extra"]["session_mode"], "workspace-write");
+    assert_eq!(data["extra"]["current_mode_id"], "workspace-write");
+    assert_eq!(data["extra"]["current_model_id"], "override-model");
+    assert!(data["extra"].get("assistant_snapshot").is_none());
+    assert!(
+        data["extra"]["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|skill| skill == "override-skill")
+    );
+
+    let snapshot = conversation_repo
+        .get_assistant_snapshot(data["id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.assistant_id, "u1");
+    assert_eq!(snapshot.agent_id, "8e1acf31");
+    assert_eq!(snapshot.rules_content, "assistant snapshot rule");
+    assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
+    assert_eq!(snapshot.resolved_skill_ids, r#"["override-skill"]"#);
+    assert_eq!(snapshot.resolved_mcp_ids, r#"["override-mcp"]"#);
+
+    let updated_preference = preference_repo.get(&definition.id).await.unwrap().unwrap();
+    assert_eq!(updated_preference.last_model_id.as_deref(), Some("override-model"));
+    assert_eq!(
+        updated_preference.last_permission_value.as_deref(),
+        Some("workspace-write")
+    );
+    assert_eq!(updated_preference.last_skill_ids, r#"["override-skill"]"#);
+    assert_eq!(
+        updated_preference.last_disabled_builtin_skill_ids,
+        r#"["override-disabled"]"#
+    );
+    assert_eq!(updated_preference.last_mcp_ids, r#"["override-mcp"]"#);
 }
 
 #[tokio::test]
@@ -764,6 +939,61 @@ async fn t7_3_reset_requires_auth() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn team_owned_conversation_rejects_ordinary_send_but_allows_history_reads() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/conversations",
+        create_body_with_extra("Team Owned", json!({ "teamId": "team-1" })),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    let id = json["data"]["id"].as_str().unwrap().to_owned();
+
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let msg = aionui_db::models::MessageRow {
+        id: "team-history-msg-1".into(),
+        conversation_id: id.clone(),
+        msg_id: Some("team-history-msg-1".into()),
+        r#type: "text".into(),
+        content: r#"{"content":"history remains readable"}"#.into(),
+        position: Some("left".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 1000,
+    };
+    aionui_db::IConversationRepository::insert_message(&repo, &msg)
+        .await
+        .unwrap();
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{id}/messages"),
+        json!({ "content": "ordinary send should be blocked" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "FORBIDDEN");
+    assert_eq!(json["error"], "Forbidden.");
+
+    let resp = app
+        .oneshot(get_with_token(&format!("/api/conversations/{id}/messages"), &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["items"].as_array().unwrap().len(), 1);
 }
 
 // ── T10: Associated ───────────────────────────────────────────────────

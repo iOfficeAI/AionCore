@@ -25,15 +25,22 @@ pub enum AgentErrorCode {
     UserAgentProtocolMismatch,
     UserAgentNotInstalled,
     UserAgentStartupFailed,
+    #[serde(rename = "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE")]
+    UserAgentOpenClawGatewayUnreachable,
     UserAgentDisconnected,
     UserAgentAuthRequired,
     UserAgentSessionNotFound,
     UserAgentNoPreviousSession,
+    UserAgentProtocolParseError,
+    UserAgentInvalidRequest,
+    UserAgentResourceNotFound,
+    UserAgentProtocolError,
     UserAgentCommandNotFound,
     UserAgentMissingEnv,
     UserAgentUnsupportedMethod,
     UserAgentInvalidParams,
     UserLlmProviderAuthFailed,
+    UserLlmProviderAwsSsoExpired,
     UserLlmProviderPermissionDenied,
     UserLlmProviderBillingRequired,
     UserLlmProviderConfigError,
@@ -198,6 +205,16 @@ mod tests {
         assert_eq!(json["code"], "AIONUI_CONVERSATION_BUSY");
         assert_eq!(json["resolution"]["kind"], "wait_for_current_response");
         assert_eq!(json["resolution"]["target"], "new_conversation");
+    }
+
+    #[test]
+    fn openclaw_gateway_unreachable_serializes_with_compact_vendor_name() {
+        let json = serde_json::to_value(AgentErrorCode::UserAgentOpenClawGatewayUnreachable).unwrap();
+        assert_eq!(json, "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE");
+
+        let decoded: AgentErrorCode =
+            serde_json::from_value(serde_json::json!("USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE")).unwrap();
+        assert_eq!(decoded, AgentErrorCode::UserAgentOpenClawGatewayUnreachable);
     }
 
     #[test]

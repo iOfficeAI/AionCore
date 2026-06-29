@@ -1,4 +1,4 @@
-//! Built-in assistant registry — embeds the manifest + rule/skill/avatar
+//! Built-in assistant registry — embeds the manifest + rule/avatar
 //! assets into the binary via `include_dir`, with an optional filesystem
 //! fallback for E2E tests.
 //!
@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use include_dir::{Dir, include_dir};
 use serde::Deserialize;
+use serde_json::Value;
 use tracing::{error, warn};
 
 /// Assets compiled into the binary at build time. Paths are relative to
@@ -41,7 +42,7 @@ pub struct BuiltinAssistant {
     pub description_i18n: HashMap<String, String>,
     #[serde(default)]
     pub avatar: Option<String>,
-    pub preset_agent_type: String,
+    pub agent_ref: String,
     #[serde(default)]
     pub enabled_skills: Vec<String>,
     #[serde(default)]
@@ -51,9 +52,6 @@ pub struct BuiltinAssistant {
     /// Relative to the asset root; may contain `{locale}`.
     #[serde(default)]
     pub rule_file: Option<String>,
-    /// Parallel to `rule_file`, for `/api/skills/assistant-skill/*` dispatch.
-    #[serde(default)]
-    pub skill_file: Option<String>,
     #[serde(default)]
     pub prompts: Vec<String>,
     #[serde(default)]
@@ -188,12 +186,6 @@ impl BuiltinAssistantRegistry {
         self.read_asset(&rel.replace("{locale}", locale))
     }
 
-    /// Read the skill file bytes for a built-in assistant.
-    pub fn skill_bytes(&self, id: &str, locale: &str) -> Option<Vec<u8>> {
-        let rel = self.assistants.get(id)?.skill_file.as_ref()?;
-        self.read_asset(&rel.replace("{locale}", locale))
-    }
-
     /// Read the avatar asset for a built-in assistant along with its
     /// extension (for Content-Type inference). Returns `None` when the
     /// manifest does not declare an avatar or the file is missing.
@@ -233,7 +225,7 @@ impl Default for BuiltinAssistantRegistry {
 }
 
 fn parse_manifest_bytes(bytes: &[u8]) -> HashMap<String, BuiltinAssistant> {
-    match serde_json::from_slice::<BuiltinManifest>(bytes) {
+    match serde_json::from_slice::<Value>(bytes).and_then(parse_manifest_value) {
         Ok(m) => m.assistants.into_iter().map(|a| (a.id.clone(), a)).collect(),
         Err(e) => {
             error!("Embedded built-in manifest parse failed: {e}");
@@ -243,13 +235,27 @@ fn parse_manifest_bytes(bytes: &[u8]) -> HashMap<String, BuiltinAssistant> {
 }
 
 fn parse_manifest_str(content: &str) -> HashMap<String, BuiltinAssistant> {
-    match serde_json::from_str::<BuiltinManifest>(content) {
+    match serde_json::from_str::<Value>(content).and_then(parse_manifest_value) {
         Ok(m) => m.assistants.into_iter().map(|a| (a.id.clone(), a)).collect(),
         Err(e) => {
             error!("Built-in manifest parse failed: {e}");
             HashMap::new()
         }
     }
+}
+
+fn parse_manifest_value(value: Value) -> Result<BuiltinManifest, serde_json::Error> {
+    if let Some(assistants) = value.get("assistants").and_then(Value::as_array) {
+        for assistant in assistants {
+            if assistant.get("skill_file").is_some() {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "builtin assistant legacy field `skill_file` is no longer supported",
+                )));
+            }
+        }
+    }
+    serde_json::from_value(value)
 }
 
 /// Heuristic for distinguishing a relative-path avatar (`"rules/x.svg"`)
@@ -296,16 +302,6 @@ mod tests {
     }
 
     #[test]
-    fn load_embedded_skill_bytes_available_for_cowork() {
-        // cowork is one of the three presets that ships a skill_file too.
-        let reg = BuiltinAssistantRegistry::load_embedded();
-        let bytes = reg
-            .skill_bytes("cowork", "en-US")
-            .expect("cowork en-US skill should resolve from the embedded bundle");
-        assert!(!bytes.is_empty());
-    }
-
-    #[test]
     fn embedded_rule_missing_locale_returns_none() {
         let reg = BuiltinAssistantRegistry::load_embedded();
         // The manifest declares rule_file as "rules/{id}.{locale}.md"; a
@@ -343,6 +339,25 @@ mod tests {
     }
 
     #[test]
+    fn load_from_dir_rejects_legacy_skill_file_entries() {
+        let tmp = TempDir::new().unwrap();
+        write_manifest(
+            tmp.path(),
+            r#"{
+              "version": "1.0.0",
+              "assistants": [{
+                "id": "legacy",
+                "name": "Legacy",
+                "agent_ref": "gemini",
+                "skill_file": "skills/legacy.en-US.md"
+              }]
+            }"#,
+        );
+        let reg = BuiltinAssistantRegistry::load_from_dir(tmp.path().to_path_buf());
+        assert!(reg.is_empty(), "legacy skill_file manifest should be rejected");
+    }
+
+    #[test]
     fn load_from_dir_reads_bytes_from_disk() {
         let tmp = TempDir::new().unwrap();
         let rules_dir = tmp.path().join("rules");
@@ -355,7 +370,7 @@ mod tests {
                 "assistants": [{
                     "id": "builtin-office",
                     "name": "Office",
-                    "preset_agent_type": "gemini",
+                    "agent_ref": "gemini",
                     "rule_file": "rules/office.{locale}.md"
                 }]
             }"#,
@@ -380,7 +395,7 @@ mod tests {
                 "assistants": [{
                     "id": "x",
                     "name": "X",
-                    "preset_agent_type": "gemini",
+                    "agent_ref": "gemini",
                     "rule_file": "rules/x.{locale}.md"
                 }]
             }"#,
@@ -398,7 +413,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_manifest(
             tmp.path(),
-            r#"{"assistants":[{"id":"env-only","name":"E","preset_agent_type":"gemini"}]}"#,
+            r#"{"assistants":[{"id":"env-only","name":"E","agent_ref": "gemini"}]}"#,
         );
         // SAFETY: env-var mutation is only unsafe if another thread reads
         // environment concurrently. This test is self-contained.
@@ -427,10 +442,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn avatar_asset_is_none_for_emoji_avatar() {
+    fn avatar_asset_is_none_for_inline_emoji_avatar() {
         let reg = BuiltinAssistantRegistry::load_embedded();
-        // word-creator ships with avatar: "📝" in the manifest.
-        assert!(reg.avatar_asset("word-creator").is_none());
+        // word-form-creator still ships with an inline emoji avatar.
+        assert!(reg.avatar_asset("word-form-creator").is_none());
+    }
+
+    #[test]
+    fn embedded_avatar_asset_returns_bytes_and_extension_for_shipped_file_avatar() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        let asset = reg
+            .avatar_asset("word-creator")
+            .expect("shipped word-creator avatar should resolve from the embedded bundle");
+        assert!(!asset.bytes.is_empty());
+        assert_eq!(asset.extension.as_deref(), Some("jpg"));
     }
 
     #[test]
@@ -442,7 +467,7 @@ mod tests {
             r#"{"assistants":[{
                 "id": "with-file-avatar",
                 "name": "F",
-                "preset_agent_type": "gemini",
+                "agent_ref": "gemini",
                 "avatar": "duck.svg"
             }]}"#,
         );

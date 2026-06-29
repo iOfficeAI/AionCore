@@ -25,12 +25,37 @@ pub struct ConversationMcpStatus {
 
 // ── Request types ──────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct AssistantConversationOverridesRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub permission: Option<String>,
+    #[serde(default)]
+    pub skill_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub disabled_builtin_skill_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub mcp_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct AssistantConversationRequest {
+    pub id: String,
+    #[serde(default)]
+    pub locale: Option<String>,
+    #[serde(default)]
+    pub conversation_overrides: Option<AssistantConversationOverridesRequest>,
+}
+
 /// Body for `POST /api/conversations`.
 #[derive(Debug, Deserialize)]
 pub struct CreateConversationRequest {
-    pub r#type: AgentType,
+    #[serde(default)]
+    pub r#type: Option<AgentType>,
     pub name: Option<String>,
     pub model: Option<ProviderWithModel>,
+    pub assistant: Option<AssistantConversationRequest>,
     pub source: Option<ConversationSource>,
     pub channel_chat_id: Option<String>,
     pub extra: serde_json::Value,
@@ -98,6 +123,7 @@ pub enum ConversationRuntimeStateKind {
     Idle,
     Starting,
     Running,
+    Cancelling,
     WaitingConfirmation,
 }
 
@@ -110,6 +136,15 @@ pub struct ConversationRuntimeSummary {
     pub is_processing: bool,
     pub pending_confirmations: usize,
     pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationAssistantIdentityResponse {
+    pub id: String,
+    pub source: String,
+    pub name: String,
+    pub avatar: String,
+    pub backend: String,
 }
 
 // ── Query types ────────────────────────────────────────────────────
@@ -127,9 +162,10 @@ pub struct ListConversationsQuery {
 /// Query parameters for `GET /api/conversations/:id/messages`.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListMessagesQuery {
-    pub page: Option<u32>,
-    pub page_size: Option<u32>,
-    pub order: Option<String>,
+    pub limit: Option<u32>,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub anchor_message_id: Option<String>,
     pub content_mode: Option<String>,
 }
 
@@ -178,6 +214,8 @@ pub struct ConversationResponse {
     pub pinned_at: Option<TimestampMs>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_chat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant: Option<ConversationAssistantIdentityResponse>,
     pub created_at: TimestampMs,
     pub modified_at: TimestampMs,
     pub extra: serde_json::Value,
@@ -200,8 +238,15 @@ pub struct MessageResponse {
     pub created_at: TimestampMs,
 }
 
-/// Paginated list of messages.
-pub type MessageListResponse = PaginatedResult<MessageResponse>;
+/// Cursor-paginated list of messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageListResponse {
+    pub items: Vec<MessageResponse>,
+    pub oldest_cursor: Option<String>,
+    pub newest_cursor: Option<String>,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
+}
 
 /// Response for `GET /api/conversations/active-count`.
 #[derive(Debug, Serialize)]
@@ -269,14 +314,39 @@ mod tests {
             "type": "acp",
             "name": "Code Review",
             "model": { "provider_id": "p1", "model": "claude-sonnet-4-20250514" },
+            "assistant": {
+                "id": "assistant-1",
+                "locale": "zh-CN",
+                "conversation_overrides": {
+                    "model": "opus-4.1",
+                    "permission": "yolo",
+                    "skill_ids": ["skill-a"],
+                    "disabled_builtin_skill_ids": ["builtin-a"],
+                    "mcp_ids": ["mcp-a"]
+                }
+            },
             "source": "aionui",
             "channel_chat_id": "user:123",
             "extra": { "workspace": "/project" }
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.r#type, AgentType::Acp);
+        assert_eq!(req.r#type, Some(AgentType::Acp));
         assert_eq!(req.name.as_deref(), Some("Code Review"));
         assert_eq!(req.model.unwrap().model, "claude-sonnet-4-20250514");
+        assert_eq!(
+            req.assistant,
+            Some(AssistantConversationRequest {
+                id: "assistant-1".into(),
+                locale: Some("zh-CN".into()),
+                conversation_overrides: Some(AssistantConversationOverridesRequest {
+                    model: Some("opus-4.1".into()),
+                    permission: Some("yolo".into()),
+                    skill_ids: Some(vec!["skill-a".into()]),
+                    disabled_builtin_skill_ids: Some(vec!["builtin-a".into()]),
+                    mcp_ids: Some(vec!["mcp-a".into()]),
+                }),
+            })
+        );
         assert_eq!(req.source, Some(ConversationSource::Aionui));
         assert_eq!(req.channel_chat_id.as_deref(), Some("user:123"));
         assert_eq!(req.extra["workspace"], "/project");
@@ -290,8 +360,9 @@ mod tests {
             "extra": {}
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.r#type, AgentType::Acp);
+        assert_eq!(req.r#type, Some(AgentType::Acp));
         assert!(req.name.is_none());
+        assert!(req.assistant.is_none());
         assert!(req.source.is_none());
         assert!(req.channel_chat_id.is_none());
     }
@@ -303,17 +374,29 @@ mod tests {
             "extra": {}
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.r#type, AgentType::Acp);
+        assert_eq!(req.r#type, Some(AgentType::Acp));
         assert!(req.model.is_none());
     }
 
     #[test]
-    fn deserialize_create_request_missing_type() {
+    fn deserialize_create_request_missing_type_without_assistant() {
         let raw = json!({
             "model": { "provider_id": "p1", "model": "m1" },
             "extra": {}
         });
-        assert!(serde_json::from_value::<CreateConversationRequest>(raw).is_err());
+        let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.r#type.is_none());
+    }
+
+    #[test]
+    fn deserialize_create_request_missing_type_with_assistant() {
+        let raw = json!({
+            "assistant": { "id": "assistant-1" },
+            "extra": {}
+        });
+        let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.r#type.is_none());
+        assert_eq!(req.assistant.unwrap().id, "assistant-1");
     }
 
     #[test]
@@ -391,7 +474,7 @@ mod tests {
             }
         });
         let req: CloneConversationRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.conversation.r#type, AgentType::Acp);
+        assert_eq!(req.conversation.r#type, Some(AgentType::Acp));
     }
 
     // ── ListConversationsQuery ──────────────────────────────────────
@@ -430,19 +513,25 @@ mod tests {
     fn deserialize_messages_query_defaults() {
         let raw = json!({});
         let q: ListMessagesQuery = serde_json::from_value(raw).unwrap();
-        assert!(q.page.is_none());
-        assert!(q.page_size.is_none());
-        assert!(q.order.is_none());
+        assert!(q.limit.is_none());
+        assert!(q.before.is_none());
+        assert!(q.after.is_none());
+        assert!(q.anchor_message_id.is_none());
         assert!(q.content_mode.is_none());
     }
 
     #[test]
     fn deserialize_messages_query_with_values() {
-        let raw = json!({ "page": 2, "page_size": 30, "order": "ASC", "content_mode": "compact" });
+        let raw = json!({
+            "limit": 200,
+            "before": "v1.abc",
+            "content_mode": "compact"
+        });
         let q: ListMessagesQuery = serde_json::from_value(raw).unwrap();
-        assert_eq!(q.page, Some(2));
-        assert_eq!(q.page_size, Some(30));
-        assert_eq!(q.order.as_deref(), Some("ASC"));
+        assert_eq!(q.limit, Some(200));
+        assert_eq!(q.before.as_deref(), Some("v1.abc"));
+        assert!(q.after.is_none());
+        assert!(q.anchor_message_id.is_none());
         assert_eq!(q.content_mode.as_deref(), Some("compact"));
     }
 
@@ -482,6 +571,7 @@ mod tests {
             pinned: false,
             pinned_at: None,
             channel_chat_id: None,
+            assistant: None,
             created_at: 1712345678000,
             modified_at: 1712345678000,
             extra: json!({ "workspace": "/project" }),
@@ -519,6 +609,7 @@ mod tests {
             pinned: false,
             pinned_at: None,
             channel_chat_id: None,
+            assistant: None,
             created_at: 1,
             modified_at: 1,
             extra: json!({}),
@@ -550,6 +641,7 @@ mod tests {
             pinned: true,
             pinned_at: Some(1712345678000),
             channel_chat_id: Some("group:42".into()),
+            assistant: None,
             created_at: 1000,
             modified_at: 2000,
             extra: json!({}),
@@ -633,6 +725,7 @@ mod tests {
                 pinned: false,
                 pinned_at: None,
                 channel_chat_id: None,
+                assistant: None,
                 created_at: 1712345678000,
                 modified_at: 1712345678000,
                 extra: json!({}),
@@ -669,6 +762,7 @@ mod tests {
                 pinned: false,
                 pinned_at: None,
                 channel_chat_id: None,
+                assistant: None,
                 created_at: 9000,
                 modified_at: 9000,
                 extra: json!({}),
@@ -739,6 +833,7 @@ mod tests {
                 pinned: false,
                 pinned_at: None,
                 channel_chat_id: None,
+                assistant: None,
                 created_at: 1000,
                 modified_at: 1000,
                 extra: json!({}),
@@ -753,15 +848,22 @@ mod tests {
     }
 
     #[test]
-    fn message_list_response_serialization() {
-        let list: MessageListResponse = PaginatedResult {
+    fn serialize_message_list_response_cursor_shape() {
+        let resp = MessageListResponse {
             items: vec![],
-            total: 0,
-            has_more: false,
+            oldest_cursor: None,
+            newest_cursor: None,
+            has_more_before: false,
+            has_more_after: false,
         };
-        let json = serde_json::to_value(&list).unwrap();
-        assert!(json["items"].as_array().unwrap().is_empty());
-        assert_eq!(json["total"], 0);
+        let raw = serde_json::to_value(resp).unwrap();
+        assert_eq!(raw["items"], json!([]));
+        assert!(raw["oldest_cursor"].is_null());
+        assert!(raw["newest_cursor"].is_null());
+        assert_eq!(raw["has_more_before"], false);
+        assert_eq!(raw["has_more_after"], false);
+        assert!(raw.get("total").is_none());
+        assert!(raw.get("has_more").is_none());
     }
 
     #[test]
@@ -783,6 +885,7 @@ mod tests {
                     pinned: false,
                     pinned_at: None,
                     channel_chat_id: None,
+                    assistant: None,
                     created_at: 5000,
                     modified_at: 5000,
                     extra: json!({}),

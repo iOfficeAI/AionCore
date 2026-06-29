@@ -386,6 +386,9 @@ fn validate_tool_root(
         )));
     }
 
+    let spec = platform_spec()?;
+    validate_platform_binary(tool, root, spec)?;
+
     let env_path_entries = manifest
         .path_entries
         .into_iter()
@@ -994,7 +997,7 @@ mod tests {
         };
         let tool = ResolvedManagedAcpTool {
             id: ManagedAcpToolId::CodexAcp,
-            version: "0.14.0".into(),
+            version: ManagedAcpToolId::CodexAcp.version().into(),
             root: PathBuf::from("/tmp/tool"),
             entrypoint: PathBuf::from("/tmp/tool/dist/index.js"),
             env_path_entries: vec![PathBuf::from("/tmp/tool/bin")],
@@ -1024,13 +1027,74 @@ mod tests {
 
     #[test]
     fn classify_error_detects_bundled_acp_validation_failure() {
-        let error = ManagedAcpToolError::invalid(
-            "bundled managed Codex ACP artifact failed validation under /app/resources/managed-resources/acp/codex-acp/0.14.0/linux-x64: managed ACP entrypoint missing",
-        );
+        let error = ManagedAcpToolError::invalid(format!(
+            "bundled managed Codex ACP artifact failed validation under /app/resources/managed-resources/acp/codex-acp/{}/linux-x64: managed ACP entrypoint missing",
+            ManagedAcpToolId::CodexAcp.version(),
+        ));
         let (kind, status_code) = classify_error(&error);
 
         assert_eq!(kind, ManagedAcpToolFailureKind::BundledResourceInvalid);
         assert_eq!(status_code, None);
+    }
+
+    #[test]
+    fn validate_tool_root_rejects_claude_artifact_missing_platform_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let entrypoint = root
+            .join("node_modules")
+            .join("@agentclientprotocol")
+            .join("claude-agent-acp")
+            .join("dist")
+            .join("index.js");
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::write(&entrypoint, "console.log('claude bridge');\n").unwrap();
+        std::fs::write(
+            root.join("manifest.json"),
+            br#"{"entrypoint":"node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js","path_entries":["node_modules/.bin"]}"#,
+        )
+        .unwrap();
+
+        let error = validate_tool_root(ManagedAcpToolId::ClaudeAgentAcp, root, None)
+            .expect_err("Claude ACP artifact without platform binary should fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected managed Claude ACP platform binary missing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_tool_root_rejects_codex_artifact_missing_platform_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let entrypoint = root
+            .join("node_modules")
+            .join("@zed-industries")
+            .join("codex-acp")
+            .join("bin")
+            .join("codex-acp.js");
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::write(&entrypoint, "console.log('codex bridge');\n").unwrap();
+        std::fs::write(
+            root.join("manifest.json"),
+            br#"{"entrypoint":"node_modules/@zed-industries/codex-acp/bin/codex-acp.js","path_entries":["node_modules/.bin"]}"#,
+        )
+        .unwrap();
+
+        let error = validate_tool_root(ManagedAcpToolId::CodexAcp, root, None)
+            .expect_err("Codex ACP artifact without platform binary should fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected managed Codex ACP platform binary missing"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1208,7 +1272,7 @@ mod tests {
         let source_root = bundled_root
             .join("acp")
             .join("codex-acp")
-            .join("0.14.0")
+            .join(ManagedAcpToolId::CodexAcp.version())
             .join(spec.manifest_key);
         std::fs::create_dir_all(&source_root).unwrap();
         std::fs::write(
@@ -1218,7 +1282,10 @@ mod tests {
         .unwrap();
 
         let runtime_root = tmp.path().join("runtime");
-        let tool_root = runtime_root.join("codex-acp").join("0.14.0").join(spec.manifest_key);
+        let tool_root = runtime_root
+            .join("codex-acp")
+            .join(ManagedAcpToolId::CodexAcp.version())
+            .join(spec.manifest_key);
 
         managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Bundled);
         let result = activate_local_tool_source(ManagedAcpToolId::CodexAcp, spec, &tool_root, None);
@@ -1248,7 +1315,7 @@ mod tests {
             bundle_root
                 .join("acp")
                 .join("codex-acp")
-                .join("0.14.0")
+                .join(ManagedAcpToolId::CodexAcp.version())
                 .join("win32-x64")
         );
     }

@@ -1,10 +1,14 @@
 use std::path::Path;
 
-use aionui_api_types::{ConversationArtifactResponse, ConversationResponse, MessageResponse, MessageSearchItem};
+use aionui_api_types::{
+    ConversationArtifactResponse, ConversationAssistantIdentityResponse, ConversationResponse, MessageResponse,
+    MessageSearchItem,
+};
 use aionui_common::{
     AgentType, ConversationSource, ConversationStatus, MessagePosition, MessageStatus, MessageType, ProviderWithModel,
 };
 use aionui_db::MessageSearchRow;
+use aionui_db::models::ConversationAssistantSnapshotRow;
 use aionui_db::models::{ConversationArtifactRow, ConversationRow, MessageRow};
 
 use crate::ConversationError;
@@ -44,6 +48,8 @@ pub fn row_to_response_with_extra(
         !ws.is_empty() && Path::new(ws).starts_with(data_dir)
     };
     if let Some(obj) = extra.as_object_mut() {
+        obj.remove("preset_context");
+        obj.remove("preset_rules");
         obj.insert(
             "is_temporary_workspace".to_owned(),
             serde_json::Value::Bool(is_temporary_workspace),
@@ -71,10 +77,29 @@ pub fn row_to_response_with_extra(
         pinned: row.pinned,
         pinned_at: row.pinned_at,
         channel_chat_id: row.channel_chat_id,
+        assistant: None,
         created_at: row.created_at,
         modified_at: row.updated_at,
         extra,
     })
+}
+
+pub fn snapshot_to_assistant_identity(
+    snapshot: &ConversationAssistantSnapshotRow,
+    runtime_backend: &str,
+) -> ConversationAssistantIdentityResponse {
+    let avatar = match snapshot.assistant_avatar_type.as_str() {
+        "builtin_asset" | "user_asset" => format!("/api/assistants/{}/avatar", snapshot.assistant_id),
+        _ => snapshot.assistant_avatar_value.clone().unwrap_or_default(),
+    };
+
+    ConversationAssistantIdentityResponse {
+        id: snapshot.assistant_id.clone(),
+        source: snapshot.assistant_source.clone(),
+        name: snapshot.assistant_name.clone(),
+        avatar,
+        backend: runtime_backend.to_owned(),
+    }
 }
 
 /// Parse the model JSON column into `ProviderWithModel`.

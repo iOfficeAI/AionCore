@@ -38,7 +38,6 @@ impl TeammateManager {
     }
 
     pub fn notify_shutdown_acknowledged(&self, slot_id: &str) {
-        self.events.broadcast_agent_shutdown(slot_id);
         debug!(team_id = %self.team_id, slot_id, "agent shutdown acknowledged");
     }
 

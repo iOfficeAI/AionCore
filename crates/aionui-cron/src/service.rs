@@ -7,9 +7,13 @@ use aionui_api_types::{
     SaveCronSkillRequest, UpdateCronJobRequest,
 };
 use aionui_common::{
-    AgentType, WorkspacePathValidationError, generate_prefixed_id, now_ms, validate_workspace_path_availability,
+    AgentType, ProviderWithModel, WorkspacePathValidationError, generate_prefixed_id, now_ms,
+    validate_workspace_path_availability,
 };
-use aionui_db::{ICronRepository, UpdateCronJobParams};
+use aionui_db::{
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository,
+    UpdateCronJobParams, resolve_agent_binding_from_rows,
+};
 use tracing::{error, info, warn};
 
 use crate::events::CronEventEmitter;
@@ -35,31 +39,40 @@ const PLACEHOLDER_PATTERNS: &[&str] = &[
     "write your",
     "put your",
 ];
-const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
-
 #[derive(Clone)]
 pub struct CronService {
     repo: Arc<dyn ICronRepository>,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
     scheduler: Arc<CronScheduler>,
     executor: Arc<JobExecutor>,
     emitter: CronEventEmitter,
     data_dir: PathBuf,
 }
 
+pub struct CronServiceDeps {
+    pub repo: Arc<dyn ICronRepository>,
+    pub agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    pub assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    pub assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    pub scheduler: Arc<CronScheduler>,
+    pub executor: Arc<JobExecutor>,
+    pub emitter: CronEventEmitter,
+    pub data_dir: PathBuf,
+}
+
 impl CronService {
-    pub fn new(
-        repo: Arc<dyn ICronRepository>,
-        scheduler: Arc<CronScheduler>,
-        executor: Arc<JobExecutor>,
-        emitter: CronEventEmitter,
-        data_dir: PathBuf,
-    ) -> Self {
+    pub fn new(deps: CronServiceDeps) -> Self {
         Self {
-            repo,
-            scheduler,
-            executor,
-            emitter,
-            data_dir,
+            repo: deps.repo,
+            agent_metadata_repo: deps.agent_metadata_repo,
+            assistant_definition_repo: deps.assistant_definition_repo,
+            assistant_overlay_repo: deps.assistant_overlay_repo,
+            scheduler: deps.scheduler,
+            executor: deps.executor,
+            emitter: deps.emitter,
+            data_dir: deps.data_dir,
         }
     }
 
@@ -68,27 +81,38 @@ impl CronService {
     // -----------------------------------------------------------------------
 
     pub async fn add_job(&self, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
+        self.add_job_internal(req, None, None).await
+    }
+
+    async fn add_job_internal(
+        &self,
+        req: CreateCronJobRequest,
+        runtime_agent_type: Option<String>,
+        assistant_backend_override: Option<String>,
+    ) -> Result<CronJob, CronError> {
         let schedule = schedule_from_dto(&req.schedule);
         validate_schedule(&schedule)?;
-        reject_deprecated_new_conversation_agent_type(&req.agent_type)?;
-        validate_aionrs_agent_config(&req.agent_type, req.agent_config.as_ref())?;
+        let resolved_agent_type = match runtime_agent_type {
+            Some(agent_type) => agent_type,
+            None => self.resolve_new_job_agent_type(req.agent_config.as_ref()).await?,
+        };
+        validate_aionrs_agent_config(&resolved_agent_type, req.agent_config.as_ref())?;
 
         let execution_mode = parse_execution_mode(req.execution_mode.as_deref())?;
         let created_by = CreatedBy::from_str(&req.created_by)?;
         let message = req.message.or(req.prompt).unwrap_or_default();
 
-        let agent_config = req.agent_config.map(|c| CronAgentConfig {
-            backend: c.backend,
-            name: c.name,
-            cli_path: c.cli_path,
-            is_preset: c.is_preset,
-            custom_agent_id: c.custom_agent_id,
-            preset_agent_type: c.preset_agent_type,
-            mode: c.mode,
-            model_id: c.model_id,
-            config_options: c.config_options,
-            workspace: c.workspace,
-        });
+        let agent_config = match req.agent_config {
+            Some(config) => Some(
+                self.build_cron_agent_config(
+                    &resolved_agent_type,
+                    sanitize_agent_config_dto(config),
+                    assistant_backend_override.as_deref(),
+                )
+                .await?,
+            ),
+            None => None,
+        };
 
         let now = now_ms();
         let next_run_at = compute_next_run(&schedule, now);
@@ -103,7 +127,7 @@ impl CronService {
             agent_config,
             conversation_id: req.conversation_id,
             conversation_title: req.conversation_title,
-            agent_type: req.agent_type,
+            agent_type: resolved_agent_type,
             created_by,
             skill_content: None,
             description: req.description,
@@ -137,7 +161,7 @@ impl CronService {
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(existing_row)?;
-        reject_deprecated_new_conversation_agent_type(&job.agent_type)?;
+        job.agent_type = self.resolve_job_agent_type(&job).await?;
 
         if let Some(name) = &req.name {
             job.name = name.clone();
@@ -160,19 +184,10 @@ impl CronService {
             job.execution_mode = parse_execution_mode(Some(mode_str))?;
         }
         if let Some(config_dto) = &req.agent_config {
-            validate_aionrs_agent_config(&job.agent_type, Some(config_dto))?;
-            job.agent_config = Some(CronAgentConfig {
-                backend: config_dto.backend.clone(),
-                name: config_dto.name.clone(),
-                cli_path: config_dto.cli_path.clone(),
-                is_preset: config_dto.is_preset,
-                custom_agent_id: config_dto.custom_agent_id.clone(),
-                preset_agent_type: config_dto.preset_agent_type.clone(),
-                mode: config_dto.mode.clone(),
-                model_id: config_dto.model_id.clone(),
-                config_options: config_dto.config_options.clone(),
-                workspace: config_dto.workspace.clone(),
-            });
+            let config_dto = sanitize_agent_config_dto(config_dto.clone());
+            job.agent_type = self.resolve_new_job_agent_type(Some(&config_dto)).await?;
+            validate_aionrs_agent_config(&job.agent_type, Some(&config_dto))?;
+            job.agent_config = Some(self.build_cron_agent_config(&job.agent_type, config_dto, None).await?);
         }
         if let Some(title) = &req.conversation_title {
             job.conversation_title = Some(title.clone());
@@ -216,7 +231,9 @@ impl CronService {
             .get_by_id(job_id)
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
-        cron_job_from_row(row)
+        let mut job = cron_job_from_row(row)?;
+        job.agent_type = self.resolve_job_agent_type(&job).await?;
+        Ok(job)
     }
 
     pub async fn list_jobs(&self, query: &ListCronJobsQuery) -> Result<Vec<CronJob>, CronError> {
@@ -226,7 +243,13 @@ impl CronService {
             self.repo.list_all().await?
         };
 
-        rows.into_iter().map(cron_job_from_row).collect()
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut job = cron_job_from_row(row)?;
+            job.agent_type = self.resolve_job_agent_type(&job).await?;
+            jobs.push(job);
+        }
+        Ok(jobs)
     }
 
     // -----------------------------------------------------------------------
@@ -290,13 +313,20 @@ impl CronService {
             }
         };
 
-        let job = match cron_job_from_row(row) {
+        let mut job = match cron_job_from_row(row) {
             Ok(j) => j,
             Err(e) => {
                 error!(job_id, error = %e, "Tick: failed to parse job");
                 return;
             }
         };
+        match self.resolve_job_agent_type(&job).await {
+            Ok(agent_type) => job.agent_type = agent_type,
+            Err(e) => {
+                error!(job_id, error = %e, "Tick: failed to resolve cron assistant runtime");
+                return;
+            }
+        }
 
         if !job.enabled {
             info!(job_id, "Tick: job disabled, skipping");
@@ -354,7 +384,8 @@ impl CronService {
             .get_by_id(job_id)
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
-        let job = cron_job_from_row(row)?;
+        let mut job = cron_job_from_row(row)?;
+        job.agent_type = self.resolve_job_agent_type(&job).await?;
         let prepared = self.executor.prepare_run_now(&job).await?;
         let conversation_id = prepared.conversation_id.clone();
         let service = self.clone();
@@ -433,6 +464,54 @@ impl CronService {
         cron_job_to_response(job)
     }
 
+    async fn resolve_new_job_agent_type(
+        &self,
+        agent_config: Option<&aionui_api_types::CronAgentConfigWriteDto>,
+    ) -> Result<String, CronError> {
+        let Some(assistant_id) = agent_config.and_then(|config| config.assistant_id.as_deref()) else {
+            return Err(CronError::InvalidAgentConfig(
+                "assistant_id is required for new cron jobs".into(),
+            ));
+        };
+
+        self.resolve_agent_type_for_assistant_id(assistant_id).await
+    }
+
+    async fn resolve_job_agent_type(&self, job: &CronJob) -> Result<String, CronError> {
+        if !job.agent_type.trim().is_empty() {
+            return Ok(job.agent_type.clone());
+        }
+
+        let Some(assistant_id) = job
+            .agent_config
+            .as_ref()
+            .and_then(|config| config.assistant_id.as_deref())
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Err(CronError::InvalidAgentConfig(
+                "assistant_id is required for cron jobs".into(),
+            ));
+        };
+
+        self.resolve_agent_type_for_assistant_id(assistant_id).await
+    }
+
+    async fn resolve_agent_type_for_assistant_id(&self, assistant_id: &str) -> Result<String, CronError> {
+        let definition = self
+            .assistant_definition_repo
+            .get_by_assistant_id(assistant_id)
+            .await?
+            .ok_or_else(|| CronError::InvalidAgentConfig(format!("assistant '{assistant_id}' not found")))?;
+        let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+        let effective_agent_id = overlay
+            .as_ref()
+            .and_then(|item| item.agent_id_override.as_deref())
+            .unwrap_or(definition.agent_id.as_str());
+        let effective_backend = self.runtime_backend_for_agent_id(effective_agent_id).await?;
+
+        Ok(runtime_agent_type_for_backend(&effective_backend).to_owned())
+    }
+
     async fn bind_existing_conversation_if_needed(&self, job: &CronJob) {
         if !matches!(job.execution_mode, ExecutionMode::Existing) || job.conversation_id.trim().is_empty() {
             return;
@@ -466,7 +545,7 @@ impl CronService {
             return false;
         }
 
-        if self.executor.busy_guard().is_busy(&job.conversation_id) {
+        if self.executor.is_conversation_claimed(&job.conversation_id) {
             return false;
         }
 
@@ -828,6 +907,252 @@ impl CronService {
             );
         }
     }
+
+    async fn build_agent_config_from_conversation(
+        &self,
+        row: &aionui_db::models::ConversationRow,
+    ) -> (
+        String,
+        Option<aionui_api_types::CronAgentConfigWriteDto>,
+        Option<String>,
+    ) {
+        let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let assistant_snapshot = match self.executor.get_assistant_snapshot(&row.id).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                warn!(
+                    conversation_id = %row.id,
+                    error = %err,
+                    "Failed to load conversation assistant snapshot for cron agent config"
+                );
+                None
+            }
+        };
+        // Both interactive `send_message` and the cron executor parse
+        // `conversation.model` via the same helper. Keeping the cron-side
+        // `agent_config.model` derivation in sync with that parser prevents
+        // the cached vendor-label fallback (`"aionrs"`) from sneaking back in
+        // (Sentry ELECTRON-1HM).
+        let model_resolved = aionui_conversation::task_options::provider_model_from_conversation_row(row);
+        let model = (!model_resolved.provider_id.is_empty()).then_some(&model_resolved);
+        let preset_assistant_id = get_string(&extra, &["preset_assistant_id", "presetAssistantId"]);
+        let extra_assistant_id = get_string(&extra, &["assistant_id", "assistantId"]).or(preset_assistant_id);
+        let snapshot_assistant_id = assistant_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.assistant_id.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let legacy_agent_label = if row.r#type == "aionrs" {
+            Some("aionrs".to_owned())
+        } else {
+            model
+                .map(|value| value.provider_id.clone())
+                .filter(|value| !value.is_empty())
+                .or_else(|| get_string(&extra, &["backend"]))
+                .or_else(|| Some(row.r#type.clone()))
+        };
+        let legacy_assistant_id = match (
+            snapshot_assistant_id.as_ref(),
+            extra_assistant_id.as_ref(),
+            legacy_agent_label,
+        ) {
+            (None, None, Some(label)) => self.resolve_assistant_id_for_agent_label(&label).await,
+            _ => None,
+        };
+        let fallback_assistant_id = match (
+            snapshot_assistant_id.as_ref(),
+            extra_assistant_id.as_ref(),
+            legacy_assistant_id.as_ref(),
+        ) {
+            (None, None, None) => self.resolve_default_assistant_id().await,
+            _ => None,
+        };
+        let uses_default_assistant_fallback = fallback_assistant_id.is_some();
+        let assistant_id = snapshot_assistant_id
+            .or(extra_assistant_id)
+            .or(legacy_assistant_id)
+            .or(fallback_assistant_id);
+        let snapshot_backend = match assistant_snapshot.as_ref() {
+            Some(snapshot) => match self.runtime_backend_for_agent_id(snapshot.agent_id.trim()).await {
+                Ok(value) => Some(value).filter(|value| !value.is_empty()),
+                Err(err) => {
+                    warn!(
+                        conversation_id = %row.id,
+                        error = %err,
+                        "Failed to resolve assistant snapshot agent id for cron agent config"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let assistant_backend = if uses_default_assistant_fallback {
+            None
+        } else {
+            snapshot_backend.clone().or(self
+                .resolve_assistant_backend(assistant_id.as_deref())
+                .await
+                .unwrap_or(None))
+        };
+
+        let backend = if row.r#type == "aionrs" {
+            model
+                .map(|value| value.provider_id.clone())
+                .filter(|value| !value.is_empty())
+                .or_else(|| get_string(&extra, &["backend"]))
+                .or_else(|| assistant_backend.clone())
+                .unwrap_or_else(|| "aionrs".to_owned())
+        } else {
+            assistant_backend
+                .clone()
+                .or_else(|| {
+                    model
+                        .map(|value| value.provider_id.clone())
+                        .filter(|value| !value.is_empty())
+                })
+                .or_else(|| get_string(&extra, &["backend"]))
+                .unwrap_or_else(|| row.r#type.clone())
+        };
+
+        let agent_type_enum = serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok();
+        let full_auto_mode = agent_type_enum
+            .unwrap_or(AgentType::Acp)
+            .full_auto_mode_id(Some(backend.as_str()))
+            .to_owned();
+        let agent_config = aionui_api_types::CronAgentConfigWriteDto {
+            name: assistant_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.assistant_name.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .or_else(|| get_string(&extra, &["agent_name", "agentName"]))
+                .unwrap_or_else(|| row.name.clone()),
+            cli_path: get_string(&extra, &["cli_path", "cliPath"]).or_else(|| {
+                extra
+                    .get("gateway")
+                    .and_then(|gateway| gateway.get("cli_path").or_else(|| gateway.get("cliPath")))
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+            }),
+            assistant_id,
+            mode: Some(full_auto_mode),
+            model_id: get_string(&extra, &["current_model_id", "currentModelId"])
+                .or_else(|| {
+                    model.and_then(|value| {
+                        value
+                            .use_model
+                            .clone()
+                            .or_else(|| (!value.model.is_empty()).then(|| value.model.clone()))
+                    })
+                })
+                .or_else(|| {
+                    assistant_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.resolved_model_id.clone())
+                }),
+            model: (row.r#type == "aionrs").then(|| model.cloned()).flatten(),
+            config_options: None,
+            workspace: get_string(&extra, &["workspace"]),
+        };
+
+        (row.r#type.clone(), Some(agent_config), snapshot_backend)
+    }
+
+    async fn build_cron_agent_config(
+        &self,
+        runtime_agent_type: &str,
+        config: aionui_api_types::CronAgentConfigWriteDto,
+        _assistant_backend_override: Option<&str>,
+    ) -> Result<CronAgentConfig, CronError> {
+        let Some(assistant_id) = config.assistant_id.as_deref().filter(|value| !value.trim().is_empty()) else {
+            return Err(CronError::InvalidAgentConfig(
+                "assistant_id is required for cron jobs".into(),
+            ));
+        };
+
+        self.resolve_assistant_backend(Some(assistant_id))
+            .await?
+            .ok_or_else(|| {
+                CronError::InvalidAgentConfig(format!(
+                    "assistant '{assistant_id}' could not resolve a runtime backend"
+                ))
+            })?;
+
+        Ok(CronAgentConfig {
+            name: config.name,
+            cli_path: config.cli_path,
+            is_preset: None,
+            assistant_id: config.assistant_id,
+            custom_agent_id: None,
+            mode: config.mode,
+            model_id: config.model_id,
+            model: normalize_model(config.model, runtime_agent_type)?,
+            config_options: config.config_options,
+            workspace: config.workspace,
+        })
+    }
+
+    async fn resolve_assistant_backend(&self, assistant_id: Option<&str>) -> Result<Option<String>, CronError> {
+        let Some(assistant_id) = assistant_id.filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+
+        let Some(definition) = self.assistant_definition_repo.get_by_assistant_id(assistant_id).await? else {
+            return Ok(None);
+        };
+        let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+        let effective_agent_id = overlay
+            .as_ref()
+            .and_then(|item| item.agent_id_override.as_deref())
+            .unwrap_or(definition.agent_id.as_str());
+
+        Ok(Some(self.runtime_backend_for_agent_id(effective_agent_id).await?))
+    }
+
+    async fn resolve_assistant_id_for_agent_label(&self, agent_label: &str) -> Option<String> {
+        let rows = self.agent_metadata_repo.list_all().await.ok()?;
+        let binding = resolve_agent_binding_from_rows(&rows, agent_label)?;
+        self.assistant_definition_repo
+            .list()
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|definition| definition.deleted_at.is_none() && definition.agent_id == binding.agent_id)
+            .min_by_key(|definition| {
+                let source_rank = match definition.source.as_str() {
+                    "builtin" => 0,
+                    "generated" => 1,
+                    "user" => 2,
+                    _ => 3,
+                };
+                (source_rank, definition.name.clone())
+            })
+            .map(|definition| definition.assistant_id)
+    }
+
+    async fn resolve_default_assistant_id(&self) -> Option<String> {
+        self.assistant_definition_repo
+            .list()
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|definition| definition.deleted_at.is_none())
+            .min_by_key(|definition| {
+                let source_rank = match definition.source.as_str() {
+                    "builtin" => 0,
+                    "generated" => 1,
+                    "user" => 2,
+                    _ => 3,
+                };
+                (source_rank, definition.name.clone())
+            })
+            .map(|definition| definition.assistant_id)
+    }
+
+    async fn runtime_backend_for_agent_id(&self, agent_id: &str) -> Result<String, CronError> {
+        let rows = self.agent_metadata_repo.list_all().await?;
+        Ok(resolve_agent_binding_from_rows(&rows, agent_id)
+            .map(|binding| binding.runtime_backend)
+            .unwrap_or_else(|| agent_id.to_owned()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -859,21 +1184,22 @@ impl aionui_conversation::response_middleware::ICronService for CronService {
             description: Some(params.schedule_description.clone()),
         };
 
-        let (agent_type, conversation_title, agent_config) =
+        let (agent_type, conversation_title, agent_config, assistant_backend_override) =
             match self.executor.get_conversation_row(conversation_id).await {
                 Ok(Some(row)) => {
                     let title = Some(row.name.clone());
-                    let (agent_type, agent_config) = build_agent_config_from_conversation(&row);
-                    (agent_type, title, agent_config)
+                    let (agent_type, agent_config, assistant_backend_override) =
+                        self.build_agent_config_from_conversation(&row).await;
+                    (agent_type, title, agent_config, assistant_backend_override)
                 }
-                Ok(None) => ("acp".to_owned(), None, None),
+                Ok(None) => ("acp".to_owned(), None, None, None),
                 Err(err) => {
                     warn!(
                         conversation_id,
                         error = %err,
                         "Failed to load conversation context for cron create; falling back to defaults"
                     );
-                    ("acp".to_owned(), None, None)
+                    ("acp".to_owned(), None, None, None)
                 }
             };
 
@@ -885,13 +1211,15 @@ impl aionui_conversation::response_middleware::ICronService for CronService {
             message: Some(params.message.clone()),
             conversation_id: conversation_id.to_owned(),
             conversation_title,
-            agent_type,
             created_by: "agent".to_owned(),
             execution_mode: Some("existing".to_owned()),
             agent_config,
         };
 
-        match self.add_job(req).await {
+        match self
+            .add_job_internal(req, Some(agent_type), assistant_backend_override)
+            .await
+        {
             Ok(job) => {
                 if let Err(err) = self
                     .executor
@@ -1027,78 +1355,6 @@ impl aionui_conversation::response_middleware::ICronService for CronService {
     }
 }
 
-fn build_agent_config_from_conversation(
-    row: &aionui_db::models::ConversationRow,
-) -> (String, Option<aionui_api_types::CronAgentConfigDto>) {
-    let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
-    // Both interactive `send_message` and the cron executor parse
-    // `conversation.model` via the same helper. Keeping the cron-side
-    // `agent_config.backend` derivation in sync with that parser
-    // prevents the cached vendor-label fallback (`"aionrs"`) from
-    // sneaking back in (Sentry ELECTRON-1HM).
-    let model_resolved = aionui_conversation::task_options::provider_model_from_conversation_row(row);
-    let model = (!model_resolved.provider_id.is_empty()).then_some(&model_resolved);
-
-    let backend = if row.r#type == "aionrs" {
-        model
-            .map(|value| value.provider_id.clone())
-            .filter(|value| !value.is_empty())
-            .or_else(|| get_string(&extra, &["backend"]))
-            .unwrap_or_else(|| "aionrs".to_owned())
-    } else {
-        get_string(&extra, &["backend"])
-            .or_else(|| {
-                model
-                    .map(|value| value.provider_id.clone())
-                    .filter(|value| !value.is_empty())
-            })
-            .unwrap_or_else(|| row.r#type.clone())
-    };
-
-    let preset_assistant_id = get_string(&extra, &["preset_assistant_id", "presetAssistantId"]);
-    let custom_agent_id = get_string(&extra, &["custom_agent_id", "customAgentId"]).or(preset_assistant_id.clone());
-    let is_preset = preset_assistant_id.as_ref().map(|_| true);
-    let preset_agent_type = if preset_assistant_id.is_some() {
-        Some(backend.clone())
-    } else {
-        None
-    };
-
-    let agent_type_enum = serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok();
-    // Backend is now the vendor label (e.g. "claude"); pass through as
-    // &str so `full_auto_mode_id` can key on it without re-parsing.
-    let full_auto_mode = agent_type_enum
-        .unwrap_or(AgentType::Acp)
-        .full_auto_mode_id(Some(backend.as_str()))
-        .to_owned();
-    let agent_config = aionui_api_types::CronAgentConfigDto {
-        backend,
-        name: get_string(&extra, &["agent_name", "agentName"]).unwrap_or_else(|| row.name.clone()),
-        cli_path: get_string(&extra, &["cli_path", "cliPath"]).or_else(|| {
-            extra
-                .get("gateway")
-                .and_then(|gateway| gateway.get("cli_path").or_else(|| gateway.get("cliPath")))
-                .and_then(|value| value.as_str())
-                .map(ToOwned::to_owned)
-        }),
-        is_preset,
-        custom_agent_id,
-        preset_agent_type,
-        mode: Some(full_auto_mode),
-        model_id: get_string(&extra, &["current_model_id", "currentModelId"]).or_else(|| {
-            model.and_then(|value| {
-                value
-                    .use_model
-                    .clone()
-                    .or_else(|| (!value.model.is_empty()).then(|| value.model.clone()))
-            })
-        }),
-        config_options: None,
-        workspace: get_string(&extra, &["workspace"]),
-    };
-
-    (row.r#type.clone(), Some(agent_config))
-}
 fn get_string(extra: &serde_json::Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         extra
@@ -1113,29 +1369,54 @@ fn get_string(extra: &serde_json::Value, keys: &[&str]) -> Option<String> {
 // Free functions
 // ---------------------------------------------------------------------------
 
-/// Aionrs cron jobs require `agent_config.backend` (provider_id) to be set —
-/// the executor uses it to look up the provider row and build the agent.
-/// Reject add/update requests that would produce an invalid aionrs job.
+fn runtime_agent_type_for_backend(backend: &str) -> &'static str {
+    if backend == "aionrs" { "aionrs" } else { "acp" }
+}
+
+fn normalize_model(
+    model: Option<ProviderWithModel>,
+    runtime_agent_type: &str,
+) -> Result<Option<ProviderWithModel>, CronError> {
+    let Some(mut model) = model else {
+        return Ok(None);
+    };
+
+    model.provider_id = model.provider_id.trim().to_owned();
+    model.model = model.model.trim().to_owned();
+    model.use_model = model
+        .use_model
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+
+    if runtime_agent_type == "aionrs" && (model.provider_id.is_empty() || model.model.is_empty()) {
+        return Err(CronError::InvalidAgentConfig(
+            "aionrs cron jobs require agent_config.model.provider_id and agent_config.model.model".into(),
+        ));
+    }
+
+    if model.provider_id.is_empty() || model.model.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(model))
+}
+
 fn validate_aionrs_agent_config(
     agent_type: &str,
-    agent_config: Option<&aionui_api_types::CronAgentConfigDto>,
+    agent_config: Option<&aionui_api_types::CronAgentConfigWriteDto>,
 ) -> Result<(), CronError> {
     if agent_type != "aionrs" {
         return Ok(());
     }
-    let backend_ok = agent_config.is_some_and(|c| !c.backend.trim().is_empty());
-    if !backend_ok {
+    let model_ok = agent_config.is_some_and(|c| {
+        c.model
+            .as_ref()
+            .is_some_and(|value| !value.provider_id.trim().is_empty() && !value.model.trim().is_empty())
+    });
+    if !model_ok {
         return Err(CronError::InvalidAgentConfig(
-            "aionrs cron jobs require agent_config.backend (provider_id)".into(),
+            "aionrs cron jobs require agent_config.model.provider_id and agent_config.model.model".into(),
         ));
-    }
-    Ok(())
-}
-
-fn reject_deprecated_new_conversation_agent_type(agent_type: &str) -> Result<(), CronError> {
-    let parsed = serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type.to_owned())).ok();
-    if parsed.is_some_and(|agent_type| agent_type.is_deprecated_runtime()) {
-        return Err(CronError::InvalidAgentConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
     }
     Ok(())
 }
@@ -1205,20 +1486,10 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
         (None, None, None, None)
     };
 
-    let agent_config = req.agent_config.as_ref().map(|c| {
-        let config = CronAgentConfig {
-            backend: c.backend.clone(),
-            name: c.name.clone(),
-            cli_path: c.cli_path.clone(),
-            is_preset: c.is_preset,
-            custom_agent_id: c.custom_agent_id.clone(),
-            preset_agent_type: c.preset_agent_type.clone(),
-            mode: c.mode.clone(),
-            model_id: c.model_id.clone(),
-            config_options: c.config_options.clone(),
-            workspace: c.workspace.clone(),
-        };
-        Some(serde_json::to_string(&config).unwrap_or_default())
+    let agent_config = req.agent_config.as_ref().and_then(|_| {
+        job.agent_config
+            .as_ref()
+            .map(|config| Some(serde_json::to_string(config).unwrap_or_default()))
     });
 
     UpdateCronJobParams {
@@ -1233,7 +1504,6 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
         agent_config,
         conversation_id: None,
         conversation_title: req.conversation_title.as_ref().map(|t| Some(t.clone())),
-        agent_type: None,
         skill_content: None,
         description: req.description.as_ref().map(|value| Some(value.clone())),
         next_run_at: if req.schedule.is_some() || req.enabled.is_some() {
@@ -1247,6 +1517,20 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
         run_count: None,
         retry_count: None,
     }
+}
+
+fn sanitize_agent_config_dto(
+    mut config: aionui_api_types::CronAgentConfigWriteDto,
+) -> aionui_api_types::CronAgentConfigWriteDto {
+    if let Some(value) = config.assistant_id.as_mut() {
+        let trimmed = value.trim().to_owned();
+        if trimmed.is_empty() {
+            config.assistant_id = None;
+        } else {
+            *value = trimmed;
+        }
+    }
+    config
 }
 
 fn schedule_from_dto_with_existing_timezone(dto: &CronScheduleDto, existing: &CronSchedule) -> CronSchedule {
@@ -1327,16 +1611,18 @@ mod tests {
 
     // -- validate_aionrs_agent_config ----------------------------------------
 
-    fn agent_cfg_dto(backend: &str) -> aionui_api_types::CronAgentConfigDto {
-        aionui_api_types::CronAgentConfigDto {
-            backend: backend.to_owned(),
+    fn agent_cfg_dto(provider_id: &str) -> aionui_api_types::CronAgentConfigWriteDto {
+        aionui_api_types::CronAgentConfigWriteDto {
             name: "provider".into(),
             cli_path: None,
-            is_preset: None,
-            custom_agent_id: None,
-            preset_agent_type: None,
+            assistant_id: Some("assistant-1".into()),
             mode: None,
             model_id: Some("gpt-4o".into()),
+            model: Some(ProviderWithModel {
+                provider_id: provider_id.to_owned(),
+                model: "gpt-4o".into(),
+                use_model: None,
+            }),
             config_options: None,
             workspace: None,
         }
@@ -1355,14 +1641,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_aionrs_rejects_empty_backend() {
+    fn validate_aionrs_rejects_empty_provider_id() {
         let cfg = agent_cfg_dto("");
         let err = validate_aionrs_agent_config("aionrs", Some(&cfg)).unwrap_err();
         assert!(matches!(err, CronError::InvalidAgentConfig(_)));
     }
 
     #[test]
-    fn validate_aionrs_rejects_whitespace_backend() {
+    fn validate_aionrs_rejects_whitespace_provider_id() {
         let cfg = agent_cfg_dto("   ");
         let err = validate_aionrs_agent_config("aionrs", Some(&cfg)).unwrap_err();
         assert!(matches!(err, CronError::InvalidAgentConfig(_)));
@@ -1370,10 +1656,41 @@ mod tests {
 
     #[test]
     fn validate_aionrs_ignores_non_aionrs_type() {
-        // ACP / other types may legitimately omit agent_config or leave backend empty.
+        // ACP / other types may legitimately omit agent_config or leave model empty.
         assert!(validate_aionrs_agent_config("acp", None).is_ok());
         let cfg = agent_cfg_dto("");
         assert!(validate_aionrs_agent_config("claude", Some(&cfg)).is_ok());
+    }
+
+    #[test]
+    fn sanitize_agent_config_dto_clears_legacy_ids_when_assistant_id_present() {
+        let config = aionui_api_types::CronAgentConfigWriteDto {
+            name: "Helper".into(),
+            cli_path: None,
+            assistant_id: Some("assistant-1".into()),
+            mode: Some("default".into()),
+            model_id: Some("claude-sonnet-4".into()),
+            model: None,
+            config_options: None,
+            workspace: None,
+        };
+
+        let sanitized = sanitize_agent_config_dto(config);
+
+        assert_eq!(sanitized.assistant_id.as_deref(), Some("assistant-1"));
+    }
+
+    #[test]
+    fn sanitize_agent_config_dto_rejects_legacy_custom_agent_id_without_assistant_id() {
+        let err = serde_json::from_value::<aionui_api_types::CronAgentConfigWriteDto>(serde_json::json!({
+            "name": "Helper",
+            "custom_agent_id": "legacy-assistant",
+            "mode": "default",
+            "model_id": "claude-sonnet-4",
+        }))
+        .expect_err("legacy custom_agent_id must be rejected");
+
+        assert!(err.to_string().contains("custom_agent_id"));
     }
 
     // -- parse_execution_mode -------------------------------------------------
@@ -1485,6 +1802,64 @@ mod tests {
         assert_eq!(params.schedule_kind.as_deref(), Some("cron"));
         assert_eq!(params.schedule_value.as_deref(), Some("0 0 9 * * *"));
         assert!(params.next_run_at.is_some());
+    }
+
+    #[test]
+    fn build_update_params_strips_legacy_ids_when_assistant_id_present() {
+        let mut job = sample_job();
+        job.agent_config = Some(CronAgentConfig {
+            name: "Helper".into(),
+            cli_path: None,
+            is_preset: None,
+            assistant_id: Some("assistant-1".into()),
+            custom_agent_id: None,
+            mode: Some("default".into()),
+            model_id: Some("claude-sonnet-4".into()),
+            model: None,
+            config_options: None,
+            workspace: None,
+        });
+        let req = UpdateCronJobRequest {
+            name: None,
+            description: None,
+            enabled: None,
+            schedule: None,
+            message: None,
+            execution_mode: None,
+            agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
+                name: "Helper".into(),
+                cli_path: None,
+                assistant_id: Some("assistant-1".into()),
+                mode: Some("default".into()),
+                model_id: Some("claude-sonnet-4".into()),
+                model: None,
+                config_options: None,
+                workspace: None,
+            }),
+            conversation_title: None,
+            max_retries: None,
+        };
+
+        let params = build_update_params(&job, &req);
+        let config_json = params.agent_config.flatten().expect("agent config json");
+        let config: CronAgentConfig = serde_json::from_str(&config_json).expect("parse cron config");
+
+        assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
+        assert!(config.custom_agent_id.is_none());
+        assert!(config.is_preset.is_none());
+    }
+
+    #[test]
+    fn build_update_params_rejects_legacy_custom_agent_id_without_assistant_id() {
+        let err = serde_json::from_value::<aionui_api_types::CronAgentConfigWriteDto>(serde_json::json!({
+            "name": "Helper",
+            "custom_agent_id": "legacy-assistant",
+            "mode": "default",
+            "model_id": "claude-sonnet-4",
+        }))
+        .expect_err("legacy custom_agent_id must be rejected");
+
+        assert!(err.to_string().contains("custom_agent_id"));
     }
 
     #[test]

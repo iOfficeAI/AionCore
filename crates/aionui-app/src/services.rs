@@ -3,23 +3,22 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::config::{AppConfig, derive_encryption_key};
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager, WorkerTaskManagerImpl,
     build_agent_factory,
 };
-use aionui_api_types::GuideMcpConfig;
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
-use aionui_conversation::runtime_state::ConversationRuntimeStateService;
+use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteConversationRepository,
-    SqliteMcpServerRepository, SqliteProviderRepository, SqliteUserRepository,
+    ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
+    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository,
+    SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
-use aionui_team::GuideMcpServer;
-
-use crate::config::{AppConfig, derive_encryption_key};
 
 pub struct AppServices {
     pub database: Database,
@@ -31,6 +30,7 @@ pub struct AppServices {
     pub event_bus: Arc<BroadcastEventBus>,
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
+    pub conversation_service: ConversationService,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -49,11 +49,8 @@ pub struct AppServices {
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
-    /// Guide MCP server config (port, token, binary_path).
-    /// `None` when the server failed to start (graceful degradation).
-    pub guide_mcp_config: Option<GuideMcpConfig>,
-    /// Guide MCP server instance kept alive for the app lifetime.
-    pub(crate) _guide_server: Option<GuideMcpServer>,
+    /// User skill metadata and import history repository.
+    pub skill_repo: Arc<dyn ISkillRepository>,
 }
 
 impl AppServices {
@@ -62,22 +59,25 @@ impl AppServices {
     /// Primarily used by tests to inject mock implementations.
     pub fn with_worker_task_manager(mut self, wtm: Arc<dyn IWorkerTaskManager>) -> Self {
         self.worker_task_manager = wtm;
+        self.conversation_service = build_conversation_service(ConversationServiceDeps {
+            database: &self.database,
+            work_dir: self.work_dir.clone(),
+            event_bus: self.event_bus.clone(),
+            skill_paths: self.skill_paths.clone(),
+            skill_repo: self.skill_repo.clone(),
+            worker_task_manager: self.worker_task_manager.clone(),
+            conversation_runtime_state: self.conversation_runtime_state.clone(),
+            conversation_repo: self.conversation_repo.clone(),
+            task_manager_delete_hook: self.task_manager_delete_hook.clone(),
+        });
         self
-    }
-
-    /// Wire the TeamSessionService into the Guide MCP server so
-    /// `aion_create_team` requests can call `service.create_team(...)`.
-    /// Called from `create_router` after `build_module_states`.
-    pub(crate) async fn inject_guide_service(&self, service: std::sync::Weak<aionui_team::TeamSessionService>) {
-        if let Some(server) = &self._guide_server {
-            server.set_service(service).await;
-        }
     }
 
     pub async fn from_config(database: Database, config: &AppConfig) -> anyhow::Result<Self> {
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
         let local = config.local;
+        let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
 
@@ -127,6 +127,7 @@ impl AppServices {
 
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+        let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
         // Skill paths need app resource dir (for builtin rules) + data dir
         // (for user skills + materialized views). AcpSkillManager uses these
@@ -137,6 +138,9 @@ impl AppServices {
             .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let skill_paths = Arc::new(aionui_extension::resolve_skill_paths(&app_resource_dir, &data_dir));
+        aionui_extension::sync_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
 
         // Absolute path to this process's binary. Reused as the `command` for
         // the stdio MCP bridge spawned by ACP CLIs when a team session is
@@ -144,39 +148,16 @@ impl AppServices {
         let backend_binary_path =
             Arc::new(std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aioncore")));
 
-        // Start Guide MCP server. Failure is non-fatal: solo agents simply
-        // won't get the `aion_create_team` tool.
-        let (guide_server, guide_mcp_config) = match GuideMcpServer::start().await {
-            Ok(srv) => {
-                let config = GuideMcpConfig {
-                    port: srv.http_port(),
-                    token: srv.auth_token().to_owned(),
-                    binary_path: backend_binary_path.to_string_lossy().to_string(),
-                };
-                tracing::info!(port = config.port, "Guide MCP server started");
-                (Some(srv), Some(config))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    code = "BOOTSTRAP_DEGRADED_GUIDE_MCP",
-                    stage = "guide_mcp.start",
-                    error = %e,
-                    "Guide MCP server failed to start; solo create-team disabled"
-                );
-                (None, None)
-            }
-        };
-
         let factory = build_agent_factory(AgentFactoryDeps {
-            skill_manager: AcpSkillManager::new(skill_paths.clone()),
+            skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
             provider_repo,
             encryption_key,
             agent_registry: agent_registry.clone(),
             acp_agent_service: acp_agent_service.clone(),
             data_dir: data_dir.clone(),
+            dump_prompts,
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
-            guide_mcp_config: guide_mcp_config.clone(),
             mcp_server_repo: Some(mcp_server_repo),
         });
 
@@ -187,6 +168,17 @@ impl AppServices {
         let worker_task_manager: Arc<dyn IWorkerTaskManager> = task_manager_concrete.clone();
         let task_manager_delete_hook: Arc<dyn OnConversationDelete> = task_manager_concrete;
         let conversation_runtime_state = Arc::new(ConversationRuntimeStateService::default());
+        let conversation_service = build_conversation_service(ConversationServiceDeps {
+            database: &database,
+            work_dir: work_dir.clone(),
+            event_bus: event_bus.clone(),
+            skill_paths: skill_paths.clone(),
+            skill_repo: skill_repo.clone(),
+            worker_task_manager: worker_task_manager.clone(),
+            conversation_runtime_state: conversation_runtime_state.clone(),
+            conversation_repo: conversation_repo.clone(),
+            task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
+        });
 
         Ok(Self {
             database,
@@ -198,6 +190,7 @@ impl AppServices {
             event_bus,
             worker_task_manager,
             conversation_runtime_state,
+            conversation_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
@@ -208,10 +201,52 @@ impl AppServices {
             local,
             app_version,
             skill_paths,
-            guide_mcp_config: guide_mcp_config.clone(),
-            _guide_server: guide_server,
+            skill_repo,
         })
     }
+}
+
+struct ConversationServiceDeps<'a> {
+    database: &'a Database,
+    work_dir: PathBuf,
+    event_bus: Arc<BroadcastEventBus>,
+    skill_paths: Arc<aionui_extension::SkillPaths>,
+    skill_repo: Arc<dyn ISkillRepository>,
+    worker_task_manager: Arc<dyn IWorkerTaskManager>,
+    conversation_runtime_state: Arc<ConversationRuntimeStateService>,
+    conversation_repo: Arc<dyn IConversationRepository>,
+    task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
+}
+
+fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
+    let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
+        deps.skill_paths,
+        deps.skill_repo,
+    ));
+    let service = ConversationService::new(
+        deps.work_dir,
+        deps.event_bus,
+        skill_resolver,
+        deps.worker_task_manager,
+        deps.conversation_repo,
+        Arc::new(SqliteAgentMetadataRepository::new(deps.database.pool().clone())),
+        Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
+    )
+    .with_runtime_state(deps.conversation_runtime_state);
+    service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
+    service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
+        deps.database.pool().clone(),
+    )));
+    service.with_assistant_state_repo(Arc::new(SqliteAssistantOverlayRepository::new(
+        deps.database.pool().clone(),
+    )));
+    service.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(
+        deps.database.pool().clone(),
+    )));
+    if let Some(hook) = deps.task_manager_delete_hook {
+        service.with_delete_hook(hook);
+    }
+    service
 }
 
 #[cfg(test)]

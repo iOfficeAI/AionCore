@@ -268,7 +268,7 @@ fn normalize_agent(value: &mut Value) {
         return;
     };
 
-    move_key(obj, "presetAgentType", "agent_type");
+    move_key(obj, "agentType", "agent_type");
 }
 
 fn normalize_skill(value: &mut Value) {

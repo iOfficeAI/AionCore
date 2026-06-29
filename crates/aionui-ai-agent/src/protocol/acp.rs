@@ -23,11 +23,11 @@
 //! shared connection, each awaited in its own caller task.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use agent_client_protocol::schema::{
     AGENT_METHOD_NAMES, AuthenticateResponse, ClientNotification, ClientRequest, CloseSessionResponse, ExtResponse,
-    ForkSessionResponse, InitializeRequest, LoadSessionResponse, PromptResponse, ProtocolVersion,
+    ForkSessionResponse, Implementation, InitializeRequest, LoadSessionResponse, PromptResponse, ProtocolVersion,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResumeSessionResponse,
     SelectedPermissionOutcome, SessionNotification, SetSessionConfigOptionResponse, SetSessionModeResponse,
     SetSessionModelResponse,
@@ -53,6 +53,30 @@ use agent_client_protocol::schema::{
 
 /// Timeout for the ACP initialize handshake (seconds).
 const INIT_TIMEOUT_SECS: u64 = 30;
+
+/// Client identity reported in the ACP `initialize` handshake (`clientInfo`).
+///
+/// Some agents forward these fields downstream as client metadata — e.g. Mistral
+/// Vibe passes them to the Mistral API as `client_name`/`client_version`, which the
+/// API rejects when empty. Always send non-empty values (see issue #3326).
+const ACP_CLIENT_NAME: &str = "AionUi";
+const ACP_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpConnectionPhase {
+    Starting,
+    Initializing,
+    Ready,
+    ShuttingDown,
+}
+
+/// Build the ACP `initialize` request, always populating `clientInfo` with a
+/// non-empty name and version so downstream agents that require client metadata
+/// (e.g. Mistral Vibe) accept the request. See issue #3326.
+fn build_initialize_request() -> InitializeRequest {
+    InitializeRequest::new(ProtocolVersion::LATEST)
+        .client_info(Implementation::new(ACP_CLIENT_NAME, ACP_CLIENT_VERSION))
+}
 
 /// A pending permission request from the agent, awaiting user decision.
 pub struct PermissionRequest {
@@ -378,6 +402,8 @@ async fn run_sdk_background(
     let mut init_tx = Some(init_tx);
     let mut ready_tx = Some(ready_tx);
     let mut shutdown_rx = Some(shutdown_rx);
+    let phase = Arc::new(Mutex::new(AcpConnectionPhase::Starting));
+    let phase_for_main = Arc::clone(&phase);
 
     let result = Client
         .builder()
@@ -421,8 +447,9 @@ async fn run_sdk_background(
             // Step 1 — initialize handshake. main_fn is the canonical place
             // to call `block_task` (see SDK `connect_with` doc example).
             let init_result = {
-                let req = InitializeRequest::new(ProtocolVersion::LATEST);
+                let req = build_initialize_request();
                 log_client_request("initialize", &json_str(&req));
+                *phase_for_main.lock().unwrap() = AcpConnectionPhase::Initializing;
                 let raw = connection.send_request(req).block_task().await;
                 log_agent_response("initialize", &json_or_err(&raw));
                 raw.map_err(|e| AcpError::from_sdk(e, "initialize"))
@@ -450,11 +477,13 @@ async fn run_sdk_background(
                 // Owner dropped before we became ready — nothing more to do.
                 return Ok(());
             }
+            *phase_for_main.lock().unwrap() = AcpConnectionPhase::Ready;
 
             // Step 3 — keep the connection alive until AcpProtocol::drop
             // releases the shutdown oneshot.
             if let Some(rx) = shutdown_rx.take() {
                 let _ = rx.await;
+                *phase_for_main.lock().unwrap() = AcpConnectionPhase::ShuttingDown;
             }
             Ok(())
         })
@@ -462,9 +491,10 @@ async fn run_sdk_background(
 
     alive.store(false, Ordering::Release);
 
+    let close_phase = *phase.lock().unwrap();
     match result {
-        Ok(_) => debug!("ACP SDK connection closed normally"),
-        Err(e) => warn!(error = %ErrorChain(&e), "ACP SDK connection closed with error"),
+        Ok(_) => debug!(?close_phase, "ACP SDK connection closed normally"),
+        Err(e) => warn!(?close_phase, error = %ErrorChain(&e), "ACP SDK connection closed with error"),
     }
 }
 
@@ -890,5 +920,22 @@ mod tests {
         assert!(!is_streaming_chunk(mode_update));
         assert!(!is_streaming_chunk(unknown), "unknown kinds default to keep");
         assert!(!is_streaming_chunk(malformed), "malformed bodies default to keep");
+    }
+
+    #[test]
+    fn initialize_request_sends_non_empty_client_info() {
+        // Regression test for #3326: agents like Mistral Vibe forward clientInfo
+        // downstream as client_name/client_version and reject empty values.
+        let req = build_initialize_request();
+
+        let client_info = req.client_info.as_ref().expect("clientInfo must be present");
+        assert_eq!(client_info.name, "AionUi");
+        assert!(!client_info.name.is_empty(), "client name must not be empty");
+        assert!(!client_info.version.is_empty(), "client version must not be empty");
+
+        // The serialized handshake must carry non-empty camelCase clientInfo fields.
+        let json = serde_json::to_value(&req).expect("request serializes");
+        assert_eq!(json["clientInfo"]["name"], "AionUi");
+        assert_ne!(json["clientInfo"]["version"], "");
     }
 }

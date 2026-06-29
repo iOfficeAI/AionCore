@@ -10,7 +10,10 @@ use aion_config::config::{CliArgs, Config};
 use aion_mcp::manager::McpManager;
 use aion_protocol::commands::SessionMode;
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
-use aionui_api_types::{AgentModeResponse, SlashCommandItem};
+use aionui_api_types::{
+    AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
+    GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
+};
 use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -23,6 +26,8 @@ use crate::error::AgentError;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
+
+use super::error::aionrs_engine_error_to_send_error;
 
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
@@ -73,6 +78,8 @@ impl AionrsAgentManager {
             model: Some(config_extra.model.clone()),
             max_tokens: Some(config_extra.max_tokens),
             max_turns: config_extra.max_turns,
+            max_tool_call_malformed_turns: config_extra.max_tool_call_malformed_turns,
+            max_tool_call_failure_turns: config_extra.max_tool_call_failure_turns,
             system_prompt: config_extra.system_prompt.clone(),
             profile: None,
             auto_approve: config_extra.session_mode.as_deref() == Some("yolo"),
@@ -222,6 +229,7 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         info!(
             conversation_id = %self.runtime.conversation_id(),
             msg_id = %data.msg_id,
+            turn_id = data.turn_id.as_deref().unwrap_or("none"),
             "Aionrs send_message started"
         );
         self.runtime.bump_activity();
@@ -255,14 +263,13 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
                 Ok(())
             }
             Some(Err(e)) => {
-                let error_msg = format!("Aionrs agent error: {e}");
                 error!(
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,
                     error = %ErrorChain(&e),
                     "Aionrs engine.run() failed, emitting Error"
                 );
-                let send_error = aionrs_engine_error_to_send_error(error_msg);
+                let send_error = aionrs_engine_error_to_send_error(&e);
                 self.runtime.emit_error_data(send_error.stream_error().clone());
                 Err(send_error)
             }
@@ -380,8 +387,68 @@ impl AionrsAgentManager {
         Ok(())
     }
 
+    pub async fn config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+        Ok(GetConfigOptionsResponse {
+            config_options: vec![aionrs_mode_config_option(self.approval_manager.current_mode())],
+        })
+    }
+
+    pub async fn set_config_option(&self, option_id: &str, value: &str) -> Result<SetConfigOptionResponse, AgentError> {
+        let option_id = option_id.trim();
+        let value = value.trim();
+
+        if option_id != AIONRS_MODE_OPTION_ID {
+            return Err(AgentError::bad_request(format!(
+                "Config option '{option_id}' is not available"
+            )));
+        }
+        if !is_aionrs_session_mode(value) {
+            return Err(AgentError::bad_request(format!(
+                "Value '{value}' is not selectable for config option '{option_id}'"
+            )));
+        }
+
+        self.set_mode(value).await?;
+        Ok(SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::Observed,
+            config_options: Some(self.config_options().await?.config_options),
+        })
+    }
+
     pub async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AgentError> {
         Ok(self.slash_commands.clone())
+    }
+}
+
+const AIONRS_MODE_OPTION_ID: &str = "mode";
+
+fn is_aionrs_session_mode(s: &str) -> bool {
+    matches!(s, "default" | "auto_edit" | "yolo")
+}
+
+fn aionrs_mode_config_option(current_value: String) -> AcpConfigOptionDto {
+    AcpConfigOptionDto {
+        id: AIONRS_MODE_OPTION_ID.to_owned(),
+        name: Some("Mode".to_owned()),
+        label: None,
+        description: None,
+        category: Some("mode".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some(current_value),
+        options: vec![
+            aionrs_mode_select_option("default", "Default"),
+            aionrs_mode_select_option("auto_edit", "Auto Edit"),
+            aionrs_mode_select_option("yolo", "YOLO"),
+        ],
+    }
+}
+
+fn aionrs_mode_select_option(value: &str, name: &str) -> AcpConfigSelectOptionDto {
+    AcpConfigSelectOptionDto {
+        value: value.to_owned(),
+        name: Some(name.to_owned()),
+        label: None,
+        description: None,
     }
 }
 
@@ -391,14 +458,6 @@ fn parse_session_mode(s: &str) -> SessionMode {
         "yolo" => SessionMode::Yolo,
         _ => SessionMode::Default,
     }
-}
-
-fn aionrs_engine_error_to_send_error(error_msg: String) -> AgentSendError {
-    let lower = error_msg.to_ascii_lowercase();
-    if lower.contains("provider error") || lower.contains("provider:") || lower.contains("api error:") {
-        return AgentSendError::from_agent_error(AgentError::bad_gateway(error_msg));
-    }
-    AgentSendError::from_agent_error(AgentError::internal(error_msg))
 }
 
 #[cfg(test)]
@@ -427,6 +486,8 @@ mod tests {
             system_prompt: None,
             max_tokens: 4096,
             max_turns: None,
+            max_tool_call_malformed_turns: None,
+            max_tool_call_failure_turns: None,
             compat_overrides: Default::default(),
             session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
             session_mode: None,
@@ -609,40 +670,5 @@ mod tests {
             AgentStreamEvent::Finish(_) => {}
             other => panic!("Expected Finish, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn aionrs_provider_connection_error_is_user_llm_provider_error() {
-        let send_error = aionrs_engine_error_to_send_error(
-            "Aionrs agent error: Provider error: Connection error: Signable request error: failed to create canonical request"
-                .to_owned(),
-        );
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UserLlmProviderConfigError)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(false));
-    }
-
-    #[test]
-    fn aionrs_api_connection_error_is_user_llm_provider_network_error() {
-        let send_error = aionrs_engine_error_to_send_error(
-            "Aionrs agent error: API error: Connection error: error decoding response body".to_owned(),
-        );
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UserLlmProviderNetworkError)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(true));
     }
 }
