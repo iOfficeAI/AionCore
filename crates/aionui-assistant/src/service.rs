@@ -136,7 +136,30 @@ impl AssistantService {
             let (definition_id, assistant_id) = self
                 .resolve_definition_identity("builtin", Some(&builtin.id), &builtin.id)
                 .await?;
+            let existing_definition = self
+                .definition_repo
+                .get_by_id(&definition_id)
+                .await
+                .map_err(|e| AssistantError::Internal(format!("get builtin definition: {e}")))?;
             let agent_id = self.resolve_agent_id_for_agent_ref(&builtin.agent_ref).await?;
+            let default_model_mode = existing_definition
+                .as_ref()
+                .filter(|definition| definition.source == "builtin")
+                .map(|definition| definition.default_model_mode.as_str())
+                .unwrap_or("auto");
+            let default_model_value = existing_definition
+                .as_ref()
+                .filter(|definition| definition.source == "builtin")
+                .and_then(|definition| definition.default_model_value.as_deref());
+            let default_permission_mode = existing_definition
+                .as_ref()
+                .filter(|definition| definition.source == "builtin")
+                .map(|definition| definition.default_permission_mode.as_str())
+                .unwrap_or("auto");
+            let default_permission_value = existing_definition
+                .as_ref()
+                .filter(|definition| definition.source == "builtin")
+                .and_then(|definition| definition.default_permission_value.as_deref());
 
             self.definition_repo
                 .upsert(&UpsertAssistantDefinitionParams {
@@ -163,10 +186,10 @@ impl AssistantService {
                     rule_inline_content: None,
                     recommended_prompts: &recommended_prompts,
                     recommended_prompts_i18n: &recommended_prompts_i18n,
-                    default_model_mode: "auto",
-                    default_model_value: None,
-                    default_permission_mode: "auto",
-                    default_permission_value: None,
+                    default_model_mode,
+                    default_model_value,
+                    default_permission_mode,
+                    default_permission_value,
                     default_skills_mode: "fixed",
                     default_skill_ids: &default_skill_ids,
                     custom_skill_names: &custom_skill_names,
@@ -239,12 +262,18 @@ impl AssistantService {
                 continue;
             };
 
+            let existing_state = self
+                .state_repo
+                .get(&definition.id)
+                .await
+                .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?;
+
             self.state_repo
                 .upsert(&UpsertAssistantOverlayParams {
                     assistant_definition_id: &definition.id,
                     enabled: override_row.enabled,
                     sort_order: override_row.sort_order,
-                    agent_id_override: None,
+                    agent_id_override: existing_state.as_ref().and_then(|row| row.agent_id_override.as_deref()),
                     last_used_at: override_row.last_used_at,
                 })
                 .await
@@ -3249,6 +3278,41 @@ mod tests {
         assert_eq!(updated.agent_id, "cc126dd5");
 
         let detail = fx.service.get_detail("builtin-office", Some("en-US")).await.unwrap();
+        assert_eq!(detail.defaults.model.mode, "fixed");
+        assert_eq!(detail.defaults.model.value.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(detail.defaults.permission.mode, "fixed");
+        assert_eq!(detail.defaults.permission.value.as_deref(), Some("default"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_preserves_builtin_user_engine_and_defaults_overrides() {
+        let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
+        fx.service
+            .update(
+                "builtin-office",
+                UpdateAssistantRequest {
+                    agent_id: Some("2d23ff1c".into()),
+                    defaults: Some(AssistantDefaultsRequest {
+                        model: Some(AssistantDefaultScalarRequest {
+                            mode: "fixed".into(),
+                            value: Some("gemini-2.5-pro".into()),
+                        }),
+                        permission: Some(AssistantDefaultScalarRequest {
+                            mode: "fixed".into(),
+                            value: Some("default".into()),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+
+        let detail = fx.service.get_detail("builtin-office", Some("en-US")).await.unwrap();
+        assert_eq!(detail.engine.agent_id, "2d23ff1c");
         assert_eq!(detail.defaults.model.mode, "fixed");
         assert_eq!(detail.defaults.model.value.as_deref(), Some("gemini-2.5-pro"));
         assert_eq!(detail.defaults.permission.mode, "fixed");
