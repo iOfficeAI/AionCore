@@ -1656,7 +1656,7 @@ impl AssistantService {
         if let Some(source_ref) = source_ref
             && let Some(existing) = self
                 .definition_repo
-                .get_by_source_ref(source, source_ref)
+                .get_by_source_ref_including_deleted(source, source_ref)
                 .await
                 .map_err(|e| AssistantError::Internal(format!("get assistant definition by source_ref: {e}")))?
         {
@@ -1665,7 +1665,7 @@ impl AssistantService {
 
         if let Some(existing) = self
             .definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_including_deleted(assistant_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("get assistant definition by key: {e}")))?
         {
@@ -3017,6 +3017,44 @@ mod tests {
         assert!(!builtin_state.enabled);
         assert_eq!(builtin_state.sort_order, 9);
         assert_eq!(builtin_state.last_used_at, Some(1234));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_reactivates_soft_deleted_builtin_definition_by_source_ref() {
+        let mut builtin = mk_builtin("aionui-assistant", "AionUi Butler");
+        builtin.rule_file = Some("rules/aionui-assistant.{locale}.md".into());
+        let fx = fixture_with_builtins(vec![builtin]).await;
+
+        let original = fx
+            .definition_repo
+            .get_by_assistant_id("aionui-assistant")
+            .await
+            .unwrap()
+            .expect("builtin definition should be materialized");
+        fx.definition_repo
+            .soft_delete(&original.id, now_ms())
+            .await
+            .expect("soft-delete builtin definition");
+        assert!(
+            fx.definition_repo
+                .get_by_assistant_id("aionui-assistant")
+                .await
+                .unwrap()
+                .is_none(),
+            "active lookup should hide the soft-deleted row"
+        );
+
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+
+        let restored = fx
+            .definition_repo
+            .get_by_assistant_id("aionui-assistant")
+            .await
+            .unwrap()
+            .expect("bootstrap should reactivate the soft-deleted builtin");
+        assert_eq!(restored.id, original.id);
+        assert_eq!(restored.rule_resource_ref.as_deref(), Some("aionui-assistant"));
+        assert!(restored.deleted_at.is_none());
     }
 
     #[tokio::test]

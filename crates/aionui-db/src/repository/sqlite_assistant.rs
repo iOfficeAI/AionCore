@@ -362,6 +362,18 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         Ok(row)
     }
 
+    async fn get_by_assistant_id_including_deleted(
+        &self,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        let row =
+            sqlx::query_as::<_, AssistantDefinitionRow>("SELECT * FROM assistant_definitions WHERE assistant_id = ?")
+                .bind(assistant_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row)
+    }
+
     async fn get_by_id(&self, id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantDefinitionRow>(
             "SELECT * FROM assistant_definitions WHERE id = ? AND deleted_at IS NULL",
@@ -379,6 +391,21 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
     ) -> Result<Option<AssistantDefinitionRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantDefinitionRow>(
             "SELECT * FROM assistant_definitions WHERE source = ? AND source_ref = ? AND deleted_at IS NULL",
+        )
+        .bind(source)
+        .bind(source_ref)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn get_by_source_ref_including_deleted(
+        &self,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        let row = sqlx::query_as::<_, AssistantDefinitionRow>(
+            "SELECT * FROM assistant_definitions WHERE source = ? AND source_ref = ?",
         )
         .bind(source)
         .bind(source_ref)
