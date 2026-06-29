@@ -22,6 +22,7 @@ const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownReason {
     Sigint,
+    #[cfg(unix)]
     Sigterm,
     ParentExit,
 }
@@ -286,6 +287,7 @@ pub(crate) async fn run_server(
                 Ok(reason) => {
                     match reason {
                         ShutdownReason::Sigint => info!("Received SIGINT, shutting down..."),
+                        #[cfg(unix)]
                         ShutdownReason::Sigterm => info!("Received SIGTERM, shutting down..."),
                         ShutdownReason::ParentExit => info!("Detected desktop parent exit, shutting down..."),
                     }

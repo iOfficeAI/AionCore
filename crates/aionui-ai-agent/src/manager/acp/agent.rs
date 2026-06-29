@@ -1448,22 +1448,15 @@ mod tests {
     // count, or extractor module path) update this helper to match.
 
     use super::CliAgentProcess;
+    use aionui_common::CommandSpec;
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Spawn a sh subprocess that writes `stderr_payload` to stderr then
+    /// Spawn a subprocess that writes `stderr_payload` to stderr then
     /// exits with `exit_code`. Used to simulate ACP CLI crashes/exits in
-    /// close-path tests. Lines containing `'` are escaped for the heredoc.
+    /// close-path tests.
     async fn spawn_with_stderr_and_exit(stderr_payload: &str, exit_code: u8) -> Arc<CliAgentProcess> {
-        use aionui_common::CommandSpec;
-        let payload = stderr_payload.replace('\'', "'\\''");
-        let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), script],
-            env: vec![],
-            cwd: None,
-        };
+        let config = stderr_exit_command_spec(stderr_payload, exit_code);
         let data_dir = tempfile::tempdir().unwrap();
         let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), proc.wait_for_exit())
@@ -1471,6 +1464,37 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         Arc::new(proc)
+    }
+
+    #[cfg(not(windows))]
+    fn stderr_exit_command_spec(stderr_payload: &str, exit_code: u8) -> CommandSpec {
+        let payload = stderr_payload.replace('\'', "'\\''");
+        let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
+        CommandSpec {
+            command: "sh".into(),
+            args: vec!["-c".into(), script],
+            env: vec![],
+            cwd: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn stderr_exit_command_spec(stderr_payload: &str, exit_code: u8) -> CommandSpec {
+        let payload = stderr_payload.replace('\'', "''");
+        let script = format!("[Console]::Error.WriteLine('{payload}'); exit {exit_code}");
+        CommandSpec {
+            command: "powershell.exe".into(),
+            args: vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-Command".into(),
+                script,
+            ],
+            env: vec![],
+            cwd: None,
+        }
     }
 
     async fn spawn_with_stderr(stderr_payload: &str) -> Arc<CliAgentProcess> {

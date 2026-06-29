@@ -30,7 +30,7 @@ async fn wait_for_parent_exit(parent_pid: u32) {
 
 #[cfg(windows)]
 fn wait_for_parent_exit_blocking(parent_pid: u32) {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
     };
@@ -41,11 +41,10 @@ fn wait_for_parent_exit_blocking(parent_pid: u32) {
             return;
         }
 
-        let wait_result = WaitForSingleObject(handle, INFINITE);
+        // Any wait completion ends the parent-exit monitor; there is no
+        // distinct error path because callers only need a shutdown signal.
+        let _ = WaitForSingleObject(handle, INFINITE);
         let _ = CloseHandle(handle);
-        if wait_result != WAIT_OBJECT_0 {
-            return;
-        }
     }
 }
 
