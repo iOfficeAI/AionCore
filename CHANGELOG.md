@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.39](https://github.com/iOfficeAI/AionCore/compare/v0.1.38...v0.1.39) (2026-06-29)
+
+
+### Bug Fixes
+
+* **agent:** adapt aionrs compat API ([#528](https://github.com/iOfficeAI/AionCore/issues/528)) ([f4ad432](https://github.com/iOfficeAI/AionCore/commit/f4ad4326342c7c93abaa1da121683d472028c2f5))
+* **agent:** guard internal Aion CLI command overrides ([#538](https://github.com/iOfficeAI/AionCore/issues/538)) ([f141233](https://github.com/iOfficeAI/AionCore/commit/f141233b0cbe03a8f8ae61372d2a8fdabb9cb81c))
+* **app:** reuse conversation service for channel messages ([#531](https://github.com/iOfficeAI/AionCore/issues/531)) ([dce8053](https://github.com/iOfficeAI/AionCore/commit/dce80538b1575a35e512f93b6da0a5b2ab7b89c4))
+* **assistant:** preserve builtin override selections ([#535](https://github.com/iOfficeAI/AionCore/issues/535)) ([be4a81e](https://github.com/iOfficeAI/AionCore/commit/be4a81ef2927c0bedef3dbf22a69fc4e8f2ffd40))
+* **file:** trust local workspace roots for fs routes ([#527](https://github.com/iOfficeAI/AionCore/issues/527)) ([8e6f32f](https://github.com/iOfficeAI/AionCore/commit/8e6f32fe1eda91177d794dca80c87cff3cd970fa))
+
 ## [0.1.38](https://github.com/iOfficeAI/AionCore/compare/v0.1.37...v0.1.38) (2026-06-26)
 
 
