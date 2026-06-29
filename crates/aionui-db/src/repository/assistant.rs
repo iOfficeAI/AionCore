@@ -61,12 +61,25 @@ pub trait IAssistantOverrideRepository: Send + Sync {
 pub trait IAssistantDefinitionRepository: Send + Sync {
     async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError>;
     async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError>;
+    async fn get_by_assistant_id_including_deleted(
+        &self,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_assistant_id(assistant_id).await
+    }
     async fn get_by_id(&self, id: &str) -> Result<Option<AssistantDefinitionRow>, DbError>;
     async fn get_by_source_ref(
         &self,
         source: &str,
         source_ref: &str,
     ) -> Result<Option<AssistantDefinitionRow>, DbError>;
+    async fn get_by_source_ref_including_deleted(
+        &self,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref(source, source_ref).await
+    }
     async fn upsert(&self, params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError>;
     async fn soft_delete(&self, id: &str, deleted_at: i64) -> Result<bool, DbError>;
 }
