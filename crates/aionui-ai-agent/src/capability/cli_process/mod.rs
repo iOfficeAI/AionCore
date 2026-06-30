@@ -261,12 +261,57 @@ pub(super) mod tests {
     use tokio::time::timeout;
 
     pub(super) fn simple_script_config(script: &str) -> CommandSpec {
+        let (command, args) = script_command(script);
         CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), script.into()],
+            command: command.into(),
+            args,
             env: vec![],
             cwd: None,
         }
+    }
+
+    #[cfg(not(windows))]
+    fn script_command(script: &str) -> (String, Vec<String>) {
+        ("sh".into(), vec!["-c".into(), script.into()])
+    }
+
+    #[cfg(windows)]
+    fn script_command(script: &str) -> (String, Vec<String>) {
+        let powershell = match script.trim() {
+            "sleep 10" => "Start-Sleep -Seconds 10",
+            "read line" => "$null = [Console]::In.ReadLine()",
+            "trap '' TERM; while true; do sleep 1; done" => "while ($true) { Start-Sleep -Seconds 1 }",
+            "true" => "exit 0",
+            "echo ready" => "Write-Output 'ready'",
+            "read line && echo \"$line\"" => "$line = [Console]::In.ReadLine(); Write-Output $line",
+            "echo 'error line 1' >&2 && echo 'error line 2' >&2" => {
+                "[Console]::Error.WriteLine('error line 1'); [Console]::Error.WriteLine('error line 2')"
+            }
+            "echo 'hello' >&2" => "[Console]::Error.WriteLine('hello')",
+            "for i in 1 2 3 4 5; do echo \"line $i\" >&2; done" => {
+                "1..5 | ForEach-Object { [Console]::Error.WriteLine(\"line $_\") }"
+            }
+            "echo 'first' >&2 && echo 'second' >&2" => {
+                "[Console]::Error.WriteLine('first'); [Console]::Error.WriteLine('second')"
+            }
+            "echo 'noise' >&2" => "[Console]::Error.WriteLine('noise')",
+            script if script.contains("HTTP 402: stale turn failure") => {
+                "while (($line = [Console]::In.ReadLine()) -ne $null) { if ($line -like '*first*') { [Console]::Error.WriteLine('HTTP 402: stale turn failure') }; Write-Output '{\"type\":\"ack\",\"data\":{}}' }"
+            }
+            other => panic!("missing Windows test script mapping for: {other}"),
+        };
+
+        (
+            "powershell.exe".into(),
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-Command".into(),
+                powershell.into(),
+            ],
+        )
     }
 
     pub(super) async fn spawn_sdk_test_process(config: CommandSpec) -> CliAgentProcess {
@@ -354,25 +399,18 @@ pub(super) mod tests {
         assert!(!proc.is_running());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn spawn_rejects_unavailable_cwd_with_trailing_whitespace_in_request() {
+    async fn spawn_allows_existing_cwd_with_trailing_whitespace() {
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("workspace");
+        let cwd = dir.path().join("workspace ");
         fs::create_dir(&cwd).unwrap();
-        let cwd_with_trailing_space = format!("{} ", cwd.to_string_lossy());
 
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
-            env: vec![],
-            cwd: Some(cwd_with_trailing_space.clone()),
-        };
-        let data_dir = tempfile::tempdir().unwrap();
-        let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
-        assert!(matches!(
-            result,
-            Err(AgentError::WorkspacePathRuntimeUnavailable(message)) if message == cwd_with_trailing_space
-        ));
+        let mut config = simple_script_config("echo ready");
+        config.cwd = Some(cwd.to_string_lossy().into_owned());
+
+        let proc = spawn_sdk_test_process(config).await;
+        proc.kill(Duration::from_millis(100)).await.unwrap();
     }
 
     #[tokio::test]
@@ -383,12 +421,8 @@ pub(super) mod tests {
         let cwd = workspace_parent.join("project");
         fs::create_dir(&cwd).unwrap();
 
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
-            env: vec![],
-            cwd: Some(cwd.to_string_lossy().into_owned()),
-        };
+        let mut config = simple_script_config("echo ready");
+        config.cwd = Some(cwd.to_string_lossy().into_owned());
 
         let proc = spawn_sdk_test_process(config).await;
         proc.kill(Duration::from_millis(100)).await.unwrap();
@@ -403,12 +437,8 @@ pub(super) mod tests {
         fs::create_dir(&cwd).unwrap();
         let data_dir = tempfile::tempdir().unwrap();
 
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), "echo ready".into()],
-            env: vec![],
-            cwd: Some(cwd.to_string_lossy().into_owned()),
-        };
+        let mut config = simple_script_config("echo ready");
+        config.cwd = Some(cwd.to_string_lossy().into_owned());
 
         let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
         proc.kill(Duration::from_millis(100)).await.unwrap();
@@ -420,12 +450,8 @@ pub(super) mod tests {
         let missing_cwd = dir.path().join("missing").join("workspace");
         assert!(!missing_cwd.exists());
 
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
-            env: vec![],
-            cwd: Some(missing_cwd.to_string_lossy().into_owned()),
-        };
+        let mut config = simple_script_config("echo ready");
+        config.cwd = Some(missing_cwd.to_string_lossy().into_owned());
 
         let data_dir = tempfile::tempdir().unwrap();
         let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
@@ -444,12 +470,8 @@ pub(super) mod tests {
         let missing_cwd = dir.path().join("missing-sdk").join("workspace");
         assert!(!missing_cwd.exists());
 
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), "sleep 10".into()],
-            env: vec![],
-            cwd: Some(missing_cwd.to_string_lossy().into_owned()),
-        };
+        let mut config = simple_script_config("sleep 10");
+        config.cwd = Some(missing_cwd.to_string_lossy().into_owned());
 
         let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(matches!(

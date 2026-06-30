@@ -556,6 +556,10 @@ mod tests {
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
+    fn is_npx_command_path(command: &str) -> bool {
+        command == "npx" || command.ends_with("/npx") || command.ends_with("\\npx.cmd")
+    }
+
     #[cfg(unix)]
     fn test_runtime_data_dir() -> &'static PathBuf {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -699,7 +703,7 @@ mod tests {
                 assert_eq!(s.name, "ctx7");
                 let command = s.command.to_string_lossy();
                 assert!(
-                    command == "npx" || command.ends_with("/npx"),
+                    is_npx_command_path(&command),
                     "unexpected stdio command path: {command}",
                 );
                 assert_eq!(s.args, vec!["-y".to_owned(), "@upstash/context7-mcp".to_owned()]);
