@@ -951,6 +951,47 @@ fn pending_mode_seed_falls_back_to_legacy_set_mode_when_mode_config_option_is_ab
 }
 
 #[test]
+fn pending_mode_seed_uses_legacy_set_mode_when_preloaded_catalog_is_supplemental_only() {
+    let mut session = AcpSession::new(Some(ModeId::new("full-access")), None, HashMap::new());
+    session.preload_advertised_catalogs(
+        Some(SessionModeState::new(
+            "auto",
+            vec![
+                SessionMode::new("read-only", "Read Only"),
+                SessionMode::new("auto", "Default"),
+                SessionMode::new("full-access", "Full Access"),
+            ],
+        )),
+        None,
+    );
+    session.seed_pending_startup_config(SessionConfigOptionCategory::Mode, ConfigValue::new("full-access"));
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            "high",
+            vec![SessionConfigSelectOption::new("high", "High")],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+
+    assert_eq!(
+        session.resolve_pending_startup_config_seeds(),
+        vec![PendingStartupConfigSeedResult::OptionNotAdvertised {
+            category: SessionConfigOptionCategory::Mode,
+        }]
+    );
+
+    assert_eq!(
+        session.plan_reconcile(),
+        vec![ReconcileAction::SetMode {
+            mode: ModeId::new("full-access"),
+        }]
+    );
+}
+
+#[test]
 fn pending_model_seed_is_dropped_without_legacy_fallback_when_model_config_option_rejects_value() {
     let mut session = AcpSession::new(None, Some(ModelId::new("openai/gpt-5")), HashMap::new());
     session.seed_pending_startup_config(SessionConfigOptionCategory::Model, ConfigValue::new("openai/gpt-5"));
