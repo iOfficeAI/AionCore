@@ -26,7 +26,7 @@ Output `[CRON_LIST]` (nothing else in this message) and wait for the system resp
 - **Task already exists and user wants to change it** → Output `[CRON_UPDATE: <job-id>]` to modify in place.
 - **Task already exists and user wants something different** → Ask the user how to proceed.
 
-## Create: [ ]
+## Create: [CRON_CREATE]
 
 Output this format DIRECTLY (not in code blocks):
 
