@@ -1,7 +1,7 @@
 ---
 name: aionui-config
 description: >-
-  Configure AionUi itself through its backend API — create and edit assistants (name, avatar, system prompt, quick-start prompts, engine), import and attach skills, manage MCP servers, configure LLM providers (add/edit a model endpoint, set the API key, fetch the model list, pick the default model), and change app/UI settings (language, theme, font size, zoom, notifications). Use when the user wants you to set up an AionUi assistant, sink a skill into AionUi's skill registry, attach skills to an assistant, change an assistant's avatar or system prompt, add or configure an MCP server, add an LLM/model provider or API key, switch the default model, change the theme or language, or otherwise configure their AionUi installation. This is "Agent-assisted AionUi configuration": you act on the user's behalf via the local backend.
+  Configure AionUi itself through its backend API — create and edit assistants (name, avatar, system prompt, quick-start prompts, engine), import and attach skills, manage MCP servers, configure LLM providers (add/edit a model endpoint, set the API key, fetch the model list, pick the default model), change app/UI settings (language, theme, font size, zoom, notifications), and create or manage scheduled tasks (cron jobs) from a natural-language schedule. Use when the user wants you to set up an AionUi assistant, sink a skill into AionUi's skill registry, attach skills to an assistant, change an assistant's avatar or system prompt, add or configure an MCP server, add an LLM/model provider or API key, switch the default model, change the theme or language, schedule a recurring or one-off task ("every morning at 9", "remind me in 2 hours", "run this daily"), or otherwise configure their AionUi installation. This is "Agent-assisted AionUi configuration": you act on the user's behalf via the local backend.
 ---
 
 > **⚠️ Platform note — read before running any command.** The shell snippets in this skill are written for **macOS / Linux** (bash/zsh). Always check which OS you are on first. On **Windows** do **not** run them verbatim — the underlying tool/CLI commands are usually cross-platform, but the surrounding shell syntax is not. Translate it to PowerShell before running:
@@ -551,6 +551,91 @@ engine (via its `agent_id` — see *Picking the engine* above).
 
 ---
 
+## Scheduled tasks (cron)
+
+Create and manage scheduled tasks ("run this every morning at 9", "remind me in
+two hours", "every 30 minutes do X") over the REST API — `/api/cron/*` is a
+full, verified CRUD surface. Translate the user's natural-language schedule into
+one of three `schedule` shapes, then `POST /api/cron/jobs`.
+
+### The schedule (`schedule` is a tagged union — the `kind` field picks the shape)
+
+| Natural language | `schedule` body |
+| --- | --- |
+| "at 3pm today / on this exact date" (one-shot) | `{"kind":"at","at_ms":<unix-ms>}` |
+| "every 30 minutes / every 2 hours" (fixed interval) | `{"kind":"every","every_ms":<ms>}` |
+| "every day at 9am / every Monday" (calendar) | `{"kind":"cron","expr":"0 9 * * *","tz":"Asia/Shanghai"}` |
+
+- **`cron.expr` takes a standard 5-field crontab** (`min hour day month weekday`).
+  The backend auto-prepends the seconds field, so `0 9 * * *` means 09:00 daily.
+  (A 6-field `sec min hour day month weekday` is also accepted as-is.)
+- **`cron.tz`** is an IANA timezone name (`Asia/Shanghai`, `America/New_York`,
+  `UTC`). Omit it and the expression runs in UTC — always set it to the user's
+  zone for "9am" to mean their 9am.
+- **`every.every_ms`** must be `> 0`. There is no documented lower bound, but be
+  sensible — don't schedule a sub-minute loop unless asked.
+- **`at.at_ms`** is a Unix timestamp in **milliseconds**. A past time is accepted
+  by the API but will not run, so compute it from "now" in the user's zone.
+- An optional `description` can go inside any schedule variant for a
+  human-readable label.
+
+### Required fields on `POST /api/cron/jobs`
+
+```bash
+python3 scripts/aionui_api.py post /api/cron/jobs '{
+  "name": "每日早报",
+  "schedule": {"kind": "cron", "expr": "0 9 * * *", "tz": "Asia/Shanghai"},
+  "message": "总结今天的科技新闻",
+  "conversation_id": "<conv-id>",
+  "created_by": "agent",
+  "execution_mode": "new_conversation",
+  "agent_config": {"name": "AionUi Butler", "assistant_id": "<assistant-id>"}
+}'
+```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `name` | ✅ | display name of the task |
+| `schedule` | ✅ | one of the three shapes above |
+| `conversation_id` | ✅ | the conversation the task is tied to — get one from `GET /api/conversations` (or create one). Even `new_conversation` jobs need this set |
+| `created_by` | ✅ | `"agent"` when you create it on the user's behalf, `"user"` for a user-initiated one. **Only these two values** |
+| `message` (or `prompt`) | — | the instruction sent on each run. `message` wins if both are given; with neither, the run sends an empty prompt |
+| `execution_mode` | — | `"existing"` (default) reuses `conversation_id` every run; `"new_conversation"` spins up a fresh conversation each run |
+| `agent_config` | — | which assistant runs the task. **In practice required for a new job**: omit it and the API 400s with *"assistant_id is required for new cron jobs"*. Pass `{"name":"<label>","assistant_id":"<id>"}` |
+| `description` | — | optional longer description |
+
+> `agent_config` is strict (`deny_unknown_fields`): only `name`, `assistant_id`,
+> `cli_path`, `mode`, `model_id`, `model`, `config_options`, `workspace` are
+> accepted. Legacy keys `backend`, `agent_type`, `custom_agent_id`, `is_preset`
+> are **rejected** — don't send them. Get the `assistant_id` from
+> `GET /api/assistants`.
+
+The response is the created job (HTTP 201) with its generated `id` (prefixed
+`cron_…`), resolved `agent_type`, and a `state` block (`next_run_at_ms`,
+`run_count`, …).
+
+### List / inspect / change / run / delete
+
+```bash
+python3 scripts/aionui_api.py get    /api/cron/jobs                       # all jobs
+python3 scripts/aionui_api.py get    "/api/cron/jobs?conversation_id=<id>"  # jobs for one conversation
+python3 scripts/aionui_api.py get    /api/cron/jobs/<id>                   # one job
+python3 scripts/aionui_api.py put    /api/cron/jobs/<id> '{"enabled": false}'   # partial update (pause)
+python3 scripts/aionui_api.py post   /api/cron/jobs/<id>/run              # run it once right now
+python3 scripts/aionui_api.py delete /api/cron/jobs/<id>                  # remove it
+```
+
+`PUT` is a partial update — send only what changes (`name`, `description`,
+`enabled`, `schedule`, `message`, `execution_mode`, `agent_config`,
+`conversation_title`, `max_retries`). Read the job back to confirm its
+`schedule` and `state.next_run_at_ms` after any change.
+
+> Note: an `existing`-mode job can't have its assistant changed after creation
+> (`agent_config` on update is rejected for ongoing-conversation jobs) — that's
+> by design, the ongoing conversation keeps its original assistant.
+
+---
+
 ## Verification checklist
 
 After a configuration task, confirm with reads:
@@ -562,7 +647,9 @@ After a configuration task, confirm with reads:
 5. MCP server in `get /api/mcp/servers`, enabled, right transport?
 6. Provider in `get /api/providers`, enabled, right `models`? (redact the key)
 7. Settings changed? `get /api/settings/client` shows the new value.
-8. Tell the user to refresh / reopen the AionUi view to see changes.
+8. Scheduled task created? `get /api/cron/jobs` lists it, `enabled: true`, with
+   the expected `schedule` and a non-null `state.next_run_at_ms`.
+9. Tell the user to refresh / reopen the AionUi view to see changes.
 
 ## Out of scope (handled elsewhere)
 
@@ -573,11 +660,9 @@ API here:
 - **Teams** (`/api/teams/*`) — create Teams through the Team UI or REST API.
   Once a Team session is active, Team agents use the `team_*` MCP tools
   provided by the per-Team `aionui-team` server.
-- **Cron / scheduled jobs** (`/api/cron/*`) — created and managed through their
-  own flow (scheduling tools / the AionUi cron UI), not this skill.
 
 This skill stays focused on *configuration*: assistants, skills, MCP servers,
-LLM providers, and app settings.
+LLM providers, app settings, and scheduled tasks.
 
 ## Not yet covered
 
