@@ -373,6 +373,11 @@ pub struct TeamRunPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamRunStateResponse {
+    pub active_run: Option<TeamRunPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamChildTurnPayload {
     pub team_id: String,
     pub team_run_id: String,
@@ -1450,6 +1455,57 @@ mod tests {
         assert_eq!(json["source"], "user_message");
         assert_eq!(json["has_user_intervention"], true);
         assert_eq!(json["message_id"], "mailbox-1");
+    }
+
+    fn active_run_payload() -> TeamRunPayload {
+        TeamRunPayload {
+            team_id: "team-1".to_owned(),
+            team_run_id: "run-1".to_owned(),
+            source: TeamRunSource::UserMessage,
+            has_user_intervention: true,
+            target_slot_id: "lead".to_owned(),
+            target_role: TeamRunTargetRole::Lead,
+            status: TeamRunStatus::Running,
+            active_child_count: 1,
+            pending_wake_count: 0,
+            starting_child_count: 0,
+            slot_work: vec![TeamSlotWorkPayload {
+                slot_id: "lead".to_owned(),
+                role: TeamRunTargetRole::Lead,
+                pending_wake_count: 0,
+                starting_child_count: 0,
+                paused: false,
+                suppressed_wake_count: 0,
+                active_turn_id: Some("turn-1".to_owned()),
+                active_turn_started_at_ms: Some(10),
+                active_turn_elapsed_ms: Some(20),
+                active_turn_slow: Some(false),
+                active_turn_slow_threshold_ms: Some(600_000),
+                runtime_health: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn team_run_state_response_serializes_null_active_run() {
+        let value = serde_json::to_value(TeamRunStateResponse { active_run: None }).unwrap();
+        assert_eq!(value, serde_json::json!({ "active_run": null }));
+    }
+
+    #[test]
+    fn team_run_state_response_serializes_some_active_run() {
+        let payload = active_run_payload();
+        let value = serde_json::to_value(TeamRunStateResponse {
+            active_run: Some(payload.clone()),
+        })
+        .unwrap();
+
+        assert_eq!(value["active_run"]["team_id"], payload.team_id);
+        assert_eq!(value["active_run"]["team_run_id"], payload.team_run_id);
+        assert_eq!(value["active_run"]["source"], "user_message");
+        assert_eq!(value["active_run"]["has_user_intervention"], true);
+        assert_eq!(value["active_run"]["status"], "running");
+        assert_eq!(value["active_run"]["slot_work"][0]["slot_id"], "lead");
     }
 
     #[test]

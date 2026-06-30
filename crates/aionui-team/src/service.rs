@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 use aionui_ai_agent::{AgentError, AgentInstance, IWorkerTaskManager};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload, TeamResponse,
-    TeamRunAckResponse, TeamRunTargetRole, WebSocketMessage,
+    TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -697,6 +697,17 @@ impl TeamSessionService {
         self.sessions.get(team_id).map(|e| e.session.user_id().to_owned())
     }
 
+    pub async fn get_run_state(&self, user_id: &str, team_id: &str) -> Result<TeamRunStateResponse, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        let active_run = match session {
+            Some(session) => session.team_run_manager().current_payload().await,
+            None => None,
+        };
+
+        Ok(TeamRunStateResponse { active_run })
+    }
+
     pub fn get_session_scheduler(&self, team_id: &str) -> Option<Arc<crate::scheduler::TeammateManager>> {
         self.sessions.get(team_id).map(|e| e.session.scheduler().clone())
     }
@@ -707,6 +718,11 @@ impl TeamSessionService {
             .get(team_id)
             .map(|entry| !entry.slow_monitor_handle.is_finished())
             .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn session_count_for_test(&self) -> usize {
+        self.sessions.len()
     }
 
     pub async fn stop_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
@@ -1001,5 +1017,44 @@ mod tests {
 
         assert!(svc.session_has_slow_monitor(&created.id));
         svc.stop_session("user-test", &created.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_state_returns_none_without_session_and_does_not_create_session() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Run State"))
+            .await
+            .unwrap();
+        svc.stop_session("user-test", &created.id).await.unwrap();
+
+        assert_eq!(svc.session_count_for_test(), 0);
+
+        let state = svc.get_run_state("user-test", &created.id).await.unwrap();
+
+        assert!(state.active_run.is_none());
+        assert_eq!(svc.session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_state_returns_current_active_payload() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Active Run State"))
+            .await
+            .unwrap();
+
+        let ack = svc.send_message("user-test", &created.id, "hello", None).await.unwrap();
+        let state = svc.get_run_state("user-test", &created.id).await.unwrap();
+        let active_run = state.active_run.expect("active run state");
+
+        assert_eq!(active_run.team_id, created.id);
+        assert_eq!(active_run.team_run_id, ack.team_run_id);
+        assert_eq!(active_run.status, ack.status);
+        assert_eq!(active_run.target_slot_id, ack.target_slot_id);
+        assert_eq!(active_run.target_role, ack.target_role);
+        assert_eq!(active_run.pending_wake_count, 1);
+        assert_eq!(active_run.slot_work.len(), 1);
+        assert_eq!(active_run.slot_work[0].slot_id, ack.accepted_slot_id);
     }
 }

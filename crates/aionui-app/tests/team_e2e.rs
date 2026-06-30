@@ -6,7 +6,7 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use common::{
-    body_json, build_app, build_app_with_mock_agents, delete_with_token, get_with_token, json_with_token,
+    body_json, build_app, build_app_with_mock_agents, delete_with_token, get_request, get_with_token, json_with_token,
     setup_and_login,
 };
 
@@ -420,6 +420,98 @@ async fn pause_team_slot_endpoint_requires_owned_team_and_active_run() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
     assert!(body["success"].as_bool().is_some_and(|success| !success));
+}
+
+#[tokio::test]
+async fn trs1_run_state_returns_null_for_existing_team_without_active_run() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+
+    let stop_req = delete_with_token(&format!("/api/teams/{team_id}/session"), &token, &csrf);
+    let stop_resp = app.clone().oneshot(stop_req).await.unwrap();
+    assert_eq!(stop_resp.status(), StatusCode::OK);
+
+    let req = get_with_token(&format!("/api/teams/{team_id}/run-state"), &token);
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["success"], true);
+    assert!(body["data"]["active_run"].is_null());
+}
+
+#[tokio::test]
+async fn trs2_run_state_returns_active_run_payload() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+
+    let send_req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/messages"),
+        json!({ "content": "hello", "files": [] }),
+        &token,
+        &csrf,
+    );
+    let send_resp = app.clone().oneshot(send_req).await.unwrap();
+    assert_eq!(send_resp.status(), StatusCode::OK);
+    let send_body = body_json(send_resp).await;
+    let team_run_id = send_body["data"]["team_run_id"].as_str().unwrap();
+
+    let req = get_with_token(&format!("/api/teams/{team_id}/run-state"), &token);
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["success"], true);
+    assert_eq!(body["data"]["active_run"]["team_id"], team_id);
+    assert_eq!(body["data"]["active_run"]["team_run_id"], team_run_id);
+    assert_eq!(body["data"]["active_run"]["source"], "user_message");
+    assert_eq!(body["data"]["active_run"]["has_user_intervention"], true);
+    assert_eq!(body["data"]["active_run"]["status"], "accepted");
+    assert_eq!(body["data"]["active_run"]["pending_wake_count"], 1);
+    assert!(body["data"]["active_run"]["slot_work"].as_array().unwrap().len() >= 1);
+}
+
+#[tokio::test]
+async fn trs3_run_state_unauthenticated_returns_401() {
+    let (app, _services) = build_app().await;
+
+    let resp = app.oneshot(get_request("/api/teams/team-1/run-state")).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn trs4_run_state_missing_team_returns_404() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = get_with_token("/api/teams/team-missing/run-state", &token);
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn trs5_run_state_rejects_cross_user_access() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (admin_token, admin_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &admin_token, &admin_csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+
+    let (other_token, _other_csrf) = setup_and_login(&mut app, &services, "other", "StrongP@ss2").await;
+    let req = get_with_token(&format!("/api/teams/{team_id}/run-state"), &other_token);
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "FORBIDDEN");
 }
 
 // TL-3: Each team contains full assistants info

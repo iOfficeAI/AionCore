@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest,
-    SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
+    SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -67,6 +67,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
     Router::new()
         .route("/api/teams", post(create_team).get(list_teams))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
+        .route("/api/teams/{id}/run-state", get(get_run_state))
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
@@ -115,6 +116,15 @@ async fn get_team(
 ) -> Result<Json<ApiResponse<TeamResponse>>, ApiError> {
     let team = state.service.get_team(&user.id, &id).await?;
     Ok(Json(ApiResponse::ok(team)))
+}
+
+async fn get_run_state(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<TeamRunStateResponse>>, ApiError> {
+    let run_state = state.service.get_run_state(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(run_state)))
 }
 
 async fn remove_team(
