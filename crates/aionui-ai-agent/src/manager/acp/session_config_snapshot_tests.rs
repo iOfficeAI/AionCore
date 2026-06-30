@@ -56,6 +56,41 @@ fn config_snapshot_supplements_missing_mode_from_non_empty_runtime_catalog() {
 }
 
 #[test]
+fn config_snapshot_supplements_missing_mode_from_preloaded_catalog_using_desired_current() {
+    let mut session = AcpSession::new(Some(ModeId::new("full-access")), None, HashMap::new());
+    session.preload_advertised_catalogs(
+        Some(SessionModeState::new(
+            "auto",
+            vec![
+                SessionMode::new("read-only", "Read Only"),
+                SessionMode::new("auto", "Default"),
+                SessionMode::new("full-access", "Full Access"),
+            ],
+        )),
+        None,
+    );
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            "high",
+            vec![SessionConfigSelectOption::new("high", "High")],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+
+    let snapshot = session.config_snapshot();
+    let mode = snapshot_option(&snapshot, "mode");
+    assert_eq!(mode.current_value.as_deref(), Some("full-access"));
+    assert_eq!(mode.options.len(), 3);
+    assert_eq!(
+        resolve_set_path(&snapshot, "mode", "read-only"),
+        Ok(ConfigSetPath::LegacyMode)
+    );
+}
+
+#[test]
 fn config_snapshot_supplements_missing_model_from_non_empty_runtime_catalog() {
     let mut session = AcpSession::new(None, None, HashMap::new());
     session.apply_advertised_models(SessionModelState::new(

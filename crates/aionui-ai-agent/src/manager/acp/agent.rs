@@ -54,6 +54,7 @@ pub(super) fn user_facing_message(err: &AgentError) -> String {
 }
 
 use super::codex_sandbox;
+use super::config_option_catalog::{extract_models_from_value, extract_modes_from_value};
 use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
 use super::mode_normalize::normalize_requested_mode;
 
@@ -164,6 +165,13 @@ fn seed_startup_config_preferences(
             ConfigValue::new(thought_level.to_owned()),
         );
     }
+}
+
+fn preload_metadata_catalogs(session: &mut AcpSession, handshake: &AgentHandshake) {
+    session.preload_advertised_catalogs(
+        handshake.available_modes.as_ref().and_then(extract_modes_from_value),
+        handshake.available_models.as_ref().and_then(extract_models_from_value),
+    );
 }
 
 fn confirm_option_id(data: &Value) -> Option<String> {
@@ -428,6 +436,7 @@ impl AcpAgentManager {
 
         let startup_config_seed_base = initial_config.clone();
         let mut session = AcpSession::new(initial_mode, initial_model, initial_config);
+        preload_metadata_catalogs(&mut session, &params.metadata.handshake);
         seed_startup_config_preferences(&mut session, &params, &startup_config_seed_base);
 
         let pipeline = PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)]);
@@ -1274,8 +1283,11 @@ mod tests {
     use crate::error::AgentError;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::{AcpError, CloseReason};
-    use crate::shared_kernel::{ConfigKey, ConfigValue, SessionId as DomainSessionId};
-    use agent_client_protocol::schema::{AvailableCommand, SessionConfigOptionCategory};
+    use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, SessionId as DomainSessionId};
+    use agent_client_protocol::schema::{
+        AvailableCommand, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    };
+    use aionui_api_types::AgentHandshake;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -1349,6 +1361,42 @@ mod tests {
     fn rate_limited_has_no_colon_returns_full_string() {
         let err = AgentError::RateLimited;
         assert_eq!(user_facing_message(&err), "Rate limited");
+    }
+
+    #[test]
+    fn preload_metadata_catalogs_seeds_mode_catalog_for_partial_session_config_options() {
+        let mut session = AcpSession::new(Some(ModeId::new("full-access")), None, HashMap::new());
+        let handshake = AgentHandshake {
+            available_modes: Some(json!({
+                "current_mode_id": "auto",
+                "available_modes": [
+                    {"id": "read-only", "name": "Read Only"},
+                    {"id": "auto", "name": "Default"},
+                    {"id": "full-access", "name": "Full Access"}
+                ]
+            })),
+            ..Default::default()
+        };
+
+        super::preload_metadata_catalogs(&mut session, &handshake);
+        session.apply_advertised_config_options(vec![
+            SessionConfigOption::select(
+                "reasoning_effort",
+                "Reasoning Effort",
+                "high",
+                vec![SessionConfigSelectOption::new("high", "High")],
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ]);
+
+        let snapshot = session.config_snapshot();
+        let mode = snapshot
+            .options
+            .iter()
+            .find(|option| option.id == "mode")
+            .expect("metadata catalog should supplement missing mode");
+        assert_eq!(mode.current_value.as_deref(), Some("full-access"));
+        assert_eq!(mode.options.len(), 3);
     }
 
     #[test]

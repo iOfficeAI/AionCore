@@ -717,6 +717,68 @@ impl AcpSession {
             self.advertised.context_usage = Some(usage.clone());
         }
     }
+
+    pub(crate) fn preload_advertised_catalogs(
+        &mut self,
+        modes: Option<SessionModeState>,
+        models: Option<SessionModelState>,
+    ) {
+        if let Some(modes) = modes.filter(|modes| !modes.available_modes.is_empty())
+            && self
+                .advertised
+                .modes
+                .as_ref()
+                .is_none_or(|existing| existing.available_modes.is_empty())
+        {
+            self.advertised.modes = Some(self.mode_catalog_with_session_current(modes));
+        }
+
+        if let Some(models) = models.filter(|models| !models.available_models.is_empty())
+            && self
+                .advertised
+                .models
+                .as_ref()
+                .is_none_or(|existing| existing.available_models.is_empty())
+        {
+            self.advertised.models = Some(self.model_catalog_with_session_current(models));
+        }
+    }
+
+    fn mode_catalog_with_session_current(&self, mut modes: SessionModeState) -> SessionModeState {
+        let current = self
+            .observed
+            .mode_id
+            .as_ref()
+            .or(self.desired.mode_id.as_ref())
+            .filter(|mode| {
+                modes
+                    .available_modes
+                    .iter()
+                    .any(|available| available.id.0.as_ref() == mode.as_str())
+            });
+        if let Some(current) = current {
+            modes.current_mode_id = current.as_str().to_owned().into();
+        }
+        modes
+    }
+
+    fn model_catalog_with_session_current(&self, mut models: SessionModelState) -> SessionModelState {
+        let current = self
+            .observed
+            .model_id
+            .as_ref()
+            .or(self.desired.model_id.as_ref())
+            .filter(|model| {
+                models
+                    .available_models
+                    .iter()
+                    .any(|available| available.model_id.0.as_ref() == model.as_str())
+            });
+        if let Some(current) = current {
+            models.current_model_id = current.as_str().to_owned().into();
+        }
+        models
+    }
 }
 
 // ─── Reconcile ─────────────────────────────────────────────────────
