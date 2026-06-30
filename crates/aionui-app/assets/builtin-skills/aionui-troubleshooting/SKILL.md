@@ -140,9 +140,11 @@ python3 scripts/aion_diag.py logs --errors --lines 100
 python3 scripts/aion_diag.py crons
 ```
 
-There is **no REST API for crons** — this reads the `cron_jobs` table from the
-SQLite store directly (read-only). It surfaces a `failing` list (jobs whose
-`last_status` is `error` or `missed`) plus every job's `schedule_*`,
+This reads the `cron_jobs` table from the SQLite store directly (read-only). A
+REST API for crons does exist (`/api/cron/jobs`, used by the `aionui-config`
+skill to *create/manage* jobs), but for diagnosis the table read is more direct
+and surfaces the run-state columns in one shot. It surfaces a `failing` list
+(jobs whose `last_status` is `error` or `missed`) plus every job's `schedule_*`,
 `last_status`, `last_error`, `next_run_at`, `last_run_at`, `run_count`,
 `retry_count`. Check `enabled`, compare `next_run_at` to now, and read
 `last_error` for failed jobs.
@@ -203,7 +205,7 @@ python3 scripts/aion_diag.py logs [--lines N] [--errors] [--conv <id>]
 | Conversation list + runtime state | `GET /api/conversations[/{id}]` | REST |
 | Conversation messages / errors | `messages` table (by `conversation_id`) | SQLite (read-only) |
 | LLM provider health | `GET /api/providers` → `model_health` | REST (api_key redacted) |
-| Scheduled jobs | `cron_jobs` table | SQLite (no REST API) |
+| Scheduled jobs | `cron_jobs` table (REST `/api/cron/jobs` exists too) | SQLite (read-only) |
 | Teams + members | `GET /api/teams` | REST |
 | MCP servers | `GET /api/mcp/servers` | REST |
 | Logs | `*.aioncore.log` in `--log-dir` | File tail |
