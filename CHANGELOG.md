@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.40](https://github.com/iOfficeAI/AionCore/compare/v0.1.39...v0.1.40) (2026-06-30)
+
+
+### Features
+
+* **team:** add run state snapshot endpoint ([#549](https://github.com/iOfficeAI/AionCore/issues/549)) ([2c7cfe8](https://github.com/iOfficeAI/AionCore/commit/2c7cfe8a3eb49c8be790a7733ccad2f8a49f19bd))
+
+
+### Bug Fixes
+
+* **acp:** preserve selectors for partial config snapshots ([#548](https://github.com/iOfficeAI/AionCore/issues/548)) ([0cb3a9a](https://github.com/iOfficeAI/AionCore/commit/0cb3a9a5925b273ec1b6610c04469f8724ad14fb))
+* **cron:** restore create command heading ([#547](https://github.com/iOfficeAI/AionCore/issues/547)) ([1a30f77](https://github.com/iOfficeAI/AionCore/commit/1a30f7710de2c98856f7256811543c1121dddc76))
+* **cron:** run jobs through conversation service ([#546](https://github.com/iOfficeAI/AionCore/issues/546)) ([b36fb5c](https://github.com/iOfficeAI/AionCore/commit/b36fb5c471b19edefd0b63dc2acf3e3d4c2c52ae))
+* **skills:** repair butler endpoint drift + add cron scheduling ([#550](https://github.com/iOfficeAI/AionCore/issues/550)) ([88bcff3](https://github.com/iOfficeAI/AionCore/commit/88bcff3c08ebcd5e5dff8f16ba9c68fa313ef55f))
+* **windows:** handle runtime process lifecycle ([399f920](https://github.com/iOfficeAI/AionCore/commit/399f920c31ab4d738ffa32b5ebcff9416ba44e6f))
+
 ## [0.1.39](https://github.com/iOfficeAI/AionCore/compare/v0.1.38...v0.1.39) (2026-06-29)
 
 
