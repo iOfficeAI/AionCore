@@ -7,29 +7,111 @@ use aionui_api_types::{AcpConfigOptionDto, AcpConfigSelectOptionDto};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ConfigSnapshot {
     pub(crate) options: Vec<AcpConfigOptionDto>,
+    option_origins: Vec<ConfigOptionOrigin>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigOptionOrigin {
+    Real,
+    SyntheticLegacyMode,
+    SyntheticLegacyModel,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ConfigSupplementSummary {
+    pub(crate) mode: bool,
+    pub(crate) model: bool,
+}
+
+impl ConfigSupplementSummary {
+    pub(crate) fn categories_csv(self) -> Option<&'static str> {
+        match (self.mode, self.model) {
+            (true, true) => Some("mode,model"),
+            (true, false) => Some("mode"),
+            (false, true) => Some("model"),
+            (false, false) => None,
+        }
+    }
 }
 
 impl ConfigSnapshot {
+    fn new(options: Vec<AcpConfigOptionDto>, option_origins: Vec<ConfigOptionOrigin>) -> Self {
+        debug_assert_eq!(
+            options.len(),
+            option_origins.len(),
+            "ConfigSnapshot options and origins must stay aligned"
+        );
+        Self {
+            options,
+            option_origins,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
-        Self { options: Vec::new() }
+        Self::new(Vec::new(), Vec::new())
     }
 
     pub(crate) fn from_real_options(options: Vec<SessionConfigOption>) -> Self {
-        Self {
-            options: options.into_iter().map(dto_from_sdk_option).collect(),
-        }
+        let options: Vec<AcpConfigOptionDto> = options.into_iter().map(dto_from_sdk_option).collect();
+        let option_origins = vec![ConfigOptionOrigin::Real; options.len()];
+        Self::new(options, option_origins)
     }
 
     pub(crate) fn from_legacy_catalogs(modes: Option<&SessionModeState>, models: Option<&SessionModelState>) -> Self {
         let mut options = Vec::new();
+        let mut option_origins = Vec::new();
         if let Some(modes) = modes {
             options.push(dto_from_modes(modes));
+            option_origins.push(ConfigOptionOrigin::SyntheticLegacyMode);
         }
         if let Some(models) = models {
             options.push(dto_from_models(models));
+            option_origins.push(ConfigOptionOrigin::SyntheticLegacyModel);
         }
-        Self { options }
+        Self::new(options, option_origins)
+    }
+
+    pub(crate) fn supplement_summary_for_real_options(
+        options: &[SessionConfigOption],
+        modes: Option<&SessionModeState>,
+        models: Option<&SessionModelState>,
+    ) -> ConfigSupplementSummary {
+        let has_real_mode = options
+            .iter()
+            .any(|option| real_option_matches_category_or_id(option, &SessionConfigOptionCategory::Mode, "mode"));
+        let has_real_model = options
+            .iter()
+            .any(|option| real_option_matches_category_or_id(option, &SessionConfigOptionCategory::Model, "model"));
+
+        ConfigSupplementSummary {
+            mode: !has_real_mode && modes.is_some_and(|modes| !modes.available_modes.is_empty()),
+            model: !has_real_model && models.is_some_and(|models| !models.available_models.is_empty()),
+        }
+    }
+
+    pub(crate) fn from_real_options_with_runtime_supplements(
+        options: Vec<SessionConfigOption>,
+        modes: Option<&SessionModeState>,
+        models: Option<&SessionModelState>,
+    ) -> Self {
+        let summary = Self::supplement_summary_for_real_options(&options, modes, models);
+        let mut snapshot = Self::from_real_options(options);
+
+        if summary.mode
+            && let Some(modes) = modes
+        {
+            snapshot.options.push(dto_from_modes(modes));
+            snapshot.option_origins.push(ConfigOptionOrigin::SyntheticLegacyMode);
+        }
+        if summary.model
+            && let Some(models) = models
+        {
+            snapshot.options.push(dto_from_models(models));
+            snapshot.option_origins.push(ConfigOptionOrigin::SyntheticLegacyModel);
+        }
+
+        snapshot
     }
 
     pub(crate) fn option_current(&self, option_id: &str) -> Option<String> {
@@ -69,15 +151,29 @@ pub(crate) fn resolve_set_path(
     option_id: &str,
     requested: &str,
 ) -> Result<ConfigSetPath, ConfigSetPathError> {
-    let Some(option) = snapshot.options.iter().find(|option| option.id == option_id) else {
+    let Some((index, option)) = snapshot
+        .options
+        .iter()
+        .enumerate()
+        .find(|(_, option)| option.id == option_id)
+    else {
         return Err(ConfigSetPathError::OptionNotFound);
     };
     if !option.options.is_empty() && !option.options.iter().any(|option| option.value == requested) {
         return Err(ConfigSetPathError::ValueNotSelectable);
     }
-    Ok(ConfigSetPath::ConfigOption {
-        option_id: option.id.clone(),
-    })
+    match snapshot
+        .option_origins
+        .get(index)
+        .copied()
+        .unwrap_or(ConfigOptionOrigin::Real)
+    {
+        ConfigOptionOrigin::Real => Ok(ConfigSetPath::ConfigOption {
+            option_id: option.id.clone(),
+        }),
+        ConfigOptionOrigin::SyntheticLegacyMode => Ok(ConfigSetPath::LegacyMode),
+        ConfigOptionOrigin::SyntheticLegacyModel => Ok(ConfigSetPath::LegacyModel),
+    }
 }
 
 fn dto_from_sdk_option(option: SessionConfigOption) -> AcpConfigOptionDto {
@@ -166,6 +262,14 @@ fn category_to_api(category: &SessionConfigOptionCategory) -> String {
     }
 }
 
+fn real_option_matches_category_or_id(
+    option: &SessionConfigOption,
+    category: &SessionConfigOptionCategory,
+    option_id: &str,
+) -> bool {
+    option.category.as_ref() == Some(category) || option.id.to_string() == option_id
+}
+
 fn flatten_select_options(options: &SessionConfigSelectOptions) -> Vec<&SessionConfigSelectOption> {
     match options {
         SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect(),
@@ -223,23 +327,15 @@ mod tests {
 
     #[test]
     fn resolve_set_path_prefers_real_config_option_over_legacy_mode() {
-        let snapshot = ConfigSnapshot {
-            options: vec![AcpConfigOptionDto {
-                id: "mode".to_owned(),
-                name: Some("Mode".to_owned()),
-                label: None,
-                description: None,
-                category: Some("mode".to_owned()),
-                option_type: "select".to_owned(),
-                current_value: Some("auto".to_owned()),
-                options: vec![AcpConfigSelectOptionDto {
-                    value: "full-access".to_owned(),
-                    name: Some("Full Access".to_owned()),
-                    label: None,
-                    description: None,
-                }],
-            }],
-        };
+        let snapshot = ConfigSnapshot::from_real_options(vec![
+            SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "auto",
+                vec![SessionConfigSelectOption::new("full-access", "Full Access")],
+            )
+            .category(SessionConfigOptionCategory::Mode),
+        ]);
 
         assert_eq!(
             resolve_set_path(&snapshot, "mode", "full-access"),

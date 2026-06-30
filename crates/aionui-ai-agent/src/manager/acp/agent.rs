@@ -588,7 +588,7 @@ impl AcpAgentManager {
         let (session_id, set_path, is_mode_option) = {
             let session = self.session.read().await;
             let snapshot = session.config_snapshot();
-            let mut set_path = resolve_set_path(&snapshot, option_id, value).map_err(|err| match err {
+            let set_path = resolve_set_path(&snapshot, option_id, value).map_err(|err| match err {
                 ConfigSetPathError::OptionNotFound => {
                     AgentError::bad_request(format!("Config option '{option_id}' is not available"))
                 }
@@ -596,13 +596,6 @@ impl AcpAgentManager {
                     "Value '{value}' is not selectable for config option '{option_id}'"
                 )),
             })?;
-            if session.config_options().is_none() {
-                set_path = match option_id {
-                    "mode" => ConfigSetPath::LegacyMode,
-                    "model" => ConfigSetPath::LegacyModel,
-                    _ => set_path,
-                };
-            }
             let session_id = session.session_id().map(ToOwned::to_owned).ok_or_else(|| {
                 warn!(
                     conversation_id = %self.params.conversation_id,

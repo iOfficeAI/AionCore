@@ -473,7 +473,11 @@ impl AcpSession {
 
     pub(crate) fn config_snapshot(&self) -> ConfigSnapshot {
         if let Some(options) = self.advertised.config_options.clone() {
-            return ConfigSnapshot::from_real_options(options);
+            return ConfigSnapshot::from_real_options_with_runtime_supplements(
+                options,
+                self.advertised.modes.as_ref(),
+                self.advertised.models.as_ref(),
+            );
         }
         ConfigSnapshot::from_legacy_catalogs(self.advertised.modes.as_ref(), self.advertised.models.as_ref())
     }
@@ -618,6 +622,28 @@ impl AcpSession {
 
     pub fn apply_advertised_config_options(&mut self, options: Vec<SessionConfigOption>) {
         let options = merge_config_options(self.advertised.config_options.as_deref(), options);
+        let supplement_summary = ConfigSnapshot::supplement_summary_for_real_options(
+            &options,
+            self.advertised.modes.as_ref(),
+            self.advertised.models.as_ref(),
+        );
+        if let Some(supplemented_categories) = supplement_summary.categories_csv() {
+            tracing::info!(
+                supplemented_categories,
+                real_option_count = options.len(),
+                mode_catalog_count = self
+                    .advertised
+                    .modes
+                    .as_ref()
+                    .map_or(0, |modes| modes.available_modes.len()),
+                model_catalog_count = self
+                    .advertised
+                    .models
+                    .as_ref()
+                    .map_or(0, |models| models.available_models.len()),
+                "ACP config options supplemented from runtime catalog"
+            );
+        }
 
         if let Some(modes) = derive_modes_from_config_options(&options) {
             self.apply_advertised_modes(modes);
@@ -811,9 +837,13 @@ fn select_option_contains_value(kind: &SessionConfigKind, value: &str) -> bool {
     }
 }
 
-// Tests live in `session_tests.rs` (linked via `#[path]`) so this file
-// stays under the 1000-line per-file budget. Inside that file `super::*`
-// resolves to this module's private items.
+// Tests live in sibling files linked via `#[path]` so this file stays under
+// the 1000-line per-file budget. Inside those files `super::*` resolves to
+// this module's private items.
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_config_snapshot_tests.rs"]
+mod config_snapshot_tests;
