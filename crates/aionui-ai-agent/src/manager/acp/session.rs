@@ -43,6 +43,20 @@ struct Advertised {
     available_commands: Option<Vec<AvailableCommand>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CatalogPreloadSummary {
+    pub(crate) mode_preloaded: bool,
+    pub(crate) model_preloaded: bool,
+    pub(crate) mode_catalog_count: usize,
+    pub(crate) model_catalog_count: usize,
+}
+
+impl CatalogPreloadSummary {
+    pub(crate) fn any_preloaded(self) -> bool {
+        self.mode_preloaded || self.model_preloaded
+    }
+}
+
 /// Aggregate root for a single ACP session's lifecycle and state.
 ///
 /// Encapsulates the three-layer state model (desired / observed / advertised)
@@ -641,7 +655,7 @@ impl AcpSession {
                     .models
                     .as_ref()
                     .map_or(0, |models| models.available_models.len()),
-                "ACP config options supplemented from runtime catalog"
+                "ACP config options supplemented from advertised catalog"
             );
         }
 
@@ -722,7 +736,9 @@ impl AcpSession {
         &mut self,
         modes: Option<SessionModeState>,
         models: Option<SessionModelState>,
-    ) {
+    ) -> CatalogPreloadSummary {
+        let mut summary = CatalogPreloadSummary::default();
+
         if let Some(modes) = modes.filter(|modes| !modes.available_modes.is_empty())
             && self
                 .advertised
@@ -730,6 +746,8 @@ impl AcpSession {
                 .as_ref()
                 .is_none_or(|existing| existing.available_modes.is_empty())
         {
+            summary.mode_preloaded = true;
+            summary.mode_catalog_count = modes.available_modes.len();
             self.advertised.modes = Some(self.mode_catalog_with_session_current(modes));
         }
 
@@ -740,8 +758,12 @@ impl AcpSession {
                 .as_ref()
                 .is_none_or(|existing| existing.available_models.is_empty())
         {
+            summary.model_preloaded = true;
+            summary.model_catalog_count = models.available_models.len();
             self.advertised.models = Some(self.model_catalog_with_session_current(models));
         }
+
+        summary
     }
 
     fn mode_catalog_with_session_current(&self, mut modes: SessionModeState) -> SessionModeState {

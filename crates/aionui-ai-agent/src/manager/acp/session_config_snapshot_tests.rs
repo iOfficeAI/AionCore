@@ -91,6 +91,35 @@ fn config_snapshot_supplements_missing_mode_from_preloaded_catalog_using_desired
 }
 
 #[test]
+fn preload_advertised_catalogs_reports_seeded_catalog_counts() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+
+    let summary = session.preload_advertised_catalogs(
+        Some(SessionModeState::new(
+            "auto",
+            vec![
+                SessionMode::new("read-only", "Read Only"),
+                SessionMode::new("auto", "Default"),
+                SessionMode::new("full-access", "Full Access"),
+            ],
+        )),
+        Some(SessionModelState::new(
+            "gpt-5.5",
+            vec![
+                ModelInfo::new("gpt-5.5", "GPT-5.5"),
+                ModelInfo::new("gpt-5.4", "GPT-5.4"),
+            ],
+        )),
+    );
+
+    assert!(summary.any_preloaded());
+    assert!(summary.mode_preloaded);
+    assert!(summary.model_preloaded);
+    assert_eq!(summary.mode_catalog_count, 3);
+    assert_eq!(summary.model_catalog_count, 2);
+}
+
+#[test]
 fn config_snapshot_supplements_missing_model_from_non_empty_runtime_catalog() {
     let mut session = AcpSession::new(None, None, HashMap::new());
     session.apply_advertised_models(SessionModelState::new(

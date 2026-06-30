@@ -167,11 +167,27 @@ fn seed_startup_config_preferences(
     }
 }
 
-fn preload_metadata_catalogs(session: &mut AcpSession, handshake: &AgentHandshake) {
-    session.preload_advertised_catalogs(
+fn preload_metadata_catalogs(
+    session: &mut AcpSession,
+    agent_id: &str,
+    agent_backend: Option<&str>,
+    handshake: &AgentHandshake,
+) {
+    let summary = session.preload_advertised_catalogs(
         handshake.available_modes.as_ref().and_then(extract_modes_from_value),
         handshake.available_models.as_ref().and_then(extract_models_from_value),
     );
+    if summary.any_preloaded() {
+        info!(
+            agent_metadata_id = %agent_id,
+            agent_backend,
+            mode_preloaded = summary.mode_preloaded,
+            model_preloaded = summary.model_preloaded,
+            mode_catalog_count = summary.mode_catalog_count,
+            model_catalog_count = summary.model_catalog_count,
+            "ACP session catalogs preloaded from agent metadata"
+        );
+    }
 }
 
 fn confirm_option_id(data: &Value) -> Option<String> {
@@ -436,7 +452,12 @@ impl AcpAgentManager {
 
         let startup_config_seed_base = initial_config.clone();
         let mut session = AcpSession::new(initial_mode, initial_model, initial_config);
-        preload_metadata_catalogs(&mut session, &params.metadata.handshake);
+        preload_metadata_catalogs(
+            &mut session,
+            &params.metadata.id,
+            params.metadata.backend.as_deref(),
+            &params.metadata.handshake,
+        );
         seed_startup_config_preferences(&mut session, &params, &startup_config_seed_base);
 
         let pipeline = PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)]);
@@ -1378,7 +1399,7 @@ mod tests {
             ..Default::default()
         };
 
-        super::preload_metadata_catalogs(&mut session, &handshake);
+        super::preload_metadata_catalogs(&mut session, "codex-agent", Some("codex"), &handshake);
         session.apply_advertised_config_options(vec![
             SessionConfigOption::select(
                 "reasoning_effort",
