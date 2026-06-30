@@ -265,7 +265,6 @@ Three sources: `builtin` (`~/.aionui/builtin-skills/`), `custom`
 ```bash
 python3 scripts/aionui_api.py get /api/skills
 python3 scripts/aionui_api.py get /api/skills/paths          # where skills live on disk
-python3 scripts/aionui_api.py get /api/skills/builtin-auto   # auto-injected builtin skills
 python3 scripts/aionui_api.py post /api/skills/info '{"skill_path":"/abs/path/to/skill-folder"}'  # read a SKILL.md's name/description WITHOUT importing
 ```
 
@@ -534,15 +533,21 @@ python3 scripts/aionui_api.py put /api/settings/client '{"ui.zoomFactor": 1.0}'
 
 ## Engines (agents)
 
-`GET /api/agents` lists the available engines (`aionrs`, `claude`, `codex`, …).
-Each entry carries `enabled` (toggled on), `available` (installed & reachable),
-`team_capable` (can run in a team), and a `handshake` object describing what the
-engine supports — `agent_capabilities`, `auth_methods`, `config_options`,
-`available_modes`, `available_models`, `available_commands`. Check `available`
-before binding an assistant to that engine (via its `agent_id` — see *Picking the
-engine* above), and inspect `handshake` to see which models/modes that engine
-offers. `POST /api/agents/refresh` re-scans custom
-agents.
+`GET /api/agents/management` lists the available engines (`aionrs`, `claude`,
+`codex`, …). There is **no** bare `GET /api/agents` — that path 404s; always use
+the `/management` sub-path. Each row carries `id`, `enabled` (toggled on),
+`installed` (spawn command resolvable on `$PATH`), `team_capable` (can run in a
+team), `backend`, `agent_type`, and a `status` of `online` / `offline` /
+`missing`. Check `installed` (and `status`) before binding an assistant to that
+engine (via its `agent_id` — see *Picking the engine* above).
+
+> The management row does **not** include the engine `handshake` (its
+> `agent_capabilities` / `auth_methods` / `config_options` / `available_modes` /
+> `available_models` / `available_commands`) — those live on the fuller agent
+> metadata returned by `POST /api/agents/refresh`, which re-scans custom agents
+> and returns each agent's `available` + `handshake`. Use `refresh` when you need
+> the modes/models an engine offers; use `management` for the at-a-glance
+> enabled/installed/status list.
 
 ---
 
