@@ -16,6 +16,7 @@ function Invoke-Native {
 
     & $Command @Arguments
     if ($LASTEXITCODE -ne 0) {
+        $script:status = $LASTEXITCODE
         exit $LASTEXITCODE
     }
 }
@@ -36,6 +37,7 @@ function Resolve-LocalPath {
 function Test-AionrsPatch {
     $metadataJson = & cargo @cargoConfig metadata --format-version 1
     if ($LASTEXITCODE -ne 0) {
+        $script:status = $LASTEXITCODE
         exit $LASTEXITCODE
     }
     $metadata = $metadataJson | ConvertFrom-Json
@@ -51,6 +53,7 @@ function Test-AionrsPatch {
 
         if ($actualPath -ne $expectedPath) {
             Write-Error "AIONRS patch was not used for $crate.`n  resolved: $actualPath`n  expected: $expectedPath"
+            $script:status = 1
             exit 1
         }
     }

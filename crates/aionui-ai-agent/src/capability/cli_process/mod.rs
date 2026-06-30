@@ -34,9 +34,6 @@ pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AgentError> {
     if cwd.trim().is_empty() {
         return Err(AgentError::bad_request("Workspace directory is empty"));
     }
-    if cwd != cwd.trim() {
-        return Err(AgentError::workspace_path_runtime_unavailable(cwd.to_string()));
-    }
 
     let workspace_path = PathBuf::from(cwd);
     match fs::metadata(&workspace_path) {
@@ -402,21 +399,18 @@ pub(super) mod tests {
         assert!(!proc.is_running());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn spawn_rejects_unavailable_cwd_with_trailing_whitespace_in_request() {
+    async fn spawn_allows_existing_cwd_with_trailing_whitespace() {
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("workspace");
+        let cwd = dir.path().join("workspace ");
         fs::create_dir(&cwd).unwrap();
-        let cwd_with_trailing_space = format!("{} ", cwd.to_string_lossy());
 
         let mut config = simple_script_config("echo ready");
-        config.cwd = Some(cwd_with_trailing_space.clone());
-        let data_dir = tempfile::tempdir().unwrap();
-        let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
-        assert!(matches!(
-            result,
-            Err(AgentError::WorkspacePathRuntimeUnavailable(message)) if message == cwd_with_trailing_space
-        ));
+        config.cwd = Some(cwd.to_string_lossy().into_owned());
+
+        let proc = spawn_sdk_test_process(config).await;
+        proc.kill(Duration::from_millis(100)).await.unwrap();
     }
 
     #[tokio::test]
