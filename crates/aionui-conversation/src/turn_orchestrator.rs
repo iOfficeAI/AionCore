@@ -43,6 +43,7 @@ pub(crate) enum ConversationTurnStatus {
 
 pub(crate) struct ConversationTurnResult {
     pub status: ConversationTurnStatus,
+    pub error_message: Option<String>,
 }
 
 pub(crate) struct ConversationTurnOrchestrator {
@@ -123,7 +124,7 @@ impl ConversationTurnOrchestrator {
                     error = %ErrorChain(&err),
                     "Agent task build failed"
                 );
-                let failure_message = err.to_string();
+                let failure_message = send_error_display_message(&send_error);
                 record_agent_session_failure(
                     &self.service,
                     availability_agent_id.as_deref(),
@@ -141,6 +142,7 @@ impl ConversationTurnOrchestrator {
                     .await;
                 return Err(ConversationTurnResult {
                     status: ConversationTurnStatus::Failed,
+                    error_message: Some(failure_message),
                 });
             }
         };
@@ -151,6 +153,7 @@ impl ConversationTurnOrchestrator {
             .await
         {
             let top_level_code = err.error_code();
+            let failure_message = err.to_string();
             let send_error = AgentSendError::from_agent_error(err.to_agent_error());
             error!(
                 conversation_id = %input.conv_id,
@@ -169,6 +172,7 @@ impl ConversationTurnOrchestrator {
                 .await;
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Failed,
+                error_message: Some(failure_message),
             });
         }
 
@@ -220,7 +224,7 @@ impl ConversationTurnOrchestrator {
 
             tokio::spawn(async move {
                 if let Err(e) = send_agent.send_message(current_send).await {
-                    let failure_message = availability_failure_message(&e);
+                    let failure_message = send_error_display_message(&e);
                     record_agent_session_failure(
                         &feedback_service,
                         feedback_agent_id.as_deref(),
@@ -317,6 +321,7 @@ impl ConversationTurnOrchestrator {
         };
         let mut replayed = false;
         let mut replay_started_at = None;
+        let mut final_error_message;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -339,12 +344,14 @@ impl ConversationTurnOrchestrator {
             {
                 Ok(result) => result,
                 Err(result) => {
+                    final_error_message = result.error_message;
                     break result.status == ConversationTurnStatus::Failed;
                 }
             };
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
+                final_error_message = None;
                 if replayed {
                     info!(
                         conversation_id = %conv_id,
@@ -358,6 +365,7 @@ impl ConversationTurnOrchestrator {
                 }
                 break false;
             }
+            final_error_message = turn_attempt_error_message(&attempt_result.summary);
             if replayed {
                 warn!(
                     conversation_id = %conv_id,
@@ -447,6 +455,7 @@ impl ConversationTurnOrchestrator {
             } else {
                 ConversationTurnStatus::Completed
             },
+            error_message: if final_failed { final_error_message } else { None },
         }
     }
 }
@@ -463,12 +472,23 @@ fn availability_agent_id(options: &BuildTaskOptions) -> Option<String> {
     }
 }
 
-fn availability_failure_message(error: &AgentSendError) -> String {
+fn send_error_display_message(error: &AgentSendError) -> String {
     error
         .stream_error()
         .detail
         .clone()
         .unwrap_or_else(|| error.stream_error().message.clone())
+}
+
+fn turn_attempt_error_message(summary: &TurnAttemptSummary) -> Option<String> {
+    summary.terminal_error.as_ref().map(|error| {
+        error
+            .detail
+            .as_deref()
+            .filter(|detail| !detail.trim().is_empty())
+            .unwrap_or(error.message.as_str())
+            .to_owned()
+    })
 }
 
 async fn record_agent_session_failure(

@@ -47,9 +47,9 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 
-use crate::ConversationError;
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
+use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
@@ -3761,6 +3761,81 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
     assert_eq!(error_tip_event.data["status"], "error");
     assert_eq!(error_tip_event.data["data"]["code"], "BAD_GATEWAY");
     assert_eq!(error_tip_event.data["turn_id"], response.turn_id);
+}
+
+#[tokio::test]
+async fn run_agent_turn_returns_error_message_when_agent_build_fails() {
+    let task_mgr: Arc<dyn IWorkerTaskManager> =
+        Arc::new(FailingBuildTaskManager::new("ACP init failed: config file is invalid"));
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster,
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr,
+        repo,
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    let outcome = service
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id,
+            content: "run scheduled task".into(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Failed);
+    assert_eq!(
+        outcome.error_message.as_deref(),
+        Some("ACP init failed: config file is invalid")
+    );
+}
+
+#[tokio::test]
+async fn latest_conversation_error_message_prefers_error_detail() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.insert_message(&MessageRow {
+        id: "msg_error".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: None,
+        r#type: "tips".into(),
+        content: serde_json::json!({
+            "content": "Current agent failed",
+            "type": "error",
+            "details": {
+                "detail": "Cannot resume Claude session with Codex assistant"
+            },
+            "error": {
+                "message": "Current agent failed",
+                "detail": "Codex cannot resume a conversation created by Claude"
+            }
+        })
+        .to_string(),
+        position: Some("center".into()),
+        status: Some("error".into()),
+        hidden: false,
+        created_at: 10,
+    })
+    .await
+    .unwrap();
+
+    let message = svc.latest_conversation_error_message(&conv.id).await.unwrap();
+
+    assert_eq!(
+        message.as_deref(),
+        Some("Codex cannot resume a conversation created by Claude")
+    );
 }
 
 #[tokio::test]

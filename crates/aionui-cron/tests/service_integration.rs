@@ -26,7 +26,7 @@ use aionui_db::{
     MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteCronRepository, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, init_database_memory,
-    models::{ConversationAssistantSnapshotRow, MessageRow},
+    models::{ConversationAssistantSnapshotRow, CronJobRow, MessageRow},
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -1002,6 +1002,19 @@ async fn cj1_create_cron_job() {
 }
 
 #[tokio::test]
+async fn create_job_allows_missing_task_description() {
+    let (svc, cron_repo, _) = setup().await;
+    let mut req = make_create_req("No Description", every_60s());
+    req.description = None;
+
+    let job = svc.add_job(req).await.unwrap();
+
+    assert_eq!(job.description, None);
+    let row = cron_repo.get_by_id(&job.id).await.unwrap().unwrap();
+    assert_eq!(row.description, None);
+}
+
+#[tokio::test]
 async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
     let (svc, _, _, _, definition_repo, _) = setup_with_assistant_repos().await;
     seed_assistant_definition(&definition_repo, "asstdef_assistant_1", "assistant-1", "claude").await;
@@ -1225,6 +1238,55 @@ async fn cj6_list_all_jobs() {
     assert!(jobs.len() >= 3);
 }
 
+#[tokio::test]
+async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
+    let (svc, cron_repo, _) = setup().await;
+    cron_repo
+        .insert(&CronJobRow {
+            id: "cron_legacy_custom_agent".into(),
+            name: "Legacy custom agent job".into(),
+            enabled: true,
+            schedule_kind: "every".into(),
+            schedule_value: "60000".into(),
+            schedule_tz: None,
+            schedule_description: Some("every minute".into()),
+            payload_message: "ping".into(),
+            execution_mode: "new_conversation".into(),
+            agent_config: Some(
+                serde_json::json!({
+                    "name": "Legacy assistant",
+                    "custom_agent_id": "assistant-default",
+                    "is_preset": true
+                })
+                .to_string(),
+            ),
+            conversation_id: "conv_legacy".into(),
+            conversation_title: None,
+            created_by: "user".into(),
+            skill_content: None,
+            description: None,
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            next_run_at: None,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            run_count: 0,
+            retry_count: 0,
+            max_retries: 3,
+        })
+        .await
+        .unwrap();
+
+    let jobs = svc.list_jobs(&ListCronJobsQuery::default()).await.unwrap();
+
+    let legacy = jobs
+        .iter()
+        .find(|job| job.id == "cron_legacy_custom_agent")
+        .expect("legacy job should be listed");
+    assert_eq!(legacy.agent_type, "acp");
+}
+
 // ── CJ-7: List by conversation ────────────────────────────────────
 
 #[tokio::test]
@@ -1301,11 +1363,10 @@ async fn cj8_update_job() {
 }
 
 #[tokio::test]
-async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
-    let (svc, _, _, _, definition_repo, _) = setup_with_assistant_repos().await;
-    seed_assistant_definition(&definition_repo, "asstdef_update_assistant_1", "assistant-1", "claude").await;
+async fn update_existing_conversation_job_rejects_agent_config_changes() {
+    let (svc, _, _) = setup().await;
     let created = svc
-        .add_job(make_create_req("Assistant Only Update", every_60s()))
+        .add_job(make_create_req("Existing Conversation Assistant Lock", every_60s()))
         .await
         .unwrap();
 
@@ -1316,6 +1377,79 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
         schedule: None,
         message: None,
         execution_mode: None,
+        agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
+            name: "Other Assistant".into(),
+            cli_path: None,
+            assistant_id: Some("assistant-default".into()),
+            mode: Some("default".into()),
+            model_id: Some("claude-sonnet-4".into()),
+            model: None,
+            config_options: None,
+            workspace: None,
+        }),
+        conversation_title: None,
+        max_retries: None,
+    };
+
+    let err = svc.update_job(&created.id, req).await.unwrap_err();
+    assert!(
+        matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(message) if message.contains("ongoing conversation"))
+    );
+}
+
+#[tokio::test]
+async fn update_existing_conversation_job_rejects_agent_config_even_when_switching_to_new_conversation() {
+    let (svc, _, _) = setup().await;
+    let created = svc
+        .add_job(make_create_req(
+            "Existing Conversation Assistant Lock Mode Switch",
+            every_60s(),
+        ))
+        .await
+        .unwrap();
+
+    let req = UpdateCronJobRequest {
+        name: None,
+        description: None,
+        enabled: None,
+        schedule: None,
+        message: None,
+        execution_mode: Some("new_conversation".into()),
+        agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
+            name: "Other Assistant".into(),
+            cli_path: None,
+            assistant_id: Some("assistant-default".into()),
+            mode: Some("default".into()),
+            model_id: Some("claude-sonnet-4".into()),
+            model: None,
+            config_options: None,
+            workspace: None,
+        }),
+        conversation_title: None,
+        max_retries: None,
+    };
+
+    let err = svc.update_job(&created.id, req).await.unwrap_err();
+    assert!(
+        matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(message) if message.contains("ongoing conversation"))
+    );
+}
+
+#[tokio::test]
+async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
+    let (svc, _, _, _, definition_repo, _) = setup_with_assistant_repos().await;
+    seed_assistant_definition(&definition_repo, "asstdef_update_assistant_1", "assistant-1", "claude").await;
+    let mut create_req = make_create_req("Assistant Only Update", every_60s());
+    create_req.execution_mode = Some("new_conversation".into());
+    let created = svc.add_job(create_req).await.unwrap();
+
+    let req = UpdateCronJobRequest {
+        name: None,
+        description: None,
+        enabled: None,
+        schedule: None,
+        message: None,
+        execution_mode: Some("new_conversation".into()),
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
             name: "Helper".into(),
             cli_path: None,
@@ -1341,10 +1475,9 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
 #[tokio::test]
 async fn update_job_rejects_when_assistant_id_cannot_resolve() {
     let (svc, _, _) = setup().await;
-    let created = svc
-        .add_job(make_create_req("Assistant Missing Update", every_60s()))
-        .await
-        .unwrap();
+    let mut create_req = make_create_req("Assistant Missing Update", every_60s());
+    create_req.execution_mode = Some("new_conversation".into());
+    let created = svc.add_job(create_req).await.unwrap();
 
     let req = UpdateCronJobRequest {
         name: None,
@@ -1352,7 +1485,7 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
         enabled: None,
         schedule: None,
         message: None,
-        execution_mode: None,
+        execution_mode: Some("new_conversation".into()),
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
             name: "Helper".into(),
             cli_path: None,

@@ -80,6 +80,8 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
                     content: request.content.clone(),
                     files: request.files.clone(),
                     inject_skills: Vec::new(),
+                    persist_user_message: false,
+                    user_message_hidden: false,
                     on_started: on_started.clone(),
                 })
                 .await

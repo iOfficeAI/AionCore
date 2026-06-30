@@ -22,7 +22,7 @@ pub struct SkillSuggestDetector {
     broadcaster: Arc<dyn EventBroadcaster>,
     conversation_repo: Arc<dyn IConversationRepository>,
     data_dir: PathBuf,
-    last_hash_by_job: Arc<Mutex<HashMap<String, String>>>,
+    last_hash_by_target: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl SkillSuggestDetector {
@@ -35,7 +35,7 @@ impl SkillSuggestDetector {
             broadcaster,
             conversation_repo,
             data_dir,
-            last_hash_by_job: Arc::new(Mutex::new(HashMap::new())),
+            last_hash_by_target: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -93,11 +93,11 @@ impl SkillSuggestDetector {
         };
 
         let hash = content_hash(&content);
-        if self.last_hash(job_id).as_deref() == Some(hash.as_str()) {
+        if self.last_hash(conversation_id, job_id).as_deref() == Some(hash.as_str()) {
             return Ok(true);
         }
 
-        self.set_last_hash(job_id, hash);
+        self.set_last_hash(conversation_id, job_id, hash);
         self.emit(
             conversation_id,
             job_id,
@@ -149,24 +149,30 @@ impl SkillSuggestDetector {
         debug!(conversation_id, job_id, "Broadcasted cron skill suggestion artifact");
     }
 
-    fn last_hash(&self, job_id: &str) -> Option<String> {
-        self.last_hash_by_job
+    fn last_hash(&self, conversation_id: &str, job_id: &str) -> Option<String> {
+        let key = last_hash_key(conversation_id, job_id);
+        self.last_hash_by_target
             .lock()
             .ok()
-            .and_then(|hashes| hashes.get(job_id).cloned())
+            .and_then(|hashes| hashes.get(&key).cloned())
     }
 
-    fn set_last_hash(&self, job_id: &str, hash: String) {
-        if let Ok(mut hashes) = self.last_hash_by_job.lock() {
-            hashes.insert(job_id.to_owned(), hash);
+    fn set_last_hash(&self, conversation_id: &str, job_id: &str, hash: String) {
+        if let Ok(mut hashes) = self.last_hash_by_target.lock() {
+            hashes.insert(last_hash_key(conversation_id, job_id), hash);
         }
     }
 
     fn clear_last_hash(&self, job_id: &str) {
-        if let Ok(mut hashes) = self.last_hash_by_job.lock() {
-            hashes.remove(job_id);
+        if let Ok(mut hashes) = self.last_hash_by_target.lock() {
+            let prefix = format!("{job_id}:");
+            hashes.retain(|key, _| !key.starts_with(&prefix));
         }
     }
+}
+
+fn last_hash_key(conversation_id: &str, job_id: &str) -> String {
+    format!("{job_id}:{conversation_id}")
 }
 
 #[cfg(test)]
@@ -236,7 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suppresses_duplicate_skill_suggest_content() {
+    async fn emits_same_skill_suggest_content_for_each_conversation() {
         let temp = tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await.unwrap();
@@ -267,6 +273,46 @@ mod tests {
         assert!(
             detector
                 .check_and_emit("conv-2", "cron-1", &workspace.to_string_lossy())
+                .await
+                .unwrap()
+        );
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.name, "conversation.artifact");
+        assert_eq!(msg.data["conversation_id"], "conv-2");
+        assert_eq!(msg.data["kind"], "skill_suggest");
+    }
+
+    #[tokio::test]
+    async fn suppresses_duplicate_skill_suggest_content_for_same_conversation() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(
+            workspace.join(SKILL_SUGGEST_FILENAME),
+            "---\nname: daily-report\ndescription: Daily report\n---\n\nCheck sources.\n",
+        )
+        .await
+        .unwrap();
+
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IConversationRepository> = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        repo.create(&make_conversation("conv-1")).await.unwrap();
+
+        let bus = Arc::new(BroadcastEventBus::new(16));
+        let detector = SkillSuggestDetector::new(bus.clone(), repo, temp.path().to_path_buf());
+        let mut rx = bus.subscribe();
+
+        assert!(
+            detector
+                .check_and_emit("conv-1", "cron-1", &workspace.to_string_lossy())
+                .await
+                .unwrap()
+        );
+        assert!(rx.try_recv().is_ok());
+
+        assert!(
+            detector
+                .check_and_emit("conv-1", "cron-1", &workspace.to_string_lossy())
                 .await
                 .unwrap()
         );

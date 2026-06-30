@@ -162,6 +162,7 @@ impl CronService {
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(existing_row)?;
         job.agent_type = self.resolve_job_agent_type(&job).await?;
+        let original_execution_mode = job.execution_mode;
 
         if let Some(name) = &req.name {
             job.name = name.clone();
@@ -182,6 +183,14 @@ impl CronService {
         }
         if let Some(mode_str) = &req.execution_mode {
             job.execution_mode = parse_execution_mode(Some(mode_str))?;
+        }
+        if req.agent_config.is_some()
+            && (matches!(original_execution_mode, ExecutionMode::Existing)
+                || matches!(job.execution_mode, ExecutionMode::Existing))
+        {
+            return Err(CronError::InvalidAgentConfig(
+                "ongoing conversation jobs must keep their original assistant".into(),
+            ));
         }
         if let Some(config_dto) = &req.agent_config {
             let config_dto = sanitize_agent_config_dto(config_dto.clone());
@@ -485,7 +494,7 @@ impl CronService {
         let Some(assistant_id) = job
             .agent_config
             .as_ref()
-            .and_then(|config| config.assistant_id.as_deref())
+            .and_then(|config| config.assistant_id.as_deref().or(config.custom_agent_id.as_deref()))
             .filter(|value| !value.trim().is_empty())
         else {
             return Err(CronError::InvalidAgentConfig(

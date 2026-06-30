@@ -344,6 +344,8 @@ pub struct ConversationAgentTurnRequest {
     pub content: String,
     pub files: Vec<String>,
     pub inject_skills: Vec<String>,
+    pub persist_user_message: bool,
+    pub user_message_hidden: bool,
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
 }
 
@@ -367,6 +369,7 @@ pub struct ConversationAgentTurnOutcome {
     pub conversation_id: String,
     pub turn_id: String,
     pub status: ConversationAgentTurnStatus,
+    pub error_message: Option<String>,
     pub runtime: ConversationRuntimeSummary,
 }
 
@@ -2605,6 +2608,36 @@ impl ConversationService {
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
+        if request.persist_user_message {
+            let user_msg_id = Self::mint_msg_id();
+            let user_msg = aionui_db::models::MessageRow {
+                id: user_msg_id.clone(),
+                conversation_id: request.conversation_id.clone(),
+                msg_id: Some(user_msg_id),
+                r#type: "text".into(),
+                content: serde_json::json!({ "content": request.content }).to_string(),
+                position: Some("right".into()),
+                status: Some("finish".into()),
+                hidden: request.user_message_hidden,
+                created_at: now_ms(),
+            };
+            if self
+                .runtime_persistence()
+                .allows(&request.conversation_id, RuntimeWriteKind::UserMessage)
+                && let Err(e) = self.conversation_repo.insert_message(&user_msg).await
+            {
+                warn!(
+                    msg_id = %user_msg.id,
+                    error = %ErrorChain(&e),
+                    "Failed to insert agent turn user message"
+                );
+                let mut turn_claim = turn_claim;
+                let was_deleting = turn_claim.release();
+                self.complete_released_turn(&request.conversation_id, &turn_id, was_deleting)
+                    .await;
+                return Err(e.into());
+            }
+        }
         if let Some(on_started) = request.on_started.as_ref() {
             on_started(ConversationAgentTurnStarted {
                 conversation_id: request.conversation_id.clone(),
@@ -2633,6 +2666,7 @@ impl ConversationService {
                     conversation_id: request.conversation_id.clone(),
                     turn_id,
                     status: ConversationAgentTurnStatus::Failed,
+                    error_message: Some(send_error_display_message(&send_error)),
                     runtime: self.runtime_summary_for(&request.conversation_id).await,
                 });
             }
@@ -2649,7 +2683,7 @@ impl ConversationService {
                     content: request.content,
                     files: request.files,
                     inject_skills: request.inject_skills,
-                    hidden: false,
+                    hidden: request.user_message_hidden,
                 },
                 build_options: build_opts,
                 stored_workspace,
@@ -2666,7 +2700,26 @@ impl ConversationService {
                 ConversationTurnStatus::Completed => ConversationAgentTurnStatus::Completed,
                 ConversationTurnStatus::Failed => ConversationAgentTurnStatus::Failed,
             },
+            error_message: result.error_message,
         })
+    }
+
+    pub async fn latest_conversation_error_message(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>, ConversationError> {
+        let page = self
+            .conversation_repo
+            .list_messages_page(
+                conversation_id,
+                &MessagePageParams {
+                    limit: 30,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await?;
+
+        Ok(page.items.iter().rev().find_map(error_message_from_message_row))
     }
 
     pub(crate) async fn persist_and_broadcast_send_failure_tip(
@@ -2865,6 +2918,49 @@ impl ConversationService {
         debug!("Agent warmed up");
         Ok(())
     }
+}
+
+fn send_error_display_message(error: &AgentSendError) -> String {
+    error
+        .stream_error()
+        .detail
+        .as_deref()
+        .filter(|detail| !detail.trim().is_empty())
+        .unwrap_or(error.stream_error().message.as_str())
+        .to_owned()
+}
+
+fn error_message_from_message_row(row: &MessageRow) -> Option<String> {
+    if row.r#type != "tips" && row.status.as_deref() != Some("error") {
+        return None;
+    }
+
+    let content: serde_json::Value = serde_json::from_str(&row.content).ok()?;
+    let is_error_tip = content.get("type").and_then(serde_json::Value::as_str) == Some("error")
+        || row.status.as_deref() == Some("error");
+    if !is_error_tip {
+        return None;
+    }
+
+    [
+        content.pointer("/error/detail"),
+        content.pointer("/details/detail"),
+        content.get("details"),
+        content.get("content"),
+        content.pointer("/error/message"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(non_empty_json_string)
+    .find(|message| message != "cron conversation turn failed")
+}
+
+fn non_empty_json_string(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 // ── Internal Helpers ────────────────────────────────────────────────

@@ -1,27 +1,26 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
+use aionui_ai_agent::AgentRegistry;
 use aionui_ai_agent::task_manager::IWorkerTaskManager;
-use aionui_ai_agent::types::SendMessageData;
-use aionui_ai_agent::{AgentRegistry, AgentStreamEvent};
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, SendMessageRequest};
+use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest};
 use aionui_common::{
     AgentType, ProviderWithModel, WorkspacePathValidationError, now_ms, validate_workspace_path_availability,
 };
-use aionui_conversation::{ConversationError, ConversationService};
+use aionui_conversation::{
+    ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
+    ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationError, ConversationService,
+};
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationRowUpdate, IConversationRepository};
 use aionui_realtime::EventBroadcaster;
-use tokio::sync::broadcast;
-use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 use crate::artifacts::{broadcast_artifact, build_cron_trigger_artifact};
 use crate::error::CronError;
 use crate::prompt::{
     build_existing_conversation_prompt, build_new_conversation_prompt_with_skill_suggest,
-    build_new_conversation_with_skill_prompt, build_skill_suggest_prompt,
+    build_new_conversation_with_skill_prompt,
 };
 use crate::skill_file::{cron_skill_name, read_skill_content, write_raw_skill_file, write_skill_file};
 use crate::skill_suggest::SkillSuggestDetector;
@@ -31,8 +30,6 @@ pub const RETRY_INTERVAL_MS: u64 = 30_000;
 pub const MAX_RETRIES_DEFAULT: i64 = 3;
 const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
-const SKILL_SUGGEST_TERMINAL_TIMEOUT: Duration = Duration::from_secs(120);
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
     Success { conversation_id: String },
@@ -47,22 +44,13 @@ pub(crate) struct PreparedExecution {
     saved_skill: Option<SavedSkillContext>,
 }
 
-/// Inputs captured for the post-turn skill-suggest detection pipeline.
-/// Grouped into a struct so the spawning function stays under the
-/// clippy `too_many_arguments` threshold and so the agent/receiver
-/// (which the spawner clones) remain distinct from these metadata
-/// fields.
 struct SkillSuggestContext {
     conversation_id: String,
     job_id: String,
-    job_name: String,
     workspace: String,
-    needs_follow_up: bool,
-    skill_names: Vec<String>,
 }
 
 pub struct JobExecutor {
-    task_manager: Arc<dyn IWorkerTaskManager>,
     conversation_repo: Arc<dyn IConversationRepository>,
     conversation_service: Arc<ConversationService>,
     work_dir: PathBuf,
@@ -75,7 +63,7 @@ pub struct JobExecutor {
 impl JobExecutor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        task_manager: Arc<dyn IWorkerTaskManager>,
+        _task_manager: Arc<dyn IWorkerTaskManager>,
         conversation_repo: Arc<dyn IConversationRepository>,
         conversation_service: Arc<ConversationService>,
         work_dir: PathBuf,
@@ -86,7 +74,6 @@ impl JobExecutor {
         let skill_suggest_detector =
             SkillSuggestDetector::new(Arc::clone(&broadcaster), conversation_repo.clone(), data_dir.clone());
         Self {
-            task_manager,
             conversation_repo,
             conversation_service,
             work_dir,
@@ -514,8 +501,8 @@ impl JobExecutor {
         saved_skill: Option<&SavedSkillContext>,
         retry_on_busy: bool,
     ) -> ExecutionResult {
-        let conversation_row = match self.get_conversation_row(conversation_id).await {
-            Ok(Some(row)) => row,
+        match self.get_conversation_row(conversation_id).await {
+            Ok(Some(_)) => {}
             Ok(None) => {
                 return ExecutionResult::Error {
                     message: format!("conversation {conversation_id} not found"),
@@ -530,19 +517,7 @@ impl JobExecutor {
                 );
                 return ExecutionResult::Error { message: e.to_string() };
             }
-        };
-        let workspace = match self.resolve_execution_workspace(job, conversation_id).await {
-            Ok(workspace) => workspace,
-            Err(e) => {
-                error!(
-                    job_id = %job.id,
-                    conversation_id,
-                    error = %e,
-                    "Failed to resolve cron execution workspace"
-                );
-                return ExecutionResult::Error { message: e.to_string() };
-            }
-        };
+        }
 
         let skill_names = match self.resolve_task_skill_names(job, conversation_id, saved_skill).await {
             Ok(names) => names,
@@ -551,69 +526,8 @@ impl JobExecutor {
                 return ExecutionResult::Error { message: e.to_string() };
             }
         };
-        let requested_workspace_missing = workspace.trim().is_empty();
-        let workspace_override = job
-            .agent_config
-            .as_ref()
-            .and_then(|config| config.workspace.as_deref())
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-
-        let options = match self
-            .conversation_service
-            .build_task_options_for_runtime(&conversation_row, workspace_override)
-            .await
-        {
-            Ok(options) => options,
-            Err(e) => {
-                error!(
-                    job_id = %job.id,
-                    conversation_id,
-                    error = %e,
-                    "Failed to build cron agent session context"
-                );
-                return ExecutionResult::Error { message: e.to_string() };
-            }
-        };
-
-        let agent = match self.task_manager.get_or_build_task(conversation_id, options).await {
-            Ok(handle) => handle,
-            Err(e) => {
-                error!(
-                    job_id = %job.id,
-                    error = %e,
-                    "Failed to get or build agent task"
-                );
-                return ExecutionResult::Error { message: e.to_string() };
-            }
-        };
-
-        if requested_workspace_missing
-            && let Err(e) = self
-                .persist_workspace_if_missing(conversation_id, agent.workspace())
-                .await
-        {
-            error!(
-                job_id = %job.id,
-                conversation_id,
-                error = %e,
-                "Failed to persist resolved cron workspace back to conversation"
-            );
-            return ExecutionResult::Error { message: e.to_string() };
-        }
-
-        if let Err(e) = self.ensure_agent_session_mode(job, &agent).await {
-            error!(
-                job_id = %job.id,
-                conversation_id,
-                error = %e,
-                "Failed to apply cron session mode"
-            );
-            return ExecutionResult::Error { message: e.to_string() };
-        }
 
         let prompt = build_prompt(job, saved_skill);
-        let terminal_rx = agent.subscribe();
         let user_id = match self.resolve_target_conversation_user_id(conversation_id).await {
             Ok(user_id) => user_id,
             Err(e) => {
@@ -626,42 +540,79 @@ impl JobExecutor {
                 return ExecutionResult::Error { message: e.to_string() };
             }
         };
-        // msg_id is generated by ConversationService::send_message — we
-        // intentionally do not set it here.
-        let send_req = SendMessageRequest {
+
+        let on_started = {
+            let job = job.clone();
+            let conversation_repo = Arc::clone(&self.conversation_repo);
+            let broadcaster = Arc::clone(&self.broadcaster);
+            Some(Arc::new(move |started: ConversationAgentTurnStarted| {
+                let job = job.clone();
+                let conversation_repo = Arc::clone(&conversation_repo);
+                let broadcaster = Arc::clone(&broadcaster);
+                let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(async move {
+                    let created_at = now_ms();
+                    let row = build_cron_trigger_artifact(&started.conversation_id, &job, created_at);
+                    match conversation_repo.upsert_artifact(&row).await {
+                        Ok(row) => {
+                            if let Err(e) = broadcast_artifact(&broadcaster, &row) {
+                                warn!(
+                                    job_id = %job.id,
+                                    conversation_id = %started.conversation_id,
+                                    error = %e,
+                                    "Failed to broadcast cron trigger artifact"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                job_id = %job.id,
+                                conversation_id = %started.conversation_id,
+                                error = %e,
+                                "Failed to persist cron trigger artifact"
+                            );
+                        }
+                    }
+                });
+                fut
+            }) as ConversationAgentTurnStartedCallback)
+        };
+
+        let turn_req = ConversationAgentTurnRequest {
+            user_id,
+            conversation_id: conversation_id.to_owned(),
             content: prompt,
             files: vec![],
             inject_skills: skill_names.clone(),
-            hidden: true,
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started,
         };
 
-        match self
-            .conversation_service
-            .send_message(&user_id, conversation_id, send_req, &self.task_manager)
-            .await
-        {
-            Ok(_) => {
-                if let Err(e) = self.upsert_cron_trigger_artifact(conversation_id, job).await {
-                    warn!(
-                        job_id = %job.id,
-                        conversation_id,
-                        error = %e,
-                        "Failed to persist/broadcast cron trigger artifact"
-                    );
+        match self.conversation_service.run_agent_turn(turn_req).await {
+            Ok(outcome) => {
+                if outcome.status == ConversationAgentTurnStatus::Failed {
+                    return ExecutionResult::Error {
+                        message: self.conversation_turn_failed_message(conversation_id, outcome).await,
+                    };
                 }
                 if saved_skill.is_none() && matches!(job.execution_mode, ExecutionMode::NewConversation) {
-                    self.spawn_skill_suggest_flow(
-                        agent.clone(),
-                        terminal_rx,
-                        SkillSuggestContext {
-                            conversation_id: conversation_id.to_owned(),
-                            job_id: job.id.clone(),
-                            job_name: job.name.clone(),
-                            workspace: agent.workspace().to_owned(),
-                            needs_follow_up: false,
-                            skill_names: skill_names.clone(),
-                        },
-                    );
+                    let workspace = self
+                        .resolve_execution_workspace(job, conversation_id)
+                        .await
+                        .unwrap_or_else(|err| {
+                            warn!(
+                                job_id = %job.id,
+                                conversation_id,
+                                error = %err,
+                                "Failed to resolve cron workspace for skill suggestion check"
+                            );
+                            String::new()
+                        });
+                    self.schedule_skill_suggest_check(SkillSuggestContext {
+                        conversation_id: conversation_id.to_owned(),
+                        job_id: job.id.clone(),
+                        workspace,
+                    });
                 }
                 info!(
                     job_id = %job.id,
@@ -693,6 +644,45 @@ impl JobExecutor {
         }
     }
 
+    async fn conversation_turn_failed_message(
+        &self,
+        conversation_id: &str,
+        outcome: ConversationAgentTurnOutcome,
+    ) -> String {
+        if let Some(message) = outcome
+            .error_message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        {
+            return message.to_owned();
+        }
+
+        match self
+            .conversation_service
+            .latest_conversation_error_message(conversation_id)
+            .await
+        {
+            Ok(Some(message)) => message,
+            Ok(None) => format!(
+                "Conversation turn {} failed without agent error details",
+                outcome.turn_id
+            ),
+            Err(err) => {
+                warn!(
+                    conversation_id,
+                    turn_id = %outcome.turn_id,
+                    error = %err,
+                    "Failed to load latest conversation error message"
+                );
+                format!(
+                    "Conversation turn {} failed without agent error details",
+                    outcome.turn_id
+                )
+            }
+        }
+    }
+
     async fn resolve_target_conversation_user_id(&self, conversation_id: &str) -> Result<String, CronError> {
         let Some(row) = self.get_conversation_row(conversation_id).await? else {
             return Err(CronError::Scheduler(format!(
@@ -705,19 +695,6 @@ impl JobExecutor {
         }
 
         Ok(row.user_id)
-    }
-
-    async fn upsert_cron_trigger_artifact(&self, conversation_id: &str, job: &CronJob) -> Result<(), CronError> {
-        let created_at = now_ms();
-        let row = build_cron_trigger_artifact(conversation_id, job, created_at);
-        let row = self
-            .conversation_repo
-            .upsert_artifact(&row)
-            .await
-            .map_err(CronError::Database)?;
-        broadcast_artifact(&self.broadcaster, &row)?;
-
-        Ok(())
     }
 
     pub async fn mark_skill_suggest_artifacts_saved(&self, job_id: &str) -> Result<(), CronError> {
@@ -759,64 +736,9 @@ impl JobExecutor {
             .to_owned())
     }
 
-    fn spawn_skill_suggest_flow(
-        &self,
-        agent: aionui_ai_agent::AgentInstance,
-        main_rx: broadcast::Receiver<AgentStreamEvent>,
-        ctx: SkillSuggestContext,
-    ) {
-        let detector = self.skill_suggest_detector.clone();
-        let SkillSuggestContext {
-            conversation_id,
-            job_id,
-            job_name,
-            workspace,
-            needs_follow_up,
-            skill_names,
-        } = ctx;
-
-        tokio::spawn(async move {
-            if !wait_for_terminal_event(main_rx).await {
-                warn!(
-                    conversation_id,
-                    job_id, "Timed out waiting for cron turn completion before skill suggestion check"
-                );
-                return;
-            }
-
-            if needs_follow_up {
-                let follow_up_rx = agent.subscribe();
-                // msg_id flows through the conversation service so every
-                // id in the system shares one minting path.
-                let follow_up = SendMessageData {
-                    content: build_skill_suggest_prompt(&job_name),
-                    msg_id: ConversationService::mint_msg_id(),
-                    turn_id: None,
-                    files: vec![],
-                    inject_skills: skill_names,
-                };
-
-                if let Err(err) = agent.send_message(follow_up).await {
-                    warn!(
-                        conversation_id,
-                        job_id,
-                        error = %err,
-                        "Failed to send cron skill suggestion follow-up prompt"
-                    );
-                    return;
-                }
-
-                if !wait_for_terminal_event(follow_up_rx).await {
-                    warn!(
-                        conversation_id,
-                        job_id, "Timed out waiting for cron skill suggestion follow-up completion"
-                    );
-                    return;
-                }
-            }
-
-            detector.schedule_check(conversation_id, job_id, workspace);
-        });
+    fn schedule_skill_suggest_check(&self, ctx: SkillSuggestContext) {
+        self.skill_suggest_detector
+            .schedule_check(ctx.conversation_id, ctx.job_id, ctx.workspace);
     }
 
     async fn prepare_saved_skill(&self, job: &CronJob) -> Result<Option<SavedSkillContext>, CronError> {
@@ -871,46 +793,6 @@ impl JobExecutor {
         Ok(skills)
     }
 
-    async fn ensure_agent_session_mode(
-        &self,
-        job: &CronJob,
-        agent: &aionui_ai_agent::AgentInstance,
-    ) -> Result<(), CronError> {
-        let Some(desired_mode) = job
-            .agent_config
-            .as_ref()
-            .and_then(|config| config.mode.as_deref())
-            .map(str::trim)
-            .filter(|mode| !mode.is_empty())
-        else {
-            return Ok(());
-        };
-
-        let current_mode = agent
-            .get_mode()
-            .await
-            .map_err(|e| CronError::Scheduler(format!("get session mode: {e}")))?;
-
-        if current_mode.mode == desired_mode {
-            return Ok(());
-        }
-
-        agent
-            .set_config_option("mode", desired_mode)
-            .await
-            .map_err(|e| CronError::Scheduler(format!("set session mode to {desired_mode}: {e}")))?;
-
-        info!(
-            conversation_id = %agent.conversation_id(),
-            from_mode = %current_mode.mode,
-            to_mode = desired_mode,
-            initialized = current_mode.initialized,
-            "Applied cron session mode before execution"
-        );
-
-        Ok(())
-    }
-
     async fn load_conversation_skill_names(&self, conversation_id: &str) -> Result<Vec<String>, CronError> {
         let Some(row) = self
             .conversation_repo
@@ -936,21 +818,6 @@ impl JobExecutor {
             })
             .unwrap_or_default())
     }
-}
-
-async fn wait_for_terminal_event(mut rx: broadcast::Receiver<AgentStreamEvent>) -> bool {
-    let fut = async move {
-        loop {
-            match rx.recv().await {
-                Ok(AgentStreamEvent::Finish(_)) | Ok(AgentStreamEvent::Error(_)) => return true,
-                Ok(_) => continue,
-                Err(broadcast::error::RecvError::Closed) => return true,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            }
-        }
-    };
-
-    timeout(SKILL_SUGGEST_TERMINAL_TIMEOUT, fut).await.unwrap_or(false)
 }
 
 /// Resolve a cron job's stored `agent_type` string into an [`AgentType`].
@@ -1221,9 +1088,10 @@ async fn persist_legacy_skill_file(data_dir: &Path, job: &CronJob, raw_content: 
 mod tests {
     use super::*;
     use crate::types::{CreatedBy, CronAgentConfig, CronSchedule};
+    use aionui_ai_agent::AgentStreamEvent;
     use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
-    use aionui_ai_agent::protocol::events::FinishEventData;
-    use aionui_ai_agent::types::BuildTaskOptions;
+    use aionui_ai_agent::protocol::events::{FinishEventData, TextEventData};
+    use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
     use aionui_api_types::{AgentModeResponse, ConfigOptionConfirmation, SetConfigOptionResponse, WebSocketMessage};
     use aionui_common::{AgentKillReason, ConversationStatus, PaginatedResult, TimestampMs};
     use aionui_db::{
@@ -1233,6 +1101,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::{RwLock, broadcast};
+    use tokio::time::timeout;
 
     fn ensure_named_workspace_path(name: &str) -> String {
         let workspace = std::env::temp_dir().join(name);
@@ -1806,7 +1675,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_inner_applies_desired_session_mode_before_sending() {
+    async fn execute_inner_leaves_session_mode_to_conversation_runtime() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
         let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
         let mut job = sample_job();
@@ -1821,13 +1690,13 @@ mod tests {
             }
         );
         wait_for_agent_send(&agent, 1).await;
-        assert_eq!(agent.mode().await, "yolo");
-        assert_eq!(agent.set_mode_calls(), 1);
+        assert_eq!(agent.mode().await, "default");
+        assert_eq!(agent.set_mode_calls(), 0);
         assert_eq!(agent.send_calls(), 1);
     }
 
     #[tokio::test]
-    async fn execute_inner_applies_mode_even_for_uninitialized_agent() {
+    async fn execute_inner_does_not_directly_set_mode_for_uninitialized_agent() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "default", false));
         let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
         let mut job = sample_job();
@@ -1842,8 +1711,8 @@ mod tests {
             }
         );
         wait_for_agent_send(&agent, 1).await;
-        assert_eq!(agent.mode().await, "yolo");
-        assert_eq!(agent.set_mode_calls(), 1);
+        assert_eq!(agent.mode().await, "default");
+        assert_eq!(agent.set_mode_calls(), 0);
         assert_eq!(agent.send_calls(), 1);
     }
 
@@ -1900,6 +1769,52 @@ mod tests {
             .last_options()
             .expect("task manager should capture build options");
         assert!(options.context.skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_inner_builds_agent_task_once_through_conversation_service() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let task_manager = Arc::new(RecordingTaskManager::new(AgentInstance::Mock(agent.clone())));
+        let executor = make_executor_with_task_manager(task_manager.clone());
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+        assert_eq!(
+            task_manager.recorded_options().len(),
+            1,
+            "cron execution should let the conversation layer build the agent task exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_inner_returns_conversation_turn_error_message() {
+        let executor = make_executor_with_task_manager(Arc::new(FailingTaskManager::new(
+            "ACP init failed: config file is invalid",
+        )));
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Error {
+                message: "ACP init failed: config file is invalid".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -2151,6 +2066,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_inner_places_cron_trigger_artifact_before_assistant_response() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true).with_text_response("assistant reply"));
+        let task_manager = Arc::new(RecordingTaskManager::new(AgentInstance::Mock(agent.clone())));
+        let repo = Arc::new(MissingWorkspaceConversationRepo::new(
+            "conv_1",
+            serde_json::json!({
+                "workspace": ensure_named_workspace_path("aionui-cron-existing-conversation-workspace")
+            }),
+        ));
+        let executor = make_executor_with_task_manager_and_repo(task_manager, repo.clone());
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+
+        let operations = repo.operations();
+        let trigger_index = operations
+            .iter()
+            .position(|operation| operation == "upsert_artifact:cron_trigger")
+            .expect("cron trigger artifact should be upserted");
+        let assistant_index = operations
+            .iter()
+            .position(|operation| operation == "insert_message:left:text")
+            .expect("assistant response should be persisted");
+        assert!(
+            trigger_index < assistant_index,
+            "cron trigger card must be created before assistant responses so it renders before the AI reply"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_inner_returns_retrying_when_send_message_reports_busy() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
         let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
@@ -2363,6 +2319,7 @@ mod tests {
         event_tx: broadcast::Sender<AgentStreamEvent>,
         mode: RwLock<String>,
         sent_messages: RwLock<Vec<SendMessageData>>,
+        response_text: Option<String>,
         initialized: bool,
         set_mode_calls: AtomicUsize,
         send_calls: AtomicUsize,
@@ -2377,10 +2334,16 @@ mod tests {
                 event_tx,
                 mode: RwLock::new(mode.to_owned()),
                 sent_messages: RwLock::new(Vec::new()),
+                response_text: None,
                 initialized,
                 set_mode_calls: AtomicUsize::new(0),
                 send_calls: AtomicUsize::new(0),
             }
+        }
+
+        fn with_text_response(mut self, content: &str) -> Self {
+            self.response_text = Some(content.to_owned());
+            self
         }
 
         async fn mode(&self) -> String {
@@ -2429,6 +2392,12 @@ mod tests {
         async fn send_message(&self, data: SendMessageData) -> Result<(), aionui_ai_agent::AgentSendError> {
             self.send_calls.fetch_add(1, Ordering::Relaxed);
             self.sent_messages.write().await.push(data);
+            if let Some(content) = self.response_text.as_ref() {
+                let _ = self.event_tx.send(AgentStreamEvent::Text(TextEventData {
+                    content: content.clone(),
+                }));
+            }
+            let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
             Ok(())
         }
 
@@ -2472,6 +2441,59 @@ mod tests {
 
     struct FixedTaskManager {
         agent: AgentInstance,
+    }
+
+    struct FailingTaskManager {
+        message: String,
+    }
+
+    impl FailingTaskManager {
+        fn new(message: impl Into<String>) -> Self {
+            Self {
+                message: message.into(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IWorkerTaskManager for FailingTaskManager {
+        fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+            None
+        }
+
+        async fn get_or_build_task(
+            &self,
+            _conversation_id: &str,
+            _options: BuildTaskOptions,
+        ) -> Result<AgentInstance, aionui_ai_agent::AgentError> {
+            Err(aionui_ai_agent::AgentError::bad_gateway(self.message.clone()))
+        }
+
+        fn kill(
+            &self,
+            _conversation_id: &str,
+            _reason: Option<AgentKillReason>,
+        ) -> Result<(), aionui_ai_agent::AgentError> {
+            Ok(())
+        }
+
+        fn kill_and_wait(
+            &self,
+            _: &str,
+            _: Option<AgentKillReason>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            Box::pin(std::future::ready(()))
+        }
+
+        async fn clear(&self) {}
+
+        fn active_count(&self) -> usize {
+            0
+        }
+
+        fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     #[async_trait::async_trait]
@@ -2707,6 +2729,7 @@ mod tests {
         updates: Mutex<Vec<ConversationRowUpdate>>,
         inserted_messages: Mutex<Vec<aionui_db::models::MessageRow>>,
         artifacts: Mutex<Vec<ConversationArtifactRow>>,
+        operations: Mutex<Vec<String>>,
     }
 
     impl MissingWorkspaceConversationRepo {
@@ -2730,6 +2753,7 @@ mod tests {
                 updates: Mutex::new(Vec::new()),
                 inserted_messages: Mutex::new(Vec::new()),
                 artifacts: Mutex::new(Vec::new()),
+                operations: Mutex::new(Vec::new()),
             }
         }
 
@@ -2745,6 +2769,10 @@ mod tests {
                 .lock()
                 .map(|items| items.clone())
                 .unwrap_or_default()
+        }
+
+        fn operations(&self) -> Vec<String> {
+            self.operations.lock().map(|items| items.clone()).unwrap_or_default()
         }
     }
 
@@ -2849,6 +2877,11 @@ mod tests {
         }
 
         async fn insert_message(&self, message: &aionui_db::models::MessageRow) -> Result<(), aionui_db::DbError> {
+            self.operations.lock().unwrap().push(format!(
+                "insert_message:{}:{}",
+                message.position.as_deref().unwrap_or("none"),
+                message.r#type
+            ));
             self.inserted_messages.lock().unwrap().push(message.clone());
             Ok(())
         }
@@ -2888,6 +2921,10 @@ mod tests {
             &self,
             artifact: &ConversationArtifactRow,
         ) -> Result<ConversationArtifactRow, aionui_db::DbError> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("upsert_artifact:{}", artifact.kind));
             let mut artifacts = self.artifacts.lock().unwrap();
             if let Some(existing) = artifacts.iter_mut().find(|row| row.id == artifact.id) {
                 *existing = artifact.clone();

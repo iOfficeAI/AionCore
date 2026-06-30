@@ -157,6 +157,17 @@ async fn cj1_create_cron_job() {
     assert_eq!(data["metadata"]["created_by"], "user");
 }
 
+#[tokio::test]
+async fn cj1b_create_job_allows_missing_task_description() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_job(&mut app, &token, &csrf, create_job_body("No Description")).await;
+
+    assert!(data.get("description").is_none());
+    assert_eq!(data["schedule"]["description"], "every minute");
+}
+
 // ── CJ-2: Create three schedule types ────────────────────────────────
 
 #[tokio::test]
