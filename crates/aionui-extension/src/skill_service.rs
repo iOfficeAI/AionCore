@@ -2135,12 +2135,7 @@ async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
         let dst = dst.to_path_buf();
         tokio::task::spawn_blocking(move || junction::create(&src, &dst))
             .await
-            .map_err(|e| {
-                ExtensionError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("junction::create join error: {e}"),
-                ))
-            })?
+            .map_err(|e| ExtensionError::Io(std::io::Error::other(format!("junction::create join error: {e}"))))?
             .map_err(ExtensionError::Io)
     } else {
         tokio::fs::symlink_file(src, dst).await.map_err(ExtensionError::Io)

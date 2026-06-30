@@ -340,14 +340,11 @@ async fn kill_windows_process_tree(pid: u32) -> io::Result<()> {
         return Ok(());
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "taskkill failed for pid {pid} (exit {:?}): {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-    ))
+    Err(io::Error::other(format!(
+        "taskkill failed for pid {pid} (exit {:?}): {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
 
 /// Resolve `program` through `resolve_command_path` so callers don't have
