@@ -131,10 +131,14 @@ async fn sh4_show_item_in_folder_not_found() {
     let (mut app, services) = build_app_with_noop_opener().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
+    // Use a path that is guaranteed not to exist in this environment.
+    // `/nonexistent/path` happens to exist in some CI images, so a deeper,
+    // unique path avoids false positives.
+    let missing_path = format!("/nonexistent/aionui_shell_missing_{}", std::process::id());
     let req = json_with_token(
         "POST",
         "/api/shell/show-item-in-folder",
-        json!({ "file_path": "/nonexistent/path" }),
+        json!({ "file_path": missing_path }),
         &token,
         &csrf,
     );

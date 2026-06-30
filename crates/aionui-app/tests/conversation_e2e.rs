@@ -65,7 +65,7 @@ async fn t1_2_create_supported_agent_types_and_reject_legacy_types() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let types = ["acp", "aionrs"];
+    let types = ["acp", "aionrs", "remote", "openclaw-gateway"];
     for agent_type in types {
         let body = json!({
             "type": agent_type,
@@ -78,7 +78,7 @@ async fn t1_2_create_supported_agent_types_and_reject_legacy_types() {
         assert_eq!(json["data"]["type"], agent_type);
     }
 
-    for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini"] {
+    for agent_type in ["nanobot", "gemini"] {
         let body = json!({
             "type": agent_type,
             "extra": {}

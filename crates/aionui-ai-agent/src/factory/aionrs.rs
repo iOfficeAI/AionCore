@@ -256,6 +256,15 @@ pub(crate) fn resolve_aionrs_url_and_compat(
         return (Some(base), compat);
     }
 
+    // Zhipu (bigmodel.cn) uses /v4/chat/completions instead of /v1/chat/completions.
+    // The base_url already includes the version (e.g. .../paas/v4), so we only
+    // append /chat/completions.
+    if raw_base_url.to_lowercase().contains("bigmodel.cn") {
+        let trimmed = raw_base_url.trim_end_matches('/');
+        compat.api_path = Some("/chat/completions".to_owned());
+        return (Some(trimmed.to_owned()), compat);
+    }
+
     let normalized = normalize_aionrs_base_url(raw_base_url);
     let base_url = Some(normalized).filter(|u| !u.is_empty());
 

@@ -3,11 +3,12 @@ pub mod acp_assembler;
 mod acp;
 pub(crate) mod aionrs;
 mod context;
+mod openclaw;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_db::{IMcpServerRepository, IProviderRepository};
+use aionui_db::{IMcpServerRepository, IProviderRepository, IRemoteAgentRepository};
 use aionui_realtime::EventBroadcaster;
 use futures_util::FutureExt;
 
@@ -39,6 +40,9 @@ pub struct AgentFactoryDeps {
     /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
     /// `None` for tests/composition paths that do not need MCP injection.
     pub mcp_server_repo: Option<Arc<dyn IMcpServerRepository>>,
+    /// Remote agent configuration repository. Required by the remote agent
+    /// factory to resolve `remote_agent_id` into gateway connection details.
+    pub remote_agent_repo: Arc<dyn IRemoteAgentRepository>,
 }
 
 /// Build a production agent factory that dispatches to concrete agent types.
@@ -64,6 +68,7 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     match context.kind {
         AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,
         AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
+        AgentSessionKind::OpenclawGateway(openclaw_context) => openclaw::build(deps, *openclaw_context, ctx).await,
     }
 }
 

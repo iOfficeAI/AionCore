@@ -21,7 +21,7 @@ use aionui_api_types::SendMessageRequest;
 fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
         AgentSessionKind::Acp(ctx) => ctx.config.backend.as_deref(),
-        AgentSessionKind::Aionrs(_) => None,
+        AgentSessionKind::Aionrs(_) | AgentSessionKind::OpenclawGateway(_) => None,
     }
 }
 
@@ -468,7 +468,7 @@ fn availability_agent_id(options: &BuildTaskOptions) -> Option<String> {
             .as_deref()
             .filter(|value| !value.is_empty())
             .map(str::to_owned),
-        AgentSessionKind::Aionrs(_) => None,
+        AgentSessionKind::Aionrs(_) | AgentSessionKind::OpenclawGateway(_) => None,
     }
 }
 

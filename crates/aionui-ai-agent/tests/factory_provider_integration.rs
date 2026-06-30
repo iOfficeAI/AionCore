@@ -12,8 +12,9 @@ use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_api_types::AionrsBuildExtra;
 use aionui_common::{AgentType, ProviderWithModel, encrypt_string};
 use aionui_db::{
-    CreateProviderParams, IAcpSessionRepository, IProviderRepository, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteProviderRepository, init_database_memory,
+    CreateProviderParams, IAcpSessionRepository, IProviderRepository, IRemoteAgentRepository,
+    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    init_database_memory,
 };
 use aionui_realtime::BroadcastEventBus;
 
@@ -60,13 +61,16 @@ async fn insert_test_provider(repo: &dyn IProviderRepository, id: &str, platform
     .unwrap();
 }
 
-fn make_factory(
+async fn make_factory(
     provider_repo: Arc<dyn IProviderRepository>,
     agent_registry: Arc<AgentRegistry>,
     acp_agent_service: Arc<AcpSessionSyncService>,
 ) -> aionui_ai_agent::task_manager::AgentFactory {
     let tmp = tempfile::TempDir::new().unwrap();
     let skill_paths = Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path()));
+    let db = init_database_memory().await.unwrap();
+    let remote_agent_repo: Arc<dyn IRemoteAgentRepository> =
+        Arc::new(SqliteRemoteAgentRepository::new(db.pool().clone()));
     build_agent_factory(AgentFactoryDeps {
         skill_manager: AcpSkillManager::new(skill_paths),
         provider_repo,
@@ -78,6 +82,7 @@ fn make_factory(
         broadcaster: Arc::new(BroadcastEventBus::new(16)),
         backend_binary_path: Arc::new(PathBuf::from("/tmp/aionrs-test/aioncore")),
         mcp_server_repo: None,
+        remote_agent_repo,
     })
 }
 
@@ -113,7 +118,7 @@ fn make_aionrs_options(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aionrs_factory_returns_error_for_missing_provider() {
     let (provider_repo, agent_registry, acp_agent_service) = setup().await;
-    let factory = make_factory(provider_repo, agent_registry, acp_agent_service);
+    let factory = make_factory(provider_repo, agent_registry, acp_agent_service).await;
 
     let options = make_aionrs_options(
         "conv-test-1",
@@ -143,7 +148,7 @@ async fn aionrs_factory_returns_error_for_missing_provider() {
 async fn aionrs_factory_resolves_provider_from_db() {
     let (provider_repo, agent_registry, acp_agent_service) = setup().await;
     insert_test_provider(&*provider_repo, "prov-001", "openai").await;
-    let factory = make_factory(provider_repo, agent_registry, acp_agent_service);
+    let factory = make_factory(provider_repo, agent_registry, acp_agent_service).await;
 
     let options = make_aionrs_options(
         "conv-test-2",
@@ -167,7 +172,7 @@ async fn aionrs_factory_resolves_provider_from_db() {
 async fn aionrs_factory_respects_use_model_override() {
     let (provider_repo, agent_registry, acp_agent_service) = setup().await;
     insert_test_provider(&*provider_repo, "prov-002", "openai").await;
-    let factory = make_factory(provider_repo, agent_registry, acp_agent_service);
+    let factory = make_factory(provider_repo, agent_registry, acp_agent_service).await;
 
     let options = make_aionrs_options(
         "conv-test-3",

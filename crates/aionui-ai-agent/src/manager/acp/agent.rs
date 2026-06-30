@@ -548,6 +548,87 @@ impl AcpAgentManager {
         })
     }
 
+    /// Set the mode for the current session.
+    pub(crate) async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
+        let normalized_mode = normalize_requested_mode(&self.params.metadata, mode);
+        if normalized_mode.is_empty() {
+            return Err(AgentError::bad_request("mode must not be empty"));
+        }
+
+        let session_id = {
+            let session = self.session.read().await;
+            if !session.can_select_mode(&normalized_mode) {
+                warn!(
+                    conversation_id = %self.params.conversation_id,
+                    agent_backend = ?self.params.metadata.backend,
+                    requested_mode_id = %normalized_mode,
+                    "acp_set_mode_rejected_unavailable"
+                );
+                return Err(AgentError::bad_request(format!(
+                    "Mode '{normalized_mode}' is not available for this ACP session"
+                )));
+            }
+            session.session_id().map(ToOwned::to_owned)
+        }
+        .ok_or_else(|| {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_mode_id = %normalized_mode,
+                "acp_set_command_missing_session"
+            );
+            AgentError::bad_request("No active session")
+        })?;
+
+        info!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            requested_mode_id = %normalized_mode,
+            "acp_set_mode_requested"
+        );
+        codex_sandbox::sync_for_agent(&self.params.metadata, Some(&normalized_mode)).await;
+
+        if let Err(e) = self
+            .protocol
+            .set_mode(SetSessionModeRequest::new(
+                SessionId::new(session_id.clone()),
+                normalized_mode.clone(),
+            ))
+            .await
+        {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_mode_id = %normalized_mode,
+                error = %e,
+                "acp_set_mode_failed"
+            );
+            return Err(AgentError::from(e));
+        }
+
+        let mut session = self.session.write().await;
+        if session.session_id() != Some(session_id.as_str()) {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested_mode_id = %normalized_mode,
+                confirmed_session_id = %session_id,
+                active_session_id = ?session.session_id(),
+                "acp_set_mode_session_changed"
+            );
+            return Err(AgentError::conflict("Active ACP session changed while applying mode"));
+        }
+        session.confirm_mode(ModeId::new(&normalized_mode));
+        self.commit_session_changes(&mut session).await;
+        info!(
+            conversation_id = %self.params.conversation_id,
+            agent_backend = ?self.params.metadata.backend,
+            confirmed_mode_id = %normalized_mode,
+            "acp_set_mode_confirmed"
+        );
+        Ok(())
+    }
+
     pub(crate) fn is_claude_backend(&self) -> bool {
         self.params.metadata.backend.as_deref() == Some("claude")
     }

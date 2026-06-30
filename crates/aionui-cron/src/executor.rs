@@ -14,6 +14,11 @@ use aionui_conversation::{
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationRowUpdate, IConversationRepository};
 use aionui_realtime::EventBroadcaster;
+use chrono::Local;
+#[cfg(test)]
+use tokio::sync::broadcast;
+#[cfg(test)]
+use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 use crate::artifacts::{broadcast_artifact, build_cron_trigger_artifact};
@@ -29,7 +34,7 @@ use crate::types::{CronJob, ExecutionMode};
 pub const RETRY_INTERVAL_MS: u64 = 30_000;
 pub const MAX_RETRIES_DEFAULT: i64 = 3;
 const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
-const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+pub(crate) const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
     Success { conversation_id: String },
@@ -429,9 +434,16 @@ impl JobExecutor {
         let extra = build_conversation_extra(&self.agent_registry, job, saved_skill).await;
         let assistant = build_assistant_request(job);
 
+        let name = job
+            .conversation_title
+            .as_ref()
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| format!("{} · {}", t, Local::now().format("%b %-d")))
+            .unwrap_or_else(|| format!("{} · {}", job.name, Local::now().format("%b %-d")));
+
         let req = CreateConversationRequest {
             r#type: if assistant.is_some() { None } else { Some(agent_type) },
-            name: Some(job.name.clone()),
+            name: Some(name),
             model,
             assistant,
             source: None,
@@ -793,6 +805,57 @@ impl JobExecutor {
         Ok(skills)
     }
 
+    #[allow(dead_code)]
+    async fn ensure_agent_session_mode(
+        &self,
+        job: &CronJob,
+        agent: &aionui_ai_agent::AgentInstance,
+    ) -> Result<(), CronError> {
+        let Some(desired_mode) = job
+            .agent_config
+            .as_ref()
+            .and_then(|config| config.mode.as_deref())
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+        else {
+            return Ok(());
+        };
+
+        let current_mode = agent
+            .get_mode()
+            .await
+            .map_err(|e| CronError::Scheduler(format!("get session mode: {e}")))?;
+
+        if current_mode.mode == desired_mode {
+            return Ok(());
+        }
+
+        match agent.set_mode(desired_mode).await {
+            Ok(()) => {
+                info!(
+                    conversation_id = %agent.conversation_id(),
+                    from_mode = %current_mode.mode,
+                    to_mode = desired_mode,
+                    initialized = current_mode.initialized,
+                    "Applied cron session mode before execution"
+                );
+            }
+            Err(e) if e.to_string().contains("not supported") => {
+                warn!(
+                    conversation_id = %agent.conversation_id(),
+                    desired_mode,
+                    error = %e,
+                    "Agent type does not support session mode switching, skipping"
+                );
+            }
+            Err(e) => {
+                return Err(CronError::Scheduler(format!("set session mode to {desired_mode}: {e}")));
+            }
+        }
+
+        Ok(())
+    }
+
     async fn load_conversation_skill_names(&self, conversation_id: &str) -> Result<Vec<String>, CronError> {
         let Some(row) = self
             .conversation_repo
@@ -832,7 +895,7 @@ impl JobExecutor {
 /// 3. Fallback to [`AgentType::Acp`] to preserve the prior default.
 async fn parse_agent_type(registry: &AgentRegistry, agent_type_str: &str) -> Result<AgentType, CronError> {
     if let Ok(agent_type) = serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type_str.to_owned())) {
-        if agent_type.is_deprecated_runtime() {
+        if !agent_type.supports_conversation_runtime() {
             return Err(CronError::InvalidAgentConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
         }
         return Ok(agent_type);
@@ -924,6 +987,13 @@ async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[Str
                     serde_json::Value::String(custom_agent_id.clone()),
                 );
             }
+            // Remote agent factory expects `remote_agent_id` in the extra.
+            if job.agent_type.eq_ignore_ascii_case("remote") || job.agent_type.eq_ignore_ascii_case("openclaw-gateway") {
+                extra.insert(
+                    "remote_agent_id".to_owned(),
+                    serde_json::Value::String(custom_agent_id.clone()),
+                );
+            }
         }
         if let Some(mode) = &config.mode {
             extra.insert("session_mode".to_owned(), serde_json::Value::String(mode.clone()));
@@ -934,6 +1004,14 @@ async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[Str
 }
 
 fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> String {
+    // Remote/OpenClaw agents are external gateways: they forward the user
+    // message verbatim to a remote process. The scheduled-task wrapper used
+    // for LLM-style agents changes what the remote process sees, so cron
+    // output diverges from a manual chat click. Send the raw message instead.
+    if is_remote_like_job(job) {
+        return job.message.trim().to_owned();
+    }
+
     let schedule_desc = schedule_description_text(&job.schedule);
 
     match job.execution_mode {
@@ -949,6 +1027,10 @@ fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> Strin
 }
 
 fn build_assistant_request(job: &CronJob) -> Option<AssistantConversationRequest> {
+    if is_remote_like_job(job) {
+        return None;
+    }
+
     let config = job.agent_config.as_ref()?;
     let assistant_id = config
         .assistant_id
@@ -968,6 +1050,11 @@ fn build_assistant_request(job: &CronJob) -> Option<AssistantConversationRequest
         locale: None,
         conversation_overrides: None,
     })
+}
+
+fn is_remote_like_job(job: &CronJob) -> bool {
+    let agent_type = job.agent_type.trim().to_lowercase();
+    agent_type == "remote" || agent_type == "openclaw-gateway"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1007,6 +1094,25 @@ async fn build_conversation_extra(
         }
         if !assistant_backed && !config.name.is_empty() {
             extra.insert("agent_name".to_owned(), serde_json::Value::String(config.name.clone()));
+        }
+        if let Some(custom_agent_id) = &config.custom_agent_id {
+            extra.insert(
+                "custom_agent_id".to_owned(),
+                serde_json::Value::String(custom_agent_id.clone()),
+            );
+            if config.is_preset.unwrap_or(false) {
+                extra.insert(
+                    "preset_assistant_id".to_owned(),
+                    serde_json::Value::String(custom_agent_id.clone()),
+                );
+            }
+            // Remote agent factory expects `remote_agent_id` in the extra.
+            if job.agent_type.eq_ignore_ascii_case("remote") || job.agent_type.eq_ignore_ascii_case("openclaw-gateway") {
+                extra.insert(
+                    "remote_agent_id".to_owned(),
+                    serde_json::Value::String(custom_agent_id.clone()),
+                );
+            }
         }
         if let Some(mode) = &config.mode {
             extra.insert("session_mode".to_owned(), serde_json::Value::String(mode.clone()));
@@ -1323,6 +1429,46 @@ mod tests {
         assert!(prompt.contains("SKILL_SUGGEST.md"));
     }
 
+    #[test]
+    fn build_prompt_remote_agent_existing_mode_uses_raw_message() {
+        let job = CronJob {
+            agent_type: "remote".into(),
+            execution_mode: ExecutionMode::Existing,
+            ..sample_job()
+        };
+        let prompt = build_prompt(&job, None);
+        assert_eq!(prompt, "do something");
+        assert!(!prompt.contains("[Scheduled Task Execution]"));
+    }
+
+    #[test]
+    fn build_prompt_openclaw_gateway_new_conv_uses_raw_message() {
+        let job = CronJob {
+            agent_type: "openclaw-gateway".into(),
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+        let prompt = build_prompt(&job, None);
+        assert_eq!(prompt, "do something");
+        assert!(!prompt.contains("[Scheduled Task Context]"));
+        assert!(!prompt.contains("SKILL_SUGGEST.md"));
+    }
+
+    #[test]
+    fn build_prompt_acp_with_remote_backend_uses_raw_message() {
+        let job = CronJob {
+            agent_type: "acp".into(),
+            agent_config: Some(CronAgentConfig {
+                backend: "remote".into(),
+                ..sample_job().agent_config.unwrap()
+            }),
+            ..sample_job()
+        };
+        let prompt = build_prompt(&job, None);
+        assert_eq!(prompt, "do something");
+        assert!(!prompt.contains("[Scheduled Task Execution]"));
+    }
+
     // -- registry helper ------------------------------------------------------
 
     /// Build a registry backed by an in-memory DB seeded from the
@@ -1348,7 +1494,7 @@ mod tests {
     #[tokio::test]
     async fn parse_agent_type_rejects_deprecated_runtime_types() {
         let registry = hydrated_registry().await;
-        for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini", "codex"] {
+        for agent_type in ["nanobot", "gemini", "codex"] {
             let err = parse_agent_type(&registry, agent_type).await.unwrap_err();
             assert!(matches!(err, CronError::InvalidAgentConfig(_)));
             assert!(

@@ -27,7 +27,10 @@ async fn sh2_open_file_not_found() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn sh4_show_item_in_folder_not_found() {
-    let err = service().show_item_in_folder("/nonexistent/path").await.unwrap_err();
+    let err = service()
+        .show_item_in_folder("/nonexistent/nonexistent_path")
+        .await
+        .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("not found"), "expected 'not found', got: {msg}");
 }

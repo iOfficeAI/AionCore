@@ -16,7 +16,9 @@ use tokio::sync::broadcast::error::TryRecvError;
 
 use super::agent::sdk_to_snake_value;
 use super::agent_close::STDERR_PEEK_LINES;
-use super::error_mapping::{AcpSendFailure, is_acp_session_not_found};
+use super::error_mapping::AcpSendFailure;
+#[cfg(test)]
+use super::error_mapping::is_acp_session_not_found;
 use tracing::warn;
 
 #[derive(Debug)]
@@ -125,7 +127,7 @@ impl AcpAgentManager {
             let req = self.params.new_session_request().meta(meta);
             let new_response = match self.protocol.new_session(req).await {
                 Ok(r) => r,
-                Err(e) if is_acp_session_not_found(&e) => {
+                Err(e) if e.is_session_not_found_like(session_id) => {
                     return self.rebuild_after_acp_session_not_found(session_id, e).await;
                 }
                 Err(e) => return Err(e.into()),
@@ -157,7 +159,9 @@ impl AcpAgentManager {
 
             return match self.reconcile_session(&new_sid).await {
                 Ok(()) => Ok(new_sid),
-                Err(e) if is_acp_session_not_found(&e) => self.rebuild_after_session_not_found(&new_sid, &e).await,
+                Err(e) if e.is_session_not_found_like(&new_sid) => {
+                    self.rebuild_after_session_not_found(&new_sid, &e).await
+                }
                 Err(e) => Err(e.into()),
             };
         }
@@ -177,7 +181,7 @@ impl AcpAgentManager {
             }
             let load_response = match self.protocol.load_session(load_req).await {
                 Ok(r) => r,
-                Err(e) if is_acp_session_not_found(&e) => {
+                Err(e) if e.is_session_not_found_like(session_id) => {
                     return self.rebuild_after_acp_session_not_found(session_id, e).await;
                 }
                 Err(e) => return Err(e.into()),
@@ -204,7 +208,9 @@ impl AcpAgentManager {
 
             return match self.reconcile_session(session_id).await {
                 Ok(()) => Ok(session_id.to_owned()),
-                Err(e) if is_acp_session_not_found(&e) => self.rebuild_after_session_not_found(session_id, &e).await,
+                Err(e) if e.is_session_not_found_like(session_id) => {
+                    self.rebuild_after_session_not_found(session_id, &e).await
+                }
                 Err(e) => Err(e.into()),
             };
         }
@@ -220,7 +226,9 @@ impl AcpAgentManager {
         self.emit_snapshot_events().await;
         match self.reconcile_session(session_id).await {
             Ok(()) => Ok(session_id.to_owned()),
-            Err(e) if is_acp_session_not_found(&e) => self.rebuild_after_session_not_found(session_id, &e).await,
+            Err(e) if e.is_session_not_found_like(session_id) => {
+                self.rebuild_after_session_not_found(session_id, &e).await
+            }
             Err(e) => Err(e.into()),
         }
     }

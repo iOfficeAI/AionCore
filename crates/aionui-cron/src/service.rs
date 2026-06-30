@@ -12,14 +12,14 @@ use aionui_common::{
 };
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository,
-    UpdateCronJobParams, resolve_agent_binding_from_rows,
+    IRemoteAgentRepository, UpdateCronJobParams, resolve_agent_binding_from_rows,
 };
 use tracing::{error, info, warn};
 
 use crate::events::CronEventEmitter;
 
 use crate::error::CronError;
-use crate::executor::{ExecutionResult, JobExecutor, RETRY_INTERVAL_MS};
+use crate::executor::{DEPRECATED_AGENT_TYPE_MESSAGE, ExecutionResult, JobExecutor, RETRY_INTERVAL_MS};
 use crate::scheduler::{CronScheduler, compute_next_run, validate_schedule};
 use crate::skill_file::{delete_skill_file, has_skill_file, write_raw_skill_file, write_skill_file};
 use crate::types::{
@@ -45,6 +45,7 @@ pub struct CronService {
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    remote_agent_repo: Option<Arc<dyn IRemoteAgentRepository>>,
     scheduler: Arc<CronScheduler>,
     executor: Arc<JobExecutor>,
     emitter: CronEventEmitter,
@@ -56,6 +57,7 @@ pub struct CronServiceDeps {
     pub agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     pub assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     pub assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    pub remote_agent_repo: Option<Arc<dyn IRemoteAgentRepository>>,
     pub scheduler: Arc<CronScheduler>,
     pub executor: Arc<JobExecutor>,
     pub emitter: CronEventEmitter,
@@ -69,6 +71,7 @@ impl CronService {
             agent_metadata_repo: deps.agent_metadata_repo,
             assistant_definition_repo: deps.assistant_definition_repo,
             assistant_overlay_repo: deps.assistant_overlay_repo,
+            remote_agent_repo: deps.remote_agent_repo,
             scheduler: deps.scheduler,
             executor: deps.executor,
             emitter: deps.emitter,
@@ -96,6 +99,7 @@ impl CronService {
             Some(agent_type) => agent_type,
             None => self.resolve_new_job_agent_type(req.agent_config.as_ref()).await?,
         };
+        reject_deprecated_new_conversation_agent_type(&resolved_agent_type)?;
         validate_aionrs_agent_config(&resolved_agent_type, req.agent_config.as_ref())?;
 
         let execution_mode = parse_execution_mode(req.execution_mode.as_deref())?;
@@ -161,7 +165,7 @@ impl CronService {
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(existing_row)?;
-        job.agent_type = self.resolve_job_agent_type(&job).await?;
+        self.resolve_job_agent_type(&mut job).await?;
         let original_execution_mode = job.execution_mode;
 
         if let Some(name) = &req.name {
@@ -195,6 +199,7 @@ impl CronService {
         if let Some(config_dto) = &req.agent_config {
             let config_dto = sanitize_agent_config_dto(config_dto.clone());
             job.agent_type = self.resolve_new_job_agent_type(Some(&config_dto)).await?;
+            reject_deprecated_new_conversation_agent_type(&job.agent_type)?;
             validate_aionrs_agent_config(&job.agent_type, Some(&config_dto))?;
             job.agent_config = Some(self.build_cron_agent_config(&job.agent_type, config_dto, None).await?);
         }
@@ -241,7 +246,7 @@ impl CronService {
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(row)?;
-        job.agent_type = self.resolve_job_agent_type(&job).await?;
+        self.resolve_job_agent_type(&mut job).await?;
         Ok(job)
     }
 
@@ -255,7 +260,7 @@ impl CronService {
         let mut jobs = Vec::with_capacity(rows.len());
         for row in rows {
             let mut job = cron_job_from_row(row)?;
-            job.agent_type = self.resolve_job_agent_type(&job).await?;
+            self.resolve_job_agent_type(&mut job).await?;
             jobs.push(job);
         }
         Ok(jobs)
@@ -329,8 +334,8 @@ impl CronService {
                 return;
             }
         };
-        match self.resolve_job_agent_type(&job).await {
-            Ok(agent_type) => job.agent_type = agent_type,
+        match self.resolve_job_agent_type(&mut job).await {
+            Ok(()) => {}
             Err(e) => {
                 error!(job_id, error = %e, "Tick: failed to resolve cron assistant runtime");
                 return;
@@ -394,7 +399,7 @@ impl CronService {
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(row)?;
-        job.agent_type = self.resolve_job_agent_type(&job).await?;
+        self.resolve_job_agent_type(&mut job).await?;
         let prepared = self.executor.prepare_run_now(&job).await?;
         let conversation_id = prepared.conversation_id.clone();
         let service = self.clone();
@@ -486,23 +491,41 @@ impl CronService {
         self.resolve_agent_type_for_assistant_id(assistant_id).await
     }
 
-    async fn resolve_job_agent_type(&self, job: &CronJob) -> Result<String, CronError> {
+    async fn resolve_job_agent_type(&self, job: &mut CronJob) -> Result<(), CronError> {
         if !job.agent_type.trim().is_empty() {
-            return Ok(job.agent_type.clone());
+            return Ok(());
         }
 
-        let Some(assistant_id) = job
+        if let Some(assistant_id) = job
             .agent_config
             .as_ref()
             .and_then(|config| config.assistant_id.as_deref().or(config.custom_agent_id.as_deref()))
             .filter(|value| !value.trim().is_empty())
-        else {
-            return Err(CronError::InvalidAgentConfig(
-                "assistant_id is required for cron jobs".into(),
-            ));
-        };
+        {
+            job.agent_type = self.resolve_agent_type_for_assistant_id(assistant_id).await?;
+            return Ok(());
+        }
 
-        self.resolve_agent_type_for_assistant_id(assistant_id).await
+        // Legacy remote-agent cron jobs persisted only the display name in
+        // `agent_config.name` and dropped the `agent_type` column upstream.
+        // Recover them by matching the name against the remote_agents table.
+        if let Some(config) = job.agent_config.as_mut() {
+            let agent_name = config.name.trim();
+            if !agent_name.is_empty() {
+                if let Some(repo) = self.remote_agent_repo.as_ref() {
+                    let rows = repo.list().await?;
+                    if let Some(remote_agent) = rows.into_iter().find(|row| row.name == agent_name) {
+                        config.custom_agent_id = Some(remote_agent.id.clone());
+                        job.agent_type = remote_agent_type_from_protocol(&remote_agent.protocol);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        Err(CronError::InvalidAgentConfig(
+            "assistant_id is required for cron jobs".into(),
+        ))
     }
 
     async fn resolve_agent_type_for_assistant_id(&self, assistant_id: &str) -> Result<String, CronError> {
@@ -619,7 +642,8 @@ impl CronService {
                 self.emitter.emit_job_executed(job_id, "skipped", None);
             }
             ExecutionResult::Error { message } => {
-                self.update_job_after_error(job_id, &message).await;
+                self.update_job_after_error(job_id, &job.conversation_id, &message)
+                    .await;
                 self.reschedule_after_execution(&job).await;
                 self.emitter.emit_job_executed(job_id, "error", Some(&message));
             }
@@ -633,7 +657,7 @@ impl CronService {
                 self.emitter.emit_job_executed(job_id, "ok", None);
             }
             ExecutionResult::Error { message } => {
-                self.update_job_after_error(job_id, &message).await;
+                self.update_job_after_error(job_id, "", &message).await;
                 self.emitter.emit_job_executed(job_id, "error", Some(&message));
             }
             ExecutionResult::Retrying { attempt } => {
@@ -681,8 +705,13 @@ impl CronService {
         // "existing" job is materialized (lazy binding). Subsequent runs then
         // reuse the same conversation, matching the UX where the job is the
         // continuation anchor.
-        let needs_conversation_bind =
-            existing_row.conversation_id.trim().is_empty() && !conversation_id.trim().is_empty();
+        //
+        // For "new_conversation" jobs a fresh conversation is created on every
+        // run, so we always overwrite the stored id with the latest one. This
+        // keeps the cron job UI pointing at the most recent execution.
+        let is_new_conversation = existing_row.execution_mode == "new_conversation";
+        let needs_conversation_bind = (is_new_conversation && !conversation_id.trim().is_empty())
+            || (existing_row.conversation_id.trim().is_empty() && !conversation_id.trim().is_empty());
         let params = UpdateCronJobParams {
             last_run_at: Some(Some(now)),
             last_status: Some(Some("ok".into())),
@@ -712,9 +741,9 @@ impl CronService {
         }
     }
 
-    async fn update_job_after_error(&self, job_id: &str, message: &str) {
-        let run_count = match self.repo.get_by_id(job_id).await {
-            Ok(Some(r)) => r.run_count,
+    async fn update_job_after_error(&self, job_id: &str, conversation_id: &str, message: &str) {
+        let existing_row = match self.repo.get_by_id(job_id).await {
+            Ok(Some(r)) => r,
             Ok(None) => return,
             Err(e) => {
                 error!(job_id, error = %e, "Failed to read job for run_count");
@@ -722,12 +751,22 @@ impl CronService {
             }
         };
         let now = now_ms();
+        // New-conversation jobs spawn a fresh conversation before executing;
+        // if the run fails we still want the cron job row to point at that
+        // conversation so the user can inspect what went wrong.
+        let is_new_conversation = existing_row.execution_mode == "new_conversation";
+        let conversation_id_update = if is_new_conversation && !conversation_id.trim().is_empty() {
+            Some(conversation_id.to_owned())
+        } else {
+            None
+        };
         let params = UpdateCronJobParams {
             last_run_at: Some(Some(now)),
             last_status: Some(Some("error".into())),
             last_error: Some(Some(message.to_owned())),
             retry_count: Some(0),
-            run_count: Some(run_count + 1),
+            run_count: Some(existing_row.run_count + 1),
+            conversation_id: conversation_id_update,
             ..Default::default()
         };
         if let Err(e) = self.repo.update(job_id, &params).await {
@@ -901,17 +940,26 @@ impl CronService {
             }
         };
 
-        for row in &jobs {
+        // Only cascade-delete existing-mode jobs. NewConversation jobs create a
+        // fresh conversation on every run and merely store the last created
+        // conversation_id; deleting that conversation should not delete the
+        // cron job itself (the user would lose their scheduled task).
+        let existing_jobs: Vec<_> = jobs
+            .into_iter()
+            .filter(|row| row.execution_mode != "new_conversation")
+            .collect();
+
+        for row in &existing_jobs {
             self.scheduler.cancel_job(&row.id);
             self.emitter.emit_job_removed(&row.id);
         }
 
         if let Err(e) = self.repo.delete_by_conversation(conversation_id).await {
             error!(conversation_id, error = %e, "Failed to cascade-delete cron jobs");
-        } else if !jobs.is_empty() {
+        } else if !existing_jobs.is_empty() {
             info!(
                 conversation_id,
-                count = jobs.len(),
+                count = existing_jobs.len(),
                 "Cascade-deleted cron jobs for conversation"
             );
         }
@@ -1382,6 +1430,14 @@ fn runtime_agent_type_for_backend(backend: &str) -> &'static str {
     if backend == "aionrs" { "aionrs" } else { "acp" }
 }
 
+fn remote_agent_type_from_protocol(protocol: &str) -> String {
+    if protocol.eq_ignore_ascii_case("openclaw") {
+        "openclaw-gateway".to_owned()
+    } else {
+        "remote".to_owned()
+    }
+}
+
 fn normalize_model(
     model: Option<ProviderWithModel>,
     runtime_agent_type: &str,
@@ -1426,6 +1482,14 @@ fn validate_aionrs_agent_config(
         return Err(CronError::InvalidAgentConfig(
             "aionrs cron jobs require agent_config.model.provider_id and agent_config.model.model".into(),
         ));
+    }
+    Ok(())
+}
+
+fn reject_deprecated_new_conversation_agent_type(agent_type: &str) -> Result<(), CronError> {
+    let parsed = serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type.to_owned())).ok();
+    if parsed.is_some_and(|agent_type| !agent_type.supports_conversation_runtime()) {
+        return Err(CronError::InvalidAgentConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
     }
     Ok(())
 }

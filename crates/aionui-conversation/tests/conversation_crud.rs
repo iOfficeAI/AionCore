@@ -164,7 +164,12 @@ async fn t1_1_create_with_defaults() {
 async fn t1_2_create_each_agent_type() {
     let (svc, _, _task_mgr) = setup().await;
 
-    let types = vec![("acp", AgentType::Acp), ("aionrs", AgentType::Aionrs)];
+    let types = vec![
+        ("acp", AgentType::Acp),
+        ("aionrs", AgentType::Aionrs),
+        ("openclaw-gateway", AgentType::OpenclawGateway),
+        ("remote", AgentType::Remote),
+    ];
 
     for (type_str, expected_type) in types {
         let body = if type_str == "aionrs" {
@@ -189,7 +194,7 @@ async fn t1_2_create_each_agent_type() {
         }
     }
 
-    for type_str in ["openclaw-gateway", "nanobot", "remote", "gemini"] {
+    for type_str in ["nanobot", "gemini"] {
         let req: CreateConversationRequest = serde_json::from_value(json!({
             "type": type_str,
             "extra": {}
@@ -685,11 +690,11 @@ async fn create_rejects_top_level_model_for_acp() {
 }
 
 #[tokio::test]
-async fn create_rejects_deprecated_remote_runtime() {
+async fn create_rejects_deprecated_nanobot_runtime() {
     let (svc, _, _task_mgr) = setup().await;
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
-        "type": "remote",
+        "type": "nanobot",
         "model": { "provider_id": "p1", "model": "m1" },
         "extra": {}
     }))

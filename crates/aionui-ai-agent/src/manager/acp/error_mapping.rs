@@ -62,6 +62,7 @@ impl std::error::Error for AcpSendFailure {
     }
 }
 
+#[cfg(test)]
 pub(super) fn is_acp_session_not_found(err: &AcpError) -> bool {
     matches!(err, AcpError::SessionNotFound { .. })
 }

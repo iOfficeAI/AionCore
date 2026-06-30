@@ -734,6 +734,7 @@ async fn setup_with_conv_repo() -> (
         agent_metadata_repo,
         assistant_definition_repo: assistant_definition_repo.clone(),
         assistant_overlay_repo: assistant_overlay_repo.clone(),
+        remote_agent_repo: None,
         scheduler,
         executor,
         emitter,
@@ -830,6 +831,7 @@ async fn setup_with_assistant_repos() -> (
         agent_metadata_repo,
         assistant_definition_repo: assistant_definition_repo.clone(),
         assistant_overlay_repo: assistant_overlay_repo.clone(),
+        remote_agent_repo: None,
         scheduler,
         executor,
         emitter,
@@ -1039,24 +1041,19 @@ async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
 }
 
 #[tokio::test]
-async fn create_job_derives_assistant_runtime_without_backend_hint() {
+async fn create_job_rejects_deprecated_agent_types() {
     let (svc, _, _) = setup().await;
 
-    let mut req = make_create_req("Stale Backend Hint", every_60s());
-    req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
-        name: "Stale Backend Hint".into(),
-        cli_path: None,
-        assistant_id: Some("assistant-default".into()),
-        mode: Some("default".into()),
-        model_id: Some("claude-sonnet-4".into()),
-        model: None,
-        config_options: None,
-        workspace: None,
-    });
+    for agent_type in ["nanobot", "gemini", "codex"] {
+        let mut req = make_create_req(&format!("Deprecated {agent_type}"), every_60s());
+        req.agent_type = agent_type.to_owned();
 
-    let job = svc.add_job(req).await.unwrap();
-
-    assert_eq!(job.agent_type, "acp");
+        let err = svc.add_job(req).await.unwrap_err();
+        assert!(
+            matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)),
+            "expected InvalidAgentConfig for {agent_type}, got {err:?}"
+        );
+    }
 }
 
 #[tokio::test]

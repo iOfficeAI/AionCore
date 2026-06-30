@@ -149,7 +149,7 @@ async fn aionrs_agent_metadata() {
 fn agent_session_kind_is_limited_to_runnable_runtimes() {
     fn assert_runnable(kind: AgentSessionKind) {
         match kind {
-            AgentSessionKind::Acp(_) | AgentSessionKind::Aionrs(_) => {}
+            AgentSessionKind::Acp(_) | AgentSessionKind::Aionrs(_) | AgentSessionKind::OpenclawGateway(_) => {}
         }
     }
 

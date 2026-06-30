@@ -383,7 +383,7 @@ fn parse_agent_type(s: &str) -> Result<AgentType, ChannelError> {
         }
     };
 
-    if agent_type.is_deprecated_runtime() {
+    if !agent_type.supports_conversation_runtime() {
         return Err(ChannelError::InvalidConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
     }
 
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn parse_agent_type_rejects_deprecated_channel_runtime_types() {
-        for raw in ["openclaw-gateway", "nanobot", "remote", "gemini"] {
+        for raw in ["nanobot", "gemini"] {
             let err = parse_agent_type(raw).unwrap_err();
             assert!(matches!(err, ChannelError::InvalidConfig(_)));
         }

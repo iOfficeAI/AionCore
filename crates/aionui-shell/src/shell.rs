@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn validate_path_exists_fails_for_nonexistent() {
-        let result = validate_path_exists("/nonexistent/path");
+        let result = validate_path_exists("/nonexistent/nonexistent_path");
         assert!(matches!(result, Err(ShellError::FileNotFound(_))));
     }
 
@@ -357,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn show_item_in_folder_fails_for_missing_path() {
         let svc = ShellService::new(Arc::new(NoopSystemOpener));
-        let result = svc.show_item_in_folder("/nonexistent/path").await;
+        let result = svc.show_item_in_folder("/nonexistent/nonexistent_path").await;
         assert!(matches!(result, Err(ShellError::FileNotFound(_))));
     }
 

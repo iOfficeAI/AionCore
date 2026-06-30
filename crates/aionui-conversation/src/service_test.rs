@@ -1307,13 +1307,7 @@ async fn create_returns_conversation_with_defaults() {
 async fn create_rejects_deprecated_agent_types_for_new_conversations() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
 
-    for agent_type in [
-        AgentType::Gemini,
-        AgentType::Codex,
-        AgentType::OpenclawGateway,
-        AgentType::Nanobot,
-        AgentType::Remote,
-    ] {
+    for agent_type in [AgentType::Gemini, AgentType::Codex, AgentType::Nanobot] {
         let mut req = make_create_req();
         req.r#type = Some(agent_type);
         req.model = None;
@@ -3008,13 +3002,7 @@ async fn send_message_rejects_legacy_runtime_conversations_as_archived() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
-    for agent_type in [
-        AgentType::Gemini,
-        AgentType::Codex,
-        AgentType::OpenclawGateway,
-        AgentType::Nanobot,
-        AgentType::Remote,
-    ] {
+    for agent_type in [AgentType::Gemini, AgentType::Codex, AgentType::Nanobot] {
         let conv = insert_conversation_with_type(&repo, "user_1", agent_type).await;
 
         let err = svc
@@ -5028,13 +5016,7 @@ async fn warmup_rejects_legacy_runtime_conversations_as_archived() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
 
-    for agent_type in [
-        AgentType::Gemini,
-        AgentType::Codex,
-        AgentType::OpenclawGateway,
-        AgentType::Nanobot,
-        AgentType::Remote,
-    ] {
+    for agent_type in [AgentType::Gemini, AgentType::Codex, AgentType::Nanobot] {
         let conv = insert_conversation_with_type(&repo, "user_1", agent_type).await;
 
         let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();

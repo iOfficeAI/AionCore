@@ -13,10 +13,10 @@ use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository,
-    SqliteUserRepository,
+    ISkillRepository, IRemoteAgentRepository, IUserRepository, SqliteAcpSessionRepository,
+    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository,
+    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSkillRepository, SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
@@ -51,6 +51,7 @@ pub struct AppServices {
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
     /// User skill metadata and import history repository.
     pub skill_repo: Arc<dyn ISkillRepository>,
+    pub remote_agent_repo: Arc<dyn IRemoteAgentRepository>,
 }
 
 impl AppServices {
@@ -128,6 +129,8 @@ impl AppServices {
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
+        let remote_agent_repo: Arc<dyn IRemoteAgentRepository> =
+            Arc::new(SqliteRemoteAgentRepository::new(database.pool().clone()));
 
         // Skill paths need app resource dir (for builtin rules) + data dir
         // (for user skills + materialized views). AcpSkillManager uses these
@@ -159,6 +162,7 @@ impl AppServices {
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            remote_agent_repo: remote_agent_repo.clone(),
         });
 
         // Agent factory is now wired. Future extension/custom agents
@@ -202,6 +206,7 @@ impl AppServices {
             app_version,
             skill_paths,
             skill_repo,
+            remote_agent_repo,
         })
     }
 }
@@ -234,6 +239,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     )
     .with_runtime_state(deps.conversation_runtime_state);
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
+    service.with_remote_agent_repo(Arc::new(SqliteRemoteAgentRepository::new(deps.database.pool().clone())));
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
         deps.database.pool().clone(),
     )));

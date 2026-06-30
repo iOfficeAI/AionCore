@@ -1,6 +1,5 @@
 use crate::manager::acp::AcpAgentManager;
 
-use crate::manager::acp::error_mapping::is_acp_session_not_found;
 use crate::manager::acp::mode_normalize::normalize_requested_mode;
 use crate::manager::acp::session::PendingStartupConfigSeedResult;
 use crate::protocol::error::AcpError;
@@ -79,7 +78,7 @@ impl AcpAgentManager {
                         ))
                         .await
                     {
-                        if is_acp_session_not_found(&e) {
+                        if e.is_session_not_found_like(session_id) {
                             warn!(
                                 conversation_id = %self.params.conversation_id,
                                 mode_id = %normalized,
@@ -107,7 +106,7 @@ impl AcpAgentManager {
                         ))
                         .await
                     {
-                        if is_acp_session_not_found(&e) {
+                        if e.is_session_not_found_like(session_id) {
                             warn!(
                                 conversation_id = %self.params.conversation_id,
                                 model_id = %model,
@@ -176,7 +175,7 @@ impl AcpAgentManager {
                             actions = followup_actions.into();
                         }
                         Err(err) => {
-                            if is_acp_session_not_found(&err) {
+                            if err.is_session_not_found_like(session_id) {
                                 warn!(
                                     conversation_id = %self.params.conversation_id,
                                     config_id = %key,

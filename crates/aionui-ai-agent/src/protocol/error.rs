@@ -268,6 +268,22 @@ impl AcpError {
         )
     }
 
+    /// Whether the error indicates the persisted `session_id` is no longer
+    /// recognised by the agent CLI. Treats both the explicit `SessionNotFound`
+    /// variant and `ResourceNotFound` errors whose resource URI equals the
+    /// stored session id as stale-session failures (some ACP backends emit
+    /// `-32002` with the session id as the missing resource after a restart).
+    pub fn is_session_not_found_like(&self, session_id: &str) -> bool {
+        match self {
+            AcpError::SessionNotFound { session_id: sid } => sid == session_id,
+            AcpError::ResourceNotFound {
+                resource: Some(resource),
+                ..
+            } => resource == session_id,
+            _ => false,
+        }
+    }
+
     /// Convert an SDK [`Error`](SdkError) into an [`AcpError`].
     ///
     /// Mapping is by [`ErrorCode`], never by message text. The single

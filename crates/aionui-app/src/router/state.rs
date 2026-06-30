@@ -667,6 +667,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         agent_metadata_repo,
         assistant_definition_repo,
         assistant_overlay_repo,
+        remote_agent_repo: Some(services.remote_agent_repo.clone()),
         scheduler,
         executor,
         emitter,
