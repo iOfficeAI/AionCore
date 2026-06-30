@@ -117,8 +117,8 @@ dependencies = [
 
 [[package]]
 name = "aion-agent"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.1.37"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -147,8 +147,8 @@ dependencies = [
 
 [[package]]
 name = "aion-compact"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.1.37"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 dependencies = [
  "regex",
  "serde",
@@ -158,8 +158,8 @@ dependencies = [
 
 [[package]]
 name = "aion-config"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.1.37"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 dependencies = [
  "aion-compact",
  "aion-process",
@@ -183,8 +183,8 @@ dependencies = [
 
 [[package]]
 name = "aion-mcp"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.1.37"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -204,8 +204,8 @@ dependencies = [
 
 [[package]]
 name = "aion-memory"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.1.37"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 dependencies = [
  "aion-config",
  "chrono",
@@ -218,8 +218,8 @@ dependencies = [
 
 [[package]]
 name = "aion-process"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.1.37"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 dependencies = [
  "libc",
  "tokio",
@@ -229,8 +229,8 @@ dependencies = [
 
 [[package]]
 name = "aion-protocol"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.1.37"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 dependencies = [
  "aion-types",
  "serde",
@@ -242,8 +242,8 @@ dependencies = [
 
 [[package]]
 name = "aion-providers"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.1.37"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -270,8 +270,8 @@ dependencies = [
 
 [[package]]
 name = "aion-skills"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.1.37"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -297,8 +297,8 @@ dependencies = [
 
 [[package]]
 name = "aion-tools"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.1.37"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 dependencies = [
  "aion-config",
  "aion-process",
@@ -318,8 +318,8 @@ dependencies = [
 
 [[package]]
 name = "aion-types"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.1.37"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6502,7 +6502,7 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.37#778cadf5d5f1eff7f95e1194e2fbd3413699c246"
 
 [[package]]
 name = "writeable"
