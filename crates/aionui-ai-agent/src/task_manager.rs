@@ -275,7 +275,7 @@ mod tests {
     use crate::session_context::{
         AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
     };
-    use crate::types::{CONVERSATION_CRON_ENV_VERSION, SendMessageData};
+    use crate::types::{CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData};
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, ProviderWithModel};
     use futures_util::FutureExt;
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -472,11 +472,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_or_build_rebuilds_when_existing_task_lacks_requested_cron_env_capability() {
+    async fn get_or_build_rebuilds_when_existing_task_lacks_requested_runtime_context_capability() {
         let mgr = make_manager();
         let h1 = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
         let mut options = make_options("conv-1");
-        options.runtime_capabilities.conversation_cron_env_version = Some(CONVERSATION_CRON_ENV_VERSION);
+        options.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
 
         let h2 = mgr.get_or_build_task("conv-1", options).await.unwrap();
 

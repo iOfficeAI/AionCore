@@ -4,13 +4,12 @@ use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
+use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_policy};
 use crate::factory::context::FactoryContext;
-use crate::manager::acp::mode_normalize::normalize_requested_mode;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::session_context::AcpSessionBuildContext;
-use crate::shared_kernel::PersistedSessionState;
 use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
-use aionui_api_types::{AcpBuildExtra, AgentMetadata, SessionMcpServer, SessionMcpTransport};
+use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
@@ -22,11 +21,6 @@ use aionui_runtime::{
 use tracing::{info, warn};
 
 use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation_runtime_reporter};
-
-const CODEX_CONFIG_FLAG: &str = "-c";
-const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all";
-const CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY: &str = "shell_environment_policy.include_only=[]";
-const CODEX_WINDOWS_UNELEVATED_SANDBOX: &str = "windows.sandbox=\"unelevated\"";
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -58,25 +52,15 @@ pub(super) async fn build(
 
     let mut command_spec =
         resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
-    apply_codex_runtime_config_args(
+    apply_acp_launch_policy(
         &mut command_spec,
-        &meta,
-        initial_mode_from_build_context(&meta, &config, build_context.session_snapshot.as_ref()).as_deref(),
+        AcpLaunchPolicyInput {
+            metadata: &meta,
+            config: &config,
+            session_snapshot: build_context.session_snapshot.as_ref(),
+            runtime_env: &ctx.runtime_env,
+        },
     );
-    append_runtime_env(&mut command_spec, &ctx.runtime_env);
-    if meta.backend.as_deref() == Some("claude") {
-        let cc_switch_env = crate::cc_switch::read_claude_provider_env();
-        if !cc_switch_env.is_empty() {
-            let keys: Vec<&str> = cc_switch_env.keys().map(|k| k.as_str()).collect();
-            for (name, value) in &cc_switch_env {
-                command_spec.env.push(aionui_common::EnvVar {
-                    name: name.clone(),
-                    value: value.clone(),
-                });
-            }
-            tracing::info!(?keys, "cc-switch: env vars injected");
-        }
-    }
     let session_snapshot = build_context.session_snapshot;
 
     // Load user-configured MCP servers from the DB so they reach
@@ -181,63 +165,6 @@ pub(super) async fn build(
     deps.acp_agent_service.attach(ctx.conversation_id, domain_rx).await;
 
     Ok(instance)
-}
-
-fn append_runtime_env(command_spec: &mut CommandSpec, runtime_env: &[(String, String)]) {
-    for (name, value) in runtime_env {
-        command_spec.env.push(aionui_common::EnvVar {
-            name: name.clone(),
-            value: value.clone(),
-        });
-    }
-}
-
-fn initial_mode_from_build_context(
-    metadata: &AgentMetadata,
-    config: &AcpBuildExtra,
-    session_snapshot: Option<&PersistedSessionState>,
-) -> Option<String> {
-    session_snapshot
-        .and_then(|snapshot| snapshot.current_mode_id.as_ref())
-        .map(|mode| normalize_requested_mode(metadata, mode.as_str()))
-        .or_else(|| {
-            config
-                .session_mode
-                .as_ref()
-                .map(|mode| normalize_requested_mode(metadata, mode))
-        })
-        .filter(|mode| !mode.is_empty())
-}
-
-fn apply_codex_runtime_config_args(
-    command_spec: &mut CommandSpec,
-    metadata: &AgentMetadata,
-    initial_mode: Option<&str>,
-) {
-    if metadata.backend.as_deref() != Some("codex") {
-        return;
-    }
-
-    push_codex_config_arg(command_spec, CODEX_ENV_POLICY_INHERIT_ALL);
-    push_codex_config_arg(command_spec, CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY);
-
-    let sandbox_mode = codex_sandbox_mode_for_requested_mode(initial_mode);
-    push_codex_config_arg(command_spec, &format!("sandbox_mode=\"{sandbox_mode}\""));
-    if sandbox_mode == "danger-full-access" {
-        push_codex_config_arg(command_spec, CODEX_WINDOWS_UNELEVATED_SANDBOX);
-    }
-}
-
-fn push_codex_config_arg(command_spec: &mut CommandSpec, value: &str) {
-    command_spec.args.push(CODEX_CONFIG_FLAG.to_owned());
-    command_spec.args.push(value.to_owned());
-}
-
-fn codex_sandbox_mode_for_requested_mode(mode: Option<&str>) -> &'static str {
-    match mode.map(str::trim) {
-        Some("full-access" | "yoloNoSandbox") => "danger-full-access",
-        _ => "workspace-write",
-    }
 }
 
 async fn resolve_agent_command_spec(
@@ -628,174 +555,6 @@ mod tests {
 
     fn is_npx_command_path(command: &str) -> bool {
         command == "npx" || command.ends_with("/npx") || command.ends_with("\\npx.cmd")
-    }
-
-    fn agent_metadata_with_backend(backend: Option<&str>) -> AgentMetadata {
-        AgentMetadata {
-            id: "agent-1".into(),
-            icon: None,
-            name: "Test ACP".into(),
-            name_i18n: None,
-            description: None,
-            description_i18n: None,
-            backend: backend.map(str::to_owned),
-            agent_type: aionui_common::AgentType::Acp,
-            agent_source: aionui_api_types::AgentSource::Builtin,
-            agent_source_info: aionui_api_types::AgentSourceInfo::default(),
-            enabled: true,
-            available: true,
-            command: None,
-            resolved_command: None,
-            args: vec![],
-            env: vec![],
-            native_skills_dirs: None,
-            behavior_policy: aionui_api_types::BehaviorPolicy::default(),
-            yolo_id: Some("full-access".into()),
-            sort_order: 0,
-            team_capable: false,
-            last_check_status: None,
-            last_check_kind: None,
-            last_check_error_code: None,
-            last_check_error_message: None,
-            last_check_error_details: None,
-            last_check_guidance: None,
-            last_check_latency_ms: None,
-            last_check_at: None,
-            last_success_at: None,
-            last_failure_at: None,
-            handshake: aionui_api_types::AgentHandshake::default(),
-            has_command_override: false,
-            env_override_key_count: 0,
-        }
-    }
-
-    #[test]
-    fn apply_codex_runtime_config_args_adds_env_policy_and_full_access_sandbox() {
-        let mut command_spec = CommandSpec {
-            command: "node".into(),
-            args: vec!["codex-acp.js".into()],
-            env: vec![],
-            cwd: None,
-        };
-
-        apply_codex_runtime_config_args(
-            &mut command_spec,
-            &agent_metadata_with_backend(Some("codex")),
-            Some("full-access"),
-        );
-
-        assert_eq!(
-            command_spec.args,
-            vec![
-                "codex-acp.js",
-                "-c",
-                "shell_environment_policy.inherit=all",
-                "-c",
-                "shell_environment_policy.include_only=[]",
-                "-c",
-                "sandbox_mode=\"danger-full-access\"",
-                "-c",
-                "windows.sandbox=\"unelevated\"",
-            ]
-        );
-    }
-
-    #[test]
-    fn apply_codex_runtime_config_args_defaults_to_workspace_write() {
-        let mut command_spec = CommandSpec {
-            command: "node".into(),
-            args: vec!["codex-acp.js".into()],
-            env: vec![],
-            cwd: None,
-        };
-
-        apply_codex_runtime_config_args(&mut command_spec, &agent_metadata_with_backend(Some("codex")), None);
-
-        assert!(
-            command_spec
-                .args
-                .windows(2)
-                .any(|pair| pair[0] == "-c" && pair[1] == "sandbox_mode=\"workspace-write\"")
-        );
-        assert!(
-            !command_spec
-                .args
-                .iter()
-                .any(|arg| arg == CODEX_WINDOWS_UNELEVATED_SANDBOX)
-        );
-    }
-
-    #[test]
-    fn apply_codex_runtime_config_args_skips_non_codex_agents() {
-        let mut command_spec = CommandSpec {
-            command: "node".into(),
-            args: vec!["claude-agent-acp.js".into()],
-            env: vec![],
-            cwd: None,
-        };
-
-        apply_codex_runtime_config_args(
-            &mut command_spec,
-            &agent_metadata_with_backend(Some("claude")),
-            Some("full-access"),
-        );
-
-        assert_eq!(command_spec.args, vec!["claude-agent-acp.js"]);
-    }
-
-    #[test]
-    fn initial_mode_from_build_context_prefers_persisted_snapshot() {
-        let mut snapshot = PersistedSessionState::default();
-        snapshot.current_mode_id = Some(crate::shared_kernel::ModeId::new("full-access"));
-        let config = AcpBuildExtra {
-            session_mode: Some("auto".into()),
-            ..Default::default()
-        };
-
-        let mode =
-            initial_mode_from_build_context(&agent_metadata_with_backend(Some("codex")), &config, Some(&snapshot));
-
-        assert_eq!(mode.as_deref(), Some("full-access"));
-    }
-
-    #[test]
-    fn append_runtime_env_adds_current_conversation_values_to_command_spec() {
-        let mut command_spec = CommandSpec {
-            command: "agent".into(),
-            args: vec![],
-            env: vec![aionui_common::EnvVar {
-                name: "EXISTING".into(),
-                value: "1".into(),
-            }],
-            cwd: None,
-        };
-
-        append_runtime_env(
-            &mut command_spec,
-            &[
-                ("AIONUI_USER_ID".into(), "user_1".into()),
-                ("AIONUI_CONVERSATION_ID".into(), "conv_1".into()),
-            ],
-        );
-
-        assert!(
-            command_spec
-                .env
-                .iter()
-                .any(|entry| entry.name == "AIONUI_USER_ID" && entry.value == "user_1")
-        );
-        assert!(
-            command_spec
-                .env
-                .iter()
-                .any(|entry| entry.name == "AIONUI_CONVERSATION_ID" && entry.value == "conv_1")
-        );
-        assert!(
-            command_spec
-                .env
-                .iter()
-                .any(|entry| entry.name == "EXISTING" && entry.value == "1")
-        );
     }
 
     #[cfg(unix)]

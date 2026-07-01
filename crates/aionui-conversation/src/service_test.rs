@@ -9,7 +9,7 @@ use std::time::Duration;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
-use aionui_ai_agent::types::{BuildTaskOptions, CONVERSATION_CRON_ENV_VERSION, SendMessageData};
+use aionui_ai_agent::types::{BuildTaskOptions, CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData};
 use aionui_ai_agent::{
     AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
 };
@@ -2904,7 +2904,7 @@ fn make_send_req() -> SendMessageRequest {
     .unwrap()
 }
 
-fn assert_conversation_cron_env(options: &BuildTaskOptions, user_id: &str, conversation_id: &str) {
+fn assert_conversation_runtime_context(options: &BuildTaskOptions, user_id: &str, conversation_id: &str) {
     assert!(
         options
             .context
@@ -2920,8 +2920,8 @@ fn assert_conversation_cron_env(options: &BuildTaskOptions, user_id: &str, conve
         "runtime env should include AIONUI_CONVERSATION_ID"
     );
     assert_eq!(
-        options.runtime_capabilities.conversation_cron_env_version,
-        Some(CONVERSATION_CRON_ENV_VERSION)
+        options.runtime_capabilities.conversation_runtime_context_version,
+        Some(CONVERSATION_RUNTIME_CONTEXT_VERSION)
     );
 }
 
@@ -2956,7 +2956,7 @@ async fn send_message_returns_accepted() {
 }
 
 #[tokio::test]
-async fn send_message_injects_conversation_cron_env() {
+async fn send_message_injects_conversation_runtime_context() {
     let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
@@ -2971,11 +2971,11 @@ async fn send_message_injects_conversation_cron_env() {
 
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
-    assert_conversation_cron_env(&options[0], "user_1", &conv.id);
+    assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
 }
 
 #[tokio::test]
-async fn run_agent_turn_injects_conversation_cron_env() {
+async fn run_agent_turn_injects_conversation_runtime_context() {
     let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
         MockAgent::new("placeholder"),
     ))]));
@@ -3009,7 +3009,7 @@ async fn run_agent_turn_injects_conversation_cron_env() {
     assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
-    assert_conversation_cron_env(&options[0], "user_1", &conv.id);
+    assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
 }
 
 #[tokio::test]
@@ -4996,7 +4996,7 @@ async fn warmup_creates_agent_task() {
 }
 
 #[tokio::test]
-async fn warmup_injects_conversation_cron_env() {
+async fn warmup_injects_conversation_runtime_context() {
     let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
@@ -5008,7 +5008,7 @@ async fn warmup_injects_conversation_cron_env() {
 
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
-    assert_conversation_cron_env(&options[0], "user_1", &conv.id);
+    assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
 }
 
 #[tokio::test]

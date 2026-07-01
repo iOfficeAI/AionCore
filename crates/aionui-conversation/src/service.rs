@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
-use aionui_ai_agent::types::{BuildTaskOptions, CONVERSATION_CRON_ENV_VERSION};
+use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
@@ -2545,7 +2545,7 @@ impl ConversationService {
                 return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
         };
-        self.inject_conversation_cron_env(&mut build_opts, user_id, conversation_id);
+        build_opts.apply_conversation_runtime_context(user_id, conversation_id);
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
@@ -2663,7 +2663,7 @@ impl ConversationService {
             }
         };
 
-        self.inject_conversation_cron_env(&mut build_opts, &request.user_id, &request.conversation_id);
+        build_opts.apply_conversation_runtime_context(&request.user_id, &request.conversation_id);
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let conversation_id = request.conversation_id.clone();
@@ -2876,7 +2876,7 @@ impl ConversationService {
         reject_deprecated_runtime_row(&row)?;
 
         let mut build_opts = self.build_task_options(&row).await?;
-        self.inject_conversation_cron_env(&mut build_opts, user_id, conversation_id);
+        build_opts.apply_conversation_runtime_context(user_id, conversation_id);
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let backend = build_options_backend(&build_opts).map(str::to_owned);
@@ -3000,22 +3000,6 @@ impl ConversationService {
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
             .build_options_with_workspace_override(row, workspace_override)
             .await
-    }
-
-    fn inject_conversation_cron_env(&self, options: &mut BuildTaskOptions, user_id: &str, conversation_id: &str) {
-        options
-            .context
-            .runtime_env
-            .retain(|(key, _)| key != "AIONUI_USER_ID" && key != "AIONUI_CONVERSATION_ID");
-        options
-            .context
-            .runtime_env
-            .push(("AIONUI_USER_ID".to_owned(), user_id.to_owned()));
-        options
-            .context
-            .runtime_env
-            .push(("AIONUI_CONVERSATION_ID".to_owned(), conversation_id.to_owned()));
-        options.runtime_capabilities.conversation_cron_env_version = Some(CONVERSATION_CRON_ENV_VERSION);
     }
 
     /// Ensure native skill links exist in the runtime workspace. Auto
