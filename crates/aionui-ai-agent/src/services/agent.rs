@@ -76,6 +76,20 @@ impl AgentService {
 
 // Agent operations
 impl AgentService {
+    /// Legacy `/api/agents` listing used by the AionUi frontend.
+    ///
+    /// Returns the same `AgentMetadata` shape as `refresh_agents` without
+    /// re-probing availability, so guid/cron/team selectors load instantly.
+    pub async fn list_agents(&self) -> Result<Vec<AgentMetadata>, AgentError> {
+        Ok(self
+            .registry
+            .list_all()
+            .await
+            .into_iter()
+            .filter(|agent| agent.agent_type.supports_new_conversation())
+            .collect())
+    }
+
     pub async fn refresh_agents(&self) -> Result<Vec<AgentMetadata>, AgentError> {
         self.registry.refresh_availability().await;
         Ok(self
