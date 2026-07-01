@@ -4,11 +4,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
-use aionui_ai_agent::types::BuildTaskOptions;
+use aionui_ai_agent::types::{BuildTaskOptions, CONVERSATION_CRON_ENV_VERSION};
 use aionui_ai_agent::{AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
-use crate::response_middleware::ICronService;
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
@@ -53,7 +52,7 @@ use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
 
-pub(crate) const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
+pub(crate) const MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN: usize = 4;
 const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
@@ -319,10 +318,8 @@ pub struct ConversationService {
     /// Hooks invoked during `delete()` before the DB row is removed so other services
     /// (`WorkerTaskManagerImpl`, `CronService`, …) can clean up their
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
-    /// can happen post-construction without breaking the `Clone` impl —
-    /// mirrors the `cron_service` slot pattern below.
+    /// can happen post-construction without breaking the `Clone` impl.
     delete_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationDelete>>>>,
-    cron_service: Arc<RwLock<Option<Arc<dyn ICronService>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
@@ -392,7 +389,6 @@ impl ConversationService {
             skill_resolver,
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
-            cron_service: Arc::new(RwLock::new(None)),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
@@ -420,12 +416,6 @@ impl ConversationService {
         std::fs::create_dir_all(&ws_path)
             .map_err(|e| ConversationError::internal(format!("Failed to create Team temporary workspace: {e}")))?;
         Ok(ws_path.to_string_lossy().into_owned())
-    }
-
-    pub fn with_cron_service(&self, cron_service: Option<Arc<dyn ICronService>>) {
-        if let Ok(mut guard) = self.cron_service.write() {
-            *guard = cron_service;
-        }
     }
 
     pub fn with_mcp_server_repo(&self, repo: Arc<dyn IMcpServerRepository>) {
@@ -2531,7 +2521,7 @@ impl ConversationService {
         ));
 
         // Build task options from conversation row
-        let build_opts = match self.build_task_options(&row).await {
+        let mut build_opts = match self.build_task_options(&row).await {
             Ok(opts) => opts,
             Err(err) => {
                 error!(
@@ -2555,6 +2545,7 @@ impl ConversationService {
                 return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
         };
+        self.inject_conversation_cron_env(&mut build_opts, user_id, conversation_id);
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
@@ -2646,7 +2637,7 @@ impl ConversationService {
             .await;
         }
 
-        let build_opts = match self.build_task_options(&row).await {
+        let mut build_opts = match self.build_task_options(&row).await {
             Ok(opts) => opts,
             Err(err) => {
                 let top_level_code = err.error_code();
@@ -2672,6 +2663,7 @@ impl ConversationService {
             }
         };
 
+        self.inject_conversation_cron_env(&mut build_opts, &request.user_id, &request.conversation_id);
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let conversation_id = request.conversation_id.clone();
@@ -2883,7 +2875,8 @@ impl ConversationService {
 
         reject_deprecated_runtime_row(&row)?;
 
-        let build_opts = self.build_task_options(&row).await?;
+        let mut build_opts = self.build_task_options(&row).await?;
+        self.inject_conversation_cron_env(&mut build_opts, user_id, conversation_id);
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let backend = build_options_backend(&build_opts).map(str::to_owned);
@@ -3009,6 +3002,22 @@ impl ConversationService {
             .await
     }
 
+    fn inject_conversation_cron_env(&self, options: &mut BuildTaskOptions, user_id: &str, conversation_id: &str) {
+        options
+            .context
+            .runtime_env
+            .retain(|(key, _)| key != "AIONUI_USER_ID" && key != "AIONUI_CONVERSATION_ID");
+        options
+            .context
+            .runtime_env
+            .push(("AIONUI_USER_ID".to_owned(), user_id.to_owned()));
+        options
+            .context
+            .runtime_env
+            .push(("AIONUI_CONVERSATION_ID".to_owned(), conversation_id.to_owned()));
+        options.runtime_capabilities.conversation_cron_env_version = Some(CONVERSATION_CRON_ENV_VERSION);
+    }
+
     /// Ensure native skill links exist in the runtime workspace. Auto
     /// workspaces are constrained to AionUi's generated path; custom
     /// workspaces were validated when the session context was built.
@@ -3130,13 +3139,6 @@ impl ConversationService {
         });
         let event = WebSocketMessage::new("conversation.listChanged", payload);
         self.broadcaster.broadcast(event);
-    }
-
-    pub(crate) fn current_cron_service(&self) -> Option<Arc<dyn ICronService>> {
-        match self.cron_service.read() {
-            Ok(guard) => guard.as_ref().map(Arc::clone),
-            Err(_) => None,
-        }
     }
 
     pub(crate) fn skill_resolver(&self) -> Arc<dyn SkillResolver> {

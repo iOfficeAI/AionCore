@@ -9,12 +9,11 @@ use std::time::Duration;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
-use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+use aionui_ai_agent::types::{BuildTaskOptions, CONVERSATION_CRON_ENV_VERSION, SendMessageData};
 use aionui_ai_agent::{
     AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
 };
 
-use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
     ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload,
@@ -2896,44 +2895,6 @@ impl IAgentTask for ScriptedAgent {
 
 impl IMockAgent for ScriptedAgent {}
 
-struct MockCronContinuationService;
-
-#[async_trait::async_trait]
-impl ICronService for MockCronContinuationService {
-    async fn create_job(&self, _user_id: &str, _conversation_id: &str, params: &CronCreateParams) -> CronCommandResult {
-        CronCommandResult {
-            success: true,
-            message: format!("Created cron job '{}'", params.name),
-        }
-    }
-
-    async fn update_job(
-        &self,
-        _user_id: &str,
-        _conversation_id: &str,
-        _params: &CronUpdateParams,
-    ) -> CronCommandResult {
-        CronCommandResult {
-            success: true,
-            message: "Updated cron job".into(),
-        }
-    }
-
-    async fn list_jobs(&self, _user_id: &str, _conversation_id: &str) -> CronCommandResult {
-        CronCommandResult {
-            success: true,
-            message: "No scheduled tasks".into(),
-        }
-    }
-
-    async fn delete_job(&self, _user_id: &str, _job_id: &str) -> CronCommandResult {
-        CronCommandResult {
-            success: true,
-            message: "Deleted cron job".into(),
-        }
-    }
-}
-
 // ── send_message tests ──────────────────────────────────────────
 
 fn make_send_req() -> SendMessageRequest {
@@ -2941,6 +2902,27 @@ fn make_send_req() -> SendMessageRequest {
         "content": "Hello"
     }))
     .unwrap()
+}
+
+fn assert_conversation_cron_env(options: &BuildTaskOptions, user_id: &str, conversation_id: &str) {
+    assert!(
+        options
+            .context
+            .runtime_env
+            .contains(&("AIONUI_USER_ID".to_owned(), user_id.to_owned())),
+        "runtime env should include AIONUI_USER_ID"
+    );
+    assert!(
+        options
+            .context
+            .runtime_env
+            .contains(&("AIONUI_CONVERSATION_ID".to_owned(), conversation_id.to_owned())),
+        "runtime env should include AIONUI_CONVERSATION_ID"
+    );
+    assert_eq!(
+        options.runtime_capabilities.conversation_cron_env_version,
+        Some(CONVERSATION_CRON_ENV_VERSION)
+    );
 }
 
 async fn wait_for_turn_released(svc: &ConversationService, conversation_id: &str) {
@@ -2971,6 +2953,63 @@ async fn send_message_returns_accepted() {
     assert_eq!(response.msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
     assert!(response.turn_id.starts_with("turn_"), "turn_id must use turn_ prefix");
     assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
+}
+
+#[tokio::test]
+async fn send_message_injects_conversation_cron_env() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    assert_conversation_cron_env(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
+async fn run_agent_turn_injects_conversation_cron_env() {
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new("placeholder"),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let repo = Arc::new(MockRepo::new());
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr_dyn,
+        repo,
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+
+    let outcome = service
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "run scheduled task".into(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    assert_conversation_cron_env(&options[0], "user_1", &conv.id);
 }
 
 #[tokio::test]
@@ -4185,73 +4224,6 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
 }
 
 #[tokio::test]
-async fn send_message_continues_cron_system_responses() {
-    let (svc, broadcaster, _repo, _default_task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
-    let conv = svc.create("user_1", make_create_req()).await.unwrap();
-
-    let scripted_agent = Arc::new(ScriptedAgent::new(
-        &conv.id,
-        vec![
-            vec![
-                AgentStreamEvent::Text(TextEventData {
-                    content: "I'll check. [CRON_LIST]".into(),
-                }),
-                AgentStreamEvent::Finish(FinishEventData::default()),
-            ],
-            vec![
-                AgentStreamEvent::Text(TextEventData {
-                    content: "[CRON_CREATE]\nname: Daily Greeting\nschedule: 0 9 * * *\nschedule_description: Daily at 9:00 AM\nmessage: Say good morning\n[/CRON_CREATE]".into(),
-                }),
-                AgentStreamEvent::Finish(FinishEventData::default()),
-            ],
-            vec![
-                AgentStreamEvent::Text(TextEventData {
-                    content: "Done. The task is scheduled.".into(),
-                }),
-                AgentStreamEvent::Finish(FinishEventData::default()),
-            ],
-        ],
-    ));
-    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent.clone()));
-    svc.with_cron_service(Some(Arc::new(MockCronContinuationService)));
-
-    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
-    let req: SendMessageRequest = serde_json::from_value(json!({
-        "content": "Create the task now"
-    }))
-    .unwrap();
-
-    svc.send_message("user_1", &conv.id, req, &task_mgr_dyn).await.unwrap();
-
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if scripted_agent.sent_contents().len() >= 3 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-
-    let sends = scripted_agent.sent_contents();
-    assert_eq!(sends.len(), 3);
-    assert_eq!(sends[0], "Create the task now");
-    assert_eq!(sends[1], "[System: No scheduled tasks]");
-    assert_eq!(sends[2], "[System: Created cron job 'Daily Greeting']");
-
-    let finished = svc.get("user_1", &conv.id).await.unwrap();
-    assert_eq!(finished.status, ConversationStatus::Finished);
-
-    let events = broadcaster.take_events();
-    let turn_events: Vec<_> = events.iter().filter(|evt| evt.name == "turn.completed").collect();
-    assert_eq!(turn_events.len(), 1);
-    assert_eq!(turn_events[0].data["runtime"]["is_processing"], false);
-    assert_eq!(turn_events[0].data["runtime"]["can_send_message"], true);
-}
-
-#[tokio::test]
 async fn send_message_keeps_acp_task_after_normal_finish() {
     let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
@@ -5021,6 +4993,22 @@ async fn warmup_creates_agent_task() {
 
     // Agent should now exist
     assert!(task_mgr.get_task(&conv.id).is_some());
+}
+
+#[tokio::test]
+async fn warmup_injects_conversation_cron_env() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.warmup("user_1", &conv.id, &task_mgr_dyn).await.unwrap();
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    assert_conversation_cron_env(&options[0], "user_1", &conv.id);
 }
 
 #[tokio::test]

@@ -4,11 +4,12 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 
 use aionui_api_types::{
-    ApiResponse, ConversationResponse, CreateCronJobRequest, CronJobResponse, HasSkillResponse, ListCronJobsQuery,
-    RunNowResponse, SaveCronSkillRequest, UpdateCronJobRequest,
+    ApiResponse, ConversationResponse, CreateConversationCronRequest, CreateConversationCronResponse,
+    CreateCronJobRequest, CronJobResponse, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
+    UpdateConversationCronRequest, UpdateCronJobRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -55,6 +56,12 @@ pub fn cron_routes(state: CronRouterState) -> Router {
         .route("/api/cron/jobs", get(list_jobs).post(create_job))
         .route("/api/cron/jobs/{id}", get(get_job).put(update_job).delete(delete_job))
         .route("/api/cron/jobs/{id}/run", post(run_now))
+        .route("/api/internal/conversation-cron/create", post(create_conversation_cron))
+        .route("/api/internal/conversation-cron/list", get(list_conversation_cron))
+        .route(
+            "/api/internal/conversation-cron/jobs/{id}",
+            put(update_conversation_cron),
+        )
         .route("/api/cron/internal/system-resume", post(system_resume))
         .route("/api/cron/jobs/{id}/conversations", get(list_conversations_by_cron_job))
         .route(
@@ -136,6 +143,61 @@ async fn system_resume(
     Ok(Json(ApiResponse::success()))
 }
 
+async fn create_conversation_cron(
+    State(state): State<CronRouterState>,
+    headers: HeaderMap,
+    body: Result<Json<CreateConversationCronRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<CreateConversationCronResponse>>, ApiError> {
+    let user_id = header_value(&headers, "x-aionui-user-id")?;
+    let conversation_id = header_value(&headers, "x-aionui-conversation-id")?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    let resp = state
+        .cron_service
+        .create_for_conversation_helper(&user_id, &conversation_id, req)
+        .await?;
+    Ok(Json(ApiResponse::ok(resp)))
+}
+
+async fn list_conversation_cron(
+    State(state): State<CronRouterState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<Vec<CronJobResponse>>>, ApiError> {
+    let user_id = header_value(&headers, "x-aionui-user-id")?;
+    let conversation_id = header_value(&headers, "x-aionui-conversation-id")?;
+    let jobs = state
+        .cron_service
+        .list_for_conversation_helper(&user_id, &conversation_id)
+        .await?;
+    let items = jobs.iter().map(CronService::to_response).collect();
+    Ok(Json(ApiResponse::ok(items)))
+}
+
+async fn update_conversation_cron(
+    State(state): State<CronRouterState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateConversationCronRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<CronJobResponse>>, ApiError> {
+    let user_id = header_value(&headers, "x-aionui-user-id")?;
+    let conversation_id = header_value(&headers, "x-aionui-conversation-id")?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    let job = state
+        .cron_service
+        .update_for_conversation_helper(&user_id, &conversation_id, &id, req)
+        .await?;
+    Ok(Json(ApiResponse::ok(CronService::to_response(&job))))
+}
+
+fn header_value(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| ApiError::BadRequest(format!("missing required header: {name}")))
+}
+
 async fn save_skill(
     State(state): State<CronRouterState>,
     Extension(_user): Extension<CurrentUser>,
@@ -177,6 +239,31 @@ async fn delete_skill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_value_rejects_missing_or_blank_required_header() {
+        let mut headers = HeaderMap::new();
+
+        assert!(matches!(
+            header_value(&headers, "x-aionui-user-id"),
+            Err(ApiError::BadRequest(message)) if message.contains("x-aionui-user-id")
+        ));
+
+        headers.insert("x-aionui-user-id", "   ".parse().unwrap());
+
+        assert!(matches!(
+            header_value(&headers, "x-aionui-user-id"),
+            Err(ApiError::BadRequest(message)) if message.contains("x-aionui-user-id")
+        ));
+    }
+
+    #[test]
+    fn header_value_trims_required_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-aionui-user-id", " user_1 ".parse().unwrap());
+
+        assert_eq!(header_value(&headers, "x-aionui-user-id").unwrap(), "user_1");
+    }
 
     #[test]
     fn job_not_found_maps_to_not_found() {

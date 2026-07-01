@@ -11,7 +11,7 @@ use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
 use crate::runtime_state::RuntimeLifecycleState;
 use crate::runtime_state::TurnClaim;
 use crate::service::{
-    ConversationService, MAX_CRON_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
+    ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
 };
 use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
@@ -188,7 +188,7 @@ impl ConversationTurnOrchestrator {
         let runtime_state = self.service.runtime_state();
         let mut pending_send = Some((input.send, input.msg_id));
         let mut continuation_count = input.continuation_count;
-        let continuation_policy = TurnContinuationPolicy::new(MAX_CRON_CONTINUATIONS_PER_TURN);
+        let continuation_policy = TurnContinuationPolicy::new(MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN);
         let mut last_outcome = None;
         let mut aggregate_summary = TurnAttemptSummary::default();
 
@@ -205,7 +205,6 @@ impl ConversationTurnOrchestrator {
                 input.user_id.clone(),
                 self.service.conversation_repo().clone(),
                 self.service.broadcaster().clone(),
-                self.service.current_cron_service(),
             )
             .with_skill_resolver(self.service.skill_resolver())
             .with_allowed_skill_names(input.allowed_skill_names.clone())

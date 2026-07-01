@@ -246,6 +246,9 @@ pub enum AgentKillReason {
     /// watchdog timeout. The stale ACP process is recycled while the user turn
     /// is treated as a clean cancellation.
     UserCancelTimeout,
+    /// The requested runtime capabilities changed, so the in-memory task must
+    /// be rebuilt before handling the next turn.
+    RuntimeCapabilityChanged,
 }
 
 /// Preview content type for document preview history.

@@ -167,6 +167,7 @@ pub(super) async fn build(
         session_mode: overrides.session_mode,
         extra_mcp_servers,
         bedrock_config,
+        runtime_env: ctx.runtime_env,
     };
 
     if let Some(system_prompt) = config.system_prompt.as_deref()

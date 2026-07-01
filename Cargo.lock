@@ -601,6 +601,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -633,6 +634,7 @@ dependencies = [
  "axum",
  "dirs",
  "fs2",
+ "hex",
  "http-body-util",
  "include_dir",
  "junction",
@@ -642,6 +644,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

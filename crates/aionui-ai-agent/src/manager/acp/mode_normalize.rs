@@ -1,6 +1,6 @@
 use aionui_api_types::AgentMetadata;
 
-pub(super) fn normalize_requested_mode(metadata: &AgentMetadata, mode: &str) -> String {
+pub(crate) fn normalize_requested_mode(metadata: &AgentMetadata, mode: &str) -> String {
     let trimmed = mode.trim();
     if trimmed.is_empty() {
         return String::new();

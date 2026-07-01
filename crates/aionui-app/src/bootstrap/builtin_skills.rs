@@ -16,13 +16,12 @@ pub(super) async fn materialize_builtin_skills(data_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    aionui_extension::materialize_if_needed(
-        data_dir,
-        aionui_extension::builtin_skills_corpus(),
-        env!("CARGO_PKG_VERSION"),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to materialize builtin skills: {e}"))?;
+    let corpus = aionui_extension::builtin_skills_corpus();
+    let marker = aionui_extension::builtin_skills_materialize_marker(corpus, env!("CARGO_PKG_VERSION"));
+
+    aionui_extension::materialize_if_needed(data_dir, corpus, &marker)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to materialize builtin skills: {e}"))?;
 
     // Best-effort cleanup of directories left behind by pre-symlink
     // refactors. Failures are non-fatal — stale empty dirs are harmless.
@@ -39,4 +38,18 @@ pub(super) async fn materialize_builtin_skills(data_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn materialize_marker_includes_builtin_skill_corpus_fingerprint() {
+        let marker = aionui_extension::builtin_skills_materialize_marker(
+            aionui_extension::builtin_skills_corpus(),
+            env!("CARGO_PKG_VERSION"),
+        );
+
+        assert_ne!(marker, env!("CARGO_PKG_VERSION"));
+        assert!(marker.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+builtin-skills.")));
+    }
 }

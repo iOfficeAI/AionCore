@@ -369,7 +369,6 @@ pub fn build_conversation_state(
     }
     if let Some(cron_service) = cron_service {
         conversation_service.with_delete_hook(cron_service.clone());
-        conversation_service.with_cron_service(Some(cron_service));
     }
     ConversationRouterState {
         service: conversation_service,

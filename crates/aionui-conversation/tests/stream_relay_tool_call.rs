@@ -81,7 +81,6 @@ async fn run_tool_call_with_empty_call_id_is_not_persisted() {
         "system_default_user".into(),
         repo.clone(),
         bus,
-        None,
     );
 
     let rx = tx.subscribe();
@@ -129,7 +128,6 @@ async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
         "system_default_user".into(),
         repo.clone(),
         bus,
-        None,
     );
 
     let rx = tx.subscribe();

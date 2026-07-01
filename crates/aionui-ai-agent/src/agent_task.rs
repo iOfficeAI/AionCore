@@ -528,6 +528,7 @@ mod aionrs_config_option_tests {
             session_mode: None,
             extra_mcp_servers: std::collections::HashMap::new(),
             bedrock_config: None,
+            runtime_env: Vec::new(),
         }
     }
 

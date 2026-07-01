@@ -3,8 +3,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aionui_api_types::{
-    CreateCronJobRequest, CronJobResponse, CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse,
-    SaveCronSkillRequest, UpdateCronJobRequest,
+    CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronJobResponse,
+    CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
+    UpdateConversationCronRequest, UpdateCronJobRequest,
 };
 use aionui_common::{
     AgentType, ProviderWithModel, WorkspacePathValidationError, generate_prefixed_id, now_ms,
@@ -82,6 +83,147 @@ impl CronService {
 
     pub async fn add_job(&self, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
         self.add_job_internal(req, None, None).await
+    }
+
+    pub async fn create_for_conversation_helper(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: CreateConversationCronRequest,
+    ) -> Result<CreateConversationCronResponse, CronError> {
+        let row = self
+            .verify_conversation_helper_context(user_id, conversation_id)
+            .await?;
+
+        let schedule_dto = CronScheduleDto::Cron {
+            expr: req.schedule,
+            tz: None,
+            description: Some(req.schedule_description),
+        };
+
+        let conversation_title = Some(row.name.clone());
+        let (agent_type, agent_config, assistant_backend_override) =
+            self.build_agent_config_from_conversation(&row).await;
+        let create_req = CreateCronJobRequest {
+            name: req.name,
+            description: None,
+            schedule: schedule_dto,
+            prompt: None,
+            message: Some(req.message),
+            conversation_id: conversation_id.to_owned(),
+            conversation_title,
+            created_by: "agent".to_owned(),
+            execution_mode: Some("existing".to_owned()),
+            agent_config,
+        };
+
+        let job = self
+            .add_job_internal(create_req, Some(agent_type), assistant_backend_override)
+            .await?;
+        if let Err(err) = self
+            .executor
+            .bind_cron_job_to_conversation(conversation_id, &job.id)
+            .await
+        {
+            if let Err(cleanup_err) = self.remove_job(&job.id).await {
+                warn!(
+                    conversation_id,
+                    job_id = %job.id,
+                    error = %cleanup_err,
+                    "Failed to remove cron job after helper conversation binding failed"
+                );
+            }
+            warn!(
+                conversation_id,
+                job_id = %job.id,
+                error = %err,
+                "Cron helper failed to bind conversation to job"
+            );
+            return Err(err);
+        }
+
+        Ok(CreateConversationCronResponse {
+            job_id: job.id.clone(),
+            message: format!("Created cron job '{}' ({})", job.name, job.id),
+        })
+    }
+
+    pub async fn list_for_conversation_helper(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<CronJob>, CronError> {
+        self.verify_conversation_helper_context(user_id, conversation_id)
+            .await?;
+        self.list_jobs(&ListCronJobsQuery {
+            conversation_id: Some(conversation_id.to_owned()),
+        })
+        .await
+    }
+
+    pub async fn update_for_conversation_helper(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        req: UpdateConversationCronRequest,
+    ) -> Result<CronJob, CronError> {
+        self.verify_conversation_helper_context(user_id, conversation_id)
+            .await?;
+
+        let existing = self.get_job(job_id).await?;
+        if existing.conversation_id != conversation_id {
+            return Err(CronError::JobNotFound(job_id.to_owned()));
+        }
+
+        let job = self
+            .update_job(
+                job_id,
+                UpdateCronJobRequest {
+                    name: Some(req.name),
+                    description: None,
+                    enabled: None,
+                    schedule: Some(CronScheduleDto::Cron {
+                        expr: req.schedule,
+                        tz: None,
+                        description: Some(req.schedule_description),
+                    }),
+                    message: Some(req.message),
+                    execution_mode: None,
+                    agent_config: None,
+                    conversation_title: None,
+                    max_retries: None,
+                },
+            )
+            .await?;
+
+        self.executor
+            .bind_cron_job_to_conversation(conversation_id, &job.id)
+            .await?;
+
+        Ok(job)
+    }
+
+    async fn verify_conversation_helper_context(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<aionui_db::models::ConversationRow, CronError> {
+        if !self.executor.is_conversation_claimed(conversation_id) {
+            return Err(CronError::InvalidAgentConfig(
+                "cron helper can only manage jobs during an active conversation turn".into(),
+            ));
+        }
+
+        self.executor
+            .get_conversation_row(conversation_id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| {
+                CronError::Conversation(aionui_conversation::ConversationError::NotFound {
+                    id: conversation_id.to_owned(),
+                })
+            })
     }
 
     async fn add_job_internal(
@@ -1172,195 +1314,6 @@ impl CronService {
 impl aionui_common::OnConversationDelete for CronService {
     async fn on_conversation_deleted(&self, conversation_id: &str) {
         self.delete_jobs_by_conversation(conversation_id).await;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ICronService implementation (for middleware)
-// ---------------------------------------------------------------------------
-
-#[async_trait::async_trait]
-impl aionui_conversation::response_middleware::ICronService for CronService {
-    async fn create_job(
-        &self,
-        _user_id: &str,
-        conversation_id: &str,
-        params: &aionui_conversation::response_middleware::CronCreateParams,
-    ) -> aionui_conversation::response_middleware::CronCommandResult {
-        let schedule_dto = CronScheduleDto::Cron {
-            expr: params.schedule.clone(),
-            tz: None,
-            description: Some(params.schedule_description.clone()),
-        };
-
-        let (agent_type, conversation_title, agent_config, assistant_backend_override) =
-            match self.executor.get_conversation_row(conversation_id).await {
-                Ok(Some(row)) => {
-                    let title = Some(row.name.clone());
-                    let (agent_type, agent_config, assistant_backend_override) =
-                        self.build_agent_config_from_conversation(&row).await;
-                    (agent_type, title, agent_config, assistant_backend_override)
-                }
-                Ok(None) => ("acp".to_owned(), None, None, None),
-                Err(err) => {
-                    warn!(
-                        conversation_id,
-                        error = %err,
-                        "Failed to load conversation context for cron create; falling back to defaults"
-                    );
-                    ("acp".to_owned(), None, None, None)
-                }
-            };
-
-        let req = CreateCronJobRequest {
-            name: params.name.clone(),
-            description: None,
-            schedule: schedule_dto,
-            prompt: None,
-            message: Some(params.message.clone()),
-            conversation_id: conversation_id.to_owned(),
-            conversation_title,
-            created_by: "agent".to_owned(),
-            execution_mode: Some("existing".to_owned()),
-            agent_config,
-        };
-
-        match self
-            .add_job_internal(req, Some(agent_type), assistant_backend_override)
-            .await
-        {
-            Ok(job) => {
-                if let Err(err) = self
-                    .executor
-                    .bind_cron_job_to_conversation(conversation_id, &job.id)
-                    .await
-                {
-                    warn!(
-                        conversation_id,
-                        job_id = %job.id,
-                        error = %err,
-                        "Cron job created but failed to bind conversation to job"
-                    );
-                }
-
-                aionui_conversation::response_middleware::CronCommandResult {
-                    success: true,
-                    message: format!("Created cron job '{}' ({})", job.name, job.id),
-                }
-            }
-            Err(e) => aionui_conversation::response_middleware::CronCommandResult {
-                success: false,
-                message: e.to_string(),
-            },
-        }
-    }
-
-    async fn update_job(
-        &self,
-        _user_id: &str,
-        conversation_id: &str,
-        params: &aionui_conversation::response_middleware::CronUpdateParams,
-    ) -> aionui_conversation::response_middleware::CronCommandResult {
-        let req = UpdateCronJobRequest {
-            name: Some(params.name.clone()),
-            description: None,
-            enabled: None,
-            schedule: Some(CronScheduleDto::Cron {
-                expr: params.schedule.clone(),
-                tz: None,
-                description: Some(params.schedule_description.clone()),
-            }),
-            message: Some(params.message.clone()),
-            execution_mode: None,
-            agent_config: None,
-            conversation_title: None,
-            max_retries: None,
-        };
-
-        match self.update_job(&params.job_id, req).await {
-            Ok(job) => {
-                if let Err(err) = self
-                    .executor
-                    .bind_cron_job_to_conversation(conversation_id, &job.id)
-                    .await
-                {
-                    warn!(
-                        conversation_id,
-                        job_id = %job.id,
-                        error = %err,
-                        "Cron job updated but failed to bind conversation to job"
-                    );
-                }
-
-                aionui_conversation::response_middleware::CronCommandResult {
-                    success: true,
-                    message: format!("Updated cron job '{}' ({})", job.name, job.id),
-                }
-            }
-            Err(e) => aionui_conversation::response_middleware::CronCommandResult {
-                success: false,
-                message: e.to_string(),
-            },
-        }
-    }
-
-    async fn list_jobs(
-        &self,
-        _user_id: &str,
-        conversation_id: &str,
-    ) -> aionui_conversation::response_middleware::CronCommandResult {
-        let query = ListCronJobsQuery {
-            conversation_id: Some(conversation_id.to_owned()),
-        };
-        match self.list_jobs(&query).await {
-            Ok(jobs) => {
-                if jobs.is_empty() {
-                    return aionui_conversation::response_middleware::CronCommandResult {
-                        success: true,
-                        message: format!("No cron jobs found for conversation '{}'.", conversation_id),
-                    };
-                }
-
-                let lines: Vec<String> = jobs
-                    .iter()
-                    .map(|j| {
-                        let status = if j.enabled { "enabled" } else { "disabled" };
-                        format!("- {} ({}) [{}]", j.name, j.id, status)
-                    })
-                    .collect();
-
-                aionui_conversation::response_middleware::CronCommandResult {
-                    success: true,
-                    message: format!(
-                        "Found {} cron job(s) for conversation '{}':\n{}",
-                        jobs.len(),
-                        conversation_id,
-                        lines.join("\n")
-                    ),
-                }
-            }
-            Err(e) => aionui_conversation::response_middleware::CronCommandResult {
-                success: false,
-                message: e.to_string(),
-            },
-        }
-    }
-
-    async fn delete_job(
-        &self,
-        _user_id: &str,
-        job_id: &str,
-    ) -> aionui_conversation::response_middleware::CronCommandResult {
-        match self.remove_job(job_id).await {
-            Ok(()) => aionui_conversation::response_middleware::CronCommandResult {
-                success: true,
-                message: format!("Deleted cron job '{job_id}'"),
-            },
-            Err(e) => aionui_conversation::response_middleware::CronCommandResult {
-                success: false,
-                message: e.to_string(),
-            },
-        }
     }
 }
 

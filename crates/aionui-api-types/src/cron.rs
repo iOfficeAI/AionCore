@@ -163,6 +163,32 @@ pub struct CreateCronJobRequest {
     pub agent_config: Option<CronAgentConfigWriteDto>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateConversationCronRequest {
+    pub name: String,
+    pub schedule: String,
+    #[serde(default)]
+    pub schedule_description: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateConversationCronResponse {
+    pub job_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateConversationCronRequest {
+    pub name: String,
+    pub schedule: String,
+    #[serde(default)]
+    pub schedule_description: String,
+    #[serde(default)]
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateCronJobRequest {
     #[serde(default)]
@@ -227,7 +253,21 @@ pub struct CronJobExecutedEvent {
 
 #[cfg(test)]
 mod write_tests {
-    use super::CronAgentConfigWriteDto;
+    use super::{CreateConversationCronRequest, CronAgentConfigWriteDto};
+
+    #[test]
+    fn create_conversation_cron_request_preserves_multiline_message() {
+        let raw = serde_json::json!({
+            "name": "Daily summary",
+            "schedule": "0 9 * * *",
+            "schedule_description": "Daily at 9",
+            "message": "first\nsecond\nthird",
+        });
+
+        let req: CreateConversationCronRequest = serde_json::from_value(raw).unwrap();
+
+        assert_eq!(req.message, "first\nsecond\nthird");
+    }
 
     #[test]
     fn cron_agent_config_write_rejects_legacy_custom_agent_id() {

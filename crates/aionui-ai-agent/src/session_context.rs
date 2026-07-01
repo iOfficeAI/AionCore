@@ -14,6 +14,7 @@ pub struct AgentSessionContext {
     pub workspace: WorkspaceContext,
     pub model: ProviderWithModel,
     pub skills: Vec<String>,
+    pub runtime_env: Vec<(String, String)>,
     pub team: Option<TeamSessionBinding>,
     pub kind: AgentSessionKind,
 }

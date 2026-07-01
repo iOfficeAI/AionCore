@@ -27,15 +27,37 @@ pub struct SendMessageData {
 #[derive(Debug, Clone)]
 pub struct BuildTaskOptions {
     pub context: AgentSessionContext,
+    pub runtime_capabilities: RuntimeCapabilities,
 }
 
 impl BuildTaskOptions {
     pub fn new(context: AgentSessionContext) -> Self {
-        Self { context }
+        Self {
+            context,
+            runtime_capabilities: RuntimeCapabilities::default(),
+        }
     }
 
     pub fn conversation_id(&self) -> &str {
         self.context.conversation_id()
+    }
+}
+
+pub const CONVERSATION_CRON_ENV_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeCapabilities {
+    pub conversation_cron_env_version: Option<u32>,
+}
+
+impl RuntimeCapabilities {
+    pub fn satisfies(&self, requested: &Self) -> bool {
+        match requested.conversation_cron_env_version {
+            Some(version) => self
+                .conversation_cron_env_version
+                .is_some_and(|actual| actual >= version),
+            None => true,
+        }
     }
 }
 
@@ -77,6 +99,8 @@ pub struct AionrsResolvedConfig {
     pub extra_mcp_servers: HashMap<String, aion_config::config::McpServerConfig>,
     /// AWS Bedrock credentials (region + access key or profile).
     pub bedrock_config: Option<aion_config::config::BedrockConfig>,
+    /// Per-turn environment values exposed to runtime tool execution.
+    pub runtime_env: Vec<(String, String)>,
 }
 
 #[cfg(test)]

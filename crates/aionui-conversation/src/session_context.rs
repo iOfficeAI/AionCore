@@ -84,6 +84,7 @@ impl<'a> SessionContextBuilder<'a> {
             workspace,
             model,
             skills,
+            runtime_env: Vec::new(),
             team,
             kind,
         })
