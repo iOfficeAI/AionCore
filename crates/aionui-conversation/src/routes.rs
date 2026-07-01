@@ -105,6 +105,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
         .route("/api/conversations/{id}/warmup", post(warmup))
+        .route("/api/conversations/{id}/active-lease", post(active_lease))
         // Confirmation system
         .route("/api/conversations/{id}/confirmations", get(list_confirmations))
         .route("/api/conversations/{id}/confirmations/{callId}/confirm", post(confirm))
@@ -312,6 +313,19 @@ async fn warmup(
     state
         .service
         .warmup(&user.id, &id, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn active_lease(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .renew_active_lease(&user.id, &id, &state.active_leases)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))

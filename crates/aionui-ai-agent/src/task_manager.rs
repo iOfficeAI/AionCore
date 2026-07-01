@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures_util::future::{BoxFuture, join_all};
 use tokio::sync::OnceCell;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::active_lease::ActiveLeaseRegistry;
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::types::BuildTaskOptions;
@@ -63,8 +64,10 @@ pub trait IWorkerTaskManager: Send + Sync {
     /// Collect tasks eligible for idle cleanup.
     ///
     /// Returns conversation IDs of tasks that:
-    /// - have `status == Some(Finished)`
+    /// - are ACP agents
+    /// - have `status == None` or `status == Some(Finished)`
     /// - have been idle longer than `idle_threshold_ms`
+    /// - are not protected by an active foreground lease
     fn collect_idle(&self, idle_threshold_ms: TimestampMs) -> Vec<String>;
 }
 
@@ -78,13 +81,19 @@ type TaskSlot = Arc<OnceCell<AgentInstance>>;
 pub struct WorkerTaskManagerImpl {
     tasks: DashMap<String, TaskSlot>,
     factory: AgentFactory,
+    active_leases: Arc<ActiveLeaseRegistry>,
 }
 
 impl WorkerTaskManagerImpl {
     pub fn new(factory: AgentFactory) -> Self {
+        Self::new_with_active_leases(factory, Arc::new(ActiveLeaseRegistry::new()))
+    }
+
+    pub fn new_with_active_leases(factory: AgentFactory, active_leases: Arc<ActiveLeaseRegistry>) -> Self {
         Self {
             tasks: DashMap::new(),
             factory,
+            active_leases,
         }
     }
 
@@ -197,23 +206,37 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                 let last_activity_at = agent.last_activity_at();
                 let idle_ms = now.saturating_sub(last_activity_at);
 
-                let selected = agent_type == AgentType::Acp
-                    && status == Some(ConversationStatus::Finished)
-                    && idle_ms > idle_threshold_ms;
-                if selected {
-                    info!(
+                if agent_type != AgentType::Acp
+                    || !matches!(status, None | Some(ConversationStatus::Finished))
+                    || idle_ms <= idle_threshold_ms
+                {
+                    return None;
+                }
+
+                if let Some(expires_at) = self.active_leases.active_until(entry.key()) {
+                    debug!(
                         conversation_id = %entry.key(),
-                        ?agent_type,
                         ?status,
                         idle_ms,
-                        threshold_ms = idle_threshold_ms,
-                        last_activity_at,
-                        "Idle scan: selected idle agent"
+                        lease_expires_in_ms = expires_at.saturating_sub(now),
+                        reason = %"ActiveLease",
+                        "Idle scan: active lease protects idle agent"
                     );
-                    Some(entry.key().clone())
-                } else {
-                    None
+                    return None;
                 }
+
+                let idle_class = if status.is_none() { "WarmupOnly" } else { "Finished" };
+                info!(
+                    conversation_id = %entry.key(),
+                    ?agent_type,
+                    ?status,
+                    idle_ms,
+                    threshold_ms = idle_threshold_ms,
+                    idle_class = %idle_class,
+                    reason = %"IdleTimeout",
+                    "Idle scan: selected idle agent"
+                );
+                Some(entry.key().clone())
             })
             .collect()
     }
@@ -537,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_idle_finds_finished_and_stale_acp_tasks() {
+    fn collect_idle_finds_finished_and_warmup_only_stale_acp_tasks() {
         let factory: AgentFactory = Arc::new(|_| async { unreachable!() }.boxed());
         let mgr = WorkerTaskManagerImpl::new(factory);
 
@@ -554,6 +577,12 @@ mod tests {
             mock_instance(
                 MockAgent::new("conv-stale", Some(ConversationStatus::Finished)).with_last_activity(now_ms() - 600_000),
             ),
+        );
+
+        // ACP + warmup-only + old activity → should be collected
+        insert(
+            "conv-warmup-only",
+            mock_instance(MockAgent::new("conv-warmup-only", None).with_last_activity(now_ms() - 600_000)),
         );
 
         // ACP + Finished + recent activity → should NOT be collected
@@ -584,8 +613,32 @@ mod tests {
         );
 
         let idle = mgr.collect_idle(300_000); // 5-min threshold
-        assert_eq!(idle.len(), 1);
-        assert_eq!(idle[0], "conv-stale");
+        assert_eq!(idle.len(), 2);
+        assert!(idle.contains(&"conv-stale".to_owned()));
+        assert!(idle.contains(&"conv-warmup-only".to_owned()));
+    }
+
+    #[test]
+    fn collect_idle_skips_tasks_with_active_lease() {
+        let active_leases = Arc::new(crate::ActiveLeaseRegistry::new());
+        active_leases.renew("conv-active");
+        let factory: AgentFactory = Arc::new(|_| async { unreachable!() }.boxed());
+        let mgr = WorkerTaskManagerImpl::new_with_active_leases(factory, active_leases);
+
+        let cell: OnceCell<AgentInstance> = OnceCell::new();
+        cell.set(mock_instance(
+            MockAgent::new("conv-active", Some(ConversationStatus::Finished)).with_last_activity(now_ms() - 600_000),
+        ))
+        .ok();
+        mgr.tasks.insert("conv-active".into(), Arc::new(cell));
+
+        let captured = capture_logs(tracing::Level::DEBUG, || {
+            let idle = mgr.collect_idle(300_000);
+            assert!(idle.is_empty());
+        });
+
+        assert!(captured.contains("reason=ActiveLease"));
+        assert!(captured.contains("lease_expires_in_ms="));
     }
 
     #[test]
@@ -611,7 +664,8 @@ mod tests {
         assert!(captured.contains("status=Some(Finished)"));
         assert!(captured.contains("idle_ms="));
         assert!(captured.contains("threshold_ms=5000"));
-        assert!(captured.contains("last_activity_at="));
+        assert!(captured.contains("idle_class=Finished"));
+        assert!(captured.contains("reason=IdleTimeout"));
     }
 
     #[test]

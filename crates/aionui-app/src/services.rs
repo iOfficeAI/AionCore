@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use crate::config::{AppConfig, derive_encryption_key};
 use aionui_ai_agent::{
-    AcpSessionSyncService, AcpSkillManager, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager, WorkerTaskManagerImpl,
-    build_agent_factory,
+    AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
+    WorkerTaskManagerImpl, build_agent_factory,
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
@@ -29,6 +29,7 @@ pub struct AppServices {
     pub ws_manager: Arc<WebSocketManager>,
     pub event_bus: Arc<BroadcastEventBus>,
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
+    pub active_lease_registry: Arc<ActiveLeaseRegistry>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
     /// Same instance as `worker_task_manager`, exposed through the
@@ -164,7 +165,11 @@ impl AppServices {
         // Agent factory is now wired. Future extension/custom agents
         // that get written to `agent_metadata` will show up after the
         // relevant service calls `AgentRegistry::hydrate`.
-        let task_manager_concrete = Arc::new(WorkerTaskManagerImpl::new(factory));
+        let active_lease_registry = Arc::new(ActiveLeaseRegistry::new());
+        let task_manager_concrete = Arc::new(WorkerTaskManagerImpl::new_with_active_leases(
+            factory,
+            active_lease_registry.clone(),
+        ));
         let worker_task_manager: Arc<dyn IWorkerTaskManager> = task_manager_concrete.clone();
         let task_manager_delete_hook: Arc<dyn OnConversationDelete> = task_manager_concrete;
         let conversation_runtime_state = Arc::new(ConversationRuntimeStateService::default());
@@ -189,6 +194,7 @@ impl AppServices {
             ws_manager: Arc::new(WebSocketManager::new()),
             event_bus,
             worker_task_manager,
+            active_lease_registry,
             conversation_runtime_state,
             conversation_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),

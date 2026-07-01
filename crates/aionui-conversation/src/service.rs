@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_ai_agent::{AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::{
+    ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
+};
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::response_middleware::ICronService;
@@ -2859,6 +2861,46 @@ impl ConversationService {
         Ok(CancelConversationResponse {
             runtime: self.runtime_summary_for(conversation_id).await,
         })
+    }
+
+    pub async fn renew_active_lease(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        active_leases: &ActiveLeaseRegistry,
+    ) -> Result<(), ConversationError> {
+        let row = match self.conversation_repo.get(conversation_id).await {
+            Ok(row) => row,
+            Err(error) => {
+                warn!(
+                    kind = "conversation",
+                    conversation_id,
+                    user_id,
+                    error = %ErrorChain(&error),
+                    "Conversation active lease renew failed"
+                );
+                return Err(error.into());
+            }
+        };
+
+        let Some(row) = row.filter(|row| row.user_id == user_id) else {
+            debug!(
+                kind = "conversation",
+                conversation_id, user_id, "Conversation active lease renew rejected"
+            );
+            return Err(ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            });
+        };
+
+        let expires_at = active_leases.renew(&row.id);
+        debug!(
+            kind = "conversation",
+            conversation_id = %row.id,
+            expires_at,
+            "Conversation active lease renewed"
+        );
+        Ok(())
     }
 
     /// Pre-initialize an agent task for a conversation (warmup).

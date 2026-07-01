@@ -9,7 +9,7 @@ use aionui_ai_agent::session_context::{
 };
 use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
+use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
@@ -1723,6 +1723,96 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
 async fn reset_auto_started_session(svc: &Arc<TeamSessionService>, tm: &Arc<CountingTaskManager>, team_id: &str) {
     svc.stop_session("user1", team_id).await.unwrap();
     tm.reset().await;
+}
+
+#[tokio::test]
+async fn renew_active_lease_records_all_team_agent_conversations() {
+    let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Lease Team".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let active_leases = ActiveLeaseRegistry::new();
+
+    svc.renew_active_lease("user1", &created.id, &active_leases)
+        .await
+        .expect("renew team lease");
+
+    for agent in &created.assistants {
+        assert!(active_leases.is_active(&agent.conversation_id));
+    }
+}
+
+#[tokio::test]
+async fn renew_active_lease_allows_empty_team_without_unrelated_lease() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo
+        .create_team(&aionui_db::models::TeamRow {
+            id: "team-empty".into(),
+            user_id: "user1".into(),
+            name: "Empty".into(),
+            workspace: String::new(),
+            workspace_mode: "shared".into(),
+            agents: "[]".into(),
+            lead_agent_id: None,
+            session_mode: None,
+            agents_version: "1.0.1".into(),
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        })
+        .await
+        .expect("insert empty team");
+    let active_leases = ActiveLeaseRegistry::new();
+
+    svc.renew_active_lease("user1", "team-empty", &active_leases)
+        .await
+        .expect("empty team renew is accepted");
+
+    assert!(!active_leases.is_active("team-empty"));
+    assert!(!active_leases.is_active("unrelated-conversation"));
+}
+
+#[tokio::test]
+async fn renew_active_lease_rejects_team_owned_by_other_user() {
+    let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Lease Team".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let active_leases = ActiveLeaseRegistry::new();
+
+    let err = svc
+        .renew_active_lease("other-user", &created.id, &active_leases)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, TeamError::Forbidden(_)));
+    for agent in &created.assistants {
+        assert!(!active_leases.is_active(&agent.conversation_id));
+    }
 }
 
 async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {
