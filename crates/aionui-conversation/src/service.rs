@@ -58,25 +58,6 @@ const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
-const ACP_VENDOR_LABELS: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "qwen",
-    "codebuddy",
-    "droid",
-    "goose",
-    "auggie",
-    "kimi",
-    "opencode",
-    "copilot",
-    "qoder",
-    "vibe",
-    "cursor",
-    "kiro",
-    "hermes",
-    "snow",
-];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct AssistantConversationOverrides {
@@ -152,6 +133,8 @@ struct AssistantSnapshot {
     agent_source: String,
     #[serde(default, alias = "agent_backend", deserialize_with = "deserialize_string_or_null")]
     runtime_backend: String,
+    #[serde(default = "default_assistant_snapshot_agent_type")]
+    agent_type: AgentType,
     rules: AssistantSnapshotRules,
     #[serde(default)]
     default_modes: AssistantSnapshotDefaultModes,
@@ -164,6 +147,10 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(<Option<String> as serde::Deserialize>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn default_assistant_snapshot_agent_type() -> AgentType {
+    AgentType::Acp
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -196,23 +183,10 @@ fn assistant_snapshot_modes<'a>(
     }
 }
 
-fn parse_supported_agent_type_from_backend(backend: &str) -> Result<AgentType, ConversationError> {
-    if ACP_VENDOR_LABELS.contains(&backend) {
-        return Ok(AgentType::Acp);
-    }
-
-    let quoted = format!("\"{backend}\"");
-    if let Ok(agent_type) = serde_json::from_str::<AgentType>(&quoted) {
-        if agent_type.is_deprecated_runtime() {
-            return Err(ConversationError::BadRequest {
-                reason: DEPRECATED_AGENT_TYPE_MESSAGE.into(),
-            });
-        }
-        return Ok(agent_type);
-    }
-
-    Err(ConversationError::BadRequest {
-        reason: format!("unsupported assistant backend: {backend}"),
+fn parse_agent_type_from_metadata(value: &str) -> Result<AgentType, ConversationError> {
+    let quoted = format!("\"{}\"", value.trim());
+    serde_json::from_str::<AgentType>(&quoted).map_err(|_| ConversationError::BadRequest {
+        reason: format!("unsupported assistant agent type in agent_metadata: {value}"),
     })
 }
 
@@ -221,7 +195,7 @@ fn resolve_create_agent_type(
     assistant_snapshot: Option<&AssistantSnapshot>,
 ) -> Result<AgentType, ConversationError> {
     if let Some(snapshot) = assistant_snapshot {
-        let derived = parse_supported_agent_type_from_backend(snapshot.runtime_backend.trim())?;
+        let derived = snapshot.agent_type;
         if let Some(explicit) = explicit_type
             && explicit != derived
         {
@@ -1340,7 +1314,13 @@ impl ConversationService {
             .as_ref()
             .and_then(|row| row.agent_id_override.clone())
             .unwrap_or_else(|| definition.agent_id.clone());
-        let agent_binding = self.resolve_assistant_agent_binding(&effective_agent_id).await?;
+        let agent_binding = self
+            .resolve_assistant_agent_binding(&effective_agent_id)
+            .await?
+            .ok_or_else(|| ConversationError::BadRequest {
+                reason: format!("assistant agent `{effective_agent_id}` is not registered in agent_metadata"),
+            })?;
+        let agent_type = parse_agent_type_from_metadata(&agent_binding.agent_type)?;
 
         Ok(Some(AssistantSnapshot {
             assistant_definition_id: definition.id,
@@ -1349,17 +1329,10 @@ impl ConversationService {
             name: definition.name,
             avatar_type: definition.avatar_type,
             avatar: definition.avatar_value,
-            agent_id: agent_binding
-                .as_ref()
-                .map(|binding| binding.agent_id.clone())
-                .unwrap_or(effective_agent_id.clone()),
-            agent_source: agent_binding
-                .as_ref()
-                .map(|binding| binding.agent_source.clone())
-                .unwrap_or_else(|| "builtin".to_owned()),
-            runtime_backend: agent_binding
-                .map(|binding| binding.runtime_backend)
-                .unwrap_or(effective_agent_id),
+            agent_id: agent_binding.agent_id,
+            agent_source: agent_binding.agent_source,
+            runtime_backend: agent_binding.runtime_backend,
+            agent_type,
             rules: AssistantSnapshotRules {
                 content: if rules_content.is_empty() {
                     fallback_rules.to_owned()

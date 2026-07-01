@@ -660,6 +660,9 @@ fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
         ("8e1acf31", Some("codex"), "acp", "Codex CLI", 110),
         ("cc126dd5", Some("gemini"), "acp", "Gemini CLI", 120),
         ("632f31d2", None, "aionrs", "Aion CLI", 200),
+        ("b7e8a9c4", Some("openclaw"), "acp", "OpenClaw", 3140),
+        ("f9f61666", None, "openclaw-gateway", "OpenClaw Gateway", 3150),
+        ("custom-acp-1", None, "acp", "My Custom ACP", 1500),
     ]
     .into_iter()
     .map(|(id, backend, agent_type, name, sort_order)| AgentMetadataRow {
@@ -671,7 +674,7 @@ fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
         description_i18n: None,
         backend: backend.map(ToOwned::to_owned),
         agent_type: agent_type.to_owned(),
-        agent_source: "builtin".to_owned(),
+        agent_source: if id.starts_with("custom-") { "custom" } else { "builtin" }.to_owned(),
         agent_source_info: None,
         enabled: true,
         command: backend.map(ToOwned::to_owned),
@@ -1527,6 +1530,203 @@ async fn create_derives_acp_type_from_assistant_backend_when_type_is_missing() {
     let resp = svc.create("user_1", req).await.unwrap();
     assert_eq!(resp.r#type, AgentType::Acp);
     assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn create_derives_acp_type_from_openclaw_agent_metadata_when_type_is_missing() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_openclaw_missing_type",
+        "assistant-openclaw-missing-type",
+        "b7e8a9c4",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_openclaw_missing_type",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-openclaw-missing-type",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.r#type, AgentType::Acp);
+    assert_eq!(resp.extra["agent_id"], json!("b7e8a9c4"));
+    assert_eq!(resp.extra["backend"], json!("openclaw"));
+    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn create_derives_acp_type_from_custom_agent_metadata_when_type_is_missing() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_custom_acp_missing_type",
+        "assistant-custom-acp-missing-type",
+        "custom-acp-1",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_custom_acp_missing_type",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-custom-acp-missing-type",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.r#type, AgentType::Acp);
+    assert_eq!(resp.extra["agent_id"], json!("custom-acp-1"));
+    assert_eq!(resp.extra["agent_source"], json!("custom"));
+    assert_eq!(resp.extra["backend"], json!("acp"));
+    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn create_rejects_assistant_bound_to_deprecated_agent_metadata() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_openclaw_gateway_deprecated",
+        "assistant-openclaw-gateway-deprecated",
+        "f9f61666",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_openclaw_gateway_deprecated",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-openclaw-gateway-deprecated",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let err = svc.create("user_1", req).await.unwrap_err();
+    assert_eq!(err.error_code(), "BAD_REQUEST");
+    assert!(
+        err.to_string()
+            .contains("This agent type is no longer supported for new conversations."),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn create_rejects_assistant_with_unregistered_agent_metadata() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_missing_agent",
+        "assistant-missing-agent",
+        "missing-agent",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_missing_agent",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-missing-agent",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let err = svc.create("user_1", req).await.unwrap_err();
+    assert_eq!(err.error_code(), "BAD_REQUEST");
+    assert!(
+        err.to_string()
+            .contains("assistant agent `missing-agent` is not registered in agent_metadata"),
+        "unexpected error: {err}"
+    );
 }
 
 // ── Get tests ──────────────────────────────────────────────────────
