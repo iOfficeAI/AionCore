@@ -13,7 +13,8 @@ pub use agent_binding::{
     runtime_backend_for_agent,
 };
 pub use database::{
-    Database, DatabaseInitError, init_database, init_database_memory, init_database_staged, maybe_copy_legacy_database,
+    Database, DatabaseInitError, DatabaseInitOptions, init_database, init_database_memory, init_database_staged,
+    init_database_staged_with_options, init_database_with_options, maybe_copy_legacy_database,
 };
 pub use error::DbError;
 pub use models::{

@@ -29,11 +29,17 @@ static DB_MIGRATOR: Migrator = sqlx::migrate!();
 // Historical special-case for the MCP schema reconciliation fallback.
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
+const RECOVERABLE_DATABASE_CORRUPTION_STAGE: &str = "database.recoverable_corruption";
 
 /// Wraps a SQLite connection pool with lifecycle management.
 #[derive(Clone, Debug)]
 pub struct Database {
     pool: SqlitePool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DatabaseInitOptions {
+    pub recover_corrupted_database: bool,
 }
 
 #[derive(Debug)]
@@ -94,10 +100,26 @@ impl Database {
 /// failures attempt recovery by backing up the corrupted file and creating a
 /// fresh database. Migration mismatches and lock contention fail fast.
 pub async fn init_database(path: &Path) -> Result<Database, DbError> {
-    init_database_staged(path).await.map_err(DatabaseInitError::into_source)
+    init_database_with_options(path, DatabaseInitOptions::default())
+        .await
+        .map_err(DatabaseInitError::into_source)
+}
+
+pub async fn init_database_with_options(
+    path: &Path,
+    options: DatabaseInitOptions,
+) -> Result<Database, DatabaseInitError> {
+    init_database_staged_with_options(path, options).await
 }
 
 pub async fn init_database_staged(path: &Path) -> Result<Database, DatabaseInitError> {
+    init_database_staged_with_options(path, DatabaseInitOptions::default()).await
+}
+
+pub async fn init_database_staged_with_options(
+    path: &Path,
+    options: DatabaseInitOptions,
+) -> Result<Database, DatabaseInitError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -111,9 +133,24 @@ pub async fn init_database_staged(path: &Path) -> Result<Database, DatabaseInitE
 
     match try_init_file_staged(path).await {
         Ok(db) => Ok(db),
-        Err(e) if path.exists() && should_attempt_recovery(e.source()) => {
-            warn!("Database initialization failed, attempting recovery: {e}");
+        Err(e) if path.exists() && options.recover_corrupted_database && should_attempt_recovery(e.source()) => {
+            warn!(
+                code = "BOOTSTRAP_DATABASE_CORRUPTION_REBUILD_AUTHORIZED",
+                stage = e.stage(),
+                "Authorized corrupted database backup and rebuild"
+            );
             recover_and_retry(path, e.into_source()).await
+        }
+        Err(e) if path.exists() && is_recoverable_migration_corruption(e.source()) => {
+            warn!(
+                code = "BOOTSTRAP_DATABASE_CORRUPTION_REQUIRES_USER_CONFIRMATION",
+                stage = e.stage(),
+                "Database corruption-like migration failure requires user confirmation before rebuild"
+            );
+            Err(DatabaseInitError::new(
+                RECOVERABLE_DATABASE_CORRUPTION_STAGE,
+                e.into_source(),
+            ))
         }
         Err(e) => Err(e),
     }
@@ -638,9 +675,18 @@ async fn recover_and_retry(path: &Path, original_error: DbError) -> Result<Datab
 
 fn should_attempt_recovery(err: &DbError) -> bool {
     match err {
-        DbError::Migration(_) => false,
+        DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(_)) => false,
+        DbError::Migration(_) => is_corruption_like_error(err),
         DbError::NotFound(_) | DbError::Conflict(_) => false,
         DbError::Query(_) | DbError::Init(_) => is_corruption_like_error(err),
+    }
+}
+
+fn is_recoverable_migration_corruption(err: &DbError) -> bool {
+    match err {
+        DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(_)) => false,
+        DbError::Migration(_) => is_corruption_like_error(err),
+        _ => false,
     }
 }
 
@@ -690,6 +736,28 @@ mod tests {
             should_attempt_recovery(&err),
             "corruption-like failures should trigger recovery"
         );
+    }
+
+    #[test]
+    fn recovery_allows_corruption_like_migration_errors_when_authorized() {
+        let err = DbError::Migration(sqlx::migrate::MigrateError::ExecuteMigration(
+            sqlx::Error::Protocol("database disk image is malformed".into()),
+            13,
+        ));
+
+        assert!(should_attempt_recovery(&err));
+        assert!(is_recoverable_migration_corruption(&err));
+    }
+
+    #[test]
+    fn recovery_skips_non_corruption_migration_errors() {
+        let err = DbError::Migration(sqlx::migrate::MigrateError::ExecuteMigration(
+            sqlx::Error::Protocol("UNIQUE constraint failed: tasks.id".into()),
+            13,
+        ));
+
+        assert!(!should_attempt_recovery(&err));
+        assert!(!is_recoverable_migration_corruption(&err));
     }
 
     #[tokio::test]
