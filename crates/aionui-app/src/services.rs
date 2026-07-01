@@ -51,6 +51,8 @@ pub struct AppServices {
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
     /// User skill metadata and import history repository.
     pub skill_repo: Arc<dyn ISkillRepository>,
+    runtime_helper_bin: String,
+    runtime_base_url: String,
 }
 
 impl AppServices {
@@ -69,6 +71,8 @@ impl AppServices {
             conversation_runtime_state: self.conversation_runtime_state.clone(),
             conversation_repo: self.conversation_repo.clone(),
             task_manager_delete_hook: self.task_manager_delete_hook.clone(),
+            runtime_helper_bin: self.runtime_helper_bin.clone(),
+            runtime_base_url: self.runtime_base_url.clone(),
         });
         self
     }
@@ -147,6 +151,8 @@ impl AppServices {
         // attached to a conversation (phase1 mcp.md §4.6 single-binary model).
         let backend_binary_path =
             Arc::new(std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aioncore")));
+        let runtime_helper_bin = backend_binary_path.to_string_lossy().into_owned();
+        let runtime_base_url = config.local_base_url();
 
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
@@ -178,6 +184,8 @@ impl AppServices {
             conversation_runtime_state: conversation_runtime_state.clone(),
             conversation_repo: conversation_repo.clone(),
             task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
+            runtime_helper_bin: runtime_helper_bin.clone(),
+            runtime_base_url: runtime_base_url.clone(),
         });
 
         Ok(Self {
@@ -202,6 +210,8 @@ impl AppServices {
             app_version,
             skill_paths,
             skill_repo,
+            runtime_helper_bin,
+            runtime_base_url,
         })
     }
 }
@@ -216,6 +226,8 @@ struct ConversationServiceDeps<'a> {
     conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     conversation_repo: Arc<dyn IConversationRepository>,
     task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
+    runtime_helper_bin: String,
+    runtime_base_url: String,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -232,7 +244,8 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         Arc::new(SqliteAgentMetadataRepository::new(deps.database.pool().clone())),
         Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
     )
-    .with_runtime_state(deps.conversation_runtime_state);
+    .with_runtime_state(deps.conversation_runtime_state)
+    .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url);
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
         deps.database.pool().clone(),

@@ -12,17 +12,19 @@ You can manage scheduled tasks for the current conversation. Use the bundled HTT
 1. Each conversation can have at most one scheduled task.
 2. Always query existing tasks before creating or updating.
 3. Do not ask for extra confirmation after the user has already requested the scheduling change.
-4. Never pass, inline, export, echo, or set `AIONUI_CONVERSATION_ID` or `AIONUI_USER_ID` in any shell command. AionUi injects them into the runtime environment before the helper runs.
-5. Helper commands must directly call `python3 scripts/aionui_cron.py ...` without any `AIONUI_...=...` prefix.
+4. Never pass, inline, export, echo, or set any `AIONUI_...` environment variable in any shell command. AionUi injects the required runtime environment before the helper runs.
+5. Helper commands must directly call `"$AIONUI_HELPER_BIN" cron-helper ...` without any `AIONUI_...=...` prefix.
 6. Pass create and update payloads through stdin heredocs attached to the helper command. Do not write payload JSON files to disk.
+7. After a successful create or update, send one short final confirmation that a normal user can understand. Include the task name and schedule description. Do not show internal ids such as `cron_...`.
+8. If the helper fails, report the failure from stderr/stdout in normal prose and do not claim the task was created.
 
 ## Workflow
 
-1. Run `python3 scripts/aionui_cron.py list`.
-2. If the returned `data` array is empty, create the task with `python3 scripts/aionui_cron.py create <<'JSON'`.
-3. If one task exists and the user wants to change it, update that task with `python3 scripts/aionui_cron.py update --job-id <job-id> <<'JSON'`.
+1. Run `"$AIONUI_HELPER_BIN" cron-helper list`.
+2. If the returned `data` array is empty, create the task with `"$AIONUI_HELPER_BIN" cron-helper create <<'JSON'`.
+3. If one task exists and the user wants to change it, update that task with `"$AIONUI_HELPER_BIN" cron-helper update --job-id <job-id> <<'JSON'`.
 4. If a task already exists and the user is asking for a different additional task, ask how they want to handle the existing task.
-5. Report success or failure from the helper output in normal prose.
+5. Report success or failure from the helper output in normal prose, following the final confirmation rule above.
 
 ## Payload
 
@@ -46,13 +48,13 @@ The `message` must tell the AI exactly what to do when the task fires. It should
 Query:
 
 ```bash
-python3 scripts/aionui_cron.py list
+"$AIONUI_HELPER_BIN" cron-helper list
 ```
 
 Create:
 
 ```bash
-python3 scripts/aionui_cron.py create <<'JSON'
+"$AIONUI_HELPER_BIN" cron-helper create <<'JSON'
 {
   "name": "Weekly Meeting Reminder",
   "schedule": "0 9 * * MON",
@@ -65,7 +67,7 @@ JSON
 Update:
 
 ```bash
-python3 scripts/aionui_cron.py update --job-id cron_123 <<'JSON'
+"$AIONUI_HELPER_BIN" cron-helper update --job-id cron_123 <<'JSON'
 {
   "name": "Daily Summary",
   "schedule": "0 18 * * MON-FRI",

@@ -9,7 +9,9 @@ use std::time::Duration;
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
-use aionui_ai_agent::types::{BuildTaskOptions, CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData};
+use aionui_ai_agent::types::{
+    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, BuildTaskOptions, CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData,
+};
 use aionui_ai_agent::{
     AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
 };
@@ -2972,6 +2974,42 @@ async fn send_message_injects_conversation_runtime_context() {
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
     assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
+async fn send_message_injects_configured_runtime_helper_context() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let svc = svc.with_runtime_helper_context(
+        "/Applications/AionUi/aioncore".to_owned(),
+        "http://127.0.0.1:51234".to_owned(),
+    );
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    assert!(
+        options[0].context.runtime_env.contains(&(
+            AIONUI_HELPER_BIN_ENV.to_owned(),
+            "/Applications/AionUi/aioncore".to_owned()
+        )),
+        "runtime env should include AIONUI_HELPER_BIN"
+    );
+    assert!(
+        options[0]
+            .context
+            .runtime_env
+            .contains(&(AIONUI_BASE_URL_ENV.to_owned(), "http://127.0.0.1:51234".to_owned())),
+        "runtime env should include AIONUI_BASE_URL"
+    );
 }
 
 #[tokio::test]

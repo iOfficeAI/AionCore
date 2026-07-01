@@ -24,6 +24,15 @@ impl AppConfig {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// Local URL helpers should use to call this backend from the same machine.
+    pub fn local_base_url(&self) -> String {
+        let host = match self.host.as_str() {
+            "0.0.0.0" | "::" => "127.0.0.1",
+            other => other,
+        };
+        format!("http://{host}:{}", self.port)
+    }
+
     /// Path to the SQLite database file.
     pub fn database_path(&self) -> PathBuf {
         self.data_dir.join("aionui-backend.db")
@@ -74,6 +83,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.socket_addr(), "0.0.0.0:3000");
+    }
+
+    #[test]
+    fn local_base_url_uses_loopback_for_wildcard_host() {
+        let config = AppConfig {
+            host: "0.0.0.0".to_string(),
+            port: 49152,
+            ..Default::default()
+        };
+        assert_eq!(config.local_base_url(), "http://127.0.0.1:49152");
     }
 
     #[test]

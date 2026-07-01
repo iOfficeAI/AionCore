@@ -42,23 +42,44 @@ impl BuildTaskOptions {
         self.context.conversation_id()
     }
 
-    pub fn apply_conversation_runtime_context(&mut self, user_id: &str, conversation_id: &str) {
-        self.context
-            .runtime_env
-            .retain(|(key, _)| key != AIONUI_USER_ID_ENV && key != AIONUI_CONVERSATION_ID_ENV);
+    pub fn apply_conversation_runtime_context(
+        &mut self,
+        user_id: &str,
+        conversation_id: &str,
+        helper_bin: Option<&str>,
+        base_url: Option<&str>,
+    ) {
+        self.context.runtime_env.retain(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                AIONUI_USER_ID_ENV | AIONUI_CONVERSATION_ID_ENV | AIONUI_HELPER_BIN_ENV | AIONUI_BASE_URL_ENV
+            )
+        });
         self.context
             .runtime_env
             .push((AIONUI_USER_ID_ENV.to_owned(), user_id.to_owned()));
         self.context
             .runtime_env
             .push((AIONUI_CONVERSATION_ID_ENV.to_owned(), conversation_id.to_owned()));
+        if let Some(helper_bin) = helper_bin {
+            self.context
+                .runtime_env
+                .push((AIONUI_HELPER_BIN_ENV.to_owned(), helper_bin.to_owned()));
+        }
+        if let Some(base_url) = base_url {
+            self.context
+                .runtime_env
+                .push((AIONUI_BASE_URL_ENV.to_owned(), base_url.to_owned()));
+        }
         self.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
     }
 }
 
 pub const AIONUI_USER_ID_ENV: &str = "AIONUI_USER_ID";
 pub const AIONUI_CONVERSATION_ID_ENV: &str = "AIONUI_CONVERSATION_ID";
-pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 1;
+pub const AIONUI_HELPER_BIN_ENV: &str = "AIONUI_HELPER_BIN";
+pub const AIONUI_BASE_URL_ENV: &str = "AIONUI_BASE_URL";
+pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
@@ -172,7 +193,12 @@ mod tests {
         };
         let mut options = BuildTaskOptions::new(context);
 
-        options.apply_conversation_runtime_context("user-1", "conv-1");
+        options.apply_conversation_runtime_context(
+            "user-1",
+            "conv-1",
+            Some("/Applications/AionUi/aioncore"),
+            Some("http://127.0.0.1:25808"),
+        );
 
         assert_eq!(
             options
@@ -194,6 +220,16 @@ mod tests {
                 .context
                 .runtime_env
                 .contains(&(AIONUI_CONVERSATION_ID_ENV.to_owned(), "conv-1".to_owned()))
+        );
+        assert!(options.context.runtime_env.contains(&(
+            AIONUI_HELPER_BIN_ENV.to_owned(),
+            "/Applications/AionUi/aioncore".to_owned()
+        )));
+        assert!(
+            options
+                .context
+                .runtime_env
+                .contains(&(AIONUI_BASE_URL_ENV.to_owned(), "http://127.0.0.1:25808".to_owned()))
         );
         assert!(options.context.runtime_env.contains(&("EXISTING".into(), "1".into())));
         assert_eq!(

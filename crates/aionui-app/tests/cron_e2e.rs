@@ -32,6 +32,12 @@ use common::{
 
 const DEFAULT_CRON_ASSISTANT_ID: &str = "cron-e2e-assistant";
 
+fn cron_helper_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aioncore"));
+    command.arg("cron-helper");
+    command
+}
+
 fn default_assistant_agent_config(name: &str) -> serde_json::Value {
     json!({
         "name": name,
@@ -259,11 +265,7 @@ async fn helper_list_sends_conversation_headers_from_runtime_env() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("user-selected-project");
     std::fs::create_dir_all(&workspace).unwrap();
-    let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/builtin-skills/auto-inject/cron/scripts/aionui_cron.py");
-
-    let output = Command::new("python3")
-        .arg(helper)
+    let output = cron_helper_command()
         .arg("list")
         .current_dir(&workspace)
         .env("AIONUI_BASE_URL", base_url)
@@ -296,11 +298,7 @@ async fn helper_create_reads_payload_from_stdin_without_payload_file() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("user-selected-project");
     std::fs::create_dir_all(&workspace).unwrap();
-    let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/builtin-skills/auto-inject/cron/scripts/aionui_cron.py");
-
-    let mut child = Command::new("python3")
-        .arg(helper)
+    let mut child = cron_helper_command()
         .arg("create")
         .current_dir(&workspace)
         .env("AIONUI_BASE_URL", base_url)
@@ -357,11 +355,7 @@ async fn helper_update_reads_payload_from_stdin_without_payload_file() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("user-selected-project");
     std::fs::create_dir_all(&workspace).unwrap();
-    let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/builtin-skills/auto-inject/cron/scripts/aionui_cron.py");
-
-    let mut child = Command::new("python3")
-        .arg(helper)
+    let mut child = cron_helper_command()
         .arg("update")
         .arg("--job-id")
         .arg("cron_helper_update")
@@ -424,6 +418,13 @@ fn cron_skill_does_not_instruct_agents_to_write_payload_files() {
     assert!(!skill.contains("--input"));
     assert!(!skill.contains("cat >"));
     assert!(!skill.contains("/tmp/aionui-cron"));
+    assert!(!skill.contains("python3"));
+    assert!(!skill.contains("aionui_cron.py"));
+    assert!(skill.contains("$AIONUI_HELPER_BIN"));
+    assert!(skill.contains("cron-helper"));
+    assert!(skill.contains("After a successful create or update"));
+    assert!(skill.contains("Do not show internal ids"));
+    assert!(skill.contains("cron_..."));
 }
 
 #[tokio::test]
@@ -432,11 +433,7 @@ async fn helper_list_fails_without_runtime_env_even_in_temp_workspace() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("conversations").join("codex-temp-conv_from_name");
     std::fs::create_dir_all(&workspace).unwrap();
-    let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/builtin-skills/auto-inject/cron/scripts/aionui_cron.py");
-
-    let output = Command::new("python3")
-        .arg(helper)
+    let output = cron_helper_command()
         .arg("list")
         .current_dir(&workspace)
         .env("AIONUI_BASE_URL", base_url)
@@ -457,11 +454,7 @@ async fn helper_list_rejects_backend_without_conversation_cron_route() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("user-selected-project");
     std::fs::create_dir_all(&workspace).unwrap();
-    let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/builtin-skills/auto-inject/cron/scripts/aionui_cron.py");
-
-    let output = Command::new("python3")
-        .arg(helper)
+    let output = cron_helper_command()
         .arg("list")
         .current_dir(&workspace)
         .env("AIONUI_BASE_URL", base_url.clone())

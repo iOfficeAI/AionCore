@@ -327,6 +327,8 @@ pub struct ConversationService {
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
+    runtime_helper_bin: Option<String>,
+    runtime_base_url: Option<String>,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -396,6 +398,8 @@ impl ConversationService {
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
+            runtime_helper_bin: None,
+            runtime_base_url: None,
 
             conversation_repo,
             agent_metadata_repo,
@@ -405,6 +409,12 @@ impl ConversationService {
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = runtime_state;
+        self
+    }
+
+    pub fn with_runtime_helper_context(mut self, helper_bin: String, base_url: String) -> Self {
+        self.runtime_helper_bin = Some(helper_bin);
+        self.runtime_base_url = Some(base_url);
         self
     }
 
@@ -2545,7 +2555,7 @@ impl ConversationService {
                 return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
         };
-        build_opts.apply_conversation_runtime_context(user_id, conversation_id);
+        self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
@@ -2663,7 +2673,7 @@ impl ConversationService {
             }
         };
 
-        build_opts.apply_conversation_runtime_context(&request.user_id, &request.conversation_id);
+        self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id);
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let conversation_id = request.conversation_id.clone();
@@ -2876,7 +2886,7 @@ impl ConversationService {
         reject_deprecated_runtime_row(&row)?;
 
         let mut build_opts = self.build_task_options(&row).await?;
-        build_opts.apply_conversation_runtime_context(user_id, conversation_id);
+        self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
         self.ensure_workspace_skill_links(&row, &build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let backend = build_options_backend(&build_opts).map(str::to_owned);
@@ -3000,6 +3010,20 @@ impl ConversationService {
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
             .build_options_with_workspace_override(row, workspace_override)
             .await
+    }
+
+    fn apply_conversation_runtime_context(
+        &self,
+        build_opts: &mut BuildTaskOptions,
+        user_id: &str,
+        conversation_id: &str,
+    ) {
+        build_opts.apply_conversation_runtime_context(
+            user_id,
+            conversation_id,
+            self.runtime_helper_bin.as_deref(),
+            self.runtime_base_url.as_deref(),
+        );
     }
 
     /// Ensure native skill links exist in the runtime workspace. Auto
