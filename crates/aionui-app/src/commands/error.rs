@@ -12,6 +12,15 @@ pub(crate) enum CliBoundaryCode {
     CliDoctorDatabaseFailed,
     CliDoctorRegistryHydrateFailed,
     CliPrepareManagedResourcesFailed,
+    CronEnvMissing,
+    CronBackendUnavailable,
+    CronPayloadMissing,
+    CronPayloadInvalid,
+    CronHttpRequestFailed,
+    CronHttpStatusError,
+    CronResponseReadFailed,
+    CronResponseJsonInvalid,
+    CronStdoutWriteFailed,
     McpEnvMissing,
     McpEnvInvalidPort,
     McpStdinTty,
@@ -41,6 +50,15 @@ impl CliBoundaryCode {
             Self::CliDoctorDatabaseFailed => "CLI_DOCTOR_DATABASE_FAILED",
             Self::CliDoctorRegistryHydrateFailed => "CLI_DOCTOR_REGISTRY_HYDRATE_FAILED",
             Self::CliPrepareManagedResourcesFailed => "CLI_PREPARE_MANAGED_RESOURCES_FAILED",
+            Self::CronEnvMissing => "CRON_ENV_MISSING",
+            Self::CronBackendUnavailable => "CRON_BACKEND_UNAVAILABLE",
+            Self::CronPayloadMissing => "CRON_PAYLOAD_MISSING",
+            Self::CronPayloadInvalid => "CRON_PAYLOAD_INVALID",
+            Self::CronHttpRequestFailed => "CRON_HTTP_REQUEST_FAILED",
+            Self::CronHttpStatusError => "CRON_HTTP_STATUS_ERROR",
+            Self::CronResponseReadFailed => "CRON_RESPONSE_READ_FAILED",
+            Self::CronResponseJsonInvalid => "CRON_RESPONSE_JSON_INVALID",
+            Self::CronStdoutWriteFailed => "CRON_STDOUT_WRITE_FAILED",
             Self::McpEnvMissing => "MCP_ENV_MISSING",
             Self::McpEnvInvalidPort => "MCP_ENV_INVALID_PORT",
             Self::McpStdinTty => "MCP_STDIN_TTY",
@@ -66,6 +84,10 @@ impl CliBoundaryCode {
 
     fn exit_kind(self) -> ExitKind {
         match self {
+            Self::CronEnvMissing | Self::CronPayloadMissing | Self::CronPayloadInvalid => ExitKind::Config,
+            Self::CronBackendUnavailable | Self::CronHttpRequestFailed | Self::CronHttpStatusError => {
+                ExitKind::Unavailable
+            }
             Self::McpEnvMissing
             | Self::McpEnvInvalidPort
             | Self::McpStdinTty

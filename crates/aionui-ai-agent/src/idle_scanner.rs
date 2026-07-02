@@ -15,7 +15,7 @@ const SCAN_INTERVAL_SECS: u64 = 60;
 /// Start the background idle agent scanner.
 ///
 /// Periodically scans active tasks and kills ACP agents that have been
-/// idle (finished + no activity) beyond the configured threshold.
+/// idle (finished or warmup-only + no activity) beyond the configured threshold.
 ///
 /// The scanner runs until the provided `shutdown` signal resolves.
 pub fn start_idle_scanner(
@@ -59,7 +59,7 @@ fn scan_and_cleanup(manager: &Arc<dyn IWorkerTaskManager>, threshold_ms: i64) {
     let idle_ids = manager.collect_idle(threshold_ms);
 
     if idle_ids.is_empty() {
-        debug!(active = manager.active_count(), "Idle scan: no idle agents found");
+        debug!(active_count = manager.active_count(), "Idle scan: no idle agents found");
         return;
     }
 

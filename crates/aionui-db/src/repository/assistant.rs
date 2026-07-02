@@ -60,6 +60,9 @@ pub trait IAssistantOverrideRepository: Send + Sync {
 #[async_trait::async_trait]
 pub trait IAssistantDefinitionRepository: Send + Sync {
     async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError>;
+    async fn list_including_deleted(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        self.list().await
+    }
     async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError>;
     async fn get_by_assistant_id_including_deleted(
         &self,
@@ -81,6 +84,17 @@ pub trait IAssistantDefinitionRepository: Send + Sync {
         self.get_by_source_ref(source, source_ref).await
     }
     async fn upsert(&self, params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError>;
+    async fn update_avatar_fields_preserving_deleted(
+        &self,
+        id: &str,
+        avatar_type: &str,
+        avatar_value: Option<&str>,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        let _ = (id, avatar_type, avatar_value);
+        Err(DbError::Init(
+            "update_avatar_fields_preserving_deleted is not supported by this repository".to_string(),
+        ))
+    }
     async fn soft_delete(&self, id: &str, deleted_at: i64) -> Result<bool, DbError>;
 }
 

@@ -15,6 +15,7 @@ aionui-mcp.workspace = true
 aionui-runtime.workspace = true
 axum.workspace = true
 base64.workspace = true
+chrono.workspace = true
 regex.workspace = true
 tokio.workspace = true
 serde.workspace = true

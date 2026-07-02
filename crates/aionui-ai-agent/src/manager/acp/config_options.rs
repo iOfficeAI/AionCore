@@ -124,13 +124,6 @@ impl ConfigSnapshot {
     pub(crate) fn observed_matches(&self, option_id: &str, requested: &str) -> bool {
         self.option_current(option_id).as_deref() == Some(requested)
     }
-
-    pub(crate) fn is_mode_option(&self, option_id: &str) -> bool {
-        self.options
-            .iter()
-            .find(|option| option.id == option_id)
-            .is_some_and(|option| option.category.as_deref() == Some("mode") || option.id == "mode")
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

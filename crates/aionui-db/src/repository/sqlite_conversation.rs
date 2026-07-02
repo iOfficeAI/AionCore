@@ -426,9 +426,6 @@ impl IConversationRepository for SqliteConversationRepository {
                 assistant_definition_id,
                 assistant_id,
                 assistant_source,
-                assistant_name,
-                assistant_avatar_type,
-                assistant_avatar_value,
                 agent_id,
                 rules_content,
                 default_model_mode,
@@ -442,14 +439,11 @@ impl IConversationRepository for SqliteConversationRepository {
                 resolved_mcp_ids,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 assistant_definition_id = excluded.assistant_definition_id,
                 assistant_id = excluded.assistant_id,
                 assistant_source = excluded.assistant_source,
-                assistant_name = excluded.assistant_name,
-                assistant_avatar_type = excluded.assistant_avatar_type,
-                assistant_avatar_value = excluded.assistant_avatar_value,
                 agent_id = excluded.agent_id,
                 rules_content = excluded.rules_content,
                 default_model_mode = excluded.default_model_mode,
@@ -467,9 +461,6 @@ impl IConversationRepository for SqliteConversationRepository {
         .bind(params.assistant_definition_id)
         .bind(params.assistant_id)
         .bind(params.assistant_source)
-        .bind(params.assistant_name)
-        .bind(params.assistant_avatar_type)
-        .bind(params.assistant_avatar_value)
         .bind(params.agent_id)
         .bind(params.rules_content)
         .bind(params.default_model_mode)

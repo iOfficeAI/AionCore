@@ -2,7 +2,7 @@ use super::*;
 use aionui_api_types::BehaviorPolicy;
 use aionui_common::AgentType;
 use aionui_common::constants::{TEAM_CAPABLE_BACKENDS, has_mcp_capability};
-use aionui_db::models::AssistantOverlayRow;
+use aionui_db::models::{AgentMetadataRow, AssistantOverlayRow};
 use aionui_db::{IAgentMetadataRepository, resolve_agent_binding_from_rows};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,39 +11,9 @@ use crate::prompts::AvailableAssistant;
 
 use crate::provisioning::PersistSpawnedAgentRequest;
 
-/// Known ACP vendor labels. Kept in lockstep with the `agent_metadata`
-/// seed in `005_agent_metadata.sql` — a caller hitting an unknown
-/// vendor should trigger a schema drift discussion, not silently fall
-/// through.
-const ACP_VENDOR_LABELS: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "qwen",
-    "codebuddy",
-    "droid",
-    "goose",
-    "auggie",
-    "kimi",
-    "opencode",
-    "copilot",
-    "qoder",
-    "vibe",
-    "cursor",
-    "kiro",
-    "hermes",
-    "snow",
-];
-
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 
 pub(crate) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
-    // Any registered ACP vendor label collapses to `AgentType::Acp`.
-    if ACP_VENDOR_LABELS.contains(&backend) {
-        return Ok(AgentType::Acp);
-    }
-    // Otherwise interpret as a top-level `AgentType` (e.g. "acp",
-    // "nanobot", "aionrs", "remote", "openclaw-gateway").
     let quoted = format!("\"{backend}\"");
     if let Ok(agent_type) = serde_json::from_str::<AgentType>(&quoted) {
         if agent_type.is_deprecated_runtime() {
@@ -54,16 +24,31 @@ pub(crate) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     Err(TeamError::InvalidRequest(format!("unsupported backend: {backend}")))
 }
 
-/// Resolve the most permissive session mode for a given backend string.
-/// Reuses `AgentType::full_auto_mode_id` from aionui-common.
-pub(crate) fn resolve_full_auto_mode(backend: &str) -> &'static str {
-    let agent_type = if ACP_VENDOR_LABELS.contains(&backend) {
-        AgentType::Acp
-    } else {
-        let quoted = format!("\"{backend}\"");
-        serde_json::from_str::<AgentType>(&quoted).unwrap_or(AgentType::Acp)
-    };
-    agent_type.full_auto_mode_id(Some(backend))
+fn find_acp_backend_metadata(rows: &[AgentMetadataRow], backend: &str) -> Option<AgentMetadataRow> {
+    rows.iter()
+        .find(|row| row.agent_type == AgentType::Acp.serde_name() && row.backend.as_deref() == Some(backend))
+        .cloned()
+}
+
+pub(crate) async fn acp_backend_metadata(
+    agent_metadata_repo: &Arc<dyn IAgentMetadataRepository>,
+    backend: &str,
+) -> Result<Option<AgentMetadataRow>, TeamError> {
+    let rows = agent_metadata_repo.list_all().await?;
+    Ok(find_acp_backend_metadata(&rows, backend))
+}
+
+pub(crate) fn session_mode_for_backend(
+    backend: &str,
+    agent_type: AgentType,
+    acp_metadata: Option<&AgentMetadataRow>,
+) -> String {
+    if let Some(row) = acp_metadata
+        && let Some(yolo_id) = row.yolo_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    {
+        return yolo_id.to_owned();
+    }
+    agent_type.full_auto_mode_id(Some(backend)).to_owned()
 }
 
 pub(crate) async fn resolve_runtime_backend(
@@ -486,15 +471,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_type_known_backends() {
+    fn parse_agent_type_accepts_top_level_supported_runtimes() {
         assert_eq!(parse_agent_type("acp").unwrap(), AgentType::Acp);
-        assert_eq!(parse_agent_type("gemini").unwrap(), AgentType::Acp);
         assert_eq!(parse_agent_type("aionrs").unwrap(), AgentType::Aionrs);
     }
 
     #[test]
     fn parse_agent_type_rejects_deprecated_runtime_types() {
-        for backend in ["nanobot", "remote", "openclaw-gateway"] {
+        for backend in ["codex", "gemini", "nanobot", "remote", "openclaw-gateway"] {
             let err = parse_agent_type(backend).unwrap_err();
             assert!(matches!(err, TeamError::InvalidRequest(_)));
             assert!(
@@ -509,11 +493,6 @@ mod tests {
     fn parse_agent_type_unknown_backend_returns_error() {
         let err = parse_agent_type("unknown").unwrap_err();
         assert!(matches!(err, TeamError::InvalidRequest(_)));
-    }
-
-    #[test]
-    fn resolve_full_auto_mode_keeps_hermes_on_default() {
-        assert_eq!(resolve_full_auto_mode("hermes"), "default");
     }
 
     #[tokio::test]

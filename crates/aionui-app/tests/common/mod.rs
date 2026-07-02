@@ -120,7 +120,7 @@ pub async fn build_app_with_mock_version(
 
 /// Build app with a mock worker task manager that returns noop agents.
 ///
-/// Use for tests that exercise session/warmup paths (team ensure_session,
+/// Use for tests that exercise runtime preparation paths (team ensure_session,
 /// send_message) where spawning a real CLI process is not feasible.
 pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();

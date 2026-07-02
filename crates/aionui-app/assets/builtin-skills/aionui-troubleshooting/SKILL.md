@@ -104,14 +104,20 @@ python3 scripts/aion_diag.py messages <id> [--limit N] [--errors]   # message hi
 ```
 
 - `conversation <id>` is the workhorse. It returns the live `runtime` block
-  (`state`, `task_status`, `is_processing`, `turn_id`), the 5 most recent
-  **error** messages, and a `stuck_hint` when `state=running` +
-  `is_processing=true`.
+  (`state`, `task_status`, `is_processing`, `turn_id`, plus `can_send_message`,
+  `has_task`, `pending_confirmations`), the 5 most recent **error** messages, and
+  a `stuck_hint` when `state=running` + `is_processing=true`. Note `state` (the
+  runtime machine state) and `task_status` are different fields — stuck detection
+  keys off `state`.
 - **Stuck detection is comparative, not absolute.** A single `running` snapshot
   is normal — that may just be the active turn. To confirm a hang, run
   `conversation <id>` a few times seconds apart: if `turn_id` and runtime never
   change while no new messages arrive, it's stuck. Cross-check with
   `logs --conv <id>`.
+- **Not every non-progressing turn is stuck.** `state=waiting_confirmation` (or
+  `pending_confirmations > 0`) means the turn is *blocked on a user approval*,
+  not hung — the fix is to answer the pending confirmation, not to restart the
+  conversation. The `stuck_hint` distinguishes these two cases.
 - `messages <id> --errors` pulls just the failed messages/tool-calls for that
   conversation from the unified `messages` table (engine-agnostic).
 
@@ -122,8 +128,9 @@ python3 scripts/aion_diag.py providers
 ```
 
 Lists every configured provider with its `model_health` (`status`, `latency`,
-`last_check`) and an `unhealthy_models` summary. A provider whose models show
-non-`healthy` status, huge `latency`, or a stale `last_check` is the suspect.
+`last_check`, and an `error` string on the last failed check) and an
+`unhealthy_models` summary. A provider whose models show non-`healthy` status,
+huge `latency`, or a stale `last_check` is the suspect.
 Then confirm with the log (filter by the provider's base_url or id):
 
 ```bash

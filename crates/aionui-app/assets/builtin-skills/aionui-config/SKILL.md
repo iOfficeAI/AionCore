@@ -76,8 +76,10 @@ An assistant has two parts stored separately:
    user_file`), written via a dedicated endpoint. Creating an assistant does
    NOT set its system prompt — that's a second call.
 
-Assistant `source` is `builtin` (shipped with the app, limited edits) or
-`user` (custom, fully editable). Custom IDs look like `custom-<digits>-<hex>`.
+Assistant `source` is `builtin` (shipped with the app, limited edits), `user`
+(custom, fully editable), or `generated` (auto-materialized from an online ACP
+agent — identity fields locked, not deletable). Custom IDs look like
+`custom-<digits>-<hex>`.
 
 ### List / inspect
 
@@ -135,11 +137,13 @@ installed agent's id — not a friendly name like `"claude"`. Read the available
 agents first and copy the id you want:
 
 ```bash
+# the LIST response is flat — each row carries agent_id + agent directly:
 python3 scripts/aionui_api.py get /api/assistants
-# look at the `engine` block of any existing assistant, e.g.
-#   "engine": {"agent_id": "2d23ff1c", "agent": {"type": "acp", "acp_backend": "claude"}}
-# reuse that agent_id for a new assistant on the same engine:
-python3 scripts/aionui_api.py put /api/assistants/<id> '{"id":"<id>","agent_id":"2d23ff1c"}'
+#   {"id": "...", "agent_id": "2d23ff1c", "agent": {"type": "acp", "acp_backend": "claude"}, ...}
+# (only the single-assistant detail read nests these under an `engine` block:
+#   GET /api/assistants/<id>?locale=en -> "engine": {"agent_id": "...", "agent": {...}})
+# reuse an existing agent_id for a new assistant on the same engine:
+python3 scripts/aionui_api.py put /api/assistants/<id> '{"agent_id":"2d23ff1c"}'
 ```
 
 > If you omit `agent_id` on create, the backend does NOT default to a CLI engine:
@@ -176,7 +180,6 @@ modes the backend accepts. The `value` is what `fixed` locks to:
 
 ```bash
 python3 scripts/aionui_api.py put /api/assistants/<id> '{
-  "id": "<id>",
   "defaults": {
     "model":      {"mode": "fixed", "value": "gemini-2.5-pro"},
     "permission": {"mode": "fixed", "value": "plan"},
@@ -187,13 +190,14 @@ python3 scripts/aionui_api.py put /api/assistants/<id> '{
 ```
 
 > Verified end-to-end: the backend stores all four entries verbatim and returns
-> them on the `?locale=` detail read. A brand-new assistant has `defaults: null`
-> until you set them.
+> them on the `?locale=` detail read. On read, `defaults` is always present with
+> all four entries — a brand-new assistant has each set to `{"mode":"auto"}` (no
+> `value`), never `null`. Lock one by sending `{"mode":"fixed","value":...}`.
 
 ### Update
 
-`PUT /api/assistants/<id>` with `{"id": "<id>", ...fields to change}`. Send only
-the fields you want to change.
+`PUT /api/assistants/<id>`, sending only the fields you want to change. The `id`
+comes from the URL path — a body `id`, if sent, is ignored.
 
 ### Set the system prompt (rules)
 
@@ -216,6 +220,12 @@ python3 scripts/aionui_api.py post /api/skills/assistant-rule/read '{"assistant_
 For multi-line / long prompts, write the text to a temp file and build the JSON
 body in Python rather than inlining a giant shell string.
 
+> To wipe an assistant's rule across all locales, `DELETE
+> /api/skills/assistant-rule/<assistant-id>`. A parallel trio exists for
+> per-assistant **skill** content (distinct from the shared registry):
+> `POST /api/skills/assistant-skill/{read,write}` (same body shape as the rule
+> endpoints) and `DELETE /api/skills/assistant-skill/<assistant-id>`.
+
 ### Avatar
 
 The `avatar` field accepts an emoji (`"📋"`), an image URL, a `data:` URI, or an
@@ -223,7 +233,7 @@ absolute local path. A self-contained inline SVG `data:` URI is a good default �
 no external dependency, renders offline:
 
 ```bash
-python3 scripts/aionui_api.py put /api/assistants/<id> '{"id":"<id>","avatar":"data:image/svg+xml;base64,<...>"}'
+python3 scripts/aionui_api.py put /api/assistants/<id> '{"avatar":"data:image/svg+xml;base64,<...>"}'
 ```
 
 > `GET /api/assistants/<id>/avatar` also serves the raw avatar binary (Content-Type
@@ -239,7 +249,8 @@ team picker without deleting it.
 ### Delete
 
 `DELETE /api/assistants/<id>` — only `source: user` assistants can be deleted.
-Builtins can only be disabled.
+`builtin` and `generated` assistants can only be disabled (check the `deletable`
+flag on the detail read).
 
 ### Bulk import
 
@@ -257,8 +268,9 @@ A skill is a folder containing a `SKILL.md` (YAML frontmatter `name` +
 `description`, then instruction body). The `description` decides when the agent
 auto-triggers the skill, so write it carefully.
 
-Three sources: `builtin` (`~/.aionui/builtin-skills/`), `custom`
-(`~/.aionui/skills/`), `extension` (external, symlinked).
+Four sources: `builtin` (`~/.aionui/builtin-skills/`), `custom`
+(`~/.aionui/skills/`), `cron` (`~/.aionui/cron/skills/`, per-scheduled-task
+skills), `extension` (external, symlinked).
 
 ### List / inspect the registry
 
@@ -270,17 +282,22 @@ python3 scripts/aionui_api.py post /api/skills/info '{"skill_path":"/abs/path/to
 
 ### Import a skill into the registry
 
-Two ways to install a skill — pick by whether you want a copy or a live link:
+`POST /api/skills/import` copies the skill(s) into the user skills dir and
+registers them. The one endpoint handles all three source shapes: a single skill
+folder, a PARENT folder containing many skills, or a `.zip` package.
 
 ```bash
-# copy the folder into the user skills dir and register it
-python3 scripts/aionui_api.py post /api/skills/import '{"skill_path":"/abs/path/to/skill-folder"}'
-
-# symlink instead of copy — good for a skill you keep editing in an external repo.
-# import-symlink (NOT bare import) is also what accepts a PARENT folder of many
-# skills, or a .zip package.
-python3 scripts/aionui_api.py post /api/skills/import-symlink '{"skill_path":"/abs/path/to/skill-or-parent-or-zip"}'
+python3 scripts/aionui_api.py post /api/skills/import '{"skill_path":"/abs/path/to/skill-or-parent-or-zip"}'
+python3 scripts/aionui_api.py get  /api/skills/import-limits   # server-side max file/total byte caps
+python3 scripts/aionui_api.py get  /api/skills/import-history  # recent import records
 ```
+
+> For external skills you keep editing in place (registered without copying), see
+> "Discover & manage skill sources" below (`external-paths`) — that's how a live,
+> non-copied source is wired in. There is no `import-symlink` endpoint; the
+> reverse operation, `POST /api/skills/export-symlink`
+> (`{"skill_path":"...","target_dir":"..."}`), symlinks an already-installed skill
+> back out to an external directory.
 
 > Caution: importing (copy) from a path that is ALREADY inside the user skills
 > dir can race with the copy step. When editing an installed skill, edit the
@@ -292,12 +309,12 @@ python3 scripts/aionui_api.py post /api/skills/import-symlink '{"skill_path":"/a
 For skills that live outside the standard dirs:
 
 ```bash
-python3 scripts/aionui_api.py post   /api/skills/scan '{"path":"/abs/dir"}'   # find skills under a dir
+python3 scripts/aionui_api.py post   /api/skills/scan '{"folder_path":"/abs/dir"}'   # find skills under a dir
 python3 scripts/aionui_api.py get    /api/skills/detect-paths                  # candidate skill locations
 python3 scripts/aionui_api.py get    /api/skills/detect-external               # external skill dirs
 python3 scripts/aionui_api.py get    /api/skills/external-paths                # list registered external paths
-python3 scripts/aionui_api.py post   /api/skills/external-paths '{"path":"/abs/dir"}'   # add one
-python3 scripts/aionui_api.py delete /api/skills/external-paths '{"path":"/abs/dir"}'   # remove one
+python3 scripts/aionui_api.py post   /api/skills/external-paths '{"name":"<label>","path":"/abs/dir"}'  # add one (both required)
+python3 scripts/aionui_api.py delete /api/skills/external-paths '{"path":"/abs/dir"}'   # remove one (path only)
 ```
 
 The **skills market** is a separate, app-wide toggle:
@@ -308,7 +325,7 @@ The **skills market** is a separate, app-wide toggle:
 Put the skill's `name` into the assistant's `enabled_skills`:
 
 ```bash
-python3 scripts/aionui_api.py put /api/assistants/<id> '{"id":"<id>","enabled_skills":["skill-a","skill-b"]}'
+python3 scripts/aionui_api.py put /api/assistants/<id> '{"enabled_skills":["skill-a","skill-b"]}'
 ```
 
 > `enabled_skills` is the full set — include every skill you want kept, not just
@@ -345,11 +362,13 @@ The `transport` object is one of:
 | --- | --- | --- |
 | `stdio` | `command`, `args?` (string[]), `env?` (map) | local process servers (npx/uvx/binaries) |
 | `sse` | `url`, `headers?` (map) | remote Server-Sent-Events servers (legacy) |
-| `http` / `streamable_http` | `url`, `headers?` (map) | remote HTTP servers (Streamable HTTP) |
+| `http` | `url`, `headers?` (map) | remote HTTP servers (Streamable HTTP) |
 
 > `headers` is an optional string→string map for auth (e.g. `{"Authorization":
-> "Bearer …"}`). `streamable_http` is accepted on create/update but always
-> normalizes to `http` in responses — don't expect `streamable_http` echoed back.
+> "Bearer …"}`). The REST API accepts exactly these three `type` values —
+> `stdio`, `sse`, `http`. Use `http` for Streamable-HTTP servers; there is no
+> separate `streamable_http` transport type at this layer (sending it fails
+> deserialization).
 
 ### Create
 
@@ -378,13 +397,19 @@ python3 scripts/aionui_api.py post /api/mcp/servers '{
 returns the server's tool list (or an error / `needs_auth`). Good to run after
 creating a remote server.
 
-### Toggle / update / delete
+### Fetch one / toggle / update / delete
 
 ```bash
+python3 scripts/aionui_api.py get    /api/mcp/servers/<id>          # one server by id
 python3 scripts/aionui_api.py post   /api/mcp/servers/<id>/toggle   # enable <-> disable
 python3 scripts/aionui_api.py put    /api/mcp/servers/<id> '{"description":"..."}'
 python3 scripts/aionui_api.py delete /api/mcp/servers/<id>
 ```
+
+> Two more list-level helpers exist: `POST /api/mcp/servers/import`
+> (`{"servers":[…]}`, bulk-restore a set at once) and `GET /api/mcp/agent-configs`
+> (scans installed Agent CLIs and returns their existing MCP configs — a source
+> for one-click import).
 
 > Remote servers may need OAuth: `/api/mcp/oauth/check-status`,
 > `/api/mcp/oauth/login`, `/api/mcp/oauth/logout` (all `post`), and
@@ -440,19 +465,21 @@ which protocol it speaks and what models it has. Use this to fill `platform` and
 
 ```bash
 python3 scripts/aionui_api.py post /api/providers/detect-protocol '{
-  "platform": "custom",
   "base_url": "https://api.deepseek.com/v1",
   "api_key": "sk-..."
 }'
 # -> {"protocol":"openai","confidence":90,"models":[...]}
 ```
 
-Optional fields on this body: `timeout` (ms), `preferred_protocol` (try a given
-protocol first), and `test_all_keys` (bool — probe every key when `api_key`
-holds several).
+Required on this body: just `base_url` + `api_key` (no `platform` — the backend
+detects it). Optional: `timeout` (ms), `preferred_protocol` (try a given protocol
+first — one of `openai`, `anthropic`, `gemini`, `unknown`), and `test_all_keys`
+(bool — probe every key when `api_key` holds several).
 
-`fetch-models` (`POST /api/providers/fetch-models`, same body) returns just the
-model list for a not-yet-saved endpoint.
+`fetch-models` (`POST /api/providers/fetch-models`) returns just the model list
+for a not-yet-saved endpoint. Its body differs from detect-protocol: `platform`,
+`base_url`, `api_key` are all **required** (plus optional `bedrock_config`,
+`try_fix`).
 
 ### Test a provider connection
 
@@ -519,11 +546,13 @@ Two stores, both verified:
 - `PUT /api/settings/client` — batch-update that store.
 
 `PUT /api/settings/client` is a **partial merge** — send only the keys you want
-to change. Read first, change one key, read back.
+to change (a key set to `null` deletes it). Its response carries no data, so
+always read the store back to confirm.
 
 ```bash
 python3 scripts/aionui_api.py get /api/settings/client
 python3 scripts/aionui_api.py put /api/settings/client '{"ui.zoomFactor": 1.0}'
+python3 scripts/aionui_api.py get /api/settings/client   # confirm — PUT returns no body
 ```
 
 > To set which model a given assistant uses, configure that assistant's
@@ -535,19 +564,20 @@ python3 scripts/aionui_api.py put /api/settings/client '{"ui.zoomFactor": 1.0}'
 
 `GET /api/agents/management` lists the available engines (`aionrs`, `claude`,
 `codex`, …). There is **no** bare `GET /api/agents` — that path 404s; always use
-the `/management` sub-path. Each row carries `id`, `enabled` (toggled on),
-`installed` (spawn command resolvable on `$PATH`), `team_capable` (can run in a
-team), `backend`, `agent_type`, and a `status` of `online` / `offline` /
-`missing`. Check `installed` (and `status`) before binding an assistant to that
+the `/management` sub-path. Each row is rich: alongside `id`, `name`, `enabled`
+(toggled on), `installed` (spawn command resolvable on `$PATH`), `team_capable`
+(can run in a team), `backend`, `agent_type`, and a `status` of `online` /
+`offline` / `missing`, it also carries `config_options`, `available_modes`,
+`available_models` (when the engine advertises them), plus `last_check_*`
+diagnostics. Check `installed` (and `status`) before binding an assistant to that
 engine (via its `agent_id` — see *Picking the engine* above).
 
-> The management row does **not** include the engine `handshake` (its
-> `agent_capabilities` / `auth_methods` / `config_options` / `available_modes` /
-> `available_models` / `available_commands`) — those live on the fuller agent
-> metadata returned by `POST /api/agents/refresh`, which re-scans custom agents
-> and returns each agent's `available` + `handshake`. Use `refresh` when you need
-> the modes/models an engine offers; use `management` for the at-a-glance
-> enabled/installed/status list.
+> What the management row does **not** carry is the rest of the engine
+> `handshake` — `agent_capabilities`, `auth_methods`, `available_commands`. For
+> those, `POST /api/agents/refresh` re-scans agents and returns each one's full
+> metadata (`available` + `handshake`). The at-a-glance modes/models are already
+> on the management row; reach for `refresh` when you need capabilities, auth
+> methods, or the command list.
 
 ---
 
@@ -623,7 +653,15 @@ python3 scripts/aionui_api.py get    /api/cron/jobs/<id>                   # one
 python3 scripts/aionui_api.py put    /api/cron/jobs/<id> '{"enabled": false}'   # partial update (pause)
 python3 scripts/aionui_api.py post   /api/cron/jobs/<id>/run              # run it once right now
 python3 scripts/aionui_api.py delete /api/cron/jobs/<id>                  # remove it
+python3 scripts/aionui_api.py get    /api/cron/jobs/<id>/conversations    # conversations this job has spawned
+python3 scripts/aionui_api.py get    /api/cron/jobs/<id>/skill            # {"has_skill": bool}
+python3 scripts/aionui_api.py post   /api/cron/jobs/<id>/skill '{"content":"<SKILL.md body>"}'  # attach/replace a per-job skill
+python3 scripts/aionui_api.py delete /api/cron/jobs/<id>/skill            # remove the attached skill
 ```
+
+> A job can carry its own inline **skill** (a `SKILL.md`-style instruction body)
+> via `.../skill` — this is the `cron` skill source. Handy when a scheduled task
+> needs bespoke instructions that shouldn't live in the shared registry.
 
 `PUT` is a partial update — send only what changes (`name`, `description`,
 `enabled`, `schedule`, `message`, `execution_mode`, `agent_config`,

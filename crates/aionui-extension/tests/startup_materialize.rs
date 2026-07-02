@@ -100,6 +100,30 @@ async fn gate_triggers_when_version_mismatches() {
 }
 
 #[tokio::test]
+async fn gate_triggers_when_existing_marker_lacks_corpus_fingerprint() {
+    let tmp = TempDir::new().unwrap();
+    let target = tmp.path().join("builtin-skills");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join(".version"), "1.2.3").unwrap();
+    std::fs::write(target.join("sentinel"), "will-be-wiped").unwrap();
+
+    let marker = aionui_extension::builtin_skills_materialize_marker(&FIXTURE_CORPUS, "1.2.3");
+    let wrote = materialize_if_needed(tmp.path(), &FIXTURE_CORPUS, &marker)
+        .await
+        .unwrap();
+
+    assert!(
+        wrote,
+        "plain package version marker should refresh to content-fingerprinted marker"
+    );
+    assert!(
+        !target.join("sentinel").exists(),
+        "sentinel must be wiped by fresh materialize"
+    );
+    assert_eq!(read_version(&target).as_deref(), Some(marker.as_str()));
+}
+
+#[tokio::test]
 async fn gate_triggers_when_version_file_missing() {
     let tmp = TempDir::new().unwrap();
 

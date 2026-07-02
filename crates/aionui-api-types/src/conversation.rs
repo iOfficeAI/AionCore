@@ -4,6 +4,8 @@ use aionui_common::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::acp::AcpConfigOptionDto;
+
 /// Per-MCP snapshot status stored in `conversation.extra`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -136,6 +138,13 @@ pub struct ConversationRuntimeSummary {
     pub is_processing: bool,
     pub pending_confirmations: usize,
     pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureConversationRuntimeResponse {
+    pub recovered: bool,
+    pub config_options: Vec<AcpConfigOptionDto>,
+    pub runtime: ConversationRuntimeSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

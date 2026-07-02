@@ -104,6 +104,7 @@ fn make_aionrs_config() -> AionrsResolvedConfig {
         session_mode: None,
         extra_mcp_servers: Default::default(),
         bedrock_config: None,
+        runtime_env: Vec::new(),
     }
 }
 
@@ -214,6 +215,7 @@ async fn collect_idle_ignores_aionrs_agent_type() {
                 use_model: None,
             },
             skills: vec![],
+            runtime_env: vec![],
             team: None,
             kind,
         })

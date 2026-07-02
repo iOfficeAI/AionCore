@@ -2,8 +2,8 @@
 
 use crate::state::ConversationRouterState;
 use aionui_api_types::{
-    ApiResponse, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest,
-    SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    ApiResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse,
+    SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -19,7 +19,6 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/side-question", post(side_question))
         .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/usage", get(get_usage))
-        .route("/api/conversations/{id}/config-options", get(get_config_options))
         .route(
             "/api/conversations/{id}/config-options/{option_id}",
             put(set_config_option),
@@ -29,16 +28,6 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
 }
 
 // ── Route handlers ─────────────────────────────────────────────────
-
-async fn get_config_options(
-    State(state): State<ConversationRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<GetConfigOptionsResponse>>, ApiError> {
-    Ok(Json(ApiResponse::ok(
-        state.service.get_config_options(&id).await.map_err(ApiError::from)?,
-    )))
-}
 
 async fn set_config_option(
     State(state): State<ConversationRouterState>,

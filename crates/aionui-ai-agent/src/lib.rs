@@ -1,6 +1,7 @@
 #![warn(clippy::disallowed_types)]
 
 //! AI agent lifecycle, worker task dispatch, and skill management.
+pub mod active_lease;
 pub(crate) mod agent_runtime;
 pub mod agent_task;
 pub mod capability;
@@ -21,6 +22,7 @@ pub mod shared_kernel;
 pub mod task_manager;
 pub mod types;
 
+pub use active_lease::{ACTIVE_LEASE_TTL_MS, ActiveLeaseRegistry};
 pub use agent_runtime::AgentRuntime;
 #[cfg(any(test, feature = "test-support"))]
 pub use agent_task::IMockAgent;

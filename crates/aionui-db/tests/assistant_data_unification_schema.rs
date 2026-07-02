@@ -76,6 +76,9 @@ async fn assistant_definition_table_has_expected_default_columns() {
     assert!(snapshot_columns.iter().any(|name| name == "conversation_id"));
     assert!(snapshot_columns.iter().any(|name| name == "assistant_definition_id"));
     assert!(snapshot_columns.iter().any(|name| name == "assistant_id"));
+    assert!(!snapshot_columns.iter().any(|name| name == "assistant_name"));
+    assert!(!snapshot_columns.iter().any(|name| name == "assistant_avatar_type"));
+    assert!(!snapshot_columns.iter().any(|name| name == "assistant_avatar_value"));
     assert!(snapshot_columns.iter().any(|name| name == "default_model_mode"));
     assert!(snapshot_columns.iter().any(|name| name == "resolved_model_id"));
     assert!(snapshot_columns.iter().any(|name| name == "resolved_skill_ids"));

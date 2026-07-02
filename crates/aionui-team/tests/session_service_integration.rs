@@ -9,7 +9,7 @@ use aionui_ai_agent::session_context::{
 };
 use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
+use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
@@ -512,6 +512,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 use_model: None,
             },
             skills: config.skills.clone(),
+            runtime_env: Vec::new(),
             team: team.clone(),
             kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
                 config,
@@ -1073,6 +1074,7 @@ fn test_acp_build_options(conversation_id: String, workspace: String) -> BuildTa
             use_model: None,
         },
         skills: Vec::new(),
+        runtime_env: Vec::new(),
         team: None,
         kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
             config: AcpBuildExtra::default(),
@@ -1657,6 +1659,20 @@ fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadata
     }
 }
 
+fn acp_agent_metadata_row(id: &str, backend: &str, yolo_id: Option<&str>) -> AgentMetadataRow {
+    let mut row = make_agent_metadata_row(id, backend, "");
+    row.yolo_id = yolo_id.map(str::to_owned);
+    row
+}
+
+fn seeded_agent_metadata_repo() -> Arc<dyn IAgentMetadataRepository> {
+    Arc::new(StubAgentMetadataRepo::with_rows(vec![
+        acp_agent_metadata_row("claude-id", "claude", Some("bypassPermissions")),
+        acp_agent_metadata_row("codex-id", "codex", Some("full-access")),
+        acp_agent_metadata_row("gemini-id", "gemini", Some("yolo")),
+    ]))
+}
+
 fn word_creator_definition() -> AssistantDefinitionRow {
     AssistantDefinitionRow {
         id: "def-word-creator".into(),
@@ -1723,6 +1739,96 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
 async fn reset_auto_started_session(svc: &Arc<TeamSessionService>, tm: &Arc<CountingTaskManager>, team_id: &str) {
     svc.stop_session("user1", team_id).await.unwrap();
     tm.reset().await;
+}
+
+#[tokio::test]
+async fn renew_active_lease_records_all_team_agent_conversations() {
+    let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Lease Team".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let active_leases = ActiveLeaseRegistry::new();
+
+    svc.renew_active_lease("user1", &created.id, &active_leases)
+        .await
+        .expect("renew team lease");
+
+    for agent in &created.assistants {
+        assert!(active_leases.is_active(&agent.conversation_id));
+    }
+}
+
+#[tokio::test]
+async fn renew_active_lease_allows_empty_team_without_unrelated_lease() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo
+        .create_team(&aionui_db::models::TeamRow {
+            id: "team-empty".into(),
+            user_id: "user1".into(),
+            name: "Empty".into(),
+            workspace: String::new(),
+            workspace_mode: "shared".into(),
+            agents: "[]".into(),
+            lead_agent_id: None,
+            session_mode: None,
+            agents_version: "1.0.1".into(),
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        })
+        .await
+        .expect("insert empty team");
+    let active_leases = ActiveLeaseRegistry::new();
+
+    svc.renew_active_lease("user1", "team-empty", &active_leases)
+        .await
+        .expect("empty team renew is accepted");
+
+    assert!(!active_leases.is_active("team-empty"));
+    assert!(!active_leases.is_active("unrelated-conversation"));
+}
+
+#[tokio::test]
+async fn renew_active_lease_rejects_team_owned_by_other_user() {
+    let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Lease Team".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let active_leases = ActiveLeaseRegistry::new();
+
+    let err = svc
+        .renew_active_lease("other-user", &created.id, &active_leases)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, TeamError::Forbidden(_)));
+    for agent in &created.assistants {
+        assert!(!active_leases.is_active(&agent.conversation_id));
+    }
 }
 
 async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {
@@ -1939,7 +2045,7 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
 
 #[tokio::test]
 async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra() {
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = seeded_agent_metadata_repo();
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
             id: "def-team-lead".into(),
@@ -2015,7 +2121,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
 
 #[tokio::test]
 async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = seeded_agent_metadata_repo();
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
             id: "def-team-lead".into(),
@@ -2102,7 +2208,7 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
 
 #[tokio::test]
 async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = seeded_agent_metadata_repo();
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
             id: "def-team-lead".into(),
@@ -2206,7 +2312,7 @@ async fn team_preset_assistant_snapshot_is_frozen() {
     });
     let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
         success_factory(),
-        Arc::new(StubAgentMetadataRepo::empty()),
+        seeded_agent_metadata_repo(),
         definition_repo,
         Arc::new(EmptyAssistantOverlayRepo),
     );
@@ -2253,7 +2359,7 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
     });
     let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
         success_factory(),
-        Arc::new(StubAgentMetadataRepo::empty()),
+        seeded_agent_metadata_repo(),
         definition_repo,
         Arc::new(EmptyAssistantOverlayRepo),
     );
@@ -2398,7 +2504,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
             updated_at: 0,
         },
     });
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = seeded_agent_metadata_repo();
     let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_assistants_and_conversation_repo(
         success_factory(),
         agent_metadata_repo,
@@ -2493,7 +2599,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
             updated_at: 0,
         },
     });
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = seeded_agent_metadata_repo();
     let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_assistants_and_conversation_repo(
         success_factory(),
         agent_metadata_repo,
@@ -3266,6 +3372,59 @@ async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
 }
 
 #[tokio::test]
+async fn provisioning_resolves_acp_backend_from_agent_metadata() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
+        Arc::new(StubAgentMetadataRepo::with_rows(vec![acp_agent_metadata_row(
+            "future-acp-id",
+            "future-acp",
+            Some("turbo"),
+        )]));
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Metadata ACP".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("future-acp".into()),
+                    model: "model-x".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let row = conv_repo
+        .get(&created.assistants[0].conversation_id)
+        .await
+        .unwrap()
+        .expect("conversation row");
+    assert_eq!(row.r#type, "acp");
+    let extra = conv_repo
+        .get_extra(&created.assistants[0].conversation_id)
+        .expect("conversation extra");
+    assert_eq!(
+        extra.get("backend").and_then(serde_json::Value::as_str),
+        Some("future-acp")
+    );
+    assert_eq!(
+        extra.get("session_mode").and_then(serde_json::Value::as_str),
+        Some("turbo")
+    );
+    assert_eq!(
+        extra.get("provider_id").and_then(serde_json::Value::as_str),
+        Some("future-acp")
+    );
+}
+
+#[tokio::test]
 async fn aa4_add_agent_to_nonexistent_team() {
     let svc = setup();
     let result = svc
@@ -3441,7 +3600,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
             updated_at: 0,
         },
     });
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = seeded_agent_metadata_repo();
     let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_assistants_and_conversation_repo(
         success_factory(),
         agent_metadata_repo,
@@ -3537,7 +3696,7 @@ async fn lead_send_agent_message_in_session_requires_active_team_run() {
 async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
     let (svc, team_repo, _, _) = setup_with_factory_metadata_assistants_and_conversation_repo(
         success_factory(),
-        Arc::new(StubAgentMetadataRepo::empty()),
+        seeded_agent_metadata_repo(),
         Arc::new(SingleAssistantDefinitionRepo {
             row: word_creator_definition(),
         }),
@@ -3584,7 +3743,7 @@ async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
 async fn spawn_agent_in_session_compensates_when_welcome_mailbox_write_fails() {
     let (svc, team_repo, _, _) = setup_with_factory_metadata_assistants_and_conversation_repo(
         success_factory(),
-        Arc::new(StubAgentMetadataRepo::empty()),
+        seeded_agent_metadata_repo(),
         Arc::new(SingleAssistantDefinitionRepo {
             row: word_creator_definition(),
         }),

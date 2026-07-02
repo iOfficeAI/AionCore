@@ -47,7 +47,6 @@ async fn run_acp_tool_call_update_without_insert_creates_placeholder() {
         "user-1".into(),
         repo.clone(),
         bus,
-        None,
     );
     let rx = tx.subscribe();
 
@@ -122,7 +121,6 @@ async fn run_acp_tool_call_late_initial_event_merges_with_update_placeholder() {
         "user-1".into(),
         repo.clone(),
         bus,
-        None,
     );
     let rx = tx.subscribe();
 

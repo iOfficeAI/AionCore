@@ -27,15 +27,73 @@ pub struct SendMessageData {
 #[derive(Debug, Clone)]
 pub struct BuildTaskOptions {
     pub context: AgentSessionContext,
+    pub runtime_capabilities: RuntimeCapabilities,
 }
 
 impl BuildTaskOptions {
     pub fn new(context: AgentSessionContext) -> Self {
-        Self { context }
+        Self {
+            context,
+            runtime_capabilities: RuntimeCapabilities::default(),
+        }
     }
 
     pub fn conversation_id(&self) -> &str {
         self.context.conversation_id()
+    }
+
+    pub fn apply_conversation_runtime_context(
+        &mut self,
+        user_id: &str,
+        conversation_id: &str,
+        helper_bin: Option<&str>,
+        base_url: Option<&str>,
+    ) {
+        self.context.runtime_env.retain(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                AIONUI_USER_ID_ENV | AIONUI_CONVERSATION_ID_ENV | AIONUI_HELPER_BIN_ENV | AIONUI_BASE_URL_ENV
+            )
+        });
+        self.context
+            .runtime_env
+            .push((AIONUI_USER_ID_ENV.to_owned(), user_id.to_owned()));
+        self.context
+            .runtime_env
+            .push((AIONUI_CONVERSATION_ID_ENV.to_owned(), conversation_id.to_owned()));
+        if let Some(helper_bin) = helper_bin {
+            self.context
+                .runtime_env
+                .push((AIONUI_HELPER_BIN_ENV.to_owned(), helper_bin.to_owned()));
+        }
+        if let Some(base_url) = base_url {
+            self.context
+                .runtime_env
+                .push((AIONUI_BASE_URL_ENV.to_owned(), base_url.to_owned()));
+        }
+        self.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
+    }
+}
+
+pub const AIONUI_USER_ID_ENV: &str = "AIONUI_USER_ID";
+pub const AIONUI_CONVERSATION_ID_ENV: &str = "AIONUI_CONVERSATION_ID";
+pub const AIONUI_HELPER_BIN_ENV: &str = "AIONUI_HELPER_BIN";
+pub const AIONUI_BASE_URL_ENV: &str = "AIONUI_BASE_URL";
+pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeCapabilities {
+    pub conversation_runtime_context_version: Option<u32>,
+}
+
+impl RuntimeCapabilities {
+    pub fn satisfies(&self, requested: &Self) -> bool {
+        match requested.conversation_runtime_context_version {
+            Some(version) => self
+                .conversation_runtime_context_version
+                .is_some_and(|actual| actual >= version),
+            None => true,
+        }
     }
 }
 
@@ -77,6 +135,8 @@ pub struct AionrsResolvedConfig {
     pub extra_mcp_servers: HashMap<String, aion_config::config::McpServerConfig>,
     /// AWS Bedrock credentials (region + access key or profile).
     pub bedrock_config: Option<aion_config::config::BedrockConfig>,
+    /// Per-turn environment values exposed to runtime tool execution.
+    pub runtime_env: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -90,6 +150,92 @@ mod tests {
         let legacy = r#"{"backend":"claude"}"#;
         let parsed: AcpBuildExtra = serde_json::from_str(legacy).unwrap();
         assert!(parsed.skills.is_empty());
+    }
+
+    #[test]
+    fn build_task_options_applies_conversation_runtime_context_once() {
+        use crate::session_context::{
+            AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
+        };
+        use aionui_common::{AgentType, ProviderWithModel};
+
+        let context = AgentSessionContext {
+            conversation: ConversationContext {
+                conversation_id: "conv-old".into(),
+                user_id: "user-old".into(),
+                agent_type: AgentType::Acp,
+                source: None,
+            },
+            workspace: WorkspaceContext {
+                path: "/tmp/workspace".into(),
+                stored_path: "/tmp/workspace".into(),
+                is_custom: false,
+            },
+            model: ProviderWithModel {
+                provider_id: "provider".into(),
+                model: "model".into(),
+                use_model: None,
+            },
+            skills: vec![],
+            runtime_env: vec![
+                (AIONUI_USER_ID_ENV.into(), "old-user".into()),
+                (AIONUI_CONVERSATION_ID_ENV.into(), "old-conv".into()),
+                ("EXISTING".into(), "1".into()),
+            ],
+            team: None,
+            kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
+                config: Default::default(),
+                team: None,
+                belongs_to_team: false,
+                session_id: None,
+                session_snapshot: None,
+            })),
+        };
+        let mut options = BuildTaskOptions::new(context);
+
+        options.apply_conversation_runtime_context(
+            "user-1",
+            "conv-1",
+            Some("/Applications/AionUi/aioncore"),
+            Some("http://127.0.0.1:25808"),
+        );
+
+        assert_eq!(
+            options
+                .context
+                .runtime_env
+                .iter()
+                .filter(|(key, _)| key == AIONUI_USER_ID_ENV)
+                .count(),
+            1
+        );
+        assert!(
+            options
+                .context
+                .runtime_env
+                .contains(&(AIONUI_USER_ID_ENV.to_owned(), "user-1".to_owned()))
+        );
+        assert!(
+            options
+                .context
+                .runtime_env
+                .contains(&(AIONUI_CONVERSATION_ID_ENV.to_owned(), "conv-1".to_owned()))
+        );
+        assert!(options.context.runtime_env.contains(&(
+            AIONUI_HELPER_BIN_ENV.to_owned(),
+            "/Applications/AionUi/aioncore".to_owned()
+        )));
+        assert!(
+            options
+                .context
+                .runtime_env
+                .contains(&(AIONUI_BASE_URL_ENV.to_owned(), "http://127.0.0.1:25808".to_owned()))
+        );
+        assert!(options.context.runtime_env.contains(&("EXISTING".into(), "1".into())));
+        assert_eq!(
+            options.runtime_capabilities.conversation_runtime_context_version,
+            Some(CONVERSATION_RUNTIME_CONTEXT_VERSION)
+        );
     }
 
     #[test]

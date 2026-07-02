@@ -5,7 +5,7 @@ pub(crate) mod spawn_support;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
-use aionui_ai_agent::{AgentError, AgentInstance, IWorkerTaskManager};
+use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload, TeamResponse,
     TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole, WebSocketMessage,
@@ -18,7 +18,7 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::AgentLoopContext;
@@ -131,6 +131,50 @@ impl TeamSessionService {
             )));
         }
         Ok(Team::from_row(&row)?)
+    }
+
+    pub async fn renew_active_lease(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        active_leases: &ActiveLeaseRegistry,
+    ) -> Result<(), TeamError> {
+        let team = match self.load_owned_team(user_id, team_id).await {
+            Ok(team) => team,
+            Err(error @ (TeamError::TeamNotFound(_) | TeamError::Forbidden(_))) => {
+                debug!(
+                    kind = "team",
+                    team_id,
+                    user_id,
+                    error = %error,
+                    "Team active lease renew rejected"
+                );
+                return Err(error);
+            }
+            Err(error) => {
+                warn!(
+                    kind = "team",
+                    team_id,
+                    user_id,
+                    error = %error,
+                    "Team active lease renew failed"
+                );
+                return Err(error);
+            }
+        };
+
+        let conversation_ids = team
+            .agents
+            .iter()
+            .map(|agent| agent.conversation_id.as_str())
+            .filter(|conversation_id| !conversation_id.trim().is_empty());
+        let (covered_count, expires_at) = active_leases.renew_many(conversation_ids);
+
+        debug!(
+            kind = "team",
+            team_id, covered_count, expires_at, "Team active lease renewed"
+        );
+        Ok(())
     }
 
     /// Restore sessions for all existing teams. Called once at app startup
@@ -430,7 +474,7 @@ impl TeamSessionService {
     /// Flow (mcp.md §4.3):
     /// 1. Start `TeamSession` (opens the MCP TCP server).
     /// 2. For each agent: persist `team_mcp_stdio_config` into
-    ///    `conversation.extra` → `task_manager.kill(conv_id, TeamMcpRebuild)`
+    ///    `conversation.extra` → `task_manager.kill_and_wait(conv_id, TeamMcpRebuild)`
     ///    → `TeamConversationProvisioningPort::warmup_agent_process(...)`
     ///    rebuilds the ACP process with
     ///    the new extra.

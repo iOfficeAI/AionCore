@@ -89,6 +89,7 @@ impl ProviderHealthCheckService {
             session_mode: None,
             extra_mcp_servers: HashMap::new(),
             bedrock_config,
+            runtime_env: Vec::new(),
         })
     }
 }
