@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "aioncore", about = "AionUi Backend Server", version)]
@@ -81,6 +81,8 @@ impl From<ManagedResourcesModeArg> for aionui_runtime::ManagedResourcesMode {
 // verbatim.
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
+    /// Manage cron jobs for the current conversation from an agent skill.
+    CronHelper(CronHelperArgs),
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
     McpBridge,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
@@ -98,6 +100,7 @@ pub(crate) enum Command {
 impl Command {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
+            Self::CronHelper(_) => "cron-helper",
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
@@ -110,7 +113,32 @@ impl Command {
     }
 }
 
-#[derive(clap::Args, Debug, Clone)]
+#[derive(Args, Debug, Clone)]
+pub(crate) struct CronHelperArgs {
+    #[command(subcommand)]
+    pub command: CronHelperCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum CronHelperCommand {
+    /// Print the configured aioncore base URL after validating cron helper routes.
+    Discover,
+    /// List cron jobs linked to the current conversation.
+    List,
+    /// Create a cron job from a JSON payload on stdin.
+    Create,
+    /// Update a cron job from a JSON payload on stdin.
+    Update(CronHelperUpdateArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct CronHelperUpdateArgs {
+    /// Cron job id to update.
+    #[arg(long)]
+    pub job_id: String,
+}
+
+#[derive(Args, Debug, Clone)]
 pub(crate) struct PrepareManagedResourcesArgs {
     /// Bundle output root. Aioncore writes the managed resources under
     /// `<bundle-out>/{node,acp}/...` for packaging.
@@ -125,7 +153,7 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
-    use super::{Cli, Command, ManagedResourcesModeArg, PrepareManagedResourcesArgs};
+    use super::{Cli, Command, CronHelperCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs};
 
     #[test]
     fn long_version_flag_uses_workspace_package_version() {
@@ -187,6 +215,19 @@ mod tests {
     }
 
     #[test]
+    fn cron_helper_accepts_update_job_id() {
+        let cli = Cli::parse_from(["aioncore", "cron-helper", "update", "--job-id", "cron_1"]);
+
+        let Some(Command::CronHelper(args)) = cli.command else {
+            panic!("expected cron-helper command");
+        };
+        let CronHelperCommand::Update(update) = args.command else {
+            panic!("expected update subcommand");
+        };
+        assert_eq!(update.job_id, "cron_1");
+    }
+
+    #[test]
     fn managed_resources_mode_defaults_to_download() {
         let cli = Cli::parse_from(["aioncore"]);
         assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
@@ -226,6 +267,12 @@ mod tests {
             (Command::McpBridge, "mcp-bridge"),
             (Command::McpTeamStdio, "mcp-team-stdio"),
             (Command::Doctor, "doctor"),
+            (
+                Command::CronHelper(super::CronHelperArgs {
+                    command: CronHelperCommand::List,
+                }),
+                "cron-helper",
+            ),
             (
                 Command::PrepareManagedResources(prepare_args),
                 "prepare-managed-resources",

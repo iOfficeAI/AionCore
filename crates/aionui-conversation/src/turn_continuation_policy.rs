@@ -46,7 +46,7 @@ impl TurnContinuationPolicy {
             warn!(
                 conversation_id,
                 max = self.max_continuations,
-                "Reached cron continuation limit; ending turn early"
+                "Reached system response continuation limit; ending turn early"
             );
             return ContinuationDecision::Stop(ContinuationStopReason::LimitReached);
         }

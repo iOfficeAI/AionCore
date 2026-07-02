@@ -52,7 +52,6 @@ async fn persist_info_tip_preserves_code_and_params() {
         "system_default_user".into(),
         repo.clone(),
         bus,
-        None,
     );
 
     let rx = tx.subscribe();

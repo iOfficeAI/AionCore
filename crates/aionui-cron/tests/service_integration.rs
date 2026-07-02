@@ -5,7 +5,7 @@
 //! is out of scope for this service-layer test).
 //!
 //! Covers test-plan items: CJ-1..CJ-12, SK-1..SK-7, SC-1..SC-8,
-//! OC-1, SR-1, ICronService trait integration.
+//! OC-1, SR-1, conversation helper API integration.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,12 +14,13 @@ use aionui_ai_agent::AgentRegistry;
 use aionui_ai_agent::agent_task::AgentInstance;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_api_types::{
-    CreateCronJobRequest, CronScheduleDto, ListCronJobsQuery, SaveCronSkillRequest, UpdateCronJobRequest,
+    ApiResponse, CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronJobResponse,
+    CronScheduleDto, ListCronJobsQuery, SaveCronSkillRequest, UpdateConversationCronRequest, UpdateCronJobRequest,
     WebSocketMessage,
 };
 use aionui_common::{PaginatedResult, ProviderWithModel, TimestampMs, now_ms};
 use aionui_conversation::ConversationService;
-use aionui_conversation::response_middleware::{CronCreateParams, CronUpdateParams};
+use aionui_cron::{CronRouterState, cron_routes};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IConversationRepository, ICronRepository,
@@ -29,12 +30,15 @@ use aionui_db::{
     models::{ConversationAssistantSnapshotRow, CronJobRow, MessageRow},
 };
 use aionui_realtime::EventBroadcaster;
+use axum::body::{Body, to_bytes};
+use axum::http::{Method, Request, StatusCode};
 
 use aionui_cron::events::CronEventEmitter;
 use aionui_cron::executor::JobExecutor;
 use aionui_cron::scheduler::CronScheduler;
 use aionui_cron::service::{CronService, CronServiceDeps};
 use aionui_cron::types::JobStatus;
+use tower::ServiceExt;
 
 // ── Test infrastructure ────────────────────────────────────────────
 
@@ -105,6 +109,7 @@ struct StubConvRepo {
     artifacts: Mutex<Vec<aionui_db::ConversationArtifactRow>>,
     rows: Mutex<HashMap<String, aionui_db::models::ConversationRow>>,
     assistant_snapshots: Mutex<HashMap<String, ConversationAssistantSnapshotRow>>,
+    update_failures: Mutex<Vec<String>>,
 }
 
 impl StubConvRepo {
@@ -114,6 +119,7 @@ impl StubConvRepo {
             artifacts: Mutex::new(Vec::new()),
             rows: Mutex::new(HashMap::new()),
             assistant_snapshots: Mutex::new(HashMap::new()),
+            update_failures: Mutex::new(Vec::new()),
         }
     }
 
@@ -135,11 +141,8 @@ impl StubConvRepo {
         self.artifacts.lock().unwrap().clone()
     }
 
-    fn insert_assistant_snapshot(&self, row: ConversationAssistantSnapshotRow) {
-        self.assistant_snapshots
-            .lock()
-            .unwrap()
-            .insert(row.conversation_id.clone(), row);
+    fn fail_updates_for(&self, conversation_id: &str) {
+        self.update_failures.lock().unwrap().push(conversation_id.to_owned());
     }
 }
 
@@ -465,6 +468,10 @@ impl IConversationRepository for StubConvRepo {
         Ok(())
     }
     async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+        if self.update_failures.lock().unwrap().iter().any(|item| item == id) {
+            return Err(aionui_db::DbError::Init(format!("forced update failure for {id}")));
+        }
+
         let mut rows = self.rows.lock().unwrap();
         let row = rows
             .entry(id.to_owned())
@@ -664,6 +671,17 @@ async fn setup_with_conv_repo() -> (
     Arc<MockBroadcaster>,
     Arc<StubConvRepo>,
 ) {
+    let (svc, repo, bc, conv_repo, _) = setup_with_conv_runtime().await;
+    (svc, repo, bc, conv_repo)
+}
+
+async fn setup_with_conv_runtime() -> (
+    CronService,
+    Arc<dyn ICronRepository>,
+    Arc<MockBroadcaster>,
+    Arc<StubConvRepo>,
+    Arc<ConversationService>,
+) {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
     let cron_repo: Arc<dyn ICronRepository> = Arc::new(SqliteCronRepository::new(pool.clone()));
@@ -719,7 +737,7 @@ async fn setup_with_conv_repo() -> (
     let executor = Arc::new(JobExecutor::new(
         task_manager,
         stub_conv_repo_trait,
-        conv_service,
+        conv_service.clone(),
         data_dir.clone(),
         data_dir.clone(),
         bc.clone() as Arc<dyn EventBroadcaster>,
@@ -750,7 +768,7 @@ async fn setup_with_conv_repo() -> (
     seed_bare_assistant_definitions(&assistant_definition_repo).await;
 
     std::mem::forget(db);
-    (svc, cron_repo, bc, stub_conv_repo)
+    (svc, cron_repo, bc, stub_conv_repo, conv_service)
 }
 
 async fn setup_with_assistant_repos() -> (
@@ -1940,396 +1958,421 @@ async fn delete_skill_clears_content() {
     assert!(!svc.has_skill(&job.id).await.unwrap().has_skill);
 }
 
-// ── ICronService trait: create ─────────────────────────────────────
-
-#[tokio::test]
-async fn icron_service_create_job() {
-    let (svc, _, _, conv_repo) = setup_with_conv_repo().await;
-
-    use aionui_conversation::response_middleware::ICronService;
-
-    let params = CronCreateParams {
-        name: "Agent Job".into(),
+fn conversation_cron_request(message: &str) -> CreateConversationCronRequest {
+    CreateConversationCronRequest {
+        name: "Agent Helper Job".into(),
         schedule: "0 */10 * * * *".into(),
         schedule_description: "every 10 min".into(),
-        message: "do agent work".into(),
-    };
+        message: message.into(),
+    }
+}
 
-    let result = ICronService::create_job(&svc, "user_1", "conv_1", &params).await;
-    assert!(result.success);
-    assert!(result.message.contains("Agent Job"));
+#[tokio::test]
+async fn create_for_conversation_helper_creates_claimed_conversation_job_with_multiline_message() {
+    let (svc, cron_repo, _, conv_repo, conv_service) = setup_with_conv_runtime().await;
+    let runtime_state = conv_service.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn("conv_1", "turn_helper_create")
+        .expect("claim conversation");
+
+    let response = svc
+        .create_for_conversation_helper("u1", "conv_1", conversation_cron_request("first\nsecond\nthird"))
+        .await
+        .unwrap();
+
+    assert!(response.job_id.starts_with("cron_"));
+    assert!(response.message.contains("Agent Helper Job"));
+
+    let row = cron_repo.get_by_id(&response.job_id).await.unwrap().unwrap();
+    assert_eq!(row.payload_message, "first\nsecond\nthird");
+    assert_eq!(row.conversation_id, "conv_1");
+    assert_eq!(row.created_by, "agent");
 
     let bound = conv_repo.get("conv_1").await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
-    let bound_job_id = extra
-        .get("cron_job_id")
-        .and_then(|value| value.as_str())
-        .or_else(|| extra.get("cronJobId").and_then(|value| value.as_str()));
-    assert!(bound_job_id.is_some());
-}
+    assert_eq!(extra["cron_job_id"], response.job_id);
+    assert_eq!(extra["cronJobId"], response.job_id);
 
-#[tokio::test]
-async fn icron_service_create_job_inherits_conversation_mode_without_backend() {
-    let (svc, _, _) = setup().await;
-
-    use aionui_conversation::response_middleware::ICronService;
-
-    let params = CronCreateParams {
-        name: "Agent Job".into(),
-        schedule: "0 */10 * * * *".into(),
-        schedule_description: "every 10 min".into(),
-        message: "do agent work".into(),
-    };
-
-    let result = ICronService::create_job(&svc, "user_1", "conv_mode", &params).await;
-    assert!(result.success);
-
-    let jobs = svc
-        .list_jobs(&ListCronJobsQuery {
-            conversation_id: Some("conv_mode".into()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(jobs.len(), 1);
-
-    let job = &jobs[0];
-    let config = job.agent_config.as_ref().expect("agent config should be copied");
-    assert_eq!(job.agent_type, "acp");
-    assert_eq!(job.conversation_title.as_deref(), Some("Gemini Chat"));
-    assert_eq!(config.name, "Gemini");
-    assert_eq!(config.mode.as_deref(), Some("yolo"));
-    assert_eq!(config.model_id.as_deref(), Some("gemini-2.5-pro"));
-    assert_eq!(
-        config.workspace.as_deref(),
-        Some(ensure_named_workspace_path("aionui-cron-service-gemini-workspace").as_str())
-    );
-}
-
-#[tokio::test]
-async fn icron_service_create_job_ignores_stale_extra_backend() {
-    let (svc, _, _) = setup().await;
-
-    use aionui_conversation::response_middleware::ICronService;
-
-    let params = CronCreateParams {
-        name: "Agent Job".into(),
-        schedule: "0 */10 * * * *".into(),
-        schedule_description: "every 10 min".into(),
-        message: "do agent work".into(),
-    };
-
-    let result = ICronService::create_job(&svc, "user_1", "conv_mode_stale_backend", &params).await;
-    assert!(result.success);
-
-    let jobs = svc
-        .list_jobs(&ListCronJobsQuery {
-            conversation_id: Some("conv_mode_stale_backend".into()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(jobs.len(), 1);
-
-    let job = &jobs[0];
-    let config = job.agent_config.as_ref().expect("agent config should be copied");
-    assert_eq!(job.agent_type, "acp");
-    assert_eq!(config.model_id.as_deref(), Some("gemini-2.5-pro"));
-}
-
-#[tokio::test]
-async fn icron_service_create_job_derives_assistant_runtime_over_stale_extra_backend() {
-    let (svc, _, _, _, definition_repo, overlay_repo) = setup_with_assistant_repos().await;
-    seed_assistant_definition(
-        &definition_repo,
-        "asstdef_assistant_override",
-        "assistant-override",
-        "codex",
-    )
-    .await;
-    seed_assistant_overlay(&overlay_repo, "asstdef_assistant_override", Some("aionrs")).await;
-
-    use aionui_conversation::response_middleware::ICronService;
-
-    let params = CronCreateParams {
-        name: "Assistant Job".into(),
-        schedule: "0 */10 * * * *".into(),
-        schedule_description: "every 10 min".into(),
-        message: "do assistant work".into(),
-    };
-
-    let result = ICronService::create_job(&svc, "user_1", "conv_mode_assistant_stale_backend", &params).await;
-    assert!(result.success);
-
-    let jobs = svc
-        .list_jobs(&ListCronJobsQuery {
-            conversation_id: Some("conv_mode_assistant_stale_backend".into()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(jobs.len(), 1);
-
-    let job = &jobs[0];
-    let config = job.agent_config.as_ref().expect("agent config should be copied");
-    assert_eq!(job.agent_type, "aionrs");
-    assert_eq!(config.assistant_id.as_deref(), Some("assistant-override"));
-    assert_eq!(config.mode.as_deref(), Some("yolo"));
-    assert_eq!(config.model_id.as_deref(), Some("gpt-5.4"));
-}
-
-#[tokio::test]
-async fn icron_service_create_job_inherits_assistant_snapshot_identity() {
-    let (svc, _, _, conv_repo, definition_repo, _) = setup_with_assistant_repos().await;
-    seed_assistant_definition(&definition_repo, "asstdef_snapshot", "assistant-snapshot", "claude").await;
-    conv_repo.insert_assistant_snapshot(ConversationAssistantSnapshotRow {
-        conversation_id: "conv_mode_assistant_snapshot".into(),
-        assistant_definition_id: "asstdef_snapshot".into(),
-        assistant_id: "assistant-snapshot".into(),
-        assistant_source: "bare".into(),
-        assistant_name: "Snapshot Assistant".into(),
-        assistant_avatar_type: "emoji".into(),
-        assistant_avatar_value: Some("S".into()),
-        agent_id: "8e1acf31".into(),
-        rules_content: String::new(),
-        default_model_mode: "default".into(),
-        resolved_model_id: Some("gpt-5.1".into()),
-        default_permission_mode: "default".into(),
-        resolved_permission_value: Some("ask".into()),
-        default_skills_mode: "default".into(),
-        resolved_skill_ids: "[]".into(),
-        resolved_disabled_builtin_skill_ids: "[]".into(),
-        default_mcps_mode: "default".into(),
-        resolved_mcp_ids: "[]".into(),
-        created_at: 1000,
-        updated_at: 1000,
-    });
-
-    use aionui_conversation::response_middleware::ICronService;
-
-    let params = CronCreateParams {
-        name: "Snapshot Assistant Job".into(),
-        schedule: "0 */10 * * * *".into(),
-        schedule_description: "every 10 min".into(),
-        message: "do assistant work".into(),
-    };
-
-    let result = ICronService::create_job(&svc, "user_1", "conv_mode_assistant_snapshot", &params).await;
-    assert!(result.success);
-
-    let jobs = svc
-        .list_jobs(&ListCronJobsQuery {
-            conversation_id: Some("conv_mode_assistant_snapshot".into()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(jobs.len(), 1);
-
-    let job = &jobs[0];
-    let config = job.agent_config.as_ref().expect("agent config should be copied");
-    assert_eq!(job.agent_type, "acp");
-    assert_eq!(config.assistant_id.as_deref(), Some("assistant-snapshot"));
-    assert_eq!(config.name, "Snapshot Assistant");
-    assert_eq!(config.model_id.as_deref(), Some("gpt-5.1"));
-}
-
-#[tokio::test]
-async fn icron_service_create_job_rejects_stale_extra_backend_when_assistant_cannot_resolve() {
-    let (svc, _, _, _, _, _) = setup_with_assistant_repos().await;
-
-    use aionui_conversation::response_middleware::ICronService;
-
-    let params = CronCreateParams {
-        name: "Missing Assistant Job".into(),
-        schedule: "0 */10 * * * *".into(),
-        schedule_description: "every 10 min".into(),
-        message: "do assistant work".into(),
-    };
-
-    let result = ICronService::create_job(&svc, "user_1", "conv_mode_missing_assistant_stale_backend", &params).await;
-
-    assert!(!result.success);
-    assert!(result.message.contains("missing-assistant"));
-    let jobs = svc
-        .list_jobs(&ListCronJobsQuery {
-            conversation_id: Some("conv_mode_missing_assistant_stale_backend".into()),
-        })
-        .await
-        .unwrap();
-    assert!(jobs.is_empty());
-}
-
-#[tokio::test]
-async fn icron_service_create_job_forces_full_auto_mode_for_generated_crons() {
-    let (svc, _, _) = setup().await;
-
-    use aionui_conversation::response_middleware::ICronService;
-
-    let params = CronCreateParams {
-        name: "Generated Agent Job".into(),
-        schedule: "0 */10 * * * *".into(),
-        schedule_description: "every 10 min".into(),
-        message: "do agent work".into(),
-    };
-
-    let gemini = ICronService::create_job(&svc, "user_1", "conv_mode_default", &params).await;
-    assert!(gemini.success);
-
-    let codex = ICronService::create_job(&svc, "user_1", "conv_mode_codex", &params).await;
-    assert!(codex.success);
-
-    let claude = ICronService::create_job(&svc, "user_1", "conv_mode_claude", &params).await;
-    assert!(claude.success);
-
-    let hermes = ICronService::create_job(&svc, "user_1", "conv_mode_hermes", &params).await;
-    assert!(hermes.success);
-
-    let aionrs = ICronService::create_job(&svc, "user_1", "conv_mode_aionrs", &params).await;
-    assert!(aionrs.success);
-
-    let gemini_jobs = svc
-        .list_jobs(&ListCronJobsQuery {
-            conversation_id: Some("conv_mode_default".into()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        gemini_jobs[0]
-            .agent_config
-            .as_ref()
-            .and_then(|config| config.mode.as_deref()),
-        Some("yolo")
-    );
-
-    let codex_jobs = svc
-        .list_jobs(&ListCronJobsQuery {
-            conversation_id: Some("conv_mode_codex".into()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        codex_jobs[0]
-            .agent_config
-            .as_ref()
-            .and_then(|config| config.mode.as_deref()),
-        Some("full-access")
-    );
-
-    let claude_jobs = svc
-        .list_jobs(&ListCronJobsQuery {
-            conversation_id: Some("conv_mode_claude".into()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        claude_jobs[0]
-            .agent_config
-            .as_ref()
-            .and_then(|config| config.mode.as_deref()),
-        Some("bypassPermissions")
-    );
-
-    let hermes_jobs = svc
-        .list_jobs(&ListCronJobsQuery {
-            conversation_id: Some("conv_mode_hermes".into()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        hermes_jobs[0]
-            .agent_config
-            .as_ref()
-            .and_then(|config| config.mode.as_deref()),
-        Some("default")
-    );
-
-    let aionrs_jobs = svc
-        .list_jobs(&ListCronJobsQuery {
-            conversation_id: Some("conv_mode_aionrs".into()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        aionrs_jobs[0]
-            .agent_config
-            .as_ref()
-            .and_then(|config| config.mode.as_deref()),
-        Some("yolo")
-    );
-}
-
-// ── ICronService trait: list ───────────────────────────────────────
-
-#[tokio::test]
-async fn icron_service_list_jobs() {
-    let (svc, _, _) = setup().await;
-
-    use aionui_conversation::response_middleware::ICronService;
-
-    let result = ICronService::list_jobs(&svc, "user_1", "conv_1").await;
-    assert!(result.success);
-    assert!(result.message.contains("No cron jobs found for conversation 'conv_1'"));
-
-    let mut req = make_create_req("Listed Job", every_60s());
-    req.conversation_id = "conv_1".into();
-    svc.add_job(req).await.unwrap();
-
-    let result = ICronService::list_jobs(&svc, "user_1", "conv_1").await;
-    assert!(result.success);
-    assert!(result.message.contains("1 cron job(s) for conversation 'conv_1'"));
-    assert!(result.message.contains("Listed Job"));
-}
-
-// ── ICronService trait: update ─────────────────────────────────────
-
-#[tokio::test]
-async fn icron_service_update_job() {
-    let (svc, _, _, conv_repo) = setup_with_conv_repo().await;
-
-    use aionui_conversation::response_middleware::ICronService;
-
-    let job = svc
-        .add_job(make_create_req("Update Via Trait", every_60s()))
-        .await
-        .unwrap();
-
-    let params = CronUpdateParams {
-        job_id: job.id.clone(),
-        name: "Updated Via Trait".into(),
-        schedule: "0 */10 * * * *".into(),
-        schedule_description: "every 10 min".into(),
-        message: "do updated work".into(),
-    };
-
-    let result = ICronService::update_job(&svc, "user_1", "conv_1", &params).await;
-    assert!(result.success);
-    assert!(result.message.contains("Updated Via Trait"));
-
-    let bound = conv_repo.get("conv_1").await.unwrap().unwrap();
-    let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
-    assert_eq!(extra["cron_job_id"], job.id);
-    assert_eq!(extra["cronJobId"], job.id);
-
-    let linked = conv_repo.list_by_cron_job("user_1", &job.id).await.unwrap();
+    let linked = conv_repo.list_by_cron_job("u1", &response.job_id).await.unwrap();
     assert_eq!(linked.len(), 1);
     assert_eq!(linked[0].id, "conv_1");
 }
 
-// ── ICronService trait: delete ─────────────────────────────────────
+#[tokio::test]
+async fn create_for_conversation_helper_fails_when_conversation_binding_fails() {
+    let (svc, cron_repo, _, conv_repo, conv_service) = setup_with_conv_runtime().await;
+    let runtime_state = conv_service.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn("conv_1", "turn_helper_create_bind_failure")
+        .expect("claim conversation");
+    conv_repo.fail_updates_for("conv_1");
+
+    let err = svc
+        .create_for_conversation_helper("u1", "conv_1", conversation_cron_request("hello"))
+        .await
+        .expect_err("helper must not report success when conversation binding fails");
+
+    assert!(matches!(err, aionui_cron::error::CronError::Database(_)));
+
+    let rows = cron_repo.list_by_conversation("conv_1").await.unwrap();
+    assert!(rows.is_empty());
+}
 
 #[tokio::test]
-async fn icron_service_delete_job() {
-    let (svc, _, _) = setup().await;
+async fn conversation_cron_routes_create_list_and_update_claimed_job() {
+    let (svc, cron_repo, _, _, conv_service) = setup_with_conv_runtime().await;
+    let runtime_state = conv_service.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn("conv_1", "turn_helper_route")
+        .expect("claim conversation");
 
-    use aionui_conversation::response_middleware::ICronService;
+    let app = cron_routes(CronRouterState {
+        cron_service: Arc::new(svc),
+        conversation_service: (*conv_service).clone(),
+    });
 
-    let job = svc
-        .add_job(make_create_req("Delete Via Trait", every_60s()))
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/internal/conversation-cron/create")
+                .header("content-type", "application/json")
+                .header("x-aionui-user-id", "u1")
+                .header("x-aionui-conversation-id", "conv_1")
+                .body(Body::from(
+                    serde_json::to_vec(&conversation_cron_request("first\nsecond\nthird")).unwrap(),
+                ))
+                .unwrap(),
+        )
         .await
         .unwrap();
 
-    let result = ICronService::delete_job(&svc, "user_1", &job.id).await;
-    assert!(result.success);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let envelope: ApiResponse<CreateConversationCronResponse> = serde_json::from_slice(&body).unwrap();
+    let payload = envelope.data.expect("response should contain created job id");
 
-    let result = ICronService::delete_job(&svc, "user_1", "cron_nonexistent").await;
-    assert!(!result.success);
+    let row = cron_repo.get_by_id(&payload.job_id).await.unwrap().unwrap();
+    assert_eq!(row.payload_message, "first\nsecond\nthird");
+    assert_eq!(row.conversation_id, "conv_1");
+    assert_eq!(row.created_by, "agent");
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/internal/conversation-cron/list")
+                .header("x-aionui-user-id", "u1")
+                .header("x-aionui-conversation-id", "conv_1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), usize::MAX).await.unwrap();
+    let envelope: ApiResponse<Vec<CronJobResponse>> = serde_json::from_slice(&body).unwrap();
+    let jobs = envelope.data.expect("response should contain helper jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, payload.job_id);
+
+    let update_response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/internal/conversation-cron/jobs/{}", payload.job_id))
+                .header("content-type", "application/json")
+                .header("x-aionui-user-id", "u1")
+                .header("x-aionui-conversation-id", "conv_1")
+                .body(Body::from(
+                    serde_json::to_vec(&UpdateConversationCronRequest {
+                        name: "Updated Route Job".into(),
+                        schedule: "0 */20 * * * *".into(),
+                        schedule_description: "every 20 min".into(),
+                        message: "updated\nsecond\nthird".into(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), StatusCode::OK);
+
+    let row = cron_repo.get_by_id(&payload.job_id).await.unwrap().unwrap();
+    assert_eq!(row.name, "Updated Route Job");
+    assert_eq!(row.payload_message, "updated\nsecond\nthird");
+    assert_eq!(row.schedule_value, "0 */20 * * * *");
+}
+
+#[tokio::test]
+async fn conversation_cron_routes_reject_missing_headers_unclaimed_and_wrong_user() {
+    let (svc, _, _, _, conv_service) = setup_with_conv_runtime().await;
+    let app = cron_routes(CronRouterState {
+        cron_service: Arc::new(svc),
+        conversation_service: (*conv_service).clone(),
+    });
+
+    let missing_header = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/internal/conversation-cron/create")
+                .header("content-type", "application/json")
+                .header("x-aionui-conversation-id", "conv_1")
+                .body(Body::from(
+                    serde_json::to_vec(&conversation_cron_request("hello")).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_header.status(), StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(to_bytes(missing_header.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    assert!(body.contains("x-aionui-user-id"));
+
+    let unclaimed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/internal/conversation-cron/create")
+                .header("content-type", "application/json")
+                .header("x-aionui-user-id", "u1")
+                .header("x-aionui-conversation-id", "conv_1")
+                .body(Body::from(
+                    serde_json::to_vec(&conversation_cron_request("hello")).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unclaimed.status(), StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(to_bytes(unclaimed.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    assert!(body.contains("active conversation turn"));
+
+    let runtime_state = conv_service.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn("conv_1", "turn_helper_route_wrong_user")
+        .expect("claim conversation");
+
+    let wrong_user = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/internal/conversation-cron/create")
+                .header("content-type", "application/json")
+                .header("x-aionui-user-id", "other_user")
+                .header("x-aionui-conversation-id", "conv_1")
+                .body(Body::from(
+                    serde_json::to_vec(&conversation_cron_request("hello")).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_user.status(), StatusCode::NOT_FOUND);
+    let body = String::from_utf8(to_bytes(wrong_user.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    assert!(body.contains("conv_1"));
+}
+
+#[tokio::test]
+async fn create_for_conversation_helper_rejects_unclaimed_conversation() {
+    let (svc, _, _, _, _) = setup_with_conv_runtime().await;
+
+    let err = svc
+        .create_for_conversation_helper("u1", "conv_1", conversation_cron_request("hello"))
+        .await
+        .expect_err("helper must require active turn claim");
+
+    assert!(matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)));
+    assert!(err.to_string().contains("active conversation turn"));
+}
+
+#[tokio::test]
+async fn create_for_conversation_helper_rejects_wrong_user() {
+    let (svc, _, _, _, conv_service) = setup_with_conv_runtime().await;
+    let runtime_state = conv_service.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn("conv_1", "turn_helper_wrong_user")
+        .expect("claim conversation");
+
+    let err = svc
+        .create_for_conversation_helper("other_user", "conv_1", conversation_cron_request("hello"))
+        .await
+        .expect_err("helper must verify conversation owner");
+
+    assert!(matches!(err, aionui_cron::error::CronError::Conversation(_)));
+}
+
+#[tokio::test]
+async fn list_for_conversation_helper_returns_claimed_conversation_jobs() {
+    let (svc, _, _, _, conv_service) = setup_with_conv_runtime().await;
+    let runtime_state = conv_service.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn("conv_1", "turn_helper_list")
+        .expect("claim conversation");
+
+    svc.create_for_conversation_helper("u1", "conv_1", conversation_cron_request("hello"))
+        .await
+        .unwrap();
+
+    let jobs = svc
+        .list_for_conversation_helper("u1", "conv_1")
+        .await
+        .expect("list helper jobs");
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].name, "Agent Helper Job");
+    assert_eq!(jobs[0].conversation_id, "conv_1");
+}
+
+#[tokio::test]
+async fn update_for_conversation_helper_updates_claimed_conversation_job() {
+    let (svc, cron_repo, _, conv_repo, conv_service) = setup_with_conv_runtime().await;
+    let runtime_state = conv_service.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn("conv_1", "turn_helper_update")
+        .expect("claim conversation");
+
+    let created = svc
+        .create_for_conversation_helper("u1", "conv_1", conversation_cron_request("old message"))
+        .await
+        .unwrap();
+
+    let updated = svc
+        .update_for_conversation_helper(
+            "u1",
+            "conv_1",
+            &created.job_id,
+            UpdateConversationCronRequest {
+                name: "Updated Helper Job".into(),
+                schedule: "0 */20 * * * *".into(),
+                schedule_description: "every 20 min".into(),
+                message: "new message\nsecond line".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.name, "Updated Helper Job");
+    let row = cron_repo.get_by_id(&created.job_id).await.unwrap().unwrap();
+    assert_eq!(row.payload_message, "new message\nsecond line");
+    assert_eq!(row.schedule_value, "0 */20 * * * *");
+
+    conv_repo
+        .update(
+            "conv_1",
+            &ConversationRowUpdate {
+                extra: Some("{}".into()),
+                updated_at: Some(now_ms()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    svc.update_for_conversation_helper(
+        "u1",
+        "conv_1",
+        &created.job_id,
+        UpdateConversationCronRequest {
+            name: "Rebound Helper Job".into(),
+            schedule: "0 */30 * * * *".into(),
+            schedule_description: "every 30 min".into(),
+            message: "rebind message".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let bound = conv_repo.get("conv_1").await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
+    assert_eq!(extra["cron_job_id"], created.job_id);
+    assert_eq!(extra["cronJobId"], created.job_id);
+}
+
+#[tokio::test]
+async fn update_for_conversation_helper_fails_when_conversation_binding_fails() {
+    let (svc, _, _, conv_repo, conv_service) = setup_with_conv_runtime().await;
+    let runtime_state = conv_service.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn("conv_1", "turn_helper_update_bind_failure")
+        .expect("claim conversation");
+
+    let created = svc
+        .create_for_conversation_helper("u1", "conv_1", conversation_cron_request("old message"))
+        .await
+        .unwrap();
+
+    conv_repo
+        .update(
+            "conv_1",
+            &ConversationRowUpdate {
+                extra: Some("{}".into()),
+                updated_at: Some(now_ms()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    conv_repo.fail_updates_for("conv_1");
+
+    let err = svc
+        .update_for_conversation_helper(
+            "u1",
+            "conv_1",
+            &created.job_id,
+            UpdateConversationCronRequest {
+                name: "Failed Rebind Helper Job".into(),
+                schedule: "0 */20 * * * *".into(),
+                schedule_description: "every 20 min".into(),
+                message: "new message".into(),
+            },
+        )
+        .await
+        .expect_err("helper must not report success when conversation binding fails");
+
+    assert!(matches!(err, aionui_cron::error::CronError::Database(_)));
+}
+
+#[tokio::test]
+async fn update_for_conversation_helper_rejects_job_from_other_conversation() {
+    let (svc, _, _, _, conv_service) = setup_with_conv_runtime().await;
+    let runtime_state = conv_service.runtime_state();
+    let _claim_1 = runtime_state
+        .try_claim_turn("conv_1", "turn_helper_update_wrong_conv_1")
+        .expect("claim first conversation");
+
+    let created = svc
+        .create_for_conversation_helper("u1", "conv_1", conversation_cron_request("hello"))
+        .await
+        .unwrap();
+    drop(_claim_1);
+
+    let _claim_2 = runtime_state
+        .try_claim_turn("conv_2", "turn_helper_update_wrong_conv_2")
+        .expect("claim second conversation");
+
+    let err = svc
+        .update_for_conversation_helper(
+            "u1",
+            "conv_2",
+            &created.job_id,
+            UpdateConversationCronRequest {
+                name: "Wrong Conversation".into(),
+                schedule: "0 */20 * * * *".into(),
+                schedule_description: "every 20 min".into(),
+                message: "nope".into(),
+            },
+        )
+        .await
+        .expect_err("helper must reject jobs outside the claimed conversation");
+
+    assert!(matches!(err, aionui_cron::error::CronError::JobNotFound(_)));
 }
 
 // ── Update with max_retries ───────────────────────────────────────

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aionui_ai_agent::protocol::events::{ErrorEventData, TipType};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
-use crate::response_middleware::{ICronService, ISkillLoadService, MessageMiddleware, MiddlewareResult};
+use crate::response_middleware::{ISkillLoadService, MessageMiddleware, MiddlewareResult};
 use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
@@ -99,7 +99,6 @@ pub struct StreamRelay {
     turn_id: String,
     user_id: String,
     broadcaster: Arc<dyn EventBroadcaster>,
-    cron_service: Option<Arc<dyn ICronService>>,
     skill_resolver: Option<Arc<dyn SkillResolver>>,
     allowed_skill_names: Vec<String>,
     runtime_state: Option<Arc<ConversationRuntimeStateService>>,
@@ -117,7 +116,6 @@ impl StreamRelay {
         user_id: String,
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
-        cron_service: Option<Arc<dyn ICronService>>,
     ) -> Self {
         let adapter = StreamPersistenceAdapter::new(conversation_id.clone(), msg_id.clone(), repo, None);
         Self {
@@ -126,7 +124,6 @@ impl StreamRelay {
             turn_id,
             user_id,
             broadcaster,
-            cron_service,
             skill_resolver: None,
             allowed_skill_names: Vec::new(),
             runtime_state: None,
@@ -700,17 +697,12 @@ impl StreamRelay {
     }
 
     async fn process_final_text(&self, text: &str) -> MiddlewareResult {
-        let middleware = MessageMiddleware::new_with_skill_loader(
-            self.cron_service
-                .as_ref()
-                .map(|service| Box::new(SharedCronService(Arc::clone(service))) as Box<dyn ICronService>),
-            self.skill_resolver.as_ref().map(|resolver| {
-                Box::new(SharedSkillResolver {
-                    resolver: Arc::clone(resolver),
-                    allowed_skill_names: self.allowed_skill_names.clone(),
-                }) as Box<dyn ISkillLoadService>
-            }),
-        );
+        let middleware = MessageMiddleware::new_with_skill_loader(self.skill_resolver.as_ref().map(|resolver| {
+            Box::new(SharedSkillResolver {
+                resolver: Arc::clone(resolver),
+                allowed_skill_names: self.allowed_skill_names.clone(),
+            }) as Box<dyn ISkillLoadService>
+        }));
 
         middleware.process(text, &self.user_id, &self.conversation_id).await
     }
@@ -747,37 +739,6 @@ impl StreamRelay {
         }
         let msg = WebSocketMessage::new("message.stream", payload);
         self.broadcaster.broadcast(msg);
-    }
-}
-
-struct SharedCronService(Arc<dyn ICronService>);
-
-#[async_trait::async_trait]
-impl ICronService for SharedCronService {
-    async fn create_job(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        params: &crate::response_middleware::CronCreateParams,
-    ) -> crate::response_middleware::CronCommandResult {
-        self.0.create_job(user_id, conversation_id, params).await
-    }
-
-    async fn update_job(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        params: &crate::response_middleware::CronUpdateParams,
-    ) -> crate::response_middleware::CronCommandResult {
-        self.0.update_job(user_id, conversation_id, params).await
-    }
-
-    async fn list_jobs(&self, user_id: &str, conversation_id: &str) -> crate::response_middleware::CronCommandResult {
-        self.0.list_jobs(user_id, conversation_id).await
-    }
-
-    async fn delete_job(&self, user_id: &str, job_id: &str) -> crate::response_middleware::CronCommandResult {
-        self.0.delete_job(user_id, job_id).await
     }
 }
 
@@ -879,7 +840,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -927,7 +887,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let mut ws_rx = bus.subscribe();
@@ -983,7 +942,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1029,7 +987,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         )
         .with_turn_completion(false)
         .with_defer_clean_terminal_errors(true);
@@ -1081,7 +1038,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         )
         .with_turn_completion(false)
         .with_defer_clean_terminal_errors(true);
@@ -1129,7 +1085,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         )
         .with_turn_completion(false)
         .with_defer_clean_terminal_errors(true);
@@ -1176,7 +1131,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1221,7 +1175,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let mut ws_rx = bus.subscribe();
@@ -1285,7 +1238,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1327,7 +1279,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1381,7 +1332,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let mut ws_rx = bus.subscribe();
@@ -1445,7 +1395,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let mut ws_rx = bus.subscribe();
@@ -1507,7 +1456,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1543,7 +1491,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         // Subscribe to the bus before relay runs
@@ -1578,57 +1525,6 @@ mod tests {
         assert_eq!(stream_event.data["turn_id"], "turn-1");
     }
 
-    #[tokio::test]
-    async fn run_finalizes_with_cleaned_replacement_event() {
-        let repo = Arc::new(RecordingRepo::new());
-        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
-        let (tx, _) = broadcast::channel(64);
-        let relay = StreamRelay::new(
-            "conv-1".into(),
-            "asst-1".into(),
-            "turn-1".into(),
-            "user-1".into(),
-            repo.clone(),
-            bus.clone(),
-            Some(Arc::new(MockCronService)),
-        );
-
-        let mut ws_rx = bus.subscribe();
-        let rx = tx.subscribe();
-        tx.send(AgentStreamEvent::Text(TextEventData {
-            content: "Hello [CRON_LIST]".into(),
-        }))
-        .unwrap();
-        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
-
-        let outcome = relay.consume(rx).await;
-        assert_eq!(outcome.system_responses, vec!["[System: listed]".to_string()]);
-
-        let inserts = repo.take_inserts();
-        assert_eq!(inserts.len(), 1);
-        let updates = repo.take_updates();
-        let final_update = updates
-            .iter()
-            .find(|(id, update)| id == "asst-1" && update.content.is_some())
-            .expect("expected cleaned final text update");
-        let content: serde_json::Value = serde_json::from_str(final_update.1.content.as_deref().unwrap()).unwrap();
-        assert_eq!(content["content"].as_str().map(str::trim), Some("Hello"));
-
-        let mut ws_events = vec![];
-        while let Ok(evt) = ws_rx.try_recv() {
-            ws_events.push(evt);
-        }
-
-        let replacement = ws_events
-            .iter()
-            .find(|evt| evt.name == "message.stream" && evt.data["type"] == "content" && evt.data["replace"] == true);
-        assert!(replacement.is_some());
-        assert_eq!(
-            replacement.unwrap().data["data"]["content"].as_str().map(str::trim),
-            Some("Hello")
-        );
-    }
-
     // ── Tool persistence tests ────────────────────────────────────
 
     #[tokio::test]
@@ -1646,7 +1542,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1720,7 +1615,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1817,7 +1711,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1902,7 +1795,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1951,7 +1843,6 @@ mod tests {
             "user-1".into(),
             repo,
             bus,
-            None,
         );
         let mut active_text = Some(TextSegmentState {
             id: "missing-segment".into(),
@@ -1999,7 +1890,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus,
-            None,
         )
         .with_runtime_state(runtime_state);
         let rx = tx.subscribe();
@@ -2029,7 +1919,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus,
-            None,
         );
 
         let outcome = relay
@@ -2060,7 +1949,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus,
-            None,
         );
         let mut active_thinking = Some(ThinkingSegmentState {
             id: "thinking-1".into(),
@@ -2078,53 +1966,6 @@ mod tests {
     }
 
     // ── Helpers ──────────────────────────────────────────────────
-
-    struct MockCronService;
-
-    #[async_trait::async_trait]
-    impl ICronService for MockCronService {
-        async fn create_job(
-            &self,
-            _user_id: &str,
-            _conversation_id: &str,
-            _params: &crate::response_middleware::CronCreateParams,
-        ) -> crate::response_middleware::CronCommandResult {
-            crate::response_middleware::CronCommandResult {
-                success: true,
-                message: "created".into(),
-            }
-        }
-
-        async fn update_job(
-            &self,
-            _user_id: &str,
-            _conversation_id: &str,
-            _params: &crate::response_middleware::CronUpdateParams,
-        ) -> crate::response_middleware::CronCommandResult {
-            crate::response_middleware::CronCommandResult {
-                success: true,
-                message: "updated".into(),
-            }
-        }
-
-        async fn list_jobs(
-            &self,
-            _user_id: &str,
-            _conversation_id: &str,
-        ) -> crate::response_middleware::CronCommandResult {
-            crate::response_middleware::CronCommandResult {
-                success: true,
-                message: "listed".into(),
-            }
-        }
-
-        async fn delete_job(&self, _user_id: &str, _job_id: &str) -> crate::response_middleware::CronCommandResult {
-            crate::response_middleware::CronCommandResult {
-                success: true,
-                message: "deleted".into(),
-            }
-        }
-    }
 
     /// Recording repo that captures insert/update calls for assertions.
     struct RecordingRepo {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{AddAgentRequest, TeamAgentInput};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
-use aionui_db::models::TeamRow;
+use aionui_db::models::{AgentMetadataRow, TeamRow};
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
     ITeamRepository, UpdateTeamParams,
@@ -14,7 +14,9 @@ use tracing::{info, warn};
 use crate::error::TeamError;
 use crate::mcp::TeamMcpStdioConfig;
 use crate::service::inherit_team_workspace;
-use crate::service::spawn_support::{parse_agent_type, resolve_full_auto_mode, resolve_runtime_backend};
+use crate::service::spawn_support::{
+    acp_backend_metadata, parse_agent_type, resolve_runtime_backend, session_mode_for_backend,
+};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::workspace::TeamWorkspaceResolver;
 
@@ -360,9 +362,16 @@ impl TeamAgentProvisioner {
         agent: &TeamAgent,
         mcp_stdio_cfg: TeamMcpStdioConfig,
     ) -> Result<(), TeamError> {
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, &agent.backend).await?;
+        let agent_type = if acp_metadata.is_some() {
+            AgentType::Acp
+        } else {
+            parse_agent_type(&agent.backend)?
+        };
+        let session_mode = session_mode_for_backend(&agent.backend, agent_type, acp_metadata.as_ref());
         let patch = serde_json::json!({
             "team_mcp_stdio_config": mcp_stdio_cfg,
-            "session_mode": resolve_full_auto_mode(&agent.backend),
+            "session_mode": session_mode,
         });
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
@@ -432,11 +441,23 @@ impl TeamAgentProvisioner {
         assistant_id: Option<&str>,
         workspace: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
-        let extra = self
-            .build_team_extra(team_id, slot_id, role, backend, model, assistant_id, workspace)
-            .await?;
-
-        let agent_type = parse_agent_type(backend)?;
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, backend).await?;
+        let agent_type = if acp_metadata.is_some() {
+            AgentType::Acp
+        } else {
+            parse_agent_type(backend)?
+        };
+        let extra = self.build_team_extra(
+            team_id,
+            slot_id,
+            role,
+            backend,
+            model,
+            assistant_id,
+            workspace,
+            agent_type,
+            acp_metadata.as_ref(),
+        );
         let provider_id = if agent_type == AgentType::Aionrs {
             self.resolve_provider_for_model(model)
                 .await
@@ -526,7 +547,7 @@ impl TeamAgentProvisioner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn build_team_extra(
+    fn build_team_extra(
         &self,
         team_id: &str,
         slot_id: &str,
@@ -535,15 +556,18 @@ impl TeamAgentProvisioner {
         model: &str,
         assistant_id: Option<&str>,
         workspace: Option<&str>,
-    ) -> Result<serde_json::Value, TeamError> {
+        agent_type: AgentType,
+        acp_metadata: Option<&AgentMetadataRow>,
+    ) -> serde_json::Value {
+        let session_mode = session_mode_for_backend(backend, agent_type, acp_metadata);
         let mut extra = serde_json::json!({
             "teamId": team_id,
             "slot_id": slot_id,
             "role": role.to_string(),
             "backend": backend,
-            "session_mode": resolve_full_auto_mode(backend),
+            "session_mode": session_mode,
         });
-        if parse_agent_type(backend)? != AgentType::Aionrs {
+        if agent_type != AgentType::Aionrs {
             extra["current_model_id"] = serde_json::Value::String(model.to_owned());
         }
         if let Some(assistant_id) = assistant_id {
@@ -552,7 +576,7 @@ impl TeamAgentProvisioner {
         if let Some(workspace) = workspace {
             inherit_team_workspace(&mut extra, workspace);
         }
-        Ok(extra)
+        extra
     }
 
     async fn persist_agents(&self, team_id: &str, agents: &[TeamAgent]) -> Result<(), TeamError> {
@@ -596,7 +620,7 @@ mod tests {
     };
     use aionui_db::{CreateProviderParams, DbError, UpdateProviderParams};
     use std::sync::Mutex;
-    use tokio::sync::Notify;
+    use tokio::sync::watch;
 
     struct RecordingProvisioningPort {
         events: Arc<Mutex<Vec<&'static str>>>,
@@ -653,8 +677,8 @@ mod tests {
 
     struct BlockingKillTaskManager {
         events: Arc<Mutex<Vec<&'static str>>>,
-        kill_started: Arc<Notify>,
-        release_kill: Arc<Notify>,
+        kill_started: watch::Sender<bool>,
+        release_kill: watch::Receiver<bool>,
     }
 
     #[async_trait]
@@ -673,7 +697,7 @@ mod tests {
 
         fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
             self.events.lock().unwrap().push("kill_sync");
-            self.kill_started.notify_one();
+            let _ = self.kill_started.send(true);
             Ok(())
         }
 
@@ -683,12 +707,16 @@ mod tests {
             _reason: Option<AgentKillReason>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
             let events = Arc::clone(&self.events);
-            let kill_started = Arc::clone(&self.kill_started);
-            let release_kill = Arc::clone(&self.release_kill);
+            let kill_started = self.kill_started.clone();
+            let mut release_kill = self.release_kill.clone();
             Box::pin(async move {
                 events.lock().unwrap().push("kill_wait_start");
-                kill_started.notify_one();
-                release_kill.notified().await;
+                let _ = kill_started.send(true);
+                while !*release_kill.borrow() {
+                    if release_kill.changed().await.is_err() {
+                        break;
+                    }
+                }
                 events.lock().unwrap().push("kill_wait_done");
             })
         }
@@ -844,7 +872,7 @@ mod tests {
             name: "Agent".into(),
             role: TeammateRole::Teammate,
             conversation_id: "conv-1".into(),
-            backend: "claude".into(),
+            backend: "acp".into(),
             model: "sonnet".into(),
             assistant_id: None,
             status: None,
@@ -866,13 +894,13 @@ mod tests {
     #[tokio::test]
     async fn attach_agent_process_waits_for_kill_before_warmup() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let kill_started = Arc::new(Notify::new());
-        let release_kill = Arc::new(Notify::new());
+        let (kill_started_tx, mut kill_started_rx) = watch::channel(false);
+        let (release_kill_tx, release_kill_rx) = watch::channel(false);
         let provisioner = test_provisioner(Arc::clone(&events));
         let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(BlockingKillTaskManager {
             events: Arc::clone(&events),
-            kill_started: Arc::clone(&kill_started),
-            release_kill: Arc::clone(&release_kill),
+            kill_started: kill_started_tx,
+            release_kill: release_kill_rx,
         });
 
         let attach = tokio::spawn(async move {
@@ -880,7 +908,9 @@ mod tests {
                 .attach_agent_process("user-1", &test_agent(), test_mcp_config(), &task_manager)
                 .await
         });
-        kill_started.notified().await;
+        while !*kill_started_rx.borrow() {
+            kill_started_rx.changed().await.unwrap();
+        }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         assert!(
@@ -888,7 +918,7 @@ mod tests {
             "agent warmup must wait until the previous task is fully killed"
         );
 
-        release_kill.notify_one();
+        release_kill_tx.send(true).unwrap();
         attach.await.unwrap().unwrap();
 
         assert_eq!(

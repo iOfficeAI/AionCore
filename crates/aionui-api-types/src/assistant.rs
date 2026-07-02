@@ -215,6 +215,62 @@ pub struct AssistantDetailResponse {
     pub preferences: AssistantPreferencesResponse,
 }
 
+pub fn assistant_avatar_response_value(
+    avatar_type: &str,
+    avatar_value: Option<&str>,
+    assistant_id: &str,
+) -> Option<String> {
+    if matches!(avatar_type, "builtin_asset" | "user_asset") {
+        return Some(format!("/api/assistants/{assistant_id}/avatar"));
+    }
+
+    let value = avatar_value.map(str::trim).filter(|value| !value.is_empty())?;
+
+    match avatar_type {
+        _ if is_unsupported_direct_avatar_value(value) => None,
+        _ if is_local_avatar_value(value) => None,
+        _ => Some(value.to_owned()),
+    }
+}
+
+pub fn assistant_avatar_response_value_with_version(
+    avatar_type: &str,
+    avatar_value: Option<&str>,
+    assistant_id: &str,
+    version: i64,
+) -> Option<String> {
+    if matches!(avatar_type, "builtin_asset" | "user_asset") {
+        return Some(format!("/api/assistants/{assistant_id}/avatar?v={version}"));
+    }
+
+    assistant_avatar_response_value(avatar_type, avatar_value, assistant_id)
+}
+
+pub fn is_local_avatar_value(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if value.starts_with("file://") {
+        return true;
+    }
+    if value.starts_with("/api/") || value.starts_with("/assets/") {
+        return false;
+    }
+    if value.starts_with("//") || value.contains("://") || value.starts_with("data:") {
+        return false;
+    }
+    if value.as_bytes().get(1) == Some(&b':') && matches!(value.as_bytes().first(), Some(b'A'..=b'Z' | b'a'..=b'z')) {
+        return true;
+    }
+    std::path::Path::new(value).is_absolute()
+}
+
+fn is_unsupported_direct_avatar_value(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.starts_with("http://") || value.starts_with("https://") || value.starts_with("data:")
+}
+
 // ---------------------------------------------------------------------------
 // Request types
 // ---------------------------------------------------------------------------
@@ -343,6 +399,61 @@ mod tests {
     fn assistant_source_rejects_legacy_bare_value() {
         let parsed = serde_json::from_str::<AssistantSource>("\"bare\"");
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn assistant_avatar_response_value_routes_asset_values_through_backend() {
+        assert_eq!(
+            assistant_avatar_response_value("user_asset", Some("data:image/svg+xml;base64,abc"), "custom-1").as_deref(),
+            Some("/api/assistants/custom-1/avatar")
+        );
+        assert_eq!(
+            assistant_avatar_response_value("user_asset", None, "custom-1").as_deref(),
+            Some("/api/assistants/custom-1/avatar")
+        );
+        assert_eq!(
+            assistant_avatar_response_value("user_asset", Some("https://example.invalid/avatar.png"), "custom-1")
+                .as_deref(),
+            Some("/api/assistants/custom-1/avatar")
+        );
+    }
+
+    #[test]
+    fn assistant_avatar_response_value_with_version_routes_asset_values_through_backend() {
+        assert_eq!(
+            assistant_avatar_response_value_with_version("user_asset", Some("custom-1.png"), "custom-1", 1782714544060)
+                .as_deref(),
+            Some("/api/assistants/custom-1/avatar?v=1782714544060")
+        );
+        assert_eq!(
+            assistant_avatar_response_value_with_version("emoji", Some("🧠"), "custom-1", 1782714544060).as_deref(),
+            Some("🧠")
+        );
+    }
+
+    #[test]
+    fn assistant_avatar_response_value_never_exposes_local_paths() {
+        assert_eq!(
+            assistant_avatar_response_value(
+                "user_asset",
+                Some("/Users/veryliu/.aionui/assistant-avatars/custom-1.jpg"),
+                "custom-1",
+            )
+            .as_deref(),
+            Some("/api/assistants/custom-1/avatar")
+        );
+        assert_eq!(
+            assistant_avatar_response_value(
+                "emoji",
+                Some("file:///Users/veryliu/.aionui/assistant-avatars/custom-1.jpg"),
+                "custom-1",
+            ),
+            None
+        );
+        assert_eq!(
+            assistant_avatar_response_value("emoji", Some("https://example.invalid/avatar.png"), "custom-1"),
+            None
+        );
     }
 
     #[test]

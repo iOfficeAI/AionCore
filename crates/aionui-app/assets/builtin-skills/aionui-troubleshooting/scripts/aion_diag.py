@@ -20,7 +20,7 @@ Usage:
   python3 aion_diag.py providers         # LLM providers + model_health (api_key REDACTED)
   python3 aion_diag.py mcp               # MCP servers + tool counts (flags enabled-but-0-tools)
   python3 aion_diag.py teams             # teams + members + each member's conversation state
-  python3 aion_diag.py crons             # scheduled jobs from SQLite (no REST API for these)
+  python3 aion_diag.py crons             # scheduled jobs read straight from SQLite (a REST API also exists)
 
   python3 aion_diag.py logs [--lines N] [--errors] [--conv <id>]   # tail aioncore log
   python3 aion_diag.py overview          # one-shot health snapshot across everything
@@ -266,12 +266,18 @@ def cmd_conversation(argv):
         })
         return
     runtime = d.get("runtime", {})
-    # engine-agnostic stuck-detection hint
+    # engine-agnostic stuck-detection hint. `state` is the runtime machine state
+    # (idle/starting/running/cancelling/waiting_confirmation); `task_status` is a
+    # different field (pending/running/finished), so key off `state` here.
     stuck_hint = None
-    if runtime.get("is_processing") and runtime.get("task_status") == "running":
+    if runtime.get("is_processing") and runtime.get("state") == "running":
         stuck_hint = ("state=running & is_processing=true — if this has not changed "
                       "across repeated checks, the turn may be stuck. Compare turn_id "
                       "over time and check recent errors + logs.")
+    elif runtime.get("state") == "waiting_confirmation" or runtime.get("pending_confirmations"):
+        stuck_hint = ("state=waiting_confirmation — the turn is blocked awaiting a "
+                      "user approval, not stuck. Resolve the pending confirmation to "
+                      "let it continue (pending_confirmations > 0).")
     errs = _rows(
         "SELECT msg_id, type, substr(content,1,300) AS content, created_at "
         "FROM messages WHERE conversation_id=? AND status='error' "
@@ -373,7 +379,9 @@ def cmd_teams(argv):
 
 
 def cmd_crons(argv):
-    # No REST API for crons — read AionUi's SQLite store directly.
+    # A REST API exists (/api/cron/jobs), but for diagnosis we read AionUi's
+    # SQLite store directly — it surfaces the run-state columns in one shot and
+    # needs no auth token.
     rows = _rows(
         "SELECT id, name, enabled, schedule_kind, schedule_value, "
         "schedule_description, last_status, last_error, "

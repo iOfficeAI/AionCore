@@ -56,7 +56,8 @@ pub use assistant::{
     AssistantDetailResponse, AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse,
     AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse,
     CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest,
-    UpdateAssistantRequest,
+    UpdateAssistantRequest, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    is_local_avatar_value,
 };
 pub use auth::{
     AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
@@ -83,9 +84,10 @@ pub use conversation::{
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
-    CreateCronJobRequest, CronAgentConfigReadDto, CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto,
-    CronJobPayloadDto, CronJobRemovedPayload, CronJobResponse, CronJobStateDto, CronJobTargetDto, CronScheduleDto,
-    HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest, UpdateCronJobRequest,
+    CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
+    CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto, CronJobPayloadDto, CronJobRemovedPayload,
+    CronJobResponse, CronJobStateDto, CronJobTargetDto, CronScheduleDto, HasSkillResponse, ListCronJobsQuery,
+    RunNowResponse, SaveCronSkillRequest, UpdateConversationCronRequest, UpdateCronJobRequest,
 };
 pub use custom_agent::{
     AgentOverridesResponse, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, DeleteCustomAgentResponse,

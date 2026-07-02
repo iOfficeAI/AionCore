@@ -117,6 +117,24 @@ fn test_agent_row(id: &str, backend: Option<&str>, agent_type: AgentType, name: 
     }
 }
 
+fn assert_versioned_avatar_route(body: &Value, expected_path: &str) {
+    assert_versioned_avatar_value(body["data"]["avatar"].as_str(), expected_path);
+}
+
+fn assert_versioned_avatar_value(value: Option<&str>, expected_path: &str) {
+    let avatar = value.expect("avatar must be a string");
+    let (path, version) = avatar
+        .split_once("?v=")
+        .expect("assistant avatar route must include cache-busting version");
+
+    assert_eq!(path, expected_path);
+    assert!(!version.is_empty(), "avatar route version must not be empty");
+    assert!(
+        version.chars().all(|ch| ch.is_ascii_digit()),
+        "avatar route version must be numeric: {version}"
+    );
+}
+
 async fn insert_generated_bare_assistant(
     fx: &Fixture,
     assistant_id: &str,
@@ -449,9 +467,9 @@ async fn list_builtin_file_avatar_is_served_via_assistant_avatar_route() {
         .find(|assistant| assistant["id"] == "builtin-office")
         .expect("builtin-office missing from assistant list");
 
-    assert_eq!(
+    assert_versioned_avatar_value(
         builtin_office["avatar"].as_str(),
-        Some("/api/assistants/builtin-office/avatar")
+        "/api/assistants/builtin-office/avatar",
     );
 }
 
@@ -736,7 +754,7 @@ async fn create_user_avatar_from_local_file_is_served_via_assistant_avatar_route
     let resp = fx.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = body_json(resp).await;
-    assert_eq!(body["data"]["avatar"], "/api/assistants/u-avatar/avatar");
+    assert_versioned_avatar_route(&body, "/api/assistants/u-avatar/avatar");
 
     let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar.png");
     assert!(
@@ -783,7 +801,7 @@ async fn create_user_avatar_from_builtin_avatar_route_copies_builtin_asset() {
     let resp = fx.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = body_json(resp).await;
-    assert_eq!(body["data"]["avatar"], "/api/assistants/u-avatar-from-builtin/avatar");
+    assert_versioned_avatar_route(&body, "/api/assistants/u-avatar-from-builtin/avatar");
 
     let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar-from-builtin.png");
     assert!(
@@ -833,10 +851,7 @@ async fn create_user_avatar_from_absolute_builtin_avatar_route_copies_builtin_as
     let resp = fx.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = body_json(resp).await;
-    assert_eq!(
-        body["data"]["avatar"],
-        "/api/assistants/u-avatar-from-builtin-absolute/avatar"
-    );
+    assert_versioned_avatar_route(&body, "/api/assistants/u-avatar-from-builtin-absolute/avatar");
 
     let persisted_avatar = fx
         .user_data_dir
@@ -1270,7 +1285,7 @@ async fn avatar_builtin_returns_bytes_with_content_type() {
 }
 
 #[tokio::test]
-async fn avatar_user_returns_bytes_after_file_planted() {
+async fn avatar_user_ignores_planted_file_without_managed_value() {
     let fx = fixture().await;
     create_user(&fx, "u1", "A").await;
     let avatars_dir = fx.user_data_dir.join("assistant-avatars");
@@ -1283,11 +1298,7 @@ async fn avatar_user_returns_bytes_after_file_planted() {
         .oneshot(get_with_token("/api/assistants/u1/avatar", &fx.token))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
-        Some("image/svg+xml")
-    );
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

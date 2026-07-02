@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use include_dir::{Dir, include_dir};
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use aionui_db::{CreateSkillImportRecordParams, ISkillRepository, SkillRow, UpsertSkillParams};
@@ -47,6 +48,50 @@ pub fn skill_import_limits() -> SkillImportLimits {
 /// `include_dir` directly.
 pub fn builtin_skills_corpus() -> &'static Dir<'static> {
     &BUILTIN_SKILLS
+}
+
+/// Build the startup materialization marker for a built-in skill corpus.
+///
+/// The package version alone is not enough: built-in skills can change
+/// without a crate version bump during development or prerelease packaging.
+/// Include a deterministic content fingerprint so startup refreshes the
+/// materialized `{data_dir}/builtin-skills` tree whenever embedded skill
+/// files change.
+pub fn builtin_skills_materialize_marker(corpus: &Dir<'static>, package_version: &str) -> String {
+    format!(
+        "{package_version}+builtin-skills.{}",
+        builtin_skills_corpus_fingerprint(corpus)
+    )
+}
+
+fn builtin_skills_corpus_fingerprint(corpus: &Dir<'static>) -> String {
+    let mut files = Vec::new();
+    collect_corpus_files(corpus, corpus.path(), &mut files);
+    files.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut hasher = Sha256::new();
+    for (relative_path, contents) in files {
+        hasher.update(relative_path.as_bytes());
+        hasher.update([0]);
+        hasher.update((contents.len() as u64).to_le_bytes());
+        hasher.update([0]);
+        hasher.update(contents);
+        hasher.update([0xff]);
+    }
+
+    let digest = hasher.finalize();
+    hex::encode(&digest[..12])
+}
+
+fn collect_corpus_files(dir: &Dir<'static>, root: &Path, files: &mut Vec<(String, &'static [u8])>) {
+    for file in dir.files() {
+        let relative_path = file.path().strip_prefix(root).unwrap_or(file.path());
+        let normalized_path = relative_path.to_string_lossy().replace('\\', "/");
+        files.push((normalized_path, file.contents()));
+    }
+    for subdir in dir.dirs() {
+        collect_corpus_files(subdir, root, files);
+    }
 }
 
 // ---------------------------------------------------------------------------

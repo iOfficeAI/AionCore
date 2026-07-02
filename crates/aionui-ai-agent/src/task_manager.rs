@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::active_lease::ActiveLeaseRegistry;
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
-use crate::types::BuildTaskOptions;
+use crate::types::{BuildTaskOptions, RuntimeCapabilities};
 
 /// Factory function that creates an [`AgentInstance`] from build options.
 ///
@@ -71,11 +71,17 @@ pub trait IWorkerTaskManager: Send + Sync {
     fn collect_idle(&self, idle_threshold_ms: TimestampMs) -> Vec<String>;
 }
 
+#[derive(Clone)]
+struct ManagedAgentTask {
+    agent: AgentInstance,
+    runtime_capabilities: RuntimeCapabilities,
+}
+
 /// Per-conversation slot: an [`OnceCell`] that the first concurrent caller
 /// initialises by running the factory, and that every subsequent caller
 /// awaits. Failed initialisations leave the cell empty so the next caller
 /// may retry; the slot itself is only removed on `kill` / `clear`.
-type TaskSlot = Arc<OnceCell<AgentInstance>>;
+type TaskSlot = Arc<OnceCell<ManagedAgentTask>>;
 
 /// Default implementation of [`IWorkerTaskManager`] using a concurrent hash map.
 pub struct WorkerTaskManagerImpl {
@@ -99,6 +105,12 @@ impl WorkerTaskManagerImpl {
 
     /// Look up a fully-initialised instance by conversation id.
     fn initialised_instance(&self, conversation_id: &str) -> Option<AgentInstance> {
+        self.tasks
+            .get(conversation_id)
+            .and_then(|slot| slot.get().map(|managed| managed.agent.clone()))
+    }
+
+    fn initialised_managed_task(&self, conversation_id: &str) -> Option<ManagedAgentTask> {
         self.tasks.get(conversation_id).and_then(|slot| slot.get().cloned())
     }
 }
@@ -114,6 +126,16 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         conversation_id: &str,
         options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
+        if let Some(existing) = self.initialised_managed_task(conversation_id)
+            && !existing.runtime_capabilities.satisfies(&options.runtime_capabilities)
+        {
+            info!(
+                conversation_id,
+                "Rebuilding agent task because runtime capabilities changed"
+            );
+            self.kill(conversation_id, Some(AgentKillReason::RuntimeCapabilityChanged))?;
+        }
+
         // Atomically obtain the per-conversation slot. `DashMap::entry` is
         // synchronous and side-effect-free — only an empty OnceCell is
         // allocated on the miss path, so concurrent callers for the same id
@@ -129,13 +151,22 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         // awaits the same future and ends up with the same instance. On
         // failure the cell stays empty so a later caller can retry.
         let factory = self.factory.clone();
-        let instance = slot.get_or_try_init(|| async move { factory(options).await }).await?;
-        Ok(instance.clone())
+        let runtime_capabilities = options.runtime_capabilities.clone();
+        let managed = slot
+            .get_or_try_init(|| async move {
+                let agent = factory(options).await?;
+                Ok::<ManagedAgentTask, AgentError>(ManagedAgentTask {
+                    agent,
+                    runtime_capabilities,
+                })
+            })
+            .await?;
+        Ok(managed.agent.clone())
     }
 
     fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
-            let agent_type = slot.get().map(|agent| agent.agent_type());
+            let agent_type = slot.get().map(|managed| managed.agent.agent_type());
             if matches!(reason, Some(AgentKillReason::IdleTimeout)) {
                 info!(
                     conversation_id = %id,
@@ -146,8 +177,8 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             } else {
                 info!(conversation_id = %id, ?reason, "Killing agent task");
             }
-            if let Some(agent) = slot.get() {
-                agent.kill(reason)?;
+            if let Some(managed) = slot.get() {
+                managed.agent.kill(reason)?;
             }
         }
         Ok(())
@@ -159,7 +190,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
-            let agent_type = slot.get().map(|agent| agent.agent_type());
+            let agent_type = slot.get().map(|managed| managed.agent.agent_type());
             if matches!(reason, Some(AgentKillReason::IdleTimeout)) {
                 info!(
                     conversation_id = %id,
@@ -170,15 +201,15 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             } else {
                 info!(conversation_id = %id, ?reason, "Killing agent task (awaitable)");
             }
-            if let Some(agent) = slot.get() {
-                return agent.kill_and_wait(reason);
+            if let Some(managed) = slot.get() {
+                return managed.agent.kill_and_wait(reason);
             }
             return Box::pin(async move {
                 match slot
                     .get_or_try_init(|| async { Err(AgentError::internal("task slot removed before initialization")) })
                     .await
                 {
-                    Ok(agent) => agent.clone().kill_and_wait(reason).await,
+                    Ok(managed) => managed.agent.clone().kill_and_wait(reason).await,
                     Err(error) => {
                         debug!(
                             conversation_id = %id,
@@ -199,8 +230,8 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         for key in keys {
             if let Some((id, slot)) = self.tasks.remove(&key) {
                 info!(conversation_id = %id, "Clearing agent task");
-                if let Some(agent) = slot.get() {
-                    waits.push(agent.kill_and_wait(None));
+                if let Some(managed) = slot.get() {
+                    waits.push(managed.agent.kill_and_wait(None));
                 }
             }
         }
@@ -216,7 +247,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         self.tasks
             .iter()
             .filter_map(|entry| {
-                let agent = entry.value().get()?;
+                let agent = &entry.value().get()?.agent;
                 let agent_type = agent.agent_type();
                 let status = agent.status();
                 let last_activity_at = agent.last_activity_at();
@@ -283,7 +314,7 @@ mod tests {
     use crate::session_context::{
         AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
     };
-    use crate::types::SendMessageData;
+    use crate::types::{CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData};
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, ProviderWithModel};
     use futures_util::FutureExt;
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -389,6 +420,7 @@ mod tests {
                 use_model: None,
             },
             skills: vec![],
+            runtime_env: vec![],
             team: None,
             kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
                 config: Default::default(),
@@ -402,6 +434,13 @@ mod tests {
 
     fn mock_instance(agent: MockAgent) -> AgentInstance {
         AgentInstance::Mock(Arc::new(agent))
+    }
+
+    fn managed_instance(agent: AgentInstance) -> ManagedAgentTask {
+        ManagedAgentTask {
+            agent,
+            runtime_capabilities: RuntimeCapabilities::default(),
+        }
     }
 
     fn make_manager() -> WorkerTaskManagerImpl {
@@ -476,6 +515,19 @@ mod tests {
         let h1 = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
         let h2 = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
         assert!(same_mock(&h1, &h2));
+        assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_or_build_rebuilds_when_existing_task_lacks_requested_runtime_context_capability() {
+        let mgr = make_manager();
+        let h1 = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
+        let mut options = make_options("conv-1");
+        options.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
+
+        let h2 = mgr.get_or_build_task("conv-1", options).await.unwrap();
+
+        assert!(!same_mock(&h1, &h2));
         assert_eq!(mgr.active_count(), 1);
     }
 
@@ -641,8 +693,8 @@ mod tests {
 
         // Helper: insert a pre-initialised slot bypassing the async factory path.
         let insert = |id: &str, instance: AgentInstance| {
-            let cell: OnceCell<AgentInstance> = OnceCell::new();
-            cell.set(instance).ok();
+            let cell: OnceCell<ManagedAgentTask> = OnceCell::new();
+            cell.set(managed_instance(instance)).ok();
             mgr.tasks.insert(id.into(), Arc::new(cell));
         };
 
@@ -700,10 +752,10 @@ mod tests {
         let factory: AgentFactory = Arc::new(|_| async { unreachable!() }.boxed());
         let mgr = WorkerTaskManagerImpl::new_with_active_leases(factory, active_leases);
 
-        let cell: OnceCell<AgentInstance> = OnceCell::new();
-        cell.set(mock_instance(
+        let cell: OnceCell<ManagedAgentTask> = OnceCell::new();
+        cell.set(managed_instance(mock_instance(
             MockAgent::new("conv-active", Some(ConversationStatus::Finished)).with_last_activity(now_ms() - 600_000),
-        ))
+        )))
         .ok();
         mgr.tasks.insert("conv-active".into(), Arc::new(cell));
 
@@ -725,7 +777,7 @@ mod tests {
         let agent =
             Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)).with_last_activity(now - 10_000));
         let slot = Arc::new(OnceCell::new());
-        assert!(slot.set(AgentInstance::Mock(agent)).is_ok());
+        assert!(slot.set(managed_instance(AgentInstance::Mock(agent))).is_ok());
         manager.tasks.insert("conv_idle".to_owned(), slot);
 
         let captured = capture_logs(tracing::Level::INFO, || {
@@ -750,7 +802,7 @@ mod tests {
         }));
         let agent = Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)));
         let slot = Arc::new(OnceCell::new());
-        assert!(slot.set(AgentInstance::Mock(agent)).is_ok());
+        assert!(slot.set(managed_instance(AgentInstance::Mock(agent))).is_ok());
         manager.tasks.insert("conv_idle".to_owned(), slot);
 
         let captured = capture_logs(tracing::Level::INFO, || {

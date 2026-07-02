@@ -197,6 +197,11 @@ pub async fn build_module_states(
         RouterBuildError::new("router.assistant.bootstrap", "failed to bootstrap assistant storage").with_source(error)
     })?;
     let cron = build_cron_state(services);
+    // Cron builds its own ConversationService (not a clone of the shared one),
+    // so wire the assistant rule dispatcher here — otherwise scheduled runs
+    // resolve empty rules. Mirrors the interactive path in build_conversation_state.
+    cron.conversation_service
+        .with_assistant_dispatcher(assistant.service.clone() as Arc<dyn AssistantRuleDispatcher>);
     cron.cron_service.init().await;
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -369,7 +374,6 @@ pub fn build_conversation_state(
     }
     if let Some(cron_service) = cron_service {
         conversation_service.with_delete_hook(cron_service.clone());
-        conversation_service.with_cron_service(Some(cron_service));
     }
     ConversationRouterState {
         service: conversation_service,

@@ -4,6 +4,7 @@ use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
+use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_policy};
 use crate::factory::context::FactoryContext;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::session_context::AcpSessionBuildContext;
@@ -51,19 +52,15 @@ pub(super) async fn build(
 
     let mut command_spec =
         resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
-    if meta.backend.as_deref() == Some("claude") {
-        let cc_switch_env = crate::cc_switch::read_claude_provider_env();
-        if !cc_switch_env.is_empty() {
-            let keys: Vec<&str> = cc_switch_env.keys().map(|k| k.as_str()).collect();
-            for (name, value) in &cc_switch_env {
-                command_spec.env.push(aionui_common::EnvVar {
-                    name: name.clone(),
-                    value: value.clone(),
-                });
-            }
-            tracing::info!(?keys, "cc-switch: env vars injected");
-        }
-    }
+    apply_acp_launch_policy(
+        &mut command_spec,
+        AcpLaunchPolicyInput {
+            metadata: &meta,
+            config: &config,
+            session_snapshot: build_context.session_snapshot.as_ref(),
+            runtime_env: &ctx.runtime_env,
+        },
+    );
     let session_snapshot = build_context.session_snapshot;
 
     // Load user-configured MCP servers from the DB so they reach

@@ -53,7 +53,6 @@ pub(super) fn user_facing_message(err: &AgentError) -> String {
     full.split_once(": ").map(|(_, rest)| rest.to_owned()).unwrap_or(full)
 }
 
-use super::codex_sandbox;
 use super::config_option_catalog::{extract_models_from_value, extract_modes_from_value};
 use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
 use super::mode_normalize::normalize_requested_mode;
@@ -372,9 +371,6 @@ impl AcpAgentManager {
         ),
         AgentError,
     > {
-        let initial_mode = initial_mode_from_params(&params);
-        codex_sandbox::sync_for_agent(&params.metadata, initial_mode.as_ref().map(|m| m.as_str())).await;
-
         let process = Arc::new(CliAgentProcess::spawn_for_sdk(params.command_spec.clone(), &params.data_dir).await?);
         register_session_process(
             &params.data_dir,
@@ -437,6 +433,7 @@ impl AcpAgentManager {
         let permission_router = Arc::new(PermissionRouter::new(permission_rx));
 
         let snapshot = params.session_snapshot.as_ref();
+        let initial_mode = initial_mode_from_params(&params);
 
         let (initial_model, initial_config) = (
             snapshot.and_then(|s| s.current_model_id.clone()).or_else(|| {
@@ -615,7 +612,7 @@ impl AcpAgentManager {
     ) -> Result<SetConfigOptionResponse, AgentError> {
         self.ensure_protocol_connected_for_operation("set_config_option")?;
 
-        let (session_id, set_path, is_mode_option) = {
+        let (session_id, set_path) = {
             let session = self.session.read().await;
             let snapshot = session.config_snapshot();
             let set_path = resolve_set_path(&snapshot, option_id, value).map_err(|err| match err {
@@ -635,7 +632,7 @@ impl AcpAgentManager {
                 );
                 AgentError::bad_request("No active session")
             })?;
-            (session_id, set_path, snapshot.is_mode_option(option_id))
+            (session_id, set_path)
         };
 
         tracing::info!(
@@ -645,10 +642,6 @@ impl AcpAgentManager {
             requested = %value,
             "acp_config_option_set_requested"
         );
-
-        if self.params.metadata.backend.as_deref() == Some("codex") && is_mode_option {
-            codex_sandbox::sync_for_agent(&self.params.metadata, Some(value)).await;
-        }
 
         match set_path {
             ConfigSetPath::ConfigOption { option_id: config_id } => {
