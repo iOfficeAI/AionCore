@@ -5,7 +5,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app_with_mock_agents, get_request, get_with_token, json_with_token, setup_and_login};
+use common::{body_json, build_app_with_mock_agents, get_with_token, json_with_token, setup_and_login};
 
 fn create_body() -> serde_json::Value {
     json!({
@@ -39,20 +39,7 @@ async fn create_and_ensure_runtime_conversation(app: &mut axum::Router, token: &
 }
 
 #[tokio::test]
-async fn config_options_requires_auth() {
-    let (app, _services) = build_app_with_mock_agents().await;
-
-    let resp = app
-        .oneshot(get_request("/api/conversations/conv-1/config-options"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let json = body_json(resp).await;
-    assert_eq!(json["code"], "UNAUTHORIZED");
-}
-
-#[tokio::test]
-async fn config_options_returns_active_agent_snapshot() {
+async fn legacy_config_options_get_route_is_removed() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let id = create_and_ensure_runtime_conversation(&mut app, &token, &csrf).await;
@@ -65,11 +52,7 @@ async fn config_options_returns_active_agent_snapshot() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["config_options"][0]["id"], "model");
-    assert_eq!(json["data"]["config_options"][0]["current_value"], "mock-model");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
