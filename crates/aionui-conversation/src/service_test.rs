@@ -3056,6 +3056,51 @@ async fn get_config_options_returns_active_agent_snapshot() {
 }
 
 #[tokio::test]
+async fn ensure_runtime_recovers_missing_agent_and_returns_snapshot() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let result = svc
+        .ensure_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    assert!(result.recovered);
+    assert!(result.runtime.has_task);
+    assert!(task_mgr.get_task(&conv.id).is_some());
+    assert!(result.config_options.is_empty());
+}
+
+#[tokio::test]
+async fn ensure_runtime_uses_existing_agent_snapshot_without_recovery() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = MockAgent::new(&conv.id).with_config_options(vec![AcpConfigOptionDto {
+        id: "model".to_owned(),
+        name: Some("Model".to_owned()),
+        label: None,
+        description: None,
+        category: Some("model".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some("gpt-5.5".to_owned()),
+        options: Vec::new(),
+    }]);
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
+
+    let result = svc
+        .ensure_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    assert!(!result.recovered);
+    assert!(result.runtime.has_task);
+    assert_eq!(result.config_options[0].id, "model");
+    assert_eq!(result.config_options[0].current_value.as_deref(), Some("gpt-5.5"));
+}
+
+#[tokio::test]
 async fn set_config_option_returns_observed_confirmation() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
