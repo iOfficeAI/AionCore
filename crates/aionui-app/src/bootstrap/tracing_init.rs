@@ -4,8 +4,9 @@
 //! subscriber registration that should never be invoked from tests or
 //! external consumers of the library.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use chrono::Datelike;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use super::{BootstrapError, BootstrapErrorCode};
@@ -82,14 +83,16 @@ pub struct LogGuards {
 const LOGGING_INIT_MESSAGE: &str = "failed to initialize logging";
 
 pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards, BootstrapError> {
-    std::fs::create_dir_all(log_dir).map_err(|e| {
+    let active_log_dir = dated_log_dir(log_dir);
+
+    std::fs::create_dir_all(&active_log_dir).map_err(|e| {
         BootstrapError::new(
             BootstrapErrorCode::LoggingInitFailed,
             "logging.dir",
             LOGGING_INIT_MESSAGE,
         )
         .with_source(e)
-        .with_field("logDir", log_dir.display().to_string())
+        .with_field("logDir", active_log_dir.display().to_string())
     })?;
 
     let console_layer = fmt::layer().with_target(true).with_filter(build_env_filter(log_level));
@@ -98,7 +101,7 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_suffix("aioncore.log")
-        .build(log_dir)
+        .build(&active_log_dir)
         .map_err(|e| {
             BootstrapError::new(
                 BootstrapErrorCode::LoggingInitFailed,
@@ -106,7 +109,7 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards
                 LOGGING_INIT_MESSAGE,
             )
             .with_source(e)
-            .with_field("logDir", log_dir.display().to_string())
+            .with_field("logDir", active_log_dir.display().to_string())
         })?;
     let (non_blocking, backend_guard) = tracing_appender::non_blocking(file_appender);
 
@@ -122,7 +125,7 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards
     let aionrs_resolved = aion_config::logging::ResolvedLogging {
         enabled: true,
         level: aionrs_level,
-        dir: log_dir.to_path_buf(),
+        dir: active_log_dir.clone(),
     };
     let (aionrs_layer, aionrs_guard) = aion_config::logging::create_file_layer(&aionrs_resolved).map_err(|e| {
         BootstrapError::new(
@@ -131,7 +134,7 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards
             LOGGING_INIT_MESSAGE,
         )
         .with_source(e)
-        .with_field("logDir", log_dir.display().to_string())
+        .with_field("logDir", active_log_dir.display().to_string())
     })?;
 
     tracing_subscriber::registry()
@@ -146,13 +149,21 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards
                 LOGGING_INIT_MESSAGE,
             )
             .with_source(e)
-            .with_field("logDir", log_dir.display().to_string())
+            .with_field("logDir", active_log_dir.display().to_string())
         })?;
 
     Ok(LogGuards {
         _backend: backend_guard,
         _aionrs: aionrs_guard,
     })
+}
+
+fn dated_log_dir(log_root: &Path) -> PathBuf {
+    let now = chrono::Local::now();
+    log_root
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month()))
+        .join(format!("{:02}", now.day()))
 }
 
 #[cfg(test)]
@@ -215,5 +226,24 @@ mod tests {
         assert!(level.contains("aion_agent=info"), "{level}");
         assert!(level.contains("aion_providers=info"), "{level}");
         assert!(level.contains("aion_tools=debug"), "{level}");
+    }
+
+    #[test]
+    fn dated_log_dir_appends_date_partition() {
+        let root = Path::new("/tmp/aionui-logs");
+        let dated = dated_log_dir(root);
+        let relative = dated.strip_prefix(root).expect("dated log dir should stay under root");
+        let parts = relative
+            .iter()
+            .map(|part| part.to_str().expect("log dir should be utf-8"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].len(), 4);
+        assert_eq!(parts[1].len(), 2);
+        assert_eq!(parts[2].len(), 2);
+        assert!(parts[0].chars().all(|ch| ch.is_ascii_digit()));
+        assert!(parts[1].chars().all(|ch| ch.is_ascii_digit()));
+        assert!(parts[2].chars().all(|ch| ch.is_ascii_digit()));
     }
 }

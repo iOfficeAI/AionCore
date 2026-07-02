@@ -1003,6 +1003,30 @@ fn make_service_with_resolver_and_acp_session_repo(
     (svc, broadcaster, repo, task_mgr)
 }
 
+fn make_service_with_workspace_root(
+    workspace_root: PathBuf,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<dyn IWorkerTaskManager>,
+) {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let svc = ConversationService::new(
+        workspace_root,
+        broadcaster.clone(),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr.clone(),
+        repo.clone(),
+        agent_metadata_repo,
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    (svc, broadcaster, repo, task_mgr)
+}
+
 fn make_service_with_resolver_and_agent_metadata_repo(
     skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
@@ -1169,6 +1193,25 @@ fn unique_test_workspace_path(label: &str) -> PathBuf {
     workspace
 }
 
+fn assert_dated_workspace_path(workspace_root: &Path, workspace: &Path, expected_file_name: &str) {
+    let relative = workspace
+        .strip_prefix(workspace_root.join("conversations"))
+        .expect("workspace should be under the conversations root");
+    let parts = relative
+        .iter()
+        .map(|part| part.to_str().expect("workspace path should be utf-8"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(parts.len(), 4);
+    assert_eq!(parts[0].len(), 4);
+    assert_eq!(parts[1].len(), 2);
+    assert_eq!(parts[2].len(), 2);
+    assert!(parts[0].chars().all(|ch| ch.is_ascii_digit()));
+    assert!(parts[1].chars().all(|ch| ch.is_ascii_digit()));
+    assert!(parts[2].chars().all(|ch| ch.is_ascii_digit()));
+    assert_eq!(parts[3], expected_file_name);
+}
+
 async fn upsert_test_assistant_definition(
     repo: &SqliteAssistantDefinitionRepository,
     definition_id: &str,
@@ -1331,6 +1374,37 @@ async fn create_rejects_deprecated_agent_types_for_new_conversations() {
             agent_type.serde_name()
         );
     }
+}
+
+#[tokio::test]
+async fn create_auto_provisions_workspace_under_date_partition() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root.clone());
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {}
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let workspace = Path::new(conv.extra["workspace"].as_str().unwrap());
+
+    assert_dated_workspace_path(&workspace_root, workspace, &format!("acp-temp-{}", conv.id));
+    assert!(workspace.is_dir());
+}
+
+#[test]
+fn create_team_temp_workspace_uses_date_partition() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root.clone());
+
+    let workspace = svc.create_team_temp_workspace("team_1").unwrap();
+
+    let workspace = Path::new(&workspace);
+    assert_dated_workspace_path(&workspace_root, workspace, "team-temp-team_1");
+    assert!(workspace.is_dir());
 }
 
 #[tokio::test]
@@ -2036,6 +2110,81 @@ async fn delete_invokes_registered_hook_before_row_delete() {
         assert_eq!(observations.as_slice(), &[true]);
     }
     assert!(repo.get(&conv.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_removes_auto_provisioned_workspace_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {}
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let workspace = conv.extra["workspace"].as_str().unwrap();
+    assert!(Path::new(workspace).is_dir());
+
+    svc.delete("user_1", &conv.id).await.unwrap();
+
+    assert!(!Path::new(workspace).exists());
+}
+
+#[tokio::test]
+async fn delete_removes_empty_date_workspace_parents() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let make_req = || {
+        serde_json::from_value::<CreateConversationRequest>(json!({
+            "type": "acp",
+            "extra": {}
+        }))
+        .unwrap()
+    };
+
+    let first = svc.create("user_1", make_req()).await.unwrap();
+    let second = svc.create("user_1", make_req()).await.unwrap();
+    let first_workspace = PathBuf::from(first.extra["workspace"].as_str().unwrap());
+    let second_workspace = PathBuf::from(second.extra["workspace"].as_str().unwrap());
+    let day_dir = first_workspace.parent().unwrap().to_path_buf();
+    let month_dir = day_dir.parent().unwrap().to_path_buf();
+    let year_dir = month_dir.parent().unwrap().to_path_buf();
+
+    svc.delete("user_1", &first.id).await.unwrap();
+
+    assert!(day_dir.is_dir());
+    assert!(second_workspace.is_dir());
+
+    svc.delete("user_1", &second.id).await.unwrap();
+
+    assert!(!day_dir.exists());
+    assert!(!month_dir.exists());
+    assert!(!year_dir.exists());
+}
+
+#[tokio::test]
+async fn delete_preserves_user_supplied_workspace_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let user_workspace = temp.path().join("user-project");
+    std::fs::create_dir_all(&user_workspace).unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": user_workspace,
+            "custom_workspace": true
+        }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    svc.delete("user_1", &conv.id).await.unwrap();
+
+    assert!(user_workspace.is_dir());
 }
 
 // ── Broadcast payload tests ────────────────────────────────────────

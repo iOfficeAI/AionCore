@@ -37,6 +37,7 @@ aionui-assistant.workspace = true
 aionui-runtime.workspace = true
 aion-config.workspace = true
 axum.workspace = true
+chrono.workspace = true
 dirs.workspace = true
 tokio.workspace = true
 tower.workspace = true

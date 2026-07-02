@@ -12,6 +12,7 @@ use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, TeamSessionBinding};
 use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
 use aionui_db::models::ConversationRow;
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
+use chrono::Datelike;
 use tracing::{debug, warn};
 
 use crate::convert::string_to_enum;
@@ -457,10 +458,19 @@ fn expected_auto_workspace_path(
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
 ) -> PathBuf {
-    workspace_root.join("conversations").join(format!(
+    auto_workspace_parent(workspace_root).join(format!(
         "{}-temp-{conversation_id}",
         conversation_label(agent_type, backend)
     ))
+}
+
+fn auto_workspace_parent(workspace_root: &Path) -> PathBuf {
+    let now = chrono::Local::now();
+    workspace_root
+        .join("conversations")
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month()))
+        .join(format!("{:02}", now.day()))
 }
 
 fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {

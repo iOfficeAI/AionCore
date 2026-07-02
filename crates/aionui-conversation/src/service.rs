@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -37,6 +37,7 @@ use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
+use chrono::Datelike;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -393,10 +394,7 @@ impl ConversationService {
     }
 
     pub fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, ConversationError> {
-        let ws_path = self
-            .workspace_root
-            .join("conversations")
-            .join(format!("team-temp-{team_id}"));
+        let ws_path = auto_workspace_parent(&self.workspace_root).join(format!("team-temp-{team_id}"));
         std::fs::create_dir_all(&ws_path)
             .map_err(|e| ConversationError::internal(format!("Failed to create Team temporary workspace: {e}")))?;
         Ok(ws_path.to_string_lossy().into_owned())
@@ -729,7 +727,8 @@ impl ConversationService {
         }
 
         // Determine whether the user chose this workspace ("custom") or we
-        // auto-provision one under `{data_dir}/conversations/{label}-temp-{id}/`.
+        // auto-provision one under
+        // `{data_dir}/conversations/YYYY/MM/DD/{label}-temp-{id}/`.
         // Skill wiring runs for both kinds so native CLI discovery behaves
         // consistently.
         let user_supplied_workspace = match extra
@@ -758,9 +757,9 @@ impl ConversationService {
 
         let auto_provisioned_workspace = if user_supplied_workspace.is_none() {
             // Per-conversation temp workspaces live under
-            // `{data_dir}/conversations/{label}-temp-{id}/`. The label lets
-            // operators eyeball the agent type; the conversation id keeps
-            // the mapping back to the DB row unique.
+            // `{data_dir}/conversations/YYYY/MM/DD/{label}-temp-{id}/`.
+            // The label lets operators eyeball the agent type; the
+            // conversation id keeps the mapping back to the DB row unique.
             let label = conversation_label(
                 &effective_type,
                 effective_backend
@@ -768,10 +767,7 @@ impl ConversationService {
                     .map(|backend| serde_json::Value::String(backend.clone()))
                     .as_ref(),
             );
-            let ws_path = self
-                .workspace_root
-                .join("conversations")
-                .join(format!("{label}-temp-{id}"));
+            let ws_path = auto_workspace_parent(&self.workspace_root).join(format!("{label}-temp-{id}"));
             std::fs::create_dir_all(&ws_path)
                 .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
             extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
@@ -1960,6 +1956,7 @@ impl ConversationService {
             .source
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
+        let auto_workspace_to_delete = auto_provisioned_workspace_to_delete(&self.workspace_root, &existing, id);
 
         let had_active_turn = self.runtime_state.mark_deleting(id);
 
@@ -1987,6 +1984,31 @@ impl ConversationService {
                 error = %ErrorChain(&err),
                 "Failed to delete acp_session row on conversation delete"
             );
+        }
+        if let Some(workspace) = auto_workspace_to_delete {
+            let workspace_removed = match tokio::fs::remove_dir_all(&workspace).await {
+                Ok(()) => {
+                    info!(
+                        conversation_id = %id,
+                        workspace = %workspace.display(),
+                        "Deleted auto-provisioned conversation workspace"
+                    );
+                    true
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                Err(err) => {
+                    warn!(
+                        conversation_id = %id,
+                        workspace = %workspace.display(),
+                        error = %err,
+                        "Failed to delete auto-provisioned conversation workspace"
+                    );
+                    false
+                }
+            };
+            if workspace_removed {
+                cleanup_empty_date_workspace_parents(&self.workspace_root, &workspace).await;
+            }
         }
 
         info!("Conversation deleted");
@@ -3299,10 +3321,131 @@ fn expected_auto_workspace_path(
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
 ) -> PathBuf {
-    workspace_root.join("conversations").join(format!(
+    auto_workspace_parent(workspace_root).join(format!(
         "{}-temp-{conversation_id}",
         conversation_label(agent_type, backend)
     ))
+}
+
+fn auto_workspace_parent(workspace_root: &Path) -> PathBuf {
+    let now = chrono::Local::now();
+    workspace_root
+        .join("conversations")
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month()))
+        .join(format!("{:02}", now.day()))
+}
+
+fn auto_provisioned_workspace_to_delete(
+    workspace_root: &Path,
+    row: &ConversationRow,
+    conversation_id: &str,
+) -> Option<PathBuf> {
+    let extra = serde_json::from_str::<serde_json::Value>(&row.extra).ok()?;
+    let workspace = extra.get("workspace")?.as_str()?.trim();
+    if workspace.is_empty() {
+        return None;
+    }
+
+    let workspace_path = Path::new(workspace);
+    if !workspace_path.is_absolute() {
+        return None;
+    }
+
+    let conversations_root = workspace_root.join("conversations");
+    let conversations_root = std::fs::canonicalize(conversations_root).ok()?;
+    let workspace_path = std::fs::canonicalize(workspace_path).ok()?;
+    let file_name = workspace_path.file_name()?.to_str()?;
+    let expected_suffix = format!("-temp-{conversation_id}");
+    if !file_name.ends_with(&expected_suffix) {
+        return None;
+    }
+
+    let relative = workspace_path.strip_prefix(&conversations_root).ok()?;
+    if !is_auto_workspace_relative_path(relative) {
+        return None;
+    }
+
+    Some(workspace_path)
+}
+
+fn is_auto_workspace_relative_path(relative: &Path) -> bool {
+    let parts = relative.iter().map(|part| part.to_str()).collect::<Option<Vec<_>>>();
+    let Some(parts) = parts else {
+        return false;
+    };
+
+    match parts.as_slice() {
+        [_file_name] => true,
+        [year, month, day, _file_name] => {
+            year.len() == 4
+                && month.len() == 2
+                && day.len() == 2
+                && year.chars().all(|ch| ch.is_ascii_digit())
+                && month.chars().all(|ch| ch.is_ascii_digit())
+                && day.chars().all(|ch| ch.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+async fn cleanup_empty_date_workspace_parents(workspace_root: &Path, workspace_path: &Path) {
+    let Some(date_dirs) = date_workspace_parent_dirs(workspace_root, workspace_path) else {
+        return;
+    };
+
+    for dir in date_dirs {
+        match tokio::fs::remove_dir(&dir).await {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                break;
+            }
+            Err(err) => {
+                warn!(
+                    workspace_parent = %dir.display(),
+                    error = %err,
+                    "Failed to remove empty auto-provisioned workspace date directory"
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn date_workspace_parent_dirs(workspace_root: &Path, workspace_path: &Path) -> Option<[PathBuf; 3]> {
+    let conversations_root = std::fs::canonicalize(workspace_root.join("conversations")).ok()?;
+    let relative = workspace_path.strip_prefix(&conversations_root).ok()?;
+    if !is_dated_auto_workspace_relative_path(relative) {
+        return None;
+    }
+
+    let day_dir = workspace_path.parent()?.to_path_buf();
+    let month_dir = day_dir.parent()?.to_path_buf();
+    let year_dir = month_dir.parent()?.to_path_buf();
+    Some([day_dir, month_dir, year_dir])
+}
+
+fn is_dated_auto_workspace_relative_path(relative: &Path) -> bool {
+    let parts = relative.iter().map(|part| part.to_str()).collect::<Option<Vec<_>>>();
+    let Some(parts) = parts else {
+        return false;
+    };
+
+    matches!(
+        parts.as_slice(),
+        [year, month, day, _file_name]
+            if year.len() == 4
+                && month.len() == 2
+                && day.len() == 2
+                && year.chars().all(|ch| ch.is_ascii_digit())
+                && month.chars().all(|ch| ch.is_ascii_digit())
+                && day.chars().all(|ch| ch.is_ascii_digit())
+    )
 }
 
 fn context_backend_value(context: &AgentSessionContext) -> Option<serde_json::Value> {
