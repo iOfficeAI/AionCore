@@ -324,7 +324,13 @@ impl CronService {
             job.message = message.clone();
         }
         if let Some(mode_str) = &req.execution_mode {
-            job.execution_mode = parse_execution_mode(Some(mode_str))?;
+            let requested_mode = parse_execution_mode(Some(mode_str))?;
+            if requested_mode != original_execution_mode && self.is_team_conversation_job(&job).await? {
+                return Err(CronError::InvalidExecutionMode(
+                    "Team cron jobs must keep running in their owning Team conversation".into(),
+                ));
+            }
+            job.execution_mode = requested_mode;
         }
         if req.agent_config.is_some()
             && (matches!(original_execution_mode, ExecutionMode::Existing)
@@ -645,6 +651,23 @@ impl CronService {
         };
 
         self.resolve_agent_type_for_assistant_id(assistant_id).await
+    }
+
+    async fn is_team_conversation_job(&self, job: &CronJob) -> Result<bool, CronError> {
+        let conversation_id = job.conversation_id.trim();
+        if conversation_id.is_empty() {
+            return Ok(false);
+        }
+
+        let Some(row) = self.executor.get_conversation_row(conversation_id).await? else {
+            return Ok(false);
+        };
+        let extra = serde_json::from_str::<serde_json::Value>(&row.extra)?;
+        Ok(extra
+            .get("team_id")
+            .or_else(|| extra.get("teamId"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty()))
     }
 
     async fn resolve_agent_type_for_assistant_id(&self, assistant_id: &str) -> Result<String, CronError> {

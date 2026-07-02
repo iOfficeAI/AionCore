@@ -144,6 +144,28 @@ impl StubConvRepo {
     fn fail_updates_for(&self, conversation_id: &str) {
         self.update_failures.lock().unwrap().push(conversation_id.to_owned());
     }
+
+    fn set_conversation_extra(&self, conversation_id: &str, extra: serde_json::Value) {
+        let mut rows = self.rows.lock().unwrap();
+        let row = rows
+            .entry(conversation_id.to_owned())
+            .or_insert_with(|| aionui_db::models::ConversationRow {
+                id: conversation_id.to_owned(),
+                user_id: "u1".into(),
+                name: "stub".into(),
+                r#type: "default".into(),
+                model: None,
+                status: Some("active".into()),
+                source: None,
+                channel_chat_id: None,
+                extra: "{}".into(),
+                pinned: false,
+                pinned_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            });
+        row.extra = extra.to_string();
+    }
 }
 
 #[async_trait::async_trait]
@@ -1451,6 +1473,36 @@ async fn update_existing_conversation_job_rejects_agent_config_even_when_switchi
     assert!(
         matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(message) if message.contains("ongoing conversation"))
     );
+}
+
+#[tokio::test]
+async fn update_team_conversation_job_rejects_execution_mode_change() {
+    let (svc, _, _, conv_repo) = setup_with_conv_repo().await;
+    let mut create_req = make_create_req("Team Cron Mode Lock", every_60s());
+    create_req.conversation_id = "conv_team_cron".into();
+    conv_repo.set_conversation_extra(
+        "conv_team_cron",
+        serde_json::json!({
+            "team_id": "team-1",
+            "workspace": ensure_named_workspace_path("aionui-cron-service-team-workspace")
+        }),
+    );
+    let created = svc.add_job(create_req).await.unwrap();
+
+    let req = UpdateCronJobRequest {
+        name: None,
+        description: None,
+        enabled: None,
+        schedule: None,
+        message: None,
+        execution_mode: Some("new_conversation".into()),
+        agent_config: None,
+        conversation_title: None,
+        max_retries: None,
+    };
+
+    let err = svc.update_job(&created.id, req).await.unwrap_err();
+    assert!(matches!(err, aionui_cron::error::CronError::InvalidExecutionMode(message) if message.contains("Team")));
 }
 
 #[tokio::test]
