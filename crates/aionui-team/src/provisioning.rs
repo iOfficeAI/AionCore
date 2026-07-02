@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{AddAgentRequest, TeamAgentInput};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
-use aionui_db::models::TeamRow;
+use aionui_db::models::{AgentMetadataRow, TeamRow};
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
     ITeamRepository, UpdateTeamParams,
@@ -14,7 +14,9 @@ use tracing::{info, warn};
 use crate::error::TeamError;
 use crate::mcp::TeamMcpStdioConfig;
 use crate::service::inherit_team_workspace;
-use crate::service::spawn_support::{parse_agent_type, resolve_full_auto_mode, resolve_runtime_backend};
+use crate::service::spawn_support::{
+    acp_backend_metadata, parse_agent_type, resolve_runtime_backend, session_mode_for_backend,
+};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::workspace::TeamWorkspaceResolver;
 
@@ -358,9 +360,16 @@ impl TeamAgentProvisioner {
         agent: &TeamAgent,
         mcp_stdio_cfg: TeamMcpStdioConfig,
     ) -> Result<(), TeamError> {
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, &agent.backend).await?;
+        let agent_type = if acp_metadata.is_some() {
+            AgentType::Acp
+        } else {
+            parse_agent_type(&agent.backend)?
+        };
+        let session_mode = session_mode_for_backend(&agent.backend, agent_type, acp_metadata.as_ref());
         let patch = serde_json::json!({
             "team_mcp_stdio_config": mcp_stdio_cfg,
-            "session_mode": resolve_full_auto_mode(&agent.backend),
+            "session_mode": session_mode,
         });
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
@@ -430,11 +439,23 @@ impl TeamAgentProvisioner {
         assistant_id: Option<&str>,
         workspace: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
-        let extra = self
-            .build_team_extra(team_id, slot_id, role, backend, model, assistant_id, workspace)
-            .await?;
-
-        let agent_type = parse_agent_type(backend)?;
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, backend).await?;
+        let agent_type = if acp_metadata.is_some() {
+            AgentType::Acp
+        } else {
+            parse_agent_type(backend)?
+        };
+        let extra = self.build_team_extra(
+            team_id,
+            slot_id,
+            role,
+            backend,
+            model,
+            assistant_id,
+            workspace,
+            agent_type,
+            acp_metadata.as_ref(),
+        );
         let provider_id = if agent_type == AgentType::Aionrs {
             self.resolve_provider_for_model(model)
                 .await
@@ -524,7 +545,7 @@ impl TeamAgentProvisioner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn build_team_extra(
+    fn build_team_extra(
         &self,
         team_id: &str,
         slot_id: &str,
@@ -533,15 +554,18 @@ impl TeamAgentProvisioner {
         model: &str,
         assistant_id: Option<&str>,
         workspace: Option<&str>,
-    ) -> Result<serde_json::Value, TeamError> {
+        agent_type: AgentType,
+        acp_metadata: Option<&AgentMetadataRow>,
+    ) -> serde_json::Value {
+        let session_mode = session_mode_for_backend(backend, agent_type, acp_metadata);
         let mut extra = serde_json::json!({
             "teamId": team_id,
             "slot_id": slot_id,
             "role": role.to_string(),
             "backend": backend,
-            "session_mode": resolve_full_auto_mode(backend),
+            "session_mode": session_mode,
         });
-        if parse_agent_type(backend)? != AgentType::Aionrs {
+        if agent_type != AgentType::Aionrs {
             extra["current_model_id"] = serde_json::Value::String(model.to_owned());
         }
         if let Some(assistant_id) = assistant_id {
@@ -550,7 +574,7 @@ impl TeamAgentProvisioner {
         if let Some(workspace) = workspace {
             inherit_team_workspace(&mut extra, workspace);
         }
-        Ok(extra)
+        extra
     }
 
     async fn persist_agents(&self, team_id: &str, agents: &[TeamAgent]) -> Result<(), TeamError> {
