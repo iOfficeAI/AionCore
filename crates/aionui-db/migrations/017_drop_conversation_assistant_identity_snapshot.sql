@@ -1,0 +1,3 @@
+ALTER TABLE conversation_assistant_snapshots DROP COLUMN assistant_name;
+ALTER TABLE conversation_assistant_snapshots DROP COLUMN assistant_avatar_type;
+ALTER TABLE conversation_assistant_snapshots DROP COLUMN assistant_avatar_value;

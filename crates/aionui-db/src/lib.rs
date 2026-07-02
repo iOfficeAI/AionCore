@@ -46,7 +46,6 @@ pub use repository::{
     SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
     SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
     SqliteSettingsRepository, SqliteSkillRepository, SqliteTeamRepository, SqliteUserRepository,
-    rebuild_legacy_assistant_mirror,
 };
 
 // Re-export sqlx pool type for downstream crates

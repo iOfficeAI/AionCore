@@ -70,22 +70,35 @@ impl TeamSessionService {
 }
 
 fn assistant_icon(assistant_id: &str, avatar_type: &str, avatar_value: Option<&str>) -> Option<String> {
-    match avatar_type {
-        "builtin_asset" | "user_asset" => avatar_value.map(|value| {
-            if is_direct_avatar_url(value) {
-                value.to_string()
-            } else {
-                format!("/api/assistants/{assistant_id}/avatar")
-            }
-        }),
-        _ => None,
-    }
+    aionui_api_types::assistant_avatar_response_value(avatar_type, avatar_value, assistant_id)
 }
 
-fn is_direct_avatar_url(value: &str) -> bool {
-    value.starts_with("http://")
-        || value.starts_with("https://")
-        || value.starts_with("data:")
-        || value.starts_with("file://")
-        || value.starts_with("/api/assistants/")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_icon_routes_user_asset_through_backend_even_without_value() {
+        assert_eq!(
+            assistant_icon("assistant-1", "user_asset", None).as_deref(),
+            Some("/api/assistants/assistant-1/avatar")
+        );
+    }
+
+    #[test]
+    fn assistant_icon_does_not_pass_through_direct_asset_values() {
+        assert_eq!(
+            assistant_icon("assistant-1", "user_asset", Some("data:image/png;base64,abc")).as_deref(),
+            Some("/api/assistants/assistant-1/avatar")
+        );
+        assert_eq!(
+            assistant_icon("assistant-1", "user_asset", Some("https://example.invalid/avatar.png")).as_deref(),
+            Some("/api/assistants/assistant-1/avatar")
+        );
+    }
+
+    #[test]
+    fn assistant_icon_returns_none_for_none_avatar_type() {
+        assert_eq!(assistant_icon("assistant-1", "none", None), None);
+    }
 }

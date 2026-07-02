@@ -12,14 +12,14 @@ use aionui_api_types::{
     AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse, AssistantPromptsResponse,
     AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse, CreateAssistantRequest,
     ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
+    assistant_avatar_response_value_with_version, is_local_avatar_value,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
     AssistantDefinitionRow, AssistantOverlayRow, AssistantRow, CreateAssistantParams, IAssistantDefinitionRepository,
     IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
     IProviderRepository, SqlitePool, UpdateAssistantParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, rebuild_legacy_assistant_mirror,
-    resolve_agent_binding,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, resolve_agent_binding,
 };
 use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
 use serde_json;
@@ -109,9 +109,9 @@ impl AssistantService {
         self.materialize_builtin_definitions().await?;
         self.soft_delete_removed_builtin_definitions().await?;
         self.sync_legacy_user_assistants_to_new_tables().await?;
+        self.reconcile_user_avatar_assets().await?;
         self.sync_legacy_overrides_to_new_states().await?;
         self.reconcile_generated_assistants().await?;
-        self.rebuild_legacy_mirror_from_new_tables().await?;
         Ok(())
     }
 
@@ -243,8 +243,59 @@ impl AssistantService {
             if self.builtin.has(&row.id) {
                 continue;
             }
+            if self
+                .definition_repo
+                .get_by_source_ref_including_deleted("user", &row.id)
+                .await
+                .map_err(|e| AssistantError::Internal(format!("get user definition by source_ref: {e}")))?
+                .is_some()
+                || self
+                    .definition_repo
+                    .get_by_assistant_id_including_deleted(&row.id)
+                    .await
+                    .map_err(|e| AssistantError::Internal(format!("get user definition by assistant_id: {e}")))?
+                    .is_some()
+            {
+                continue;
+            }
             self.upsert_definition_from_legacy_user_row(&row, None).await?;
         }
+        Ok(())
+    }
+
+    async fn reconcile_user_avatar_assets(&self) -> Result<(), AssistantError> {
+        let definitions = self.definition_repo.list_including_deleted().await.map_err(|e| {
+            AssistantError::Internal(format!(
+                "list assistant definitions including deleted for avatar reconcile: {e}"
+            ))
+        })?;
+
+        for mut definition in definitions {
+            if definition.avatar_type != "user_asset" {
+                continue;
+            }
+
+            if self.user_asset_avatar_value_is_renderable(&definition) {
+                continue;
+            }
+
+            if let Some(path) = self.find_existing_user_avatar_file(&definition.assistant_id) {
+                definition.avatar_type = "user_asset".to_string();
+                definition.avatar_value = Some(managed_user_avatar_value_from_path(&path)?);
+            } else {
+                definition.avatar_type = "none".to_string();
+                definition.avatar_value = None;
+            }
+            self.definition_repo
+                .update_avatar_fields_preserving_deleted(
+                    &definition.id,
+                    &definition.avatar_type,
+                    definition.avatar_value.as_deref(),
+                )
+                .await
+                .map_err(|e| AssistantError::Internal(format!("reconcile local assistant avatar path: {e}")))?;
+        }
+
         Ok(())
     }
 
@@ -456,8 +507,9 @@ impl AssistantService {
         let custom_skill_names = normalize_json_array_string(row.custom_skill_names.as_deref(), "custom_skill_names")?;
         let default_disabled_builtin_skill_ids =
             normalize_json_array_string(row.disabled_builtin_skills.as_deref(), "disabled_builtin_skills")?;
-        let (avatar_type, avatar_value) = serialize_avatar("user", row.avatar.as_deref());
         let (definition_id, assistant_id) = self.resolve_definition_identity("user", Some(&row.id), &row.id).await?;
+        let (avatar_type, avatar_value) =
+            self.normalize_legacy_user_avatar_input(&assistant_id, row.avatar.as_deref())?;
         let existing_definition = self.definition_repo.get_by_assistant_id(&assistant_id).await?;
         let agent_id = match requested_agent_id {
             Some(agent_id) => agent_id.to_string(),
@@ -528,46 +580,10 @@ impl AssistantService {
         let mut patched = existing.clone();
         apply_detail_patch_to_definition(&mut patched, &overrides, reset_model_and_permission);
 
-        let patched = self
-            .definition_repo
+        self.definition_repo
             .upsert(&upsert_params_from_definition(&patched))
             .await
             .map_err(|e| AssistantError::Internal(format!("upsert patched assistant definition: {e}")))?;
-
-        let state = self
-            .state_repo
-            .get(&patched.id)
-            .await
-            .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?;
-        rebuild_legacy_assistant_mirror(&self.pool, &patched, state.as_ref())
-            .await
-            .map_err(|e| AssistantError::Internal(format!("rebuild legacy mirror: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Rebuild downgrade-compatibility mirror rows from the new assistant tables.
-    pub async fn rebuild_legacy_mirror_from_new_tables(&self) -> Result<(), AssistantError> {
-        let states = self
-            .state_repo
-            .list()
-            .await
-            .map_err(|e| AssistantError::Internal(format!("list assistant overlays: {e}")))?;
-        let state_map: HashMap<String, aionui_db::AssistantOverlayRow> = states
-            .into_iter()
-            .map(|state| (state.assistant_definition_id.clone(), state))
-            .collect();
-
-        for definition in self
-            .definition_repo
-            .list()
-            .await
-            .map_err(|e| AssistantError::Internal(format!("list assistant definitions: {e}")))?
-        {
-            rebuild_legacy_assistant_mirror(&self.pool, &definition, state_map.get(&definition.id))
-                .await
-                .map_err(|e| AssistantError::Internal(format!("rebuild legacy mirror: {e}")))?;
-        }
 
         Ok(())
     }
@@ -621,11 +637,7 @@ impl AssistantService {
             let projection = self
                 .project_definition(definition, state_map.get(&definition.id), &projections)
                 .await?;
-            result.push(definition_to_response(
-                definition,
-                state_map.get(&definition.id),
-                &projection,
-            )?);
+            result.push(self.definition_to_response(definition, state_map.get(&definition.id), &projection)?);
         }
 
         // Sort by sort_order asc, then last_used_at desc (newer first).
@@ -652,7 +664,7 @@ impl AssistantService {
             let projection = self
                 .project_definition(&definition, state.as_ref(), &projections)
                 .await?;
-            return definition_to_response(&definition, state.as_ref(), &projection);
+            return self.definition_to_response(&definition, state.as_ref(), &projection);
         }
 
         Err(AssistantError::NotFound(format!("assistant '{id}' not found")))
@@ -667,7 +679,7 @@ impl AssistantService {
             let projection = self
                 .project_definition(&definition, state.as_ref(), &projections)
                 .await?;
-            return definition_to_detail_response(
+            return self.definition_to_detail_response(
                 &definition,
                 state.as_ref(),
                 preference.as_ref(),
@@ -898,10 +910,6 @@ impl AssistantService {
                     .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
                 self.sync_preferences_from_defaults_request(&definition, Some(&definition), req.defaults.as_ref())
                     .await?;
-                let state = self.state_repo.get(&definition.id).await?;
-                rebuild_legacy_assistant_mirror(&self.pool, &definition, state.as_ref())
-                    .await
-                    .map_err(|e| AssistantError::Internal(format!("rebuild legacy mirror: {e}")))?;
                 return self.get(id).await;
             }
             AssistantSource::Generated => {
@@ -958,10 +966,6 @@ impl AssistantService {
                     .map_err(|e| AssistantError::Internal(format!("upsert generated assistant definition: {e}")))?;
                 self.sync_preferences_from_defaults_request(&patched, Some(&current_definition), req.defaults.as_ref())
                     .await?;
-                let state = self.state_repo.get(&patched.id).await?;
-                rebuild_legacy_assistant_mirror(&self.pool, &patched, state.as_ref())
-                    .await
-                    .map_err(|e| AssistantError::Internal(format!("rebuild legacy mirror: {e}")))?;
                 return self.get(id).await;
             }
             AssistantSource::User => {}
@@ -1244,8 +1248,7 @@ impl AssistantService {
         let agent_id_override = existing_state
             .as_ref()
             .and_then(|state| state.agent_id_override.clone());
-        let state = self
-            .state_repo
+        self.state_repo
             .upsert(&UpsertAssistantOverlayParams {
                 assistant_definition_id: &definition.id,
                 enabled,
@@ -1255,9 +1258,6 @@ impl AssistantService {
             })
             .await
             .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
-        rebuild_legacy_assistant_mirror(&self.pool, &definition, Some(&state))
-            .await
-            .map_err(|e| AssistantError::Internal(format!("rebuild legacy mirror: {e}")))?;
 
         self.get(id).await
     }
@@ -1516,8 +1516,8 @@ impl AssistantService {
     ///
     /// - Built-in source → read from the embedded bundle (or the disk
     ///   override when `AIONUI_BUILTIN_ASSISTANTS_PATH` is set).
-    /// - User source → scan the user-writable avatars directory for a file
-    ///   whose stem equals `id`.
+    /// - User source → read the managed avatar filename recorded on the
+    ///   unified assistant definition.
     ///
     /// Built-ins whose manifest `avatar` field is an inline emoji (and thus
     /// has no on-disk file) also return `None`; clients fall back to the
@@ -1526,20 +1526,18 @@ impl AssistantService {
         match self.classify_source(id).await {
             AssistantSource::Builtin => self.builtin.avatar_asset(id),
             AssistantSource::Generated | AssistantSource::User => {
-                let dir = self.user_avatars_dir();
-                let entries = std::fs::read_dir(&dir).ok()?;
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if let Some(stem) = name.split('.').next()
-                        && stem == id
+                if let Ok(Some(definition)) = self.definition_repo.get_by_assistant_id(id).await {
+                    if definition.avatar_type != "user_asset" {
+                        return None;
+                    }
+                    if let Some(value) = definition
+                        .avatar_value
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        && let Some(asset) = self.read_user_avatar_asset_by_filename(value)
                     {
-                        let bytes = std::fs::read(entry.path()).ok()?;
-                        let extension = std::path::Path::new(name.as_ref())
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .map(|s| s.to_ascii_lowercase());
-                        return Some(AvatarAsset { bytes, extension });
+                        return Some(asset);
                     }
                 }
                 None
@@ -1563,6 +1561,96 @@ impl AssistantService {
         self.user_data_dir.join("assistant-avatars")
     }
 
+    fn normalize_legacy_user_avatar_input(
+        &self,
+        id: &str,
+        avatar: Option<&str>,
+    ) -> Result<(String, Option<String>), AssistantError> {
+        let Some(value) = avatar.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(("none".to_string(), None));
+        };
+
+        if is_local_avatar_value(value) && parse_local_avatar_path(value).is_none() {
+            if let Some(path) = self.find_existing_user_avatar_file(id) {
+                return Ok((
+                    "user_asset".to_string(),
+                    Some(managed_user_avatar_value_from_path(&path)?),
+                ));
+            }
+            warn!(
+                assistant_id = %id,
+                "clear unavailable legacy assistant avatar during sync"
+            );
+            return Ok(("none".to_string(), None));
+        }
+
+        if is_unsupported_direct_avatar_reference(value) {
+            warn!(
+                assistant_id = %id,
+                "clear unavailable legacy assistant avatar during sync"
+            );
+            return Ok(("none".to_string(), None));
+        }
+
+        if let Some(source_assistant_id) = parse_assistant_avatar_route(value) {
+            if let Some(path) = self.find_existing_user_avatar_file(id) {
+                return Ok((
+                    "user_asset".to_string(),
+                    Some(managed_user_avatar_value_from_path(&path)?),
+                ));
+            }
+            if source_assistant_id == id {
+                warn!(
+                    assistant_id = %id,
+                    "clear unavailable legacy assistant avatar during sync"
+                );
+                return Ok(("none".to_string(), None));
+            }
+            if let Some(source_avatar_path) = self.find_existing_user_avatar_file(&source_assistant_id) {
+                let avatar_value = self.persist_user_avatar_file(id, &source_avatar_path)?;
+                return Ok(("user_asset".to_string(), Some(avatar_value)));
+            }
+            if let Some(builtin_avatar) = self.builtin.avatar_asset(&source_assistant_id) {
+                let avatar_value =
+                    self.persist_user_avatar_bytes(id, &builtin_avatar.bytes, builtin_avatar.extension.as_deref())?;
+                return Ok(("user_asset".to_string(), Some(avatar_value)));
+            }
+            warn!(
+                assistant_id = %id,
+                source_assistant_id = %source_assistant_id,
+                "clear unavailable legacy assistant avatar during sync"
+            );
+            return Ok(("none".to_string(), None));
+        }
+
+        if let Some(source_path) = parse_local_avatar_path(value) {
+            if let Some(path) = self.find_existing_user_avatar_file(id) {
+                return Ok((
+                    "user_asset".to_string(),
+                    Some(managed_user_avatar_value_from_path(&path)?),
+                ));
+            }
+            let avatar_value = self.persist_user_avatar_file(id, &source_path)?;
+            return Ok(("user_asset".to_string(), Some(avatar_value)));
+        }
+
+        if looks_like_avatar_asset(value) {
+            if let Some(path) = self.find_existing_user_avatar_file(id) {
+                return Ok((
+                    "user_asset".to_string(),
+                    Some(managed_user_avatar_value_from_path(&path)?),
+                ));
+            }
+            warn!(
+                assistant_id = %id,
+                "clear unavailable legacy assistant avatar during sync"
+            );
+            return Ok(("none".to_string(), None));
+        }
+
+        Ok(("emoji".to_string(), Some(value.to_string())))
+    }
+
     fn normalize_user_avatar_input(&self, id: &str, avatar: Option<&str>) -> Result<Option<String>, AssistantError> {
         let Some(value) = avatar.map(str::trim).filter(|value| !value.is_empty()) else {
             remove_assistant_avatar_files(&self.user_avatars_dir(), id);
@@ -1577,7 +1665,7 @@ impl AssistantService {
         if let Some(source_assistant_id) = parse_assistant_avatar_route(value) {
             if let Some(existing_avatar_path) = self.find_existing_user_avatar_file(&source_assistant_id) {
                 if source_assistant_id == id {
-                    return Ok(Some(existing_avatar_path.to_string_lossy().to_string()));
+                    return managed_user_avatar_value_from_path(&existing_avatar_path).map(Some);
                 }
                 return self.persist_user_avatar_file(id, &existing_avatar_path).map(Some);
             }
@@ -1587,6 +1675,13 @@ impl AssistantService {
                     .map(Some);
             }
             return Ok(Some(value.to_string()));
+        }
+
+        if is_unsupported_direct_avatar_reference(value) {
+            remove_assistant_avatar_files(&self.user_avatars_dir(), id);
+            return Err(AssistantError::BadRequest(
+                "assistant avatar must be an emoji or a local image file".into(),
+            ));
         }
 
         if let Some(source_path) = parse_local_avatar_path(value) {
@@ -1613,9 +1708,12 @@ impl AssistantService {
         let destination_dir = self.user_avatars_dir();
         std::fs::create_dir_all(&destination_dir)
             .map_err(|e| AssistantError::Internal(format!("create assistant avatar directory: {e}")))?;
-        remove_assistant_avatar_files(&destination_dir, id);
-
         let destination = destination_dir.join(format!("{id}.{extension}"));
+        if paths_refer_to_same_file(source_path, &destination) {
+            return managed_user_avatar_value_from_path(&destination);
+        }
+
+        remove_assistant_avatar_files(&destination_dir, id);
         std::fs::copy(source_path, &destination).map_err(|e| {
             AssistantError::Internal(format!(
                 "copy assistant avatar from '{}' to '{}': {e}",
@@ -1624,7 +1722,7 @@ impl AssistantService {
             ))
         })?;
 
-        Ok(destination.to_string_lossy().to_string())
+        managed_user_avatar_value_from_path(&destination)
     }
 
     fn persist_user_avatar_bytes(
@@ -1653,7 +1751,7 @@ impl AssistantService {
             AssistantError::Internal(format!("write assistant avatar to '{}': {e}", destination.display()))
         })?;
 
-        Ok(destination.to_string_lossy().to_string())
+        managed_user_avatar_value_from_path(&destination)
     }
 
     fn find_existing_user_avatar_file(&self, id: &str) -> Option<PathBuf> {
@@ -1666,6 +1764,33 @@ impl AssistantService {
             }
         }
         None
+    }
+
+    fn read_user_avatar_asset_by_filename(&self, value: &str) -> Option<AvatarAsset> {
+        let value = value.trim();
+        if value.is_empty() || value.contains('/') || value.contains('\\') {
+            return None;
+        }
+        read_user_avatar_asset_from_path(&self.user_avatars_dir().join(value))
+    }
+
+    fn user_asset_avatar_value_is_renderable(&self, definition: &AssistantDefinitionRow) -> bool {
+        let Some(value) = definition
+            .avatar_value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        if is_local_avatar_value(value) || value.contains('/') || value.contains('\\') {
+            return false;
+        }
+        let path = Path::new(value);
+        if path.file_stem().and_then(|stem| stem.to_str()) != Some(definition.assistant_id.as_str()) {
+            return false;
+        }
+        self.read_user_avatar_asset_by_filename(value).is_some()
     }
 
     fn user_rule_path(&self, id: &str, locale: Option<&str>) -> PathBuf {
@@ -1770,16 +1895,167 @@ fn assistant_error_to_extension_error(error: AssistantError) -> ExtensionError {
 // Response conversion
 // ---------------------------------------------------------------------------
 
-fn avatar_display_value(definition: &AssistantDefinitionRow) -> Option<String> {
-    match definition.avatar_type.as_str() {
-        "builtin_asset" | "user_asset" => definition.avatar_value.as_deref().map(|value| {
-            if is_direct_avatar_url(value) {
-                value.to_string()
-            } else {
-                format!("/api/assistants/{}/avatar", definition.assistant_id)
-            }
-        }),
-        _ => definition.avatar_value.clone(),
+impl AssistantService {
+    fn avatar_display_value(&self, definition: &AssistantDefinitionRow) -> Option<String> {
+        if definition.avatar_type == "user_asset" && !self.user_asset_avatar_value_is_renderable(definition) {
+            return None;
+        }
+
+        let value = assistant_avatar_response_value_with_version(
+            definition.avatar_type.as_str(),
+            definition.avatar_value.as_deref(),
+            definition.assistant_id.as_str(),
+            definition.updated_at,
+        )?;
+
+        Some(value)
+    }
+
+    fn definition_to_response(
+        &self,
+        definition: &AssistantDefinitionRow,
+        state: Option<&AssistantOverlayRow>,
+        projection: &AssistantRuntimeProjection,
+    ) -> Result<AssistantResponse, AssistantError> {
+        let source = match definition.source.as_str() {
+            "builtin" => AssistantSource::Builtin,
+            "generated" => AssistantSource::Generated,
+            _ => AssistantSource::User,
+        };
+        let models = match (
+            definition.default_model_mode.as_str(),
+            definition.default_model_value.as_deref(),
+        ) {
+            ("fixed", Some(model)) => vec![model.to_string()],
+            _ => Vec::new(),
+        };
+
+        Ok(AssistantResponse {
+            id: definition.assistant_id.clone(),
+            source,
+            name: definition.name.clone(),
+            name_i18n: decode_str_map(Some(definition.name_i18n.as_str()))?,
+            description: definition.description.clone(),
+            description_i18n: decode_str_map(Some(definition.description_i18n.as_str()))?,
+            avatar: self.avatar_display_value(definition),
+            enabled: state.is_none_or(|row| row.enabled),
+            sort_order: state.map(|row| row.sort_order).unwrap_or(0),
+            agent_id: projection.agent_id.clone(),
+            agent: projection.agent.clone(),
+            enabled_skills: decode_str_list(Some(definition.default_skill_ids.as_str()))?,
+            custom_skill_names: decode_str_list(Some(definition.custom_skill_names.as_str()))?,
+            disabled_builtin_skills: decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?,
+            context: None,
+            context_i18n: HashMap::new(),
+            prompts: decode_str_list(Some(definition.recommended_prompts.as_str()))?,
+            prompts_i18n: decode_list_map(Some(definition.recommended_prompts_i18n.as_str()))?,
+            models,
+            last_used_at: state.and_then(|row| row.last_used_at),
+            agent_status: projection.agent_status,
+            agent_status_message: projection.agent_status_message.clone(),
+            team_selectable: projection.team_selectable,
+            team_block_reason: projection.team_block_reason.clone(),
+            deletable: projection.deletable,
+        })
+    }
+
+    fn definition_to_detail_response(
+        &self,
+        definition: &AssistantDefinitionRow,
+        state: Option<&AssistantOverlayRow>,
+        preference: Option<&aionui_db::AssistantPreferenceRow>,
+        rules_content: &str,
+        projection: &AssistantRuntimeProjection,
+    ) -> Result<AssistantDetailResponse, AssistantError> {
+        let default_skill_ids = decode_str_list(Some(definition.default_skill_ids.as_str()))?;
+        let custom_skill_names = decode_str_list(Some(definition.custom_skill_names.as_str()))?;
+        let default_disabled_builtin_skill_ids =
+            decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?;
+        let default_mcp_ids = decode_str_list(Some(definition.default_mcp_ids.as_str()))?;
+        let last_skill_ids = preference
+            .map(|row| decode_str_list(Some(row.last_skill_ids.as_str())))
+            .transpose()?
+            .unwrap_or_default();
+        let last_disabled_builtin_skill_ids = preference
+            .map(|row| decode_str_list(Some(row.last_disabled_builtin_skill_ids.as_str())))
+            .transpose()?
+            .unwrap_or_default();
+        let last_mcp_ids = preference
+            .map(|row| decode_str_list(Some(row.last_mcp_ids.as_str())))
+            .transpose()?
+            .unwrap_or_default();
+
+        Ok(AssistantDetailResponse {
+            id: definition.assistant_id.clone(),
+            source: match definition.source.as_str() {
+                "builtin" => AssistantSource::Builtin,
+                "generated" => AssistantSource::Generated,
+                _ => AssistantSource::User,
+            },
+            agent_status: projection.agent_status,
+            agent_status_message: projection.agent_status_message.clone(),
+            team_selectable: projection.team_selectable,
+            team_block_reason: projection.team_block_reason.clone(),
+            deletable: projection.deletable,
+            profile: AssistantProfileResponse {
+                name: definition.name.clone(),
+                name_i18n: decode_str_map(Some(definition.name_i18n.as_str()))?,
+                description: definition.description.clone(),
+                description_i18n: decode_str_map(Some(definition.description_i18n.as_str()))?,
+                avatar: self.avatar_display_value(definition),
+            },
+            state: AssistantStateResponse {
+                enabled: state.map(|row| row.enabled).unwrap_or(true),
+                sort_order: state.map(|row| row.sort_order).unwrap_or_default(),
+                last_used_at: state.and_then(|row| row.last_used_at),
+            },
+            engine: AssistantEngineResponse {
+                agent_id: projection.agent_id.clone(),
+                agent: projection.agent.clone(),
+            },
+            rules: AssistantRulesResponse {
+                content: if rules_content.is_empty() {
+                    definition.rule_inline_content.clone().unwrap_or_default()
+                } else {
+                    rules_content.to_owned()
+                },
+                storage_mode: definition.rule_resource_type.clone(),
+            },
+            prompts: AssistantPromptsResponse {
+                recommended: decode_str_list(Some(definition.recommended_prompts.as_str()))?,
+                recommended_i18n: decode_list_map(Some(definition.recommended_prompts_i18n.as_str()))?,
+            },
+            defaults: AssistantDefaultsResponse {
+                model: AssistantDefaultScalarResponse {
+                    mode: definition.default_model_mode.clone(),
+                    value: definition.default_model_value.clone(),
+                },
+                permission: AssistantDefaultScalarResponse {
+                    mode: definition.default_permission_mode.clone(),
+                    value: definition.default_permission_value.clone(),
+                },
+                skills: AssistantDefaultListResponse {
+                    mode: definition.default_skills_mode.clone(),
+                    value: default_skill_ids.clone(),
+                },
+                mcps: AssistantDefaultListResponse {
+                    mode: definition.default_mcps_mode.clone(),
+                    value: default_mcp_ids,
+                },
+            },
+            capabilities: AssistantCapabilitiesResponse {
+                default_skill_ids,
+                custom_skill_names,
+                default_disabled_builtin_skill_ids,
+            },
+            preferences: AssistantPreferencesResponse {
+                last_model_id: preference.and_then(|row| row.last_model_id.clone()),
+                last_permission_value: preference.and_then(|row| row.last_permission_value.clone()),
+                last_skill_ids,
+                last_disabled_builtin_skill_ids,
+                last_mcp_ids,
+            },
+        })
     }
 }
 
@@ -1804,6 +2080,23 @@ fn looks_like_avatar_asset(value: &str) -> bool {
     value.contains('/') || (std::path::Path::new(value).extension().is_some() && !value.starts_with('.'))
 }
 
+fn managed_user_avatar_value_from_path(path: &Path) -> Result<String, AssistantError> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| AssistantError::Internal(format!("invalid assistant avatar filename: {}", path.display())))
+}
+
+fn read_user_avatar_asset_from_path(path: &Path) -> Option<AvatarAsset> {
+    let bytes = std::fs::read(path).ok()?;
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    Some(AvatarAsset { bytes, extension })
+}
+
 fn parse_local_avatar_path(value: &str) -> Option<PathBuf> {
     let path = value
         .strip_prefix("file://")
@@ -1812,172 +2105,31 @@ fn parse_local_avatar_path(value: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 fn is_supported_avatar_extension(extension: &str) -> bool {
     matches!(extension, "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg")
 }
 
-fn is_direct_avatar_url(value: &str) -> bool {
-    value.starts_with("http://")
-        || value.starts_with("https://")
-        || value.starts_with("data:")
-        || value.starts_with("file://")
-        || value.starts_with("/api/assistants/")
+fn is_unsupported_direct_avatar_reference(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.starts_with("http://") || value.starts_with("https://") || value.starts_with("data:")
 }
 
 fn parse_assistant_avatar_route(value: &str) -> Option<String> {
     let prefix = "/api/assistants/";
     let suffix = "/avatar";
-    let route = value
-        .strip_prefix(prefix)
-        .map(|rest| format!("{prefix}{rest}"))
-        .or_else(|| value.find(prefix).map(|index| value[index..].to_string()))?;
+    let route_start = value.find(prefix)?;
+    let route_and_after = &value[route_start..];
+    let suffix_end = route_and_after.find(suffix)? + suffix.len();
+    let route = &route_and_after[..suffix_end];
     let id = route.strip_prefix(prefix)?.strip_suffix(suffix)?.trim();
     (!id.is_empty()).then(|| id.to_string())
-}
-
-fn definition_to_response(
-    definition: &AssistantDefinitionRow,
-    state: Option<&AssistantOverlayRow>,
-    projection: &AssistantRuntimeProjection,
-) -> Result<AssistantResponse, AssistantError> {
-    let source = match definition.source.as_str() {
-        "builtin" => AssistantSource::Builtin,
-        "generated" => AssistantSource::Generated,
-        _ => AssistantSource::User,
-    };
-    let models = match (
-        definition.default_model_mode.as_str(),
-        definition.default_model_value.as_deref(),
-    ) {
-        ("fixed", Some(model)) => vec![model.to_string()],
-        _ => Vec::new(),
-    };
-
-    Ok(AssistantResponse {
-        id: definition.assistant_id.clone(),
-        source,
-        name: definition.name.clone(),
-        name_i18n: decode_str_map(Some(definition.name_i18n.as_str()))?,
-        description: definition.description.clone(),
-        description_i18n: decode_str_map(Some(definition.description_i18n.as_str()))?,
-        avatar: avatar_display_value(definition),
-        enabled: state.is_none_or(|row| row.enabled),
-        sort_order: state.map(|row| row.sort_order).unwrap_or(0),
-        agent_id: projection.agent_id.clone(),
-        agent: projection.agent.clone(),
-        enabled_skills: decode_str_list(Some(definition.default_skill_ids.as_str()))?,
-        custom_skill_names: decode_str_list(Some(definition.custom_skill_names.as_str()))?,
-        disabled_builtin_skills: decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?,
-        context: None,
-        context_i18n: HashMap::new(),
-        prompts: decode_str_list(Some(definition.recommended_prompts.as_str()))?,
-        prompts_i18n: decode_list_map(Some(definition.recommended_prompts_i18n.as_str()))?,
-        models,
-        last_used_at: state.and_then(|row| row.last_used_at),
-        agent_status: projection.agent_status,
-        agent_status_message: projection.agent_status_message.clone(),
-        team_selectable: projection.team_selectable,
-        team_block_reason: projection.team_block_reason.clone(),
-        deletable: projection.deletable,
-    })
-}
-
-fn definition_to_detail_response(
-    definition: &AssistantDefinitionRow,
-    state: Option<&AssistantOverlayRow>,
-    preference: Option<&aionui_db::AssistantPreferenceRow>,
-    rules_content: &str,
-    projection: &AssistantRuntimeProjection,
-) -> Result<AssistantDetailResponse, AssistantError> {
-    let default_skill_ids = decode_str_list(Some(definition.default_skill_ids.as_str()))?;
-    let custom_skill_names = decode_str_list(Some(definition.custom_skill_names.as_str()))?;
-    let default_disabled_builtin_skill_ids =
-        decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?;
-    let default_mcp_ids = decode_str_list(Some(definition.default_mcp_ids.as_str()))?;
-    let last_skill_ids = preference
-        .map(|row| decode_str_list(Some(row.last_skill_ids.as_str())))
-        .transpose()?
-        .unwrap_or_default();
-    let last_disabled_builtin_skill_ids = preference
-        .map(|row| decode_str_list(Some(row.last_disabled_builtin_skill_ids.as_str())))
-        .transpose()?
-        .unwrap_or_default();
-    let last_mcp_ids = preference
-        .map(|row| decode_str_list(Some(row.last_mcp_ids.as_str())))
-        .transpose()?
-        .unwrap_or_default();
-
-    Ok(AssistantDetailResponse {
-        id: definition.assistant_id.clone(),
-        source: match definition.source.as_str() {
-            "builtin" => AssistantSource::Builtin,
-            "generated" => AssistantSource::Generated,
-            _ => AssistantSource::User,
-        },
-        agent_status: projection.agent_status,
-        agent_status_message: projection.agent_status_message.clone(),
-        team_selectable: projection.team_selectable,
-        team_block_reason: projection.team_block_reason.clone(),
-        deletable: projection.deletable,
-        profile: AssistantProfileResponse {
-            name: definition.name.clone(),
-            name_i18n: decode_str_map(Some(definition.name_i18n.as_str()))?,
-            description: definition.description.clone(),
-            description_i18n: decode_str_map(Some(definition.description_i18n.as_str()))?,
-            avatar: avatar_display_value(definition),
-        },
-        state: AssistantStateResponse {
-            enabled: state.map(|row| row.enabled).unwrap_or(true),
-            sort_order: state.map(|row| row.sort_order).unwrap_or_default(),
-            last_used_at: state.and_then(|row| row.last_used_at),
-        },
-        engine: AssistantEngineResponse {
-            agent_id: projection.agent_id.clone(),
-            agent: projection.agent.clone(),
-        },
-        rules: AssistantRulesResponse {
-            content: if rules_content.is_empty() {
-                definition.rule_inline_content.clone().unwrap_or_default()
-            } else {
-                rules_content.to_owned()
-            },
-            storage_mode: definition.rule_resource_type.clone(),
-        },
-        prompts: AssistantPromptsResponse {
-            recommended: decode_str_list(Some(definition.recommended_prompts.as_str()))?,
-            recommended_i18n: decode_list_map(Some(definition.recommended_prompts_i18n.as_str()))?,
-        },
-        defaults: AssistantDefaultsResponse {
-            model: AssistantDefaultScalarResponse {
-                mode: definition.default_model_mode.clone(),
-                value: definition.default_model_value.clone(),
-            },
-            permission: AssistantDefaultScalarResponse {
-                mode: definition.default_permission_mode.clone(),
-                value: definition.default_permission_value.clone(),
-            },
-            skills: AssistantDefaultListResponse {
-                mode: definition.default_skills_mode.clone(),
-                value: default_skill_ids.clone(),
-            },
-            mcps: AssistantDefaultListResponse {
-                mode: definition.default_mcps_mode.clone(),
-                value: default_mcp_ids,
-            },
-        },
-        capabilities: AssistantCapabilitiesResponse {
-            default_skill_ids,
-            custom_skill_names,
-            default_disabled_builtin_skill_ids,
-        },
-        preferences: AssistantPreferencesResponse {
-            last_model_id: preference.and_then(|row| row.last_model_id.clone()),
-            last_permission_value: preference.and_then(|row| row.last_permission_value.clone()),
-            last_skill_ids,
-            last_disabled_builtin_skill_ids,
-            last_mcp_ids,
-        },
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -2486,6 +2638,7 @@ mod tests {
         definition_repo: Arc<dyn IAssistantDefinitionRepository>,
         state_repo: Arc<dyn IAssistantOverlayRepository>,
         preference_repo: Arc<dyn IAssistantPreferenceRepository>,
+        repo: Arc<dyn IAssistantRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
         agent_rows: Arc<Mutex<Vec<aionui_api_types::AgentManagementRow>>>,
         _tmp: TempDir,
@@ -2563,6 +2716,7 @@ mod tests {
                     serde_json::json!({
                         "id": b.id,
                         "name": b.name,
+                        "avatar": b.avatar,
                         "agent_ref": b.agent_ref,
                         "rule_file": b.rule_file,
                     })
@@ -2574,6 +2728,17 @@ mod tests {
             serde_json::to_string(&manifest_json).unwrap(),
         )
         .unwrap();
+        for builtin in &opts.builtins {
+            if let Some(avatar) = builtin.avatar.as_deref()
+                && looks_like_avatar_asset(avatar)
+            {
+                let avatar_path = assets_dir.join(avatar);
+                if let Some(parent) = avatar_path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(avatar_path, b"builtin-avatar-bytes").unwrap();
+            }
+        }
         let builtin_reg = Arc::new(BuiltinAssistantRegistry::load_from_dir(assets_dir));
 
         let agent_rows = Arc::new(Mutex::new(opts.agent_rows.clone()));
@@ -2583,7 +2748,7 @@ mod tests {
                 definition_repo: definition_repo.clone(),
                 state_repo: state_repo.clone(),
                 preference_repo: preference_repo.clone(),
-                repo,
+                repo: repo.clone(),
                 override_repo: orepo,
                 provider_repo: provider_repo.clone(),
                 builtin: builtin_reg,
@@ -2600,6 +2765,7 @@ mod tests {
             definition_repo,
             state_repo,
             preference_repo,
+            repo,
             provider_repo,
             agent_rows,
             _tmp: tmp,
@@ -2644,6 +2810,13 @@ mod tests {
             prompts: Vec::new(),
             prompts_i18n: HashMap::new(),
             models: Vec::new(),
+        }
+    }
+
+    fn mk_builtin_with_avatar(id: &str, name: &str, avatar: &str) -> BuiltinAssistant {
+        BuiltinAssistant {
+            avatar: Some(avatar.into()),
+            ..mk_builtin(id, name)
         }
     }
 
@@ -2700,6 +2873,49 @@ mod tests {
         let fx = fixture().await;
         let list = fx.service.list().await.unwrap();
         assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_does_not_rebuild_legacy_assistant_rows_from_definitions() {
+        let fx = fixture().await;
+        fx.definition_repo
+            .upsert(&UpsertAssistantDefinitionParams {
+                id: "asstdef_canonical_only",
+                assistant_id: "custom-canonical-only",
+                source: "user",
+                owner_type: "user",
+                source_ref: Some("custom-canonical-only"),
+                source_version: None,
+                source_hash: None,
+                name: "Canonical Only",
+                name_i18n: "{}",
+                description: None,
+                description_i18n: "{}",
+                avatar_type: "emoji",
+                avatar_value: Some("🙂"),
+                agent_id: "aionrs",
+                rule_resource_type: "user_file",
+                rule_resource_ref: Some("custom-canonical-only"),
+                rule_inline_content: None,
+                recommended_prompts: "[]",
+                recommended_prompts_i18n: "{}",
+                default_model_mode: "auto",
+                default_model_value: None,
+                default_permission_mode: "auto",
+                default_permission_value: None,
+                default_skills_mode: "fixed",
+                default_skill_ids: "[]",
+                custom_skill_names: "[]",
+                default_disabled_builtin_skill_ids: "[]",
+                default_mcps_mode: "auto",
+                default_mcp_ids: "[]",
+            })
+            .await
+            .unwrap();
+
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+
+        assert!(fx.repo.get("custom-canonical-only").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2803,6 +3019,516 @@ mod tests {
         assert_eq!(detail.defaults.skills.mode, "fixed");
         assert!(detail.defaults.skills.value.is_empty());
         assert!(detail.capabilities.default_disabled_builtin_skill_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_user_avatar_path_is_copied_to_managed_avatar_asset() {
+        let fx = fixture().await;
+        let source_avatar = fx._tmp.path().join("legacy-avatar.png");
+        std::fs::write(&source_avatar, b"avatar-bytes").unwrap();
+        let source_avatar = source_avatar.to_string_lossy().to_string();
+
+        fx.repo
+            .create(&CreateAssistantParams {
+                id: "custom-local-avatar",
+                name: "Local Avatar",
+                description: None,
+                avatar: Some(&source_avatar),
+                enabled_skills: None,
+                custom_skill_names: None,
+                disabled_builtin_skills: None,
+                prompts: None,
+                models: None,
+                name_i18n: None,
+                description_i18n: None,
+                prompts_i18n: None,
+            })
+            .await
+            .unwrap();
+
+        fx.service.sync_legacy_user_assistants_to_new_tables().await.unwrap();
+
+        let managed_avatar = fx._tmp.path().join("assistant-avatars").join("custom-local-avatar.png");
+        assert_eq!(std::fs::read(&managed_avatar).unwrap(), b"avatar-bytes");
+
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-local-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "user_asset");
+        assert_eq!(definition.avatar_value.as_deref(), Some("custom-local-avatar.png"));
+
+        let listed = fx.service.list().await.unwrap();
+        let assistant = listed
+            .iter()
+            .find(|assistant| assistant.id == "custom-local-avatar")
+            .unwrap();
+        assert!(
+            assistant
+                .avatar
+                .as_deref()
+                .is_some_and(|avatar| avatar.starts_with("/api/assistants/custom-local-avatar/avatar?v="))
+        );
+        let asset = fx.service.avatar_asset("custom-local-avatar").await.unwrap();
+        assert_eq!(asset.bytes, b"avatar-bytes");
+        assert_eq!(asset.extension.as_deref(), Some("png"));
+    }
+
+    #[tokio::test]
+    async fn legacy_user_avatar_path_already_managed_is_preserved() {
+        let fx = fixture().await;
+        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        std::fs::create_dir_all(&managed_avatar_dir).unwrap();
+        let managed_avatar = managed_avatar_dir.join("custom-managed-avatar.jpg");
+        std::fs::write(&managed_avatar, b"managed-avatar-bytes").unwrap();
+        let managed_avatar_value = managed_avatar.to_string_lossy().to_string();
+
+        fx.repo
+            .create(&CreateAssistantParams {
+                id: "custom-managed-avatar",
+                name: "Managed Avatar",
+                description: None,
+                avatar: Some(&managed_avatar_value),
+                enabled_skills: None,
+                custom_skill_names: None,
+                disabled_builtin_skills: None,
+                prompts: None,
+                models: None,
+                name_i18n: None,
+                description_i18n: None,
+                prompts_i18n: None,
+            })
+            .await
+            .unwrap();
+
+        fx.service.sync_legacy_user_assistants_to_new_tables().await.unwrap();
+
+        assert_eq!(std::fs::read(&managed_avatar).unwrap(), b"managed-avatar-bytes");
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-managed-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "user_asset");
+        assert_eq!(definition.avatar_value.as_deref(), Some("custom-managed-avatar.jpg"));
+    }
+
+    #[tokio::test]
+    async fn legacy_sync_does_not_overwrite_existing_definition_avatar() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("custom-existing-definition".into()),
+                name: "Canonical Name".into(),
+                avatar: Some("🙂".into()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let legacy_avatar = fx._tmp.path().join("legacy-avatar.jpg");
+        std::fs::write(&legacy_avatar, b"legacy-avatar-bytes").unwrap();
+        let legacy_avatar_value = legacy_avatar.to_string_lossy().to_string();
+
+        fx.repo
+            .update(
+                "custom-existing-definition",
+                &UpdateAssistantParams {
+                    name: Some("Legacy Name"),
+                    avatar: Some(Some(&legacy_avatar_value)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        fx.service.sync_legacy_user_assistants_to_new_tables().await.unwrap();
+
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-existing-definition")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.name, "Canonical Name");
+        assert_eq!(definition.avatar_type, "emoji");
+        assert_eq!(definition.avatar_value.as_deref(), Some("🙂"));
+        assert_eq!(std::fs::read(&legacy_avatar).unwrap(), b"legacy-avatar-bytes");
+    }
+
+    #[tokio::test]
+    async fn legacy_direct_avatar_url_is_cleared_during_sync() {
+        let fx = fixture().await;
+        fx.repo
+            .create(&CreateAssistantParams {
+                id: "custom-direct-avatar",
+                name: "Direct Avatar",
+                description: None,
+                avatar: Some("data:image/png;base64,abc"),
+                enabled_skills: None,
+                custom_skill_names: None,
+                disabled_builtin_skills: None,
+                prompts: None,
+                models: None,
+                name_i18n: None,
+                description_i18n: None,
+                prompts_i18n: None,
+            })
+            .await
+            .unwrap();
+
+        fx.service.sync_legacy_user_assistants_to_new_tables().await.unwrap();
+
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-direct-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "none");
+        assert_eq!(definition.avatar_value, None);
+
+        let listed = fx.service.list().await.unwrap();
+        let assistant = listed
+            .iter()
+            .find(|assistant| assistant.id == "custom-direct-avatar")
+            .unwrap();
+        assert_eq!(assistant.avatar, None);
+    }
+
+    #[tokio::test]
+    async fn legacy_sync_does_not_delete_existing_avatar_file_for_bad_legacy_avatar() {
+        let fx = fixture().await;
+        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        std::fs::create_dir_all(&managed_avatar_dir).unwrap();
+        let managed_avatar = managed_avatar_dir.join("custom-bad-legacy-avatar.jpg");
+        std::fs::write(&managed_avatar, b"do-not-delete").unwrap();
+
+        fx.repo
+            .create(&CreateAssistantParams {
+                id: "custom-bad-legacy-avatar",
+                name: "Bad Legacy Avatar",
+                description: None,
+                avatar: Some("data:image/png;base64,abc"),
+                enabled_skills: None,
+                custom_skill_names: None,
+                disabled_builtin_skills: None,
+                prompts: None,
+                models: None,
+                name_i18n: None,
+                description_i18n: None,
+                prompts_i18n: None,
+            })
+            .await
+            .unwrap();
+
+        fx.service.sync_legacy_user_assistants_to_new_tables().await.unwrap();
+
+        assert_eq!(std::fs::read(&managed_avatar).unwrap(), b"do-not-delete");
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-bad-legacy-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "none");
+        assert_eq!(definition.avatar_value, None);
+    }
+
+    #[tokio::test]
+    async fn legacy_missing_local_avatar_path_recovers_existing_managed_avatar() {
+        let fx = fixture().await;
+        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        std::fs::create_dir_all(&managed_avatar_dir).unwrap();
+        let managed_avatar = managed_avatar_dir.join("custom-recovered-avatar.png");
+        std::fs::write(&managed_avatar, b"recovered-avatar-bytes").unwrap();
+
+        fx.repo
+            .create(&CreateAssistantParams {
+                id: "custom-recovered-avatar",
+                name: "Recovered Avatar",
+                description: None,
+                avatar: Some("/missing/legacy/custom-recovered-avatar.png"),
+                enabled_skills: None,
+                custom_skill_names: None,
+                disabled_builtin_skills: None,
+                prompts: None,
+                models: None,
+                name_i18n: None,
+                description_i18n: None,
+                prompts_i18n: None,
+            })
+            .await
+            .unwrap();
+
+        fx.service.sync_legacy_user_assistants_to_new_tables().await.unwrap();
+
+        assert_eq!(std::fs::read(&managed_avatar).unwrap(), b"recovered-avatar-bytes");
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-recovered-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "user_asset");
+        assert_eq!(definition.avatar_value.as_deref(), Some("custom-recovered-avatar.png"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_repairs_user_asset_local_path_to_managed_filename_when_managed_avatar_exists() {
+        let fx = fixture().await;
+        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        std::fs::create_dir_all(&managed_avatar_dir).unwrap();
+        let managed_avatar = managed_avatar_dir.join("custom-definition-recovered.jpg");
+
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("custom-definition-recovered".into()),
+                name: "Definition Recovered".into(),
+                avatar: Some("🙂".into()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let mut definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-definition-recovered")
+            .await
+            .unwrap()
+            .unwrap();
+        definition.avatar_type = "user_asset".into();
+        definition.avatar_value = Some("/missing/legacy/custom-definition-recovered.jpg".into());
+        fx.definition_repo
+            .upsert(&upsert_params_from_definition(&definition))
+            .await
+            .unwrap();
+        std::fs::write(&managed_avatar, b"definition-recovered-avatar").unwrap();
+
+        fx.service.reconcile_user_avatar_assets().await.unwrap();
+
+        assert_eq!(std::fs::read(&managed_avatar).unwrap(), b"definition-recovered-avatar");
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-definition-recovered")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "user_asset");
+        assert_eq!(
+            definition.avatar_value.as_deref(),
+            Some("custom-definition-recovered.jpg")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_clears_user_asset_local_path_to_no_avatar_when_managed_avatar_is_missing() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("custom-missing-managed-avatar".into()),
+                name: "Missing Managed Avatar".into(),
+                avatar: Some("🙂".into()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let mut definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-missing-managed-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        definition.avatar_type = "user_asset".into();
+        definition.avatar_value = Some("/missing/legacy/custom-missing-managed-avatar.jpg".into());
+        fx.definition_repo
+            .upsert(&upsert_params_from_definition(&definition))
+            .await
+            .unwrap();
+
+        fx.service.reconcile_user_avatar_assets().await.unwrap();
+
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-missing-managed-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "none");
+        assert_eq!(definition.avatar_value, None);
+    }
+
+    #[tokio::test]
+    async fn reconcile_clears_deleted_user_asset_local_path_without_restoring_definition() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("custom-deleted-missing-managed-avatar".into()),
+                name: "Deleted Missing Managed Avatar".into(),
+                avatar: Some("🙂".into()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let mut definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-deleted-missing-managed-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        definition.avatar_type = "user_asset".into();
+        definition.avatar_value = Some("/missing/legacy/custom-deleted-missing-managed-avatar.jpg".into());
+        fx.definition_repo
+            .upsert(&upsert_params_from_definition(&definition))
+            .await
+            .unwrap();
+        fx.definition_repo
+            .soft_delete(&definition.id, 1_782_267_601_569)
+            .await
+            .unwrap();
+
+        fx.service.reconcile_user_avatar_assets().await.unwrap();
+
+        assert!(
+            fx.definition_repo
+                .get_by_assistant_id("custom-deleted-missing-managed-avatar")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id_including_deleted("custom-deleted-missing-managed-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.deleted_at, Some(1_782_267_601_569));
+        assert_eq!(definition.avatar_type, "none");
+        assert_eq!(definition.avatar_value, None);
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_non_user_asset_local_path_value_unchanged() {
+        let fx = fixture().await;
+        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        std::fs::create_dir_all(&managed_avatar_dir).unwrap();
+        let managed_avatar = managed_avatar_dir.join("custom-non-user-asset.jpg");
+        std::fs::write(&managed_avatar, b"non-user-asset-avatar").unwrap();
+
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("custom-non-user-asset".into()),
+                name: "Non User Asset".into(),
+                avatar: Some("🙂".into()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let mut definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-non-user-asset")
+            .await
+            .unwrap()
+            .unwrap();
+        definition.avatar_type = "emoji".into();
+        definition.avatar_value = Some("/missing/legacy/custom-non-user-asset.jpg".into());
+        fx.definition_repo
+            .upsert(&upsert_params_from_definition(&definition))
+            .await
+            .unwrap();
+
+        fx.service.reconcile_user_avatar_assets().await.unwrap();
+
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-non-user-asset")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "emoji");
+        assert_eq!(
+            definition.avatar_value.as_deref(),
+            Some("/missing/legacy/custom-non-user-asset.jpg")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_repairs_empty_user_asset_value_to_managed_filename() {
+        let fx = fixture().await;
+        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        std::fs::create_dir_all(&managed_avatar_dir).unwrap();
+        let managed_avatar = managed_avatar_dir.join("custom-empty-user-asset.png");
+
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("custom-empty-user-asset".into()),
+                name: "Empty User Asset".into(),
+                avatar: Some("🙂".into()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let mut definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-empty-user-asset")
+            .await
+            .unwrap()
+            .unwrap();
+        definition.avatar_type = "user_asset".into();
+        definition.avatar_value = None;
+        fx.definition_repo
+            .upsert(&upsert_params_from_definition(&definition))
+            .await
+            .unwrap();
+        std::fs::write(&managed_avatar, b"empty-user-asset-avatar").unwrap();
+
+        fx.service.reconcile_user_avatar_assets().await.unwrap();
+
+        assert_eq!(std::fs::read(&managed_avatar).unwrap(), b"empty-user-asset-avatar");
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-empty-user-asset")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "user_asset");
+        assert_eq!(definition.avatar_value.as_deref(), Some("custom-empty-user-asset.png"));
+    }
+
+    #[tokio::test]
+    async fn avatar_asset_does_not_fallback_to_id_scanned_file_without_managed_value() {
+        let fx = fixture().await;
+        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        std::fs::create_dir_all(&managed_avatar_dir).unwrap();
+        let managed_avatar = managed_avatar_dir.join("custom-no-avatar-value.png");
+        std::fs::write(&managed_avatar, b"must-not-be-used-without-db-value").unwrap();
+
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("custom-no-avatar-value".into()),
+                name: "No Avatar Value".into(),
+                avatar: Some("🙂".into()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let mut definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-no-avatar-value")
+            .await
+            .unwrap()
+            .unwrap();
+        definition.avatar_type = "user_asset".into();
+        definition.avatar_value = None;
+        fx.definition_repo
+            .upsert(&upsert_params_from_definition(&definition))
+            .await
+            .unwrap();
+
+        assert!(fx.service.avatar_asset("custom-no-avatar-value").await.is_none());
+        let assistant = fx.service.get("custom-no-avatar-value").await.unwrap();
+        assert_eq!(assistant.avatar, None);
     }
 
     #[tokio::test]
@@ -3178,6 +3904,149 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AssistantError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_direct_avatar_urls() {
+        let fx = fixture().await;
+        for avatar in ["data:image/png;base64,abc", "https://example.invalid/avatar.png"] {
+            let err = fx
+                .service
+                .create(CreateAssistantRequest {
+                    id: Some(format!(
+                        "custom-{avatar}",
+                        avatar = avatar.split(':').next().unwrap_or("avatar")
+                    )),
+                    name: "A".into(),
+                    avatar: Some(avatar.into()),
+                    ..req_default()
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AssistantError::BadRequest(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn update_user_accepts_absolute_backend_builtin_avatar_route() {
+        let fx = fixture_with_builtins(vec![mk_builtin_with_avatar(
+            "builtin-avatar-source",
+            "Builtin Avatar Source",
+            "avatars/builtin-source.png",
+        )])
+        .await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("custom-absolute-builtin-avatar".into()),
+                name: "Custom Absolute Builtin Avatar".into(),
+                avatar: Some("🙂".into()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        fx.service
+            .update(
+                "custom-absolute-builtin-avatar",
+                UpdateAssistantRequest {
+                    avatar: Some("http://127.0.0.1:49194/api/assistants/builtin-avatar-source/avatar".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-absolute-builtin-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "user_asset");
+        assert_eq!(
+            definition.avatar_value.as_deref(),
+            Some("custom-absolute-builtin-avatar.png")
+        );
+        assert!(
+            fx._tmp
+                .path()
+                .join("assistant-avatars/custom-absolute-builtin-avatar.png")
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_user_with_local_avatar_stores_managed_filename_in_definition() {
+        let fx = fixture().await;
+        let source_avatar = fx._tmp.path().join("uploaded-avatar.png");
+        std::fs::write(&source_avatar, b"uploaded-avatar-bytes").unwrap();
+
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("custom-uploaded-avatar".into()),
+                name: "Uploaded Avatar".into(),
+                avatar: Some(source_avatar.to_string_lossy().to_string()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        let managed_avatar = fx
+            ._tmp
+            .path()
+            .join("assistant-avatars")
+            .join("custom-uploaded-avatar.png");
+        assert_eq!(std::fs::read(&managed_avatar).unwrap(), b"uploaded-avatar-bytes");
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-uploaded-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "user_asset");
+        assert_eq!(definition.avatar_value.as_deref(), Some("custom-uploaded-avatar.png"));
+    }
+
+    #[tokio::test]
+    async fn update_user_with_local_avatar_stores_managed_filename_in_definition() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("custom-updated-avatar".into()),
+                name: "Updated Avatar".into(),
+                avatar: Some("🙂".into()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let source_avatar = fx._tmp.path().join("updated-avatar.jpg");
+        std::fs::write(&source_avatar, b"updated-avatar-bytes").unwrap();
+
+        fx.service
+            .update(
+                "custom-updated-avatar",
+                UpdateAssistantRequest {
+                    avatar: Some(source_avatar.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let managed_avatar = fx
+            ._tmp
+            .path()
+            .join("assistant-avatars")
+            .join("custom-updated-avatar.jpg");
+        assert_eq!(std::fs::read(&managed_avatar).unwrap(), b"updated-avatar-bytes");
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("custom-updated-avatar")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.avatar_type, "user_asset");
+        assert_eq!(definition.avatar_value.as_deref(), Some("custom-updated-avatar.jpg"));
     }
 
     #[tokio::test]

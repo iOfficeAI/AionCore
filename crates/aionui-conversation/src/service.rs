@@ -19,12 +19,13 @@ use aionui_api_types::{
     ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
     SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
     TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    assistant_avatar_response_value, assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
     PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
 };
-use aionui_db::models::{ConversationRow, MessageRow};
+use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -42,8 +43,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::convert::{
     TOOL_CONTENT_COMPACT_THRESHOLD_BYTES, row_to_artifact_response, row_to_message_response,
-    row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item,
-    snapshot_to_assistant_identity, string_to_enum,
+    row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
 use crate::session_context::SessionContextBuilder;
@@ -594,15 +594,61 @@ impl ConversationService {
         }
 
         if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(&response.id).await? {
-            let runtime_backend = self
-                .resolve_assistant_agent_binding(&snapshot.agent_id)
-                .await?
-                .map(|binding| binding.runtime_backend)
-                .unwrap_or_else(|| snapshot.agent_id.clone());
-            response.assistant = Some(snapshot_to_assistant_identity(&snapshot, &runtime_backend));
+            response.assistant = Some(self.assistant_identity_from_snapshot(&snapshot).await?);
         }
 
         Ok(())
+    }
+
+    async fn assistant_identity_from_snapshot(
+        &self,
+        snapshot: &ConversationAssistantSnapshotRow,
+    ) -> Result<aionui_api_types::ConversationAssistantIdentityResponse, ConversationError> {
+        let runtime_backend = self
+            .resolve_assistant_agent_binding(&snapshot.agent_id)
+            .await?
+            .map(|binding| binding.runtime_backend)
+            .unwrap_or_else(|| snapshot.agent_id.clone());
+        let current_definition = self.current_assistant_definition(&snapshot.assistant_id).await?;
+        let (source, name, avatar) = match current_definition {
+            Some(definition) => (
+                definition.source,
+                definition.name,
+                assistant_avatar_response_value_with_version(
+                    definition.avatar_type.as_str(),
+                    definition.avatar_value.as_deref(),
+                    definition.assistant_id.as_str(),
+                    definition.updated_at,
+                )
+                .unwrap_or_default(),
+            ),
+            None => (
+                snapshot.assistant_source.clone(),
+                snapshot.assistant_id.clone(),
+                String::new(),
+            ),
+        };
+
+        Ok(aionui_api_types::ConversationAssistantIdentityResponse {
+            id: snapshot.assistant_id.clone(),
+            source,
+            name,
+            avatar,
+            backend: runtime_backend,
+        })
+    }
+
+    async fn current_assistant_definition(
+        &self,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, ConversationError> {
+        let Some(definition_repo) = self.assistant_definition_repo() else {
+            return Ok(None);
+        };
+        definition_repo
+            .get_by_assistant_id(assistant_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))
     }
 
     /// Create a new conversation.
@@ -1054,9 +1100,6 @@ impl ConversationService {
                     assistant_definition_id: &snapshot.assistant_definition_id,
                     assistant_id: &snapshot.assistant_id,
                     assistant_source: &snapshot.assistant_source,
-                    assistant_name: &snapshot.name,
-                    assistant_avatar_type: &snapshot.avatar_type,
-                    assistant_avatar_value: snapshot.avatar.as_deref(),
                     agent_id: &snapshot.agent_id,
                     rules_content: &snapshot.rules.content,
                     default_model_mode: &snapshot.default_modes.model,
@@ -1091,10 +1134,12 @@ impl ConversationService {
                 id: snapshot.assistant_id.clone(),
                 source: snapshot.assistant_source.clone(),
                 name: snapshot.name.clone(),
-                avatar: match snapshot.avatar_type.as_str() {
-                    "builtin_asset" | "user_asset" => format!("/api/assistants/{}/avatar", snapshot.assistant_id),
-                    _ => snapshot.avatar.clone().unwrap_or_default(),
-                },
+                avatar: assistant_avatar_response_value(
+                    snapshot.avatar_type.as_str(),
+                    snapshot.avatar.as_deref(),
+                    snapshot.assistant_id.as_str(),
+                )
+                .unwrap_or_default(),
                 backend: snapshot.runtime_backend.clone(),
             });
         }
@@ -1448,9 +1493,6 @@ impl ConversationService {
                 assistant_definition_id: &snapshot.assistant_definition_id,
                 assistant_id: &snapshot.assistant_id,
                 assistant_source: &snapshot.assistant_source,
-                assistant_name: &snapshot.assistant_name,
-                assistant_avatar_type: &snapshot.assistant_avatar_type,
-                assistant_avatar_value: snapshot.assistant_avatar_value.as_deref(),
                 agent_id: &snapshot.agent_id,
                 rules_content: &snapshot.rules_content,
                 default_model_mode: &snapshot.default_model_mode,

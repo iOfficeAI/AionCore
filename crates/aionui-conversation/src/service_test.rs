@@ -362,9 +362,6 @@ impl IConversationRepository for MockRepo {
             assistant_definition_id: params.assistant_definition_id.to_owned(),
             assistant_id: params.assistant_id.to_owned(),
             assistant_source: params.assistant_source.to_owned(),
-            assistant_name: params.assistant_name.to_owned(),
-            assistant_avatar_type: params.assistant_avatar_type.to_owned(),
-            assistant_avatar_value: params.assistant_avatar_value.map(ToOwned::to_owned),
             agent_id: params.agent_id.to_owned(),
             rules_content: params.rules_content.to_owned(),
             default_model_mode: params.default_model_mode.to_owned(),
@@ -5868,6 +5865,209 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             avatar: "🤖".into(),
             backend: "codex".into(),
         })
+    );
+}
+
+#[tokio::test]
+async fn existing_conversation_reads_current_assistant_identity() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, state_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+    let workspace = ensure_test_workspace_path();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: "asstdef_live_identity",
+            assistant_id: "live-identity",
+            source: "user",
+            owner_type: "user",
+            source_ref: Some("live-identity"),
+            source_version: None,
+            source_hash: None,
+            name: "Old Name",
+            name_i18n: "{}",
+            description: None,
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🤖"),
+            agent_id: "claude",
+            rule_resource_type: "none",
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_live_identity",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "assistant": { "id": "live-identity" },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
+        },
+    }))
+    .unwrap();
+    let created = svc.create("user-1", req).await.unwrap();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: "asstdef_live_identity",
+            assistant_id: "live-identity",
+            source: "user",
+            owner_type: "user",
+            source_ref: Some("live-identity"),
+            source_version: None,
+            source_hash: None,
+            name: "New Name",
+            name_i18n: "{}",
+            description: None,
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🧪"),
+            agent_id: "claude",
+            rule_resource_type: "none",
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let fetched = svc.get("user-1", &created.id).await.unwrap();
+    assert_eq!(
+        fetched.assistant,
+        Some(aionui_api_types::ConversationAssistantIdentityResponse {
+            id: "live-identity".into(),
+            source: "user".into(),
+            name: "New Name".into(),
+            avatar: "🧪".into(),
+            backend: "claude".into(),
+        })
+    );
+
+    let listed = svc
+        .list(
+            "user-1",
+            ListConversationsQuery {
+                cursor: None,
+                limit: Some(20),
+                source: None,
+                cron_job_id: None,
+                pinned: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.items[0].assistant, fetched.assistant);
+}
+
+#[tokio::test]
+async fn create_routes_asset_avatar_in_assistant_identity_through_backend() {
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, state_repo, _preference_repo) =
+        make_service_with_assistant_support(Arc::new(FixedSkillResolver { names: vec![] }), dispatcher).await;
+    let workspace = ensure_test_workspace_path();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: "asstdef_data_avatar",
+            assistant_id: "custom-data-avatar",
+            source: "user",
+            owner_type: "user",
+            source_ref: Some("custom-data-avatar"),
+            source_version: None,
+            source_hash: None,
+            name: "Data Avatar",
+            name_i18n: "{}",
+            description: None,
+            description_i18n: "{}",
+            avatar_type: "user_asset",
+            avatar_value: Some("data:image/svg+xml;base64,PHN2Zy8+"),
+            agent_id: "claude",
+            rule_resource_type: "none",
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_data_avatar",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "assistant": { "id": "custom-data-avatar" },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
+        },
+    }))
+    .unwrap();
+
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(
+        resp.assistant.as_ref().map(|assistant| assistant.avatar.as_str()),
+        Some("/api/assistants/custom-data-avatar/avatar")
     );
 }
 

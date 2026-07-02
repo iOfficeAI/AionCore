@@ -1122,6 +1122,21 @@ impl CronService {
             .or(extra_assistant_id)
             .or(legacy_assistant_id)
             .or(fallback_assistant_id);
+        let assistant_name = match assistant_id.as_deref() {
+            Some(assistant_id) => match self.resolve_assistant_name(Some(assistant_id)).await {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        conversation_id = %row.id,
+                        assistant_id,
+                        error = %err,
+                        "Failed to resolve assistant name for cron agent config"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
         let snapshot_backend = match assistant_snapshot.as_ref() {
             Some(snapshot) => match self.runtime_backend_for_agent_id(snapshot.agent_id.trim()).await {
                 Ok(value) => Some(value).filter(|value| !value.is_empty()),
@@ -1170,10 +1185,7 @@ impl CronService {
             .full_auto_mode_id(Some(backend.as_str()))
             .to_owned();
         let agent_config = aionui_api_types::CronAgentConfigWriteDto {
-            name: assistant_snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.assistant_name.trim().to_owned())
-                .filter(|value| !value.is_empty())
+            name: assistant_name
                 .or_else(|| get_string(&extra, &["agent_name", "agentName"]))
                 .unwrap_or_else(|| row.name.clone()),
             cli_path: get_string(&extra, &["cli_path", "cliPath"]).or_else(|| {
@@ -1256,6 +1268,19 @@ impl CronService {
             .unwrap_or(definition.agent_id.as_str());
 
         Ok(Some(self.runtime_backend_for_agent_id(effective_agent_id).await?))
+    }
+
+    async fn resolve_assistant_name(&self, assistant_id: Option<&str>) -> Result<Option<String>, CronError> {
+        let Some(assistant_id) = assistant_id.filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+
+        Ok(self
+            .assistant_definition_repo
+            .get_by_assistant_id(assistant_id)
+            .await?
+            .map(|definition| definition.name.trim().to_owned())
+            .filter(|value| !value.is_empty()))
     }
 
     async fn resolve_assistant_id_for_agent_label(&self, agent_label: &str) -> Option<String> {

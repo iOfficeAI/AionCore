@@ -124,6 +124,7 @@ async fn get_avatar(State(state): State<AssistantRouterState>, Path(id): Path<St
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(asset.bytes))
         .map_err(|e| ApiError::Internal(e.to_string()))
 }
