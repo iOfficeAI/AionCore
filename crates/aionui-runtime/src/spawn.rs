@@ -268,7 +268,7 @@ fn shell_wrap_windows_script(program: &OsStr) -> Option<ProgramPlan> {
     if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
         return Some(ProgramPlan {
             program: "cmd".into(),
-            args_prefix: vec!["/c".into(), program.into()],
+            args_prefix: vec!["/d".into(), "/c".into(), program.into()],
         });
     }
 
@@ -524,6 +524,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                OsString::from("/d"),
                 OsString::from("/c"),
                 OsString::from(r"C:\Users\me\AppData\Roaming\npm\opencode.cmd"),
                 OsString::from("run"),
@@ -540,6 +541,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                OsString::from("/d"),
                 OsString::from("/c"),
                 OsString::from(r"C:\Users\me\AppData\Roaming\npm\opencode.bat"),
                 OsString::from("--version"),
