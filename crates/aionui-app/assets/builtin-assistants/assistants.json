@@ -3,6 +3,8 @@
   "assistants": [
     {
       "id": "word-creator",
+      "sort_order": 10,
+      "default_enabled": false,
       "name": "Word Creator",
       "name_i18n": {
         "en-US": "Word Creator",
@@ -56,6 +58,8 @@
     },
     {
       "id": "ppt-creator",
+      "sort_order": 20,
+      "default_enabled": false,
       "name": "PPT Creator",
       "name_i18n": {
         "en-US": "PPT Creator",
@@ -109,6 +113,8 @@
     },
     {
       "id": "excel-creator",
+      "sort_order": 30,
+      "default_enabled": false,
       "name": "Excel Creator",
       "name_i18n": {
         "en-US": "Excel Creator",
@@ -162,6 +168,8 @@
     },
     {
       "id": "morph-ppt",
+      "sort_order": 90,
+      "default_enabled": false,
       "name": "Morph PPT",
       "name_i18n": {
         "en-US": "Morph PPT",
@@ -215,6 +223,8 @@
     },
     {
       "id": "morph-ppt-3d",
+      "sort_order": 100,
+      "default_enabled": false,
       "name": "3D Morph PPT",
       "name_i18n": {
         "en-US": "3D Morph PPT",
@@ -255,6 +265,8 @@
     },
     {
       "id": "pitch-deck-creator",
+      "sort_order": 80,
+      "default_enabled": false,
       "name": "Pitch Deck Creator",
       "name_i18n": {
         "en-US": "Pitch Deck Creator",
@@ -308,6 +320,8 @@
     },
     {
       "id": "dashboard-creator",
+      "sort_order": 50,
+      "default_enabled": false,
       "name": "Dashboard Creator",
       "name_i18n": {
         "en-US": "Dashboard Creator",
@@ -361,6 +375,8 @@
     },
     {
       "id": "academic-paper",
+      "sort_order": 70,
+      "default_enabled": false,
       "name": "Academic Paper",
       "name_i18n": {
         "en-US": "Academic Paper",
@@ -414,6 +430,8 @@
     },
     {
       "id": "financial-model-creator",
+      "sort_order": 60,
+      "default_enabled": false,
       "name": "Financial Model Creator",
       "name_i18n": {
         "en-US": "Financial Model Creator",
@@ -467,6 +485,8 @@
     },
     {
       "id": "openclaw-setup",
+      "sort_order": 170,
+      "default_enabled": false,
       "name": "OpenClaw Setup Expert",
       "name_i18n": {
         "en-US": "OpenClaw Setup Expert",
@@ -521,6 +541,8 @@
     },
     {
       "id": "cowork",
+      "sort_order": 160,
+      "default_enabled": false,
       "name": "Cowork",
       "name_i18n": {
         "en-US": "Cowork",
@@ -578,6 +600,8 @@
     },
     {
       "id": "game-3d",
+      "sort_order": 130,
+      "default_enabled": false,
       "name": "3D Game",
       "name_i18n": {
         "en-US": "3D Game",
@@ -629,6 +653,8 @@
     },
     {
       "id": "ui-ux-pro-max",
+      "sort_order": 120,
+      "default_enabled": false,
       "name": "UI/UX Pro Max",
       "name_i18n": {
         "en-US": "UI/UX Pro Max",
@@ -680,6 +706,8 @@
     },
     {
       "id": "planning-with-files",
+      "sort_order": 150,
+      "default_enabled": false,
       "name": "Planning with Files",
       "name_i18n": {
         "en-US": "Planning with Files",
@@ -731,6 +759,8 @@
     },
     {
       "id": "human-3-coach",
+      "sort_order": 190,
+      "default_enabled": false,
       "name": "HUMAN 3.0 Coach",
       "name_i18n": {
         "en-US": "HUMAN 3.0 Coach",
@@ -782,6 +812,8 @@
     },
     {
       "id": "social-job-publisher",
+      "sort_order": 180,
+      "default_enabled": false,
       "name": "Social Job Publisher",
       "name_i18n": {
         "en-US": "Social Job Publisher",
@@ -836,6 +868,8 @@
     },
     {
       "id": "moltbook",
+      "sort_order": 200,
+      "default_enabled": false,
       "name": "moltbook",
       "name_i18n": {
         "en-US": "moltbook",
@@ -889,6 +923,8 @@
     },
     {
       "id": "beautiful-mermaid",
+      "sort_order": 110,
+      "default_enabled": false,
       "name": "Beautiful Mermaid",
       "name_i18n": {
         "en-US": "Beautiful Mermaid",
@@ -942,6 +978,8 @@
     },
     {
       "id": "story-roleplay",
+      "sort_order": 140,
+      "default_enabled": false,
       "name": "Story Roleplay",
       "name_i18n": {
         "en-US": "Story Roleplay",
@@ -995,6 +1033,8 @@
     },
     {
       "id": "word-form-creator",
+      "sort_order": 40,
+      "default_enabled": false,
       "name": "Word Form Creator",
       "name_i18n": {
         "en-US": "Word Form Creator",
@@ -1048,6 +1088,8 @@
     },
     {
       "id": "aionui-assistant",
+      "sort_order": 0,
+      "default_enabled": true,
       "name": "AionUi Butler",
       "name_i18n": {
         "en-US": "AionUi Butler",
