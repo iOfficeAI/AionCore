@@ -206,8 +206,8 @@ async fn import_limits_route_returns_server_configured_limits() {
 
     let body: ApiResponse<SkillImportLimitsResponse> = body_json(resp).await;
     let limits = body.data.expect("import limits response data");
-    assert_eq!(limits.max_file_bytes, 10 * 1024 * 1024);
-    assert_eq!(limits.max_total_bytes, 50 * 1024 * 1024);
+    assert_eq!(limits.max_file_bytes, 50 * 1024 * 1024);
+    assert_eq!(limits.max_total_bytes, 200 * 1024 * 1024);
 }
 
 #[tokio::test]

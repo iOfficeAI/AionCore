@@ -26,8 +26,8 @@ static BUILTIN_SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../aionu
 /// corpus with an on-disk directory. Consumed by
 /// [`resolve_skill_paths`] when building [`SkillPaths`].
 pub const BUILTIN_SKILLS_ENV_VAR: &str = "AIONUI_BUILTIN_SKILLS_PATH";
-const MAX_SKILL_IMPORT_FILE_BYTES: u64 = 10 * 1024 * 1024;
-const MAX_SKILL_IMPORT_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_SKILL_IMPORT_FILE_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_SKILL_IMPORT_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
 const IMPORT_STAGING_PREFIX: &str = ".import-staging-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
