@@ -977,7 +977,7 @@ impl AcpAgentManager {
     }
 
     /// Pre-open the ACP session without sending a prompt. Called by the
-    /// factory after `AcpAgentManager::build` so `POST /warmup` returns
+    /// factory after `AcpAgentManager::build` so runtime preparation returns
     /// only after the session is ready to accept `set_mode` / `set_model`
     /// / `prompt`. Idempotent — if already opened, returns immediately.
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id))]

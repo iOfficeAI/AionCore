@@ -23,11 +23,11 @@ async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str) ->
     json["data"]["id"].as_str().unwrap().to_owned()
 }
 
-async fn create_and_warmup_conversation(app: &mut axum::Router, token: &str, csrf: &str) -> String {
+async fn create_and_ensure_runtime_conversation(app: &mut axum::Router, token: &str, csrf: &str) -> String {
     let id = create_conversation(app, token, csrf).await;
     let req = json_with_token(
         "POST",
-        &format!("/api/conversations/{id}/warmup"),
+        &format!("/api/conversations/{id}/runtime/ensure"),
         json!(null),
         token,
         csrf,
@@ -55,7 +55,7 @@ async fn config_options_requires_auth() {
 async fn config_options_returns_active_agent_snapshot() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let id = create_and_warmup_conversation(&mut app, &token, &csrf).await;
+    let id = create_and_ensure_runtime_conversation(&mut app, &token, &csrf).await;
 
     let resp = app
         .oneshot(get_with_token(
@@ -115,6 +115,24 @@ async fn runtime_ensure_requires_csrf() {
 }
 
 #[tokio::test]
+async fn legacy_warmup_route_is_removed() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let id = create_conversation(&mut app, &token, &csrf).await;
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{id}/warmup"),
+        json!(null),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn runtime_ensure_recovers_missing_agent_and_returns_config_snapshot() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
@@ -142,7 +160,7 @@ async fn runtime_ensure_recovers_missing_agent_and_returns_config_snapshot() {
 async fn runtime_ensure_uses_existing_agent_without_recovery() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let id = create_and_warmup_conversation(&mut app, &token, &csrf).await;
+    let id = create_and_ensure_runtime_conversation(&mut app, &token, &csrf).await;
 
     let req = json_with_token(
         "POST",
@@ -164,7 +182,7 @@ async fn runtime_ensure_uses_existing_agent_without_recovery() {
 async fn set_config_option_requires_csrf() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let id = create_and_warmup_conversation(&mut app, &token, &csrf).await;
+    let id = create_and_ensure_runtime_conversation(&mut app, &token, &csrf).await;
 
     let req = Request::builder()
         .method("PUT")
@@ -186,7 +204,7 @@ async fn set_config_option_requires_csrf() {
 async fn set_config_option_returns_observed_confirmation() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let id = create_and_warmup_conversation(&mut app, &token, &csrf).await;
+    let id = create_and_ensure_runtime_conversation(&mut app, &token, &csrf).await;
 
     let req = json_with_token(
         "PUT",
@@ -207,7 +225,7 @@ async fn set_config_option_returns_observed_confirmation() {
 async fn old_mode_and_model_routes_are_removed() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let id = create_and_warmup_conversation(&mut app, &token, &csrf).await;
+    let id = create_and_ensure_runtime_conversation(&mut app, &token, &csrf).await;
 
     let resp = app
         .clone()

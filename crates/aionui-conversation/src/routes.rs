@@ -104,7 +104,6 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
-        .route("/api/conversations/{id}/warmup", post(warmup))
         .route("/api/conversations/{id}/runtime/ensure", post(ensure_runtime))
         .route("/api/conversations/{id}/active-lease", post(active_lease))
         // Confirmation system
@@ -304,19 +303,6 @@ async fn cancel(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(response)))
-}
-
-async fn warmup(
-    State(state): State<ConversationRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state
-        .service
-        .warmup(&user.id, &id, &state.task_manager)
-        .await
-        .map_err(ApiError::from)?;
-    Ok(Json(ApiResponse::success()))
 }
 
 async fn ensure_runtime(

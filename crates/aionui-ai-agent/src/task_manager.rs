@@ -37,7 +37,7 @@ pub trait IWorkerTaskManager: Send + Sync {
     /// Concurrent callers with the same `conversation_id` block on a shared
     /// [`OnceCell`] so the factory runs at most once per conversation —
     /// avoiding the race where two concurrent HTTP requests (e.g.
-    /// `/messages` + `/warmup`) would each spawn their own CLI process and
+    /// `/messages` + `/runtime/ensure`) would each spawn their own CLI process and
     /// ACP connection, with one of them leaking.
     async fn get_or_build_task(
         &self,

@@ -186,7 +186,7 @@ async fn run_event_loop(
 
             match execute_turn(&ctx, &input).await {
                 Some(turn) => finalize_turn(&ctx, turn, &input).await,
-                None => break, // Turn not started (guard/warmup); retry on next signal
+                None => break, // Turn not started (guard/runtime preparation); retry on next signal
             }
         }
     }

@@ -478,14 +478,14 @@ async fn stop_stream_with_mock_agent() {
 }
 
 #[tokio::test]
-async fn warmup_with_mock_agent() {
+async fn runtime_ensure_with_mock_agent() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
-    let conv_id = create_conversation(&mut app, &token, &csrf, "Warmup Test").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Runtime Ensure Test").await;
 
     let req = json_with_token(
         "POST",
-        &format!("/api/conversations/{conv_id}/warmup"),
+        &format!("/api/conversations/{conv_id}/runtime/ensure"),
         json!({}),
         &token,
         &csrf,

@@ -154,7 +154,7 @@ pub(super) async fn build(
         arc.set_session_id(sid).await;
     }
 
-    // Open the ACP session eagerly so `POST /warmup` returns only after
+    // Open the ACP session eagerly so runtime preparation returns only after
     // session/new (or claude-meta-resume / session/load) and the first
     // reconcile pass have completed. Matches aionrs factory behaviour:
     // the caller sees "warmed up" == "ready for PUT /mode | /model".
