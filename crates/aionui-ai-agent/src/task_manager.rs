@@ -173,6 +173,22 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             if let Some(agent) = slot.get() {
                 return agent.kill_and_wait(reason);
             }
+            return Box::pin(async move {
+                match slot
+                    .get_or_try_init(|| async { Err(AgentError::internal("task slot removed before initialization")) })
+                    .await
+                {
+                    Ok(agent) => agent.clone().kill_and_wait(reason).await,
+                    Err(error) => {
+                        debug!(
+                            conversation_id = %id,
+                            ?reason,
+                            error = %ErrorChain(&error),
+                            "Kill requested for task slot that did not finish initialization"
+                        );
+                    }
+                }
+            });
         }
         Box::pin(std::future::ready(()))
     }
@@ -283,6 +299,7 @@ mod tests {
         workspace: String,
         status: Option<ConversationStatus>,
         last_activity: AtomicI64,
+        killed: Arc<std::sync::atomic::AtomicUsize>,
         event_tx: broadcast::Sender<AgentStreamEvent>,
     }
 
@@ -295,8 +312,14 @@ mod tests {
                 workspace: "/tmp/test".to_owned(),
                 status,
                 last_activity: AtomicI64::new(now_ms()),
+                killed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 event_tx,
             }
+        }
+
+        fn with_kill_counter(mut self, killed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            self.killed = killed;
+            self
         }
 
         fn with_agent_type(mut self, t: AgentType) -> Self {
@@ -340,6 +363,7 @@ mod tests {
             Ok(())
         }
         fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            self.killed.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -519,6 +543,57 @@ mod tests {
         let h = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
         assert_eq!(h.conversation_id(), "conv-1");
         assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn kill_and_wait_waits_for_in_flight_build_and_kills_result() {
+        let build_started = Arc::new(tokio::sync::Notify::new());
+        let release_build = Arc::new(tokio::sync::Notify::new());
+        let killed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let factory: AgentFactory = Arc::new({
+            let build_started = Arc::clone(&build_started);
+            let release_build = Arc::clone(&release_build);
+            let killed = Arc::clone(&killed);
+            move |opts: BuildTaskOptions| {
+                let build_started = Arc::clone(&build_started);
+                let release_build = Arc::clone(&release_build);
+                let killed = Arc::clone(&killed);
+                async move {
+                    build_started.notify_one();
+                    release_build.notified().await;
+                    Ok(mock_instance(
+                        MockAgent::new(opts.conversation_id(), None).with_kill_counter(killed),
+                    ))
+                }
+                .boxed()
+            }
+        });
+        let mgr = Arc::new(WorkerTaskManagerImpl::new(factory));
+
+        let build = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_build_task("conv-1", make_options("conv-1")).await })
+        };
+        build_started.notified().await;
+
+        let wait = mgr.kill_and_wait("conv-1", Some(AgentKillReason::TeamMcpRebuild));
+        let wait_task = tokio::spawn(async move {
+            wait.await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !wait_task.is_finished(),
+            "kill_and_wait must wait for the in-flight build before returning"
+        );
+
+        release_build.notify_one();
+        build.await.unwrap().unwrap();
+        wait_task.await.unwrap();
+
+        assert_eq!(killed.load(Ordering::SeqCst), 1);
+        assert_eq!(mgr.active_count(), 0);
     }
 
     #[tokio::test]

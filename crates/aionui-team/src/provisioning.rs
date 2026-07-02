@@ -336,7 +336,9 @@ impl TeamAgentProvisioner {
     ) -> Result<(), TeamError> {
         let team_id = mcp_stdio_cfg.team_id.clone();
         self.write_team_mcp_runtime_config(agent, mcp_stdio_cfg).await?;
-        let _ = task_manager.kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild));
+        task_manager
+            .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
+            .await;
         self.conversation_port
             .warmup_agent_process(user_id, &agent.conversation_id, task_manager)
             .await
@@ -579,5 +581,319 @@ impl TeamAgentProvisioner {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aionui_ai_agent::types::BuildTaskOptions;
+    use aionui_ai_agent::{AgentError, AgentInstance};
+    use aionui_db::models::{
+        AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, Provider, UpdateAgentAvailabilitySnapshotParams,
+        UpdateAgentHandshakeParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
+        UpsertAssistantOverlayParams,
+    };
+    use aionui_db::{CreateProviderParams, DbError, UpdateProviderParams};
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    struct RecordingProvisioningPort {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl TeamConversationProvisioningPort for RecordingProvisioningPort {
+        async fn create_team_conversation(
+            &self,
+            _request: TeamConversationCreateRequest,
+        ) -> Result<TeamConversationCreateResult, TeamError> {
+            Err(TeamError::InvalidRequest("unused".into()))
+        }
+
+        async fn conversation_workspace(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+            Ok(None)
+        }
+
+        async fn conversation_assistant_id(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+            Ok(None)
+        }
+
+        async fn create_team_temp_workspace(&self, _team_id: &str) -> Result<String, TeamError> {
+            Err(TeamError::InvalidRequest("unused".into()))
+        }
+
+        async fn patch_runtime_config(
+            &self,
+            _conversation_id: &str,
+            _patch: serde_json::Value,
+        ) -> Result<(), TeamError> {
+            self.events.lock().unwrap().push("patch");
+            Ok(())
+        }
+
+        async fn save_acp_runtime_mode(&self, _conversation_id: &str, _mode: &str) -> Result<(), TeamError> {
+            Ok(())
+        }
+
+        async fn warmup_agent_process(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _task_manager: &Arc<dyn IWorkerTaskManager>,
+        ) -> Result<(), TeamError> {
+            self.events.lock().unwrap().push("warmup");
+            Ok(())
+        }
+
+        async fn delete_team_conversation(&self, _user_id: &str, _conversation_id: &str) -> Result<(), TeamError> {
+            Ok(())
+        }
+    }
+
+    struct BlockingKillTaskManager {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        kill_started: Arc<Notify>,
+        release_kill: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl IWorkerTaskManager for BlockingKillTaskManager {
+        fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+            None
+        }
+
+        async fn get_or_build_task(
+            &self,
+            _conversation_id: &str,
+            _options: BuildTaskOptions,
+        ) -> Result<AgentInstance, AgentError> {
+            Err(AgentError::internal("unused"))
+        }
+
+        fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            self.events.lock().unwrap().push("kill_sync");
+            self.kill_started.notify_one();
+            Ok(())
+        }
+
+        fn kill_and_wait(
+            &self,
+            _conversation_id: &str,
+            _reason: Option<AgentKillReason>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let events = Arc::clone(&self.events);
+            let kill_started = Arc::clone(&self.kill_started);
+            let release_kill = Arc::clone(&self.release_kill);
+            Box::pin(async move {
+                events.lock().unwrap().push("kill_wait_start");
+                kill_started.notify_one();
+                release_kill.notified().await;
+                events.lock().unwrap().push("kill_wait_done");
+            })
+        }
+
+        async fn clear(&self) {}
+
+        fn active_count(&self) -> usize {
+            0
+        }
+
+        fn collect_idle(&self, _idle_threshold_ms: aionui_common::TimestampMs) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    struct UnusedAgentMetadataRepo;
+
+    #[async_trait]
+    impl IAgentMetadataRepository for UnusedAgentMetadataRepo {
+        async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
+            Ok(Vec::new())
+        }
+        async fn get(&self, _id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+        async fn find_by_source_and_name(
+            &self,
+            _agent_source: &str,
+            _name: &str,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+        async fn find_builtin_by_backend(&self, _backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+        async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
+            Err(DbError::Init("unused".into()))
+        }
+        async fn apply_handshake(
+            &self,
+            _id: &str,
+            _params: &UpdateAgentHandshakeParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+        async fn update_availability_snapshot(
+            &self,
+            _id: &str,
+            _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+        async fn update_agent_overrides(
+            &self,
+            _id: &str,
+            _command_override: Option<&str>,
+            _env_override: Option<&str>,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
+            Ok(false)
+        }
+        async fn delete(&self, _id: &str) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    struct UnusedAssistantDefinitionRepo;
+
+    #[async_trait]
+    impl IAssistantDefinitionRepository for UnusedAssistantDefinitionRepo {
+        async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+            Ok(Vec::new())
+        }
+        async fn get_by_assistant_id(&self, _assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(None)
+        }
+        async fn get_by_id(&self, _id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(None)
+        }
+        async fn get_by_source_ref(
+            &self,
+            _source: &str,
+            _source_ref: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(None)
+        }
+        async fn upsert(
+            &self,
+            _params: &UpsertAssistantDefinitionParams<'_>,
+        ) -> Result<AssistantDefinitionRow, DbError> {
+            Err(DbError::Init("unused".into()))
+        }
+        async fn soft_delete(&self, _id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    struct UnusedAssistantOverlayRepo;
+
+    #[async_trait]
+    impl IAssistantOverlayRepository for UnusedAssistantOverlayRepo {
+        async fn get(&self, _assistant_definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+            Ok(None)
+        }
+        async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
+            Ok(Vec::new())
+        }
+        async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
+            Err(DbError::Init("unused".into()))
+        }
+        async fn delete(&self, _assistant_definition_id: &str) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    struct EmptyProviderRepo;
+
+    #[async_trait]
+    impl IProviderRepository for EmptyProviderRepo {
+        async fn list(&self) -> Result<Vec<Provider>, DbError> {
+            Ok(Vec::new())
+        }
+        async fn find_by_id(&self, _id: &str) -> Result<Option<Provider>, DbError> {
+            Ok(None)
+        }
+        async fn create(&self, _params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
+            Err(DbError::Init("unused".into()))
+        }
+        async fn update(&self, _id: &str, _params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+            Err(DbError::Init("unused".into()))
+        }
+        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
+    fn test_provisioner(events: Arc<Mutex<Vec<&'static str>>>) -> TeamAgentProvisioner {
+        TeamAgentProvisioner::new(
+            Arc::new(crate::test_utils::MockTeamRepo::new()),
+            Arc::new(UnusedAgentMetadataRepo),
+            Arc::new(UnusedAssistantDefinitionRepo),
+            Arc::new(UnusedAssistantOverlayRepo),
+            Arc::new(EmptyProviderRepo),
+            Arc::new(RecordingProvisioningPort { events }),
+        )
+    }
+
+    fn test_agent() -> TeamAgent {
+        TeamAgent {
+            slot_id: "slot-1".into(),
+            name: "Agent".into(),
+            role: TeammateRole::Teammate,
+            conversation_id: "conv-1".into(),
+            backend: "claude".into(),
+            model: "sonnet".into(),
+            assistant_id: None,
+            status: None,
+            conversation_type: None,
+            cli_path: None,
+        }
+    }
+
+    fn test_mcp_config() -> TeamMcpStdioConfig {
+        TeamMcpStdioConfig {
+            team_id: "team-1".into(),
+            port: 12345,
+            token: "token".into(),
+            slot_id: "slot-1".into(),
+            binary_path: "/tmp/aioncore".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_agent_process_waits_for_kill_before_warmup() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let kill_started = Arc::new(Notify::new());
+        let release_kill = Arc::new(Notify::new());
+        let provisioner = test_provisioner(Arc::clone(&events));
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(BlockingKillTaskManager {
+            events: Arc::clone(&events),
+            kill_started: Arc::clone(&kill_started),
+            release_kill: Arc::clone(&release_kill),
+        });
+
+        let attach = tokio::spawn(async move {
+            provisioner
+                .attach_agent_process("user-1", &test_agent(), test_mcp_config(), &task_manager)
+                .await
+        });
+        kill_started.notified().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            !events.lock().unwrap().contains(&"warmup"),
+            "agent warmup must wait until the previous task is fully killed"
+        );
+
+        release_kill.notify_one();
+        attach.await.unwrap().unwrap();
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["patch", "kill_wait_start", "kill_wait_done", "warmup"]
+        );
     }
 }

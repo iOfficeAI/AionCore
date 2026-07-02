@@ -474,7 +474,7 @@ impl TeamSessionService {
     /// Flow (mcp.md §4.3):
     /// 1. Start `TeamSession` (opens the MCP TCP server).
     /// 2. For each agent: persist `team_mcp_stdio_config` into
-    ///    `conversation.extra` → `task_manager.kill(conv_id, TeamMcpRebuild)`
+    ///    `conversation.extra` → `task_manager.kill_and_wait(conv_id, TeamMcpRebuild)`
     ///    → `TeamConversationProvisioningPort::warmup_agent_process(...)`
     ///    rebuilds the ACP process with
     ///    the new extra.
