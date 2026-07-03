@@ -364,7 +364,10 @@ impl AssistantService {
             .filter(|row| {
                 row.enabled
                     && row.agent_type.supports_new_conversation()
-                    && matches!(row.status, AgentManagementStatus::Online)
+                    && matches!(
+                        row.status,
+                        AgentManagementStatus::Online | AgentManagementStatus::Unchecked
+                    )
             })
             .collect();
         let missing_generated_count = generated_rows
@@ -2270,7 +2273,12 @@ fn assistant_projection_for_definition(
         agent_status,
         agent_status_message,
         team_selectable: enabled
-            && agent_row.is_some_and(|row| matches!(row.status, AgentManagementStatus::Online) && row.team_capable),
+            && agent_row.is_some_and(|row| {
+                matches!(
+                    row.status,
+                    AgentManagementStatus::Online | AgentManagementStatus::Unchecked
+                ) && row.team_capable
+            }),
         team_block_reason,
         deletable: matches!(source, AssistantSource::User),
     }
@@ -3114,6 +3122,36 @@ mod tests {
         assert_eq!(detail.defaults.skills.mode, "fixed");
         assert!(detail.defaults.skills.value.is_empty());
         assert!(detail.capabilities.default_disabled_builtin_skill_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_materializes_generated_assistant_from_unchecked_agent() {
+        let mut unchecked_row = mk_agent_row(
+            "agent-cursor",
+            "cursor",
+            aionui_api_types::AgentManagementStatus::Unchecked,
+        );
+        unchecked_row.last_check_status = None;
+        unchecked_row.last_check_kind = None;
+        unchecked_row.last_check_at = None;
+        unchecked_row.last_success_at = None;
+
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![unchecked_row],
+            ..Default::default()
+        })
+        .await;
+
+        let list = fx.service.list().await.unwrap();
+        let bare = list
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-cursor")
+            .expect("unchecked agent should be selectable as a generated assistant");
+        assert_eq!(bare.source, AssistantSource::Generated);
+        assert_eq!(bare.agent_id, "agent-cursor");
+        assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Unchecked);
+        assert!(bare.team_selectable);
+        assert!(bare.agent_status_message.is_none());
     }
 
     #[tokio::test]

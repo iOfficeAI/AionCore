@@ -37,8 +37,8 @@ pub use message_projection::{
 };
 pub use ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback, AgentTurnStatus, TeamConversationBindingLookup,
-    TeamConversationLookupPort,
+    AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback, AgentTurnStatus, TeamAssistantCatalogEntry,
+    TeamAssistantCatalogPort, TeamConversationBindingLookup, TeamConversationLookupPort,
 };
 
 pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};

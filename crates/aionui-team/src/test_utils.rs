@@ -221,7 +221,8 @@ pub(crate) mod workspace_harness {
 
     use crate::ports::{
         AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-        AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
+        AgentTurnStarted, AgentTurnStatus, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
+        TeamConversationBindingLookup, TeamConversationLookupPort,
     };
     use crate::provisioning::{
         TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationProvisioningPort,
@@ -717,6 +718,15 @@ pub(crate) mod workspace_harness {
 
     struct EmptyAgentMetadataRepo;
 
+    struct EmptyTeamAssistantCatalog;
+
+    #[async_trait]
+    impl TeamAssistantCatalogPort for EmptyTeamAssistantCatalog {
+        async fn list_team_selectable_assistants(&self) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
+            Ok(Vec::new())
+        }
+    }
+
     #[async_trait]
     impl IAgentMetadataRepository for EmptyAgentMetadataRepo {
         async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
@@ -921,6 +931,7 @@ pub(crate) mod workspace_harness {
         let svc = TeamSessionService::new(
             team_repo_dyn,
             Arc::new(EmptyAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
             Arc::new(EmptyAssistantDefinitionRepo),
             Arc::new(EmptyAssistantOverlayRepo),
             Arc::new(EmptyProviderRepo),

@@ -2,9 +2,12 @@ mod common;
 
 use aionui_db::{IConversationRepository, MessagePageDirection, MessagePageParams};
 use axum::http::StatusCode;
-use serde_json::json;
+use serde_json::{Value, json};
+use tokio::net::TcpStream;
 use tower::ServiceExt;
 
+use aionui_api_types::TeamMcpStdioConfig;
+use aionui_team::mcp::protocol::{read_frame, write_frame};
 use common::{
     body_json, build_app, build_app_with_mock_agents, delete_with_token, get_request, get_with_token, json_with_token,
     setup_and_login,
@@ -59,6 +62,56 @@ async fn create_team(app: &mut axum::Router, token: &str, csrf: &str) -> serde_j
     let json = body_json(resp).await;
     assert!(json["success"].as_bool().unwrap());
     json["data"].clone()
+}
+
+async fn mcp_send(stream: &mut TcpStream, req: &Value) {
+    let bytes = serde_json::to_vec(req).unwrap();
+    write_frame(stream, &bytes).await.unwrap();
+}
+
+async fn mcp_recv(stream: &mut TcpStream) -> Value {
+    let frame = read_frame(stream).await.unwrap();
+    serde_json::from_slice(&frame).unwrap()
+}
+
+async fn mcp_connect(port: u16, auth_token: &str, slot_id: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("tcp connect to TeamMcpServer");
+    let init_req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "auth_token": auth_token,
+            "slot_id": slot_id,
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "app-team-e2e", "version": "0.1" }
+        }
+    });
+    mcp_send(&mut stream, &init_req).await;
+    let resp = mcp_recv(&mut stream).await;
+    assert!(
+        resp["result"]["serverInfo"]["name"].is_string(),
+        "initialize failed: {resp}"
+    );
+    stream
+}
+
+async fn mcp_call_tool(stream: &mut TcpStream, id: u64, tool: &str, args: Value) -> Value {
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": tool, "arguments": args }
+    });
+    mcp_send(stream, &req).await;
+    mcp_recv(stream).await
+}
+
+fn mcp_text(resp: &Value) -> &str {
+    resp["result"]["content"][0]["text"].as_str().unwrap_or("")
 }
 
 // ===========================================================================
@@ -890,6 +943,88 @@ async fn es1_ensure_session() {
     );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_team(&mut app, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let lead = &data["assistants"][0];
+    let lead_conversation_id = lead["conversation_id"].as_str().unwrap();
+    let lead_slot_id = lead["slot_id"].as_str().unwrap();
+
+    let assistants_resp = app
+        .clone()
+        .oneshot(get_with_token("/api/assistants", &token))
+        .await
+        .unwrap();
+    assert_eq!(assistants_resp.status(), StatusCode::OK);
+    let assistants_body = body_json(assistants_resp).await;
+    let mut expected_ids: Vec<String> = assistants_body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|assistant| assistant["team_selectable"].as_bool().unwrap_or(false))
+        .filter(|assistant| assistant["agent"].is_object())
+        .map(|assistant| assistant["id"].as_str().unwrap().to_owned())
+        .collect();
+    expected_ids.sort();
+    assert!(
+        !expected_ids.is_empty(),
+        "fixture must expose at least one team-selectable assistant via /api/assistants: {assistants_body}"
+    );
+    assert!(
+        expected_ids.contains(&DEFAULT_TEAM_ASSISTANT_ID.to_owned()),
+        "seeded team assistant must be team-selectable in assistant projection: {assistants_body}"
+    );
+
+    let ensure_req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/session"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let ensure_resp = app.clone().oneshot(ensure_req).await.unwrap();
+    assert_eq!(ensure_resp.status(), StatusCode::OK);
+
+    let lead_conversation = services
+        .conversation_repo
+        .get(lead_conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let extra: Value = serde_json::from_str(&lead_conversation.extra).unwrap();
+    let mcp_config: TeamMcpStdioConfig =
+        serde_json::from_value(extra["team_mcp_stdio_config"].clone()).expect("team mcp config");
+    assert_eq!(mcp_config.slot_id, lead_slot_id);
+
+    let mut stream = mcp_connect(mcp_config.port, &mcp_config.token, &mcp_config.slot_id).await;
+    let list_resp = mcp_call_tool(&mut stream, 2, "team_list_assistants", json!({})).await;
+    assert!(
+        !list_resp["result"]["isError"].as_bool().unwrap_or(false),
+        "team_list_assistants failed: {list_resp}"
+    );
+    let list_body: Value = serde_json::from_str(mcp_text(&list_resp)).expect("team_list_assistants JSON");
+    let mut runtime_ids: Vec<String> = list_body["assistants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|assistant| assistant["assistant_id"].as_str().unwrap().to_owned())
+        .collect();
+    runtime_ids.sort();
+
+    assert_eq!(
+        runtime_ids, expected_ids,
+        "Team MCP runtime assistant list must match /api/assistants team_selectable projection"
+    );
+
+    let stop_req = delete_with_token(&format!("/api/teams/{team_id}/session"), &token, &csrf);
+    let stop_resp = app.oneshot(stop_req).await.unwrap();
+    assert_eq!(stop_resp.status(), StatusCode::OK);
 }
 
 // ES-2: Ensure session is idempotent

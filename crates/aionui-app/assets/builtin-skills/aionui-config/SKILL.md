@@ -115,7 +115,7 @@ Key fields in the create/update body:
 | Field | Meaning |
 | --- | --- |
 | `name`, `description` | display text (required: name) |
-| `agent_id` | **engine binding** — the id of an installed agent (see "Picking the engine" below). This, not `preset_agent_type`, is what actually sets the engine |
+| `agent_id` | **engine binding** — the id of an agent row from `/api/agents/management` (see "Picking the engine" below). This, not `preset_agent_type`, is what actually sets the engine |
 | `preset_agent_type` | display/i18n hint only; does **not** bind the engine in the current backend |
 | `prompts` | quick-start prompts shown on the assistant (NOT the system prompt) |
 | `avatar` | emoji, image URL, `data:` URI, or absolute local path |
@@ -133,8 +133,8 @@ Key fields in the create/update body:
 ### Picking the engine (`agent_id`)
 
 The engine is bound by the request-body field **`agent_id`**, whose value is an
-installed agent's id — not a friendly name like `"claude"`. Read the available
-agents first and copy the id you want:
+agent row id from `/api/agents/management` — not a friendly name like
+`"claude"`. Read the engine catalog first and copy the id you want:
 
 ```bash
 # the LIST response is flat — each row carries agent_id + agent directly:
@@ -562,16 +562,19 @@ python3 scripts/aionui_api.py get /api/settings/client   # confirm — PUT retur
 
 ## Engines (agents)
 
-`GET /api/agents/management` lists the available engines (`aionrs`, `claude`,
+`GET /api/agents/management` lists the engine catalog (`aionrs`, `claude`,
 `codex`, …). There is **no** bare `GET /api/agents` — that path 404s; always use
 the `/management` sub-path. Each row is rich: alongside `id`, `name`, `enabled`
-(toggled on), `installed` (spawn command resolvable on `$PATH`), `team_capable`
+(toggled on), `installed` (diagnostic spawn-command state), `team_capable`
 (can run in a team), `backend`, `agent_type`, and a `status` of `online` /
 `offline` / `missing` / `unchecked`, it also carries `config_options`,
 `available_modes`, `available_models` (when the engine advertises them), plus
-`last_check_*` diagnostics. `unchecked` means no persisted connectivity check has
-run for that row yet. Check `installed` (and `status`) before binding an
-assistant to that engine (via its `agent_id` — see *Picking the engine* above).
+`last_check_*` diagnostics. Treat `status` as the selection source of truth:
+`online` is verified usable, `unchecked` has not been probed yet and is still
+valid to bind/select, while `missing` and `offline` are known unusable until
+repaired or rechecked. `installed` is legacy/diagnostic; do not use it by itself
+to decide whether an assistant may bind to an engine because startup no longer
+performs full availability probes.
 
 The management row is the supported engine catalog surface. Do not call legacy
 agent refresh endpoints; connectivity checks are explicit per-agent operations.

@@ -42,8 +42,8 @@ use aionui_system::{
     ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService,
 };
 use aionui_team::{
-    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamConversationProvisioningPort, TeamProjectionMessageStore,
-    TeamRouterState, TeamSessionService,
+    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
+    TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState, TeamSessionService,
 };
 
 use crate::config::derive_encryption_key;
@@ -270,7 +270,12 @@ pub async fn build_module_states(
         skill: skill_state,
         channel: channel_state,
         team: build_module_state_phase(&boot, "team", || {
-            build_team_state(services, Some(cron.cron_service.clone()), backend_binary_path.clone())
+            build_team_state(
+                services,
+                Some(cron.cron_service.clone()),
+                backend_binary_path.clone(),
+                assistant.service.clone(),
+            )
         }),
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
@@ -568,7 +573,46 @@ pub fn build_team_state(
     services: &AppServices,
     _cron_service: Option<Arc<aionui_cron::service::CronService>>,
     backend_binary_path: Arc<std::path::PathBuf>,
+    assistant_service: Arc<AssistantService>,
 ) -> TeamRouterState {
+    #[derive(Clone)]
+    struct AssistantServiceTeamCatalog {
+        assistant_service: Arc<AssistantService>,
+    }
+
+    #[async_trait::async_trait]
+    impl TeamAssistantCatalogPort for AssistantServiceTeamCatalog {
+        async fn list_team_selectable_assistants(
+            &self,
+        ) -> Result<Vec<TeamAssistantCatalogEntry>, aionui_team::TeamError> {
+            let assistants = self.assistant_service.list().await.map_err(|error| {
+                aionui_team::TeamError::InvalidRequest(format!("assistant catalog unavailable: {error}"))
+            })?;
+
+            Ok(assistants
+                .into_iter()
+                .filter(|assistant| assistant.team_selectable)
+                .filter_map(|assistant| {
+                    let agent = assistant.agent?;
+                    let backend = agent
+                        .acp_backend
+                        .unwrap_or_else(|| agent.r#type.serde_name().to_owned());
+                    Some(TeamAssistantCatalogEntry {
+                        assistant_id: assistant.id,
+                        name: assistant.name,
+                        backend,
+                        description: assistant.description.unwrap_or_default(),
+                        skills: assistant
+                            .enabled_skills
+                            .into_iter()
+                            .chain(assistant.custom_skill_names)
+                            .collect(),
+                    })
+                })
+                .collect())
+        }
+    }
+
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> = Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
     let conv_service = services.conversation_service.clone();
@@ -585,6 +629,7 @@ pub fn build_team_state(
     let service = TeamSessionService::new(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
+        Arc::new(AssistantServiceTeamCatalog { assistant_service }),
         Arc::new(SqliteAssistantDefinitionRepository::new(
             services.database.pool().clone(),
         )),

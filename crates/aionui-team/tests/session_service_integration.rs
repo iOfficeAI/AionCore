@@ -26,7 +26,8 @@ use aionui_realtime::EventBroadcaster;
 
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
+    AgentTurnStarted, AgentTurnStatus, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
+    TeamConversationBindingLookup, TeamConversationLookupPort,
 };
 use aionui_team::session::SpawnAgentRequest;
 use aionui_team::{
@@ -1086,6 +1087,15 @@ fn test_acp_build_options(conversation_id: String, workspace: String) -> BuildTa
     })
 }
 
+struct EmptyTeamAssistantCatalog;
+
+#[async_trait::async_trait]
+impl TeamAssistantCatalogPort for EmptyTeamAssistantCatalog {
+    async fn list_team_selectable_assistants(&self) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
+        Ok(Vec::new())
+    }
+}
+
 struct EmptyProviderRepo;
 
 #[async_trait::async_trait]
@@ -1274,6 +1284,7 @@ fn setup_with_factory_metadata_team_repo_and_conversation_repo(
     let svc = TeamSessionService::new(
         team_repo_dyn,
         agent_metadata_repo,
+        Arc::new(EmptyTeamAssistantCatalog),
         Arc::new(EmptyAssistantDefinitionRepo),
         Arc::new(EmptyAssistantOverlayRepo),
         provider_repo,
@@ -1313,6 +1324,7 @@ fn setup_with_factory_metadata_assistants_and_conversation_repo(
     let svc = TeamSessionService::new(
         team_repo_dyn,
         agent_metadata_repo,
+        Arc::new(EmptyTeamAssistantCatalog),
         assistant_definition_repo,
         assistant_overlay_repo,
         provider_repo,
@@ -1368,6 +1380,7 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
     let svc = TeamSessionService::new(
         team_repo_dyn,
         agent_metadata_repo,
+        Arc::new(EmptyTeamAssistantCatalog),
         assistant_definition_repo,
         assistant_overlay_repo,
         provider_repo,
@@ -1402,6 +1415,7 @@ fn setup_with_recording_turn_port() -> (
     let svc = TeamSessionService::new(
         team_repo_dyn,
         Arc::new(StubAgentMetadataRepo::empty()),
+        Arc::new(EmptyTeamAssistantCatalog),
         Arc::new(EmptyAssistantDefinitionRepo),
         Arc::new(EmptyAssistantOverlayRepo),
         provider_repo,
@@ -1603,6 +1617,7 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
     let svc = TeamSessionService::new(
         team_repo,
         agent_metadata_repo,
+        Arc::new(EmptyTeamAssistantCatalog),
         Arc::new(EmptyAssistantDefinitionRepo),
         Arc::new(EmptyAssistantOverlayRepo),
         provider_repo,
