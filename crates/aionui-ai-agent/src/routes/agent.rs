@@ -5,7 +5,6 @@
 //! Endpoints:
 //!
 //! - `GET  /api/agents/management` — list diagnostics-first agent rows
-//! - `POST /api/agents/refresh` — refresh agent list (e.g. after new agent is added to the system)
 //! - `POST /api/agents/custom/try-connect` — test custom agent configuration (e.g. ACP connection)
 
 use axum::Router;
@@ -28,7 +27,6 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
     Router::new()
         .route("/api/agents/logos", get(list_agent_logos))
         .route("/api/agents/management", get(list_management_agents))
-        .route("/api/agents/refresh", post(refresh_agents))
         .route("/api/agents/{id}/health-check", post(health_check_by_id))
         .route("/api/agents/provider-health-check", post(provider_health_check))
         .route("/api/agents/{id}/enabled", patch(set_agent_enabled))
@@ -40,15 +38,6 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
         .route("/api/agents/custom/{id}", put(update_custom).delete(delete_custom))
         .route("/api/agents/custom/try-connect", post(try_connect_custom))
         .with_state(state)
-}
-
-async fn refresh_agents(
-    State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-) -> Result<Json<ApiResponse<Vec<AgentMetadata>>>, ApiError> {
-    Ok(Json(ApiResponse::ok(
-        state.service.refresh_agents().await.map_err(agent_error_to_api_error)?,
-    )))
 }
 
 async fn list_agent_logos(

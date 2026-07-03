@@ -107,8 +107,8 @@ impl AgentService {
         if !removed {
             return Err(AgentError::not_found(format!("Agent '{id}' not found")));
         }
-        if let Err(err) = self.registry().invalidate_and_rehydrate().await {
-            warn!(agent_id = %id, error = %err, "registry rehydrate failed after delete_custom_agent");
+        if let Err(err) = self.registry().reload_one(id).await {
+            warn!(agent_id = %id, error = %err, "registry reload failed after delete_custom_agent");
         }
         Ok(())
     }
@@ -123,8 +123,8 @@ impl AgentService {
         if !updated {
             return Err(AgentError::not_found(format!("Agent '{id}' not found")));
         }
-        if let Err(err) = self.registry().invalidate_and_rehydrate().await {
-            warn!(agent_id = %id, error = %err, "registry rehydrate failed after set_agent_enabled");
+        if let Err(err) = self.registry().reload_one(id).await {
+            warn!(agent_id = %id, error = %err, "registry reload failed after set_agent_enabled");
         }
         self.registry()
             .get(id)
@@ -195,9 +195,9 @@ impl AgentService {
             .map_err(|e| AgentError::internal(format!("repo.upsert: {e}")))?;
 
         self.registry()
-            .invalidate_and_rehydrate()
+            .reload_one(id)
             .await
-            .map_err(|e| AgentError::internal(format!("registry rehydrate: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("registry reload: {e}")))?;
 
         self.registry()
             .get(id)

@@ -268,3 +268,91 @@ async fn manual_health_check_does_not_refresh_unrelated_agents() {
         "single-agent health check should not refresh unrelated agents"
     );
 }
+
+#[tokio::test]
+async fn custom_enabled_toggle_does_not_refresh_unrelated_agents() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let unrelated_path = temp.path().join("unrelated-agent-command");
+    std::fs::write(&unrelated_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let unrelated_command = unrelated_path.to_string_lossy().to_string();
+    let unrelated_source_info = serde_json::json!({ "binary_name": unrelated_command }).to_string();
+
+    repo.upsert(&custom_params(
+        "agent-unrelated",
+        "Unrelated Agent",
+        &unrelated_command,
+        &unrelated_source_info,
+    ))
+    .await
+    .unwrap();
+    repo.upsert(&custom_params(
+        "agent-target-toggle",
+        "Target Toggle Agent",
+        "aionui-target-toggle-command",
+        r#"{"binary_name":"aionui-target-toggle-command"}"#,
+    ))
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+    std::fs::remove_file(&unrelated_path).unwrap();
+
+    let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
+    service.set_agent_enabled("agent-target-toggle", false).await.unwrap();
+
+    let rows = registry.list_management_rows().await;
+    let unrelated = rows.iter().find(|row| row.id == "agent-unrelated").unwrap();
+
+    assert_eq!(unrelated.status, AgentManagementStatus::Online);
+    assert!(
+        unrelated.installed,
+        "custom enabled toggle should not refresh unrelated agents"
+    );
+}
+
+#[tokio::test]
+async fn custom_delete_does_not_refresh_unrelated_agents() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let unrelated_path = temp.path().join("unrelated-agent-command");
+    std::fs::write(&unrelated_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let unrelated_command = unrelated_path.to_string_lossy().to_string();
+    let unrelated_source_info = serde_json::json!({ "binary_name": unrelated_command }).to_string();
+
+    repo.upsert(&custom_params(
+        "agent-unrelated",
+        "Unrelated Agent",
+        &unrelated_command,
+        &unrelated_source_info,
+    ))
+    .await
+    .unwrap();
+    repo.upsert(&custom_params(
+        "agent-target-delete",
+        "Target Delete Agent",
+        "aionui-target-delete-command",
+        r#"{"binary_name":"aionui-target-delete-command"}"#,
+    ))
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+    std::fs::remove_file(&unrelated_path).unwrap();
+
+    let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
+    service.delete_custom_agent("agent-target-delete").await.unwrap();
+
+    let rows = registry.list_management_rows().await;
+    let unrelated = rows.iter().find(|row| row.id == "agent-unrelated").unwrap();
+
+    assert_eq!(unrelated.status, AgentManagementStatus::Online);
+    assert!(unrelated.installed, "custom delete should not refresh unrelated agents");
+    assert!(rows.iter().all(|row| row.id != "agent-target-delete"));
+}

@@ -572,12 +572,8 @@ the `/management` sub-path. Each row is rich: alongside `id`, `name`, `enabled`
 diagnostics. Check `installed` (and `status`) before binding an assistant to that
 engine (via its `agent_id` — see *Picking the engine* above).
 
-> What the management row does **not** carry is the rest of the engine
-> `handshake` — `agent_capabilities`, `auth_methods`, `available_commands`. For
-> those, `POST /api/agents/refresh` re-scans agents and returns each one's full
-> metadata (`available` + `handshake`). The at-a-glance modes/models are already
-> on the management row; reach for `refresh` when you need capabilities, auth
-> methods, or the command list.
+The management row is the supported engine catalog surface. Do not call legacy
+agent refresh endpoints; connectivity checks are explicit per-agent operations.
 
 ---
 

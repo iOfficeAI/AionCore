@@ -264,7 +264,8 @@ async fn management_endpoint_keeps_deprecated_runtime_rows_for_diagnostics() {
     ] {
         upsert_visible_agent_metadata(&services, id, agent_type).await;
     }
-    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
 
     let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -402,7 +403,8 @@ async fn agent_logos_endpoint_includes_disabled_and_missing_rows() {
         })
         .await
         .unwrap();
-    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
 
     let req = get_with_token("/api/agents/logos", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -624,7 +626,8 @@ async fn agent_overrides_roundtrip_and_management_summary() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
     upsert_visible_agent_metadata(&services, "ovr-agent", "acp").await;
-    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
 
     // PUT overrides
     let body = json!({
@@ -672,7 +675,8 @@ async fn internal_aion_cli_rejects_overrides() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
     upsert_visible_agent_metadata(&services, "632f31d2", "aionrs").await;
-    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
 
     let command_body = json!({
         "command_override": "irm https://claude.ai/install.ps1 | iex",

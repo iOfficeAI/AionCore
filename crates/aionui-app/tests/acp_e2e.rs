@@ -1,6 +1,6 @@
 //! E2E integration tests for ACP management routes.
 //!
-//! Tests cover: agents list, agents/refresh, agents/test,
+//! Tests cover: agents list, legacy agents/refresh removal, agents/test,
 //! and session-bound routes (mode/model).
 
 mod common;
@@ -35,17 +35,13 @@ async fn management_list_returns_array() {
 }
 
 #[tokio::test]
-async fn refresh_agents_returns_array() {
+async fn legacy_refresh_agents_endpoint_is_not_found() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
     let req = json_with_token("POST", "/api/agents/refresh", json!({}), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = body_json(resp).await;
-    assert_eq!(body["success"], true);
-    assert!(body["data"].is_array());
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -106,7 +102,8 @@ async fn management_list_includes_missing_custom_agents() {
     })
     .await
     .unwrap();
-    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
 
     let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -172,7 +169,8 @@ async fn management_list_marks_rows_with_unavailable_snapshot() {
     )
     .await
     .unwrap();
-    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
 
     let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -232,7 +230,8 @@ async fn health_check_by_id_returns_missing_status_for_uninstalled_agent() {
     })
     .await
     .unwrap();
-    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
 
     let req = json_with_token(
         "POST",

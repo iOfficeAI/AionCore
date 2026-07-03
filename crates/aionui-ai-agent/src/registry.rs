@@ -264,19 +264,6 @@ impl AgentRegistry {
         Ok(Some(meta))
     }
 
-    /// Refetch every row from the repository, then re-resolve PATH.
-    ///
-    /// Called after any mutation that changed the set of rows on disk
-    /// (create/delete) or the spawn command of an existing row
-    /// (update). Pure refresh with no DB writes — just rebuilds the
-    /// in-memory snapshot so `list_all()` and `get()` return the latest
-    /// catalog state without waiting for the next process restart.
-    pub async fn invalidate_and_rehydrate(&self) -> Result<(), AgentError> {
-        self.hydrate().await?;
-        self.refresh_availability().await;
-        Ok(())
-    }
-
     pub async fn get(&self, id: &str) -> Option<AgentMetadata> {
         self.by_id.read().await.get(id).cloned()
     }
