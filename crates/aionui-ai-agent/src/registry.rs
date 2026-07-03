@@ -59,6 +59,7 @@ mod registry_tests;
 pub struct AgentRegistry {
     repo: Arc<dyn IAgentMetadataRepository>,
     by_id: RwLock<HashMap<String, AgentMetadata>>,
+    unavailable_reasons: RwLock<HashMap<String, UnavailableReason>>,
     /// MPSC sender shared with every forwarder in every `AcpAgentManager`.
     /// Draining happens in a single background task owned by this
     /// registry, so DB writes for the same (id, field) serialize.
@@ -71,6 +72,7 @@ impl AgentRegistry {
         let this = Arc::new(Self {
             repo,
             by_id: RwLock::new(HashMap::new()),
+            unavailable_reasons: RwLock::new(HashMap::new()),
             catalog_tx: tx,
         });
 
@@ -144,10 +146,20 @@ impl AgentRegistry {
             return Ok(());
         };
 
-        if let Some((meta, _)) = decode_row(row) {
+        if let Some((meta, reason)) = decode_row(row) {
+            self.update_cached_unavailable_reason(&meta.id, reason).await;
             self.by_id.write().await.insert(meta.id.clone(), meta);
         }
         Ok(())
+    }
+
+    async fn update_cached_unavailable_reason(&self, id: &str, reason: Option<UnavailableReason>) {
+        let mut guard = self.unavailable_reasons.write().await;
+        if let Some(reason) = reason {
+            guard.insert(id.to_owned(), reason);
+        } else {
+            guard.remove(id);
+        }
     }
 }
 
@@ -169,11 +181,15 @@ impl AgentRegistry {
             .map_err(|e| AgentError::internal(format!("load agent_metadata: {e}")))?;
 
         let mut map = HashMap::with_capacity(rows.len());
+        let mut reasons = HashMap::new();
         for row in rows {
             let Some((meta, reason)) = decode_row(row) else {
                 continue;
             };
             log_probe_result(&meta, &reason);
+            if let Some(reason) = reason {
+                reasons.insert(meta.id.clone(), reason);
+            }
             map.insert(meta.id.clone(), meta);
         }
         // Snapshot the summary off the local map before transferring it
@@ -181,6 +197,7 @@ impl AgentRegistry {
         // and we don't want that borrow to outlive the move.
         log_availability_summary(map.values(), "AgentRegistry hydrated");
         *self.by_id.write().await = map;
+        *self.unavailable_reasons.write().await = reasons;
         Ok(())
     }
 
@@ -188,14 +205,43 @@ impl AgentRegistry {
     /// Useful after PATH has changed (e.g. `launchctl setenv`).
     pub async fn refresh_availability(&self) {
         let mut guard = self.by_id.write().await;
+        let mut reasons = HashMap::new();
         for meta in guard.values_mut() {
             let (path, reason) = probe_with_reason(meta);
             meta.resolved_command = path;
             meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(meta);
             let reason = if meta.available { None } else { reason };
             log_probe_result(meta, &reason);
+            if let Some(reason) = reason {
+                reasons.insert(meta.id.clone(), reason);
+            }
         }
         log_availability_summary(guard.values(), "AgentRegistry refresh_availability complete");
+        *self.unavailable_reasons.write().await = reasons;
+    }
+
+    /// Refetch and re-probe one row from the repository, leaving the rest of
+    /// the in-memory availability snapshot untouched.
+    pub async fn reload_one(&self, id: &str) -> Result<Option<AgentMetadata>, AgentError> {
+        let row = self
+            .repo
+            .get(id)
+            .await
+            .map_err(|e| AgentError::internal(format!("load agent_metadata '{id}': {e}")))?;
+        let Some(row) = row else {
+            self.by_id.write().await.remove(id);
+            self.unavailable_reasons.write().await.remove(id);
+            return Ok(None);
+        };
+        let Some((meta, reason)) = decode_row(row) else {
+            self.by_id.write().await.remove(id);
+            self.unavailable_reasons.write().await.remove(id);
+            return Ok(None);
+        };
+        log_probe_result(&meta, &reason);
+        self.update_cached_unavailable_reason(&meta.id, reason).await;
+        self.by_id.write().await.insert(meta.id.clone(), meta.clone());
+        Ok(Some(meta))
     }
 
     /// Refetch every row from the repository, then re-resolve PATH.
@@ -271,6 +317,7 @@ impl AgentRegistry {
     /// Management read model for settings surfaces that need to show
     /// official/custom rows even when unavailable.
     pub async fn list_management_rows(&self) -> Vec<AgentManagementRow> {
+        let reasons = self.unavailable_reasons.read().await.clone();
         let mut rows: Vec<AgentManagementRow> = self
             .by_id
             .read()
@@ -279,7 +326,7 @@ impl AgentRegistry {
             .cloned()
             .map(|meta| {
                 let status = derive_management_status(&meta);
-                let diagnostics = derive_management_diagnostics(&meta, status);
+                let diagnostics = derive_management_diagnostics(&meta, status, reasons.get(&meta.id));
                 let handshake = meta.handshake;
                 AgentManagementRow {
                     id: meta.id,
@@ -325,6 +372,52 @@ impl AgentRegistry {
         rows
     }
 
+    pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
+        let reason = self.unavailable_reasons.read().await.get(id).cloned();
+        let meta = self.by_id.read().await.get(id).cloned()?;
+        let status = derive_management_status(&meta);
+        let diagnostics = derive_management_diagnostics(&meta, status, reason.as_ref());
+        let handshake = meta.handshake.clone();
+        Some(AgentManagementRow {
+            id: meta.id,
+            icon: meta.icon,
+            name: meta.name,
+            name_i18n: meta.name_i18n,
+            description: meta.description,
+            description_i18n: meta.description_i18n,
+            backend: meta.backend,
+            agent_type: meta.agent_type,
+            agent_source: meta.agent_source,
+            agent_source_info: meta.agent_source_info,
+            enabled: meta.enabled,
+            installed: meta.available,
+            command: meta.command,
+            args: meta.args,
+            env: Vec::new(),
+            native_skills_dirs: meta.native_skills_dirs,
+            behavior_policy: meta.behavior_policy,
+            yolo_id: meta.yolo_id,
+            config_options: handshake.config_options.clone(),
+            available_modes: handshake.available_modes.clone(),
+            available_models: handshake.available_models.clone(),
+            sort_order: meta.sort_order,
+            team_capable: meta.team_capable,
+            status,
+            last_check_status: meta.last_check_status,
+            last_check_kind: meta.last_check_kind,
+            last_check_error_code: diagnostics.error_code,
+            last_check_error_message: diagnostics.error_message,
+            last_check_error_details: diagnostics.details,
+            last_check_guidance: diagnostics.guidance,
+            last_check_latency_ms: meta.last_check_latency_ms,
+            last_check_at: meta.last_check_at,
+            last_success_at: meta.last_success_at,
+            last_failure_at: meta.last_failure_at,
+            has_command_override: meta.has_command_override,
+            env_override_key_count: meta.env_override_key_count,
+        })
+    }
+
     /// Like [`Self::list_all_including_hidden`] but pairs every row
     /// with a freshly-computed availability reason so callers (the
     /// `doctor` command, diagnostic UIs) can explain *why* a row is
@@ -338,17 +431,14 @@ impl AgentRegistry {
     /// when `available = true` would just confuse the caller, so we
     /// suppress it here.
     pub async fn diagnostic_snapshot(&self) -> Vec<(AgentMetadata, Option<UnavailableReason>)> {
+        let reasons = self.unavailable_reasons.read().await.clone();
         let mut rows: Vec<(AgentMetadata, Option<UnavailableReason>)> = self
             .by_id
             .read()
             .await
             .values()
             .map(|m| {
-                let reason = if m.available {
-                    None
-                } else {
-                    probe_resolved_command(m).err()
-                };
+                let reason = if m.available { None } else { reasons.get(&m.id).cloned() };
                 (m.clone(), reason)
             })
             .collect();
@@ -663,9 +753,13 @@ struct ManagementDiagnostics {
     guidance: Option<String>,
 }
 
-fn derive_management_diagnostics(meta: &AgentMetadata, status: AgentManagementStatus) -> ManagementDiagnostics {
+fn derive_management_diagnostics(
+    meta: &AgentMetadata,
+    status: AgentManagementStatus,
+    reason: Option<&UnavailableReason>,
+) -> ManagementDiagnostics {
     let derived_reason = if matches!(status, AgentManagementStatus::Missing) {
-        probe_resolved_command(meta).err()
+        reason.cloned()
     } else {
         None
     };

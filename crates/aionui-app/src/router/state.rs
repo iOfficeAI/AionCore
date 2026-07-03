@@ -300,7 +300,6 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
     #[async_trait::async_trait]
     impl AssistantAgentCatalogPort for RegistryAssistantAgentCatalog {
         async fn list_management_agents(&self) -> Result<Vec<aionui_api_types::AgentManagementRow>, AssistantError> {
-            self.registry.refresh_availability().await;
             Ok(self.registry.list_management_rows().await)
         }
     }

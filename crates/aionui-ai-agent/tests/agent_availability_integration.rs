@@ -1,11 +1,18 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::AgentRegistry;
+use aionui_ai_agent::{AgentRegistry, AgentService};
 use aionui_api_types::{AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus};
 use aionui_db::{
-    IAgentMetadataRepository, SqliteAgentMetadataRepository, UpdateAgentAvailabilitySnapshotParams,
-    UpsertAgentMetadataParams, init_database_memory,
+    IAgentMetadataRepository, IProviderRepository, SqliteAgentMetadataRepository, SqliteProviderRepository,
+    UpdateAgentAvailabilitySnapshotParams, UpsertAgentMetadataParams, init_database_memory,
 };
+use aionui_realtime::EventBroadcaster;
+
+struct NoopBroadcaster;
+
+impl EventBroadcaster for NoopBroadcaster {
+    fn broadcast(&self, _msg: aionui_api_types::WebSocketMessage<serde_json::Value>) {}
+}
 
 fn custom_params<'a>(
     id: &'a str,
@@ -39,6 +46,14 @@ fn custom_params<'a>(
         available_commands: None,
         sort_order: 100,
     }
+}
+
+fn agent_service(
+    registry: Arc<AgentRegistry>,
+    provider_repo: Arc<dyn IProviderRepository>,
+    data_dir: std::path::PathBuf,
+) -> Arc<AgentService> {
+    AgentService::new(registry, Arc::new(NoopBroadcaster), provider_repo, [0; 32], data_dir)
 }
 
 #[tokio::test]
@@ -130,4 +145,77 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
     assert_eq!(available.last_check_status, Some(AgentSnapshotCheckStatus::Online));
     assert_eq!(available.last_check_kind, Some(AgentSnapshotCheckKind::Scheduled));
     assert_eq!(available.last_check_latency_ms, Some(120));
+}
+
+#[tokio::test]
+async fn management_list_uses_cached_availability_without_reprobing_path() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let command_path = temp.path().join("cached-agent-command");
+    std::fs::write(&command_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let command = command_path.to_string_lossy().to_string();
+    let source_info = serde_json::json!({ "binary_name": command }).to_string();
+
+    repo.upsert(&custom_params("agent-cached", "Cached Agent", &command, &source_info))
+        .await
+        .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    std::fs::remove_file(&command_path).unwrap();
+
+    let service = agent_service(registry, provider_repo, temp.path().to_path_buf());
+    let rows = service.list_management_agents().await.unwrap();
+    let cached = rows.iter().find(|row| row.id == "agent-cached").unwrap();
+
+    assert_eq!(cached.status, AgentManagementStatus::Online);
+    assert!(cached.installed, "management list should not refresh PATH on read");
+}
+
+#[tokio::test]
+async fn manual_health_check_does_not_refresh_unrelated_agents() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let unrelated_path = temp.path().join("unrelated-agent-command");
+    std::fs::write(&unrelated_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let unrelated_command = unrelated_path.to_string_lossy().to_string();
+    let unrelated_source_info = serde_json::json!({ "binary_name": unrelated_command }).to_string();
+
+    repo.upsert(&custom_params(
+        "agent-unrelated",
+        "Unrelated Agent",
+        &unrelated_command,
+        &unrelated_source_info,
+    ))
+    .await
+    .unwrap();
+    repo.upsert(&custom_params(
+        "agent-target-missing",
+        "Target Missing Agent",
+        "aionui-definitely-missing-health-check-target",
+        r#"{"binary_name":"aionui-definitely-missing-health-check-target"}"#,
+    ))
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+    std::fs::remove_file(&unrelated_path).unwrap();
+
+    let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
+    service.health_check_agent_by_id("agent-target-missing").await.unwrap();
+
+    let rows = registry.list_management_rows().await;
+    let unrelated = rows.iter().find(|row| row.id == "agent-unrelated").unwrap();
+
+    assert_eq!(unrelated.status, AgentManagementStatus::Online);
+    assert!(
+        unrelated.installed,
+        "single-agent health check should not refresh unrelated agents"
+    );
 }

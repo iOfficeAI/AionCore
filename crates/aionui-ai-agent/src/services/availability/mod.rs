@@ -53,17 +53,15 @@ impl AgentAvailabilityService {
     }
 
     pub async fn list_management_rows(&self) -> Vec<AgentManagementRow> {
-        self.registry.refresh_availability().await;
         self.registry.list_management_rows().await
     }
 
     pub async fn run_manual_health_check(&self, id: &str) -> Result<AgentManagementRow, AgentError> {
-        self.registry.invalidate_and_rehydrate().await?;
         let meta = self
             .registry
-            .get(id)
+            .reload_one(id)
             .await
-            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
+            .and_then(|row| row.ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found"))))?;
 
         if !meta.available {
             return self
@@ -113,11 +111,7 @@ impl AgentAvailabilityService {
     }
 
     pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
-        self.registry
-            .list_management_rows()
-            .await
-            .into_iter()
-            .find(|row| row.id == id)
+        self.registry.management_row_by_id(id).await
     }
 
     async fn persist_snapshot(&self, id: &str, snapshot: &AvailabilitySnapshot) -> Result<(), AgentError> {
@@ -156,7 +150,7 @@ impl AgentAvailabilityService {
             .update_availability_snapshot(id, &params)
             .await
             .map_err(|error| AgentError::internal(format!("repo.update_availability_snapshot: {error}")))?;
-        self.registry.invalidate_and_rehydrate().await?;
+        self.registry.reload_one(id).await?;
         Ok(())
     }
 }
