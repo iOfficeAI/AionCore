@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub local: bool,
     /// Dump prompt diagnostics under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,
+    /// Explicitly authorize backup and rebuild for corruption-like local databases.
+    pub recover_corrupted_database: bool,
 }
 
 impl AppConfig {
@@ -49,6 +51,7 @@ impl Default for AppConfig {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             local: false,
             dump_prompts: false,
+            recover_corrupted_database: false,
         }
     }
 }
@@ -73,6 +76,7 @@ mod tests {
         assert_eq!(config.data_dir, PathBuf::from("data"));
         assert_eq!(config.app_version, env!("CARGO_PKG_VERSION"));
         assert!(!config.dump_prompts);
+        assert!(!config.recover_corrupted_database);
     }
 
     #[test]

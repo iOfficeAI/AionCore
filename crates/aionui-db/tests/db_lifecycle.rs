@@ -1,4 +1,6 @@
-use aionui_db::{init_database, init_database_memory, maybe_copy_legacy_database};
+use aionui_db::{
+    DatabaseInitOptions, init_database, init_database_memory, init_database_with_options, maybe_copy_legacy_database,
+};
 use sqlx::Row;
 
 // -- T1.1 Initialization --
@@ -231,7 +233,14 @@ async fn corruption_recovery_creates_backup() {
     // Write invalid content to simulate corruption
     std::fs::write(&path, b"not a valid sqlite database").unwrap();
 
-    let db = init_database(&path).await.unwrap();
+    let db = init_database_with_options(
+        &path,
+        DatabaseInitOptions {
+            recover_corrupted_database: true,
+        },
+    )
+    .await
+    .unwrap();
 
     // Recovered database should work
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
@@ -248,6 +257,24 @@ async fn corruption_recovery_creates_backup() {
     assert!(has_backup, "backup of corrupted file should exist");
 
     db.close().await;
+}
+
+#[tokio::test]
+async fn corruption_without_recovery_authorization_preserves_original_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let original = b"not a valid sqlite database";
+    std::fs::write(&path, original).unwrap();
+
+    let result = init_database(&path).await;
+
+    assert!(result.is_err(), "unconfirmed startup must not rebuild corrupted DB");
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let has_backup = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().contains("backup"));
+    assert!(!has_backup, "unconfirmed startup must not create a backup file");
 }
 
 // -- Directory creation --

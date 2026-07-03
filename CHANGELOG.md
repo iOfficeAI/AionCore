@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.41](https://github.com/iOfficeAI/AionCore/compare/v0.1.40...v0.1.41) (2026-07-02)
+
+
+### Bug Fixes
+
+* **assistant:** normalize avatar storage and identity ([#558](https://github.com/iOfficeAI/AionCore/issues/558)) ([155c278](https://github.com/iOfficeAI/AionCore/commit/155c278b7b603e8bf29e412295cec5ec50bb25fe))
+* **conversation:** derive assistant runtime type from metadata ([#555](https://github.com/iOfficeAI/AionCore/issues/555)) ([236217d](https://github.com/iOfficeAI/AionCore/commit/236217d360ff67d0dcba906f287a34b954cb305d))
+* **conversation:** partition temp workspaces and logs by date ([#560](https://github.com/iOfficeAI/AionCore/issues/560)) ([9bb1f33](https://github.com/iOfficeAI/AionCore/commit/9bb1f333065318c00da73c3a96f7fe92bea38d49))
+* **cron:** apply custom assistant rules in scheduled runs ([#495](https://github.com/iOfficeAI/AionCore/issues/495)) ([3840b77](https://github.com/iOfficeAI/AionCore/commit/3840b77f4f4dc26b58481868507e07e13fb9fbd1))
+* **cron:** lock team cron execution mode ([#562](https://github.com/iOfficeAI/AionCore/issues/562)) ([56f3873](https://github.com/iOfficeAI/AionCore/commit/56f38734844164707782b795627a8d65ff1b3c16))
+* **cron:** route skill scheduling through helper ([#553](https://github.com/iOfficeAI/AionCore/issues/553)) ([c57970f](https://github.com/iOfficeAI/AionCore/commit/c57970fed387ba895dd934f85c4c59af63da6cfa))
+* **database:** require explicit corrupted database recovery ([#563](https://github.com/iOfficeAI/AionCore/issues/563)) ([203bd1b](https://github.com/iOfficeAI/AionCore/commit/203bd1b574438cf730c351879a773a82548b972c))
+* resolve ACP backends from metadata ([#559](https://github.com/iOfficeAI/AionCore/issues/559)) ([6c15bb7](https://github.com/iOfficeAI/AionCore/commit/6c15bb765f8c84baddd89830839c832424ef1789))
+* **runtime:** harden managed Node command resolution ([#565](https://github.com/iOfficeAI/AionCore/issues/565)) ([e69b83a](https://github.com/iOfficeAI/AionCore/commit/e69b83a836b369b4244a04b64f931bea1dd54743))
+* **runtime:** protect active ACP tasks from idle cleanup ([#561](https://github.com/iOfficeAI/AionCore/issues/561)) ([1fa7a54](https://github.com/iOfficeAI/AionCore/commit/1fa7a543e8fd4cec7e423443cbd6299de6a761ad))
+* **skill:** raise import size limits ([#564](https://github.com/iOfficeAI/AionCore/issues/564)) ([50d9aff](https://github.com/iOfficeAI/AionCore/commit/50d9affe53ad64e994564a31215caab428eb7094))
+* **skills:** correct AionUi Butler skill drift against current backend ([#557](https://github.com/iOfficeAI/AionCore/issues/557)) ([41c2c94](https://github.com/iOfficeAI/AionCore/commit/41c2c9426eefb2ce29de4a9f5b4e10c862a63994))
+
 ## [0.1.40](https://github.com/iOfficeAI/AionCore/compare/v0.1.39...v0.1.40) (2026-06-30)
 
 

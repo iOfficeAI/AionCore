@@ -52,6 +52,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub dump_prompts: bool,
 
+    /// Explicitly back up a corruption-like local database and create a fresh database during startup.
+    #[arg(long)]
+    pub recover_corrupted_database: bool,
+
     /// Managed runtime resource source selection.
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,
@@ -255,6 +259,18 @@ mod tests {
     fn dump_prompts_accepts_flag() {
         let cli = Cli::parse_from(["aioncore", "--dump-prompts"]);
         assert!(cli.dump_prompts);
+    }
+
+    #[test]
+    fn recover_corrupted_database_flag_defaults_to_false() {
+        let cli = Cli::parse_from(["aioncore"]);
+        assert!(!cli.recover_corrupted_database);
+    }
+
+    #[test]
+    fn recover_corrupted_database_flag_is_accepted() {
+        let cli = Cli::parse_from(["aioncore", "--recover-corrupted-database"]);
+        assert!(cli.recover_corrupted_database);
     }
 
     #[test]
