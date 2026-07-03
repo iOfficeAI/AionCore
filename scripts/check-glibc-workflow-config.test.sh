@@ -52,6 +52,12 @@ for workflow in "${workflows[@]}"; do
       exit 1
     }
 
+  grep -Fq "docker pull ${arm64_cross_image}" "${workflow}" \
+    || {
+      echo "${workflow} must pre-pull the pinned Linux ARM64 cross image" >&2
+      exit 1
+    }
+
   grep -Fq "matrix.target == 'x86_64-unknown-linux-gnu'" "${workflow}" \
     || {
       echo "${workflow} must verify the Linux x64 GLIBC baseline" >&2
