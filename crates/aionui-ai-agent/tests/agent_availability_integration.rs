@@ -122,6 +122,7 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
 
     let registry = AgentRegistry::new(repo);
     registry.hydrate().await.unwrap();
+    registry.refresh_availability().await;
 
     let rows = registry.list_management_rows().await;
 
@@ -145,6 +146,54 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
     assert_eq!(available.last_check_status, Some(AgentSnapshotCheckStatus::Online));
     assert_eq!(available.last_check_kind, Some(AgentSnapshotCheckKind::Scheduled));
     assert_eq!(available.last_check_latency_ms, Some(120));
+}
+
+#[tokio::test]
+async fn hydrate_uses_persisted_availability_without_reprobing_path() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let command_path = temp.path().join("startup-cached-agent-command");
+    std::fs::write(&command_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let command = command_path.to_string_lossy().to_string();
+    let source_info = serde_json::json!({ "binary_name": command }).to_string();
+
+    repo.upsert(&custom_params(
+        "agent-startup-cached",
+        "Startup Cached Agent",
+        &command,
+        &source_info,
+    ))
+    .await
+    .unwrap();
+    repo.update_availability_snapshot(
+        "agent-startup-cached",
+        &UpdateAgentAvailabilitySnapshotParams {
+            last_check_status: Some("online"),
+            last_check_kind: Some("manual"),
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: Some(42),
+            last_check_at: Some(1_750_000_100_000),
+            last_success_at: Some(1_750_000_100_000),
+            last_failure_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    std::fs::remove_file(&command_path).unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    let rows = registry.list_management_rows().await;
+    let cached = rows.iter().find(|row| row.id == "agent-startup-cached").unwrap();
+
+    assert_eq!(cached.status, AgentManagementStatus::Online);
+    assert!(cached.installed, "startup hydrate should not refresh PATH");
+    assert_eq!(cached.last_check_status, Some(AgentSnapshotCheckStatus::Online));
 }
 
 #[tokio::test]

@@ -197,6 +197,7 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
 
     let registry = AgentRegistry::new(repo);
     registry.hydrate().await.unwrap();
+    registry.refresh_availability().await;
 
     let row = registry
         .list_management_rows()
