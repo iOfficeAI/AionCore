@@ -4,7 +4,11 @@
 //! subscriber registration that should never be invoked from tests or
 //! external consumers of the library.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 
 use chrono::Datelike;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -98,19 +102,7 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards
     let console_layer = fmt::layer().with_target(true).with_filter(build_env_filter(log_level));
 
     // Backend file layer — excludes aion_* targets
-    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_suffix("aioncore.log")
-        .build(&active_log_dir)
-        .map_err(|e| {
-            BootstrapError::new(
-                BootstrapErrorCode::LoggingInitFailed,
-                "logging.appender",
-                LOGGING_INIT_MESSAGE,
-            )
-            .with_source(e)
-            .with_field("logDir", active_log_dir.display().to_string())
-        })?;
+    let file_appender = DailyDatedLogWriter::new(log_dir.to_path_buf(), "aioncore.log");
     let (non_blocking, backend_guard) = tracing_appender::non_blocking(file_appender);
 
     let backend_file_layer = fmt::layer()
@@ -122,20 +114,24 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards
 
     // Aionrs file layer — only aion_* targets
     let aionrs_level = build_aionrs_level(log_level);
-    let aionrs_resolved = aion_config::logging::ResolvedLogging {
-        enabled: true,
-        level: aionrs_level,
-        dir: active_log_dir.clone(),
-    };
-    let (aionrs_layer, aionrs_guard) = aion_config::logging::create_file_layer(&aionrs_resolved).map_err(|e| {
+    let aionrs_filter = EnvFilter::try_new(&aionrs_level).map_err(|e| {
         BootstrapError::new(
             BootstrapErrorCode::LoggingInitFailed,
-            "logging.appender",
+            "logging.filter",
             LOGGING_INIT_MESSAGE,
         )
         .with_source(e)
+        .with_field("filter", aionrs_level.clone())
         .with_field("logDir", active_log_dir.display().to_string())
     })?;
+    let aionrs_appender = DailyDatedLogWriter::new(log_dir.to_path_buf(), "aionrs.log");
+    let (aionrs_non_blocking, aionrs_guard) = tracing_appender::non_blocking(aionrs_appender);
+    let aionrs_layer = fmt::layer()
+        .json()
+        .with_writer(aionrs_non_blocking)
+        .with_ansi(false)
+        .with_target(true)
+        .with_filter(aionrs_filter);
 
     tracing_subscriber::registry()
         .with(console_layer)
@@ -159,11 +155,98 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards
 }
 
 fn dated_log_dir(log_root: &Path) -> PathBuf {
-    let now = chrono::Local::now();
+    dated_log_dir_for(log_root, LogDate::today())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogDate {
+    year: i32,
+    month: u32,
+    day: u32,
+}
+
+impl LogDate {
+    fn today() -> Self {
+        let now = chrono::Local::now();
+        Self {
+            year: now.year(),
+            month: now.month(),
+            day: now.day(),
+        }
+    }
+
+    fn file_name(self, suffix: &str) -> String {
+        format!("{:04}-{:02}-{:02}.{}", self.year, self.month, self.day, suffix)
+    }
+}
+
+fn dated_log_dir_for(log_root: &Path, date: LogDate) -> PathBuf {
     log_root
-        .join(format!("{:04}", now.year()))
-        .join(format!("{:02}", now.month()))
-        .join(format!("{:02}", now.day()))
+        .join(format!("{:04}", date.year))
+        .join(format!("{:02}", date.month))
+        .join(format!("{:02}", date.day))
+}
+
+fn dated_log_file_path(log_root: &Path, date: LogDate, suffix: &str) -> PathBuf {
+    dated_log_dir_for(log_root, date).join(date.file_name(suffix))
+}
+
+struct DailyDatedLogWriter {
+    log_root: PathBuf,
+    filename_suffix: &'static str,
+    date_provider: Box<dyn Fn() -> LogDate + Send + Sync>,
+    active_date: Option<LogDate>,
+    active_file: Option<File>,
+}
+
+impl DailyDatedLogWriter {
+    fn new(log_root: PathBuf, filename_suffix: &'static str) -> Self {
+        Self::new_with_date_provider(log_root, filename_suffix, Box::new(LogDate::today))
+    }
+
+    fn new_with_date_provider(
+        log_root: PathBuf,
+        filename_suffix: &'static str,
+        date_provider: Box<dyn Fn() -> LogDate + Send + Sync>,
+    ) -> Self {
+        Self {
+            log_root,
+            filename_suffix,
+            date_provider,
+            active_date: None,
+            active_file: None,
+        }
+    }
+
+    fn active_file(&mut self) -> io::Result<&mut File> {
+        let date = (self.date_provider)();
+        if self.active_date != Some(date) {
+            let file_path = dated_log_file_path(&self.log_root, date, self.filename_suffix);
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            self.active_file = Some(OpenOptions::new().create(true).append(true).open(file_path)?);
+            self.active_date = Some(date);
+        }
+
+        self.active_file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("log file was not opened"))
+    }
+}
+
+impl Write for DailyDatedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.active_file()?.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(file) = self.active_file.as_mut() {
+            file.flush()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -245,5 +328,42 @@ mod tests {
         assert!(parts[0].chars().all(|ch| ch.is_ascii_digit()));
         assert!(parts[1].chars().all(|ch| ch.is_ascii_digit()));
         assert!(parts[2].chars().all(|ch| ch.is_ascii_digit()));
+    }
+
+    #[test]
+    fn dated_file_writer_moves_new_day_files_into_matching_day_directory() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let first_day = LogDate {
+            year: 2026,
+            month: 7,
+            day: 2,
+        };
+        let second_day = LogDate {
+            year: 2026,
+            month: 7,
+            day: 3,
+        };
+        let days = std::sync::Arc::new(std::sync::Mutex::new(vec![second_day, first_day]));
+        let mut writer = DailyDatedLogWriter::new_with_date_provider(
+            tmp.path().to_path_buf(),
+            "aioncore.log",
+            Box::new({
+                let days = std::sync::Arc::clone(&days);
+                move || days.lock().expect("date queue").pop().expect("date")
+            }),
+        );
+
+        std::io::Write::write_all(&mut writer, b"july 2\n").expect("write first day");
+        std::io::Write::write_all(&mut writer, b"july 3\n").expect("write second day");
+        std::io::Write::flush(&mut writer).expect("flush");
+
+        let first_path = tmp.path().join("2026/07/02/2026-07-02.aioncore.log");
+        let second_path = tmp.path().join("2026/07/03/2026-07-03.aioncore.log");
+        assert_eq!(std::fs::read_to_string(first_path).expect("first day log"), "july 2\n");
+        assert_eq!(
+            std::fs::read_to_string(second_path).expect("second day log"),
+            "july 3\n"
+        );
+        assert!(!tmp.path().join("2026/07/02/2026-07-03.aioncore.log").exists());
     }
 }
