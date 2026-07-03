@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.42](https://github.com/iOfficeAI/AionCore/compare/v0.1.41...v0.1.42) (2026-07-03)
+
+
+### Features
+
+* **assistant:** 官方助手默认关闭 + 固定顺序 + 一次性重置迁移 ([#567](https://github.com/iOfficeAI/AionCore/issues/567)) ([3e30b02](https://github.com/iOfficeAI/AionCore/commit/3e30b02e021642ea116b68abc441bca0b91c60f3))
+
+
+### Bug Fixes
+
+* **agent:** align unchecked availability with team runtime selection ([#571](https://github.com/iOfficeAI/AionCore/issues/571)) ([f80b0ce](https://github.com/iOfficeAI/AionCore/commit/f80b0ceac3b603c3b58e0f1a25feb31a0261f7c8))
+* **agent:** avoid full availability refresh on reads ([#566](https://github.com/iOfficeAI/AionCore/issues/566)) ([1ffb7aa](https://github.com/iOfficeAI/AionCore/commit/1ffb7aa6a0fcb55a4c8966b965133ab0ace9e8b2))
+* **cron:** preserve existing conversation jobs across lifecycle changes ([#572](https://github.com/iOfficeAI/AionCore/issues/572)) ([fa4217a](https://github.com/iOfficeAI/AionCore/commit/fa4217a6d4ba0cde4d4c7d0d5460969b94eb6c4a))
+* **mcp:** support aionrs config path subcommand with legacy fallback ([#568](https://github.com/iOfficeAI/AionCore/issues/568)) ([72cfba1](https://github.com/iOfficeAI/AionCore/commit/72cfba1909d663117615a595316804c7707bdfd3))
+* preserve ACP config catalogs on resume ([#570](https://github.com/iOfficeAI/AionCore/issues/570)) ([a9c1955](https://github.com/iOfficeAI/AionCore/commit/a9c19553bad1da3283f5dfad1972cd1ed1992546))
+* preserve Linux GLIBC baselines ([#573](https://github.com/iOfficeAI/AionCore/issues/573)) ([ab6e227](https://github.com/iOfficeAI/AionCore/commit/ab6e227504c40f78823988d4c10af8fd153cc47c))
+
 ## [0.1.41](https://github.com/iOfficeAI/AionCore/compare/v0.1.40...v0.1.41) (2026-07-02)
 
 
