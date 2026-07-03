@@ -91,6 +91,130 @@ fn config_snapshot_supplements_missing_mode_from_preloaded_catalog_using_desired
 }
 
 #[test]
+fn config_snapshot_keeps_preloaded_mode_catalog_when_resume_load_advertises_empty_modes() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.preload_persisted(&PersistedSessionState {
+        current_mode_id: Some(ModeId::new("full-access")),
+        ..Default::default()
+    });
+    session.preload_advertised_catalogs(
+        Some(SessionModeState::new(
+            "auto",
+            vec![
+                SessionMode::new("read-only", "Read Only"),
+                SessionMode::new("auto", "Default"),
+                SessionMode::new("full-access", "Full Access"),
+            ],
+        )),
+        None,
+    );
+
+    session.apply_advertised_modes(SessionModeState::new("full-access", Vec::new()));
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            "high",
+            vec![SessionConfigSelectOption::new("high", "High")],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+
+    let snapshot = session.config_snapshot();
+    let mode = snapshot_option(&snapshot, "mode");
+    assert_eq!(mode.current_value.as_deref(), Some("full-access"));
+    assert_eq!(mode.options.len(), 3);
+    assert_eq!(
+        resolve_set_path(&snapshot, "mode", "read-only"),
+        Ok(ConfigSetPath::LegacyMode)
+    );
+}
+
+#[test]
+fn persisted_preload_keeps_catalogs_preloaded_from_metadata() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.preload_advertised_catalogs(
+        Some(SessionModeState::new(
+            "auto",
+            vec![
+                SessionMode::new("read-only", "Read Only"),
+                SessionMode::new("auto", "Default"),
+                SessionMode::new("full-access", "Full Access"),
+            ],
+        )),
+        Some(SessionModelState::new(
+            "gpt-5.4",
+            vec![
+                ModelInfo::new("gpt-5.4", "GPT-5.4"),
+                ModelInfo::new("gpt-5.5", "GPT-5.5"),
+            ],
+        )),
+    );
+
+    session.preload_persisted(&PersistedSessionState {
+        current_mode_id: Some(ModeId::new("full-access")),
+        current_model_id: Some(ModelId::new("gpt-5.5")),
+        ..Default::default()
+    });
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            "high",
+            vec![SessionConfigSelectOption::new("high", "High")],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+
+    let snapshot = session.config_snapshot();
+    let mode = snapshot_option(&snapshot, "mode");
+    assert_eq!(mode.current_value.as_deref(), Some("full-access"));
+    assert_eq!(mode.options.len(), 3);
+    let model = snapshot_option(&snapshot, "model");
+    assert_eq!(model.current_value.as_deref(), Some("gpt-5.5"));
+    assert_eq!(model.options.len(), 2);
+}
+
+#[test]
+fn config_snapshot_keeps_preloaded_model_catalog_when_resume_load_advertises_empty_models() {
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.preload_persisted(&PersistedSessionState {
+        current_model_id: Some(ModelId::new("gpt-5.5")),
+        ..Default::default()
+    });
+    session.preload_advertised_catalogs(
+        None,
+        Some(SessionModelState::new(
+            "gpt-5.4",
+            vec![
+                ModelInfo::new("gpt-5.4", "GPT-5.4"),
+                ModelInfo::new("gpt-5.5", "GPT-5.5"),
+            ],
+        )),
+    );
+
+    session.apply_advertised_models(SessionModelState::new("gpt-5.5", Vec::new()));
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            "high",
+            vec![SessionConfigSelectOption::new("high", "High")],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+    ]);
+
+    let snapshot = session.config_snapshot();
+    let model = snapshot_option(&snapshot, "model");
+    assert_eq!(model.current_value.as_deref(), Some("gpt-5.5"));
+    assert_eq!(model.options.len(), 2);
+    assert_eq!(
+        resolve_set_path(&snapshot, "model", "gpt-5.4"),
+        Ok(ConfigSetPath::LegacyModel)
+    );
+}
+
+#[test]
 fn preload_advertised_catalogs_reports_seeded_catalog_counts() {
     let mut session = AcpSession::new(None, None, HashMap::new());
 
