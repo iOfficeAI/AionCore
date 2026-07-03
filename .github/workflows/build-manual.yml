@@ -32,6 +32,8 @@ env:
   CARGO_NET_RETRY: "10"
   AIONUI_EMBED_BUN: "1"
   BUN_VARIANT: default
+  CROSS_VERSION: "0.2.5"
+  LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
 
 jobs:
   prepare-matrix:
@@ -108,11 +110,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: manual-build-${{ matrix.target }}-${{ matrix.os }}${{ matrix.use_cross == true && '-cross' || '' }}
+          shared-key: manual-build-${{ matrix.target }}-${{ matrix.os }}${{ matrix.use_cross == true && format('-cross-{0}-{1}', env.CROSS_VERSION, env.LINUX_ARM64_GLIBC_MAX) || '' }}
 
       - name: Install cross (Linux targets)
         if: matrix.use_cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --version "${CROSS_VERSION}" --locked
 
       - name: Build release binary
         shell: bash
@@ -128,6 +130,11 @@ jobs:
           else
             cargo build --release --target ${{ matrix.target }} -p aionui-app
           fi
+
+      - name: Verify Linux ARM64 GLIBC baseline
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_ARM64_GLIBC_MAX}"
 
       - name: Package binary (Unix)
         if: runner.os != 'Windows'

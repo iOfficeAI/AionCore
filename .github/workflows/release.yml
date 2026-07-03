@@ -27,6 +27,8 @@ env:
   CARGO_NET_RETRY: "10"
   AIONUI_EMBED_BUN: "1"
   BUN_VARIANT: default
+  CROSS_VERSION: "0.2.5"
+  LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
   RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
 
 jobs:
@@ -104,17 +106,17 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          # Include runner OS image and use_cross flag in the cache key.
+          # Include runner OS image and cross baseline in the cache key.
           # Proc-macro .so files link against the host GLIBC, so switching
           # the runner (ubuntu-24.04 ↔ 22.04) or flipping native ↔ cross
           # must fall into a different cache bucket — otherwise the cached
           # .so is loaded against an incompatible GLIBC and cargo panics
           # with "can't find crate" / "GLIBC_* not found" errors.
-          shared-key: release-${{ matrix.target }}-${{ matrix.os }}${{ matrix.use_cross == true && '-cross' || '' }}
+          shared-key: release-${{ matrix.target }}-${{ matrix.os }}${{ matrix.use_cross == true && format('-cross-{0}-{1}', env.CROSS_VERSION, env.LINUX_ARM64_GLIBC_MAX) || '' }}
 
       - name: Install cross (Linux targets)
         if: matrix.use_cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --version "${CROSS_VERSION}" --locked
 
       - name: Build release binary
         shell: bash
@@ -129,6 +131,11 @@ jobs:
           else
             cargo build --release --target ${{ matrix.target }} -p aionui-app
           fi
+
+      - name: Verify Linux ARM64 GLIBC baseline
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_ARM64_GLIBC_MAX}"
 
       - name: Package binary (Unix)
         if: runner.os != 'Windows'
