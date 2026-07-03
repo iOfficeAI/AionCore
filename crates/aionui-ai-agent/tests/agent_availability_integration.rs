@@ -197,6 +197,70 @@ async fn hydrate_uses_persisted_availability_without_reprobing_path() {
 }
 
 #[tokio::test]
+async fn hydrate_uses_persisted_availability_for_commandless_managed_builtin() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+    repo.upsert(&UpsertAgentMetadataParams {
+        id: "agent-managed-cached",
+        icon: None,
+        name: "Managed Cached Agent",
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: Some("claude"),
+        agent_type: "acp",
+        agent_source: "builtin",
+        agent_source_info: Some(r#"{"binary_name":"claude"}"#),
+        enabled: true,
+        command: None,
+        args: Some("[]"),
+        env: Some("[]"),
+        native_skills_dirs: None,
+        behavior_policy: None,
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 100,
+    })
+    .await
+    .unwrap();
+    repo.update_availability_snapshot(
+        "agent-managed-cached",
+        &UpdateAgentAvailabilitySnapshotParams {
+            last_check_status: Some("online"),
+            last_check_kind: Some("manual"),
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: Some(120),
+            last_check_at: Some(1_750_000_100_000),
+            last_success_at: Some(1_750_000_100_000),
+            last_failure_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    let rows = registry.list_management_rows().await;
+    let cached = rows.iter().find(|row| row.id == "agent-managed-cached").unwrap();
+
+    assert_eq!(cached.status, AgentManagementStatus::Online);
+    assert!(
+        cached.installed,
+        "managed builtin should trust persisted online snapshot"
+    );
+    assert_eq!(cached.last_check_status, Some(AgentSnapshotCheckStatus::Online));
+}
+
+#[tokio::test]
 async fn management_list_uses_cached_availability_without_reprobing_path() {
     let db = init_database_memory().await.unwrap();
     let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));

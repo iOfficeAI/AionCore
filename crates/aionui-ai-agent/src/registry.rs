@@ -644,20 +644,31 @@ fn apply_cached_availability(meta: &mut AgentMetadata) -> Option<UnavailableReas
         meta.available = true;
         return None;
     }
-    if meta.command.as_deref().filter(|s| !s.is_empty()).is_none() {
-        meta.available = false;
-        return Some(UnavailableReason::NoCommand);
-    }
     if cached_snapshot_indicates_missing(meta) {
         meta.available = false;
         return cached_unavailable_reason(meta);
     }
     if !has_availability_snapshot(meta) {
         meta.available = false;
-        return None;
+        return if is_builtin_managed_agent(meta) {
+            None
+        } else if meta.command.as_deref().filter(|s| !s.is_empty()).is_none() {
+            Some(UnavailableReason::NoCommand)
+        } else {
+            None
+        };
     }
     meta.available = true;
     None
+}
+
+fn is_builtin_managed_agent(meta: &AgentMetadata) -> bool {
+    meta.agent_source == AgentSource::Builtin
+        && meta
+            .backend
+            .as_deref()
+            .and_then(ManagedAcpToolId::from_backend)
+            .is_some()
 }
 
 fn has_availability_snapshot(meta: &AgentMetadata) -> bool {
