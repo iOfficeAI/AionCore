@@ -1082,6 +1082,10 @@ async fn delete_extension_registry_id_without_user_row_returns_404() {
 
 #[tokio::test]
 async fn set_state_inserts_override_for_builtin() {
+    // Builtin sort_order is manifest-owned (users can't reorder official
+    // assistants), so a set_state sort_order is ignored for builtins and the
+    // response keeps the manifest value (0 for this fixture). Only `enabled`
+    // is honoured.
     let fx = fixture().await;
     let req = json_with_token(
         "PATCH",
@@ -1094,7 +1098,7 @@ async fn set_state_inserts_override_for_builtin() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["data"]["enabled"], false);
-    assert_eq!(json["data"]["sort_order"], 9);
+    assert_eq!(json["data"]["sort_order"], 0);
     assert_eq!(json["data"]["source"], "builtin");
 }
 
