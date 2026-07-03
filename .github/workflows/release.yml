@@ -28,6 +28,7 @@ env:
   AIONUI_EMBED_BUN: "1"
   BUN_VARIANT: default
   CROSS_VERSION: "0.2.5"
+  LINUX_X64_GLIBC_MAX: "GLIBC_2.34"
   LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
   RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
 
@@ -112,7 +113,7 @@ jobs:
           # must fall into a different cache bucket — otherwise the cached
           # .so is loaded against an incompatible GLIBC and cargo panics
           # with "can't find crate" / "GLIBC_* not found" errors.
-          shared-key: release-${{ matrix.target }}-${{ matrix.os }}${{ matrix.use_cross == true && format('-cross-{0}-{1}', env.CROSS_VERSION, env.LINUX_ARM64_GLIBC_MAX) || '' }}
+          shared-key: release-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_VERSION, env.LINUX_ARM64_GLIBC_MAX) || '' }}
 
       - name: Install cross (Linux targets)
         if: matrix.use_cross == true
@@ -136,6 +137,11 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_ARM64_GLIBC_MAX}"
+
+      - name: Verify Linux x64 GLIBC baseline
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_X64_GLIBC_MAX}"
 
       - name: Package binary (Unix)
         if: runner.os != 'Windows'
