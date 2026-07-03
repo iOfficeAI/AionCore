@@ -1921,12 +1921,29 @@ impl AssistantService {
         Some(value)
     }
 
+    /// Manifest-owned listing defaults for a builtin assistant.
+    ///
+    /// Official assistants cannot be reordered by users, so their `sort_order`
+    /// is always the manifest value (never an overlay). Their default `enabled`
+    /// (butler on, others off) applies only when the user has no overlay.
+    /// Returns `(sort_order, default_enabled)`; `None` for non-builtins.
+    fn builtin_listing_default(&self, definition: &AssistantDefinitionRow) -> Option<(i32, bool)> {
+        if definition.source != "builtin" {
+            return None;
+        }
+        let source_ref = definition.source_ref.as_deref()?;
+        self.builtin
+            .get(source_ref)
+            .map(|builtin| (builtin.sort_order, builtin.default_enabled))
+    }
+
     fn definition_to_response(
         &self,
         definition: &AssistantDefinitionRow,
         state: Option<&AssistantOverlayRow>,
         projection: &AssistantRuntimeProjection,
     ) -> Result<AssistantResponse, AssistantError> {
+        let builtin_default = self.builtin_listing_default(definition);
         let source = match definition.source.as_str() {
             "builtin" => AssistantSource::Builtin,
             "generated" => AssistantSource::Generated,
@@ -1948,8 +1965,16 @@ impl AssistantService {
             description: definition.description.clone(),
             description_i18n: decode_str_map(Some(definition.description_i18n.as_str()))?,
             avatar: self.avatar_display_value(definition),
-            enabled: state.is_none_or(|row| row.enabled),
-            sort_order: state.map(|row| row.sort_order).unwrap_or(0),
+            // For builtins: enabled = overlay if the user has one, else the
+            // manifest default (butler on, others off). sort_order = always the
+            // manifest value (users can't reorder official assistants).
+            enabled: match state {
+                Some(row) => row.enabled,
+                None => builtin_default.map(|(_, en)| en).unwrap_or(true),
+            },
+            sort_order: builtin_default
+                .map(|(so, _)| so)
+                .unwrap_or_else(|| state.map(|row| row.sort_order).unwrap_or(0)),
             agent_id: projection.agent_id.clone(),
             agent: projection.agent.clone(),
             enabled_skills: decode_str_list(Some(definition.default_skill_ids.as_str()))?,
@@ -1977,6 +2002,7 @@ impl AssistantService {
         rules_content: &str,
         projection: &AssistantRuntimeProjection,
     ) -> Result<AssistantDetailResponse, AssistantError> {
+        let builtin_default = self.builtin_listing_default(definition);
         let default_skill_ids = decode_str_list(Some(definition.default_skill_ids.as_str()))?;
         let custom_skill_names = decode_str_list(Some(definition.custom_skill_names.as_str()))?;
         let default_disabled_builtin_skill_ids =
@@ -2015,8 +2041,13 @@ impl AssistantService {
                 avatar: self.avatar_display_value(definition),
             },
             state: AssistantStateResponse {
-                enabled: state.map(|row| row.enabled).unwrap_or(true),
-                sort_order: state.map(|row| row.sort_order).unwrap_or_default(),
+                enabled: match state {
+                    Some(row) => row.enabled,
+                    None => builtin_default.map(|(_, en)| en).unwrap_or(true),
+                },
+                sort_order: builtin_default
+                    .map(|(so, _)| so)
+                    .unwrap_or_else(|| state.map(|row| row.sort_order).unwrap_or_default()),
                 last_used_at: state.and_then(|row| row.last_used_at),
             },
             engine: AssistantEngineResponse {
@@ -2754,6 +2785,8 @@ mod tests {
                         "avatar": b.avatar,
                         "agent_ref": b.agent_ref,
                         "rule_file": b.rule_file,
+                        "sort_order": b.sort_order,
+                        "default_enabled": b.default_enabled,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -2845,6 +2878,8 @@ mod tests {
             prompts: Vec::new(),
             prompts_i18n: HashMap::new(),
             models: Vec::new(),
+            sort_order: 0,
+            default_enabled: true,
         }
     }
 
@@ -2972,6 +3007,31 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert!(list.iter().any(|a| a.id == "builtin-office"));
         assert!(list.iter().any(|a| a.id == "u1"));
+    }
+
+    #[tokio::test]
+    async fn builtin_listing_uses_manifest_default_enabled_and_sort_order() {
+        // A builtin with default_enabled=false + sort_order=50, and no user
+        // overlay, must surface disabled with the manifest sort_order. The
+        // butler (default_enabled=true, sort_order=0) stays enabled and first.
+        let mut disabled = mk_builtin("builtin-writer", "Writer");
+        disabled.default_enabled = false;
+        disabled.sort_order = 50;
+        let mut butler = mk_builtin("aionui-assistant", "Butler");
+        butler.default_enabled = true;
+        butler.sort_order = 0;
+        let fx = fixture_with_builtins(vec![disabled, butler]).await;
+
+        let list = fx.service.list().await.unwrap();
+        let writer = list.iter().find(|a| a.id == "builtin-writer").unwrap();
+        assert!(!writer.enabled, "non-butler builtin defaults to disabled");
+        assert_eq!(writer.sort_order, 50, "sort_order comes from manifest");
+        let butler_resp = list.iter().find(|a| a.id == "aionui-assistant").unwrap();
+        assert!(butler_resp.enabled, "butler defaults to enabled");
+        assert_eq!(butler_resp.sort_order, 0);
+        let butler_idx = list.iter().position(|a| a.id == "aionui-assistant").unwrap();
+        let writer_idx = list.iter().position(|a| a.id == "builtin-writer").unwrap();
+        assert!(butler_idx < writer_idx, "butler (0) sorts before writer (50)");
     }
 
     #[tokio::test]
@@ -4806,7 +4866,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_state_builtin_writes_override() {
+    async fn set_state_builtin_writes_enabled_but_sort_order_stays_manifest() {
+        // Builtin sort_order is manifest-owned (users can't reorder official
+        // assistants), so set_state's sort_order must NOT affect the response —
+        // it stays the manifest value. Only enabled is honoured.
         let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
         let resp = fx
             .service
@@ -4821,7 +4884,8 @@ mod tests {
             .await
             .unwrap();
         assert!(!resp.enabled);
-        assert_eq!(resp.sort_order, 7);
+        // mk_builtin ships sort_order = 0; the overlay's 7 is ignored for builtins.
+        assert_eq!(resp.sort_order, 0);
         assert_eq!(resp.source, AssistantSource::Builtin);
     }
 
