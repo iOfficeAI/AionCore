@@ -1,4 +1,4 @@
 [target.aarch64-unknown-linux-gnu]
-# Keep Linux ARM64 releases on the historical cross 0.2.5 image/sysroot.
-# This prevents cross main/edge image updates from raising the GLIBC baseline.
-image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:7f8308a8734d9fcd2ebbe9a3e4bdea74af293f0799d80c3cc341e340cda49a4c"
+# Match the cross image digest used by v0.1.39/v0.1.40 Linux ARM64 releases.
+# This prevents cross main image updates from raising the GLIBC baseline again.
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:99e041b94e7d4f31477c6ddede176688562c3762ba3833b75de3316100afc39d"

@@ -32,7 +32,8 @@ env:
   CARGO_NET_RETRY: "10"
   AIONUI_EMBED_BUN: "1"
   BUN_VARIANT: default
-  CROSS_VERSION: "0.2.5"
+  # cross commit used by the v0.1.39/v0.1.40 Linux ARM64 release builds.
+  CROSS_GIT_REV: "29d00c7803f221f1b3f35e561b03792368fb8339"
   LINUX_X64_GLIBC_MAX: "GLIBC_2.34"
   LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
 
@@ -111,11 +112,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: manual-build-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_VERSION, env.LINUX_ARM64_GLIBC_MAX) || '' }}
+          shared-key: manual-build-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
 
       - name: Install cross (Linux targets)
         if: matrix.use_cross == true
-        run: cargo install cross --version "${CROSS_VERSION}" --locked
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev "${CROSS_GIT_REV}" --locked
 
       - name: Build release binary
         shell: bash
