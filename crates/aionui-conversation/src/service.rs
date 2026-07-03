@@ -483,6 +483,14 @@ impl ConversationService {
         self.runtime_state.clone()
     }
 
+    pub fn auto_workspace_to_delete_for_row(
+        &self,
+        row: &aionui_db::models::ConversationRow,
+        conversation_id: &str,
+    ) -> Option<PathBuf> {
+        auto_provisioned_workspace_to_delete(&self.workspace_root, row, conversation_id)
+    }
+
     fn assistant_definition_repo(&self) -> Option<Arc<dyn IAssistantDefinitionRepository>> {
         self.assistant_definition_repo
             .read()

@@ -15,12 +15,12 @@ use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository,
     UpdateCronJobParams, resolve_agent_binding_from_rows,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::events::CronEventEmitter;
 
 use crate::error::CronError;
-use crate::executor::{ExecutionResult, JobExecutor, RETRY_INTERVAL_MS};
+use crate::executor::{ExecutionResult, JobExecutor, PreparedRunNow, RETRY_INTERVAL_MS};
 use crate::scheduler::{CronScheduler, compute_next_run, validate_schedule};
 use crate::skill_file::{delete_skill_file, has_skill_file, write_raw_skill_file, write_skill_file};
 use crate::types::{
@@ -305,6 +305,9 @@ impl CronService {
         let mut job = cron_job_from_row(existing_row)?;
         job.agent_type = self.resolve_job_agent_type(&job).await?;
         let original_execution_mode = job.execution_mode;
+        let original_conversation_id = job.conversation_id.clone();
+        let mut clear_conversation_binding = false;
+        let mut agent_config_changed = false;
 
         if let Some(name) = &req.name {
             job.name = name.clone();
@@ -331,6 +334,11 @@ impl CronService {
                 ));
             }
             job.execution_mode = requested_mode;
+            if requested_mode != original_execution_mode && matches!(requested_mode, ExecutionMode::NewConversation) {
+                clear_conversation_binding = !job.conversation_id.trim().is_empty();
+                job.conversation_id.clear();
+                job.conversation_title = None;
+            }
         }
         if req.agent_config.is_some()
             && (matches!(original_execution_mode, ExecutionMode::Existing)
@@ -346,7 +354,9 @@ impl CronService {
             validate_aionrs_agent_config(&job.agent_type, Some(&config_dto))?;
             job.agent_config = Some(self.build_cron_agent_config(&job.agent_type, config_dto, None).await?);
         }
-        if let Some(title) = &req.conversation_title {
+        if let Some(title) = &req.conversation_title
+            && !clear_conversation_binding
+        {
             job.conversation_title = Some(title.clone());
         }
         if let Some(max_retries) = req.max_retries {
@@ -356,12 +366,40 @@ impl CronService {
         if req.schedule.is_some() || req.enabled.is_some() {
             job.next_run_at = compute_next_run(&job.schedule, now_ms());
         }
+        if clear_conversation_binding
+            && self
+                .clear_auto_workspace_from_job_config(&mut job, &original_conversation_id)
+                .await
+        {
+            agent_config_changed = true;
+        }
 
         job.updated_at = now_ms();
         self.validate_job_workspace(&job).await?;
 
-        let params = build_update_params(&job, &req);
+        let mut params = build_update_params(&job, &req);
+        if clear_conversation_binding {
+            params.conversation_id = Some(String::new());
+            params.conversation_title = Some(None);
+        }
+        if agent_config_changed {
+            params.agent_config = Some(job.agent_config.as_ref().map(serde_json::to_string).transpose()?);
+        }
         self.repo.update(job_id, &params).await?;
+
+        if clear_conversation_binding
+            && let Err(err) = self
+                .executor
+                .unbind_cron_job_from_conversation(&original_conversation_id, &job.id)
+                .await
+        {
+            warn!(
+                conversation_id = %original_conversation_id,
+                job_id = %job.id,
+                error = %err,
+                "Failed to remove cron job binding from previous conversation"
+            );
+        }
 
         self.bind_existing_conversation_if_needed(&job).await;
         self.scheduler.reschedule_job(&job);
@@ -423,7 +461,6 @@ impl CronService {
         };
 
         let mut scheduled = 0u32;
-        let mut orphans = 0u32;
 
         for row in rows {
             let job = match cron_job_from_row(row) {
@@ -434,26 +471,11 @@ impl CronService {
                 }
             };
 
-            if self.is_orphan(&job).await {
-                warn!(
-                    job_id = %job.id,
-                    job_name = %job.name,
-                    conversation_id = %job.conversation_id,
-                    execution_mode = job.execution_mode.as_str(),
-                    "Deleting orphan cron job whose bound conversation no longer exists"
-                );
-                if let Err(e) = self.repo.delete(&job.id).await {
-                    error!(job_id = %job.id, error = %e, "Failed to delete orphan cron job");
-                }
-                orphans += 1;
-                continue;
-            }
-
             self.scheduler.schedule_job(&job);
             scheduled += 1;
         }
 
-        info!(scheduled, orphans, "Cron service initialized");
+        info!(scheduled, "Cron service initialized");
     }
 
     pub async fn tick(&self, job_id: &str) {
@@ -490,8 +512,36 @@ impl CronService {
             return;
         }
 
-        let result = self.executor.execute(&job).await;
-        self.handle_execution_result(job, result).await;
+        let prepared = match self.executor.prepare_scheduled(&job).await {
+            Ok(prepared) => prepared,
+            Err(result) => {
+                self.handle_execution_result(job, result).await;
+                return;
+            }
+        };
+        let mut execution_job = job;
+        if let Err(err) = self
+            .bind_materialized_existing_conversation_if_needed(&mut execution_job, &prepared.conversation_id)
+            .await
+        {
+            error!(
+                job_id,
+                conversation_id = %prepared.conversation_id,
+                error = %err,
+                "Failed to bind materialized cron replacement conversation before execution"
+            );
+            self.handle_execution_result(
+                execution_job,
+                ExecutionResult::Error {
+                    message: err.to_string(),
+                },
+            )
+            .await;
+            return;
+        }
+
+        let result = self.executor.execute_prepared_scheduled(&execution_job, prepared).await;
+        self.handle_execution_result(execution_job, result).await;
     }
 
     pub async fn handle_system_resume(&self) {
@@ -543,7 +593,14 @@ impl CronService {
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(row)?;
         job.agent_type = self.resolve_job_agent_type(&job).await?;
-        let prepared = self.executor.prepare_run_now(&job).await?;
+        let prepared = match self.executor.prepare_run_now(&job).await? {
+            PreparedRunNow::Ready(prepared) => prepared,
+            PreparedRunNow::AlreadyRunning { conversation_id } => {
+                return Ok(RunNowResponse { conversation_id });
+            }
+        };
+        self.bind_materialized_existing_conversation_if_needed(&mut job, &prepared.conversation_id)
+            .await?;
         let conversation_id = prepared.conversation_id.clone();
         let service = self.clone();
         let job_id = job.id.clone();
@@ -705,38 +762,30 @@ impl CronService {
         }
     }
 
-    async fn is_orphan(&self, job: &CronJob) -> bool {
-        // NewConversation jobs never depend on an existing conversation —
-        // every run materializes a fresh one. They must not be cleaned up
-        // based on conversation state.
-        if matches!(job.execution_mode, ExecutionMode::NewConversation) {
-            return false;
+    async fn bind_materialized_existing_conversation_if_needed(
+        &self,
+        job: &mut CronJob,
+        conversation_id: &str,
+    ) -> Result<(), CronError> {
+        let conversation_id = conversation_id.trim();
+        if !matches!(job.execution_mode, ExecutionMode::Existing)
+            || conversation_id.is_empty()
+            || job.conversation_id.trim() == conversation_id
+        {
+            return Ok(());
         }
 
-        // Existing-mode jobs can legitimately carry an empty conversation_id
-        // until the first run performs lazy binding. Leave them alone.
-        if job.conversation_id.trim().is_empty() {
-            return false;
-        }
+        let params = UpdateCronJobParams {
+            conversation_id: Some(conversation_id.to_owned()),
+            ..Default::default()
+        };
+        self.repo.update(&job.id, &params).await?;
+        self.executor
+            .bind_cron_job_to_conversation(conversation_id, &job.id)
+            .await?;
+        job.conversation_id = conversation_id.to_owned();
 
-        if self.executor.is_conversation_claimed(&job.conversation_id) {
-            return false;
-        }
-
-        // Only true orphan case: Existing + bound conversation_id, but that
-        // conversation has been deleted.
-        match self.executor.conversation_exists(&job.conversation_id).await {
-            Ok(exists) => !exists,
-            Err(err) => {
-                warn!(
-                    job_id = %job.id,
-                    conversation_id = %job.conversation_id,
-                    error = %err,
-                    "Failed to verify cron conversation during orphan cleanup"
-                );
-                false
-            }
-        }
+        Ok(())
     }
 
     async fn validate_job_workspace(&self, job: &CronJob) -> Result<(), CronError> {
@@ -750,6 +799,39 @@ impl CronService {
                 Err(CronError::WorkspacePathUnavailable(path))
             }
         }
+    }
+
+    async fn clear_auto_workspace_from_job_config(&self, job: &mut CronJob, conversation_id: &str) -> bool {
+        let Some(config) = job.agent_config.as_mut() else {
+            return false;
+        };
+        let Some(workspace) = config.workspace.as_deref() else {
+            return false;
+        };
+        let workspace_to_clear = match self
+            .executor
+            .auto_workspace_to_delete_for_conversation(conversation_id)
+            .await
+        {
+            Ok(Some(path)) => path,
+            Ok(None) => return false,
+            Err(err) => {
+                warn!(
+                    conversation_id,
+                    job_id = %job.id,
+                    error = %err,
+                    "Failed to inspect previous conversation workspace for cron cleanup"
+                );
+                return false;
+            }
+        };
+
+        if !workspace_matches_path(workspace, &workspace_to_clear) {
+            return false;
+        }
+
+        config.workspace = None;
+        true
     }
 
     async fn handle_execution_result(&self, job: CronJob, result: ExecutionResult) {
@@ -842,12 +924,14 @@ impl CronService {
             }
         };
         let now = now_ms();
-        // Persist the conversation_id back onto the job the first time an
-        // "existing" job is materialized (lazy binding). Subsequent runs then
-        // reuse the same conversation, matching the UX where the job is the
-        // continuation anchor.
-        let needs_conversation_bind =
-            existing_row.conversation_id.trim().is_empty() && !conversation_id.trim().is_empty();
+        // Persist the conversation_id back onto existing-mode jobs whenever
+        // execution materializes a new anchor conversation. This covers both
+        // lazy binding and recovery after the previous conversation was deleted.
+        let needs_conversation_bind = should_bind_success_conversation(
+            &existing_row.execution_mode,
+            &existing_row.conversation_id,
+            conversation_id,
+        );
         let params = UpdateCronJobParams {
             last_run_at: Some(Some(now)),
             last_status: Some(Some("ok".into())),
@@ -1058,26 +1142,106 @@ impl CronService {
     }
 
     pub async fn delete_jobs_by_conversation(&self, conversation_id: &str) {
-        let jobs = match self.repo.list_by_conversation(conversation_id).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                error!(conversation_id, error = %e, "Failed to list cron jobs for cascade delete");
+        let workspace_to_clear = match self
+            .executor
+            .auto_workspace_to_delete_for_conversation(conversation_id)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    conversation_id,
+                    error = %err,
+                    "Failed to inspect deleted conversation workspace for cron cleanup"
+                );
                 return;
             }
         };
 
-        for row in &jobs {
-            self.scheduler.cancel_job(&row.id);
-            self.emitter.emit_job_removed(&row.id);
+        let Some(workspace_to_clear) = workspace_to_clear else {
+            debug!(conversation_id, "Conversation deleted; cron jobs are preserved");
+            return;
+        };
+
+        self.clear_deleted_workspace_from_jobs(conversation_id, &workspace_to_clear)
+            .await;
+        debug!(conversation_id, "Conversation deleted; cron jobs are preserved");
+    }
+
+    async fn clear_deleted_workspace_from_jobs(&self, conversation_id: &str, workspace_to_clear: &Path) {
+        let jobs = match self.repo.list_by_conversation(conversation_id).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                error!(
+                    conversation_id,
+                    error = %err,
+                    "Failed to list cron jobs for deleted workspace cleanup"
+                );
+                return;
+            }
+        };
+
+        let mut cleared = 0usize;
+        for row in jobs {
+            let Some(agent_config_json) = row.agent_config.as_deref() else {
+                continue;
+            };
+            let mut agent_config = match serde_json::from_str::<CronAgentConfig>(agent_config_json) {
+                Ok(config) => config,
+                Err(err) => {
+                    warn!(
+                        job_id = %row.id,
+                        conversation_id,
+                        error = %err,
+                        "Failed to parse cron agent config for deleted workspace cleanup"
+                    );
+                    continue;
+                }
+            };
+            if !agent_config
+                .workspace
+                .as_deref()
+                .is_some_and(|workspace| workspace_matches_path(workspace, workspace_to_clear))
+            {
+                continue;
+            }
+
+            agent_config.workspace = None;
+            let agent_config_json = match serde_json::to_string(&agent_config) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        job_id = %row.id,
+                        conversation_id,
+                        error = %err,
+                        "Failed to serialize cron agent config for deleted workspace cleanup"
+                    );
+                    continue;
+                }
+            };
+            let params = UpdateCronJobParams {
+                agent_config: Some(Some(agent_config_json)),
+                ..Default::default()
+            };
+            match self.repo.update(&row.id, &params).await {
+                Ok(()) => cleared += 1,
+                Err(err) => {
+                    error!(
+                        job_id = %row.id,
+                        conversation_id,
+                        error = %err,
+                        "Failed to clear deleted workspace from cron job"
+                    );
+                }
+            }
         }
 
-        if let Err(e) = self.repo.delete_by_conversation(conversation_id).await {
-            error!(conversation_id, error = %e, "Failed to cascade-delete cron jobs");
-        } else if !jobs.is_empty() {
+        if cleared > 0 {
             info!(
                 conversation_id,
-                count = jobs.len(),
-                "Cascade-deleted cron jobs for conversation"
+                cleared,
+                workspace = %workspace_to_clear.display(),
+                "Cleared deleted conversation workspace from cron jobs"
             );
         }
     }
@@ -1438,6 +1602,29 @@ fn parse_execution_mode(mode: Option<&str>) -> Result<ExecutionMode, CronError> 
     }
 }
 
+fn should_bind_success_conversation(
+    execution_mode: &str,
+    existing_conversation_id: &str,
+    success_conversation_id: &str,
+) -> bool {
+    let success_conversation_id = success_conversation_id.trim();
+    execution_mode == ExecutionMode::Existing.as_str()
+        && !success_conversation_id.is_empty()
+        && existing_conversation_id.trim() != success_conversation_id
+}
+
+fn workspace_matches_path(stored_workspace: &str, target_workspace: &Path) -> bool {
+    let stored_path = Path::new(stored_workspace);
+    if stored_path == target_workspace {
+        return true;
+    }
+
+    match std::fs::canonicalize(stored_path) {
+        Ok(canonical_stored_path) => canonical_stored_path == target_workspace,
+        Err(_) => false,
+    }
+}
+
 fn validate_skill_body_content(content: &str) -> Result<(), CronError> {
     let trimmed = content.trim();
 
@@ -1727,6 +1914,15 @@ mod tests {
     fn parse_mode_invalid() {
         let err = parse_execution_mode(Some("parallel")).unwrap_err();
         assert!(matches!(err, CronError::InvalidExecutionMode(_)));
+    }
+
+    #[test]
+    fn success_conversation_bind_only_applies_to_existing_mode() {
+        assert!(should_bind_success_conversation("existing", "", "conv_run"));
+        assert!(should_bind_success_conversation("existing", "missing_old", "conv_run"));
+        assert!(!should_bind_success_conversation("new_conversation", "", "conv_run"));
+        assert!(!should_bind_success_conversation("existing", "conv_run", "conv_run"));
+        assert!(!should_bind_success_conversation("existing", "", "   "));
     }
 
     // -- build_update_params --------------------------------------------------

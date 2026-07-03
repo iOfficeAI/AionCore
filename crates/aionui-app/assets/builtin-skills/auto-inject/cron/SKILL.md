@@ -31,7 +31,7 @@ You can manage scheduled tasks for the current conversation. Use the bundled HTT
 Create and update payloads use the same fields:
 
 - `name`: Short descriptive name.
-- `schedule`: Valid cron expression.
+- `schedule`: Standard 5-field cron expression.
 - `schedule_description`: Human-readable schedule.
 - `message`: Complete, self-contained instruction sent to the AI when the task runs.
 
@@ -93,3 +93,5 @@ Multiline message example:
 Format: `minute hour day-of-month month day-of-week`.
 
 Example: `0 9 * * MON-FRI` means weekdays at 9:00 AM.
+
+Use only standard cron fields and ranges supported by the backend parser. Do not use Quartz-style extensions such as `L`, `L-N`, `W`, `LW`, `#`, or `?`.
