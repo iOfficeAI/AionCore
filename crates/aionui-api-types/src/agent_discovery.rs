@@ -112,6 +112,7 @@ pub enum AgentManagementStatus {
     Missing,
     Online,
     Offline,
+    Unchecked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,6 +407,8 @@ mod tests {
     fn agent_management_status_serializes_snake_case() {
         let value = serde_json::to_value(AgentManagementStatus::Offline).unwrap();
         assert_eq!(value, json!("offline"));
+        let value = serde_json::to_value(AgentManagementStatus::Unchecked).unwrap();
+        assert_eq!(value, json!("unchecked"));
     }
 }
 

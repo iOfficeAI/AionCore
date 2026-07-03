@@ -332,8 +332,9 @@ impl AgentRegistry {
             .values()
             .cloned()
             .map(|meta| {
-                let status = derive_management_status(&meta);
-                let diagnostics = derive_management_diagnostics(&meta, status, reasons.get(&meta.id));
+                let reason = reasons.get(&meta.id);
+                let status = derive_management_status(&meta, reason);
+                let diagnostics = derive_management_diagnostics(&meta, status, reason);
                 let handshake = meta.handshake;
                 AgentManagementRow {
                     id: meta.id,
@@ -382,7 +383,7 @@ impl AgentRegistry {
     pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
         let reason = self.unavailable_reasons.read().await.get(id).cloned();
         let meta = self.by_id.read().await.get(id).cloned()?;
-        let status = derive_management_status(&meta);
+        let status = derive_management_status(&meta, reason.as_ref());
         let diagnostics = derive_management_diagnostics(&meta, status, reason.as_ref());
         let handshake = meta.handshake.clone();
         Some(AgentManagementRow {
@@ -467,7 +468,7 @@ impl AgentRegistry {
 /// keeps both uninstalled CLIs and rows that most recently failed
 /// ACP/session admission out of visible legacy catalog reads.
 fn is_visible(meta: &AgentMetadata) -> bool {
-    meta.enabled && matches!(derive_management_status(meta), AgentManagementStatus::Online)
+    meta.enabled && matches!(derive_management_status(meta, None), AgentManagementStatus::Online)
 }
 
 /// Extract and trim a command override, filtering out empty strings.
@@ -651,8 +652,21 @@ fn apply_cached_availability(meta: &mut AgentMetadata) -> Option<UnavailableReas
         meta.available = false;
         return cached_unavailable_reason(meta);
     }
+    if !has_availability_snapshot(meta) {
+        meta.available = false;
+        return None;
+    }
     meta.available = true;
     None
+}
+
+fn has_availability_snapshot(meta: &AgentMetadata) -> bool {
+    meta.last_check_status.is_some()
+        || meta.last_check_kind.is_some()
+        || meta.last_check_error_code.is_some()
+        || meta.last_check_at.is_some()
+        || meta.last_success_at.is_some()
+        || meta.last_failure_at.is_some()
 }
 
 fn cached_snapshot_indicates_missing(meta: &AgentMetadata) -> bool {
@@ -829,14 +843,21 @@ fn parse_last_check_kind(raw: Option<&str>) -> Option<AgentSnapshotCheckKind> {
     })
 }
 
-fn derive_management_status(meta: &AgentMetadata) -> AgentManagementStatus {
+fn derive_management_status(meta: &AgentMetadata, reason: Option<&UnavailableReason>) -> AgentManagementStatus {
     if !meta.available {
-        return AgentManagementStatus::Missing;
+        if reason.is_some() || has_availability_snapshot(meta) {
+            return AgentManagementStatus::Missing;
+        }
+        return AgentManagementStatus::Unchecked;
+    }
+    if is_internal_commandless_agent(meta) {
+        return AgentManagementStatus::Online;
     }
 
     match meta.last_check_status {
         Some(AgentSnapshotCheckStatus::Offline) => AgentManagementStatus::Offline,
-        _ => AgentManagementStatus::Online,
+        Some(AgentSnapshotCheckStatus::Online) => AgentManagementStatus::Online,
+        None => AgentManagementStatus::Unchecked,
     }
 }
 
@@ -1386,10 +1407,9 @@ mod tests {
     }
 
     /// `diagnostic_snapshot` returns one entry per row, populates a
-    /// reason for every unavailable row, and leaves available rows
-    /// without one. The CI host doesn't have the seeded CLIs
-    /// installed, so the bridge/CLI rows are reliably unavailable
-    /// here — the assertion exploits that to lock the contract.
+    /// reason for rows known unavailable by probe/cache, and leaves
+    /// available or unchecked rows without one. Unchecked rows are
+    /// expected after startup hydration avoids live probing.
     #[tokio::test]
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
@@ -1400,6 +1420,7 @@ mod tests {
             match (meta.available, reason) {
                 (true, None) => {}
                 (false, Some(_)) => {}
+                (false, None) if matches!(derive_management_status(meta, None), AgentManagementStatus::Unchecked) => {}
                 (true, Some(r)) => panic!("available row {} has unexpected reason {:?}", meta.id, r),
                 (false, None) => panic!(
                     "unavailable row {} (source={:?}) is missing a reason",

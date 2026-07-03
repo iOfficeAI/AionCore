@@ -156,7 +156,7 @@ async fn management_list_marks_rows_with_unavailable_snapshot() {
     repo.update_availability_snapshot(
         "custom-unavailable-agent",
         &UpdateAgentAvailabilitySnapshotParams {
-            last_check_status: Some("unavailable"),
+            last_check_status: Some("offline"),
             last_check_kind: Some("scheduled"),
             last_check_error_code: Some("acp_init_failed"),
             last_check_error_message: Some("Synthetic unavailable snapshot"),
@@ -170,7 +170,6 @@ async fn management_list_marks_rows_with_unavailable_snapshot() {
     .await
     .unwrap();
     services.agent_registry.hydrate().await.unwrap();
-    services.agent_registry.refresh_availability().await;
 
     let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -182,7 +181,7 @@ async fn management_list_marks_rows_with_unavailable_snapshot() {
         .iter()
         .find(|item| item["id"].as_str() == Some("custom-unavailable-agent"))
         .expect("management list should include unavailable rows");
-    assert_eq!(row["status"], "online");
+    assert_eq!(row["status"], "offline");
 }
 
 #[tokio::test]

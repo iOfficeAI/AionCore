@@ -226,6 +226,57 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
 }
 
 #[tokio::test]
+async fn management_rows_mark_unchecked_agents_unchecked_without_probe() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+    repo.upsert(&UpsertAgentMetadataParams {
+        id: "agent-unchecked-cli",
+        icon: None,
+        name: "Unchecked CLI Agent",
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: Some("custom"),
+        agent_type: "acp",
+        agent_source: "custom",
+        agent_source_info: Some(r#"{"binary_name":"unchecked-cli"}"#),
+        enabled: true,
+        command: Some("unchecked-cli"),
+        args: Some("[]"),
+        env: Some("[]"),
+        native_skills_dirs: None,
+        behavior_policy: None,
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 100,
+    })
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    let row = registry
+        .list_management_rows()
+        .await
+        .into_iter()
+        .find(|item| item.id == "agent-unchecked-cli")
+        .unwrap();
+
+    let row_json = serde_json::to_value(&row).unwrap();
+    assert_eq!(row_json["status"].as_str(), Some("unchecked"));
+    assert!(!row.installed);
+    assert!(row.last_check_status.is_none());
+    assert!(row.last_check_error_code.is_none());
+}
+
+#[tokio::test]
 async fn hydrate_continues_when_agent_metadata_config_options_has_invalid_utf8() {
     let db = init_database_memory().await.unwrap();
     sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE id = ?")

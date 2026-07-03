@@ -220,8 +220,8 @@ async fn management_list_uses_cached_availability_without_reprobing_path() {
     let rows = service.list_management_agents().await.unwrap();
     let cached = rows.iter().find(|row| row.id == "agent-cached").unwrap();
 
-    assert_eq!(cached.status, AgentManagementStatus::Online);
-    assert!(cached.installed, "management list should not refresh PATH on read");
+    assert_eq!(cached.status, AgentManagementStatus::Unchecked);
+    assert!(!cached.installed, "management list should not refresh PATH on read");
 }
 
 #[tokio::test]
@@ -262,9 +262,9 @@ async fn manual_health_check_does_not_refresh_unrelated_agents() {
     let rows = registry.list_management_rows().await;
     let unrelated = rows.iter().find(|row| row.id == "agent-unrelated").unwrap();
 
-    assert_eq!(unrelated.status, AgentManagementStatus::Online);
+    assert_eq!(unrelated.status, AgentManagementStatus::Unchecked);
     assert!(
-        unrelated.installed,
+        !unrelated.installed,
         "single-agent health check should not refresh unrelated agents"
     );
 }
@@ -307,9 +307,9 @@ async fn custom_enabled_toggle_does_not_refresh_unrelated_agents() {
     let rows = registry.list_management_rows().await;
     let unrelated = rows.iter().find(|row| row.id == "agent-unrelated").unwrap();
 
-    assert_eq!(unrelated.status, AgentManagementStatus::Online);
+    assert_eq!(unrelated.status, AgentManagementStatus::Unchecked);
     assert!(
-        unrelated.installed,
+        !unrelated.installed,
         "custom enabled toggle should not refresh unrelated agents"
     );
 }
@@ -352,7 +352,10 @@ async fn custom_delete_does_not_refresh_unrelated_agents() {
     let rows = registry.list_management_rows().await;
     let unrelated = rows.iter().find(|row| row.id == "agent-unrelated").unwrap();
 
-    assert_eq!(unrelated.status, AgentManagementStatus::Online);
-    assert!(unrelated.installed, "custom delete should not refresh unrelated agents");
+    assert_eq!(unrelated.status, AgentManagementStatus::Unchecked);
+    assert!(
+        !unrelated.installed,
+        "custom delete should not refresh unrelated agents"
+    );
     assert!(rows.iter().all(|row| row.id != "agent-target-delete"));
 }
