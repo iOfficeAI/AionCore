@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use crate::AgentError;
@@ -48,9 +48,13 @@ pub struct OpenClawAgentManager {
     runtime: AgentRuntime,
     config: OpenClawBuildExtra,
     gateway_process: Option<Arc<CliAgentProcess>>,
-    pub(super) connection: Arc<OpenClawConnection>,
+    ws_url: String,
+    auth: Option<AuthConfig>,
+    connection: Arc<RwLock<Arc<OpenClawConnection>>>,
     pub(super) state: Arc<RwLock<OpenClawState>>,
     text_state: Mutex<TextFallbackState>,
+    event_relay_handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    weak_self: Mutex<Option<std::sync::Weak<OpenClawAgentManager>>>,
 }
 
 impl OpenClawAgentManager {
@@ -136,7 +140,7 @@ impl OpenClawAgentManager {
             None
         };
 
-        let (connection, hello) = OpenClawConnection::connect(&ws_url, auth, &identity)
+        let (connection, hello) = OpenClawConnection::connect(&ws_url, auth.clone(), &identity)
             .await
             .inspect_err(|e| {
                 error!(
@@ -178,7 +182,9 @@ impl OpenClawAgentManager {
             runtime,
             config,
             gateway_process,
-            connection: Arc::clone(&connection),
+            ws_url,
+            auth,
+            connection: Arc::new(RwLock::new(connection)),
             state: Arc::new(RwLock::new(OpenClawState {
                 session_key: resume_session_key,
                 confirmations: Vec::new(),
@@ -186,6 +192,8 @@ impl OpenClawAgentManager {
                 approval_memory: HashMap::new(),
             })),
             text_state: Mutex::new(TextFallbackState::new()),
+            event_relay_handle: StdMutex::new(None),
+            weak_self: Mutex::new(None),
         };
 
         Ok(manager)
@@ -193,13 +201,91 @@ impl OpenClawAgentManager {
 
     pub fn start_event_relay(self: &Arc<Self>) {
         let this = Arc::clone(self);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             this.run_event_relay().await;
         });
+        if let Ok(mut guard) = self.event_relay_handle.lock() {
+            *guard = Some(handle);
+        }
+    }
+
+    pub async fn set_weak_self(
+        &self,
+        weak: std::sync::Weak<OpenClawAgentManager>,
+    ) {
+        *self.weak_self.lock().await = Some(weak);
+    }
+
+    async fn self_arc(&self) -> Option<Arc<Self>> {
+        self.weak_self.lock().await.as_ref()?.upgrade()
+    }
+
+    async fn current_connection(&self) -> Arc<OpenClawConnection> {
+        self.connection.read().await.clone()
+    }
+
+    /// Reconnect to the OpenClaw gateway when the WebSocket has been closed.
+    /// Replaces the cached connection and restarts the event relay so follow-up
+    /// user messages can keep working after the gateway drops the socket.
+    async fn reconnect(&self) -> Result<(), AgentError> {
+        info!(
+            conversation_id = %self.runtime.conversation_id(),
+            "OpenClaw connection closed; reconnecting"
+        );
+
+        let identity = load_or_create_identity(None)?;
+        let (connection, hello) = OpenClawConnection::connect(
+            &self.ws_url,
+            self.auth.clone(),
+            &identity,
+        )
+        .await
+        .inspect_err(|e| {
+            error!(
+                conversation_id = %self.runtime.conversation_id(),
+                url = %self.ws_url,
+                error = %ErrorChain(e),
+                "Failed to reconnect to OpenClaw gateway"
+            );
+        })?;
+
+        if let Some(ref auth_info) = hello.auth
+            && let Some(ref device_token) = auth_info.device_token
+        {
+            super::device_auth_store::store_device_auth_token(
+                &identity.device_id,
+                auth_info.role.as_deref().unwrap_or("operator"),
+                device_token,
+                auth_info.scopes.as_deref().unwrap_or(&[]),
+            );
+        }
+
+        {
+            let mut guard = self.connection.write().await;
+            *guard = connection;
+        }
+
+        if let Ok(mut guard) = self.event_relay_handle.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+
+        if let Some(arc_self) = self.self_arc().await {
+            arc_self.start_event_relay();
+        }
+
+        info!(
+            conversation_id = %self.runtime.conversation_id(),
+            url = %self.ws_url,
+            "Reconnected to OpenClaw gateway"
+        );
+
+        Ok(())
     }
 
     async fn run_event_relay(self: Arc<Self>) {
-        let mut event_rx = self.connection.subscribe_events().await;
+        let mut event_rx = self.current_connection().await.subscribe_events().await;
 
         loop {
             match event_rx.recv().await {
@@ -278,7 +364,14 @@ impl OpenClawAgentManager {
         }
     }
 
-    async fn do_send_message(&self, is_first: bool, data: SendMessageData) -> Result<(), AgentError> {
+    async fn do_send_message(&self,
+        is_first: bool,
+        data: SendMessageData,
+    ) -> Result<(), AgentError> {
+        if !self.current_connection().await.is_connected() {
+            self.reconnect().await?;
+        }
+
         if is_first {
             self.resolve_session().await?;
         }
@@ -302,7 +395,8 @@ impl OpenClawAgentManager {
             },
         };
 
-        self.connection
+        self.current_connection()
+            .await
             .request::<Value>("chat.send", serde_json::to_value(params).unwrap_or_default())
             .await?;
 
@@ -316,7 +410,8 @@ impl OpenClawAgentManager {
 
         if let Some(ref key) = resume_key {
             match self
-                .connection
+                .current_connection()
+                .await
                 .request::<SessionsResolveResponse>(
                     "sessions.resolve",
                     serde_json::to_value(SessionsResolveParams { key: key.clone() }).unwrap_or_default(),
@@ -344,7 +439,8 @@ impl OpenClawAgentManager {
         }
 
         let resp: SessionsResetResponse = self
-            .connection
+            .current_connection()
+            .await
             .request(
                 "sessions.reset",
                 serde_json::to_value(SessionsResetParams {
@@ -376,7 +472,7 @@ impl OpenClawAgentManager {
             "gatewayHost": host,
             "gatewayPort": port,
             "conversationId": self.runtime.conversation_id(),
-            "isConnected": self.connection.is_connected(),
+            "isConnected": self.current_connection().await.is_connected(),
             "hasActiveSession": state.session_key.is_some(),
             "sessionKey": state.session_key,
         })
@@ -449,7 +545,8 @@ impl crate::agent_task::IAgentTask for OpenClawAgentManager {
                 run_id: None,
             };
             let _ = self
-                .connection
+                .current_connection()
+                .await
                 .request::<Value>("chat.abort", serde_json::to_value(params).unwrap_or_default())
                 .await;
         }
@@ -489,7 +586,8 @@ impl crate::agent_task::IAgentTask for OpenClawAgentManager {
 
         let connection = Arc::clone(&self.connection);
         tokio::spawn(async move {
-            connection.close().await;
+            let conn = connection.read().await.clone();
+            conn.close().await;
         });
 
         if let Some(ref process) = self.gateway_process {

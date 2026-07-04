@@ -31,7 +31,8 @@ impl OpenClawAgentManager {
                 "requestId": call_id,
                 "optionId": option_id,
             });
-            if let Err(e) = connection.request::<Value>("exec.approval.respond", params).await {
+            let conn = connection.read().await.clone();
+            if let Err(e) = conn.request::<Value>("exec.approval.respond", params).await {
                 warn!(error = %e, "Failed to send OpenClaw approval response");
             }
         });

@@ -74,7 +74,11 @@ pub(super) async fn build(
         deps.data_dir.clone(),
     )
     .await?;
-    let arc = Arc::new(agent);
+    let mut arc = Arc::new(agent);
+    let weak = Arc::downgrade(&arc);
+    if let Some(manager) = Arc::get_mut(&mut arc) {
+        manager.set_weak_self(weak).await;
+    }
     arc.start_event_relay();
     Ok(AgentInstance::OpenClaw(arc))
 }

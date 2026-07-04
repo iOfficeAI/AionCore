@@ -33,6 +33,7 @@ const DEFAULT_TICK_INTERVAL_MS: u64 = 30_000;
 
 type PendingSender = oneshot::Sender<Result<Value, AgentError>>;
 
+#[derive(Clone)]
 pub struct AuthConfig {
     pub token: Option<String>,
     pub password: Option<String>,
