@@ -19,7 +19,7 @@ use aionui_ai_agent::{
 use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
     ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload,
-    SetConfigOptionRequest, SetConfigOptionResponse,
+    SetConfigOptionRequest, SetConfigOptionResponse, WorkspaceBrowseQuery,
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
@@ -2225,6 +2225,118 @@ async fn delete_preserves_user_supplied_workspace_directory() {
     svc.delete("user_1", &conv.id).await.unwrap();
 
     assert!(user_workspace.is_dir());
+}
+
+#[tokio::test]
+async fn browse_workspace_search_matches_nested_file_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let user_workspace = temp.path().join("user-project");
+    std::fs::create_dir_all(user_workspace.join("src/components")).unwrap();
+    std::fs::write(
+        user_workspace.join("src/components/SearchPanel.tsx"),
+        "export const panel = true;",
+    )
+    .unwrap();
+    std::fs::write(user_workspace.join("README.md"), "overview").unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": user_workspace,
+            "custom_workspace": true
+        }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let entries = svc
+        .browse_workspace(
+            &conv.id,
+            WorkspaceBrowseQuery {
+                path: ".".into(),
+                search: Some("searchpanel".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "src/components/SearchPanel.tsx");
+    assert_eq!(entries[0].entry_type, "file");
+}
+
+#[tokio::test]
+async fn browse_workspace_search_matches_nested_file_contents() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let user_workspace = temp.path().join("user-project");
+    std::fs::create_dir_all(user_workspace.join("docs")).unwrap();
+    std::fs::write(
+        user_workspace.join("docs/notes.md"),
+        "release checklist mentions ProjectDelta",
+    )
+    .unwrap();
+    std::fs::write(user_workspace.join("unrelated.md"), "nothing here").unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": user_workspace,
+            "custom_workspace": true
+        }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let entries = svc
+        .browse_workspace(
+            &conv.id,
+            WorkspaceBrowseQuery {
+                path: ".".into(),
+                search: Some("projectdelta".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "docs/notes.md");
+    assert_eq!(entries[0].entry_type, "file");
+}
+
+#[tokio::test]
+async fn browse_workspace_without_search_keeps_shallow_directory_listing() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let user_workspace = temp.path().join("user-project");
+    std::fs::create_dir_all(user_workspace.join("src")).unwrap();
+    std::fs::write(user_workspace.join("src/nested.txt"), "nested").unwrap();
+    std::fs::write(user_workspace.join("README.md"), "overview").unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": user_workspace,
+            "custom_workspace": true
+        }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let entries = svc
+        .browse_workspace(
+            &conv.id,
+            WorkspaceBrowseQuery {
+                path: ".".into(),
+                search: None,
+            },
+        )
+        .await
+        .unwrap();
+    let names = entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>();
+
+    assert_eq!(names, vec!["src", "README.md"]);
 }
 
 // ── Broadcast payload tests ────────────────────────────────────────

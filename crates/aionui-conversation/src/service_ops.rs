@@ -7,7 +7,7 @@
 //! Kept in a separate file from service.rs to avoid pushing that file
 //! over 2000 lines.
 
-use std::path::Component;
+use std::path::{Component, Path, PathBuf};
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
@@ -21,6 +21,97 @@ use crate::ConversationError;
 use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 
 const MAX_DIR_DEPTH: usize = 10;
+const MAX_WORKSPACE_SEARCH_RESULTS: usize = 200;
+const MAX_WORKSPACE_SEARCH_SCANNED: usize = 5000;
+const MAX_WORKSPACE_SEARCH_FILE_BYTES: u64 = 512 * 1024;
+
+fn workspace_search_matches_content(path: &Path, needle: &str) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > MAX_WORKSPACE_SEARCH_FILE_BYTES {
+        return false;
+    }
+
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    content.to_lowercase().contains(needle)
+}
+
+fn workspace_search_entry(base: &Path, path: &Path, is_dir: bool) -> Option<WorkspaceEntry> {
+    let relative = path.strip_prefix(base).ok()?;
+    let name = relative.to_string_lossy().replace('\\', "/");
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(WorkspaceEntry {
+        name,
+        entry_type: if is_dir { "directory" } else { "file" }.into(),
+    })
+}
+
+fn search_workspace_entries_sync(base: PathBuf, search_root: PathBuf, search: String) -> Vec<WorkspaceEntry> {
+    let needle = search.to_lowercase();
+    let mut entries = Vec::new();
+    let mut scanned = 0usize;
+    let mut stack = vec![search_root];
+
+    while let Some(dir) = stack.pop() {
+        if entries.len() >= MAX_WORKSPACE_SEARCH_RESULTS || scanned >= MAX_WORKSPACE_SEARCH_SCANNED {
+            break;
+        }
+
+        let Ok(reader) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in reader.flatten() {
+            if entries.len() >= MAX_WORKSPACE_SEARCH_RESULTS || scanned >= MAX_WORKSPACE_SEARCH_SCANNED {
+                break;
+            }
+
+            scanned += 1;
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+
+            let is_dir = metadata.is_dir();
+            let is_file = metadata.is_file();
+            let name_matches = file_name.to_lowercase().contains(&needle)
+                || path
+                    .strip_prefix(&base)
+                    .ok()
+                    .map(|relative| relative.to_string_lossy().to_lowercase().contains(&needle))
+                    .unwrap_or(false);
+            let content_matches = is_file && workspace_search_matches_content(&path, &needle);
+
+            if (name_matches || content_matches)
+                && let Some(search_entry) = workspace_search_entry(&base, &path, is_dir)
+            {
+                entries.push(search_entry);
+            }
+
+            if is_dir {
+                stack.push(path);
+            }
+        }
+    }
+
+    entries.sort_by(|a, b| {
+        let type_cmp = a.entry_type.cmp(&b.entry_type);
+        if type_cmp == std::cmp::Ordering::Equal {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase())
+        } else {
+            type_cmp
+        }
+    });
+
+    entries
+}
 
 impl ConversationService {
     // ── Config Options ──────────────────────────────────────────────
@@ -241,6 +332,23 @@ impl ConversationService {
             });
         }
 
+        if let Some(search) = query
+            .search
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            let entries = tokio::task::spawn_blocking({
+                let canonical_base = canonical_base.clone();
+                let canonical_browse = canonical_browse.clone();
+                let search = search.to_owned();
+                move || search_workspace_entries_sync(canonical_base, canonical_browse, search)
+            })
+            .await
+            .map_err(|e| ConversationError::internal(format!("Workspace search task failed: {e}")))?;
+            return Ok(entries);
+        }
+
         let mut entries = Vec::new();
         let mut dir_reader = tokio::fs::read_dir(&canonical_browse)
             .await
@@ -248,14 +356,6 @@ impl ConversationService {
 
         while let Ok(Some(entry)) = dir_reader.next_entry().await {
             let name = entry.file_name().to_string_lossy().into_owned();
-
-            // Apply search filter if provided
-            if let Some(ref search) = query.search
-                && !search.is_empty()
-                && !name.to_lowercase().contains(&search.to_lowercase())
-            {
-                continue;
-            }
 
             let entry_path = entry.path();
             let metadata = tokio::fs::metadata(&entry_path)
