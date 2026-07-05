@@ -13,6 +13,7 @@ use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
     ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse,
     SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    WorkspaceSearchMatchKind, WorkspaceSearchMode,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
 use ignore::{DirEntry, WalkBuilder};
@@ -54,7 +55,12 @@ fn workspace_search_matches_content(path: &Path, needle: &str) -> bool {
     content.to_lowercase().contains(needle)
 }
 
-fn workspace_search_entry(base: &Path, path: &Path, is_dir: bool) -> Option<WorkspaceEntry> {
+fn workspace_search_entry(
+    base: &Path,
+    path: &Path,
+    is_dir: bool,
+    match_kind: WorkspaceSearchMatchKind,
+) -> Option<WorkspaceEntry> {
     let relative = path.strip_prefix(base).ok()?;
     let name = relative.to_string_lossy().replace('\\', "/");
     if name.is_empty() {
@@ -64,6 +70,7 @@ fn workspace_search_entry(base: &Path, path: &Path, is_dir: bool) -> Option<Work
     Some(WorkspaceEntry {
         name,
         entry_type: if is_dir { "directory" } else { "file" }.into(),
+        match_kind: Some(match_kind),
     })
 }
 
@@ -83,7 +90,12 @@ fn should_prune_workspace_search_entry(entry: &DirEntry, search_root: &Path) -> 
     WORKSPACE_SEARCH_PRUNED_DIRS.contains(&name)
 }
 
-fn search_workspace_entries_sync(base: PathBuf, search_root: PathBuf, search: String) -> Vec<WorkspaceEntry> {
+fn search_workspace_entries_sync(
+    base: PathBuf,
+    search_root: PathBuf,
+    search: String,
+    search_mode: WorkspaceSearchMode,
+) -> Vec<WorkspaceEntry> {
     let needle = search.to_lowercase();
     let mut entries = Vec::new();
     let mut scanned = 0usize;
@@ -119,22 +131,38 @@ fn search_workspace_entries_sync(base: PathBuf, search_root: PathBuf, search: St
 
         let is_dir = file_type.is_dir();
         let is_file = file_type.is_file();
-        let name_matches = entry.file_name().to_string_lossy().to_lowercase().contains(&needle)
-            || path
-                .strip_prefix(&base)
-                .ok()
-                .map(|relative| relative.to_string_lossy().to_lowercase().contains(&needle))
-                .unwrap_or(false);
-        let content_matches = is_file && workspace_search_matches_content(path, &needle);
+        let name_matches = !matches!(search_mode, WorkspaceSearchMode::Content)
+            && (entry.file_name().to_string_lossy().to_lowercase().contains(&needle)
+                || path
+                    .strip_prefix(&base)
+                    .ok()
+                    .map(|relative| relative.to_string_lossy().to_lowercase().contains(&needle))
+                    .unwrap_or(false));
+        let content_matches = !matches!(search_mode, WorkspaceSearchMode::Name)
+            && is_file
+            && workspace_search_matches_content(path, &needle);
 
-        if (name_matches || content_matches)
-            && let Some(search_entry) = workspace_search_entry(&base, path, is_dir)
+        let match_kind = if name_matches {
+            Some(WorkspaceSearchMatchKind::Name)
+        } else if content_matches {
+            Some(WorkspaceSearchMatchKind::Content)
+        } else {
+            None
+        };
+
+        if let Some(match_kind) = match_kind
+            && let Some(search_entry) = workspace_search_entry(&base, path, is_dir, match_kind)
         {
             entries.push(search_entry);
         }
     }
 
     entries.sort_by(|a, b| {
+        let match_cmp = search_match_rank(a.match_kind).cmp(&search_match_rank(b.match_kind));
+        if match_cmp != std::cmp::Ordering::Equal {
+            return match_cmp;
+        }
+
         let type_cmp = a.entry_type.cmp(&b.entry_type);
         if type_cmp == std::cmp::Ordering::Equal {
             a.name.to_lowercase().cmp(&b.name.to_lowercase())
@@ -144,6 +172,14 @@ fn search_workspace_entries_sync(base: PathBuf, search_root: PathBuf, search: St
     });
 
     entries
+}
+
+fn search_match_rank(match_kind: Option<WorkspaceSearchMatchKind>) -> u8 {
+    match match_kind {
+        Some(WorkspaceSearchMatchKind::Name) => 0,
+        Some(WorkspaceSearchMatchKind::Content) => 1,
+        None => 2,
+    }
 }
 
 impl ConversationService {
@@ -371,11 +407,12 @@ impl ConversationService {
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
         {
+            let search_mode = query.search_mode.unwrap_or(WorkspaceSearchMode::All);
             let entries = tokio::task::spawn_blocking({
                 let canonical_base = canonical_base.clone();
                 let canonical_browse = canonical_browse.clone();
                 let search = search.to_owned();
-                move || search_workspace_entries_sync(canonical_base, canonical_browse, search)
+                move || search_workspace_entries_sync(canonical_base, canonical_browse, search, search_mode)
             })
             .await
             .map_err(|e| ConversationError::internal(format!("Workspace search task failed: {e}")))?;
@@ -400,6 +437,7 @@ impl ConversationService {
             entries.push(WorkspaceEntry {
                 name,
                 entry_type: entry_type.into(),
+                match_kind: None,
             });
         }
 
