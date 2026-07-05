@@ -2306,6 +2306,148 @@ async fn browse_workspace_search_matches_nested_file_contents() {
 }
 
 #[tokio::test]
+async fn browse_workspace_search_skips_dependency_dirs_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let user_workspace = temp.path().join("user-project");
+    std::fs::create_dir_all(user_workspace.join("node_modules/pkg")).unwrap();
+    std::fs::write(
+        user_workspace.join("node_modules/pkg/secret.txt"),
+        "DependencyOnlyNeedle should not be scanned by default",
+    )
+    .unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": user_workspace,
+            "custom_workspace": true
+        }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let entries = svc
+        .browse_workspace(
+            &conv.id,
+            WorkspaceBrowseQuery {
+                path: ".".into(),
+                search: Some("dependencyonlyneedle".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(entries.is_empty());
+}
+
+#[tokio::test]
+async fn browse_workspace_search_allows_explicit_dependency_dir_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let user_workspace = temp.path().join("user-project");
+    std::fs::create_dir_all(user_workspace.join("node_modules/pkg")).unwrap();
+    std::fs::write(
+        user_workspace.join("node_modules/pkg/secret.txt"),
+        "DependencyOnlyNeedle should be scanned when node_modules is explicit",
+    )
+    .unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": user_workspace,
+            "custom_workspace": true
+        }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let entries = svc
+        .browse_workspace(
+            &conv.id,
+            WorkspaceBrowseQuery {
+                path: "node_modules".into(),
+                search: Some("dependencyonlyneedle".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "node_modules/pkg/secret.txt");
+    assert_eq!(entries[0].entry_type, "file");
+}
+
+#[tokio::test]
+async fn browse_workspace_search_respects_gitignore_from_workspace_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let user_workspace = temp.path().join("user-project");
+    std::fs::create_dir_all(user_workspace.join("ignored")).unwrap();
+    std::fs::write(user_workspace.join(".gitignore"), "ignored/\n").unwrap();
+    std::fs::write(user_workspace.join("ignored/notes.md"), "IgnoredNeedle").unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": user_workspace,
+            "custom_workspace": true
+        }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let entries = svc
+        .browse_workspace(
+            &conv.id,
+            WorkspaceBrowseQuery {
+                path: ".".into(),
+                search: Some("ignoredneedle".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(entries.is_empty());
+}
+
+#[tokio::test]
+async fn browse_workspace_search_allows_explicit_gitignored_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let user_workspace = temp.path().join("user-project");
+    std::fs::create_dir_all(user_workspace.join("ignored")).unwrap();
+    std::fs::write(user_workspace.join(".gitignore"), "ignored/\n").unwrap();
+    std::fs::write(user_workspace.join("ignored/notes.md"), "IgnoredNeedle").unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": user_workspace,
+            "custom_workspace": true
+        }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let entries = svc
+        .browse_workspace(
+            &conv.id,
+            WorkspaceBrowseQuery {
+                path: "ignored".into(),
+                search: Some("ignoredneedle".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "ignored/notes.md");
+    assert_eq!(entries[0].entry_type, "file");
+}
+
+#[tokio::test]
 async fn browse_workspace_without_search_keeps_shallow_directory_listing() {
     let temp = tempfile::tempdir().unwrap();
     let workspace_root = temp.path().join("aionui-data");

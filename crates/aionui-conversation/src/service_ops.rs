@@ -15,6 +15,7 @@ use aionui_api_types::{
     SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
+use ignore::{DirEntry, WalkBuilder};
 use tracing::warn;
 
 use crate::ConversationError;
@@ -24,6 +25,20 @@ const MAX_DIR_DEPTH: usize = 10;
 const MAX_WORKSPACE_SEARCH_RESULTS: usize = 200;
 const MAX_WORKSPACE_SEARCH_SCANNED: usize = 5000;
 const MAX_WORKSPACE_SEARCH_FILE_BYTES: u64 = 512 * 1024;
+const WORKSPACE_SEARCH_PRUNED_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".cache",
+    ".next",
+    ".turbo",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "out",
+    "target",
+];
 
 fn workspace_search_matches_content(path: &Path, needle: &str) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
@@ -52,52 +67,70 @@ fn workspace_search_entry(base: &Path, path: &Path, is_dir: bool) -> Option<Work
     })
 }
 
+fn should_prune_workspace_search_entry(entry: &DirEntry, search_root: &Path) -> bool {
+    if entry.path() == search_root {
+        return false;
+    }
+
+    if !entry.file_type().map(|file_type| file_type.is_dir()).unwrap_or(false) {
+        return false;
+    }
+
+    let Some(name) = entry.file_name().to_str() else {
+        return false;
+    };
+
+    WORKSPACE_SEARCH_PRUNED_DIRS.contains(&name)
+}
+
 fn search_workspace_entries_sync(base: PathBuf, search_root: PathBuf, search: String) -> Vec<WorkspaceEntry> {
     let needle = search.to_lowercase();
     let mut entries = Vec::new();
     let mut scanned = 0usize;
-    let mut stack = vec![search_root];
 
-    while let Some(dir) = stack.pop() {
+    let mut walker_builder = WalkBuilder::new(&search_root);
+    let filter_search_root = search_root.clone();
+    walker_builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .require_git(false)
+        .filter_entry(move |entry| !should_prune_workspace_search_entry(entry, &filter_search_root));
+    let walker = walker_builder.build();
+
+    for entry in walker {
         if entries.len() >= MAX_WORKSPACE_SEARCH_RESULTS || scanned >= MAX_WORKSPACE_SEARCH_SCANNED {
             break;
         }
 
-        let Ok(reader) = std::fs::read_dir(&dir) else {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path == search_root {
+            continue;
+        }
+
+        scanned += 1;
+        let Some(file_type) = entry.file_type() else {
             continue;
         };
 
-        for entry in reader.flatten() {
-            if entries.len() >= MAX_WORKSPACE_SEARCH_RESULTS || scanned >= MAX_WORKSPACE_SEARCH_SCANNED {
-                break;
-            }
+        let is_dir = file_type.is_dir();
+        let is_file = file_type.is_file();
+        let name_matches = entry.file_name().to_string_lossy().to_lowercase().contains(&needle)
+            || path
+                .strip_prefix(&base)
+                .ok()
+                .map(|relative| relative.to_string_lossy().to_lowercase().contains(&needle))
+                .unwrap_or(false);
+        let content_matches = is_file && workspace_search_matches_content(path, &needle);
 
-            scanned += 1;
-            let path = entry.path();
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-
-            let is_dir = metadata.is_dir();
-            let is_file = metadata.is_file();
-            let name_matches = file_name.to_lowercase().contains(&needle)
-                || path
-                    .strip_prefix(&base)
-                    .ok()
-                    .map(|relative| relative.to_string_lossy().to_lowercase().contains(&needle))
-                    .unwrap_or(false);
-            let content_matches = is_file && workspace_search_matches_content(&path, &needle);
-
-            if (name_matches || content_matches)
-                && let Some(search_entry) = workspace_search_entry(&base, &path, is_dir)
-            {
-                entries.push(search_entry);
-            }
-
-            if is_dir {
-                stack.push(path);
-            }
+        if (name_matches || content_matches)
+            && let Some(search_entry) = workspace_search_entry(&base, path, is_dir)
+        {
+            entries.push(search_entry);
         }
     }
 
