@@ -197,7 +197,7 @@ async fn hydrate_refreshes_installation_without_rerunning_health_check() {
 }
 
 #[tokio::test]
-async fn hydrate_uses_persisted_availability_for_commandless_managed_builtin() {
+async fn hydrate_refreshes_commandless_managed_builtin_installation() {
     let db = init_database_memory().await.unwrap();
     let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
 
@@ -211,7 +211,7 @@ async fn hydrate_uses_persisted_availability_for_commandless_managed_builtin() {
         backend: Some("claude"),
         agent_type: "acp",
         agent_source: "builtin",
-        agent_source_info: Some(r#"{"binary_name":"claude"}"#),
+        agent_source_info: Some(r#"{"binary_name":"definitely-missing-managed-claude-cli"}"#),
         enabled: true,
         command: None,
         args: Some("[]"),
@@ -252,10 +252,10 @@ async fn hydrate_uses_persisted_availability_for_commandless_managed_builtin() {
     let rows = registry.list_management_rows().await;
     let cached = rows.iter().find(|row| row.id == "agent-managed-cached").unwrap();
 
-    assert_eq!(cached.status, AgentManagementStatus::Online);
+    assert_eq!(cached.status, AgentManagementStatus::Missing);
     assert!(
-        cached.installed,
-        "managed builtin should trust persisted online snapshot"
+        !cached.installed,
+        "startup hydrate should refresh managed builtin installation state"
     );
     assert_eq!(cached.last_check_status, Some(AgentSnapshotCheckStatus::Online));
 }
