@@ -219,6 +219,31 @@ async fn tc3b_create_team_writes_legacy_extra_shape() {
     assert_eq!(extra["current_model_id"], "claude");
 }
 
+#[tokio::test]
+async fn tc3c_team_conversation_rejects_standalone_runtime_ensure() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_team(&mut app, &token, &csrf).await;
+    let conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{conversation_id}/runtime/ensure"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert_eq!(body["success"], false);
+    assert_eq!(body["code"], "TEAM_RUNTIME_REQUIRED");
+    assert_eq!(body["details"]["conversation_id"], conversation_id);
+    assert_eq!(body["details"]["team_id"], data["id"]);
+}
+
 // TC-4: Explicit lead role is returned first
 #[tokio::test]
 async fn tc4_explicit_lead_is_returned_first() {
