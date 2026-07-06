@@ -290,61 +290,58 @@ impl JobExecutor {
         &self,
         conversation_id: &str,
         cron_job_id: &str,
+        session_mode: Option<&str>,
     ) -> Result<(), CronError> {
         let Some(row) = self.get_conversation_row(conversation_id).await? else {
             return Ok(());
         };
 
+        let session_mode = session_mode.map(str::trim).filter(|value| !value.is_empty());
+        let is_acp_conversation = row.r#type == AgentType::Acp.serde_name();
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
-        let Some(obj) = extra.as_object_mut() else {
+        if !extra.is_object() {
             extra = serde_json::json!({});
-            extra.as_object_mut().expect("json object").insert(
-                "cron_job_id".to_owned(),
-                serde_json::Value::String(cron_job_id.to_owned()),
-            );
-            extra.as_object_mut().expect("json object").insert(
-                "cronJobId".to_owned(),
-                serde_json::Value::String(cron_job_id.to_owned()),
-            );
-            let update = ConversationRowUpdate {
-                extra: Some(extra.to_string()),
-                updated_at: Some(now_ms()),
-                ..Default::default()
-            };
-            return self
-                .conversation_repo
-                .update(conversation_id, &update)
-                .await
-                .map_err(CronError::Database);
-        };
+        }
+
+        let obj = extra.as_object_mut().expect("json object");
+        let mut changed = false;
 
         let current = obj
             .get("cron_job_id")
             .and_then(|value| value.as_str())
             .or_else(|| obj.get("cronJobId").and_then(|value| value.as_str()));
 
-        if current == Some(cron_job_id) {
-            return Ok(());
+        if current != Some(cron_job_id) {
+            obj.insert(
+                "cron_job_id".to_owned(),
+                serde_json::Value::String(cron_job_id.to_owned()),
+            );
+            obj.insert(
+                "cronJobId".to_owned(),
+                serde_json::Value::String(cron_job_id.to_owned()),
+            );
+            changed = true;
         }
 
-        obj.insert(
-            "cron_job_id".to_owned(),
-            serde_json::Value::String(cron_job_id.to_owned()),
-        );
-        obj.insert(
-            "cronJobId".to_owned(),
-            serde_json::Value::String(cron_job_id.to_owned()),
-        );
+        if changed {
+            let update = ConversationRowUpdate {
+                extra: Some(extra.to_string()),
+                updated_at: Some(now_ms()),
+                ..Default::default()
+            };
+            self.conversation_repo
+                .update(conversation_id, &update)
+                .await
+                .map_err(CronError::Database)?;
+        }
 
-        let update = ConversationRowUpdate {
-            extra: Some(extra.to_string()),
-            updated_at: Some(now_ms()),
-            ..Default::default()
-        };
-        self.conversation_repo
-            .update(conversation_id, &update)
-            .await
-            .map_err(CronError::Database)
+        if is_acp_conversation && let Some(mode) = session_mode {
+            self.conversation_service
+                .save_acp_runtime_mode(conversation_id, mode)
+                .await?;
+        }
+
+        Ok(())
     }
 
     pub async fn unbind_cron_job_from_conversation(
@@ -664,6 +661,7 @@ impl JobExecutor {
             content: prompt,
             files: vec![],
             inject_skills: skill_names.clone(),
+            required_runtime_mode: cron_job_runtime_mode(job).map(ToOwned::to_owned),
             persist_user_message: true,
             user_message_hidden: true,
             on_started,
@@ -1027,6 +1025,14 @@ fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> Strin
             }
         }
     }
+}
+
+fn cron_job_runtime_mode(job: &CronJob) -> Option<&str> {
+    job.agent_config
+        .as_ref()
+        .and_then(|config| config.mode.as_deref())
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
 }
 
 fn build_assistant_request(job: &CronJob) -> Option<AssistantConversationRequest> {
@@ -1790,7 +1796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_inner_leaves_session_mode_to_conversation_runtime() {
+    async fn execute_inner_applies_session_mode_to_active_conversation_runtime() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
         let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
         let mut job = sample_job();
@@ -1805,13 +1811,13 @@ mod tests {
             }
         );
         wait_for_agent_send(&agent, 1).await;
-        assert_eq!(agent.mode().await, "default");
-        assert_eq!(agent.set_mode_calls(), 0);
+        assert_eq!(agent.mode().await, "yolo");
+        assert_eq!(agent.set_mode_calls(), 1);
         assert_eq!(agent.send_calls(), 1);
     }
 
     #[tokio::test]
-    async fn execute_inner_does_not_directly_set_mode_for_uninitialized_agent() {
+    async fn execute_inner_applies_session_mode_when_mode_endpoint_is_uninitialized() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "default", false));
         let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
         let mut job = sample_job();
@@ -1826,13 +1832,13 @@ mod tests {
             }
         );
         wait_for_agent_send(&agent, 1).await;
-        assert_eq!(agent.mode().await, "default");
-        assert_eq!(agent.set_mode_calls(), 0);
+        assert_eq!(agent.mode().await, "yolo");
+        assert_eq!(agent.set_mode_calls(), 1);
         assert_eq!(agent.send_calls(), 1);
     }
 
     #[tokio::test]
-    async fn execute_inner_skips_mode_update_when_already_matching() {
+    async fn execute_inner_reconfirms_session_mode_when_reported_already_matching() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "yolo", true));
         let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
         let mut job = sample_job();
@@ -1848,7 +1854,7 @@ mod tests {
         );
         wait_for_agent_send(&agent, 1).await;
         assert_eq!(agent.mode().await, "yolo");
-        assert_eq!(agent.set_mode_calls(), 0);
+        assert_eq!(agent.set_mode_calls(), 1);
         assert_eq!(agent.send_calls(), 1);
     }
 

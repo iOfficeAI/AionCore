@@ -322,6 +322,7 @@ async fn run_agent_turn_with_empty_call_id_tool_call_is_not_persisted() {
             content: "run glob".into(),
             files: Vec::new(),
             inject_skills: Vec::new(),
+            required_runtime_mode: None,
             persist_user_message: false,
             user_message_hidden: false,
             on_started: None,

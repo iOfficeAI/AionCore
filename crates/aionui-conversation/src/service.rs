@@ -334,6 +334,7 @@ pub struct ConversationAgentTurnRequest {
     pub content: String,
     pub files: Vec<String>,
     pub inject_skills: Vec<String>,
+    pub required_runtime_mode: Option<String>,
     pub persist_user_message: bool,
     pub user_message_hidden: bool,
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
@@ -1997,8 +1998,21 @@ impl ConversationService {
     }
 
     pub async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), ConversationError> {
+        let runtime_state = self
+            .acp_session_repo
+            .load_runtime_state(conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load runtime mode state: {e}")))?;
+        let mut config_selections = runtime_state
+            .and_then(|state| state.config_selections_json)
+            .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(&raw).ok())
+            .unwrap_or_default();
+        config_selections.insert("mode".to_owned(), mode.to_owned());
+        let config_selections_json = serde_json::to_string(&config_selections)
+            .map_err(|e| ConversationError::internal(format!("Failed to serialize runtime mode selection: {e}")))?;
         let params = SaveRuntimeStateParams {
             current_mode_id: Some(Some(mode)),
+            config_selections_json: Some(Some(config_selections_json.as_str())),
             ..Default::default()
         };
         self.acp_session_repo
@@ -2670,6 +2684,7 @@ impl ConversationService {
             user_id: user_id.to_owned(),
             conversation: row,
             request: req,
+            required_runtime_mode: None,
             build_options: build_opts,
             stored_workspace,
             turn_id: turn_id.clone(),
@@ -2793,6 +2808,7 @@ impl ConversationService {
                     inject_skills: request.inject_skills,
                     hidden: request.user_message_hidden,
                 },
+                required_runtime_mode: request.required_runtime_mode,
                 build_options: build_opts,
                 stored_workspace,
                 turn_id: turn_id.clone(),

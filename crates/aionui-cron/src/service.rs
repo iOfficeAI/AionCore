@@ -13,7 +13,7 @@ use aionui_common::{
 };
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository,
-    UpdateCronJobParams, resolve_agent_binding_from_rows,
+    UpdateCronJobParams, models::AgentMetadataRow, resolve_agent_binding_from_rows, runtime_backend_for_agent,
 };
 use tracing::{debug, error, info, warn};
 
@@ -122,7 +122,11 @@ impl CronService {
             .await?;
         if let Err(err) = self
             .executor
-            .bind_cron_job_to_conversation(conversation_id, &job.id)
+            .bind_cron_job_to_conversation(
+                conversation_id,
+                &job.id,
+                job.agent_config.as_ref().and_then(|config| config.mode.as_deref()),
+            )
             .await
         {
             if let Err(cleanup_err) = self.remove_job(&job.id).await {
@@ -198,7 +202,11 @@ impl CronService {
             .await?;
 
         self.executor
-            .bind_cron_job_to_conversation(conversation_id, &job.id)
+            .bind_cron_job_to_conversation(
+                conversation_id,
+                &job.id,
+                job.agent_config.as_ref().and_then(|config| config.mode.as_deref()),
+            )
             .await?;
 
         Ok(job)
@@ -750,7 +758,11 @@ impl CronService {
 
         if let Err(err) = self
             .executor
-            .bind_cron_job_to_conversation(&job.conversation_id, &job.id)
+            .bind_cron_job_to_conversation(
+                &job.conversation_id,
+                &job.id,
+                job.agent_config.as_ref().and_then(|config| config.mode.as_deref()),
+            )
             .await
         {
             warn!(
@@ -781,7 +793,11 @@ impl CronService {
         };
         self.repo.update(&job.id, &params).await?;
         self.executor
-            .bind_cron_job_to_conversation(conversation_id, &job.id)
+            .bind_cron_job_to_conversation(
+                conversation_id,
+                &job.id,
+                job.agent_config.as_ref().and_then(|config| config.mode.as_deref()),
+            )
             .await?;
         job.conversation_id = conversation_id.to_owned();
 
@@ -949,7 +965,7 @@ impl CronService {
         if needs_conversation_bind
             && let Err(e) = self
                 .executor
-                .bind_cron_job_to_conversation(conversation_id, job_id)
+                .bind_cron_job_to_conversation(conversation_id, job_id, None)
                 .await
         {
             warn!(
@@ -1366,11 +1382,32 @@ impl CronService {
                 .unwrap_or_else(|| row.r#type.clone())
         };
 
-        let agent_type_enum = serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok();
-        let full_auto_mode = agent_type_enum
-            .unwrap_or(AgentType::Acp)
-            .full_auto_mode_id(Some(backend.as_str()))
-            .to_owned();
+        let assistant_id_for_mode = if uses_default_assistant_fallback {
+            None
+        } else {
+            assistant_id.as_deref()
+        };
+        let full_auto_mode = match self
+            .resolve_cron_full_auto_mode(
+                &row.r#type,
+                assistant_id_for_mode,
+                assistant_snapshot.as_ref().map(|snapshot| snapshot.agent_id.as_str()),
+                Some(backend.as_str()),
+            )
+            .await
+        {
+            Ok(mode) => mode,
+            Err(err) => {
+                warn!(
+                    conversation_id = %row.id,
+                    assistant_id = assistant_id.as_deref().unwrap_or(""),
+                    backend,
+                    error = %err,
+                    "Failed to resolve cron full-auto mode from agent metadata"
+                );
+                fallback_full_auto_mode(&row.r#type, Some(backend.as_str()))
+            }
+        };
         let agent_config = aionui_api_types::CronAgentConfigWriteDto {
             name: assistant_name
                 .or_else(|| get_string(&extra, &["agent_name", "agentName"]))
@@ -1418,13 +1455,22 @@ impl CronService {
             ));
         };
 
-        self.resolve_assistant_backend(Some(assistant_id))
+        let assistant_backend = self
+            .resolve_assistant_backend(Some(assistant_id))
             .await?
             .ok_or_else(|| {
                 CronError::InvalidAgentConfig(format!(
                     "assistant '{assistant_id}' could not resolve a runtime backend"
                 ))
             })?;
+        let full_auto_mode = self
+            .resolve_cron_full_auto_mode(
+                runtime_agent_type,
+                Some(assistant_id),
+                None,
+                Some(assistant_backend.as_str()),
+            )
+            .await?;
 
         Ok(CronAgentConfig {
             name: config.name,
@@ -1432,7 +1478,7 @@ impl CronService {
             is_preset: None,
             assistant_id: config.assistant_id,
             custom_agent_id: None,
-            mode: config.mode,
+            mode: Some(full_auto_mode),
             model_id: config.model_id,
             model: normalize_model(config.model, runtime_agent_type)?,
             config_options: config.config_options,
@@ -1516,6 +1562,82 @@ impl CronService {
             .map(|binding| binding.runtime_backend)
             .unwrap_or_else(|| agent_id.to_owned()))
     }
+
+    async fn resolve_cron_full_auto_mode(
+        &self,
+        runtime_agent_type: &str,
+        assistant_id: Option<&str>,
+        agent_id_hint: Option<&str>,
+        backend_hint: Option<&str>,
+    ) -> Result<String, CronError> {
+        if let Some(row) = self.resolve_agent_metadata_for_assistant(assistant_id).await? {
+            return Ok(full_auto_mode_from_metadata(&row, runtime_agent_type));
+        }
+
+        if let Some(row) = self.resolve_agent_metadata_for_value(agent_id_hint).await? {
+            return Ok(full_auto_mode_from_metadata(&row, runtime_agent_type));
+        }
+
+        if let Some(row) = self.resolve_agent_metadata_for_value(backend_hint).await? {
+            return Ok(full_auto_mode_from_metadata(&row, runtime_agent_type));
+        }
+
+        Ok(fallback_full_auto_mode(runtime_agent_type, backend_hint))
+    }
+
+    async fn resolve_agent_metadata_for_assistant(
+        &self,
+        assistant_id: Option<&str>,
+    ) -> Result<Option<AgentMetadataRow>, CronError> {
+        let Some(assistant_id) = assistant_id.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+
+        let Some(definition) = self.assistant_definition_repo.get_by_assistant_id(assistant_id).await? else {
+            return Ok(None);
+        };
+        let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+        let effective_agent_id = overlay
+            .as_ref()
+            .and_then(|item| item.agent_id_override.as_deref())
+            .unwrap_or(definition.agent_id.as_str());
+
+        self.resolve_agent_metadata_for_value(Some(effective_agent_id)).await
+    }
+
+    async fn resolve_agent_metadata_for_value(
+        &self,
+        value: Option<&str>,
+    ) -> Result<Option<AgentMetadataRow>, CronError> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+
+        let rows = self.agent_metadata_repo.list_all().await?;
+        let Some(binding) = resolve_agent_binding_from_rows(&rows, value) else {
+            return Ok(None);
+        };
+
+        Ok(rows.into_iter().find(|row| row.id == binding.agent_id))
+    }
+}
+
+fn full_auto_mode_from_metadata(row: &AgentMetadataRow, runtime_agent_type: &str) -> String {
+    row.yolo_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback_full_auto_mode(runtime_agent_type, Some(runtime_backend_for_agent(row).as_str())))
+}
+
+fn fallback_full_auto_mode(runtime_agent_type: &str, backend_hint: Option<&str>) -> String {
+    let agent_type_enum =
+        serde_json::from_value::<AgentType>(serde_json::Value::String(runtime_agent_type.to_owned())).ok();
+    agent_type_enum
+        .unwrap_or(AgentType::Acp)
+        .full_auto_mode_id(backend_hint)
+        .to_owned()
 }
 
 // ---------------------------------------------------------------------------

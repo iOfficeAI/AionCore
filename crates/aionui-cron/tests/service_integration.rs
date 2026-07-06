@@ -1127,6 +1127,18 @@ async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
 }
 
 #[tokio::test]
+async fn create_job_uses_assistant_full_auto_mode_instead_of_requested_mode() {
+    let (svc, _, _) = setup().await;
+    let req = make_create_req("Full Auto Mode", every_60s());
+
+    let job = svc.add_job(req).await.unwrap();
+    let config = job.agent_config.expect("agent config");
+
+    assert_eq!(config.assistant_id.as_deref(), Some("assistant-default"));
+    assert_eq!(config.mode.as_deref(), Some("bypassPermissions"));
+}
+
+#[tokio::test]
 async fn create_job_derives_assistant_runtime_without_backend_hint() {
     let (svc, _, _) = setup().await;
 
@@ -2302,6 +2314,57 @@ async fn create_for_conversation_helper_creates_claimed_conversation_job_with_mu
     let linked = conv_repo.list_by_cron_job("u1", &response.job_id).await.unwrap();
     assert_eq!(linked.len(), 1);
     assert_eq!(linked[0].id, "conv_1");
+}
+
+#[tokio::test]
+async fn create_for_conversation_helper_keeps_conversation_extra_mode_unchanged() {
+    let (svc, cron_repo, _, conv_repo, conv_service) = setup_with_conv_runtime().await;
+    let runtime_state = conv_service.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn("conv_mode_default", "turn_helper_create_full_auto")
+        .expect("claim conversation");
+
+    let response = svc
+        .create_for_conversation_helper(
+            "u1",
+            "conv_mode_default",
+            conversation_cron_request("create files without prompting"),
+        )
+        .await
+        .unwrap();
+
+    let row = cron_repo.get_by_id(&response.job_id).await.unwrap().unwrap();
+    let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
+    assert_eq!(config.mode.as_deref(), Some("yolo"));
+
+    let bound = conv_repo.get("conv_mode_default").await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
+    assert_eq!(extra["cron_job_id"], response.job_id);
+    assert_eq!(extra["cronJobId"], response.job_id);
+    assert_eq!(extra["session_mode"], "default");
+    assert!(extra.get("current_mode_id").is_none());
+}
+
+#[tokio::test]
+async fn create_for_conversation_helper_uses_assistant_metadata_full_auto_mode() {
+    let (svc, cron_repo, _, _, conv_service) = setup_with_conv_runtime().await;
+    let runtime_state = conv_service.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn("conv_mode_codex", "turn_helper_create_codex_full_auto")
+        .expect("claim conversation");
+
+    let response = svc
+        .create_for_conversation_helper(
+            "u1",
+            "conv_mode_codex",
+            conversation_cron_request("run codex without prompting"),
+        )
+        .await
+        .unwrap();
+
+    let row = cron_repo.get_by_id(&response.job_id).await.unwrap().unwrap();
+    let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
+    assert_eq!(config.mode.as_deref(), Some("full-access"));
 }
 
 #[tokio::test]

@@ -102,6 +102,7 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
             conversation_id: conv.id.clone(),
             current_mode_id: None,
             current_model_id: Some(None),
+            config_selections_json: None,
         }]
     );
 

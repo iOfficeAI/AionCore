@@ -862,6 +862,7 @@ struct RuntimeStateSaveCall {
     conversation_id: String,
     current_mode_id: Option<Option<String>>,
     current_model_id: Option<Option<String>>,
+    config_selections_json: Option<Option<String>>,
 }
 
 #[derive(Default)]
@@ -869,6 +870,7 @@ struct StubAcpSessionRepo {
     create_calls: Mutex<Vec<CreateAcpSessionCall>>,
     runtime_state_saves: Mutex<Vec<RuntimeStateSaveCall>>,
     session_id: Mutex<Option<String>>,
+    runtime_state: Mutex<Option<PersistedSessionState>>,
 }
 
 impl StubAcpSessionRepo {
@@ -881,6 +883,16 @@ impl StubAcpSessionRepo {
             create_calls: Mutex::new(Vec::new()),
             runtime_state_saves: Mutex::new(Vec::new()),
             session_id: Mutex::new(Some(session_id.into())),
+            runtime_state: Mutex::new(None),
+        }
+    }
+
+    fn with_runtime_state(state: PersistedSessionState) -> Self {
+        Self {
+            create_calls: Mutex::new(Vec::new()),
+            runtime_state_saves: Mutex::new(Vec::new()),
+            session_id: Mutex::new(None),
+            runtime_state: Mutex::new(Some(state)),
         }
     }
 
@@ -941,10 +953,12 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
         Ok(false)
     }
     async fn load_runtime_state(&self, _conversation_id: &str) -> Result<Option<PersistedSessionState>, DbError> {
-        Ok(Some(PersistedSessionState {
-            current_model_id: Some("deepseek-v4-pro".to_owned()),
-            ..Default::default()
-        }))
+        Ok(Some(self.runtime_state.lock().unwrap().clone().unwrap_or(
+            PersistedSessionState {
+                current_model_id: Some("deepseek-v4-pro".to_owned()),
+                ..Default::default()
+            },
+        )))
     }
     async fn save_runtime_state(
         &self,
@@ -955,6 +969,7 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
             conversation_id: conversation_id.to_owned(),
             current_mode_id: params.current_mode_id.map(|outer| outer.map(ToOwned::to_owned)),
             current_model_id: params.current_model_id.map(|outer| outer.map(ToOwned::to_owned)),
+            config_selections_json: params.config_selections_json.map(|outer| outer.map(ToOwned::to_owned)),
         });
         Ok(true)
     }
@@ -2528,6 +2543,11 @@ impl MockAgent {
         self
     }
 
+    fn with_mode(self, mode: &str) -> Self {
+        *self.mode.lock().unwrap() = mode.to_owned();
+        self
+    }
+
     fn with_set_config_option_response(self, response: SetConfigOptionResponse) -> Self {
         *self.set_config_option_response.lock().unwrap() = Some(response);
         self
@@ -2634,16 +2654,30 @@ impl IMockAgent for MockAgent {
             .lock()
             .unwrap()
             .push((option_id.to_owned(), value.to_owned()));
+        if option_id == "mode" {
+            *self.mode.lock().unwrap() = value.to_owned();
+        }
         if let Some(error) = self.set_config_option_error.lock().unwrap().take() {
             return Err(error);
         }
         if let Some(response) = self.set_config_option_response.lock().unwrap().clone() {
+            if let Some(config_options) = response.config_options.as_ref() {
+                let _ = self.event_tx.send(AgentStreamEvent::AcpConfigOption(json!({
+                    "config_options": config_options,
+                })));
+            }
             return Ok(response);
         }
-        Ok(SetConfigOptionResponse {
+        let response = SetConfigOptionResponse {
             confirmation: ConfigOptionConfirmation::Observed,
             config_options: Some(self.config_options.lock().unwrap().clone()),
-        })
+        };
+        if let Some(config_options) = response.config_options.as_ref() {
+            let _ = self.event_tx.send(AgentStreamEvent::AcpConfigOption(json!({
+                "config_options": config_options,
+            })));
+        }
+        Ok(response)
     }
 }
 
@@ -3408,6 +3442,7 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
             content: "run scheduled task".into(),
             files: Vec::new(),
             inject_skills: Vec::new(),
+            required_runtime_mode: None,
             persist_user_message: true,
             user_message_hidden: true,
             on_started: None,
@@ -3581,6 +3616,90 @@ async fn set_config_option_returns_observed_confirmation() {
         agent.set_config_option_calls.lock().unwrap().as_slice(),
         &[("reasoning_effort".to_owned(), "high".to_owned())]
     );
+}
+
+#[tokio::test]
+async fn save_acp_runtime_mode_updates_runtime_mode_config_selection() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_runtime_state(PersistedSessionState {
+        current_mode_id: Some("read-only".to_owned()),
+        current_model_id: Some("gpt-5.3-codex".to_owned()),
+        config_selections_json: Some(
+            serde_json::json!({
+                "mode": "read-only",
+                "model": "gpt-5.3-codex",
+                "reasoning_effort": "low"
+            })
+            .to_string(),
+        ),
+        context_usage_json: None,
+    }));
+    let (svc, _, _, _) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_repo.clone(),
+    );
+    svc.save_acp_runtime_mode("conv_1", "full-access").await.unwrap();
+
+    let saves = acp_repo.runtime_state_saves();
+    assert_eq!(saves.len(), 1);
+    assert_eq!(saves[0].current_mode_id, Some(Some("full-access".to_owned())));
+    let selections: serde_json::Value =
+        serde_json::from_str(saves[0].config_selections_json.as_ref().unwrap().as_ref().unwrap()).unwrap();
+    assert_eq!(selections["mode"], "full-access");
+    assert_eq!(selections["model"], "gpt-5.3-codex");
+    assert_eq!(selections["reasoning_effort"], "low");
+}
+
+#[tokio::test]
+async fn run_agent_turn_applies_required_runtime_mode_after_stream_subscription() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    let agent = Arc::new(
+        MockAgent::new(&conv.id)
+            .with_mode("yolo")
+            .with_config_options(vec![AcpConfigOptionDto {
+                id: "mode".to_owned(),
+                name: Some("Mode".to_owned()),
+                label: None,
+                description: None,
+                category: Some("mode".to_owned()),
+                option_type: "select".to_owned(),
+                current_value: Some("yolo".to_owned()),
+                options: Vec::new(),
+            }]),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+
+    let outcome = svc
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".to_owned(),
+            conversation_id: conv.id.clone(),
+            content: "run scheduled task".to_owned(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            required_runtime_mode: Some("yolo".to_owned()),
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    assert_eq!(
+        agent.set_config_option_calls.lock().unwrap().as_slice(),
+        &[("mode".to_owned(), "yolo".to_owned())]
+    );
+    let events = broadcaster.take_events();
+    let config_event = events
+        .iter()
+        .find(|event| event.name == "message.stream" && event.data["type"] == "acp_config_option")
+        .expect("runtime mode switch should broadcast config option snapshot");
+    assert_eq!(config_event.data["conversation_id"], conv.id);
+    assert_eq!(config_event.data["data"]["config_options"][0]["id"], "mode");
+    assert_eq!(config_event.data["data"]["config_options"][0]["current_value"], "yolo");
 }
 
 #[tokio::test]
@@ -4304,6 +4423,7 @@ async fn run_agent_turn_returns_error_message_when_agent_build_fails() {
             content: "run scheduled task".into(),
             files: Vec::new(),
             inject_skills: Vec::new(),
+            required_runtime_mode: None,
             persist_user_message: true,
             user_message_hidden: true,
             on_started: None,
