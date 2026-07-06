@@ -257,6 +257,14 @@ pub(crate) fn resolve_aionrs_url_and_compat(
         return (Some(base), compat);
     }
 
+    // `/v1` is intentionally excluded — that case is handled by the
+    // default branch below for OpenAI/DeepSeek compatibility.
+    if has_non_v1_version_suffix(raw_base_url) {
+        let trimmed = raw_base_url.trim_end_matches('/');
+        compat.api_path = Some("/chat/completions".to_owned());
+        return (Some(trimmed.to_owned()), compat);
+    }
+
     let normalized = normalize_aionrs_base_url(raw_base_url);
     let base_url = Some(normalized).filter(|u| !u.is_empty());
 
@@ -281,6 +289,16 @@ fn is_openai_host(url: &str) -> bool {
 fn normalize_aionrs_base_url(url: &str) -> String {
     let trimmed = url.trim_end_matches('/');
     trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_owned()
+}
+
+/// Detects OpenAI-compatible providers whose base URL already pins a non-v1
+/// API version segment (Zhipu `/api/paas/v4`, Alibaba Ark `/api/v3`, ...).
+fn has_non_v1_version_suffix(url: &str) -> bool {
+    let trimmed = url.trim_end_matches('/');
+    let Some(last) = trimmed.rsplit('/').next() else {
+        return false;
+    };
+    last.len() >= 2 && last.starts_with('v') && last[1..].bytes().all(|b| b.is_ascii_digit()) && last != "v1"
 }
 
 pub(crate) fn resolve_bedrock_config(json: Option<&str>) -> Option<aion_config::config::BedrockConfig> {
@@ -932,6 +950,46 @@ mod tests {
             resolve_aionrs_url_and_compat("custom", "https://api.deepseek.com/v1", "openai", false);
         assert_eq!(base_url.as_deref(), Some("https://api.deepseek.com"));
         assert!(compat.api_path.is_none());
+    }
+
+    #[test]
+    fn resolve_zhipu_v4_keeps_segment_and_sets_chat_path() {
+        let (base_url, compat) =
+            resolve_aionrs_url_and_compat("custom", "https://open.bigmodel.cn/api/paas/v4", "openai", false);
+        assert_eq!(base_url.as_deref(), Some("https://open.bigmodel.cn/api/paas/v4"));
+        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
+        assert!(compat.max_tokens_field.is_none());
+    }
+
+    #[test]
+    fn resolve_ark_v3_keeps_segment_and_sets_chat_path() {
+        let (base_url, compat) =
+            resolve_aionrs_url_and_compat("custom", "https://ark.cn-beijing.volces.com/api/v3", "openai", false);
+        assert_eq!(base_url.as_deref(), Some("https://ark.cn-beijing.volces.com/api/v3"));
+        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
+    }
+
+    #[test]
+    fn resolve_zhipu_v4_with_trailing_slash_stripped() {
+        let (base_url, compat) =
+            resolve_aionrs_url_and_compat("custom", "https://open.bigmodel.cn/api/paas/v4/", "openai", false);
+        assert_eq!(base_url.as_deref(), Some("https://open.bigmodel.cn/api/paas/v4"));
+        assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
+    }
+
+    #[test]
+    fn has_non_v1_version_suffix_cases() {
+        assert!(has_non_v1_version_suffix("https://x/api/paas/v4"));
+        assert!(has_non_v1_version_suffix("https://x/api/v3"));
+        assert!(has_non_v1_version_suffix("https://x/v2"));
+        assert!(has_non_v1_version_suffix("https://x/v04"));
+
+        assert!(!has_non_v1_version_suffix("https://x/v1"));
+        assert!(!has_non_v1_version_suffix("https://x/v1beta"));
+        assert!(!has_non_v1_version_suffix("https://x/v"));
+        assert!(!has_non_v1_version_suffix("https://x/api"));
+        assert!(!has_non_v1_version_suffix("https://x/v1/"));
+        assert!(!has_non_v1_version_suffix(""));
     }
 
     #[test]
