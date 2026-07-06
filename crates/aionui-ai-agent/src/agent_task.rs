@@ -150,6 +150,10 @@ pub trait IMockAgent: IAgentTask {
 pub enum AgentInstance {
     Acp(Arc<AcpAgentManager>),
     Aionrs(Arc<AionrsAgentManager>),
+    /// clean-slate direct-CLI session model (claude/codex only). Wraps an
+    /// `aionui_session::SessionBackend` via [`SessionAgentTask`]. Every other
+    /// backend keeps the `Acp` path. See the session-model-port design doc.
+    Session(Arc<crate::session_agent::SessionAgentTask>),
     /// Test-only trait-object escape hatch used by downstream crates
     /// (conversation/cron/team/app tests) to inject fake agents without
     /// spinning up a real CLI or WebSocket connection. Gated behind
@@ -169,6 +173,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.as_ref(),
             Self::Aionrs(m) => m.as_ref(),
+            Self::Session(m) => m.as_ref(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.as_ref(),
         }
@@ -234,6 +239,12 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.kill_and_wait(reason),
             Self::Aionrs(m) => m.kill_and_wait(reason),
+            // Session teardown is Drop-driven (dropping the last SessionBackend
+            // handle aborts its reader + reaps the child). Nothing to await here.
+            Self::Session(m) => {
+                let _ = m.kill(reason);
+                Box::pin(std::future::ready(()))
+            }
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => {
                 let _ = m.kill(reason);
@@ -257,6 +268,9 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.get_confirmations(),
             Self::Aionrs(m) => m.get_confirmations(),
+            // Session permissions surface as AcpPermission stream events + are
+            // answered via confirm(); no separate cached-confirmation list yet.
+            Self::Session(m) => m.get_confirmations(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_confirmations(),
         }
@@ -273,6 +287,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.confirm(msg_id, call_id, data, always_allow),
             Self::Aionrs(m) => m.confirm(msg_id, call_id, data, always_allow),
+            Self::Session(m) => m.confirm(msg_id, call_id, data, always_allow),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.confirm(msg_id, call_id, data, always_allow),
         }
@@ -283,6 +298,8 @@ impl AgentInstance {
         match self {
             Self::Acp(_) => false,
             Self::Aionrs(m) => m.check_approval(action, command_type),
+            // Session (claude/codex) has no aionrs-style auto-approve list.
+            Self::Session(_) => false,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.check_approval(action, command_type),
         }
@@ -291,7 +308,7 @@ impl AgentInstance {
     /// Session key for test doubles that expose one.
     pub fn get_session_key(&self) -> Option<String> {
         match self {
-            Self::Acp(_) | Self::Aionrs(_) => None,
+            Self::Acp(_) | Self::Aionrs(_) | Self::Session(_) => None,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_session_key(),
         }
@@ -302,6 +319,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.mode().await,
             Self::Aionrs(m) => m.mode().await,
+            Self::Session(m) => m.mode().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.mode().await,
         }
@@ -324,6 +342,7 @@ impl AgentInstance {
                 Ok(GetModelInfoResponse { model_info })
             }
             Self::Aionrs(_) => Ok(GetModelInfoResponse { model_info: None }),
+            Self::Session(m) => m.get_model().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_model().await,
         }
@@ -333,6 +352,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.config_options().await,
             Self::Aionrs(m) => m.config_options().await,
+            Self::Session(m) => m.get_config_options().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_config_options().await,
         }
@@ -348,6 +368,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.set_config_option_confirmed(option_id, value).await,
             Self::Aionrs(m) => m.set_config_option(option_id, value).await,
+            Self::Session(m) => m.set_config_option(option_id, value).await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.set_config_option(option_id, value).await,
         }
@@ -371,6 +392,7 @@ impl AgentInstance {
                 Ok(Some(value))
             }
             Self::Aionrs(_) => Ok(None),
+            Self::Session(m) => m.get_usage().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_usage().await,
         }
@@ -383,6 +405,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.load_slash_commands().await,
             Self::Aionrs(m) => m.get_slash_commands().await,
+            Self::Session(m) => m.get_slash_commands().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_slash_commands().await,
         }
@@ -410,6 +433,10 @@ impl AgentInstance {
                 })
             }
             Self::Aionrs(_) => Ok(SideQuestionResponse {
+                status: "unsupported".into(),
+                answer: None,
+            }),
+            Self::Session(_) => Ok(SideQuestionResponse {
                 status: "unsupported".into(),
                 answer: None,
             }),

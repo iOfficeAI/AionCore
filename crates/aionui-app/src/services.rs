@@ -163,6 +163,34 @@ impl AppServices {
         let runtime_helper_bin = backend_binary_path.to_string_lossy().into_owned();
         let runtime_base_url = config.local_base_url();
 
+        // Session-model port (phase 1): the subprocess spawner the clean-slate
+        // claude/codex SessionBackend uses. Registry-backed (feature 001) so spawned
+        // processes are reap-gateable; a fresh per-run epoch (no cross-run reap
+        // authority is required for the port's spawn path).
+        //
+        // A/B differential-test escape hatch: setting AIONUI_DISABLE_SESSION_PORT=1
+        // leaves the spawner un-wired (None), so claude/codex fall through to the
+        // legacy AcpAgentManager path in factory/acp.rs. This lets the SAME binary
+        // drive the SAME claude/codex CLI through EITHER path (flip the env, restart)
+        // for frame-by-frame equivalence comparison. Unset (production) = session path.
+        let session_port_disabled = std::env::var("AIONUI_DISABLE_SESSION_PORT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let session_spawner: Option<Arc<dyn aionui_process::Spawner>> = if session_port_disabled {
+            tracing::warn!(
+                "AIONUI_DISABLE_SESSION_PORT set — claude/codex will use the legacy AcpAgentManager path (A/B test mode)"
+            );
+            None
+        } else {
+            let process_registry = Arc::new(aionui_process::FileRegistryStore::new(&data_dir));
+            let machine_id = aionui_process::local_machine_id(&data_dir);
+            Some(Arc::new(aionui_process::RealSpawner::new(
+                process_registry,
+                uuid::Uuid::now_v7(),
+                machine_id,
+            )))
+        };
+
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
             provider_repo,
@@ -174,6 +202,7 @@ impl AppServices {
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            session_spawner,
         });
 
         // Agent factory is now wired. Future extension/custom agents

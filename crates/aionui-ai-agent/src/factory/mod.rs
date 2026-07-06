@@ -40,6 +40,11 @@ pub struct AgentFactoryDeps {
     /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
     /// `None` for tests/composition paths that do not need MCP injection.
     pub mcp_server_repo: Option<Arc<dyn IMcpServerRepository>>,
+    /// Subprocess spawner for the clean-slate session model (claude/codex go
+    /// through `SessionAgentTask` instead of the ACP manager — session-model
+    /// port phase 1). `None` on paths that never build a claude/codex session
+    /// (tests); when `None` those backends fall back to the ACP path.
+    pub session_spawner: Option<Arc<dyn aionui_process::Spawner>>,
 }
 
 /// Build a production agent factory that dispatches to concrete agent types.

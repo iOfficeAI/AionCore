@@ -50,6 +50,48 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
+    // Session-model port (phase 1): claude/codex run through the clean-slate
+    // direct-CLI SessionBackend (SessionAgentTask), NOT the ACP manager. Every other
+    // ACP vendor keeps the AcpAgentManager path below. Gated on a spawner being wired
+    // (production); absent (tests) → fall through to the ACP path. The build inputs
+    // mirror clean-slate `build_runtime` 1:1 (resume anchor, mode/model precedence,
+    // MCP + preset + skills init surface, cc-switch env, codex sandbox/approval).
+    if let (Some(backend_label), Some(spawner)) = (config.backend.as_deref(), deps.session_spawner.clone())
+        && matches!(backend_label, "claude" | "codex")
+        && let Some(instance) = crate::session_agent::build_session_instance(
+            backend_label,
+            crate::session_agent::SessionBuildInputs {
+                conversation_id: ctx.conversation_id.clone(),
+                workspace: ctx.workspace.clone(),
+                config: &config,
+                metadata: &meta,
+                session_snapshot: build_context.session_snapshot.as_ref(),
+                backend_session_id: build_context.session_id.clone(),
+                mcp_server_repo: deps.mcp_server_repo.as_ref(),
+                broadcaster: deps.broadcaster.clone(),
+                // G5: keyed by the resolved catalog row so the discovered
+                // modes/models/commands refresh the `/api/agents` picker (the
+                // AcpAgentManager path does this via CatalogForwarder; the session
+                // path polls capabilities() directly since its stream carries no
+                // catalog events).
+                catalog_writeback: Some((meta.id.clone(), deps.agent_registry.catalog_sender())),
+                // Persist the resume anchor + observed mode/model from the session
+                // pump (the ACP path does this via acp_agent_service.attach, which
+                // this early-return bypasses).
+                acp_session_repo: Some(deps.acp_agent_service.repo()),
+            },
+            spawner,
+        )
+        .await?
+    {
+        tracing::info!(
+            conversation_id = %ctx.conversation_id,
+            backend = %backend_label,
+            "session-port: routing conversation through the direct-CLI SessionAgentTask (not AcpAgentManager)"
+        );
+        return Ok(instance);
+    }
+
     let mut command_spec =
         resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
     apply_acp_launch_policy(

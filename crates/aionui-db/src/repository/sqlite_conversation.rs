@@ -12,6 +12,27 @@ use crate::repository::conversation::{
     MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
 
+/// Bump `conversations.updated_at` so the conversation-list sort
+/// (ORDER BY conversations.updated_at DESC) floats a conversation with fresh
+/// activity to the top. Persisting a message never used to touch this column,
+/// so a conversation receiving new messages stayed frozen at its last
+/// create/rename/reset time. `MAX(updated_at, ?)` keeps recency monotonic: an
+/// out-of-order streaming upsert (older event time) can never move a
+/// conversation backward in the list. Runs inside the caller's transaction so
+/// the message write and the bump commit atomically.
+async fn bump_conversation_updated_at(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+    at: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?")
+        .bind(at)
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// SQLite-backed implementation of [`IConversationRepository`].
 #[derive(Clone, Debug)]
 pub struct SqliteConversationRepository {
@@ -24,6 +45,7 @@ impl SqliteConversationRepository {
     }
 
     async fn insert_message_once(&self, message: &MessageRow) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
@@ -39,13 +61,17 @@ impl SqliteConversationRepository {
         .bind(&message.status)
         .bind(message.hidden)
         .bind(message.created_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        bump_conversation_updated_at(&mut tx, &message.conversation_id, message.created_at).await?;
+        tx.commit().await?;
 
         Ok(())
     }
 
     async fn upsert_message_once(&self, message: &MessageRow) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
@@ -85,8 +111,11 @@ impl SqliteConversationRepository {
         .bind(&message.status)
         .bind(message.hidden)
         .bind(message.created_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        bump_conversation_updated_at(&mut tx, &message.conversation_id, message.created_at).await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -1091,6 +1120,50 @@ mod tests {
     async fn get_nonexistent_returns_none() {
         let (repo, _db) = setup().await;
         assert!(repo.get("no_such_id").await.unwrap().is_none());
+    }
+
+    /// Persisting a message must bump the parent conversation's updated_at so the
+    /// conversation-list sort (ORDER BY conversations.updated_at DESC) floats a
+    /// conversation with fresh activity to the top. Recency is monotonic — an
+    /// out-of-order (older) upsert must not move it backward.
+    #[tokio::test]
+    async fn insert_message_bumps_conversation_updated_at() {
+        let (repo, _db) = setup().await;
+        let mut conv = sample_conversation(SYSTEM_USER_ID);
+        conv.updated_at = 1; // force a known-stale baseline
+        repo.create(&conv).await.unwrap();
+
+        // insert_message with a newer event time bumps updated_at forward.
+        let mut msg = sample_message(&conv.id);
+        msg.created_at = 5_000;
+        repo.insert_message(&msg).await.unwrap();
+        assert_eq!(
+            repo.get(&conv.id).await.unwrap().unwrap().updated_at,
+            5_000,
+            "insert must bump updated_at to the message time"
+        );
+
+        // A newer upsert (streaming tool-call update) advances recency.
+        let mut newer = sample_message(&conv.id);
+        newer.id = "tool-1".to_string();
+        newer.created_at = 9_000;
+        repo.upsert_message(&newer).await.unwrap();
+        assert_eq!(
+            repo.get(&conv.id).await.unwrap().unwrap().updated_at,
+            9_000,
+            "newer upsert must advance updated_at"
+        );
+
+        // An out-of-order (older) upsert must NOT move recency backward (MAX guard).
+        let mut older = sample_message(&conv.id);
+        older.id = "tool-2".to_string();
+        older.created_at = 3_000;
+        repo.upsert_message(&older).await.unwrap();
+        assert_eq!(
+            repo.get(&conv.id).await.unwrap().unwrap().updated_at,
+            9_000,
+            "older upsert must not move updated_at backward"
+        );
     }
 
     #[tokio::test]

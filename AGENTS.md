@@ -8,6 +8,22 @@ Project-specific rules and conventions for AI assistants and contributors.
 
 ## High-Priority Rules
 
+### Do NOT state a claim as fact until you have verified it in the code yourself
+
+This rule exists because of a repeated, costly failure mode: forming a confident conclusion from a *proxy* for the truth instead of the truth itself, then reporting it to the user as fact. Concrete instances that must never recur:
+
+- **Trusting a sub-agent's conclusion without checking its evidence.** A spawned agent reported "the frontend has NO question renderer; the break is in the frontend." That was false — the frontend renders whatever `options[]` the backend sends; the real bug was the backend hard-coding `[Allow, Reject]` options for an AskUserQuestion. The conclusion was relayed to the user verbatim. **A sub-agent's report is a lead, not a fact. Before you repeat any load-bearing claim from an agent, open the cited file:line and confirm it says what the agent said.**
+- **Declaring equivalence/correctness from a thin test.** A frame-by-frame A/B was run with one trivial prompt ("Reply PONG") that only exercised `start/text/finish`, then "core turn flow is equivalent" was declared. The prompt never triggered tool-output streaming, subagents, plans, permissions, AskUserQuestion, or mode-switch — where all the real divergences were. **A green result on inputs that don't exercise the behavior is not evidence about that behavior. Before claiming a class of behavior works, confirm your test actually produces that class of event.**
+
+Enforced behaviors:
+1. **Cite from primary source.** Any claim about what code does must be backed by a file you (this agent) have read this session — not a sub-agent's summary, not memory, not inference from names. Sub-agent findings must be spot-checked against the code before being surfaced.
+2. **Verify the negative before asserting absence.** Never say "X has no Y / feature Z doesn't exist / the frontend can't do this" until you have grepped for it AND read the relevant handler. Absence is a strong claim; a single missed file falsifies it (e.g. `sideQuestion.ts`, `MessageAcpPermission` rendering dynamic `options[]`).
+3. **Match the test to the claim.** When verifying behavior, the test input must exercise the exact events/paths the claim covers. Trivial/happy-path inputs prove only the trivial path. When you cannot exercise a path, say so explicitly rather than implying it passed.
+4. **Trace to the break, don't guess the layer.** For a cross-layer bug (backend→wire→frontend), follow the actual data through every link and locate where it diverges from expected. Do not attribute the break to a layer by plausibility.
+5. **Calibrate language to evidence.** Say "verified: <file:line>", "not yet checked", or "a sub-agent claims X (unverified)". Never launder an unverified lead into a flat assertion.
+
+See also the standing discipline in the root `AGENTS.md` / memory `aioncore-verification-blindspot-g6`: self-consistent-all-green ≠ correct — verify outward (against a real agent) AND against the old/reference implementation, not just against your own happy path.
+
 ### Do NOT add fields to `AcpAgentManager` unless every alternative is exhausted
 
 `AcpAgentManager` (in `crates/aionui-ai-agent/src/acp_agent.rs`) is already large and carries multiple overlapping state holders (e.g. `runtime_snapshot`, `state`, `preferred_mode`, `config`). New fields tend to duplicate semantics that `AcpRuntimeSnapshot` or `AcpState` already model, which fragments the source of truth and makes resume/new paths diverge.

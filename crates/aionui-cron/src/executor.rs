@@ -3150,6 +3150,9 @@ mod tests {
         ) -> Result<bool, aionui_db::DbError> {
             Ok(false)
         }
+        async fn clear_session_id(&self, _conversation_id: &str) -> Result<bool, aionui_db::DbError> {
+            Ok(false)
+        }
         async fn delete(&self, _conversation_id: &str) -> Result<bool, aionui_db::DbError> {
             Ok(false)
         }

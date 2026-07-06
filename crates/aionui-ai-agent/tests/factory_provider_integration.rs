@@ -78,6 +78,7 @@ fn make_factory(
         broadcaster: Arc::new(BroadcastEventBus::new(16)),
         backend_binary_path: Arc::new(PathBuf::from("/tmp/aionrs-test/aioncore")),
         mcp_server_repo: None,
+        session_spawner: None,
     })
 }
 
