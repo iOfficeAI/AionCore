@@ -637,7 +637,12 @@ async fn exec_send_message(
             );
         }
         debug!(from = caller_slot_id, reason, "shutdown_rejected handled");
-        return Ok(format!("shutdown_rejected: {reason}"));
+        return Ok(json!({
+            "status": "ok",
+            "action": "shutdown_rejected",
+            "reason": reason,
+        })
+        .to_string());
     }
 
     let resolved_to = if input.to == "*" {

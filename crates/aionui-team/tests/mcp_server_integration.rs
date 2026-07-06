@@ -427,7 +427,10 @@ async fn team_send_message_shutdown_rejected_intercepted() {
 
     assert!(!is_error_response(&resp));
     let text = extract_text(&resp);
-    assert_eq!(text, "shutdown_rejected: still finishing task");
+    let payload: Value = serde_json::from_str(&text).expect("shutdown_rejected response must be JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["action"], "shutdown_rejected");
+    assert_eq!(payload["reason"], "still finishing task");
 
     env.server.stop();
 }
@@ -1131,14 +1134,10 @@ async fn tsr1_shutdown_rejected_notifies_lead_and_preserves_agent() {
 
     assert!(!is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(
-        text.contains("shutdown_rejected"),
-        "response should echo the sentinel, got: {text}"
-    );
-    assert!(
-        text.contains("still working"),
-        "response should echo the reason, got: {text}"
-    );
+    let payload: Value = serde_json::from_str(&text).expect("shutdown_rejected response must be JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["action"], "shutdown_rejected");
+    assert_eq!(payload["reason"], "still working");
 
     // Leader mailbox contains the notification, worker did not receive a
     // literal copy of the sentinel.
