@@ -357,7 +357,9 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
         available_models: Some(
             r#"{"current_model_id":"claude-opus","current_model_label":"Claude Opus","available_models":[{"id":"claude-opus","label":"Claude Opus"}]}"#,
         ),
-        available_commands: None,
+        available_commands: Some(
+            r#"{"available_commands":[{"name":"review","description":"Review the current diff"}]}"#,
+        ),
         sort_order: 100,
     })
     .await
@@ -382,6 +384,10 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
     assert_eq!(
         row_json["config_options"]["config_options"][0]["current_value"].as_str(),
         Some("claude-opus")
+    );
+    assert_eq!(
+        row_json["available_commands"]["available_commands"][0]["name"].as_str(),
+        Some("review")
     );
 }
 

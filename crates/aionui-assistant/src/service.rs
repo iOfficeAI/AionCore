@@ -3015,6 +3015,7 @@ mod tests {
             config_options: None,
             available_modes: None,
             available_models: None,
+            available_commands: None,
             sort_order: 3100,
             team_capable: true,
             status,
