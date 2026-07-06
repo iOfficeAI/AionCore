@@ -226,9 +226,14 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
 }
 
 #[tokio::test]
-async fn management_rows_mark_unchecked_agents_unchecked_without_probe() {
+async fn management_rows_mark_installed_agents_without_health_check_unchecked() {
     let db = init_database_memory().await.unwrap();
     let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let command_path = temp.path().join("unchecked-cli");
+    std::fs::write(&command_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let command = command_path.to_string_lossy().to_string();
+    let source_info = serde_json::json!({ "binary_name": command }).to_string();
 
     repo.upsert(&UpsertAgentMetadataParams {
         id: "agent-unchecked-cli",
@@ -240,9 +245,9 @@ async fn management_rows_mark_unchecked_agents_unchecked_without_probe() {
         backend: Some("custom"),
         agent_type: "acp",
         agent_source: "custom",
-        agent_source_info: Some(r#"{"binary_name":"unchecked-cli"}"#),
+        agent_source_info: Some(&source_info),
         enabled: true,
-        command: Some("unchecked-cli"),
+        command: Some(&command),
         args: Some("[]"),
         env: Some("[]"),
         native_skills_dirs: None,
@@ -271,7 +276,7 @@ async fn management_rows_mark_unchecked_agents_unchecked_without_probe() {
 
     let row_json = serde_json::to_value(&row).unwrap();
     assert_eq!(row_json["status"].as_str(), Some("unchecked"));
-    assert!(!row.installed);
+    assert!(row.installed);
     assert!(row.last_check_status.is_none());
     assert!(row.last_check_error_code.is_none());
 }

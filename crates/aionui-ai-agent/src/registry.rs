@@ -188,12 +188,12 @@ impl AgentRegistry {
             tx: self.catalog_tx.clone(),
         }
     }
-    /// Reload every row from the database without probing spawn commands.
+    /// Reload every row from the database and refresh installation state.
     ///
-    /// Startup must be cheap and side-effect free: user-facing health checks
-    /// are explicit, so hydration projects availability from persisted
-    /// snapshots and only marks deterministic row states (disabled/no command)
-    /// as unavailable.
+    /// Startup remains side-effect free: this only checks whether the required
+    /// command / managed runtime can be resolved. It does not start agents,
+    /// perform handshakes, fetch models, or overwrite persisted health-check
+    /// snapshots. User-facing health checks stay explicit.
     pub async fn hydrate(&self) -> Result<(), AgentError> {
         let rows = self
             .repo
@@ -204,7 +204,7 @@ impl AgentRegistry {
         let mut map = HashMap::with_capacity(rows.len());
         let mut reasons = HashMap::new();
         for row in rows {
-            let Some((meta, reason)) = decode_row(row, AvailabilityProjection::Cached) else {
+            let Some((meta, reason)) = decode_row(row, AvailabilityProjection::Probe) else {
                 continue;
             };
             if let Some(reason) = reason {

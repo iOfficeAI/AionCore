@@ -374,6 +374,7 @@ impl AssistantService {
             .iter()
             .filter(|row| {
                 row.enabled
+                    && row.installed
                     && row.agent_type.supports_new_conversation()
                     && matches!(
                         row.status,
@@ -652,6 +653,9 @@ impl AssistantService {
         let mut result = Vec::new();
 
         for definition in &definitions {
+            if generated_definition_is_uninstalled(definition, &projections) {
+                continue;
+            }
             let projection = self
                 .project_definition(definition, state_map.get(&definition.id), &projections)
                 .await?;
@@ -678,6 +682,9 @@ impl AssistantService {
     pub async fn get(&self, id: &str) -> Result<AssistantResponse, AssistantError> {
         let projections = self.reconcile_generated_assistants().await?;
         if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
+            if generated_definition_is_uninstalled(&definition, &projections) {
+                return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
+            }
             let state = self.state_repo.get(&definition.id).await?;
             let projection = self
                 .project_definition(&definition, state.as_ref(), &projections)
@@ -691,6 +698,9 @@ impl AssistantService {
     pub async fn get_detail(&self, id: &str, locale: Option<&str>) -> Result<AssistantDetailResponse, AssistantError> {
         let projections = self.reconcile_generated_assistants().await?;
         if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
+            if generated_definition_is_uninstalled(&definition, &projections) {
+                return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
+            }
             let state = self.state_repo.get(&definition.id).await?;
             let preference = self.preference_repo.get(&definition.id).await?;
             let rules_content = self.read_rule(id, locale).await?;
@@ -2325,6 +2335,23 @@ fn assistant_projection_for_definition(
     }
 }
 
+fn generated_definition_is_uninstalled(definition: &AssistantDefinitionRow, agent_rows: &[AgentManagementRow]) -> bool {
+    if definition.source != "generated" {
+        return false;
+    }
+
+    let agent_id = definition.agent_id.as_str();
+    let source_ref = definition.source_ref.as_deref();
+    let Some(row) = agent_rows
+        .iter()
+        .find(|row| row.id == agent_id || source_ref == Some(row.id.as_str()))
+    else {
+        return true;
+    };
+
+    !row.installed
+}
+
 fn effective_agent_id_for_definition<'a>(
     definition: &'a AssistantDefinitionRow,
     state: Option<&'a AssistantOverlayRow>,
@@ -3006,6 +3033,66 @@ mod tests {
         }
     }
 
+    fn mk_uninstalled_agent_row(id: &str, backend: &str) -> aionui_api_types::AgentManagementRow {
+        let mut row = mk_agent_row(id, backend, aionui_api_types::AgentManagementStatus::Unchecked);
+        row.installed = false;
+        row.last_check_status = None;
+        row.last_check_kind = None;
+        row.last_check_latency_ms = None;
+        row.last_check_at = None;
+        row.last_success_at = None;
+        row
+    }
+
+    async fn insert_generated_definition(fx: &Fixture, definition_id: &str, assistant_id: &str, agent_id: &str) {
+        fx.definition_repo
+            .upsert(&UpsertAssistantDefinitionParams {
+                id: definition_id,
+                assistant_id,
+                source: "generated",
+                owner_type: "system",
+                source_ref: Some(agent_id),
+                source_version: None,
+                source_hash: None,
+                name: "Historical generated agent",
+                name_i18n: "{}",
+                description: None,
+                description_i18n: "{}",
+                avatar_type: "none",
+                avatar_value: None,
+                agent_id,
+                rule_resource_type: "none",
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: "[]",
+                recommended_prompts_i18n: "{}",
+                default_model_mode: "auto",
+                default_model_value: None,
+                default_permission_mode: "auto",
+                default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
+                default_skills_mode: "fixed",
+                default_skill_ids: "[]",
+                custom_skill_names: "[]",
+                default_disabled_builtin_skill_ids: "[]",
+                default_mcps_mode: "auto",
+                default_mcp_ids: "[]",
+            })
+            .await
+            .unwrap();
+        fx.state_repo
+            .upsert(&UpsertAssistantOverlayParams {
+                assistant_definition_id: definition_id,
+                enabled: true,
+                sort_order: 3,
+                agent_id_override: None,
+                last_used_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn list_empty_is_empty() {
         let fx = fixture().await;
@@ -3107,6 +3194,14 @@ mod tests {
     #[tokio::test]
     async fn list_maps_generated_definition_to_generated_source() {
         let fx = fixture().await;
+        fx.agent_rows
+            .lock()
+            .expect("agent rows lock poisoned")
+            .push(mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            ));
         fx.definition_repo
             .upsert(&UpsertAssistantDefinitionParams {
                 id: "asstdef-generated",
@@ -3216,6 +3311,65 @@ mod tests {
         assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Unchecked);
         assert!(bare.team_selectable);
         assert!(bare.agent_status_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_skips_generated_assistant_for_uninstalled_unchecked_agent() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_uninstalled_agent_row("agent-snow", "snow")],
+            ..Default::default()
+        })
+        .await;
+
+        let list = fx.service.list().await.unwrap();
+
+        assert!(
+            list.iter().all(|assistant| assistant.id != "bare:agent-snow"),
+            "uninstalled agents must not occupy generated assistant list slots"
+        );
+        assert!(
+            fx.definition_repo
+                .get_by_assistant_id("bare:agent-snow")
+                .await
+                .unwrap()
+                .is_none(),
+            "bootstrap should not materialize generated assistant definitions for uninstalled agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_hides_existing_generated_assistant_when_agent_is_uninstalled_until_installed() {
+        let mut uninstalled_row = mk_uninstalled_agent_row("agent-snow", "snow");
+        uninstalled_row.status = aionui_api_types::AgentManagementStatus::Offline;
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![uninstalled_row],
+            ..Default::default()
+        })
+        .await;
+        insert_generated_definition(&fx, "asstdef-generated-snow", "bare:agent-snow", "agent-snow").await;
+
+        let hidden = fx.service.list().await.unwrap();
+        assert!(
+            hidden.iter().all(|assistant| assistant.id != "bare:agent-snow"),
+            "historical generated assistants should be hidden while their agent is not installed"
+        );
+
+        {
+            let mut rows = fx.agent_rows.lock().expect("agent rows lock poisoned");
+            rows[0].installed = true;
+            rows[0].status = aionui_api_types::AgentManagementStatus::Unchecked;
+        }
+
+        let restored = fx.service.list().await.unwrap();
+        let assistant = restored
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-snow")
+            .expect("installed generated assistant should reappear");
+        assert_eq!(assistant.source, AssistantSource::Generated);
+        assert_eq!(
+            assistant.agent_status,
+            aionui_api_types::AgentManagementStatus::Unchecked
+        );
     }
 
     #[tokio::test]
