@@ -4,6 +4,7 @@ pub(crate) mod spawn_support;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager};
 use aionui_api_types::{
@@ -19,6 +20,7 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
+use futures_util::stream::{self, StreamExt};
 use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
@@ -30,7 +32,7 @@ use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogPort};
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::session::{AgentMessageQueueResult, TeamSession, spawn_attach_agent_process_bg};
-use crate::types::{Team, TeamAgent, TeammateStatus};
+use crate::types::{Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::wake::TeamWakeSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -43,6 +45,14 @@ pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &
 struct SessionEntry {
     session: Arc<TeamSession>,
     slow_monitor_handle: tokio::task::JoinHandle<()>,
+}
+
+const TEAM_REBUILD_MAX_PARALLELISM: usize = 4;
+
+struct TeamAgentRebuildOutcome {
+    agent: TeamAgent,
+    duration_ms: u128,
+    result: Result<(), TeamError>,
 }
 
 pub struct TeamSessionService {
@@ -746,28 +756,133 @@ impl TeamSessionService {
         agents: &[TeamAgent],
     ) -> Result<(), TeamError> {
         let provisioner = self.provisioner();
-        for agent in agents {
+        let task_manager = self.task_manager.clone();
+        let parallelism = agents.len().clamp(1, TEAM_REBUILD_MAX_PARALLELISM);
+        let started_at = Instant::now();
+        let mut rebuild_jobs: Vec<TeamAgent> = agents.to_vec();
+        rebuild_jobs.sort_by_key(|agent| match agent.role {
+            TeammateRole::Lead => 0,
+            TeammateRole::Teammate => 1,
+        });
+
+        info!(
+            team_id,
+            agent_count = agents.len(),
+            parallelism,
+            "team agent rebuild started"
+        );
+
+        let outcomes: Vec<TeamAgentRebuildOutcome> = stream::iter(rebuild_jobs.into_iter().map(|agent| {
+            let provisioner = provisioner.clone();
+            let task_manager = task_manager.clone();
+            let user_id = user_id.to_owned();
             let cfg = session.mcp_stdio_config(&agent.slot_id);
 
-            if let Err(e) = provisioner
-                .attach_agent_process(user_id, agent, cfg, &self.task_manager)
-                .await
-            {
-                let msg = format!("failed to attach rebuilt agent {}: {e}", agent.slot_id);
-                self.broadcast_mcp_phase(team_id, &agent.slot_id, TeamMcpPhase::SessionError, None, |p| {
-                    p.error = Some(msg.clone());
-                });
-                warn!(
-                    team_id,
+            async move {
+                info!(
+                    team_id = %cfg.team_id,
                     slot_id = %agent.slot_id,
                     conversation_id = %agent.conversation_id,
-                    error = %e,
-                    "warmup failed during rebuild"
+                    backend = %agent.backend,
+                    role = %agent.role,
+                    "team agent rebuild attach started"
                 );
-                return Err(TeamError::InvalidRequest(msg));
+                let attach_started_at = Instant::now();
+                let result = provisioner
+                    .attach_agent_process(&user_id, &agent, cfg, &task_manager)
+                    .await;
+                let duration_ms = attach_started_at.elapsed().as_millis();
+                match &result {
+                    Ok(()) => info!(
+                        team_id,
+                        slot_id = %agent.slot_id,
+                        conversation_id = %agent.conversation_id,
+                        duration_ms,
+                        "team agent rebuild attach finished"
+                    ),
+                    Err(error) => warn!(
+                        team_id,
+                        slot_id = %agent.slot_id,
+                        conversation_id = %agent.conversation_id,
+                        duration_ms,
+                        error = %error,
+                        "team agent rebuild attach failed"
+                    ),
+                }
+                TeamAgentRebuildOutcome {
+                    agent,
+                    duration_ms,
+                    result,
+                }
+            }
+        }))
+        .buffer_unordered(parallelism)
+        .collect()
+        .await;
+
+        let mut success_count = 0usize;
+        let mut failures: Vec<&TeamAgentRebuildOutcome> = Vec::new();
+        for outcome in &outcomes {
+            match &outcome.result {
+                Ok(()) => success_count += 1,
+                Err(_) => failures.push(outcome),
             }
         }
-        Ok(())
+
+        info!(
+            team_id,
+            agent_count = agents.len(),
+            success_count,
+            failure_count = failures.len(),
+            duration_ms = started_at.elapsed().as_millis(),
+            "team agent rebuild completed"
+        );
+
+        if failures.is_empty() {
+            return Ok(());
+        }
+
+        let first_error = failures
+            .first()
+            .and_then(|outcome| outcome.result.as_ref().err().map(|error| error.to_string()))
+            .unwrap_or_else(|| "unknown rebuild failure".to_owned());
+
+        for failure in &failures {
+            let error = failure
+                .result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unknown rebuild failure".to_owned());
+            let msg = format!("failed to attach rebuilt agent {}: {error}", failure.agent.slot_id);
+            self.broadcast_mcp_phase(team_id, &failure.agent.slot_id, TeamMcpPhase::SessionError, None, |p| {
+                p.error = Some(msg);
+            });
+            warn!(
+                team_id,
+                slot_id = %failure.agent.slot_id,
+                conversation_id = %failure.agent.conversation_id,
+                duration_ms = failure.duration_ms,
+                error = %error,
+                "warmup failed during rebuild"
+            );
+        }
+
+        for success in outcomes.iter().filter(|outcome| outcome.result.is_ok()) {
+            info!(
+                team_id,
+                slot_id = %success.agent.slot_id,
+                conversation_id = %success.agent.conversation_id,
+                "cleaning up successfully attached agent after rebuild failure"
+            );
+            self.task_manager
+                .kill_and_wait(&success.agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
+                .await;
+        }
+
+        Err(TeamError::InvalidRequest(format!(
+            "failed to attach rebuilt agent: {first_error}"
+        )))
     }
 
     /// Spawn per-agent event loops that drain the mailbox whenever notified.

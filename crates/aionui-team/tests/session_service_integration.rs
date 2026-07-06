@@ -1826,6 +1826,75 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
     ]
 }
 
+fn team_agent_input(name: &str, role: &str, model: &str) -> TeamAgentInput {
+    TeamAgentInput {
+        name: name.into(),
+        role: role.into(),
+        backend: Some("acp".into()),
+        model: model.into(),
+        assistant_id: None,
+        conversation_id: None,
+    }
+}
+
+fn four_agent_input_leader_not_first() -> Vec<TeamAgentInput> {
+    vec![
+        team_agent_input("Worker 1", "teammate", "worker-1"),
+        team_agent_input("Lead", "lead", "lead-model"),
+        team_agent_input("Worker 2", "teammate", "worker-2"),
+        team_agent_input("Worker 3", "teammate", "worker-3"),
+    ]
+}
+
+fn five_agent_input_leader_not_first() -> Vec<TeamAgentInput> {
+    vec![
+        team_agent_input("Worker 1", "teammate", "worker-1"),
+        team_agent_input("Worker 2", "teammate", "worker-2"),
+        team_agent_input("Lead", "lead", "lead-model"),
+        team_agent_input("Worker 3", "teammate", "worker-3"),
+        team_agent_input("Worker 4", "teammate", "worker-4"),
+    ]
+}
+
+#[derive(Default)]
+struct WarmupConcurrencyProbe {
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    starts: Mutex<Vec<String>>,
+}
+
+impl WarmupConcurrencyProbe {
+    fn factory(self: &Arc<Self>, delay: std::time::Duration) -> AgentFactory {
+        use futures_util::FutureExt;
+
+        let probe = Arc::clone(self);
+        Arc::new(move |opts: BuildTaskOptions| {
+            let probe = Arc::clone(&probe);
+            async move {
+                let conversation_id = opts.context.conversation.conversation_id.clone();
+                probe.starts.lock().unwrap().push(conversation_id.clone());
+                let current = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+                probe.max_active.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                probe.active.fetch_sub(1, Ordering::SeqCst);
+
+                Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                    mock_agent::MockAgent::new(conversation_id, opts.context.workspace.path),
+                )))
+            }
+            .boxed()
+        })
+    }
+
+    fn max_active(&self) -> usize {
+        self.max_active.load(Ordering::SeqCst)
+    }
+
+    fn starts(&self) -> Vec<String> {
+        self.starts.lock().unwrap().clone()
+    }
+}
+
 async fn reset_runtime_state(svc: &Arc<TeamSessionService>, tm: &Arc<CountingTaskManager>, team_id: &str) {
     svc.stop_session("user1", team_id).await.unwrap();
     tm.reset().await;
@@ -4603,6 +4672,44 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
 }
 
 #[tokio::test]
+async fn d9_ensure_session_rebuilds_agents_in_bounded_parallel_with_leader_first() {
+    let probe = Arc::new(WarmupConcurrencyProbe::default());
+    let (svc, _tm) = setup_with_factory(probe.factory(std::time::Duration::from_millis(40)));
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: five_agent_input_leader_not_first(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let lead_conversation_id = created
+        .assistants
+        .iter()
+        .find(|assistant| assistant.role == "lead")
+        .expect("lead assistant")
+        .conversation_id
+        .clone();
+
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    let starts = probe.starts();
+    assert_eq!(
+        starts.first(),
+        Some(&lead_conversation_id),
+        "leader must be scheduled first for team rebuild warmup"
+    );
+    assert_eq!(
+        probe.max_active(),
+        4,
+        "five-agent rebuild should use bounded parallelism with a max of four concurrent warmups"
+    );
+}
+
+#[tokio::test]
 async fn d9_ensure_session_persists_team_mcp_stdio_config() {
     // Each agent's conversation.extra must carry a `team_mcp_stdio_config`
     // object by the time the factory is called — that is what the rebuilt
@@ -4703,16 +4810,73 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
     let result = svc.ensure_session("user1", &created.id).await;
     assert!(result.is_err(), "ensure_session should propagate build error");
 
-    // Rebuild aborts on the first warmup failure, so only the first agent
-    // is killed/built. No session is inserted, so send_message still errors.
+    // Parallel rebuild attempts all settle, but no session is inserted after
+    // the aggregate failure.
     let calls = tm.snapshot();
-    assert_eq!(calls.kill.len(), 1);
-    assert_eq!(calls.build.len(), 1);
+    assert_eq!(calls.kill.len(), 2);
+    assert_eq!(calls.build.len(), 2);
 
     let send_result = svc.send_message("user1", &created.id, "Hello", None).await;
     assert!(
         send_result.is_err(),
         "session must not be registered after build failure"
+    );
+}
+
+#[tokio::test]
+async fn d9_ensure_session_cleans_up_successful_rebuilds_when_one_agent_fails() {
+    use futures_util::FutureExt;
+
+    let fail_conversation_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let fail_target = Arc::clone(&fail_conversation_id);
+    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+        let fail_target = Arc::clone(&fail_target);
+        async move {
+            let conversation_id = opts.context.conversation.conversation_id.clone();
+            if fail_target.lock().unwrap().as_deref() == Some(conversation_id.as_str()) {
+                return Err(AgentError::internal("simulated build failure"));
+            }
+
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                mock_agent::MockAgent::new(conversation_id, opts.context.workspace.path),
+            )))
+        }
+        .boxed()
+    });
+    let (svc, tm) = setup_with_factory(factory);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: four_agent_input_leader_not_first(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let failed_agent = created
+        .assistants
+        .iter()
+        .find(|assistant| assistant.name == "Worker 3")
+        .expect("failed agent")
+        .conversation_id
+        .clone();
+    *fail_conversation_id.lock().unwrap() = Some(failed_agent);
+
+    let result = svc.ensure_session("user1", &created.id).await;
+    assert!(result.is_err(), "ensure_session should propagate build error");
+
+    let calls = tm.snapshot();
+    assert_eq!(calls.build.len(), 4, "all parallel rebuild attempts should settle");
+    assert_eq!(
+        calls.kill.len(),
+        7,
+        "four initial rebuild kills plus cleanup kills for the three successful rebuilds"
+    );
+    assert!(
+        svc.get_session_scheduler(&created.id).is_none(),
+        "session must not be registered after partial rebuild failure"
     );
 }
 
