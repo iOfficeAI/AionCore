@@ -685,6 +685,8 @@ mod tests {
                     default_model_value: None,
                     default_permission_mode: "auto".into(),
                     default_permission_value: None,
+                    default_thought_level_mode: "auto".into(),
+                    default_thought_level_value: None,
                     default_skills_mode: "auto".into(),
                     default_skill_ids: "[]".into(),
                     custom_skill_names: "[]".into(),

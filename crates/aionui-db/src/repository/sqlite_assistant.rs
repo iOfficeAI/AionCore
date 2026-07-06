@@ -433,10 +433,11 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
                 recommended_prompts, recommended_prompts_i18n,
                 default_model_mode, default_model_value,
                 default_permission_mode, default_permission_value,
+                default_thought_level_mode, default_thought_level_value,
                 default_skills_mode, default_skill_ids, custom_skill_names, default_disabled_builtin_skill_ids,
                 default_mcps_mode, default_mcp_ids,
                 created_at, updated_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             ON CONFLICT(id) DO UPDATE SET
                 assistant_id = excluded.assistant_id,
                 source = excluded.source,
@@ -460,6 +461,8 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
                 default_model_value = excluded.default_model_value,
                 default_permission_mode = excluded.default_permission_mode,
                 default_permission_value = excluded.default_permission_value,
+                default_thought_level_mode = excluded.default_thought_level_mode,
+                default_thought_level_value = excluded.default_thought_level_value,
                 default_skills_mode = excluded.default_skills_mode,
                 default_skill_ids = excluded.default_skill_ids,
                 custom_skill_names = excluded.custom_skill_names,
@@ -492,6 +495,8 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         .bind(params.default_model_value)
         .bind(params.default_permission_mode)
         .bind(params.default_permission_value)
+        .bind(params.default_thought_level_mode)
+        .bind(params.default_thought_level_value)
         .bind(params.default_skills_mode)
         .bind(params.default_skill_ids)
         .bind(params.custom_skill_names)
@@ -624,12 +629,13 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
         let now = now_ms();
         sqlx::query(
             "INSERT INTO assistant_preferences (
-                assistant_definition_id, last_model_id, last_permission_value, last_skill_ids,
+                assistant_definition_id, last_model_id, last_permission_value, last_thought_level_value, last_skill_ids,
                 last_disabled_builtin_skill_ids, last_mcp_ids, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(assistant_definition_id) DO UPDATE SET
                 last_model_id = excluded.last_model_id,
                 last_permission_value = excluded.last_permission_value,
+                last_thought_level_value = excluded.last_thought_level_value,
                 last_skill_ids = excluded.last_skill_ids,
                 last_disabled_builtin_skill_ids = excluded.last_disabled_builtin_skill_ids,
                 last_mcp_ids = excluded.last_mcp_ids,
@@ -638,6 +644,7 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
         .bind(params.assistant_definition_id)
         .bind(params.last_model_id)
         .bind(params.last_permission_value)
+        .bind(params.last_thought_level_value)
         .bind(params.last_skill_ids)
         .bind(params.last_disabled_builtin_skill_ids)
         .bind(params.last_mcp_ids)
@@ -738,6 +745,8 @@ mod tests {
             default_model_value: None,
             default_permission_mode: "fixed",
             default_permission_value: Some("workspace-write"),
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
             default_skills_mode: "fixed",
             default_skill_ids: r#"["pdf","cron"]"#,
             custom_skill_names: r#"["my-custom-skill"]"#,
@@ -1044,6 +1053,7 @@ mod tests {
                 assistant_definition_id: &definition.id,
                 last_model_id: Some("gpt-4.1"),
                 last_permission_value: Some("workspace-write"),
+                last_thought_level_value: Some("high"),
                 last_skill_ids: r#"["pdf"]"#,
                 last_disabled_builtin_skill_ids: r#"["todo-tracker"]"#,
                 last_mcp_ids: r#"["mcp-1"]"#,
@@ -1051,8 +1061,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row.last_model_id.as_deref(), Some("gpt-4.1"));
+        assert_eq!(row.last_thought_level_value.as_deref(), Some("high"));
 
         let fetched = p.get(&definition.id).await.unwrap().unwrap();
         assert_eq!(fetched.last_skill_ids, r#"["pdf"]"#);
+        assert_eq!(fetched.last_thought_level_value.as_deref(), Some("high"));
     }
 }

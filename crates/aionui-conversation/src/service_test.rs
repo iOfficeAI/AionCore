@@ -368,6 +368,8 @@ impl IConversationRepository for MockRepo {
             resolved_model_id: params.resolved_model_id.map(ToOwned::to_owned),
             default_permission_mode: params.default_permission_mode.to_owned(),
             resolved_permission_value: params.resolved_permission_value.map(ToOwned::to_owned),
+            default_thought_level_mode: params.default_thought_level_mode.to_owned(),
+            resolved_thought_level_value: params.resolved_thought_level_value.map(ToOwned::to_owned),
             default_skills_mode: params.default_skills_mode.to_owned(),
             resolved_skill_ids: params.resolved_skill_ids.to_owned(),
             resolved_disabled_builtin_skill_ids: params.resolved_disabled_builtin_skill_ids.to_owned(),
@@ -1220,6 +1222,27 @@ async fn upsert_test_assistant_definition(
     default_model_mode: &str,
     default_permission_mode: &str,
 ) {
+    upsert_test_assistant_definition_with_thought_level(
+        repo,
+        definition_id,
+        assistant_id,
+        agent_id,
+        default_model_mode,
+        default_permission_mode,
+        "auto",
+    )
+    .await;
+}
+
+async fn upsert_test_assistant_definition_with_thought_level(
+    repo: &SqliteAssistantDefinitionRepository,
+    definition_id: &str,
+    assistant_id: &str,
+    agent_id: &str,
+    default_model_mode: &str,
+    default_permission_mode: &str,
+    default_thought_level_mode: &str,
+) {
     repo.upsert(&UpsertAssistantDefinitionParams {
         id: definition_id,
         assistant_id,
@@ -1244,6 +1267,8 @@ async fn upsert_test_assistant_definition(
         default_model_value: None,
         default_permission_mode,
         default_permission_value: None,
+        default_thought_level_mode,
+        default_thought_level_value: None,
         default_skills_mode: "auto",
         default_skill_ids: "[]",
         custom_skill_names: "[]",
@@ -3647,6 +3672,7 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
             assistant_definition_id: "asstdef_acp_auto",
             last_model_id: Some("legacy-acp-model"),
             last_permission_value: Some("legacy-mode"),
+            last_thought_level_value: Some("legacy-low"),
             last_skill_ids: "[]",
             last_disabled_builtin_skill_ids: "[]",
             last_mcp_ids: "[]",
@@ -3692,10 +3718,11 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
     let snapshot_after_mode = repo.get_assistant_snapshot(&conv.id).await.unwrap().unwrap();
     assert_eq!(snapshot_after_mode.resolved_permission_value.as_deref(), Some("plan"));
 
-    // Unrelated option ids must not touch preferences.
+    // Thought-level config options follow the same auto-default writeback
+    // contract as model and permission defaults.
     svc.set_config_option(
         &conv.id,
-        "thought_level",
+        "reasoning_effort",
         SetConfigOptionRequest {
             value: "high".to_owned(),
         },
@@ -3705,6 +3732,12 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
     let pref_after_thought = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
     assert_eq!(pref_after_thought.last_model_id.as_deref(), Some("gpt-5.5"));
     assert_eq!(pref_after_thought.last_permission_value.as_deref(), Some("plan"));
+    assert_eq!(pref_after_thought.last_thought_level_value.as_deref(), Some("high"));
+    let snapshot_after_thought = repo.get_assistant_snapshot(&conv.id).await.unwrap().unwrap();
+    assert_eq!(
+        snapshot_after_thought.resolved_thought_level_value.as_deref(),
+        Some("high")
+    );
 }
 
 #[tokio::test]
@@ -3713,11 +3746,12 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
     let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
         make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
 
-    upsert_test_assistant_definition(
+    upsert_test_assistant_definition_with_thought_level(
         &definition_repo,
         "asstdef_acp_fixed",
         "assistant-acp-fixed",
         "codex",
+        "fixed",
         "fixed",
         "fixed",
     )
@@ -3737,6 +3771,7 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
             assistant_definition_id: "asstdef_acp_fixed",
             last_model_id: Some("legacy-fixed-model"),
             last_permission_value: Some("legacy-fixed-mode"),
+            last_thought_level_value: None,
             last_skill_ids: "[]",
             last_disabled_builtin_skill_ids: "[]",
             last_mcp_ids: "[]",
@@ -3766,15 +3801,26 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
     )
     .await
     .unwrap();
+    svc.set_config_option(
+        &conv.id,
+        "reasoning_effort",
+        SetConfigOptionRequest {
+            value: "transient-high".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
 
     let pref = preference_repo.get("asstdef_acp_fixed").await.unwrap().unwrap();
     assert_eq!(pref.last_model_id.as_deref(), Some("legacy-fixed-model"));
     assert_eq!(pref.last_permission_value.as_deref(), Some("legacy-fixed-mode"));
+    assert_eq!(pref.last_thought_level_value.as_deref(), None);
     // The snapshot still tracks the runtime override so the active session reflects it,
     // even though the persisted assistant preference must not change for fixed defaults.
     let snapshot = repo.get_assistant_snapshot(&conv.id).await.unwrap().unwrap();
     assert_eq!(snapshot.resolved_model_id.as_deref(), Some("transient-model"));
     assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("transient-mode"));
+    assert_eq!(snapshot.resolved_thought_level_value.as_deref(), Some("transient-high"));
 }
 
 #[tokio::test]
@@ -3807,6 +3853,7 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
             assistant_definition_id: "asstdef_acp_ack",
             last_model_id: Some("legacy-ack-model"),
             last_permission_value: Some("legacy-ack-mode"),
+            last_thought_level_value: Some("legacy-ack-thought"),
             last_skill_ids: "[]",
             last_disabled_builtin_skill_ids: "[]",
             last_mcp_ids: "[]",
@@ -3870,6 +3917,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
             assistant_definition_id: "asstdef_aionrs_auto",
             last_model_id: Some("legacy-aionrs-model"),
             last_permission_value: None,
+            last_thought_level_value: None,
             last_skill_ids: "[]",
             last_disabled_builtin_skill_ids: "[]",
             last_mcp_ids: "[]",
@@ -3931,6 +3979,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
             assistant_definition_id: "asstdef_aionrs_fixed",
             last_model_id: Some("legacy-aionrs-fixed-model"),
             last_permission_value: None,
+            last_thought_level_value: None,
             last_skill_ids: "[]",
             last_disabled_builtin_skill_ids: "[]",
             last_mcp_ids: "[]",
@@ -5937,6 +5986,8 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             default_model_value: None,
             default_permission_mode: "auto",
             default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
             default_skills_mode: "auto",
             default_skill_ids: "[]",
             custom_skill_names: "[]",
@@ -5961,6 +6012,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             assistant_definition_id: "asstdef_preset_1",
             last_model_id: Some("old-model"),
             last_permission_value: Some("workspace-write"),
+            last_thought_level_value: Some("high"),
             last_skill_ids: r#"["legacy-skill"]"#,
             last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
             last_mcp_ids: r#"["legacy-mcp"]"#,
@@ -6097,6 +6149,8 @@ async fn existing_conversation_reads_current_assistant_identity() {
             default_model_value: None,
             default_permission_mode: "auto",
             default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
             default_skills_mode: "auto",
             default_skill_ids: "[]",
             custom_skill_names: "[]",
@@ -6154,6 +6208,8 @@ async fn existing_conversation_reads_current_assistant_identity() {
             default_model_value: None,
             default_permission_mode: "auto",
             default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
             default_skills_mode: "auto",
             default_skill_ids: "[]",
             custom_skill_names: "[]",
@@ -6226,6 +6282,8 @@ async fn create_routes_asset_avatar_in_assistant_identity_through_backend() {
             default_model_value: None,
             default_permission_mode: "auto",
             default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
             default_skills_mode: "auto",
             default_skill_ids: "[]",
             custom_skill_names: "[]",
@@ -6385,6 +6443,8 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
             default_model_value: None,
             default_permission_mode: "auto",
             default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
             default_skills_mode: "auto",
             default_skill_ids: "[]",
             custom_skill_names: "[]",
@@ -6409,6 +6469,7 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
             assistant_definition_id: "asstdef_preset_legacy_seed",
             last_model_id: Some("preferred-model"),
             last_permission_value: Some("workspace-write"),
+            last_thought_level_value: Some("medium"),
             last_skill_ids: r#"["legacy-skill"]"#,
             last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
             last_mcp_ids: r#"["legacy-mcp"]"#,
@@ -6546,6 +6607,8 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
             default_model_value: None,
             default_permission_mode: "auto",
             default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
             default_skills_mode: "fixed",
             default_skill_ids: r#"["pdf"]"#,
             custom_skill_names: "[]",
@@ -6570,6 +6633,7 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
             assistant_definition_id: "asstdef_preset_fixed",
             last_model_id: Some("legacy-model"),
             last_permission_value: Some("workspace-write"),
+            last_thought_level_value: Some("legacy-thought"),
             last_skill_ids: r#"["legacy-skill"]"#,
             last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
             last_mcp_ids: r#"["legacy-mcp"]"#,
@@ -6644,6 +6708,8 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
             default_model_value: None,
             default_permission_mode: "auto",
             default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
             default_skills_mode: "fixed",
             default_skill_ids: r#"["pdf"]"#,
             custom_skill_names: "[]",
@@ -6668,6 +6734,7 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
             assistant_definition_id: "asstdef_preset_auto",
             last_model_id: None,
             last_permission_value: None,
+            last_thought_level_value: None,
             last_skill_ids: "[]",
             last_disabled_builtin_skill_ids: "[]",
             last_mcp_ids: "[]",
