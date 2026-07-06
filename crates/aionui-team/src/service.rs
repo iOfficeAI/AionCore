@@ -669,7 +669,6 @@ impl TeamSessionService {
             return Err(TeamError::AgentNotFound(conversation_id.to_owned()));
         }
 
-        self.ensure_session_inner(team_id).await?;
         self.conversation_port.get_config_options(conversation_id).await
     }
 
@@ -1177,6 +1176,26 @@ mod tests {
         let state = svc.get_run_state("user-test", &created.id).await.unwrap();
 
         assert!(state.active_run.is_none());
+        assert_eq!(svc.session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn config_options_returns_snapshot_without_creating_team_session() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Config Options"))
+            .await
+            .unwrap();
+        let conversation_id = &created.assistants[0].conversation_id;
+
+        assert_eq!(svc.session_count_for_test(), 0);
+
+        let options = svc
+            .get_conversation_config_options("user-test", &created.id, conversation_id)
+            .await
+            .unwrap();
+
+        assert_eq!(options.config_options[0].id, "model");
         assert_eq!(svc.session_count_for_test(), 0);
     }
 
