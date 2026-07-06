@@ -7,8 +7,9 @@ use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager};
 use aionui_api_types::{
-    AddAgentRequest, CreateTeamRequest, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload, TeamResponse,
-    TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole, TeamSlotRuntimeHealth, WebSocketMessage,
+    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamMcpPhase,
+    TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole,
+    TeamSlotRuntimeHealth, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -645,6 +646,33 @@ impl TeamSessionService {
         Ok(())
     }
 
+    pub async fn get_conversation_config_options(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+    ) -> Result<GetConfigOptionsResponse, TeamError> {
+        let row = self
+            .repo
+            .get_team(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
+        if row.user_id != user_id {
+            return Err(TeamError::Forbidden(format!(
+                "team {team_id} is not owned by current user"
+            )));
+        }
+
+        let team = Team::from_row(&row)?;
+        let member = team.agents.iter().any(|agent| agent.conversation_id == conversation_id);
+        if !member {
+            return Err(TeamError::AgentNotFound(conversation_id.to_owned()));
+        }
+
+        self.ensure_session_inner(team_id).await?;
+        self.conversation_port.get_config_options(conversation_id).await
+    }
+
     fn broadcast_mcp_phase<F>(&self, team_id: &str, slot_id: &str, phase: TeamMcpPhase, port: Option<u16>, customize: F)
     where
         F: FnOnce(&mut TeamMcpStatusPayload),
@@ -1172,5 +1200,60 @@ mod tests {
         assert_eq!(active_run.pending_wake_count, 1);
         assert_eq!(active_run.slot_work.len(), 1);
         assert_eq!(active_run.slot_work[0].slot_id, ack.accepted_slot_id);
+    }
+
+    #[tokio::test]
+    async fn config_options_return_member_runtime_snapshot() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Team Config"))
+            .await
+            .unwrap();
+        let conversation_id = created.assistants[0].conversation_id.clone();
+
+        let response = svc
+            .get_conversation_config_options("user-test", &created.id, &conversation_id)
+            .await
+            .unwrap();
+
+        let model = response
+            .config_options
+            .iter()
+            .find(|option| option.id == "model")
+            .expect("model config option");
+        assert_eq!(model.current_value.as_deref(), Some("claude"));
+    }
+
+    #[tokio::test]
+    async fn config_options_reject_non_member_conversation() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Team Config Reject"))
+            .await
+            .unwrap();
+
+        let err = svc
+            .get_conversation_config_options("user-test", &created.id, "other-conversation")
+            .await
+            .expect_err("non-member conversation must be rejected");
+
+        assert!(matches!(err, crate::error::TeamError::AgentNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn config_options_reject_cross_user_access() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Team Config Owner"))
+            .await
+            .unwrap();
+        let conversation_id = created.assistants[0].conversation_id.clone();
+
+        let err = svc
+            .get_conversation_config_options("other-user", &created.id, &conversation_id)
+            .await
+            .expect_err("team config options must reject cross-user access");
+
+        assert!(matches!(err, crate::error::TeamError::Forbidden(_)));
     }
 }

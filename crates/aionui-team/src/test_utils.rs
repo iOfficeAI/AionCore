@@ -204,7 +204,9 @@ pub(crate) mod workspace_harness {
     use std::sync::{Arc, Mutex};
 
     use aionui_ai_agent::{AgentError, IWorkerTaskManager};
-    use aionui_api_types::{CreateTeamRequest, WebSocketMessage};
+    use aionui_api_types::{
+        AcpConfigOptionDto, AcpConfigSelectOptionDto, CreateTeamRequest, GetConfigOptionsResponse, WebSocketMessage,
+    };
     use aionui_common::{AgentKillReason, AgentType, PaginatedResult, now_ms};
     use aionui_db::models::{
         AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow, TeamRow,
@@ -625,6 +627,35 @@ pub(crate) mod workspace_harness {
         async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError> {
             self.patch_runtime_config(conversation_id, serde_json::json!({ "session_mode": mode }))
                 .await
+        }
+
+        async fn get_config_options(&self, conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError> {
+            let extra = self
+                .repo
+                .get_extra(conversation_id)
+                .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+            let model = extra
+                .get("current_model_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("mock-model")
+                .to_owned();
+            Ok(GetConfigOptionsResponse {
+                config_options: vec![AcpConfigOptionDto {
+                    id: "model".to_owned(),
+                    name: None,
+                    label: Some("Model".to_owned()),
+                    description: None,
+                    category: Some("model".to_owned()),
+                    option_type: "select".to_owned(),
+                    current_value: Some(model.clone()),
+                    options: vec![AcpConfigSelectOptionDto {
+                        value: model.clone(),
+                        name: None,
+                        label: Some(model),
+                        description: None,
+                    }],
+                }],
+            })
         }
 
         async fn warmup_agent_process(

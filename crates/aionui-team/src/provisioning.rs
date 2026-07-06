@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AddAgentRequest, TeamAgentInput};
+use aionui_api_types::{AddAgentRequest, GetConfigOptionsResponse, TeamAgentInput};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::{AgentMetadataRow, TeamRow};
 use aionui_db::{
@@ -94,6 +94,8 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
 
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError>;
+
+    async fn get_config_options(&self, conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError>;
 
     async fn warmup_agent_process(
         &self,
@@ -688,6 +690,12 @@ mod tests {
 
         async fn save_acp_runtime_mode(&self, _conversation_id: &str, _mode: &str) -> Result<(), TeamError> {
             Ok(())
+        }
+
+        async fn get_config_options(&self, _conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError> {
+            Ok(GetConfigOptionsResponse {
+                config_options: Vec::new(),
+            })
         }
 
         async fn warmup_agent_process(

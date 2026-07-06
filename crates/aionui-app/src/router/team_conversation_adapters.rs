@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest};
+use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse};
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
     ConversationService,
@@ -253,6 +253,13 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError> {
         self.conversation_service
             .save_acp_runtime_mode(conversation_id, mode)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn get_config_options(&self, conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError> {
+        self.conversation_service
+            .get_config_options(conversation_id)
             .await
             .map_err(map_conversation_update_error)
     }

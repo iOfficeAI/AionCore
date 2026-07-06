@@ -11,8 +11,9 @@ use axum::routing::{get, post};
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
-    PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest,
-    SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
+    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
+    TeamRunStateResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -79,6 +80,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         )
         .route("/api/teams/{id}/messages", post(send_message))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/config-options",
+            get(get_conversation_config_options),
+        )
         .route("/api/teams/{id}/runs/{team_run_id}/cancel", post(cancel_run))
         .route(
             "/api/teams/{id}/runs/{team_run_id}/agents/{slot_id}/cancel",
@@ -312,6 +317,19 @@ async fn ensure_session(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.service.ensure_session(&user.id, &id).await?;
     Ok(Json(ApiResponse::success()))
+}
+
+async fn get_conversation_config_options(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<GetConfigOptionsResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_conversation_config_options(&user.id, &id, &conversation_id)
+            .await?,
+    )))
 }
 
 async fn stop_session(
