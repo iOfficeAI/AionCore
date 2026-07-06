@@ -4672,7 +4672,7 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
 }
 
 #[tokio::test]
-async fn d9_ensure_session_rebuilds_agents_in_bounded_parallel_with_leader_first() {
+async fn d9_ensure_session_rebuilds_agents_serially_with_leader_first() {
     let probe = Arc::new(WarmupConcurrencyProbe::default());
     let (svc, _tm) = setup_with_factory(probe.factory(std::time::Duration::from_millis(40)));
     let created = svc
@@ -4686,26 +4686,33 @@ async fn d9_ensure_session_rebuilds_agents_in_bounded_parallel_with_leader_first
         )
         .await
         .unwrap();
-    let lead_conversation_id = created
-        .assistants
-        .iter()
-        .find(|assistant| assistant.role == "lead")
-        .expect("lead assistant")
-        .conversation_id
-        .clone();
+    let mut expected_starts = Vec::new();
+    expected_starts.extend(
+        created
+            .assistants
+            .iter()
+            .filter(|assistant| assistant.role == "lead")
+            .map(|assistant| assistant.conversation_id.clone()),
+    );
+    expected_starts.extend(
+        created
+            .assistants
+            .iter()
+            .filter(|assistant| assistant.role != "lead")
+            .map(|assistant| assistant.conversation_id.clone()),
+    );
 
     svc.ensure_session("user1", &created.id).await.unwrap();
 
     let starts = probe.starts();
     assert_eq!(
-        starts.first(),
-        Some(&lead_conversation_id),
-        "leader must be scheduled first for team rebuild warmup"
+        starts, expected_starts,
+        "team rebuild warmup must run leader first and then teammates serially"
     );
     assert_eq!(
         probe.max_active(),
-        4,
-        "five-agent rebuild should use bounded parallelism with a max of four concurrent warmups"
+        1,
+        "team rebuild warmup should not run multiple agents concurrently"
     );
 }
 
@@ -4810,11 +4817,11 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
     let result = svc.ensure_session("user1", &created.id).await;
     assert!(result.is_err(), "ensure_session should propagate build error");
 
-    // Parallel rebuild attempts all settle, but no session is inserted after
-    // the aggregate failure.
+    // Serial rebuild stops at the first failing agent, and no session is
+    // inserted after the failure.
     let calls = tm.snapshot();
-    assert_eq!(calls.kill.len(), 2);
-    assert_eq!(calls.build.len(), 2);
+    assert_eq!(calls.kill.len(), 1);
+    assert_eq!(calls.build.len(), 1);
 
     let send_result = svc.send_message("user1", &created.id, "Hello", None).await;
     assert!(
@@ -4868,7 +4875,11 @@ async fn d9_ensure_session_cleans_up_successful_rebuilds_when_one_agent_fails() 
     assert!(result.is_err(), "ensure_session should propagate build error");
 
     let calls = tm.snapshot();
-    assert_eq!(calls.build.len(), 4, "all parallel rebuild attempts should settle");
+    assert_eq!(
+        calls.build.len(),
+        4,
+        "serial rebuild should stop only after the failing attempted agent"
+    );
     assert_eq!(
         calls.kill.len(),
         7,

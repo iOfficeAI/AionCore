@@ -20,7 +20,6 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
-use futures_util::stream::{self, StreamExt};
 use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
@@ -46,8 +45,6 @@ struct SessionEntry {
     session: Arc<TeamSession>,
     slow_monitor_handle: tokio::task::JoinHandle<()>,
 }
-
-const TEAM_REBUILD_MAX_PARALLELISM: usize = 4;
 
 struct TeamAgentRebuildOutcome {
     agent: TeamAgent,
@@ -757,7 +754,6 @@ impl TeamSessionService {
     ) -> Result<(), TeamError> {
         let provisioner = self.provisioner();
         let task_manager = self.task_manager.clone();
-        let parallelism = agents.len().clamp(1, TEAM_REBUILD_MAX_PARALLELISM);
         let started_at = Instant::now();
         let mut rebuild_jobs: Vec<TeamAgent> = agents.to_vec();
         rebuild_jobs.sort_by_key(|agent| match agent.role {
@@ -765,60 +761,51 @@ impl TeamSessionService {
             TeammateRole::Teammate => 1,
         });
 
-        info!(
-            team_id,
-            agent_count = agents.len(),
-            parallelism,
-            "team agent rebuild started"
-        );
+        info!(team_id, agent_count = agents.len(), "team agent rebuild started");
 
-        let outcomes: Vec<TeamAgentRebuildOutcome> = stream::iter(rebuild_jobs.into_iter().map(|agent| {
-            let provisioner = provisioner.clone();
-            let task_manager = task_manager.clone();
-            let user_id = user_id.to_owned();
+        let mut outcomes = Vec::new();
+        for agent in rebuild_jobs {
             let cfg = session.mcp_stdio_config(&agent.slot_id);
-
-            async move {
-                info!(
-                    team_id = %cfg.team_id,
+            info!(
+                team_id = %cfg.team_id,
+                slot_id = %agent.slot_id,
+                conversation_id = %agent.conversation_id,
+                backend = %agent.backend,
+                role = %agent.role,
+                "team agent rebuild attach started"
+            );
+            let attach_started_at = Instant::now();
+            let result = provisioner
+                .attach_agent_process(user_id, &agent, cfg, &task_manager)
+                .await;
+            let duration_ms = attach_started_at.elapsed().as_millis();
+            match &result {
+                Ok(()) => info!(
+                    team_id,
                     slot_id = %agent.slot_id,
                     conversation_id = %agent.conversation_id,
-                    backend = %agent.backend,
-                    role = %agent.role,
-                    "team agent rebuild attach started"
-                );
-                let attach_started_at = Instant::now();
-                let result = provisioner
-                    .attach_agent_process(&user_id, &agent, cfg, &task_manager)
-                    .await;
-                let duration_ms = attach_started_at.elapsed().as_millis();
-                match &result {
-                    Ok(()) => info!(
-                        team_id,
-                        slot_id = %agent.slot_id,
-                        conversation_id = %agent.conversation_id,
-                        duration_ms,
-                        "team agent rebuild attach finished"
-                    ),
-                    Err(error) => warn!(
-                        team_id,
-                        slot_id = %agent.slot_id,
-                        conversation_id = %agent.conversation_id,
-                        duration_ms,
-                        error = %error,
-                        "team agent rebuild attach failed"
-                    ),
-                }
-                TeamAgentRebuildOutcome {
-                    agent,
                     duration_ms,
-                    result,
-                }
+                    "team agent rebuild attach finished"
+                ),
+                Err(error) => warn!(
+                    team_id,
+                    slot_id = %agent.slot_id,
+                    conversation_id = %agent.conversation_id,
+                    duration_ms,
+                    error = %error,
+                    "team agent rebuild attach failed"
+                ),
             }
-        }))
-        .buffer_unordered(parallelism)
-        .collect()
-        .await;
+            let failed = result.is_err();
+            outcomes.push(TeamAgentRebuildOutcome {
+                agent,
+                duration_ms,
+                result,
+            });
+            if failed {
+                break;
+            }
+        }
 
         let mut success_count = 0usize;
         let mut failures: Vec<&TeamAgentRebuildOutcome> = Vec::new();
