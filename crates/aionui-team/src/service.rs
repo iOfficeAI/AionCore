@@ -63,9 +63,8 @@ pub struct TeamSessionService {
     /// read-modify-write the `agents` JSON with stale state (last-writer-wins
     /// would otherwise drop entries).
     add_agent_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Per-team mutex serializing `ensure_session` so concurrent callers
-    /// (e.g. create_team + frontend POST /session) cannot race and start
-    /// two sessions for the same team.
+    /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
+    /// race and start two sessions for the same team.
     ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
@@ -272,13 +271,6 @@ impl TeamSessionService {
         );
 
         self.broadcast_team_created(&team.id, &team.name);
-
-        // Auto-start session so MCP is injected immediately after team creation.
-        // Failure only logs — the team is persisted and frontend can retry
-        // via POST /api/teams/{id}/session if needed.
-        if let Err(e) = self.ensure_session_inner(&team.id).await {
-            warn!(team_id = %team.id, error = %e, "auto ensure_session after create_team failed");
-        }
 
         self.build_team_response(&team).await
     }

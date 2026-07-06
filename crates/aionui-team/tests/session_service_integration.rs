@@ -1452,7 +1452,7 @@ async fn ensure_session_recovery_drain_runs_agent_turn_with_team_run_id() {
     let lead_slot_id = created.leader_assistant_id.clone().expect("lead");
     svc.stop_session("user1", &created.id)
         .await
-        .expect("stop auto-started session");
+        .expect("clear existing session");
 
     team_repo
         .write_message(&aionui_db::models::MailboxMessageRow {
@@ -1506,7 +1506,7 @@ async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
     let worker_slot_id = created.assistants[1].slot_id.clone();
     svc.stop_session("user1", &created.id)
         .await
-        .expect("stop auto-started session");
+        .expect("clear existing session");
 
     team_repo
         .write_message(&aionui_db::models::MailboxMessageRow {
@@ -1576,7 +1576,7 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
     let lead_slot_id = created.leader_assistant_id.clone().expect("lead");
     svc.stop_session("user1", &created.id)
         .await
-        .expect("stop auto-started session");
+        .expect("clear existing session");
 
     team_repo
         .write_message(&aionui_db::models::MailboxMessageRow {
@@ -1791,7 +1791,7 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
     ]
 }
 
-async fn reset_auto_started_session(svc: &Arc<TeamSessionService>, tm: &Arc<CountingTaskManager>, team_id: &str) {
+async fn reset_runtime_state(svc: &Arc<TeamSessionService>, tm: &Arc<CountingTaskManager>, team_id: &str) {
     svc.stop_session("user1", team_id).await.unwrap();
     tm.reset().await;
 }
@@ -3284,6 +3284,8 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
         )
         .await
         .unwrap();
+    assert_eq!(task_manager.snapshot().build.len(), 0);
+    svc.ensure_session("user1", &created.id).await.unwrap();
     assert_eq!(task_manager.snapshot().build.len(), 1);
 
     let started_at = std::time::Instant::now();
@@ -3360,6 +3362,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() 
         )
         .await
         .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
 
     let agent = svc
         .add_agent(
@@ -4505,7 +4508,7 @@ async fn td_delete_team_stops_session() {
 // ===========================================================================
 
 #[tokio::test]
-async fn d9_create_team_auto_start_rebuilds_every_initial_agent() {
+async fn d9_create_team_persists_without_warming_initial_agents() {
     let (svc, tm) = setup_with_factory(success_factory());
     let created = svc
         .create_team(
@@ -4521,17 +4524,17 @@ async fn d9_create_team_auto_start_rebuilds_every_initial_agent() {
 
     let calls = tm.snapshot();
     assert_eq!(
-        calls.kill.len(),
+        created.assistants.len(),
         2,
-        "auto-start should kill every initial agent before rebuild"
+        "create_team should still persist initial agents"
     );
-    assert_eq!(calls.build.len(), 2, "auto-start should warm every initial agent");
-    for (i, agent) in created.assistants.iter().enumerate() {
-        assert_eq!(calls.kill[i].0, agent.conversation_id);
-        assert_eq!(calls.kill[i].1, Some(AgentKillReason::TeamMcpRebuild));
-        assert_eq!(calls.build[i], agent.conversation_id);
-    }
-    assert_eq!(tm.active_count(), 2, "auto-start must register every initial agent");
+    assert!(calls.kill.is_empty(), "create_team must not rebuild initial agents");
+    assert!(calls.build.is_empty(), "create_team must not warm initial agents");
+    assert_eq!(tm.active_count(), 0, "create_team must not register live agent tasks");
+    assert!(
+        svc.get_session_scheduler(&created.id).is_none(),
+        "create_team must not create a runtime session"
+    );
 }
 
 #[tokio::test]
@@ -4549,7 +4552,7 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id).await;
+    reset_runtime_state(&svc, &tm, &created.id).await;
     svc.ensure_session("user1", &created.id).await.unwrap();
 
     // Two agents → kill called 2x and get_or_build_task called 2x, each with
@@ -4631,7 +4634,7 @@ async fn d9_ensure_session_is_idempotent() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id).await;
+    reset_runtime_state(&svc, &tm, &created.id).await;
     svc.ensure_session("user1", &created.id).await.unwrap();
     svc.ensure_session("user1", &created.id).await.unwrap();
 
@@ -4661,7 +4664,7 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id).await;
+    reset_runtime_state(&svc, &tm, &created.id).await;
     let result = svc.ensure_session("user1", &created.id).await;
     assert!(result.is_err(), "ensure_session should propagate build error");
 
@@ -4779,7 +4782,7 @@ async fn d115_remove_team_kills_every_agent_process() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id).await;
+    reset_runtime_state(&svc, &tm, &created.id).await;
     // Bring two agents online — after ensure_session, active_count == 2.
     svc.ensure_session("user1", &created.id).await.unwrap();
     assert_eq!(tm.active_count(), 2, "ensure_session must register 2 live agents");
