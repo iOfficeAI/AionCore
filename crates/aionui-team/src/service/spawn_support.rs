@@ -166,7 +166,11 @@ impl TeamSessionService {
         let Ok(rows) = self.agent_metadata_repo.list_all().await else {
             return Ok(crate::mcp::tools::handle_team_list_models(&serde_json::Value::Null));
         };
-        let backend_filter = match assistant_id_filter.map(str::trim).filter(|value| !value.is_empty()) {
+        let requested_assistant_id = assistant_id_filter
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let backend_filter = match requested_assistant_id.as_deref() {
             Some(assistant_id) => {
                 let definition = self
                     .assistant_definition_repo
@@ -189,11 +193,22 @@ impl TeamSessionService {
             None => None,
         };
         let provider_models = self.collect_provider_models().await;
-        Ok(crate::mcp::tools::build_list_models_from_rows(
-            &rows,
-            backend_filter.as_deref(),
-            &provider_models,
-        ))
+        let value = crate::mcp::tools::build_list_models_from_rows(&rows, backend_filter.as_deref(), &provider_models);
+        if let Some(assistant_id) = requested_assistant_id {
+            let assistant = value
+                .get("assistants")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| items.first())
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "models": [], "default_model": null }));
+            return Ok(serde_json::json!({
+                "status": "ok",
+                "assistant_id": assistant_id,
+                "models": assistant.get("models").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "default_model": assistant.get("default_model").cloned().unwrap_or(serde_json::Value::Null),
+            }));
+        }
+        Ok(value)
     }
 
     /// Collect all enabled provider model IDs grouped by provider name.

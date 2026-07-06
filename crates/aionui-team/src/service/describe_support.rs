@@ -25,12 +25,43 @@ impl TeamSessionService {
             .unwrap_or(definition.agent_id.as_str());
         let effective_backend = resolve_runtime_backend(&self.agent_metadata_repo, effective_agent_id).await?;
 
-        Ok(render_assistant_description(
+        Ok(render_assistant_description_json(
             &definition,
             &effective_backend,
             locale.unwrap_or("en-US"),
-        ))
+        )?)
     }
+}
+
+fn render_assistant_description_json(
+    definition: &AssistantDefinitionRow,
+    effective_backend: &str,
+    locale: &str,
+) -> Result<String, serde_json::Error> {
+    let name_map = decode_str_map(&definition.name_i18n);
+    let description_map = decode_str_map(&definition.description_i18n);
+    let prompts_map = decode_list_map(&definition.recommended_prompts_i18n);
+
+    let name = localized_text(&name_map, &definition.name, locale);
+    let description = localized_optional_text(&description_map, definition.description.as_deref(), locale)
+        .unwrap_or_else(|| "No description available.".to_owned());
+    let example_tasks = localized_list(&prompts_map, &definition.recommended_prompts, locale).unwrap_or_default();
+    let skills = decode_string_list(&definition.default_skill_ids)
+        .into_iter()
+        .chain(decode_string_list(&definition.custom_skill_names))
+        .collect::<Vec<_>>();
+    let description_markdown = render_assistant_description(definition, effective_backend, locale);
+
+    serde_json::to_string_pretty(&serde_json::json!({
+        "status": "ok",
+        "assistant_id": definition.assistant_id,
+        "name": name,
+        "description": description,
+        "description_markdown": description_markdown,
+        "skills": skills,
+        "example_tasks": example_tasks,
+        "default_model": definition.default_model_value.clone(),
+    }))
 }
 
 fn render_assistant_description(definition: &AssistantDefinitionRow, effective_backend: &str, locale: &str) -> String {

@@ -1,14 +1,9 @@
-use std::collections::HashMap;
-use std::fmt::Write;
-
 use crate::governance::with_team_governance;
 use serde::Serialize;
+use std::collections::HashMap;
 
 pub const LEAD_PROMPT_TEMPLATE: &str = include_str!("prompt_templates/lead.txt");
 
-const PLACEHOLDER_TEAMMATE_LIST: &str = "${teammateList}";
-const PLACEHOLDER_AVAILABLE_TYPES_SECTION: &str = "${availableTypesSection}";
-const PLACEHOLDER_AVAILABLE_ASSISTANTS_SECTION: &str = "${availableAssistantsSection}";
 const PLACEHOLDER_WORKSPACE_SECTION: &str = "${workspaceSection}";
 const PLACEHOLDER_PRESET_FORMATTING_STEP_RULE: &str = "${presetFormattingStepRule}";
 const PLACEHOLDER_PRESET_FORMATTING_IMPORTANT_RULE: &str = "${presetFormattingImportantRule}";
@@ -82,98 +77,24 @@ pub fn build_teammate_prompt(params: &TeammatePromptParams<'_>) -> String {
 }
 
 fn build_lead_role_prompt(params: &LeadPromptParams<'_>) -> String {
-    let teammate_list = render_teammate_list(params.teammates, params.renamed_agents);
-    let available_types_section = render_available_types_section(params.available_agent_types);
-    let available_assistants_section = render_available_assistants_section(params.available_assistants);
+    let _ = (
+        params.teammates,
+        params.available_agent_types,
+        params.available_assistants,
+        params.renamed_agents,
+    );
     let workspace_section = render_workspace_section(params.team_workspace);
 
     let preset_formatting_step_rule = "";
     let preset_formatting_important_rule = "";
 
     LEAD_PROMPT_TEMPLATE
-        .replace(PLACEHOLDER_TEAMMATE_LIST, &teammate_list)
-        .replace(PLACEHOLDER_AVAILABLE_TYPES_SECTION, &available_types_section)
-        .replace(PLACEHOLDER_AVAILABLE_ASSISTANTS_SECTION, &available_assistants_section)
         .replace(PLACEHOLDER_WORKSPACE_SECTION, &workspace_section)
         .replace(PLACEHOLDER_PRESET_FORMATTING_STEP_RULE, preset_formatting_step_rule)
         .replace(
             PLACEHOLDER_PRESET_FORMATTING_IMPORTANT_RULE,
             preset_formatting_important_rule,
         )
-}
-
-fn render_teammate_list(teammates: &[TeamPromptAgent], renamed_agents: &HashMap<String, String>) -> String {
-    if teammates.is_empty() {
-        return "(no teammates yet — propose the lineup to the user first, then use \
-                team_spawn_agent only after they confirm or explicitly ask you to create \
-                teammates immediately)"
-            .to_owned();
-    }
-
-    let mut out = String::with_capacity(teammates.len() * 64);
-    for (idx, teammate) in teammates.iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-        let status = teammate.status.as_deref().unwrap_or("unknown");
-        let _ = write!(out, "- {} ({}, status: {})", teammate.name, teammate.backend, status);
-        if let Some(former) = renamed_agents.get(&teammate.slot_id) {
-            let _ = write!(out, " [formerly: {former}]");
-        }
-    }
-    out
-}
-
-fn render_available_types_section(agent_types: &[AvailableAgentType]) -> String {
-    let _ = agent_types;
-    String::new()
-}
-
-fn render_available_assistants_section(assistants: &[AvailableAssistant]) -> String {
-    if assistants.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from("\n\n## Available Assistants for Spawning\n");
-    out.push_str(
-        "These are available assistants with pre-loaded rules and skills for specific \
-         domains (writing, research, PPT building, etc.). When a task matches an assistant's \
-         specialty, prefer spawning that assistant — you get its domain \
-         expertise automatically.\n\n",
-    );
-    for (idx, assistant) in assistants.iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-        let desc = if assistant.description.is_empty() {
-            String::new()
-        } else {
-            format!(" — {}", assistant.description)
-        };
-        let skills = if assistant.skills.is_empty() {
-            String::new()
-        } else {
-            format!("\n   skills: {}", assistant.skills.join(", "))
-        };
-        let _ = write!(
-            out,
-            "- `{}` ({}){}{}",
-            assistant.assistant_id, assistant.name, desc, skills,
-        );
-    }
-    out.push_str(
-        "\n\n### How to pick an assistant\n\
-         1. Scan the one-line descriptions and skills above. If one clearly matches the user's \
-         domain (e.g. \"quarterly Word report\" → `word-creator`), spawn it directly with \
-         `team_spawn_agent`.\n\
-         2. If two or more assistants seem relevant, call `team_describe_assistant` on each \
-         candidate to see its full description, skills, and example tasks, then choose the best \
-         fit.\n\
-         3. If no assistant is an obvious fit, choose the assistant whose domain and backing \
-         capabilities best match the work.\n\n\
-         Pass the assistant's ID as `assistant_id` to `team_spawn_agent`. The runtime backend \
-         is derived automatically and does not need to be specified.",
-    );
-    out
 }
 
 fn render_workspace_section(team_workspace: Option<&str>) -> String {
@@ -198,8 +119,7 @@ Name: {{AGENT_NAME}}, Role: {{ROLE_DESC}}
 
 ## Your Team
 Team: {{TEAM_NAME}}
-Leader: {{LEADER_NAME}}
-Teammates: {{TEAMMATES}}{{WORKSPACE}}
+Leader: {{LEADER_NAME}}{{WORKSPACE}}
 
 ## Team Coordination Tools
 You MUST use the `team_*` MCP tools for ALL team coordination.
@@ -248,19 +168,7 @@ If you receive a message with type `shutdown_request`, the leader is asking you 
 - Use your native tools (Read, Write, Bash, etc.) for implementation work"#;
 
 fn build_teammate_role_prompt(params: &TeammatePromptParams<'_>) -> String {
-    let teammates_section = if params.teammates.is_empty() {
-        "(none)".to_string()
-    } else {
-        params
-            .teammates
-            .iter()
-            .map(|teammate| match params.renamed_agents.get(&teammate.slot_id) {
-                Some(original) => format!("{} [formerly: {}]", teammate.name, original),
-                None => teammate.name.clone(),
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let _ = (params.teammates, params.renamed_agents);
 
     let workspace_section = match params.team_workspace {
         Some(workspace) => format!(
@@ -277,7 +185,6 @@ Always use the team workspace path for any project-related operations."
         .replace("{{ROLE_DESC}}", &role_description(&params.agent.backend))
         .replace("{{TEAM_NAME}}", params.team_name)
         .replace("{{LEADER_NAME}}", &params.leader.name)
-        .replace("{{TEAMMATES}}", &teammates_section)
         .replace("{{WORKSPACE}}", &workspace_section)
 }
 
@@ -327,9 +234,12 @@ mod tests {
         });
 
         assert!(prompt.starts_with("## Team Governance"));
-        assert!(prompt.contains("- Worker (claude, status: unknown)"));
-        assert!(prompt.contains("## Available Assistants for Spawning"));
-        assert!(prompt.contains("Pass the assistant's ID as `assistant_id`"));
+        assert!(!prompt.contains("## Your Teammates"));
+        assert!(!prompt.contains("## Available Assistants for Spawning"));
+        assert!(!prompt.contains("- Worker (claude, status: unknown)"));
+        assert!(prompt.to_lowercase().contains("first team turn"));
+        assert!(prompt.contains("team_members"));
+        assert!(prompt.contains("team_list_assistants"));
         assert!(!prompt.contains("${"));
     }
 
@@ -350,5 +260,6 @@ mod tests {
         assert!(prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
         assert!(prompt.contains("Use team_send_message to report results to the leader"));
         assert!(prompt.contains("STOP GENERATING"));
+        assert!(!prompt.contains("Teammates: Worker"));
     }
 }

@@ -9,8 +9,9 @@ use crate::TeamMcpStdioConfig;
 
 /// Input for a single agent when creating a team or adding an agent.
 ///
-/// Each agent gets its own conversation; the first agent in a create
-/// request becomes the team lead.
+/// Each agent gets its own conversation. Create requests must include exactly
+/// one agent with role `lead` or `leader`; that explicit role becomes the team
+/// lead.
 ///
 #[derive(Debug, Clone)]
 pub struct TeamAgentInput {
@@ -67,7 +68,7 @@ impl<'de> Deserialize<'de> for TeamAgentInput {
 /// Request body for `POST /api/teams`.
 ///
 /// Creates a team with the given name and agent list.
-/// The first agent in the array is designated as the lead.
+/// Exactly one agent with role `lead` or `leader` is designated as the lead.
 #[derive(Debug, Deserialize)]
 pub struct CreateTeamRequest {
     pub name: String,

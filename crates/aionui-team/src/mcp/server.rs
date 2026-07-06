@@ -15,7 +15,7 @@ use crate::events::TEAM_MCP_STATUS_EVENT;
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
-use crate::types::{TeammateRole, TeammateStatus};
+use crate::types::{TeamAgent, TeamTask, TeammateRole, TeammateStatus};
 use crate::wake::TeamWakeSource;
 
 use super::protocol::{
@@ -692,6 +692,32 @@ fn build_send_message_queued_response(
     })
 }
 
+fn agent_json(agent: &TeamAgent) -> Value {
+    let status = agent.status.unwrap_or(TeammateStatus::Idle);
+    json!({
+        "slot_id": agent.slot_id,
+        "name": agent.name,
+        "role": agent.role,
+        "status": status,
+        "assistant_id": agent.assistant_id,
+        "model": agent.model,
+    })
+}
+
+fn task_json(task: &TeamTask) -> Value {
+    json!({
+        "task_id": task.id,
+        "subject": task.subject,
+        "status": task.status,
+        "owner": task.owner,
+        "blocked_by": task.blocked_by,
+    })
+}
+
+fn json_text(value: &Value) -> Result<String, ToolCallError> {
+    serde_json::to_string_pretty(value).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
+}
+
 async fn exec_spawn_agent(
     args: &Value,
     service: &Weak<TeamSessionService>,
@@ -744,7 +770,14 @@ async fn exec_spawn_agent(
     service
         .spawn_agent_in_session(team_id, caller_slot_id, req)
         .await
-        .map(|agent| format!("Agent '{}' spawned (slot_id={})", agent.name, agent.slot_id))
+        .and_then(|agent| {
+            serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "action": "agent_spawned",
+                "agent": agent_json(&agent),
+            }))
+            .map_err(TeamError::Json)
+        })
         .map_err(|e| ToolCallError::from_message(e.to_string()))
 }
 
@@ -752,37 +785,35 @@ async fn exec_task_create(args: &Value, scheduler: &TeammateManager) -> Result<S
     let input: TaskCreateInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
-    let action = crate::scheduler::SchedulerAction::TaskCreate {
-        subject: input.subject.clone(),
-        description: input.description,
-        owner: input.owner,
-        blocked_by: input.blocked_by.unwrap_or_default(),
-    };
-    scheduler
-        .execute_action("system", &action)
+    let task = scheduler
+        .create_task(
+            &input.subject,
+            input.description.as_deref(),
+            input.owner.as_deref(),
+            &input.blocked_by.unwrap_or_default(),
+        )
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
 
-    Ok(format!("Task '{}' created", input.subject))
+    json_text(&json!({ "status": "ok", "task": task_json(&task) }))
 }
 
 async fn exec_task_update(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
     let input: TaskUpdateInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
-    let action = crate::scheduler::SchedulerAction::TaskUpdate {
-        task_id: input.task_id.clone(),
-        status: input.status,
-        description: input.description,
-        owner: input.owner,
-        blocked_by: input.blocked_by,
-    };
-    scheduler
-        .execute_action("system", &action)
+    let task = scheduler
+        .update_task(
+            &input.task_id,
+            input.status.as_deref(),
+            input.description,
+            input.owner,
+            input.blocked_by,
+        )
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
 
-    Ok(format!("Task '{}' updated", input.task_id))
+    json_text(&json!({ "status": "ok", "task": task_json(&task) }))
 }
 
 async fn exec_task_list(scheduler: &TeammateManager) -> Result<String, ToolCallError> {
@@ -808,28 +839,12 @@ async fn exec_task_list(scheduler: &TeammateManager) -> Result<String, ToolCallE
 }
 
 async fn exec_members(scheduler: &TeammateManager) -> Result<String, ToolCallError> {
-    let agents = scheduler.list_agents().await;
-    let output: Vec<Value> = agents
-        .iter()
-        .map(|a| {
-            // `TeamAgent::status` is `None` for cold-start agents that have not
-            // yet transitioned through `set_status` (e.g. the lead before its
-            // first wake). The scheduler already tracks them as `Idle`
-            // internally (see `TeammateManager::new`), and AionUi's
-            // TeammateManager exposes `'idle'` as the initial value. Mirror
-            // that here so MCP clients never see `null` and misread a live
-            // teammate as offline.
-            let status = a.status.unwrap_or(TeammateStatus::Idle);
-            json!({
-                "slot_id": a.slot_id,
-                "name": a.name,
-                "role": a.role,
-                "status": status,
-                "backend": a.backend,
-                "model": a.model,
-            })
-        })
-        .collect();
+    let mut agents = scheduler.list_agents().await;
+    agents.sort_by_key(|agent| match agent.role {
+        TeammateRole::Lead => 0,
+        TeammateRole::Teammate => 1,
+    });
+    let output: Vec<Value> = agents.iter().map(agent_json).collect();
     serde_json::to_string_pretty(&output).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
 }
 
@@ -861,7 +876,15 @@ async fn exec_rename_agent(
             .map_err(|e| ToolCallError::from_message(e.to_string()))?;
     }
 
-    Ok(format!("Agent '{}' renamed to '{}'", input.slot_id, input.new_name))
+    let agent = scheduler
+        .get_agent(&resolved_slot)
+        .await
+        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+    json_text(&json!({
+        "status": "ok",
+        "action": "agent_renamed",
+        "agent": agent_json(&agent),
+    }))
 }
 
 async fn exec_shutdown_agent(
@@ -884,12 +907,18 @@ async fn exec_shutdown_agent(
     let service = service
         .upgrade()
         .ok_or_else(|| ToolCallError::from_message("Team service not available; cannot wake shutdown target"))?;
+    let reason = input.reason.clone();
     service
         .shutdown_agent_in_session(team_id, caller_slot_id, &target_slot_id, input.reason)
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
 
-    Ok(format!("Shutdown request sent to agent '{}'", target_slot_id))
+    json_text(&json!({
+        "status": "ok",
+        "action": "shutdown_requested",
+        "target_slot_id": target_slot_id,
+        "reason": reason,
+    }))
 }
 
 // ---------------------------------------------------------------------------

@@ -72,7 +72,7 @@ pub struct SpawnAgentRequest {
     pub model: Option<String>,
 }
 
-enum SpawnWakePlan {
+pub(crate) enum SpawnWakePlan {
     RunScoped(TeamRunTargetRole),
     MailboxOnly,
 }
@@ -286,17 +286,7 @@ impl TeamSession {
 
         let first_message = if needs_role_prompt {
             let role_prompt = match agent.role {
-                TeammateRole::Lead => {
-                    let available_assistants = match self.service.upgrade() {
-                        Some(svc) => svc.list_team_selectable_assistants().await,
-                        None => Vec::new(),
-                    };
-                    build_lead_prompt(
-                        &self.team.name,
-                        &self.scheduler.list_agents().await,
-                        &available_assistants,
-                    )
-                }
+                TeammateRole::Lead => build_lead_prompt(&self.team.name, &self.scheduler.list_agents().await, &[]),
                 TeammateRole::Teammate => {
                     let members = self.scheduler.list_agents().await;
                     build_teammate_prompt(&agent, &self.team.name, &members)
@@ -1261,6 +1251,116 @@ impl TeamSession {
         self.scheduler.add_agent(agent).await;
     }
 
+    pub(crate) async fn add_manual_agent(&self, agent: &TeamAgent) -> Result<SpawnWakePlan, TeamError> {
+        self.scheduler.add_agent(agent).await;
+        let lead_slot_id = self
+            .scheduler
+            .find_lead_slot_id()
+            .await
+            .ok_or_else(|| TeamError::InvalidRequest("team lead not found".into()))?;
+
+        let welcome = self
+            .mailbox
+            .write(
+                &self.team.id,
+                &agent.slot_id,
+                "team_system",
+                MailboxMessageType::Message,
+                "You were manually added to this team by the user. Read the Team context, wait for Leader instructions, and use team_members when you need the current roster.",
+                None,
+            )
+            .await?;
+        let leader_notice = self
+            .mailbox
+            .write(
+                &self.team.id,
+                &lead_slot_id,
+                "team_system",
+                MailboxMessageType::Message,
+                &format!(
+                    "The user manually added teammate '{}' (slot_id={}, assistant_id={}, model={}). Call team_members to get the latest roster before delegating work.",
+                    agent.name,
+                    agent.slot_id,
+                    agent.assistant_id.as_deref().unwrap_or(""),
+                    agent.model
+                ),
+                None,
+            )
+            .await?;
+
+        let spawn_wake_plan = if self.team_run_manager.active_run_id().await.is_some() {
+            let spawn_welcome_role = match self
+                .reserve_wake_for_team_work(&agent.slot_id, TeamWakeSource::SpawnWelcome, Some(welcome.id))
+                .await?
+            {
+                Some(role) => role,
+                None => {
+                    warn!(
+                        team_id = %self.team.id,
+                        slot_id = %agent.slot_id,
+                        wake_source = %TeamWakeSource::SpawnWelcome,
+                        "manual teammate welcome wake was suppressed"
+                    );
+                    TeamRunTargetRole::Teammate
+                }
+            };
+            if let Some(role) = self
+                .reserve_wake_for_team_work(
+                    &lead_slot_id,
+                    TeamWakeSource::TeamMembershipChanged,
+                    Some(leader_notice.id),
+                )
+                .await?
+            {
+                self.notify_reserved_wake_for_team_work(&lead_slot_id, role, TeamWakeSource::TeamMembershipChanged);
+            }
+            SpawnWakePlan::RunScoped(spawn_welcome_role)
+        } else {
+            self.notify_mailbox_only_wake(&lead_slot_id, TeamWakeSource::TeamMembershipChanged);
+            SpawnWakePlan::MailboxOnly
+        };
+
+        Ok(spawn_wake_plan)
+    }
+
+    pub async fn notify_leader_membership_removed(&self, removed: &TeamAgent) -> Result<(), TeamError> {
+        let lead_slot_id = self
+            .scheduler
+            .find_lead_slot_id()
+            .await
+            .ok_or_else(|| TeamError::InvalidRequest("team lead not found".into()))?;
+        let notice = self
+            .mailbox
+            .write(
+                &self.team.id,
+                &lead_slot_id,
+                "team_system",
+                MailboxMessageType::Message,
+                &format!(
+                    "Teammate '{}' was removed from the team (slot_id={}, assistant_id={}, model={}). Call team_members to get the latest roster before delegating work.",
+                    removed.name,
+                    removed.slot_id,
+                    removed.assistant_id.as_deref().unwrap_or(""),
+                    removed.model
+                ),
+                None,
+            )
+            .await?;
+
+        if self.team_run_manager.active_run_id().await.is_some() {
+            if let Some(role) = self
+                .reserve_wake_for_team_work(&lead_slot_id, TeamWakeSource::TeamMembershipChanged, Some(notice.id))
+                .await?
+            {
+                self.notify_reserved_wake_for_team_work(&lead_slot_id, role, TeamWakeSource::TeamMembershipChanged);
+            }
+        } else {
+            self.notify_mailbox_only_wake(&lead_slot_id, TeamWakeSource::TeamMembershipChanged);
+        }
+
+        Ok(())
+    }
+
     pub async fn remove_agent(&self, slot_id: &str) -> Result<(), TeamError> {
         self.event_loops.remove(slot_id);
         let conversation_id = self.scheduler.remove_agent(slot_id).await?;
@@ -1432,64 +1532,15 @@ impl TeamSession {
         // time (10-30s). Running it asynchronously ensures `spawn_agent`
         // returns promptly so the MCP tool call completes without blocking
         // the leader's connection loop.
-        {
-            let team_id = self.team.id.clone();
-            let user_id = self.user_id.clone();
-            let agent_clone = new_agent.clone();
-            let mcp_stdio_cfg = self.mcp_stdio_config(&new_agent.slot_id);
-            let task_manager = self.task_manager.clone();
-            tokio::spawn(async move {
-                // Push the team MCP stdio config into the new conversation's
-                // extras, then kill + rebuild the agent task so the freshly
-                // spawned process boots with the MCP handshake pointing at
-                // our session.
-                if let Err(err) = Self::attach_spawned_agent_process_bg(
-                    &service,
-                    &agent_clone,
-                    mcp_stdio_cfg,
-                    &user_id,
-                    &task_manager,
-                )
-                .await
-                {
-                    warn!(
-                        team_id = %team_id,
-                        slot_id = %agent_clone.slot_id,
-                        error = %err,
-                        "failed to attach spawned agent process; agent is persisted but not yet running"
-                    );
-                    if let Err(notify_err) = service
-                        .notify_leader_spawn_attach_failed(&team_id, &agent_clone.slot_id, &err.to_string())
-                        .await
-                    {
-                        warn!(
-                            team_id = %team_id,
-                            slot_id = %agent_clone.slot_id,
-                            error = %notify_err,
-                            "failed to notify leader about spawned agent attach failure"
-                        );
-                    }
-                    return;
-                }
-
-                // Register the event loop for the newly spawned agent.
-                service.register_event_loop(&team_id, &agent_clone.slot_id);
-
-                match spawn_wake_plan {
-                    SpawnWakePlan::RunScoped(spawn_welcome_role) => {
-                        service.notify_reserved_wake_for_team_work(
-                            &team_id,
-                            &agent_clone.slot_id,
-                            spawn_welcome_role,
-                            TeamWakeSource::SpawnWelcome,
-                        );
-                    }
-                    SpawnWakePlan::MailboxOnly => {
-                        service.notify_mailbox_only_wake(&team_id, &agent_clone.slot_id, TeamWakeSource::SpawnWelcome);
-                    }
-                }
-            });
-        }
+        spawn_attach_agent_process_bg(
+            service,
+            self.team.id.clone(),
+            self.user_id.clone(),
+            new_agent.clone(),
+            self.mcp_stdio_config(&new_agent.slot_id),
+            self.task_manager.clone(),
+            spawn_wake_plan,
+        );
 
         Ok(new_agent)
     }
@@ -1499,7 +1550,7 @@ impl TeamSession {
     ///
     /// This is a static helper suitable for use inside `tokio::spawn` (no
     /// `&self` borrow). The caller passes all necessary context by value.
-    async fn attach_spawned_agent_process_bg(
+    async fn attach_spawned_agent_process(
         service: &TeamSessionService,
         agent: &TeamAgent,
         mcp_stdio_cfg: crate::mcp::TeamMcpStdioConfig,
@@ -1524,6 +1575,65 @@ impl TeamSession {
     pub fn task_board(&self) -> &Arc<TaskBoard> {
         &self.task_board
     }
+}
+
+pub(crate) fn spawn_attach_agent_process_bg(
+    service: Arc<TeamSessionService>,
+    team_id: String,
+    user_id: String,
+    agent: TeamAgent,
+    mcp_stdio_cfg: TeamMcpStdioConfig,
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    wake_plan: SpawnWakePlan,
+) {
+    tokio::spawn(async move {
+        if let Err(err) =
+            TeamSession::attach_spawned_agent_process(&service, &agent, mcp_stdio_cfg, &user_id, &task_manager).await
+        {
+            warn!(
+                team_id = %team_id,
+                slot_id = %agent.slot_id,
+                error = %err,
+                "failed to attach teammate agent process; agent is persisted but not yet running"
+            );
+            if let Err(status_err) = service.mark_agent_attach_failed(&team_id, &agent.slot_id).await {
+                warn!(
+                    team_id = %team_id,
+                    slot_id = %agent.slot_id,
+                    error = %status_err,
+                    "failed to mark teammate attach failure"
+                );
+            }
+            if let Err(notify_err) = service
+                .notify_leader_spawn_attach_failed(&team_id, &agent.slot_id, &err.to_string())
+                .await
+            {
+                warn!(
+                    team_id = %team_id,
+                    slot_id = %agent.slot_id,
+                    error = %notify_err,
+                    "failed to notify leader about teammate attach failure"
+                );
+            }
+            return;
+        }
+
+        service.register_event_loop(&team_id, &agent.slot_id);
+
+        match wake_plan {
+            SpawnWakePlan::RunScoped(spawn_welcome_role) => {
+                service.notify_reserved_wake_for_team_work(
+                    &team_id,
+                    &agent.slot_id,
+                    spawn_welcome_role,
+                    TeamWakeSource::SpawnWelcome,
+                );
+            }
+            SpawnWakePlan::MailboxOnly => {
+                service.notify_mailbox_only_wake(&team_id, &agent.slot_id, TeamWakeSource::SpawnWelcome);
+            }
+        }
+    });
 }
 
 fn classify_send_message_queue_state(

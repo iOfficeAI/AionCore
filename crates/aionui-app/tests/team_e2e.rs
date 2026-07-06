@@ -219,9 +219,9 @@ async fn tc3b_create_team_writes_legacy_extra_shape() {
     assert_eq!(extra["current_model_id"], "claude");
 }
 
-// TC-4: First assistant defaults to lead
+// TC-4: Explicit lead role is returned first
 #[tokio::test]
-async fn tc4_first_agent_is_lead() {
+async fn tc4_explicit_lead_is_returned_first() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     ensure_default_team_assistant(&mut app, &token, &csrf).await;
@@ -230,13 +230,16 @@ async fn tc4_first_agent_is_lead() {
         "name": "T",
         "agents": [
             team_agent("A", "teammate"),
-            team_agent("B", "teammate")
+            team_agent("B", "lead")
         ]
     });
     let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     let json = body_json(resp).await;
+    assert_eq!(json["data"]["assistants"][0]["name"], "B");
     assert_eq!(json["data"]["assistants"][0]["role"], "lead");
+    assert_eq!(json["data"]["assistants"][1]["name"], "A");
+    assert_eq!(json["data"]["assistants"][1]["role"], "teammate");
     assert_eq!(
         json["data"]["leader_assistant_id"],
         json["data"]["assistants"][0]["slot_id"]

@@ -422,7 +422,7 @@ fn acquire_policy(
                 AcquirePolicyDecision::Accept
             }
         },
-        TeamWakeSource::McpSendMessage => match slot_state {
+        TeamWakeSource::McpSendMessage | TeamWakeSource::TeamMembershipChanged => match slot_state {
             TeamRunSlotState::Paused => AcquirePolicyDecision::Suppress("paused_slot_background_wake"),
             TeamRunSlotState::Busy | TeamRunSlotState::Pending | TeamRunSlotState::Idle => {
                 AcquirePolicyDecision::Accept

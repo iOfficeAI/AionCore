@@ -332,7 +332,7 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_describe_assistant",
-        description = "Get detailed information about an assistant before spawning it as a teammate.\n\nReturns the assistant's full description, enabled skills, and example tasks so you can\njudge whether it fits the user's request. Use this when two or more assistants look\nrelevant from the one-line catalog in your system prompt.\n\nOnly works on assistants listed in \"Available Assistants for Spawning\".\nAfter confirming a match, call team_spawn_agent with the same assistant_id."
+        description = "Get detailed information about an assistant before spawning it as a teammate.\n\nReturns the assistant's full description, enabled skills, and example tasks so you can\njudge whether it fits the user's request. Use this when two or more assistants look\nrelevant from the one-line catalog in your system prompt.\n\nUse team_list_assistants to find candidate assistant_id values.\nAfter confirming a match, call team_spawn_agent with the same assistant_id."
     )]
     async fn describe_assistant(&self, Parameters(params): Parameters<DescribeAssistantParams>) -> CallToolResult {
         self.forward_to_tcp(

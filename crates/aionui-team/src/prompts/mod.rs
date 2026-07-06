@@ -228,14 +228,14 @@ mod tests {
     }
 
     #[test]
-    fn lead_prompt_contains_member_list() {
+    fn lead_prompt_uses_tool_for_member_list() {
         let assistants = default_assistants();
         let members = vec![make_lead(), make_teammate("w1", "Worker1")];
         let prompt = build_lead_prompt("Alpha", &members, &assistants);
 
-        // AionUi bullet format: `- {name} ({backend}, status: {status})`
-        assert!(prompt.contains("- Lead (acp, status:"));
-        assert!(prompt.contains("- Worker1 (acp, status:"));
+        assert!(!prompt.contains("- Lead (acp, status:"));
+        assert!(!prompt.contains("- Worker1 (acp, status:"));
+        assert!(prompt.contains("team_members"));
     }
 
     #[test]
@@ -243,9 +243,10 @@ mod tests {
         let assistants = default_assistants();
         let prompt = build_lead_prompt("Alpha", &[], &assistants);
 
-        // Workflow — 15-step procedure with model listing at step 3
+        // Workflow uses tools for dynamic state.
         assert!(prompt.contains("## Workflow"));
-        assert!(prompt.contains("FIRST call `team_list_assistants`"));
+        assert!(prompt.contains("FIRST call `team_members`"));
+        assert!(prompt.contains("call `team_list_assistants`"));
         assert!(prompt.contains("Wait for explicit confirmation before using team_spawn_agent"));
         assert!(prompt.contains("End your turn after the proposal"));
 
@@ -274,15 +275,14 @@ mod tests {
     }
 
     #[test]
-    fn lead_prompt_includes_available_assistants_section() {
+    fn lead_prompt_omits_dynamic_available_assistants_section() {
         let assistants = default_assistants();
         let prompt = build_lead_prompt("Alpha", &[], &assistants);
 
-        assert!(prompt.contains("## Available Assistants for Spawning"));
-        assert!(prompt.contains("- `word-creator` (Word Creator) — Drafts Word documents"));
-        assert!(prompt.contains("skills: docx, formatting"));
-        assert!(prompt.contains("Pass the assistant's ID as `assistant_id`"));
-        assert!(!prompt.contains("backend: claude"));
+        assert!(!prompt.contains("## Available Assistants for Spawning"));
+        assert!(!prompt.contains("- `word-creator` (Word Creator) — Drafts Word documents"));
+        assert!(prompt.contains("team_list_assistants"));
+        assert!(prompt.contains("team_list_models"));
     }
 
     #[test]
@@ -292,11 +292,13 @@ mod tests {
     }
 
     #[test]
-    fn lead_prompt_no_members_shows_empty_lineup_copy() {
+    fn lead_prompt_does_not_include_dynamic_member_snapshot() {
         let assistants = default_assistants();
         let prompt = build_lead_prompt("Solo", &[], &assistants);
-        assert!(prompt.contains("(no teammates yet"));
-        assert!(prompt.contains("propose the lineup to the user first"));
+        assert!(!prompt.contains("## Your Teammates"));
+        assert!(!prompt.contains("(no teammates yet"));
+        assert!(prompt.to_lowercase().contains("first team turn"));
+        assert!(prompt.contains("team_members"));
     }
 
     #[test]
@@ -310,6 +312,8 @@ mod tests {
         );
         assert!(!prompt.contains("assistant or backend"));
         assert!(!prompt.contains("Available Generic Backends"));
+        assert!(!prompt.contains("## Your Teammates"));
+        assert!(!prompt.contains("## Available Assistants for Spawning"));
     }
 
     // -- Teammate prompt ------------------------------------------------------
@@ -324,6 +328,7 @@ mod tests {
         assert!(prompt.contains("Name: Worker1"));
         assert!(prompt.contains("Team: Alpha"));
         assert!(prompt.contains("Leader: Lead"));
+        assert!(!prompt.contains("Teammates:"));
     }
 
     #[test]

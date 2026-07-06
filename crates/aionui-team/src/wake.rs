@@ -8,6 +8,7 @@ pub(crate) enum TeamWakeSource {
     McpSendMessage,
     McpShutdownRequest,
     SpawnWelcome,
+    TeamMembershipChanged,
     SpawnAttachFailure,
     IdleNotification,
     InterruptedNotification,
@@ -33,6 +34,7 @@ impl TeamWakeSource {
             Self::McpSendMessage => "mcp_send_message",
             Self::McpShutdownRequest => "mcp_shutdown_request",
             Self::SpawnWelcome => "spawn_welcome",
+            Self::TeamMembershipChanged => "team_membership_changed",
             Self::SpawnAttachFailure => "spawn_attach_failure",
             Self::IdleNotification => "idle_notification",
             Self::InterruptedNotification => "interrupted_notification",
@@ -46,7 +48,10 @@ impl TeamWakeSource {
     pub(crate) fn class(self) -> TeamWakeClass {
         match self {
             Self::UserMessage | Self::UserIntervention => TeamWakeClass::Foreground,
-            Self::McpSendMessage | Self::IdleNotification | Self::InterruptedNotification => TeamWakeClass::Background,
+            Self::McpSendMessage
+            | Self::TeamMembershipChanged
+            | Self::IdleNotification
+            | Self::InterruptedNotification => TeamWakeClass::Background,
             Self::CrashNotification
             | Self::InactivityTimeout
             | Self::SpawnAttachFailure

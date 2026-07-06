@@ -3,6 +3,7 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aionui_ai_agent::session_context::{
     AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
@@ -1632,6 +1633,45 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
     (svc, recorder)
 }
 
+fn setup_with_factory_and_recording_broadcaster(
+    factory: AgentFactory,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<CountingTaskManager>,
+    Arc<RecordingBroadcaster>,
+) {
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let recorder = Arc::new(RecordingBroadcaster::new());
+    let broadcaster: Arc<dyn EventBroadcaster> = recorder.clone();
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+    let task_manager = Arc::new(CountingTaskManager::new(factory));
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
+    let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let svc = TeamSessionService::new(
+        team_repo_dyn,
+        agent_metadata_repo,
+        Arc::new(EmptyTeamAssistantCatalog),
+        Arc::new(EmptyAssistantDefinitionRepo),
+        Arc::new(EmptyAssistantOverlayRepo),
+        provider_repo,
+        conversation_port,
+        projection_store,
+        broadcaster,
+        task_manager_dyn,
+        noop_turn_port(),
+        noop_cancellation_port(),
+        backend_binary_path,
+    );
+    (svc, team_repo, task_manager, recorder)
+}
+
 fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadataRow {
     AgentMetadataRow {
         id: id.to_owned(),
@@ -2686,7 +2726,7 @@ async fn tc2_create_single_agent_team() {
 }
 
 #[tokio::test]
-async fn tc4_first_agent_is_lead() {
+async fn create_team_uses_explicit_leader_role_when_leader_is_not_first() {
     let svc = setup();
     let resp = svc
         .create_team(
@@ -2695,7 +2735,7 @@ async fn tc4_first_agent_is_lead() {
                 name: "T".into(),
                 agents: vec![
                     TeamAgentInput {
-                        name: "A".into(),
+                        name: "Worker".into(),
                         role: "teammate".into(),
                         backend: Some("acp".into()),
                         model: "claude".into(),
@@ -2703,8 +2743,8 @@ async fn tc4_first_agent_is_lead() {
                         conversation_id: None,
                     },
                     TeamAgentInput {
-                        name: "B".into(),
-                        role: "teammate".into(),
+                        name: "Lead".into(),
+                        role: "lead".into(),
                         backend: Some("acp".into()),
                         model: "claude".into(),
                         assistant_id: None,
@@ -2717,8 +2757,93 @@ async fn tc4_first_agent_is_lead() {
         .await
         .unwrap();
 
+    assert_eq!(resp.assistants[0].name, "Lead");
     assert_eq!(resp.assistants[0].role, "lead");
+    assert_eq!(resp.assistants[1].name, "Worker");
+    assert_eq!(resp.assistants[1].role, "teammate");
     assert_eq!(resp.leader_assistant_id, Some(resp.assistants[0].slot_id.clone()));
+}
+
+#[tokio::test]
+async fn create_team_rejects_zero_leaders() {
+    let svc = setup();
+    let result = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Worker".into(),
+                    role: "teammate".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await;
+
+    assert!(matches!(result, Err(TeamError::InvalidRequest(_))));
+}
+
+#[tokio::test]
+async fn create_team_rejects_multiple_leaders() {
+    let svc = setup();
+    let result = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: vec![
+                    TeamAgentInput {
+                        name: "Lead A".into(),
+                        role: "lead".into(),
+                        backend: Some("acp".into()),
+                        model: "claude".into(),
+                        assistant_id: None,
+                        conversation_id: None,
+                    },
+                    TeamAgentInput {
+                        name: "Lead B".into(),
+                        role: "leader".into(),
+                        backend: Some("acp".into()),
+                        model: "claude".into(),
+                        assistant_id: None,
+                        conversation_id: None,
+                    },
+                ],
+                workspace: None,
+            },
+        )
+        .await;
+
+    assert!(matches!(result, Err(TeamError::InvalidRequest(_))));
+}
+
+#[tokio::test]
+async fn create_team_rejects_unknown_role() {
+    let svc = setup();
+    let result = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "captain".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await;
+
+    assert!(matches!(result, Err(TeamError::InvalidRequest(_))));
 }
 
 #[tokio::test]
@@ -3040,6 +3165,240 @@ async fn aa1_add_agent_to_team() {
 
     let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.assistants.len(), 2);
+}
+
+#[tokio::test]
+async fn add_agent_rejects_leader_role() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Second Leader".into(),
+                role: "lead".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: None,
+            },
+        )
+        .await;
+
+    assert!(matches!(result, Err(TeamError::InvalidRequest(_))));
+}
+
+#[tokio::test]
+async fn add_agent_allows_same_assistant_id_multiple_times() {
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+        row: word_creator_definition(),
+    });
+    let (svc, _team_repo, _conversation_ports, _conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        seeded_agent_metadata_repo(),
+        definition_repo,
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    for name in ["Worker Copy A", "Worker Copy B"] {
+        svc.add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: name.into(),
+                role: "teammate".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: Some("word-creator".into()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let got = svc.get_team("user1", &created.id).await.unwrap();
+    let matching = got
+        .assistants
+        .iter()
+        .filter(|agent| agent.assistant_id.as_deref() == Some("word-creator"))
+        .count();
+    assert_eq!(matching, 2);
+}
+
+#[tokio::test]
+async fn manual_add_agent_active_session_attaches_runtime_in_background_without_blocking_http() {
+    use futures_util::FutureExt;
+
+    let build_count = Arc::new(AtomicUsize::new(0));
+    let factory_count = build_count.clone();
+    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+        let build_index = factory_count.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if build_index >= 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
+            )))
+        }
+        .boxed()
+    });
+    let (svc, _team_repo, task_manager, _recorder) = setup_with_factory_and_recording_broadcaster(factory);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(task_manager.snapshot().build.len(), 1);
+
+    let started_at = std::time::Instant::now();
+    let agent = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Worker".into(),
+                role: "teammate".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        started_at.elapsed() < std::time::Duration::from_millis(150),
+        "manual add HTTP path must not wait for delayed runtime attach"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if task_manager
+                .snapshot()
+                .build
+                .iter()
+                .any(|conversation_id| conversation_id == &agent.conversation_id)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("manual add background attach should build the new runtime");
+}
+
+#[tokio::test]
+async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() {
+    use futures_util::FutureExt;
+
+    let build_count = Arc::new(AtomicUsize::new(0));
+    let factory_count = build_count.clone();
+    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+        let build_index = factory_count.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if build_index >= 1 {
+                return Err(AgentError::internal("simulated manual add attach failure"));
+            }
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
+            )))
+        }
+        .boxed()
+    });
+    let (svc, team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(factory);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let agent = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Worker".into(),
+                role: "teammate".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let has_error_status = recorder.events_by_name("team.agentStatusChanged").iter().any(|event| {
+                event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(agent.slot_id.as_str())
+                    && event.data.get("status").and_then(serde_json::Value::as_str) == Some("error")
+            });
+            if has_error_status {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("manual add attach failure should mark the slot error");
+
+    let lead_slot_id = created.leader_assistant_id.as_deref().expect("leader slot");
+    let leader_messages = team_repo.peek_unread(&created.id, lead_slot_id).await.unwrap();
+    assert!(
+        leader_messages
+            .iter()
+            .any(|message| message.content.contains("failed to attach its runtime")),
+        "leader should receive a persisted attach-failure notice"
+    );
 }
 
 #[tokio::test]
@@ -3479,6 +3838,29 @@ async fn ar1_remove_agent_from_team() {
     let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.assistants.len(), 1);
     assert!(got.assistants.iter().all(|a| a.slot_id != worker_slot));
+}
+
+#[tokio::test]
+async fn remove_agent_rejects_leader() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let lead_slot = created.assistants[0].slot_id.clone();
+    let result = svc.remove_agent("user1", &created.id, &lead_slot).await;
+
+    assert!(matches!(result, Err(TeamError::InvalidRequest(_))));
+    let got = svc.get_team("user1", &created.id).await.unwrap();
+    assert!(got.assistants.iter().any(|agent| agent.slot_id == lead_slot));
 }
 
 #[tokio::test]

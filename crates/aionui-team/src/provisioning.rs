@@ -106,6 +106,11 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 }
 
 impl TeamAgentProvisioner {
+    fn normalized_role(input: &TeamAgentInput) -> Result<TeammateRole, TeamError> {
+        TeammateRole::parse(input.role.trim())
+            .ok_or_else(|| TeamError::InvalidRequest(format!("invalid team agent role: {}", input.role)))
+    }
+
     fn effective_assistant_id(assistant_id: Option<&str>) -> Option<String> {
         assistant_id
             .map(str::trim)
@@ -142,10 +147,26 @@ impl TeamAgentProvisioner {
         inputs: &[TeamAgentInput],
         shared_workspace: Option<&str>,
     ) -> Result<InitialProvisioningResult, TeamError> {
-        let Some((leader_input, teammate_inputs)) = inputs.split_first() else {
+        if inputs.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
         };
 
+        let roles = inputs
+            .iter()
+            .map(Self::normalized_role)
+            .collect::<Result<Vec<_>, _>>()?;
+        let leaders = roles
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, role)| (*role == TeammateRole::Lead).then_some(idx))
+            .collect::<Vec<_>>();
+        let [leader_idx] = leaders.as_slice() else {
+            return Err(TeamError::InvalidRequest(
+                "exactly one team agent must have role lead".into(),
+            ));
+        };
+
+        let leader_input = &inputs[*leader_idx];
         let leader_slot_id = generate_id();
         let leader_role = TeammateRole::Lead;
         let leader_assistant_id = Self::effective_assistant_id(leader_input.assistant_id.as_deref());
@@ -192,9 +213,12 @@ impl TeamAgentProvisioner {
             cli_path: None,
         });
 
-        for input in teammate_inputs {
+        for (input, role) in inputs
+            .iter()
+            .zip(roles.iter())
+            .filter(|(_, role)| **role == TeammateRole::Teammate)
+        {
             let slot_id = generate_id();
-            let role = TeammateRole::parse(&input.role).unwrap_or(TeammateRole::Teammate);
             let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
             let backend = self
                 .resolve_requested_backend(input.backend.as_deref(), assistant_id.as_deref())
@@ -204,7 +228,7 @@ impl TeamAgentProvisioner {
                     user_id,
                     team_id,
                     &slot_id,
-                    role,
+                    *role,
                     &input.name,
                     &backend,
                     &input.model,
@@ -215,7 +239,7 @@ impl TeamAgentProvisioner {
             agents.push(TeamAgent {
                 slot_id,
                 name: input.name.clone(),
-                role,
+                role: *role,
                 conversation_id: conversation.conversation_id,
                 backend,
                 model: input.model.clone(),
@@ -251,7 +275,13 @@ impl TeamAgentProvisioner {
         team: &mut Team,
         req: AddAgentRequest,
     ) -> Result<TeamAgent, TeamError> {
-        let role = TeammateRole::parse(&req.role).unwrap_or(TeammateRole::Teammate);
+        let role = TeammateRole::parse(req.role.trim())
+            .ok_or_else(|| TeamError::InvalidRequest(format!("invalid team agent role: {}", req.role)))?;
+        if role != TeammateRole::Teammate {
+            return Err(TeamError::InvalidRequest(
+                "add_agent only supports teammate role".into(),
+            ));
+        }
         let workspace = self.workspace_resolver().resolve_for_new_agent(row, team).await?;
         let assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref());
         let backend = self

@@ -49,7 +49,7 @@ fn make_agents() -> Vec<TeamAgent> {
             conversation_id: "conv-lead".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            assistant_id: None,
+            assistant_id: Some("lead-assistant".into()),
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -61,7 +61,7 @@ fn make_agents() -> Vec<TeamAgent> {
             conversation_id: "conv-worker".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            assistant_id: None,
+            assistant_id: Some("worker-assistant".into()),
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -472,7 +472,7 @@ async fn sp1_lead_spawn_requires_live_session_service() {
         &mut stream,
         2,
         "team_spawn_agent",
-        json!({"name": "Helper", "role": "worker", "assistant_id": "word-creator"}),
+        json!({"name": "Helper", "assistant_id": "word-creator"}),
     )
     .await;
 
@@ -548,7 +548,10 @@ async fn ttc1_create_basic_task() {
 
     assert!(!is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(text.contains("Implement feature X"));
+    let payload: Value = serde_json::from_str(&text).expect("team_task_create must return JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["task"]["subject"], "Implement feature X");
+    assert!(payload["task"]["task_id"].as_str().is_some());
 
     env.server.stop();
 }
@@ -573,6 +576,10 @@ async fn ttc2_create_task_with_dependency() {
     .await;
 
     assert!(!is_error_response(&resp));
+    let text = extract_text(&resp);
+    let payload: Value = serde_json::from_str(&text).expect("team_task_create must return JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["task"]["subject"], "Task B");
 
     let list_resp2 = call_tool(&mut stream, 5, "team_task_list", json!({})).await;
     let tasks2: Vec<Value> = serde_json::from_str(&extract_text(&list_resp2)).unwrap();
@@ -640,6 +647,11 @@ async fn ttu1_update_task_status() {
     .await;
 
     assert!(!is_error_response(&resp));
+    let text = extract_text(&resp);
+    let payload: Value = serde_json::from_str(&text).expect("team_task_update must return JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["task"]["task_id"], task_id);
+    assert_eq!(payload["task"]["status"], "completed");
 
     let list_resp2 = call_tool(&mut stream, 5, "team_task_list", json!({})).await;
     let tasks2: Vec<Value> = serde_json::from_str(&extract_text(&list_resp2)).unwrap();
@@ -682,9 +694,16 @@ async fn tm1_list_all_members() {
     let members: Vec<Value> = serde_json::from_str(&text).unwrap();
     assert_eq!(members.len(), 2);
 
-    let names: Vec<&str> = members.iter().map(|m| m["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"Leader"));
-    assert!(names.contains(&"Worker"));
+    assert_eq!(members[0]["name"], "Leader");
+    assert_eq!(members[0]["role"], "lead");
+    assert_eq!(members[0]["assistant_id"], "lead-assistant");
+    assert_eq!(members[0]["model"], "claude");
+    assert!(members[0].get("conversation_id").is_none());
+    assert_eq!(members[1]["name"], "Worker");
+    assert_eq!(members[1]["role"], "teammate");
+    assert_eq!(members[1]["assistant_id"], "worker-assistant");
+    assert_eq!(members[1]["model"], "claude");
+    assert!(members[1].get("conversation_id").is_none());
 
     // Regression: cold-start agents (including the lead before its first
     // wake) must report an explicit `idle` status — never `null` — so MCP
@@ -720,7 +739,11 @@ async fn tra1_rename_existing_agent() {
 
     assert!(!is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(text.contains("renamed"));
+    let payload: Value = serde_json::from_str(&text).expect("team_rename_agent must return JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["action"], "agent_renamed");
+    assert_eq!(payload["agent"]["slot_id"], "worker-1");
+    assert_eq!(payload["agent"]["name"], "Senior Worker");
 
     env.server.stop();
 }

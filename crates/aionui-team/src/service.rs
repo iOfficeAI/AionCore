@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload, TeamResponse,
-    TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole, WebSocketMessage,
+    TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole, TeamSlotRuntimeHealth, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -22,12 +22,14 @@ use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::AgentLoopContext;
-use crate::events::{TEAM_CREATED_EVENT, TEAM_MCP_STATUS_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT};
+use crate::events::{
+    TEAM_CREATED_EVENT, TEAM_MCP_STATUS_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT, TeamEventEmitter,
+};
 use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogPort};
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
-use crate::session::{AgentMessageQueueResult, TeamSession};
-use crate::types::{Team, TeamAgent};
+use crate::session::{AgentMessageQueueResult, TeamSession, spawn_attach_agent_process_bg};
+use crate::types::{Team, TeamAgent, TeammateStatus};
 use crate::wake::TeamWakeSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -386,8 +388,40 @@ impl TeamSessionService {
         let agent = self.provisioner().add_agent(user_id, &row, &mut team, req).await?;
 
         if let Some(session) = self.sessions.get(team_id).map(|e| Arc::clone(&e.session)) {
-            session.add_agent(&agent).await;
-            self.register_event_loop(team_id, &agent.slot_id);
+            let wake_plan = session.add_manual_agent(&agent).await?;
+            let service = self
+                .self_ref
+                .upgrade()
+                .ok_or_else(|| TeamError::InvalidRequest("add_agent requires a live TeamSessionService".into()))?;
+            spawn_attach_agent_process_bg(
+                service,
+                team_id.to_owned(),
+                user_id.to_owned(),
+                agent.clone(),
+                session.mcp_stdio_config(&agent.slot_id),
+                self.task_manager.clone(),
+                wake_plan,
+            );
+            info!(
+                team_id = %team_id,
+                slot_id = %agent.slot_id,
+                assistant_id = %agent.assistant_id.as_deref().unwrap_or(""),
+                role = %agent.role,
+                notification_written = true,
+                wake_requested = true,
+                "manual teammate added"
+            );
+        } else {
+            TeamEventEmitter::new(team_id.to_owned(), self.broadcaster.clone()).broadcast_agent_spawned(&agent);
+            info!(
+                team_id = %team_id,
+                slot_id = %agent.slot_id,
+                assistant_id = %agent.assistant_id.as_deref().unwrap_or(""),
+                role = %agent.role,
+                notification_written = false,
+                wake_requested = false,
+                "manual teammate added"
+            );
         }
 
         self.build_agent_response(&agent).await
@@ -401,6 +435,10 @@ impl TeamSessionService {
             .iter()
             .position(|a| a.slot_id == slot_id)
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.into()))?;
+
+        if team.agents[idx].role == crate::types::TeammateRole::Lead {
+            return Err(TeamError::InvalidRequest("cannot remove the team lead".into()));
+        }
 
         let removed = team.agents.remove(idx);
 
@@ -421,7 +459,28 @@ impl TeamSessionService {
             .await?;
 
         if let Some(session) = self.sessions.get(team_id).map(|e| Arc::clone(&e.session)) {
-            let _ = session.remove_agent(slot_id).await;
+            session.remove_agent(slot_id).await?;
+            session.notify_leader_membership_removed(&removed).await?;
+            info!(
+                team_id = %team_id,
+                slot_id = %removed.slot_id,
+                assistant_id = %removed.assistant_id.as_deref().unwrap_or(""),
+                role = %removed.role,
+                notification_written = true,
+                wake_requested = true,
+                "manual teammate removed"
+            );
+        } else {
+            TeamEventEmitter::new(team_id.to_owned(), self.broadcaster.clone()).broadcast_agent_removed(slot_id);
+            info!(
+                team_id = %team_id,
+                slot_id = %removed.slot_id,
+                assistant_id = %removed.assistant_id.as_deref().unwrap_or(""),
+                role = %removed.role,
+                notification_written = false,
+                wake_requested = false,
+                "manual teammate removed"
+            );
         }
 
         Ok(())
@@ -1018,6 +1077,24 @@ impl TeamSessionService {
             .session
             .notify_leader_spawn_attach_failed(failed_slot_id, error)
             .await
+    }
+
+    pub(crate) async fn mark_agent_attach_failed(&self, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let entry = self
+            .sessions
+            .get(team_id)
+            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+        entry
+            .session
+            .scheduler()
+            .set_status(slot_id, TeammateStatus::Error)
+            .await?;
+        entry
+            .session
+            .team_run_manager()
+            .mark_slot_runtime_health(slot_id, TeamSlotRuntimeHealth::Unhealthy)
+            .await;
+        Ok(())
     }
 
     pub(crate) async fn wake_leader_after_recovery_message(

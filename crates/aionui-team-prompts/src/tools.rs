@@ -59,7 +59,7 @@ Returns the assistant's full description, enabled skills, and example tasks so y
 judge whether it fits the user's request. Use this when two or more assistants look
 relevant from the one-line catalog in your system prompt.
 
-Only works on assistants listed in \"Available Assistants for Spawning\".
+Use team_list_assistants to find candidate assistant_id values.
 After confirming a match, call team_spawn_agent with the same assistant_id.";
 
 pub const TEAM_LIST_ASSISTANTS_DESCRIPTION: &str = "List the assistants available for team spawning. Returns the real assistant catalog with \
@@ -91,8 +91,7 @@ pub fn team_tool_specs() -> Vec<TeamToolSpec> {
                 "properties": {
                     "name": { "type": "string", "description": "Agent display name" },
                     "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be valid for the chosen assistant backend. Query team_list_models to see available models." },
-                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn (from the Available Assistants catalog). The runtime backend is derived from this assistant." },
-                    "role": { "type": "string", "description": "Agent role (default: 'teammate')" }
+                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn. Call team_list_assistants when you need candidates; the runtime backend is derived from this assistant." }
                 },
                 "required": ["name", "assistant_id"]
             }),

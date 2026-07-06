@@ -239,10 +239,10 @@ fn default_assistants() -> Vec<AvailableAssistant> {
     ]
 }
 
-// -- LP-1: Lead prompt contains member list ----------------------------------
+// -- LP-1: Lead prompt relies on team_members for roster ----------------------
 
 #[test]
-fn lp1_lead_prompt_contains_member_list() {
+fn lp1_lead_prompt_does_not_contain_member_snapshot() {
     let members = vec![
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Alice", TeammateRole::Teammate),
@@ -251,10 +251,12 @@ fn lp1_lead_prompt_contains_member_list() {
     let assistants = default_assistants();
     let prompt = build_lead_prompt("Alpha", &members, &assistants);
 
-    // AionUi bullet format: `- {name} ({backend}, status: {status})`
-    assert!(prompt.contains("- Lead ("), "lead name missing");
-    assert!(prompt.contains("- Alice ("), "teammate Alice missing");
-    assert!(prompt.contains("- Bob ("), "teammate Bob missing");
+    assert!(!prompt.contains("## Your Teammates"));
+    assert!(!prompt.contains("- Lead ("), "lead snapshot leaked");
+    assert!(!prompt.contains("- Alice ("), "teammate Alice snapshot leaked");
+    assert!(!prompt.contains("- Bob ("), "teammate Bob snapshot leaked");
+    assert!(prompt.to_lowercase().contains("first team turn"));
+    assert!(prompt.contains("team_members"));
 }
 
 // -- LP-2: Lead prompt contains tool descriptions ----------------------------
@@ -279,6 +281,8 @@ fn lp2_lead_prompt_contains_tool_descriptions() {
     for tool in expected_tools {
         assert!(prompt.contains(tool), "missing tool: {tool}");
     }
+    assert!(prompt.contains("team_list_assistants"));
+    assert!(!prompt.contains("## Available Assistants for Spawning"));
 }
 
 // -- LP-3: Lead prompt contains task management guidance ---------------------
@@ -318,6 +322,10 @@ fn tp1_teammate_prompt_contains_execution_guidance() {
     assert!(prompt.contains("shutdown_request"), "missing shutdown protocol");
     assert!(prompt.contains("shutdown_approved"), "missing shutdown_approved");
     assert!(prompt.contains("STOP GENERATING"), "missing stop protocol");
+    assert!(
+        !prompt.contains("Teammates:"),
+        "static teammate list must not be injected"
+    );
 }
 
 // -- TP-2: Teammate prompt contains team name --------------------------------
