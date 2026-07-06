@@ -160,6 +160,15 @@ impl AssistantService {
                 .as_ref()
                 .filter(|definition| definition.source == "builtin")
                 .and_then(|definition| definition.default_permission_value.as_deref());
+            let default_thought_level_mode = existing_definition
+                .as_ref()
+                .filter(|definition| definition.source == "builtin")
+                .map(|definition| definition.default_thought_level_mode.as_str())
+                .unwrap_or("auto");
+            let default_thought_level_value = existing_definition
+                .as_ref()
+                .filter(|definition| definition.source == "builtin")
+                .and_then(|definition| definition.default_thought_level_value.as_deref());
 
             self.definition_repo
                 .upsert(&UpsertAssistantDefinitionParams {
@@ -190,6 +199,8 @@ impl AssistantService {
                     default_model_value,
                     default_permission_mode,
                     default_permission_value,
+                    default_thought_level_mode,
+                    default_thought_level_value,
                     default_skills_mode: "fixed",
                     default_skill_ids: &default_skill_ids,
                     custom_skill_names: &custom_skill_names,
@@ -363,6 +374,7 @@ impl AssistantService {
             .iter()
             .filter(|row| {
                 row.enabled
+                    && row.installed
                     && row.agent_type.supports_new_conversation()
                     && matches!(
                         row.status,
@@ -439,6 +451,8 @@ impl AssistantService {
                         default_model_value: None,
                         default_permission_mode: "auto".into(),
                         default_permission_value: None,
+                        default_thought_level_mode: "auto".into(),
+                        default_thought_level_value: None,
                         default_skills_mode: "fixed".into(),
                         default_skill_ids: "[]".into(),
                         custom_skill_names: "[]".into(),
@@ -548,6 +562,8 @@ impl AssistantService {
                 default_model_value: None,
                 default_permission_mode: "auto",
                 default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
                 default_skills_mode: "fixed",
                 default_skill_ids: &default_skill_ids,
                 custom_skill_names: &custom_skill_names,
@@ -637,6 +653,9 @@ impl AssistantService {
         let mut result = Vec::new();
 
         for definition in &definitions {
+            if generated_definition_is_uninstalled(definition, &projections) {
+                continue;
+            }
             let projection = self
                 .project_definition(definition, state_map.get(&definition.id), &projections)
                 .await?;
@@ -663,6 +682,9 @@ impl AssistantService {
     pub async fn get(&self, id: &str) -> Result<AssistantResponse, AssistantError> {
         let projections = self.reconcile_generated_assistants().await?;
         if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
+            if generated_definition_is_uninstalled(&definition, &projections) {
+                return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
+            }
             let state = self.state_repo.get(&definition.id).await?;
             let projection = self
                 .project_definition(&definition, state.as_ref(), &projections)
@@ -676,6 +698,9 @@ impl AssistantService {
     pub async fn get_detail(&self, id: &str, locale: Option<&str>) -> Result<AssistantDetailResponse, AssistantError> {
         let projections = self.reconcile_generated_assistants().await?;
         if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
+            if generated_definition_is_uninstalled(&definition, &projections) {
+                return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
+            }
             let state = self.state_repo.get(&definition.id).await?;
             let preference = self.preference_repo.get(&definition.id).await?;
             let rules_content = self.read_rule(id, locale).await?;
@@ -847,8 +872,8 @@ impl AssistantService {
 
                 // Built-in rows are sourced from the embedded bundle and can't
                 // be mutated. Users may still override `agent_id`, and
-                // product-defined governance allows model/permission defaults
-                // to vary per built-in assistant. Any other field on the
+                // product-defined governance allows model/permission/thought
+                // defaults to vary per built-in assistant. Any other field on the
                 // request is rejected so callers don't silently lose data.
                 if req.name.is_some()
                     || req.description.is_some()
@@ -866,7 +891,7 @@ impl AssistantService {
                     || builtin_defaults_forbidden
                 {
                     return Err(AssistantError::Forbidden(
-                        "Only 'agent_id', 'defaults.model', and 'defaults.permission' can be overridden on built-in assistants".into(),
+                        "Only 'agent_id', 'defaults.model', 'defaults.permission', and 'defaults.thought_level' can be overridden on built-in assistants".into(),
                     ));
                 }
 
@@ -1045,6 +1070,7 @@ impl AssistantService {
 
         let mut last_model_id = existing.as_ref().and_then(|row| row.last_model_id.clone());
         let mut last_permission_value = existing.as_ref().and_then(|row| row.last_permission_value.clone());
+        let mut last_thought_level_value = existing.as_ref().and_then(|row| row.last_thought_level_value.clone());
         let mut last_skill_ids = existing
             .as_ref()
             .map(|row| decode_str_list(Some(row.last_skill_ids.as_str())))
@@ -1097,6 +1123,24 @@ impl AssistantService {
             }
         }
 
+        if let Some(thought_level) = defaults.thought_level.as_ref() {
+            match thought_level.mode.as_str() {
+                "fixed" => {
+                    last_thought_level_value = thought_level.value.clone().filter(|value| !value.trim().is_empty());
+                }
+                "auto" => {
+                    if previous_definition.is_some_and(|current| current.default_thought_level_mode == "fixed") {
+                        last_thought_level_value = None;
+                    }
+                }
+                other => {
+                    return Err(AssistantError::BadRequest(format!(
+                        "defaults.thought_level.mode must be 'auto' or 'fixed', got '{other}'"
+                    )));
+                }
+            }
+        }
+
         if let Some(skills) = defaults.skills.as_ref() {
             match skills.mode.as_str() {
                 "fixed" => {
@@ -1137,6 +1181,7 @@ impl AssistantService {
 
         if last_model_id.is_none()
             && last_permission_value.is_none()
+            && last_thought_level_value.is_none()
             && last_skill_ids.is_empty()
             && last_disabled_builtin_skill_ids.is_empty()
             && last_mcp_ids.is_empty()
@@ -1162,6 +1207,7 @@ impl AssistantService {
                 assistant_definition_id: &definition.id,
                 last_model_id: last_model_id.as_deref(),
                 last_permission_value: last_permission_value.as_deref(),
+                last_thought_level_value: last_thought_level_value.as_deref(),
                 last_skill_ids: &last_skill_ids_json,
                 last_disabled_builtin_skill_ids: &last_disabled_builtin_skill_ids_json,
                 last_mcp_ids: &last_mcp_ids_json,
@@ -2078,6 +2124,10 @@ impl AssistantService {
                     mode: definition.default_permission_mode.clone(),
                     value: definition.default_permission_value.clone(),
                 },
+                thought_level: AssistantDefaultScalarResponse {
+                    mode: definition.default_thought_level_mode.clone(),
+                    value: definition.default_thought_level_value.clone(),
+                },
                 skills: AssistantDefaultListResponse {
                     mode: definition.default_skills_mode.clone(),
                     value: default_skill_ids.clone(),
@@ -2095,6 +2145,7 @@ impl AssistantService {
             preferences: AssistantPreferencesResponse {
                 last_model_id: preference.and_then(|row| row.last_model_id.clone()),
                 last_permission_value: preference.and_then(|row| row.last_permission_value.clone()),
+                last_thought_level_value: preference.and_then(|row| row.last_thought_level_value.clone()),
                 last_skill_ids,
                 last_disabled_builtin_skill_ids,
                 last_mcp_ids,
@@ -2284,6 +2335,23 @@ fn assistant_projection_for_definition(
     }
 }
 
+fn generated_definition_is_uninstalled(definition: &AssistantDefinitionRow, agent_rows: &[AgentManagementRow]) -> bool {
+    if definition.source != "generated" {
+        return false;
+    }
+
+    let agent_id = definition.agent_id.as_str();
+    let source_ref = definition.source_ref.as_deref();
+    let Some(row) = agent_rows
+        .iter()
+        .find(|row| row.id == agent_id || source_ref == Some(row.id.as_str()))
+    else {
+        return true;
+    };
+
+    !row.installed
+}
+
 fn effective_agent_id_for_definition<'a>(
     definition: &'a AssistantDefinitionRow,
     state: Option<&'a AssistantOverlayRow>,
@@ -2346,6 +2414,8 @@ struct SerializedDetailOverrides {
     default_model_value: Option<Option<String>>,
     default_permission_mode: Option<String>,
     default_permission_value: Option<Option<String>>,
+    default_thought_level_mode: Option<String>,
+    default_thought_level_value: Option<Option<String>>,
     default_skills_mode: Option<String>,
     default_skill_ids: Option<String>,
     default_mcps_mode: Option<String>,
@@ -2393,6 +2463,11 @@ impl SerializedDetailOverrides {
                 result.default_permission_mode = Some(mode);
                 result.default_permission_value = Some(value);
             }
+            if let Some(thought_level) = defaults.thought_level.as_ref() {
+                let (mode, value) = validate_scalar_default(thought_level, "defaults.thought_level")?;
+                result.default_thought_level_mode = Some(mode);
+                result.default_thought_level_value = Some(value);
+            }
             if let Some(skills) = defaults.skills.as_ref() {
                 let (mode, value) = validate_list_default(skills, "defaults.skills")?;
                 result.default_skills_mode = Some(mode);
@@ -2415,6 +2490,8 @@ impl SerializedDetailOverrides {
             || self.default_model_value.is_some()
             || self.default_permission_mode.is_some()
             || self.default_permission_value.is_some()
+            || self.default_thought_level_mode.is_some()
+            || self.default_thought_level_value.is_some()
             || self.default_skills_mode.is_some()
             || self.default_skill_ids.is_some()
             || self.default_mcps_mode.is_some()
@@ -2432,6 +2509,8 @@ fn apply_detail_patch_to_definition(
         definition.default_model_value = None;
         definition.default_permission_mode = "auto".to_string();
         definition.default_permission_value = None;
+        definition.default_thought_level_mode = "auto".to_string();
+        definition.default_thought_level_value = None;
     }
     if let Some(value) = overrides.recommended_prompts.as_deref() {
         definition.recommended_prompts = value.to_string();
@@ -2450,6 +2529,12 @@ fn apply_detail_patch_to_definition(
     }
     if let Some(value) = overrides.default_permission_value.as_ref() {
         definition.default_permission_value = value.clone();
+    }
+    if let Some(value) = overrides.default_thought_level_mode.as_deref() {
+        definition.default_thought_level_mode = value.to_string();
+    }
+    if let Some(value) = overrides.default_thought_level_value.as_ref() {
+        definition.default_thought_level_value = value.clone();
     }
     if let Some(value) = overrides.default_skills_mode.as_deref() {
         definition.default_skills_mode = value.to_string();
@@ -2490,6 +2575,8 @@ fn upsert_params_from_definition(definition: &AssistantDefinitionRow) -> UpsertA
         default_model_value: definition.default_model_value.as_deref(),
         default_permission_mode: &definition.default_permission_mode,
         default_permission_value: definition.default_permission_value.as_deref(),
+        default_thought_level_mode: &definition.default_thought_level_mode,
+        default_thought_level_value: definition.default_thought_level_value.as_deref(),
         default_skills_mode: &definition.default_skills_mode,
         default_skill_ids: &definition.default_skill_ids,
         custom_skill_names: &definition.custom_skill_names,
@@ -2928,6 +3015,7 @@ mod tests {
             config_options: None,
             available_modes: None,
             available_models: None,
+            available_commands: None,
             sort_order: 3100,
             team_capable: true,
             status,
@@ -2944,6 +3032,66 @@ mod tests {
             has_command_override: false,
             env_override_key_count: 0,
         }
+    }
+
+    fn mk_uninstalled_agent_row(id: &str, backend: &str) -> aionui_api_types::AgentManagementRow {
+        let mut row = mk_agent_row(id, backend, aionui_api_types::AgentManagementStatus::Unchecked);
+        row.installed = false;
+        row.last_check_status = None;
+        row.last_check_kind = None;
+        row.last_check_latency_ms = None;
+        row.last_check_at = None;
+        row.last_success_at = None;
+        row
+    }
+
+    async fn insert_generated_definition(fx: &Fixture, definition_id: &str, assistant_id: &str, agent_id: &str) {
+        fx.definition_repo
+            .upsert(&UpsertAssistantDefinitionParams {
+                id: definition_id,
+                assistant_id,
+                source: "generated",
+                owner_type: "system",
+                source_ref: Some(agent_id),
+                source_version: None,
+                source_hash: None,
+                name: "Historical generated agent",
+                name_i18n: "{}",
+                description: None,
+                description_i18n: "{}",
+                avatar_type: "none",
+                avatar_value: None,
+                agent_id,
+                rule_resource_type: "none",
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: "[]",
+                recommended_prompts_i18n: "{}",
+                default_model_mode: "auto",
+                default_model_value: None,
+                default_permission_mode: "auto",
+                default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
+                default_skills_mode: "fixed",
+                default_skill_ids: "[]",
+                custom_skill_names: "[]",
+                default_disabled_builtin_skill_ids: "[]",
+                default_mcps_mode: "auto",
+                default_mcp_ids: "[]",
+            })
+            .await
+            .unwrap();
+        fx.state_repo
+            .upsert(&UpsertAssistantOverlayParams {
+                assistant_definition_id: definition_id,
+                enabled: true,
+                sort_order: 3,
+                agent_id_override: None,
+                last_used_at: None,
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2981,6 +3129,8 @@ mod tests {
                 default_model_value: None,
                 default_permission_mode: "auto",
                 default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
                 default_skills_mode: "fixed",
                 default_skill_ids: "[]",
                 custom_skill_names: "[]",
@@ -3045,6 +3195,14 @@ mod tests {
     #[tokio::test]
     async fn list_maps_generated_definition_to_generated_source() {
         let fx = fixture().await;
+        fx.agent_rows
+            .lock()
+            .expect("agent rows lock poisoned")
+            .push(mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            ));
         fx.definition_repo
             .upsert(&UpsertAssistantDefinitionParams {
                 id: "asstdef-generated",
@@ -3070,6 +3228,8 @@ mod tests {
                 default_model_value: None,
                 default_permission_mode: "auto",
                 default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
                 default_skills_mode: "auto",
                 default_skill_ids: "[]",
                 custom_skill_names: "[]",
@@ -3152,6 +3312,65 @@ mod tests {
         assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Unchecked);
         assert!(bare.team_selectable);
         assert!(bare.agent_status_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_skips_generated_assistant_for_uninstalled_unchecked_agent() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_uninstalled_agent_row("agent-snow", "snow")],
+            ..Default::default()
+        })
+        .await;
+
+        let list = fx.service.list().await.unwrap();
+
+        assert!(
+            list.iter().all(|assistant| assistant.id != "bare:agent-snow"),
+            "uninstalled agents must not occupy generated assistant list slots"
+        );
+        assert!(
+            fx.definition_repo
+                .get_by_assistant_id("bare:agent-snow")
+                .await
+                .unwrap()
+                .is_none(),
+            "bootstrap should not materialize generated assistant definitions for uninstalled agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_hides_existing_generated_assistant_when_agent_is_uninstalled_until_installed() {
+        let mut uninstalled_row = mk_uninstalled_agent_row("agent-snow", "snow");
+        uninstalled_row.status = aionui_api_types::AgentManagementStatus::Offline;
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![uninstalled_row],
+            ..Default::default()
+        })
+        .await;
+        insert_generated_definition(&fx, "asstdef-generated-snow", "bare:agent-snow", "agent-snow").await;
+
+        let hidden = fx.service.list().await.unwrap();
+        assert!(
+            hidden.iter().all(|assistant| assistant.id != "bare:agent-snow"),
+            "historical generated assistants should be hidden while their agent is not installed"
+        );
+
+        {
+            let mut rows = fx.agent_rows.lock().expect("agent rows lock poisoned");
+            rows[0].installed = true;
+            rows[0].status = aionui_api_types::AgentManagementStatus::Unchecked;
+        }
+
+        let restored = fx.service.list().await.unwrap();
+        let assistant = restored
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-snow")
+            .expect("installed generated assistant should reappear");
+        assert_eq!(assistant.source, AssistantSource::Generated);
+        assert_eq!(
+            assistant.agent_status,
+            aionui_api_types::AgentManagementStatus::Unchecked
+        );
     }
 
     #[tokio::test]
@@ -4377,6 +4596,7 @@ mod tests {
                             mode: "fixed".into(),
                             value: Some("strict".into()),
                         }),
+                        thought_level: None,
                         skills: Some(AssistantDefaultListRequest {
                             mode: "fixed".into(),
                             value: vec!["skill-a".into()],
@@ -4680,6 +4900,7 @@ mod tests {
                         mode: "fixed".into(),
                         value: Some("default".into()),
                     }),
+                    thought_level: None,
                     skills: Some(AssistantDefaultListRequest {
                         mode: "fixed".into(),
                         value: vec!["skill-a".into(), "skill-b".into()],
@@ -4732,6 +4953,7 @@ mod tests {
                             mode: "fixed".into(),
                             value: Some("strict".into()),
                         }),
+                        thought_level: None,
                         skills: Some(AssistantDefaultListRequest {
                             mode: "fixed".into(),
                             value: vec!["skill-z".into()],
@@ -4784,6 +5006,7 @@ mod tests {
                             mode: "fixed".into(),
                             value: Some("strict".into()),
                         }),
+                        thought_level: None,
                         skills: Some(AssistantDefaultListRequest {
                             mode: "fixed".into(),
                             value: vec!["skill-z".into()],
@@ -4823,6 +5046,7 @@ mod tests {
                         mode: "fixed".into(),
                         value: Some("strict".into()),
                     }),
+                    thought_level: None,
                     skills: Some(AssistantDefaultListRequest {
                         mode: "fixed".into(),
                         value: vec!["skill-z".into()],
@@ -4850,6 +5074,7 @@ mod tests {
                             mode: "auto".into(),
                             value: None,
                         }),
+                        thought_level: None,
                         skills: Some(AssistantDefaultListRequest {
                             mode: "auto".into(),
                             value: vec![],

@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.43](https://github.com/iOfficeAI/AionCore/compare/v0.1.42...v0.1.43) (2026-07-06)
+
+
+### Features
+
+* **assistant:** persist thought-level defaults ([#574](https://github.com/iOfficeAI/AionCore/issues/574)) ([dd9f299](https://github.com/iOfficeAI/AionCore/commit/dd9f29967270f4e7263484532fad3b2199ba1894))
+
+
+### Bug Fixes
+
+* **agent:** project available commands in management rows ([#579](https://github.com/iOfficeAI/AionCore/issues/579)) ([689ee8f](https://github.com/iOfficeAI/AionCore/commit/689ee8f91cbabd7e57c4e882f86c1ceec167e36d))
+* **assistant:** filter generated assistants by installed agents ([#578](https://github.com/iOfficeAI/AionCore/issues/578)) ([5b7c366](https://github.com/iOfficeAI/AionCore/commit/5b7c366132006eb16e748e8fc5a0976da9a5b2a3))
+* **cron:** enforce full-auto mode for scheduled tasks ([#576](https://github.com/iOfficeAI/AionCore/issues/576)) ([cf0a9bd](https://github.com/iOfficeAI/AionCore/commit/cf0a9bd88ac295fe8b40a6c1f9f21174b574718d))
+
 ## [0.1.42](https://github.com/iOfficeAI/AionCore/compare/v0.1.41...v0.1.42) (2026-07-03)
 
 

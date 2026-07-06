@@ -68,6 +68,8 @@ struct AssistantConversationOverrides {
     #[serde(default)]
     permission: Option<String>,
     #[serde(default)]
+    thought_level: Option<String>,
+    #[serde(default)]
     skill_ids: Option<Vec<String>>,
     #[serde(default)]
     disabled_builtin_skill_ids: Option<Vec<String>>,
@@ -80,6 +82,7 @@ impl From<AssistantConversationOverridesRequest> for AssistantConversationOverri
         Self {
             model: value.model,
             permission: value.permission,
+            thought_level: value.thought_level,
             skill_ids: value.skill_ids,
             disabled_builtin_skill_ids: value.disabled_builtin_skill_ids,
             mcp_ids: value.mcp_ids,
@@ -94,6 +97,8 @@ struct AssistantSnapshotResolvedDefaults {
     #[serde(default)]
     permission: Option<String>,
     #[serde(default)]
+    thought_level: Option<String>,
+    #[serde(default)]
     skill_ids: Vec<String>,
     #[serde(default)]
     disabled_builtin_skill_ids: Vec<String>,
@@ -107,6 +112,8 @@ struct AssistantSnapshotDefaultModes {
     model: String,
     #[serde(default)]
     permission: String,
+    #[serde(default)]
+    thought_level: String,
     #[serde(default)]
     skills: String,
     #[serde(default)]
@@ -159,12 +166,14 @@ fn default_assistant_snapshot_agent_type() -> AgentType {
 struct AssistantEffectiveDefaultModes<'a> {
     model: &'a str,
     permission: &'a str,
+    thought_level: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AssistantRuntimePreferenceUpdate<'a> {
     pub(crate) model: Option<&'a str>,
     pub(crate) permission: Option<&'a str>,
+    pub(crate) thought_level: Option<&'a str>,
 }
 
 fn assistant_snapshot_modes<'a>(
@@ -181,6 +190,11 @@ fn assistant_snapshot_modes<'a>(
             definition.default_permission_mode.as_str()
         } else {
             snapshot.default_modes.permission.as_str()
+        },
+        thought_level: if snapshot.default_modes.thought_level.is_empty() {
+            definition.default_thought_level_mode.as_str()
+        } else {
+            snapshot.default_modes.thought_level.as_str()
         },
     }
 }
@@ -320,6 +334,7 @@ pub struct ConversationAgentTurnRequest {
     pub content: String,
     pub files: Vec<String>,
     pub inject_skills: Vec<String>,
+    pub required_runtime_mode: Option<String>,
     pub persist_user_message: bool,
     pub user_message_hidden: bool,
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
@@ -841,6 +856,12 @@ impl ConversationService {
                     );
                 }
             }
+            if let Some(thought_level) = snapshot.resolved_defaults.thought_level.as_ref() {
+                obj.insert(
+                    "thought_level".to_owned(),
+                    serde_json::Value::String(thought_level.clone()),
+                );
+            }
             if !snapshot.rules.content.trim().is_empty() {
                 match effective_type {
                     AgentType::Acp => {
@@ -1112,6 +1133,8 @@ impl ConversationService {
                     resolved_model_id: snapshot.resolved_defaults.model.as_deref(),
                     default_permission_mode: &snapshot.default_modes.permission,
                     resolved_permission_value: snapshot.resolved_defaults.permission.as_deref(),
+                    default_thought_level_mode: &snapshot.default_modes.thought_level,
+                    resolved_thought_level_value: snapshot.resolved_defaults.thought_level.as_deref(),
                     default_skills_mode: &snapshot.default_modes.skills,
                     resolved_skill_ids: &resolved_skill_ids,
                     resolved_disabled_builtin_skill_ids: &resolved_disabled_builtin_skill_ids,
@@ -1347,6 +1370,15 @@ impl ConversationService {
                 "auto" => preference.as_ref().and_then(|row| row.last_permission_value.clone()),
                 _ => None,
             });
+        let thought_level =
+            overrides
+                .thought_level
+                .clone()
+                .or_else(|| match definition.default_thought_level_mode.as_str() {
+                    "fixed" => definition.default_thought_level_value.clone(),
+                    "auto" => preference.as_ref().and_then(|row| row.last_thought_level_value.clone()),
+                    _ => None,
+                });
 
         let rules_content = if let Some(dispatcher) = self.assistant_dispatcher() {
             dispatcher
@@ -1394,12 +1426,14 @@ impl ConversationService {
             default_modes: AssistantSnapshotDefaultModes {
                 model: definition.default_model_mode.clone(),
                 permission: definition.default_permission_mode.clone(),
+                thought_level: definition.default_thought_level_mode.clone(),
                 skills: definition.default_skills_mode.clone(),
                 mcps: definition.default_mcps_mode.clone(),
             },
             resolved_defaults: AssistantSnapshotResolvedDefaults {
                 model,
                 permission,
+                thought_level,
                 skill_ids,
                 disabled_builtin_skill_ids,
                 mcp_ids,
@@ -1431,6 +1465,13 @@ impl ConversationService {
             existing_preference
                 .as_ref()
                 .and_then(|row| row.last_permission_value.clone())
+        };
+        let last_thought_level_value = if snapshot.default_modes.thought_level == "auto" {
+            snapshot.resolved_defaults.thought_level.clone()
+        } else {
+            existing_preference
+                .as_ref()
+                .and_then(|row| row.last_thought_level_value.clone())
         };
         let last_skill_ids = if snapshot.default_modes.skills == "auto" {
             serde_json::to_string(&snapshot.resolved_defaults.skill_ids)
@@ -1465,6 +1506,7 @@ impl ConversationService {
                 assistant_definition_id: &snapshot.assistant_definition_id,
                 last_model_id: last_model_id.as_deref(),
                 last_permission_value: last_permission_value.as_deref(),
+                last_thought_level_value: last_thought_level_value.as_deref(),
                 last_skill_ids: &last_skill_ids,
                 last_disabled_builtin_skill_ids: &last_disabled_builtin_skill_ids,
                 last_mcp_ids: &last_mcp_ids,
@@ -1505,6 +1547,10 @@ impl ConversationService {
                 resolved_model_id: updates.model.or(snapshot.resolved_model_id.as_deref()),
                 default_permission_mode: &snapshot.default_permission_mode,
                 resolved_permission_value: updates.permission.or(snapshot.resolved_permission_value.as_deref()),
+                default_thought_level_mode: &snapshot.default_thought_level_mode,
+                resolved_thought_level_value: updates
+                    .thought_level
+                    .or(snapshot.resolved_thought_level_value.as_deref()),
                 default_skills_mode: &snapshot.default_skills_mode,
                 resolved_skill_ids: &snapshot.resolved_skill_ids,
                 resolved_disabled_builtin_skill_ids: &snapshot.resolved_disabled_builtin_skill_ids,
@@ -1594,6 +1640,7 @@ impl ConversationService {
                 AssistantEffectiveDefaultModes {
                     model: snapshot.default_model_mode.as_str(),
                     permission: snapshot.default_permission_mode.as_str(),
+                    thought_level: snapshot.default_thought_level_mode.as_str(),
                 },
             )
         } else {
@@ -1608,6 +1655,7 @@ impl ConversationService {
                     .unwrap_or_else(|| AssistantEffectiveDefaultModes {
                         model: definition.default_model_mode.as_str(),
                         permission: definition.default_permission_mode.as_str(),
+                        thought_level: definition.default_thought_level_mode.as_str(),
                     }),
             )
         };
@@ -1636,12 +1684,24 @@ impl ConversationService {
                 .as_ref()
                 .and_then(|row| row.last_permission_value.clone())
         };
+        let last_thought_level_value = if default_modes.thought_level == "auto" {
+            updates.thought_level.map(ToOwned::to_owned).or_else(|| {
+                existing_preference
+                    .as_ref()
+                    .and_then(|row| row.last_thought_level_value.clone())
+            })
+        } else {
+            existing_preference
+                .as_ref()
+                .and_then(|row| row.last_thought_level_value.clone())
+        };
 
         preference_repo
             .upsert(&aionui_db::UpsertAssistantPreferenceParams {
                 assistant_definition_id: &definition_id,
                 last_model_id: last_model_id.as_deref(),
                 last_permission_value: last_permission_value.as_deref(),
+                last_thought_level_value: last_thought_level_value.as_deref(),
                 last_skill_ids: existing_preference
                     .as_ref()
                     .map(|row| row.last_skill_ids.as_str())
@@ -1938,8 +1998,21 @@ impl ConversationService {
     }
 
     pub async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), ConversationError> {
+        let runtime_state = self
+            .acp_session_repo
+            .load_runtime_state(conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load runtime mode state: {e}")))?;
+        let mut config_selections = runtime_state
+            .and_then(|state| state.config_selections_json)
+            .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(&raw).ok())
+            .unwrap_or_default();
+        config_selections.insert("mode".to_owned(), mode.to_owned());
+        let config_selections_json = serde_json::to_string(&config_selections)
+            .map_err(|e| ConversationError::internal(format!("Failed to serialize runtime mode selection: {e}")))?;
         let params = SaveRuntimeStateParams {
             current_mode_id: Some(Some(mode)),
+            config_selections_json: Some(Some(config_selections_json.as_str())),
             ..Default::default()
         };
         self.acp_session_repo
@@ -2611,6 +2684,7 @@ impl ConversationService {
             user_id: user_id.to_owned(),
             conversation: row,
             request: req,
+            required_runtime_mode: None,
             build_options: build_opts,
             stored_workspace,
             turn_id: turn_id.clone(),
@@ -2734,6 +2808,7 @@ impl ConversationService {
                     inject_skills: request.inject_skills,
                     hidden: request.user_message_hidden,
                 },
+                required_runtime_mode: request.required_runtime_mode,
                 build_options: build_opts,
                 stored_workspace,
                 turn_id: turn_id.clone(),

@@ -157,6 +157,8 @@ pub struct AssistantDefaultsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission: Option<AssistantDefaultScalarRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_level: Option<AssistantDefaultScalarRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<AssistantDefaultListRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcps: Option<AssistantDefaultListRequest>,
@@ -166,6 +168,7 @@ pub struct AssistantDefaultsRequest {
 pub struct AssistantDefaultsResponse {
     pub model: AssistantDefaultScalarResponse,
     pub permission: AssistantDefaultScalarResponse,
+    pub thought_level: AssistantDefaultScalarResponse,
     pub skills: AssistantDefaultListResponse,
     pub mcps: AssistantDefaultListResponse,
 }
@@ -186,6 +189,8 @@ pub struct AssistantPreferencesResponse {
     pub last_model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_permission_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_thought_level_value: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub last_skill_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -149,7 +149,7 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
 }
 
 #[tokio::test]
-async fn hydrate_uses_persisted_availability_without_reprobing_path() {
+async fn hydrate_refreshes_installation_without_rerunning_health_check() {
     let db = init_database_memory().await.unwrap();
     let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
     let temp = tempfile::tempdir().unwrap();
@@ -191,13 +191,13 @@ async fn hydrate_uses_persisted_availability_without_reprobing_path() {
     let rows = registry.list_management_rows().await;
     let cached = rows.iter().find(|row| row.id == "agent-startup-cached").unwrap();
 
-    assert_eq!(cached.status, AgentManagementStatus::Online);
-    assert!(cached.installed, "startup hydrate should not refresh PATH");
+    assert_eq!(cached.status, AgentManagementStatus::Missing);
+    assert!(!cached.installed, "startup hydrate should refresh installation state");
     assert_eq!(cached.last_check_status, Some(AgentSnapshotCheckStatus::Online));
 }
 
 #[tokio::test]
-async fn hydrate_uses_persisted_availability_for_commandless_managed_builtin() {
+async fn hydrate_refreshes_commandless_managed_builtin_installation() {
     let db = init_database_memory().await.unwrap();
     let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
 
@@ -211,7 +211,7 @@ async fn hydrate_uses_persisted_availability_for_commandless_managed_builtin() {
         backend: Some("claude"),
         agent_type: "acp",
         agent_source: "builtin",
-        agent_source_info: Some(r#"{"binary_name":"claude"}"#),
+        agent_source_info: Some(r#"{"binary_name":"definitely-missing-managed-claude-cli"}"#),
         enabled: true,
         command: None,
         args: Some("[]"),
@@ -252,16 +252,16 @@ async fn hydrate_uses_persisted_availability_for_commandless_managed_builtin() {
     let rows = registry.list_management_rows().await;
     let cached = rows.iter().find(|row| row.id == "agent-managed-cached").unwrap();
 
-    assert_eq!(cached.status, AgentManagementStatus::Online);
+    assert_eq!(cached.status, AgentManagementStatus::Missing);
     assert!(
-        cached.installed,
-        "managed builtin should trust persisted online snapshot"
+        !cached.installed,
+        "startup hydrate should refresh managed builtin installation state"
     );
     assert_eq!(cached.last_check_status, Some(AgentSnapshotCheckStatus::Online));
 }
 
 #[tokio::test]
-async fn management_list_uses_cached_availability_without_reprobing_path() {
+async fn management_list_keeps_hydrated_installation_without_reprobing_path() {
     let db = init_database_memory().await.unwrap();
     let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
@@ -285,7 +285,7 @@ async fn management_list_uses_cached_availability_without_reprobing_path() {
     let cached = rows.iter().find(|row| row.id == "agent-cached").unwrap();
 
     assert_eq!(cached.status, AgentManagementStatus::Unchecked);
-    assert!(!cached.installed, "management list should not refresh PATH on read");
+    assert!(cached.installed, "management list should not refresh PATH on read");
 }
 
 #[tokio::test]
@@ -328,7 +328,7 @@ async fn manual_health_check_does_not_refresh_unrelated_agents() {
 
     assert_eq!(unrelated.status, AgentManagementStatus::Unchecked);
     assert!(
-        !unrelated.installed,
+        unrelated.installed,
         "single-agent health check should not refresh unrelated agents"
     );
 }
@@ -373,7 +373,7 @@ async fn custom_enabled_toggle_does_not_refresh_unrelated_agents() {
 
     assert_eq!(unrelated.status, AgentManagementStatus::Unchecked);
     assert!(
-        !unrelated.installed,
+        unrelated.installed,
         "custom enabled toggle should not refresh unrelated agents"
     );
 }
@@ -417,9 +417,6 @@ async fn custom_delete_does_not_refresh_unrelated_agents() {
     let unrelated = rows.iter().find(|row| row.id == "agent-unrelated").unwrap();
 
     assert_eq!(unrelated.status, AgentManagementStatus::Unchecked);
-    assert!(
-        !unrelated.installed,
-        "custom delete should not refresh unrelated agents"
-    );
+    assert!(unrelated.installed, "custom delete should not refresh unrelated agents");
     assert!(rows.iter().all(|row| row.id != "agent-target-delete"));
 }

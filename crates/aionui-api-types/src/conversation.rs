@@ -34,6 +34,8 @@ pub struct AssistantConversationOverridesRequest {
     #[serde(default)]
     pub permission: Option<String>,
     #[serde(default)]
+    pub thought_level: Option<String>,
+    #[serde(default)]
     pub skill_ids: Option<Vec<String>>,
     #[serde(default)]
     pub disabled_builtin_skill_ids: Option<Vec<String>>,
@@ -329,6 +331,7 @@ mod tests {
                 "conversation_overrides": {
                     "model": "opus-4.1",
                     "permission": "yolo",
+                    "thought_level": "high",
                     "skill_ids": ["skill-a"],
                     "disabled_builtin_skill_ids": ["builtin-a"],
                     "mcp_ids": ["mcp-a"]
@@ -350,6 +353,7 @@ mod tests {
                 conversation_overrides: Some(AssistantConversationOverridesRequest {
                     model: Some("opus-4.1".into()),
                     permission: Some("yolo".into()),
+                    thought_level: Some("high".into()),
                     skill_ids: Some(vec!["skill-a".into()]),
                     disabled_builtin_skill_ids: Some(vec!["builtin-a".into()]),
                     mcp_ids: Some(vec!["mcp-a".into()]),
