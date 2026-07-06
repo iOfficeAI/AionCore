@@ -160,11 +160,32 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     // "default" (standard prompts) so a session with no explicit choice is gated, not
     // bypassed. `default`/`plan`/`acceptEdits`/`bypassPermissions` are claude's exact
     // wire values (see `claude_permission_modes`).
+    // VALIDATE before the flag reaches the spawn: an invalid `--permission-mode`
+    // makes claude exit 1 at spawn (LIVE-PROBED), which surfaces as an opaque
+    // "agent crashed" with no diagnosis. `config.mode` is sourced from unconstrained
+    // storage (a persisted `current_mode_id`, an assistant default), so a stale/
+    // generic alias that survived normalization would harden into a spawn crash. The
+    // dead-until-now `is_valid_claude_permission_mode` is the exact seed-time
+    // whitelist for this; an unrecognized value falls back to the fail-CLOSED
+    // "default" (a WARN records the drop) rather than crashing the process. Mirrors
+    // the ACP path's `clear_invalid_desired_mode` (drop-if-not-in-catalog) — a
+    // protection the port had wired but never called.
     let mode = config
         .mode
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .filter(|m| {
+            let ok = crate::adapter::is_valid_claude_permission_mode(m);
+            if !ok {
+                tracing::warn!(
+                    requested_mode = %m,
+                    "claude: ignoring unrecognized --permission-mode (would crash spawn); \
+                     falling back to \"default\""
+                );
+            }
+            ok
+        })
         .unwrap_or("default");
     args.push("--permission-mode".to_string());
     args.push(mode.to_string());
@@ -2542,6 +2563,44 @@ mod tests {
              is always present so a later in-band switch to bypass is accepted; \
              AskUserQuestion is denied (temporary)"
         );
+    }
+
+    /// claude-mode-gating: an UNRECOGNIZED `--permission-mode` value makes claude exit 1
+    /// at spawn (LIVE-PROBED), surfacing as an opaque crash. `config.mode` is sourced
+    /// from unconstrained storage (a persisted `current_mode_id`, an assistant default,
+    /// a stale generic alias), so `build_claude_init_args` must validate it against
+    /// claude's exact enum and fall back to the fail-CLOSED `default` — never pass an
+    /// invalid value through to the flag. Mirrors the ACP path's
+    /// `clear_invalid_desired_mode` (drop-if-not-in-catalog).
+    #[test]
+    fn build_claude_init_args_invalid_mode_falls_back_to_default() {
+        let permission_mode = |mode: &str| -> Option<String> {
+            let cfg = SessionConfig {
+                mode: Some(mode.to_string()),
+                ..Default::default()
+            };
+            let args = build_claude_init_args(&cfg);
+            args.iter()
+                .position(|a| a == "--permission-mode")
+                .and_then(|i| args.get(i + 1).cloned())
+        };
+        // Every valid enum value passes through verbatim.
+        for valid in ["default", "plan", "acceptEdits", "bypassPermissions"] {
+            assert_eq!(
+                permission_mode(valid).as_deref(),
+                Some(valid),
+                "valid mode {valid:?} must pass through unchanged"
+            );
+        }
+        // Anything else (a stale alias, a codex-ism, free text) falls back to
+        // `default` instead of crashing the spawn.
+        for invalid in ["yolo", "yoloNoSandbox", "auto", "acceptedits", "danger", "Plan"] {
+            assert_eq!(
+                permission_mode(invalid).as_deref(),
+                Some("default"),
+                "invalid mode {invalid:?} must fall back to `default` (not crash the spawn)"
+            );
+        }
     }
 
     /// http/sse MCP transports map to claude's `{type,url,headers}` entry shape.

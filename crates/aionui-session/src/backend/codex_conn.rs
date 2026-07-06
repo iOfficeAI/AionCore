@@ -96,6 +96,10 @@ impl BackendConnection for CodexConnection {
         let mut backend = CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms).await;
         // Seed the current model (M1): codex's collaborationMode for SetMode
         // requires settings.model, so the backend must track it from the start.
+        // OPTIMISTIC seed: the model is not actually bound at thread/start anymore
+        // (codex-model-gating). `spawn_codex_model_reconcile` clears this back to None
+        // if the requested model turns out NOT to be in the discovered catalog, so a
+        // later SetMode never builds a collaborationMode around a model codex rejects.
         if let Some(model) = &config.model {
             *backend.current_model.lock().await = Some(model.clone());
         }
@@ -112,8 +116,9 @@ impl BackendConnection for CodexConnection {
         // JSON-RPC handshake over the retained stdin (the reader task is already
         // draining stdout). REAL codex 0.137.0 wire (verified against the
         // aion-probe transcripts in protocols/verification fixtures):
-        //   initialize{clientInfo} → thread/start{approvalPolicy,sandbox,cwd,model}
-        //   (Fresh) | thread/resume{threadId}. The threadId comes back BOTH in the
+        //   initialize{clientInfo} → thread/start{approvalPolicy,sandbox,cwd}
+        //   (Fresh; NO model — applied later via a validated SetModel, see
+        //   spawn_codex_model_reconcile) | thread/resume{threadId}. The threadId comes back BOTH in the
         // thread/* RESULT and the `thread/started` NOTIFICATION; the reader binds it
         // from the latter (two-id, §4.1). For Resume we already hold it, so
         // run_handshake pre-seeds the binding so the first `turn/start` has a
@@ -125,6 +130,22 @@ impl BackendConnection for CodexConnection {
             SessionSpec::Resume { backend_session_id, .. } => backend_session_id.clone(),
         };
         backend.run_handshake(resume_tid.as_deref()).await?;
+
+        // codex-model-gating: `thread/start` intentionally did NOT bind `config.model`
+        // (see `thread_start_params`) — the thread launched on codex's own default
+        // model. Now apply the requested model the ACP way: wait for `model/list` to
+        // fill the catalog, then dispatch a VALIDATED `SetModel` (dropped if the model
+        // is not in the catalog, so a stale picker default never poisons every turn).
+        // Detached + off the open hot path; a Fresh session with a requested model is
+        // the only case that does any work (Resume keeps codex's bound model; no
+        // requested model → nothing to reconcile).
+        if matches!(spec, SessionSpec::Fresh { .. })
+            && let Some(model) = config.model.clone()
+        {
+            let backend = Arc::new(backend);
+            spawn_codex_model_reconcile(backend.clone(), model);
+            return Ok(backend);
+        }
 
         Ok(Arc::new(backend))
     }
@@ -143,6 +164,80 @@ impl BackendConnection for CodexConnection {
     fn capabilities(&self) -> Capabilities {
         codex_capabilities()
     }
+}
+
+/// How long the post-handshake model reconcile waits for `model/list` to fill the
+/// catalog before giving up. 100 × 50ms = 5s — the same bound `spawn_catalog_writeback`
+/// uses to wait for models (codex answers modes before models). If the catalog never
+/// arrives we do NOT apply the requested model (we cannot validate it), leaving the
+/// thread on codex's launch default rather than risk binding a bad model.
+const CODEX_MODEL_RECONCILE_POLLS: u32 = 100;
+
+/// codex-model-gating self-heal (the ACP `clear_invalid_desired_model` +
+/// `reconcile_session` port). `thread/start` launched the thread on codex's OWN
+/// default model (it deliberately did not embed `config.model`). This detached task
+/// waits for `model/list` to fill the discovered catalog, then:
+///   - if `requested` IS in the catalog → dispatch a `SetModel` so the thread uses it
+///     (the validated apply; success converges via `thread/settings/updated`);
+///   - if `requested` is NOT in the catalog → DROP it (WARN) and clear the optimistic
+///     open-time `current_model` seed, so a stale frontend default (e.g. `gpt-5.5`
+///     the local codex lacks) never binds and poisons every turn with an opaque
+///     UNKNOWN_UPSTREAM_ERROR. This is the exact ACP contract (`session/new` carried
+///     no model; the model was applied only after being validated against the
+///     session/new catalog), adapted to codex's `model/list`-after-`thread/start`
+///     ordering.
+fn spawn_codex_model_reconcile(backend: Arc<CodexSessionBackend>, requested: String) {
+    tokio::spawn(async move {
+        // Wait for the catalog (model/list response → `discovered.models`). The reader
+        // fills it asynchronously after `run_handshake` fired the request.
+        let mut catalog: Vec<String> = Vec::new();
+        for _ in 0..CODEX_MODEL_RECONCILE_POLLS {
+            {
+                let disc = backend.discovered.lock().unwrap_or_else(|e| e.into_inner());
+                if !disc.models.is_empty() {
+                    catalog = disc.models.iter().map(|m| m.id.clone()).collect();
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        if catalog.is_empty() {
+            // Never learned the catalog → cannot validate. Leave codex on its launch
+            // default (the safe choice) rather than bind a possibly-invalid model.
+            tracing::warn!(
+                requested_model = %requested,
+                "codex model reconcile: model/list never populated; leaving thread on codex default \
+                 (requested model NOT applied — cannot validate)"
+            );
+            return;
+        }
+
+        if !catalog.contains(&requested) {
+            // DROP the invalid desire (ACP `clear_invalid_desired_model`). Clear the
+            // optimistic open-time seed so SetMode can't later build a collaborationMode
+            // around a model codex rejected, and the UI intent doesn't outlive reality.
+            tracing::warn!(
+                requested_model = %requested,
+                catalog = ?catalog,
+                "codex model reconcile: requested model not in catalog; dropping it \
+                 (thread stays on codex default)"
+            );
+            *backend.current_model.lock().await = None;
+            return;
+        }
+
+        // Valid → apply via the normal SetModel wire (validated apply). Success
+        // converges to the UI via the `thread/settings/updated` → ConfigChanged notif;
+        // a rejection surfaces as a Notice{Warning} (pending_set path).
+        tracing::info!(
+            model = %requested,
+            "codex model reconcile: applying requested model (validated against catalog)"
+        );
+        if let Err(e) = backend.dispatch(Command::SetModel { model: requested }).await {
+            tracing::error!(error = %e, "codex model reconcile: SetModel dispatch failed");
+        }
+    });
 }
 
 /// A pure params object that knows how to wrap itself in a JSON-RPC request frame.
@@ -183,7 +278,21 @@ fn initialize_params() -> HandshakeParams {
 }
 
 /// `thread/start` params (Fresh / lost-Resume). approvalPolicy/sandbox are valid
-/// AskForApproval/SandboxMode enum values; cwd + model threaded from config.
+/// AskForApproval/SandboxMode enum values; cwd threaded from config.
+///
+/// ⚠️ MODEL IS DELIBERATELY NOT EMBEDDED HERE (codex-model-gating regression fix).
+/// `thread/start` binds the model for the WHOLE thread, and `turn/start` carries NO
+/// model — so a stale/invalid `config.model` (e.g. a frontend picker default like
+/// `gpt-5.5` the local codex doesn't have) bound here makes EVERY turn fail with an
+/// opaque UNKNOWN_UPSTREAM_ERROR (live-repro: a fresh codex conv's first reply
+/// fails; an old conv resumes via thread/resume which sends no model → works). The
+/// catalog (`model/list`) is UNKNOWN at this instant — it is fired AFTER thread/start
+/// in `run_handshake` — so we CANNOT validate the model here. Instead we launch on
+/// codex's OWN default model (always valid locally) and apply `config.model` later
+/// via a VALIDATED `SetModel`, dropping it if it is not in the discovered catalog.
+/// This is the faithful port of the ACP path, which likewise launched model-less
+/// (`session/new` carried no model) and applied the model only after
+/// `clear_invalid_desired_model` validated it against the session/new catalog.
 ///
 /// Wave 0c: the session-init surface is injected here. codex reads MCP servers
 /// from its CONFIG (NOT a per-thread param), so they go into `config.mcp_servers`
@@ -207,9 +316,8 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
     if let Some(cwd) = &config.cwd {
         params["cwd"] = json!(cwd);
     }
-    if let Some(model) = &config.model {
-        params["model"] = json!(model);
-    }
+    // NB: `config.model` is intentionally NOT written here — see the doc comment
+    // above. It is applied post-discovery by `reconcile_codex_model` (validated).
     if !config.init.mcp_servers.is_empty() {
         params["config"] = json!({ "mcp_servers": build_codex_mcp_servers(&config.init.mcp_servers) });
     }
@@ -4875,10 +4983,13 @@ mod tests {
         assert_eq!(frame["params"]["clientInfo"]["name"], "aionui-session");
     }
 
-    /// thread/start params thread cwd + model from config; approvalPolicy/sandbox
-    /// are valid codex enum values.
+    /// thread/start params thread cwd from config; approvalPolicy/sandbox are valid
+    /// codex enum values. MODEL IS NEVER EMBEDDED (codex-model-gating regression fix):
+    /// the model binds the whole thread and cannot be validated at this instant
+    /// (model/list comes AFTER thread/start), so a requested model is applied later
+    /// via a validated `SetModel` (`spawn_codex_model_reconcile`), never here.
     #[test]
-    fn thread_start_frame_threads_cwd_and_model() {
+    fn thread_start_frame_threads_cwd_and_never_model() {
         let frame = thread_start_params(&SessionConfig {
             cwd: Some("/work".into()),
             model: Some("gpt-5.5".into()),
@@ -4887,7 +4998,11 @@ mod tests {
         .into_frame(2, "thread/start");
         assert_eq!(frame["method"], "thread/start");
         assert_eq!(frame["params"]["cwd"], "/work");
-        assert_eq!(frame["params"]["model"], "gpt-5.5");
+        assert!(
+            frame["params"].get("model").is_none(),
+            "model must NOT be bound at thread/start even when config carries one \
+             (applied post-discovery via a validated SetModel instead)"
+        );
         assert_eq!(frame["params"]["approvalPolicy"], "on-request");
         assert_eq!(frame["params"]["sandbox"], "workspace-write");
         // omitted when config has neither
@@ -5130,6 +5245,98 @@ mod tests {
         // mode with only `name` (no `mode` token) falls back to name as the id.
         assert_eq!(d.modes.len(), 1, "legacy result.modes[] still parses");
         assert_eq!(d.modes[0].id, "plan", "mode id falls back to `name` when `mode` absent");
+    }
+
+    // ===== codex-model-gating: post-handshake validated model reconcile =====
+
+    /// Build a backend whose reader has already learned a two-model catalog
+    /// (`openai.gpt-5.5`, `openai.gpt-5.4`) AND bound a thread — the state
+    /// `spawn_codex_model_reconcile` runs against. Returns (Arc<backend>, captured
+    /// stdin) so a test can drive the reconcile and inspect the frames it writes.
+    async fn backend_with_catalog_and_binding() -> (Arc<CodexSessionBackend>, Arc<tokio::sync::Mutex<Vec<u8>>>) {
+        let started = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-rec"}}}"#;
+        let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"openai.gpt-5.5","displayName":"GPT-5.5","isDefault":true},{"id":"openai.gpt-5.4","displayName":"gpt-5.4"}],"nextCursor":null}}"#;
+        let bytes = format!("{started}\n{model_resp}\n").into_bytes();
+        let fake = FakeAgentIo::never_exits(bytes);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-rec", Box::new(fake)).await;
+        backend.pending_discovery.lock().await.insert(50, DiscoveryKind::Models);
+        // Drive the reader so it binds the thread + fills the catalog.
+        let _events = backend.events();
+        for _ in 0..40 {
+            let filled = !backend
+                .discovered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .models
+                .is_empty();
+            let bound = backend.thread_binding.lock().await.is_some();
+            if filled && bound {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        (Arc::new(backend), captured)
+    }
+
+    /// A requested model that IS in the discovered catalog is applied via a real
+    /// `thread/settings/update{model}` (the validated apply) — the same wire a manual
+    /// SetModel uses. This is the codex analogue of ACP's reconcile issuing `set_model`
+    /// only for a desire that survived `clear_invalid_desired_model`.
+    #[tokio::test]
+    async fn codex_model_reconcile_applies_valid_model() {
+        let (backend, captured) = backend_with_catalog_and_binding().await;
+        spawn_codex_model_reconcile(backend.clone(), "openai.gpt-5.4".into());
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"thread/settings/update""#),
+            "a catalog-valid model is applied via thread/settings/update, got: {written}"
+        );
+        assert!(
+            written.contains(r#""model":"openai.gpt-5.4""#),
+            "carries the requested (valid) model, got: {written}"
+        );
+    }
+
+    /// A requested model that is NOT in the catalog (a stale frontend picker default the
+    /// local codex lacks — the exact "新会话首个回复报上游错误" repro) is DROPPED: no
+    /// `thread/settings/update` is written (the thread stays on codex's launch default),
+    /// and the optimistic open-time `current_model` seed is cleared so a later SetMode
+    /// can't build a collaborationMode around a model codex rejected. This is the port of
+    /// ACP's `clear_invalid_desired_model`.
+    #[tokio::test]
+    async fn codex_model_reconcile_drops_invalid_model_and_clears_seed() {
+        let (backend, captured) = backend_with_catalog_and_binding().await;
+        // Optimistic open-time seed (open_session sets this from config.model).
+        *backend.current_model.lock().await = Some("gpt-5.5-that-local-codex-lacks".into());
+        // Run the reconcile inline (await the spawned task's effect by polling).
+        spawn_codex_model_reconcile(backend.clone(), "gpt-5.5-that-local-codex-lacks".into());
+        // Give the detached task time to observe the catalog + drop the seed.
+        let mut cleared = false;
+        for _ in 0..40 {
+            if backend.current_model.lock().await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            cleared,
+            "an invalid requested model must clear the optimistic current_model seed"
+        );
+        let written = captured_str_allow_empty(&captured).await;
+        assert!(
+            !written.contains(r#""method":"thread/settings/update""#),
+            "an invalid model must NOT be applied to codex (no thread/settings/update), got: {written}"
+        );
+    }
+
+    /// Drain captured stdin WITHOUT requiring non-empty output (the invalid-model
+    /// reconcile writes NOTHING, so `captured_str`'s "poll until non-empty" would hang
+    /// the full 40 iterations then still assert). Bounded settle, returns whatever is there.
+    async fn captured_str_allow_empty(captured: &Arc<tokio::sync::Mutex<Vec<u8>>>) -> String {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        String::from_utf8_lossy(&captured.lock().await.clone()).to_string()
     }
 
     // ===== O2: thread/turns/list response → CheckpointList event (up-leg) =====

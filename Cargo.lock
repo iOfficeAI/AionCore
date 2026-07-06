@@ -392,6 +392,7 @@ dependencies = [
 name = "aionui-app"
 version = "0.1.42"
 dependencies = [
+ "aion-config",
  "aionui-ai-agent",
  "aionui-api-types",
  "aionui-assets",
@@ -740,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-process"
-version = "0.1.40"
+version = "0.1.42"
 dependencies = [
  "aionui-common",
  "aionui-runtime",
@@ -801,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-session"
-version = "0.1.40"
+version = "0.1.42"
 dependencies = [
  "aionui-common",
  "aionui-process",
