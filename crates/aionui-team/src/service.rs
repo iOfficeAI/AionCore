@@ -52,6 +52,13 @@ struct TeamAgentRebuildOutcome {
     result: Result<(), TeamError>,
 }
 
+fn format_rebuild_agent_identity(agent: &TeamAgent) -> String {
+    format!(
+        "{} (backend={}, model={}, role={}, slot_id={}, conversation_id={})",
+        agent.name, agent.backend, agent.model, agent.role, agent.slot_id, agent.conversation_id
+    )
+}
+
 pub struct TeamSessionService {
     repo: Arc<dyn ITeamRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
@@ -769,8 +776,10 @@ impl TeamSessionService {
             info!(
                 team_id = %cfg.team_id,
                 slot_id = %agent.slot_id,
+                agent_name = %agent.name,
                 conversation_id = %agent.conversation_id,
                 backend = %agent.backend,
+                model = %agent.model,
                 role = %agent.role,
                 "team agent rebuild attach started"
             );
@@ -783,14 +792,22 @@ impl TeamSessionService {
                 Ok(()) => info!(
                     team_id,
                     slot_id = %agent.slot_id,
+                    agent_name = %agent.name,
                     conversation_id = %agent.conversation_id,
+                    backend = %agent.backend,
+                    model = %agent.model,
+                    role = %agent.role,
                     duration_ms,
                     "team agent rebuild attach finished"
                 ),
                 Err(error) => warn!(
                     team_id,
                     slot_id = %agent.slot_id,
+                    agent_name = %agent.name,
                     conversation_id = %agent.conversation_id,
+                    backend = %agent.backend,
+                    model = %agent.model,
+                    role = %agent.role,
                     duration_ms,
                     error = %error,
                     "team agent rebuild attach failed"
@@ -831,7 +848,15 @@ impl TeamSessionService {
 
         let first_error = failures
             .first()
-            .and_then(|outcome| outcome.result.as_ref().err().map(|error| error.to_string()))
+            .map(|outcome| {
+                let error = outcome
+                    .result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unknown rebuild failure".to_owned());
+                format!("{}: {error}", format_rebuild_agent_identity(&outcome.agent))
+            })
             .unwrap_or_else(|| "unknown rebuild failure".to_owned());
 
         for failure in &failures {
@@ -841,14 +866,19 @@ impl TeamSessionService {
                 .err()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "unknown rebuild failure".to_owned());
-            let msg = format!("failed to attach rebuilt agent {}: {error}", failure.agent.slot_id);
+            let agent_identity = format_rebuild_agent_identity(&failure.agent);
+            let msg = format!("failed to attach rebuilt agent {agent_identity}: {error}");
             self.broadcast_mcp_phase(team_id, &failure.agent.slot_id, TeamMcpPhase::SessionError, None, |p| {
                 p.error = Some(msg);
             });
             warn!(
                 team_id,
                 slot_id = %failure.agent.slot_id,
+                agent_name = %failure.agent.name,
                 conversation_id = %failure.agent.conversation_id,
+                backend = %failure.agent.backend,
+                model = %failure.agent.model,
+                role = %failure.agent.role,
                 duration_ms = failure.duration_ms,
                 error = %error,
                 "warmup failed during rebuild"
@@ -859,7 +889,11 @@ impl TeamSessionService {
             info!(
                 team_id,
                 slot_id = %success.agent.slot_id,
+                agent_name = %success.agent.name,
                 conversation_id = %success.agent.conversation_id,
+                backend = %success.agent.backend,
+                model = %success.agent.model,
+                role = %success.agent.role,
                 "cleaning up successfully attached agent after rebuild failure"
             );
             self.task_manager

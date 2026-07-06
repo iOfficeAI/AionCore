@@ -4873,6 +4873,14 @@ async fn d9_ensure_session_cleans_up_successful_rebuilds_when_one_agent_fails() 
 
     let result = svc.ensure_session("user1", &created.id).await;
     assert!(result.is_err(), "ensure_session should propagate build error");
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("Worker 3")
+            && error.contains("backend=acp")
+            && error.contains("model=worker-3")
+            && error.contains("role=teammate"),
+        "rebuild error should identify the failing agent by name, backend, model, and role: {error}"
+    );
 
     let calls = tm.snapshot();
     assert_eq!(
