@@ -81,8 +81,9 @@ impl AcpAgentManager {
         warn!(
             conversation_id = %self.params.conversation_id,
             stale_session_id = %stale_sid,
+            recovery_action = "clear_persisted_session_id_and_session_new",
             error = %err,
-            "open_session_resume: stale session id rejected by CLI; rebuilding via session/new"
+            "open_session_resume: stale session id rejected by CLI; clearing persisted session id and rebuilding via session/new"
         );
         {
             let mut session = self.session.write().await;

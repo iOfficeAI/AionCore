@@ -275,11 +275,10 @@ impl AcpError {
     ///
     /// Mapping is by [`ErrorCode`], never by message text. The single
     /// exceptions are known stale-session shapes: `data.error == "Session not
-    /// found: ..."` and resource-not-found replies on existing-session
-    /// methods without a concrete resource URI. OpenCode/Codex have both
-    /// emitted stale-session failures with those shapes, so we re-classify
-    /// them into `SessionNotFound` to keep recovery paths uniform across
-    /// agents.
+    /// found: ..."` and resource-not-found replies from `session/load`
+    /// without a concrete resource URI. OpenCode/Codex have emitted stale
+    /// resume failures with those shapes, so we re-classify them into
+    /// `SessionNotFound` to keep recovery paths uniform across agents.
     /// See ELECTRON-1HQ.
     /// `context` carries the session ID or method name for diagnostics.
     pub fn from_sdk(err: SdkError, context: &str) -> Self {
@@ -290,8 +289,7 @@ impl AcpError {
             ErrorCode::ResourceNotFound => {
                 if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
                     AcpError::SessionNotFound { session_id: sid }
-                } else if extract_resource_not_found(err.data.as_ref()).is_none() && is_existing_session_method(context)
-                {
+                } else if extract_resource_not_found(err.data.as_ref()).is_none() && is_session_load_method(context) {
                     AcpError::SessionNotFound {
                         session_id: context.to_owned(),
                     }
@@ -345,11 +343,8 @@ impl AcpError {
     }
 }
 
-fn is_existing_session_method(context: &str) -> bool {
-    matches!(
-        context,
-        "session/load" | "session/prompt" | "session/set_mode" | "session/set_model" | "session/set_config_option"
-    )
+fn is_session_load_method(context: &str) -> bool {
+    context == "session/load"
 }
 
 /// If `data` carries a `{"error": "Session not found: <sid>"}` payload
@@ -565,6 +560,16 @@ mod tests {
             AcpError::SessionNotFound { session_id } => assert_eq!(session_id, "session/load"),
             other => panic!("expected SessionNotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_sdk_prompt_resource_not_found_without_uri_stays_resource_not_found() {
+        let sdk_err = SdkError::resource_not_found(None);
+        let acp = AcpError::from_sdk(sdk_err, "session/prompt");
+        assert!(
+            matches!(acp, AcpError::ResourceNotFound { resource: None, .. }),
+            "prompt ResourceNotFound must not clear a persisted session id: {acp:?}"
+        );
     }
 
     #[test]
