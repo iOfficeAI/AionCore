@@ -24,7 +24,9 @@ use crate::agent_task::IAgentTask;
 use crate::error::AgentError;
 use crate::protocol::events::session_updates::ThinkingEventData;
 use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
-use crate::protocol::events::{AgentStreamEvent, FinishEventData, StartEventData, TextEventData};
+use crate::protocol::events::{
+    AgentStreamEvent, FinishEventData, StartEventData, TextEventData, TipType, TipsEventData,
+};
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
 use crate::types::SendMessageData;
@@ -1180,13 +1182,29 @@ fn spawn_event_pump(
         // survives — mirroring the reference `BackendOutputSink::emit_tool_result`,
         // which re-sends the name on completion. Cleared per turn with `tool_output`.
         let mut tool_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Did the CURRENT turn emit any user-visible output (text / thinking / tool /
+        // plan / permission)? Mirrors the ACP path's `is_empty_turn` (agent_session_flow.rs):
+        // a clean terminal with this still `false` is a "blank reply" (ELECTRON-1JG) and
+        // gets a diagnostic Tip so the user isn't left staring at an empty bubble. Set as
+        // events are observed, reset at the per-turn terminal (with `tool_output`/`tool_name`).
+        let mut saw_visible_output = false;
         while let Some(env) = events.next().await {
             runtime.touch();
             tracing::debug!(conv_id = %conversation_id, event = session_event_name(&env.event), "session-pump: backend event");
 
+            // Empty-turn diagnostic Tip to emit for THIS terminal, if the turn was a
+            // clean blank reply. Computed in the terminal match arm below (while
+            // `saw_visible_output` still reflects this turn) and drained just before the
+            // Finish in the translate loop — a Tips after Finish would be dropped, since
+            // the relay breaks the turn on Finish. Per-iteration, so it never leaks
+            // across turns.
+            let mut pending_empty_turn_tip: Option<TipsEventData> = None;
+
             // ToolOutputDelta needs pump-local accumulation (see above), so it is
             // handled here rather than in the stateless translate_event.
             if let SessionEvent::ToolOutputDelta { item_id, text } = &env.event {
+                // Streamed tool stdout is user-visible output — this turn is not blank.
+                saw_visible_output = true;
                 let acc = tool_output.entry(item_id.clone()).or_default();
                 acc.push_str(text);
                 let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -1246,11 +1264,31 @@ fn spawn_event_pump(
                 SessionEvent::TurnStarted { .. } => runtime.set_status(ConversationStatus::Running),
                 SessionEvent::TurnResult { .. } | SessionEvent::Detached { .. } if !suppress_intermediate_finish => {
                     runtime.set_status(ConversationStatus::Finished);
+                    // Empty-turn (blank-reply) diagnostic, mirroring the ACP path
+                    // (agent_session_flow.rs `prompt_outcome_from_stop_reason`): a turn
+                    // that reached a CLEAN terminal (`TurnResult{is_error:false}`, not
+                    // cancelled) without emitting any user-visible output gets an
+                    // informational/warning Tip so the user isn't left with an empty
+                    // bubble. `Detached` (process crash) is excluded — that surfaces as a
+                    // crash error elsewhere, not a "the model had nothing to say" tip, and
+                    // ACP likewise only tips on a completed prompt. An error result is
+                    // excluded because it already terminates as `AgentStreamEvent::Error`.
+                    if let SessionEvent::TurnResult {
+                        is_error: false,
+                        outcome,
+                        ..
+                    } = &env.event
+                        && !saw_visible_output
+                    {
+                        pending_empty_turn_tip = empty_turn_tip(outcome);
+                    }
                     // Live tool-output accumulators are per-turn; the authoritative
                     // full output already rode each ToolResult. Drop them so a long
                     // session doesn't retain every turn's stdout.
                     tool_output.clear();
                     tool_name.clear();
+                    // Reset the per-turn visibility flag for the next turn.
+                    saw_visible_output = false;
                 }
                 // Learn the CLI-assigned session id so send_message (Start) and the
                 // Finish stamping below carry it, matching the ACP path.
@@ -1272,6 +1310,23 @@ fn spawn_event_pump(
                 // the row's name to "". Runs before any routing decision below;
                 // no-op on non-ToolCall frames (e.g. the suppressed Finish).
                 stamp_tool_name(&mut tool_name, &mut ev);
+                // Record whether this turn produced user-visible output, so a clean
+                // terminal with none is detected as a blank reply (see the terminal
+                // match arm above). Checked against the translated frame so the
+                // definition matches the relay's own notion of visible output.
+                if event_is_user_visible_output(&ev) {
+                    saw_visible_output = true;
+                }
+                // Emit the empty-turn diagnostic Tip immediately BEFORE the Finish it
+                // was computed for. It MUST precede Finish: the relay breaks the turn on
+                // Finish (stream_relay.rs), so a Tips sent afterwards would never be
+                // forwarded. `pending_empty_turn_tip` is only ever set on a clean
+                // TurnResult, whose translation is exactly one Finish, so this fires once.
+                if matches!(ev, AgentStreamEvent::Finish(_))
+                    && let Some(tip) = pending_empty_turn_tip.take()
+                {
+                    let _ = runtime.tx.send(AgentStreamEvent::Tips(tip));
+                }
                 // Suppress the intermediate workflow-launch Finish: the assistant's
                 // reply text already reached the frontend via MessageDelta→Text, so
                 // dropping this Finish loses no output — it only keeps the relay open
@@ -1507,6 +1562,61 @@ fn stamp_tool_name(names: &mut std::collections::HashMap<String, String>, ev: &m
 /// Translate one clean-slate `SessionEvent` into zero or more origin
 /// `AgentStreamEvent`s. The fold SHAPE mirrors the clean-slate TurnFinalizer, but
 /// the output targets origin's `AgentStreamEvent` enum instead of `ConvDomainEvent`.
+/// Whether a translated stream event represents user-visible turn output —
+/// anything that renders in chat. Mirrors the ACP path's
+/// `event_is_user_visible_output` (agent_session_flow.rs) so the direct-CLI
+/// empty-turn detection uses the same definition of "the turn said something".
+fn event_is_user_visible_output(event: &AgentStreamEvent) -> bool {
+    matches!(
+        event,
+        AgentStreamEvent::Text(_)
+            | AgentStreamEvent::Thinking(_)
+            | AgentStreamEvent::ToolCall(_)
+            | AgentStreamEvent::AcpToolCall(_)
+            | AgentStreamEvent::ToolGroup(_)
+            | AgentStreamEvent::Plan(_)
+            | AgentStreamEvent::Permission(_)
+            | AgentStreamEvent::AcpPermission(_)
+    )
+}
+
+/// Build the empty-turn diagnostic Tip for a clean terminal that produced no
+/// user-visible output, mirroring the ACP path (agent_session_flow.rs:388-448):
+/// a normal `EndTurn` is an informational "no reply" note; any other stop reason
+/// (truncation / refusal / failure) is a warning naming the cause. Codes match
+/// the `conversation.agentTip.codes.*` i18n keys the frontend `MessageTips`
+/// renderer localizes. Cancelled is `None` (never a blank-reply; the caller also
+/// guards it) so a user interrupt never surfaces a spurious tip.
+fn empty_turn_tip(outcome: &aionui_session::TurnOutcome) -> Option<TipsEventData> {
+    use aionui_session::{StopReason, TruncationKind, TurnOutcome};
+    let (tip_type, code) = match outcome {
+        TurnOutcome::EndTurn
+        | TurnOutcome::Completed {
+            stop_reason: StopReason::EndTurn,
+        } => (TipType::Info, "ACP_EMPTY_TURN"),
+        TurnOutcome::Completed {
+            stop_reason: StopReason::Truncated(TruncationKind::MaxTokens),
+        } => (TipType::Warning, "ACP_EMPTY_TURN_MAX_TOKENS"),
+        TurnOutcome::Completed {
+            stop_reason: StopReason::Truncated(TruncationKind::MaxTurns),
+        } => (TipType::Warning, "ACP_EMPTY_TURN_MAX_TURN_REQUESTS"),
+        TurnOutcome::Completed {
+            stop_reason: StopReason::Refused { .. },
+        } => (TipType::Warning, "ACP_EMPTY_TURN_REFUSAL"),
+        // Other truncation kinds (context window / budget / bare wire-end) and a
+        // clean `Failed` have no dedicated ACP code — surface the generic warning
+        // so the user still sees "the turn ended without a reply" with a hint.
+        TurnOutcome::Completed { .. } | TurnOutcome::Failed => (TipType::Warning, "ACP_EMPTY_TURN"),
+        TurnOutcome::Cancelled { .. } => return None,
+    };
+    Some(TipsEventData {
+        content: String::new(),
+        tip_type,
+        code: Some(code.to_owned()),
+        params: None,
+    })
+}
+
 fn translate_event(event: SessionEvent, _conversation_id: &str) -> Vec<AgentStreamEvent> {
     match event {
         // NOTE: the Start lifecycle frame is emitted by `send_message` (before
@@ -2337,6 +2447,98 @@ mod translate_tests {
         assert!(data.retryable.is_some(), "error must carry a retryable flag");
         // Must NOT also emit a Finish (Error is the terminal).
         assert!(!events.iter().any(|e| matches!(e, AgentStreamEvent::Finish(_))));
+    }
+
+    // --- empty-turn (blank-reply) diagnostic Tip, mirroring the ACP path ---
+
+    fn tip_code(outcome: aionui_session::TurnOutcome) -> Option<(TipType, String)> {
+        empty_turn_tip(&outcome).map(|t| (t.tip_type, t.code.unwrap()))
+    }
+
+    #[test]
+    fn empty_turn_endturn_is_info_generic_code() {
+        use aionui_session::{StopReason, TurnOutcome};
+        // Both the legacy default `EndTurn` and the modern `Completed{EndTurn}` map
+        // to the informational "no reply" note.
+        for outcome in [
+            TurnOutcome::EndTurn,
+            TurnOutcome::Completed {
+                stop_reason: StopReason::EndTurn,
+            },
+        ] {
+            assert_eq!(tip_code(outcome), Some((TipType::Info, "ACP_EMPTY_TURN".to_owned())));
+        }
+    }
+
+    #[test]
+    fn empty_turn_truncation_and_refusal_map_to_acp_warning_codes() {
+        use aionui_session::{StopReason, TruncationKind, TurnOutcome};
+        // Exactly the codes the ACP path emits (agent_session_flow.rs empty_finish_tip_code).
+        assert_eq!(
+            tip_code(TurnOutcome::Completed {
+                stop_reason: StopReason::Truncated(TruncationKind::MaxTokens),
+            }),
+            Some((TipType::Warning, "ACP_EMPTY_TURN_MAX_TOKENS".to_owned()))
+        );
+        assert_eq!(
+            tip_code(TurnOutcome::Completed {
+                stop_reason: StopReason::Truncated(TruncationKind::MaxTurns),
+            }),
+            Some((TipType::Warning, "ACP_EMPTY_TURN_MAX_TURN_REQUESTS".to_owned()))
+        );
+        assert_eq!(
+            tip_code(TurnOutcome::Completed {
+                stop_reason: StopReason::Refused { category: None },
+            }),
+            Some((TipType::Warning, "ACP_EMPTY_TURN_REFUSAL".to_owned()))
+        );
+    }
+
+    #[test]
+    fn empty_turn_other_truncation_and_failed_fall_back_to_generic_warning() {
+        use aionui_session::{StopReason, TruncationKind, TurnOutcome};
+        // Truncation kinds with no dedicated ACP code, plus a clean Failed, still
+        // warn the user rather than silently rendering an empty bubble.
+        for outcome in [
+            TurnOutcome::Completed {
+                stop_reason: StopReason::Truncated(TruncationKind::ContextWindow),
+            },
+            TurnOutcome::Completed {
+                stop_reason: StopReason::Truncated(TruncationKind::Budget),
+            },
+            TurnOutcome::Failed,
+        ] {
+            assert_eq!(tip_code(outcome), Some((TipType::Warning, "ACP_EMPTY_TURN".to_owned())));
+        }
+    }
+
+    #[test]
+    fn empty_turn_cancelled_never_tips() {
+        use aionui_session::{CancelReason, TurnOutcome};
+        // A user interrupt is not a blank reply — no spurious tip.
+        assert!(
+            empty_turn_tip(&TurnOutcome::Cancelled {
+                reason: CancelReason::UserCancel,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn user_visible_output_predicate_matches_renderable_frames() {
+        // Frames that render in chat count as visible; lifecycle/metadata frames do not.
+        assert!(event_is_user_visible_output(&AgentStreamEvent::Text(TextEventData {
+            content: "hi".into(),
+        })));
+        assert!(event_is_user_visible_output(&tool_call(
+            "c",
+            "Read",
+            ToolCallStatus::Running
+        )));
+        assert!(!event_is_user_visible_output(&AgentStreamEvent::Finish(
+            FinishEventData::default()
+        )));
+        assert!(!event_is_user_visible_output(&AgentStreamEvent::SegmentBreak));
     }
 }
 
