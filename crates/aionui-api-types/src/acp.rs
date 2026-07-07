@@ -201,6 +201,8 @@ pub struct WorkspaceEntry {
     pub entry_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_kind: Option<WorkspaceSearchMatchKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_match_count: Option<usize>,
 }
 
 /// Request body for side question.

@@ -2267,6 +2267,7 @@ async fn browse_workspace_search_matches_nested_file_names() {
     assert_eq!(entries[0].name, "src/components/SearchPanel.tsx");
     assert_eq!(entries[0].entry_type, "file");
     assert_eq!(entries[0].match_kind, Some(WorkspaceSearchMatchKind::Name));
+    assert_eq!(entries[0].content_match_count, None);
 }
 
 #[tokio::test]
@@ -2277,7 +2278,7 @@ async fn browse_workspace_search_matches_nested_file_contents() {
     std::fs::create_dir_all(user_workspace.join("docs")).unwrap();
     std::fs::write(
         user_workspace.join("docs/notes.md"),
-        "release checklist mentions ProjectDelta",
+        "release checklist mentions ProjectDelta\nProjectDelta rollout notes",
     )
     .unwrap();
     std::fs::write(user_workspace.join("unrelated.md"), "nothing here").unwrap();
@@ -2308,6 +2309,7 @@ async fn browse_workspace_search_matches_nested_file_contents() {
     assert_eq!(entries[0].name, "docs/notes.md");
     assert_eq!(entries[0].entry_type, "file");
     assert_eq!(entries[0].match_kind, Some(WorkspaceSearchMatchKind::Content));
+    assert_eq!(entries[0].content_match_count, Some(2));
 }
 
 #[tokio::test]
@@ -2490,8 +2492,10 @@ async fn browse_workspace_search_prioritizes_name_matches_before_content_matches
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].name, "a-keyword-name.txt");
     assert_eq!(entries[0].match_kind, Some(WorkspaceSearchMatchKind::Name));
+    assert_eq!(entries[0].content_match_count, None);
     assert_eq!(entries[1].name, "b-content.txt");
     assert_eq!(entries[1].match_kind, Some(WorkspaceSearchMatchKind::Content));
+    assert_eq!(entries[1].content_match_count, Some(1));
 }
 
 #[tokio::test]
@@ -2542,6 +2546,7 @@ async fn browse_workspace_search_mode_limits_match_sources() {
     assert_eq!(content_entries.len(), 1);
     assert_eq!(content_entries[0].name, "content-only.txt");
     assert_eq!(content_entries[0].match_kind, Some(WorkspaceSearchMatchKind::Content));
+    assert_eq!(content_entries[0].content_match_count, Some(1));
 }
 
 #[tokio::test]

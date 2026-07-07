@@ -41,18 +41,18 @@ const WORKSPACE_SEARCH_PRUNED_DIRS: &[&str] = &[
     "target",
 ];
 
-fn workspace_search_matches_content(path: &Path, needle: &str) -> bool {
+fn workspace_search_content_match_count(path: &Path, needle: &str) -> usize {
     let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
+        return 0;
     };
     if !metadata.is_file() || metadata.len() > MAX_WORKSPACE_SEARCH_FILE_BYTES {
-        return false;
+        return 0;
     }
 
     let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
+        return 0;
     };
-    content.to_lowercase().contains(needle)
+    content.to_lowercase().matches(needle).count()
 }
 
 fn workspace_search_entry(
@@ -60,6 +60,7 @@ fn workspace_search_entry(
     path: &Path,
     is_dir: bool,
     match_kind: WorkspaceSearchMatchKind,
+    content_match_count: usize,
 ) -> Option<WorkspaceEntry> {
     let relative = path.strip_prefix(base).ok()?;
     let name = relative.to_string_lossy().replace('\\', "/");
@@ -71,6 +72,7 @@ fn workspace_search_entry(
         name,
         entry_type: if is_dir { "directory" } else { "file" }.into(),
         match_kind: Some(match_kind),
+        content_match_count: (content_match_count > 0).then_some(content_match_count),
     })
 }
 
@@ -138,9 +140,12 @@ fn search_workspace_entries_sync(
                     .ok()
                     .map(|relative| relative.to_string_lossy().to_lowercase().contains(&needle))
                     .unwrap_or(false));
-        let content_matches = !matches!(search_mode, WorkspaceSearchMode::Name)
-            && is_file
-            && workspace_search_matches_content(path, &needle);
+        let content_match_count = if !matches!(search_mode, WorkspaceSearchMode::Name) && is_file {
+            workspace_search_content_match_count(path, &needle)
+        } else {
+            0
+        };
+        let content_matches = content_match_count > 0;
 
         let match_kind = if name_matches {
             Some(WorkspaceSearchMatchKind::Name)
@@ -151,7 +156,7 @@ fn search_workspace_entries_sync(
         };
 
         if let Some(match_kind) = match_kind
-            && let Some(search_entry) = workspace_search_entry(&base, path, is_dir, match_kind)
+            && let Some(search_entry) = workspace_search_entry(&base, path, is_dir, match_kind, content_match_count)
         {
             entries.push(search_entry);
         }
@@ -438,6 +443,7 @@ impl ConversationService {
                 name,
                 entry_type: entry_type.into(),
                 match_kind: None,
+                content_match_count: None,
             });
         }
 
