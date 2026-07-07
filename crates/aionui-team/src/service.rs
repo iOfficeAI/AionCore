@@ -31,6 +31,7 @@ use crate::events::{
 use crate::mcp::TeamMcpStdioConfig;
 use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogPort};
+use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::session::{AgentMessageQueueResult, TeamSession, spawn_attach_agent_process_bg};
 use crate::types::{Team, TeamAgent, TeammateRole, TeammateStatus};
@@ -148,6 +149,7 @@ pub struct TeamSessionService {
     turn_port: Arc<dyn AgentTurnExecutionPort>,
     cancellation_port: Arc<dyn AgentTurnCancellationPort>,
     backend_binary_path: Arc<PathBuf>,
+    prompt_dump: TeamPromptDumpConfig,
     sessions: Arc<DashMap<String, SessionEntry>>,
     /// Per-team mutex serializing `add_agent` so concurrent callers cannot
     /// read-modify-write the `agents` JSON with stale state (last-writer-wins
@@ -181,6 +183,41 @@ impl TeamSessionService {
         cancellation_port: Arc<dyn AgentTurnCancellationPort>,
         backend_binary_path: Arc<PathBuf>,
     ) -> Arc<Self> {
+        Self::new_with_prompt_dump(
+            repo,
+            agent_metadata_repo,
+            assistant_catalog,
+            assistant_definition_repo,
+            assistant_overlay_repo,
+            provider_repo,
+            conversation_port,
+            projection_store,
+            broadcaster,
+            task_manager,
+            turn_port,
+            cancellation_port,
+            backend_binary_path,
+            TeamPromptDumpConfig::disabled(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_prompt_dump(
+        repo: Arc<dyn ITeamRepository>,
+        agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+        assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
+        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+        provider_repo: Arc<dyn IProviderRepository>,
+        conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+        projection_store: Arc<dyn TeamProjectionMessageStore>,
+        broadcaster: Arc<dyn EventBroadcaster>,
+        task_manager: Arc<dyn IWorkerTaskManager>,
+        turn_port: Arc<dyn AgentTurnExecutionPort>,
+        cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+        backend_binary_path: Arc<PathBuf>,
+        prompt_dump: TeamPromptDumpConfig,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
             repo,
             agent_metadata_repo,
@@ -195,6 +232,7 @@ impl TeamSessionService {
             turn_port,
             cancellation_port,
             backend_binary_path,
+            prompt_dump,
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
@@ -675,7 +713,7 @@ impl TeamSessionService {
         let team = Team::from_row(&row)?;
         let agents_snapshot: Vec<TeamAgent> = team.agents.clone();
 
-        let session = match TeamSession::start(
+        let session = match TeamSession::start_with_prompt_dump(
             team,
             self.repo.clone(),
             self.broadcaster.clone(),
@@ -686,6 +724,7 @@ impl TeamSessionService {
             self.projection_store.clone(),
             user_id.clone(),
             self.self_ref.clone(),
+            self.prompt_dump.clone(),
         )
         .await
         {

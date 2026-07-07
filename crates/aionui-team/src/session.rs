@@ -21,6 +21,7 @@ use crate::message_projection::{
     TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
 };
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
+use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
 use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use crate::provisioning::PersistSpawnedAgentRequest;
 use crate::scheduler::{TeammateManager, normalize_name};
@@ -103,6 +104,7 @@ pub struct TeamSession {
     /// Per-agent event loop registry. Each agent has a dedicated tokio task
     /// that drains its mailbox whenever notified.
     event_loops: Arc<EventLoopRegistry>,
+    prompt_dump: TeamPromptDumpConfig,
     /// Set after the session lifecycle performs its system recovery mailbox scan.
     /// Written by `try_start_recovery_drain` and read by later scan attempts so
     /// ordinary event-loop notifications cannot repeatedly create recovery runs.
@@ -125,6 +127,36 @@ impl TeamSession {
         user_id: String,
         service: Weak<TeamSessionService>,
     ) -> Result<Self, TeamError> {
+        Self::start_with_prompt_dump(
+            team,
+            repo,
+            broadcaster,
+            backend_binary_path,
+            task_manager,
+            turn_port,
+            cancellation_port,
+            projection_store,
+            user_id,
+            service,
+            TeamPromptDumpConfig::disabled(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_prompt_dump(
+        team: Team,
+        repo: Arc<dyn ITeamRepository>,
+        broadcaster: Arc<dyn EventBroadcaster>,
+        backend_binary_path: Arc<PathBuf>,
+        task_manager: Arc<dyn IWorkerTaskManager>,
+        turn_port: Arc<dyn AgentTurnExecutionPort>,
+        cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+        projection_store: Arc<dyn TeamProjectionMessageStore>,
+        user_id: String,
+        service: Weak<TeamSessionService>,
+        prompt_dump: TeamPromptDumpConfig,
+    ) -> Result<Self, TeamError> {
         let mailbox = Arc::new(Mailbox::new(repo.clone()));
         let task_board = Arc::new(TaskBoard::new(repo));
         let team_run_manager = Arc::new(TeamRunManager::new(
@@ -141,12 +173,13 @@ impl TeamSession {
         ));
 
         let auth_token = aionui_common::generate_id();
-        let mcp_server = TeamMcpServer::start(
+        let mcp_server = TeamMcpServer::start_with_prompt_dump(
             auth_token,
             scheduler.clone(),
             team.id.clone(),
             broadcaster.clone(),
             service.clone(),
+            Some(prompt_dump.clone()),
         )
         .await?;
 
@@ -174,6 +207,7 @@ impl TeamSession {
             service,
             broadcaster,
             event_loops,
+            prompt_dump,
             recovery_scan_completed: AtomicBool::new(false),
         })
     }
@@ -297,6 +331,38 @@ impl TeamSession {
         };
 
         let should_send = !unread.is_empty();
+        if should_send {
+            match dump_team_wake_prompt(
+                &self.prompt_dump,
+                TeamWakePromptDump {
+                    team_id: &self.team.id,
+                    slot_id,
+                    conversation_id: &agent.conversation_id,
+                    role: agent.role,
+                    needs_role_prompt,
+                    unread_count: unread.len(),
+                    prompt: &first_message,
+                },
+            ) {
+                Ok(Some(path)) => {
+                    tracing::debug!(
+                        team_id = %self.team.id,
+                        slot_id,
+                        path = %path.display(),
+                        "team wake prompt dump written"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        team_id = %self.team.id,
+                        slot_id,
+                        error = %error,
+                        "team wake prompt dump failed"
+                    );
+                }
+            }
+        }
 
         Ok(Some(WakeInput {
             team_run_id: active_team_run_id,
@@ -1996,9 +2062,13 @@ mod tests {
     }
 
     async fn start_session() -> TeamSession {
+        start_session_with_prompt_dump(crate::prompt_dump::TeamPromptDumpConfig::disabled()).await
+    }
+
+    async fn start_session_with_prompt_dump(prompt_dump: crate::prompt_dump::TeamPromptDumpConfig) -> TeamSession {
         let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-        TeamSession::start(
+        TeamSession::start_with_prompt_dump(
             make_team(),
             repo,
             broadcaster,
@@ -2009,6 +2079,7 @@ mod tests {
             noop_projection_store(),
             "user-test".into(),
             Weak::<TeamSessionService>::new(),
+            prompt_dump,
         )
         .await
         .unwrap()
@@ -3089,6 +3160,40 @@ mod tests {
             input.first_message
         );
         assert!(input.first_message.contains("kick off"));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn compute_wake_input_dumps_team_wake_prompt_when_enabled() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let session =
+            start_session_with_prompt_dump(crate::prompt_dump::TeamPromptDumpConfig::enabled(temp.path())).await;
+        session
+            .mailbox
+            .write("t1", "lead-1", "user", MailboxMessageType::Message, "kick off", None)
+            .await
+            .unwrap();
+        record_recovery_wake(&session, "lead-1", TeamRunTargetRole::Lead, 1).await;
+
+        let input = session.compute_wake_input("lead-1").await.unwrap().expect("WakeInput");
+        assert!(input.should_send);
+
+        let dumps: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(dumps.len(), 1);
+        let content = std::fs::read_to_string(&dumps[0]).unwrap();
+        assert!(content.contains("kind: team-wake-prompt\n"));
+        assert!(content.contains("team_id: t1\n"));
+        assert!(content.contains("slot_id: lead-1\n"));
+        assert!(content.contains("conversation_id: c1\n"));
+        assert!(content.contains("role: lead\n"));
+        assert!(content.contains("needs_role_prompt: true\n"));
+        assert!(content.contains("unread_count: 1\n"));
+        assert!(content.contains("---- prompt ----\n"));
+        assert!(content.contains("You are the Team Leader"));
+        assert!(content.contains("kick off"));
         session.stop();
     }
 

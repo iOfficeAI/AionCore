@@ -91,7 +91,7 @@ mod tests {
         let path = dump_prompt(
             temp.path(),
             PromptDump {
-                kind: "acp-first-prompt",
+                kind: "test-prompt",
                 backend: Some("claude"),
                 conversation_id: "conversation/123",
                 session_id: Some("session-1"),
@@ -104,12 +104,12 @@ mod tests {
 
         assert_eq!(path.parent(), Some(temp.path()));
         let file_name = path.file_name().unwrap().to_string_lossy();
-        assert!(file_name.contains("acp-first-prompt"));
+        assert!(file_name.contains("test-prompt"));
         assert!(file_name.contains("conversation_123"));
         assert!(file_name.contains("msg-1"));
 
         let content = std::fs::read_to_string(path).unwrap();
-        assert!(content.contains("kind: acp-first-prompt\n"));
+        assert!(content.contains("kind: test-prompt\n"));
         assert!(content.contains("backend: claude\n"));
         assert!(content.contains("conversation_id: conversation/123\n"));
         assert!(content.contains("session_id: session-1\n"));

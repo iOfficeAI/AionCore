@@ -5,7 +5,7 @@ use std::sync::Arc;
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
-use aionui_team::{Mailbox, TaskBoard, TeamAgent, TeamMcpServer, TeammateManager, TeammateRole};
+use aionui_team::{Mailbox, TaskBoard, TeamAgent, TeamMcpServer, TeamPromptDumpConfig, TeammateManager, TeammateRole};
 use common::MockTeamRepo;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -76,6 +76,10 @@ struct TestEnv {
 }
 
 async fn setup() -> TestEnv {
+    setup_with_prompt_dump(None).await
+}
+
+async fn setup_with_prompt_dump(prompt_dump: Option<TeamPromptDumpConfig>) -> TestEnv {
     let repo = Arc::new(MockTeamRepo::new());
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo.clone()));
@@ -94,12 +98,13 @@ async fn setup() -> TestEnv {
     // the Weak cannot upgrade, so `team_spawn_agent` will surface the
     // service-unavailable error. Non-spawn tools still exercise scheduler
     // flows directly and do not hit this path.
-    let server = TeamMcpServer::start(
+    let server = TeamMcpServer::start_with_prompt_dump(
         "test-token-123".into(),
         scheduler,
         "team-1".into(),
         broadcaster,
         std::sync::Weak::new(),
+        prompt_dump,
     )
     .await
     .unwrap();
@@ -642,6 +647,42 @@ async fn ttl1_task_list_after_create() {
     let tasks: Vec<Value> = serde_json::from_str(&text).unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0]["subject"], "Task A");
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn tools_list_dumps_team_tool_schema_when_enabled() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let dump_config = TeamPromptDumpConfig::enabled(temp.path());
+    let env = setup_with_prompt_dump(Some(dump_config)).await;
+
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+    send_request(
+        &mut stream,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/list"
+        }),
+    )
+    .await;
+    let response = read_response(&mut stream).await;
+    assert!(response["result"]["tools"].as_array().unwrap().len() > 1);
+
+    let dumps: Vec<_> = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(dumps.len(), 1);
+    let dump: Value = serde_json::from_str(&std::fs::read_to_string(&dumps[0]).unwrap()).unwrap();
+    assert_eq!(dump["kind"], "team-tools-list");
+    assert_eq!(dump["team_id"], "team-1");
+    assert_eq!(dump["caller_slot_id"], "lead-1");
+    assert_eq!(dump["caller_role"], "lead");
+    assert!(dump["tools"].as_array().unwrap().iter().any(|tool| {
+        tool["name"] == "team_spawn_agent" && tool["inputSchema"]["properties"]["assistant_id"].is_object()
+    }));
 
     env.server.stop();
 }

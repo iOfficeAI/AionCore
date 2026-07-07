@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{TeamError, classify_public_error};
 use crate::events::TEAM_MCP_STATUS_EVENT;
+use crate::prompt_dump::{TeamPromptDumpConfig, TeamToolsListDump, dump_team_tools_list};
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
@@ -45,6 +46,25 @@ impl TeamMcpServer {
         team_id: String,
         broadcaster: Arc<dyn EventBroadcaster>,
         service: Weak<TeamSessionService>,
+    ) -> Result<Self, TeamError> {
+        Self::start_with_prompt_dump(
+            auth_token,
+            scheduler,
+            team_id,
+            broadcaster,
+            service,
+            Some(TeamPromptDumpConfig::disabled()),
+        )
+        .await
+    }
+
+    pub async fn start_with_prompt_dump(
+        auth_token: String,
+        scheduler: Arc<TeammateManager>,
+        team_id: String,
+        broadcaster: Arc<dyn EventBroadcaster>,
+        service: Weak<TeamSessionService>,
+        prompt_dump: Option<TeamPromptDumpConfig>,
     ) -> Result<Self, TeamError> {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
@@ -85,12 +105,15 @@ impl TeamMcpServer {
         let sched_for_tcp = scheduler.clone();
         let service_for_tcp = service.clone();
         let team_id_for_tcp = team_id.clone();
+        let prompt_dump = prompt_dump.unwrap_or_else(TeamPromptDumpConfig::disabled);
+        let prompt_dump_for_tcp = prompt_dump.clone();
         tokio::spawn(accept_loop(
             listener,
             token,
             sched_for_tcp,
             service_for_tcp,
             team_id_for_tcp,
+            prompt_dump_for_tcp,
             shutdown_rx.clone(),
         ));
 
@@ -106,12 +129,14 @@ impl TeamMcpServer {
         let http_sched = scheduler.clone();
         let http_service = service.clone();
         let http_team_id = team_id.clone();
+        let http_prompt_dump = prompt_dump.clone();
         tokio::spawn(http_mcp_loop(
             http_listener,
             http_token,
             http_sched,
             http_service,
             http_team_id,
+            http_prompt_dump,
             shutdown_rx,
         ));
 
@@ -171,6 +196,7 @@ async fn accept_loop(
     scheduler: Arc<TeammateManager>,
     service: Weak<TeamSessionService>,
     team_id: String,
+    prompt_dump: TeamPromptDumpConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -183,7 +209,8 @@ async fn accept_loop(
                         let sched = Arc::clone(&scheduler);
                         let svc = service.clone();
                         let tid = team_id.clone();
-                        tokio::spawn(handle_connection(stream, token, sched, svc, tid));
+                        let dump = prompt_dump.clone();
+                        tokio::spawn(handle_connection(stream, token, sched, svc, tid, dump));
                     }
                     Err(e) => {
                         error!("Accept error: {e}");
@@ -210,6 +237,7 @@ async fn handle_connection(
     scheduler: Arc<TeammateManager>,
     service: Weak<TeamSessionService>,
     team_id: String,
+    prompt_dump: TeamPromptDumpConfig,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
@@ -250,6 +278,7 @@ async fn handle_connection(
                 &service,
                 &team_id,
                 caller_slot_id.as_deref().unwrap_or("unknown"),
+                &prompt_dump,
             )
             .await
         };
@@ -329,10 +358,11 @@ async fn handle_method(
     service: &Weak<TeamSessionService>,
     team_id: &str,
     caller_slot_id: &str,
+    prompt_dump: &TeamPromptDumpConfig,
 ) -> JsonRpcResponse {
     match request.method.as_str() {
         "notifications/initialized" => JsonRpcResponse::success(request.id, json!({})),
-        "tools/list" => handle_tools_list(request.id, scheduler, caller_slot_id).await,
+        "tools/list" => handle_tools_list(request.id, scheduler, team_id, caller_slot_id, prompt_dump).await,
         "tools/call" => handle_tools_call(request, scheduler, service, team_id, caller_slot_id).await,
         _ => JsonRpcResponse::error(
             request.id,
@@ -350,10 +380,46 @@ async fn caller_role_for_tools_list(scheduler: &TeammateManager, caller_slot_id:
         .unwrap_or(TeammateRole::Teammate)
 }
 
-async fn handle_tools_list(id: Option<u64>, scheduler: &TeammateManager, caller_slot_id: &str) -> JsonRpcResponse {
+async fn handle_tools_list(
+    id: Option<u64>,
+    scheduler: &TeammateManager,
+    team_id: &str,
+    caller_slot_id: &str,
+    prompt_dump: &TeamPromptDumpConfig,
+) -> JsonRpcResponse {
     let caller_role = caller_role_for_tools_list(scheduler, caller_slot_id).await;
     let tools = all_tool_descriptors_for_role(caller_role);
+    let tools_for_dump = tool_descriptors_to_mcp_json(&tools);
+    if let Err(error) = dump_team_tools_list(
+        prompt_dump,
+        TeamToolsListDump {
+            team_id,
+            caller_slot_id,
+            caller_role,
+            tools: &tools_for_dump,
+        },
+    ) {
+        warn!(
+            team_id,
+            caller_slot_id,
+            error = %error,
+            "team tools/list prompt dump failed"
+        );
+    }
     JsonRpcResponse::success(id, json!({ "tools": tools }))
+}
+
+fn tool_descriptors_to_mcp_json(tools: &[super::tools::ToolDescriptor]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|d| {
+            json!({
+                "name": d.name,
+                "description": d.description,
+                "inputSchema": d.input_schema,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -946,6 +1012,7 @@ async fn http_mcp_loop(
     scheduler: Arc<TeammateManager>,
     service: Weak<TeamSessionService>,
     team_id: String,
+    prompt_dump: TeamPromptDumpConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -959,6 +1026,7 @@ async fn http_mcp_loop(
                 let sched = scheduler.clone();
                 let svc = service.clone();
                 let tid = team_id.clone();
+                let dump = prompt_dump.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
                     let n = match stream.read(&mut buf).await {
@@ -1017,14 +1085,24 @@ async fn http_mcp_loop(
                             return;
                         }
                         "tools/list" => {
-                            let tools: Vec<Value> = all_tool_descriptors_for_role(caller_role)
-                                .iter()
-                                .map(|d| json!({
-                                    "name": d.name,
-                                    "description": d.description,
-                                    "inputSchema": d.input_schema,
-                                }))
-                                .collect();
+                            let descriptors = all_tool_descriptors_for_role(caller_role);
+                            let tools: Vec<Value> = tool_descriptors_to_mcp_json(&descriptors);
+                            if let Err(error) = dump_team_tools_list(
+                                &dump,
+                                TeamToolsListDump {
+                                    team_id: &tid,
+                                    caller_slot_id,
+                                    caller_role,
+                                    tools: &tools,
+                                },
+                            ) {
+                                warn!(
+                                    team_id = %tid,
+                                    caller_slot_id,
+                                    error = %error,
+                                    "team HTTP tools/list prompt dump failed"
+                                );
+                            }
                             json!({ "tools": tools })
                         }
                         "tools/call" => {
