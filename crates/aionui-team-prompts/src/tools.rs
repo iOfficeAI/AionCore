@@ -42,17 +42,6 @@ Do not provide a model. The new teammate uses the selected assistant's configure
 
 The new agent will be created and added to the team. You can then assign tasks and send messages to it."#;
 
-pub const TEAM_LIST_MODELS_DESCRIPTION: &str =
-    "Query available models for assistant backends. Returns the real-time model list that matches the frontend model selector.
-
-Use this to:
-- Inspect what models are available for a selected assistant/backend
-- See all available backends and their models at once
-- Diagnose model availability shown by the UI
-
-This tool is informational. Do not use it to choose or pass a model to team_spawn_agent.
-Pass assistant_id to query models for a specific assistant, or omit it to see all backends.";
-
 pub const TEAM_DESCRIBE_ASSISTANT_DESCRIPTION: &str =
     "Get detailed information about an assistant before spawning it as a teammate.
 
@@ -193,17 +182,6 @@ pub fn team_tool_specs() -> Vec<TeamToolSpec> {
                 "required": ["assistant_id"]
             }),
         },
-        TeamToolSpec {
-            name: "team_list_models",
-            permission: TeamToolPermission::AnyTeamAgent,
-            description: TEAM_LIST_MODELS_DESCRIPTION,
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "assistant_id": { "type": "string", "description": "Assistant ID to query. When provided, returns models for the backend behind that assistant. Shows all backends when omitted." }
-                }
-            }),
-        },
     ]
 }
 
@@ -270,7 +248,6 @@ mod tests {
                 ("team_shutdown_agent", TeamToolPermission::LeadOnly),
                 ("team_list_assistants", TeamToolPermission::AnyTeamAgent),
                 ("team_describe_assistant", TeamToolPermission::AnyTeamAgent),
-                ("team_list_models", TeamToolPermission::AnyTeamAgent),
             ]
         );
     }

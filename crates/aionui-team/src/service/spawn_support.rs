@@ -155,62 +155,6 @@ impl TeamSessionService {
             .collect()
     }
 
-    /// Return the `team_list_models` response built from DB rows.
-    /// Falls back to the hardcoded response if the DB query fails.
-    /// For internal agents (like aionrs with backend=NULL), enriches
-    /// with models from the providers table.
-    pub(crate) async fn list_models_from_db(
-        &self,
-        assistant_id_filter: Option<&str>,
-    ) -> Result<serde_json::Value, TeamError> {
-        let Ok(rows) = self.agent_metadata_repo.list_all().await else {
-            return Ok(crate::mcp::tools::handle_team_list_models(&serde_json::Value::Null));
-        };
-        let requested_assistant_id = assistant_id_filter
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-        let backend_filter = match requested_assistant_id.as_deref() {
-            Some(assistant_id) => {
-                let definition = self
-                    .assistant_definition_repo
-                    .get_by_assistant_id(assistant_id)
-                    .await?
-                    .ok_or_else(|| TeamError::InvalidRequest(format!("Assistant not found: {assistant_id}")))?;
-                let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
-                Some(
-                    resolve_runtime_backend(
-                        &self.agent_metadata_repo,
-                        overlay
-                            .as_ref()
-                            .and_then(|row| row.agent_id_override.as_deref())
-                            .filter(|value| !value.trim().is_empty())
-                            .unwrap_or(definition.agent_id.as_str()),
-                    )
-                    .await?,
-                )
-            }
-            None => None,
-        };
-        let provider_models = self.collect_provider_models().await;
-        let value = crate::mcp::tools::build_list_models_from_rows(&rows, backend_filter.as_deref(), &provider_models);
-        if let Some(assistant_id) = requested_assistant_id {
-            let assistant = value
-                .get("assistants")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|items| items.first())
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({ "models": [], "default_model": null }));
-            return Ok(serde_json::json!({
-                "status": "ok",
-                "assistant_id": assistant_id,
-                "models": assistant.get("models").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "default_model": assistant.get("default_model").cloned().unwrap_or(serde_json::Value::Null),
-            }));
-        }
-        Ok(value)
-    }
-
     /// Collect all enabled provider model IDs grouped by provider name.
     /// Returns a flat list of model IDs for use by internal agents (aionrs).
     async fn collect_provider_models(&self) -> Vec<String> {

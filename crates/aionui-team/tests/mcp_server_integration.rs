@@ -228,7 +228,9 @@ async fn mc1_correct_token_connects() {
     send_request(&mut stream, &req).await;
     let resp = read_response(&mut stream).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 10);
+    let names: Vec<&str> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
+    assert!(!names.contains(&"team_list_models"));
 
     env.server.stop();
 }
@@ -288,12 +290,12 @@ async fn mc3_no_token_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_returns_all_11_tools() {
+async fn tools_list_returns_all_10_tools() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
     let names = list_tools(&mut stream, 10).await;
-    assert_eq!(names.len(), 11);
+    assert_eq!(names.len(), 10);
 
     assert!(names.contains(&"team_send_message".to_owned()));
     assert!(names.contains(&"team_spawn_agent".to_owned()));
@@ -304,8 +306,8 @@ async fn tools_list_returns_all_11_tools() {
     assert!(names.contains(&"team_rename_agent".to_owned()));
     assert!(names.contains(&"team_shutdown_agent".to_owned()));
     assert!(names.contains(&"team_list_assistants".to_owned()));
-    assert!(names.contains(&"team_list_models".to_owned()));
     assert!(names.contains(&"team_describe_assistant".to_owned()));
+    assert!(!names.contains(&"team_list_models".to_owned()));
 
     env.server.stop();
 }
@@ -326,8 +328,8 @@ async fn mcp_tools_list_filters_lead_only_tools() {
     assert!(names.contains(&"team_task_list".to_owned()));
     assert!(names.contains(&"team_members".to_owned()));
     assert!(names.contains(&"team_list_assistants".to_owned()));
-    assert!(names.contains(&"team_list_models".to_owned()));
     assert!(names.contains(&"team_describe_assistant".to_owned()));
+    assert!(!names.contains(&"team_list_models".to_owned()));
 
     env.server.stop();
 }

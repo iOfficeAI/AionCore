@@ -25,7 +25,7 @@ use super::protocol::{
 };
 use super::tools::{
     RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskUpdateInput,
-    all_tool_descriptors_for_role, handle_team_list_models,
+    all_tool_descriptors_for_role,
 };
 
 // ---------------------------------------------------------------------------
@@ -564,7 +564,6 @@ pub(crate) async fn dispatch_tool(
             exec_shutdown_agent(arguments, scheduler, service, team_id, caller_slot_id, caller_role).await
         }
         "team_list_assistants" => exec_list_assistants(arguments, service).await,
-        "team_list_models" => exec_list_models(arguments, service).await,
         "team_describe_assistant" => exec_describe_assistant(arguments, service).await,
         _ => Err(ToolCallError::from_message(format!("Unknown tool: {tool_name}"))),
     }
@@ -582,29 +581,6 @@ async fn exec_list_assistants(args: &Value, service: &Weak<TeamSessionService>) 
         .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
     let assistants = service.list_team_selectable_assistants().await;
     let value = json!({ "assistants": assistants });
-    serde_json::to_string_pretty(&value).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
-}
-
-async fn exec_list_models(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, ToolCallError> {
-    if args.get("backend").is_some() {
-        return Err(ToolCallError::from_message(
-            "backend is no longer accepted; use assistant_id",
-        ));
-    }
-    if args.get("agent_type").is_some() {
-        return Err(ToolCallError::from_message(
-            "agent_type is no longer accepted; use assistant_id",
-        ));
-    }
-    let assistant_id_filter = args.get("assistant_id").and_then(Value::as_str);
-
-    let value = match service.upgrade() {
-        Some(svc) => svc
-            .list_models_from_db(assistant_id_filter)
-            .await
-            .map_err(|error| ToolCallError::from_message(error.to_string()))?,
-        None => handle_team_list_models(args),
-    };
     serde_json::to_string_pretty(&value).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
 }
 
@@ -1315,32 +1291,6 @@ mod tests {
             "expected assistant_id requirement, got {err:?}"
         );
         assert_eq!(err.domain_code, Some("TEAM_ASSISTANT_ID_REQUIRED"));
-    }
-
-    #[tokio::test]
-    async fn exec_list_models_rejects_legacy_backend_alias() {
-        let service: Weak<TeamSessionService> = Weak::new();
-        let args = json!({ "backend": "claude" });
-        let result = exec_list_models(&args, &service).await;
-        let err = result.expect_err("legacy backend alias must be rejected");
-        assert!(
-            err.message.contains("backend is no longer accepted"),
-            "expected explicit backend rejection, got {err:?}"
-        );
-        assert_eq!(err.domain_code, Some("TEAM_ASSISTANT_FIELD_UNSUPPORTED"));
-    }
-
-    #[tokio::test]
-    async fn exec_list_models_rejects_legacy_agent_type_alias() {
-        let service: Weak<TeamSessionService> = Weak::new();
-        let args = json!({ "agent_type": "claude" });
-        let result = exec_list_models(&args, &service).await;
-        let err = result.expect_err("legacy agent_type alias must be rejected");
-        assert!(
-            err.message.contains("agent_type is no longer accepted"),
-            "expected explicit agent_type rejection, got {err:?}"
-        );
-        assert_eq!(err.domain_code, Some("TEAM_ASSISTANT_FIELD_UNSUPPORTED"));
     }
 
     #[tokio::test]

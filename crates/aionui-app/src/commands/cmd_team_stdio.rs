@@ -130,15 +130,9 @@ struct SendMessageParams {
 struct SpawnAgentParams {
     /// Agent display name.
     name: String,
-    /// Model override for the new agent.
-    #[serde(default)]
-    model: Option<String>,
     /// Assistant identifier from the available assistants catalog.
     #[serde(default)]
     assistant_id: Option<String>,
-    /// Agent role (default: "teammate").
-    #[serde(default)]
-    role: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -192,13 +186,6 @@ struct ShutdownAgentParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
-struct ListModelsParams {
-    /// Assistant ID to query. Shows all backends when omitted.
-    #[serde(default)]
-    assistant_id: Option<String>,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DescribeAssistantParams {
     /// The assistant ID from the "Available Assistants" catalog.
@@ -228,16 +215,14 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_spawn_agent",
-        description = "Create a new teammate agent to join the team.\n\nUse this only when one of the following is true:\n- The user explicitly approved the proposed teammate lineup in a previous message\n- The user explicitly instructed you to create a specific teammate immediately\n\nBefore calling this tool in the normal planning flow:\n- Start with one short sentence explaining why additional teammates would help\n- Tell the user which teammate(s) you recommend\n- Present the proposal as a table with: name, responsibility, recommended assistant, and recommended model\n- Include each teammate's responsibility, recommended assistant, and model\n- Ask whether to create them as proposed or change any names, responsibilities, or assistant choices\n- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well\n- Do NOT call this tool in that same turn; wait for explicit approval in a later user message\n\nWhen calling this tool, always provide assistant_id from the available assistants catalog.\nWhen calling this tool, provide the model parameter if a specific model was recommended and approved.\n\nThe new agent will be created and added to the team. You can then assign tasks and send messages to it."
+        description = "Create a new teammate agent to join the team.\n\nUse this only when one of the following is true:\n- The user explicitly approved the proposed teammate lineup in a previous message\n- The user explicitly instructed you to create a specific teammate immediately\n\nBefore calling this tool in the normal planning flow:\n- Start with one short sentence explaining why additional teammates would help\n- Tell the user which teammate(s) you recommend\n- Present the proposal as a table with: name, responsibility, and recommended assistant\n- Include each teammate's responsibility and recommended assistant\n- Ask whether to create them as proposed or change any names, responsibilities, or assistant choices\n- In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well\n- Do NOT call this tool in that same turn; wait for explicit approval in a later user message\n\nWhen calling this tool, always provide assistant_id from the available assistants catalog.\nDo not provide a model. The new teammate uses the selected assistant's configured/default model; users can adjust models from the UI model selector.\n\nThe new agent will be created and added to the team. You can then assign tasks and send messages to it."
     )]
     async fn spawn_agent(&self, Parameters(params): Parameters<SpawnAgentParams>) -> CallToolResult {
         self.forward_to_tcp(
             "team_spawn_agent",
             &serde_json::json!({
                 "name": params.name,
-                "model": params.model,
                 "assistant_id": params.assistant_id,
-                "role": params.role,
             }),
         )
         .await
@@ -316,18 +301,6 @@ impl TeamStdioServer {
     async fn list_assistants(&self) -> CallToolResult {
         self.forward_to_tcp("team_list_assistants", &serde_json::json!({}))
             .await
-    }
-
-    #[tool(
-        name = "team_list_models",
-        description = "Query available models for assistant backends. Returns the real-time model list that matches the frontend model selector.\n\nUse this to:\n- Check what models are available before spawning an assistant-backed teammate with a specific model\n- See all available backends and their models at once\n- Verify a model ID is valid for the backend behind a chosen assistant or fallback backend\n\nPass assistant_id to query models for a specific assistant, or omit it to see all backends."
-    )]
-    async fn list_models(&self, Parameters(params): Parameters<ListModelsParams>) -> CallToolResult {
-        self.forward_to_tcp(
-            "team_list_models",
-            &serde_json::json!({ "assistant_id": params.assistant_id }),
-        )
-        .await
     }
 
     #[tool(
@@ -724,6 +697,14 @@ mod tests {
     fn team_stdio_descriptions_match_prompt_registry() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
+        let mut actual_names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        actual_names.sort_unstable();
+        let mut expected_names: Vec<_> = aionui_team_prompts::tools::team_tool_specs()
+            .iter()
+            .map(|spec| spec.name)
+            .collect();
+        expected_names.sort_unstable();
+        assert_eq!(actual_names, expected_names, "stdio tool registry drift");
 
         for spec in aionui_team_prompts::tools::team_tool_specs() {
             let tool = tools
@@ -890,7 +871,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_models_forwards_assistant_id_argument() {
+    async fn spawn_agent_forwards_only_assistant_first_arguments() {
         let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accept_task = tokio::spawn(async move {
@@ -906,9 +887,14 @@ mod tests {
 
             let call = read_frame(&mut socket).await.unwrap();
             let call_value: serde_json::Value = serde_json::from_slice(&call).unwrap();
+            assert_eq!(call_value["params"]["name"], json!("team_spawn_agent"));
             let arguments = &call_value["params"]["arguments"];
-            assert_eq!(arguments["assistant_id"], json!("assistant-social-job-publisher"));
+            assert_eq!(arguments["name"], json!("CodexCLI"));
+            assert_eq!(arguments["assistant_id"], json!("bare:8e1acf31"));
+            assert!(arguments.get("model").is_none());
+            assert!(arguments.get("role").is_none());
             assert!(arguments.get("agent_type").is_none());
+            assert!(arguments.get("backend").is_none());
 
             let tool_response = serde_json::to_vec(&json!({
                 "jsonrpc": "2.0",
@@ -928,8 +914,9 @@ mod tests {
         };
 
         let result = server
-            .list_models(Parameters(ListModelsParams {
-                assistant_id: Some("assistant-social-job-publisher".into()),
+            .spawn_agent(Parameters(SpawnAgentParams {
+                name: "CodexCLI".into(),
+                assistant_id: Some("bare:8e1acf31".into()),
             }))
             .await;
 

@@ -44,7 +44,6 @@ current task state.
 ## Assistant Selection Guidelines
 - Use `team_list_assistants` to choose assistants by their declared purpose, description, and skills
 - Use `team_describe_assistant` when two or more assistants look relevant and you need more detail before proposing one
-- Do not call `team_list_models` as part of normal teammate creation
 - Do not pass a model to `team_spawn_agent`; teammate models come from the selected assistant configuration or the UI model selector
 
 ## Bug Fix Priority (applies to all team members)

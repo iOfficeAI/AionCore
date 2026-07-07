@@ -252,7 +252,7 @@ mod tests {
 
         // Assistant selection, not model selection.
         assert!(prompt.contains("## Assistant Selection Guidelines"));
-        assert!(prompt.contains("Do not call `team_list_models` as part of normal teammate creation"));
+        assert!(!prompt.contains("team_list_models"));
         assert!(prompt.contains("Do not pass a model to `team_spawn_agent`"));
 
         // Conversation Style — don't pitch proposals up-front
