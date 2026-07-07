@@ -219,6 +219,7 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
     }
 
     AgentBootstrap::new(config, workspace, sink)
+        .runtime_env(config_extra.runtime_env)
         .build()
         .await
         .map(|result| result.engine)
