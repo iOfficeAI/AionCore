@@ -284,6 +284,8 @@ pub struct AgentManagementRow {
     pub available_modes: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_models: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_commands: Option<serde_json::Value>,
     pub sort_order: i64,
     #[serde(default)]
     pub team_capable: bool,
