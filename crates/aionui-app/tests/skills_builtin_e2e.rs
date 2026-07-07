@@ -131,6 +131,10 @@ async fn unified_skill_list_includes_auto_inject_entries_from_embedded_corpus() 
     );
     let names: Vec<&str> = auto_items.iter().filter_map(|item| item["name"].as_str()).collect();
     assert!(
+        names.contains(&"aionui-config"),
+        "aionui-config should be shipped as an auto-inject builtin skill: {names:?}",
+    );
+    assert!(
         !names.contains(&"aionui-skills"),
         "aionui-skills should not be shipped as an auto-inject builtin skill: {names:?}",
     );
