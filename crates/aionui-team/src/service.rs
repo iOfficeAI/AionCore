@@ -151,9 +151,9 @@ pub struct TeamSessionService {
     backend_binary_path: Arc<PathBuf>,
     prompt_dump: TeamPromptDumpConfig,
     sessions: Arc<DashMap<String, SessionEntry>>,
-    /// Per-team mutex serializing `add_agent` so concurrent callers cannot
-    /// read-modify-write the `agents` JSON with stale state (last-writer-wins
-    /// would otherwise drop entries).
+    /// Per-team mutex serializing membership mutations with session startup so
+    /// callers cannot read-modify-write the `agents` JSON or rebuild a runtime
+    /// session from a stale roster snapshot.
     add_agent_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
     /// race and start two sessions for the same team.
@@ -549,6 +549,13 @@ impl TeamSessionService {
     }
 
     pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
         let mut team = self.load_owned_team(user_id, team_id).await?;
 
         let idx = team
@@ -679,6 +686,20 @@ impl TeamSessionService {
     }
 
     async fn ensure_session_inner(&self, team_id: &str) -> Result<(), TeamError> {
+        if self.sessions.contains_key(team_id) {
+            return Ok(());
+        }
+
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _membership_guard = membership_lock.lock().await;
+
+        // Re-check after acquiring the membership lock. A preceding add/remove
+        // may have completed while this call was waiting, and another ensure
+        // caller may also have finished startup.
         if self.sessions.contains_key(team_id) {
             return Ok(());
         }

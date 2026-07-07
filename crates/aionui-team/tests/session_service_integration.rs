@@ -1085,6 +1085,28 @@ fn success_factory() -> AgentFactory {
     })
 }
 
+fn blocking_first_build_factory(started: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>) -> AgentFactory {
+    use futures_util::FutureExt;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    Arc::new(move |opts: BuildTaskOptions| {
+        let started = Arc::clone(&started);
+        let release = Arc::clone(&release);
+        let calls = Arc::clone(&calls);
+        async move {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                started.notify_one();
+                release.notified().await;
+            }
+
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
+            )))
+        }
+        .boxed()
+    })
+}
+
 fn confirmations_factory(count: usize) -> AgentFactory {
     use aionui_common::Confirmation;
     use futures_util::FutureExt;
@@ -5078,6 +5100,127 @@ async fn d9_ensure_session_cleans_up_successful_rebuilds_when_one_agent_fails() 
         svc.get_session_scheduler(&created.id).is_none(),
         "session must not be registered after partial rebuild failure"
     );
+}
+
+#[tokio::test]
+async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
+    let build_started = Arc::new(tokio::sync::Notify::new());
+    let release_build = Arc::new(tokio::sync::Notify::new());
+    let (svc, _tm) = setup_with_factory(blocking_first_build_factory(
+        Arc::clone(&build_started),
+        Arc::clone(&release_build),
+    ));
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let svc_for_ensure = Arc::clone(&svc);
+    let ensure_team_id = created.id.clone();
+    let ensure_handle = tokio::spawn(async move { svc_for_ensure.ensure_session("user1", &ensure_team_id).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), build_started.notified())
+        .await
+        .expect("ensure_session should start rebuilding before mutation attempt");
+
+    let svc_for_add = Arc::clone(&svc);
+    let add_team_id = created.id.clone();
+    let mut add_handle = tokio::spawn(async move {
+        svc_for_add
+            .add_agent(
+                "user1",
+                &add_team_id,
+                AddAgentRequest {
+                    name: "Worker".into(),
+                    role: "teammate".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                },
+            )
+            .await
+    });
+
+    tokio::select! {
+        result = &mut add_handle => panic!("add_agent completed while ensure_session was rebuilding: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+    }
+
+    release_build.notify_waiters();
+    ensure_handle.await.unwrap().unwrap();
+    add_handle.await.unwrap().unwrap();
+
+    let scheduler = svc
+        .get_session_scheduler(&created.id)
+        .expect("session should be registered after ensure_session");
+    assert_eq!(scheduler.list_agents().await.len(), 2);
+}
+
+#[tokio::test]
+async fn ensure_session_serializes_manual_remove_until_rebuild_completes() {
+    let build_started = Arc::new(tokio::sync::Notify::new());
+    let release_build = Arc::new(tokio::sync::Notify::new());
+    let (svc, _tm) = setup_with_factory(blocking_first_build_factory(
+        Arc::clone(&build_started),
+        Arc::clone(&release_build),
+    ));
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker_slot = created.assistants[1].slot_id.clone();
+
+    let svc_for_ensure = Arc::clone(&svc);
+    let ensure_team_id = created.id.clone();
+    let ensure_handle = tokio::spawn(async move { svc_for_ensure.ensure_session("user1", &ensure_team_id).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), build_started.notified())
+        .await
+        .expect("ensure_session should start rebuilding before mutation attempt");
+
+    let svc_for_remove = Arc::clone(&svc);
+    let remove_team_id = created.id.clone();
+    let remove_slot = worker_slot.clone();
+    let mut remove_handle = tokio::spawn(async move {
+        svc_for_remove
+            .remove_agent("user1", &remove_team_id, &remove_slot)
+            .await
+    });
+
+    tokio::select! {
+        result = &mut remove_handle => panic!("remove_agent completed while ensure_session was rebuilding: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+    }
+
+    release_build.notify_waiters();
+    ensure_handle.await.unwrap().unwrap();
+    remove_handle.await.unwrap().unwrap();
+
+    let scheduler = svc
+        .get_session_scheduler(&created.id)
+        .expect("session should be registered after ensure_session");
+    let agents = scheduler.list_agents().await;
+    assert_eq!(agents.len(), 1);
+    assert!(agents.iter().all(|agent| agent.slot_id != worker_slot));
 }
 
 // ===========================================================================
