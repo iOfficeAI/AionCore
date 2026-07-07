@@ -2,20 +2,22 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Path, Query, State};
+use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
     ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, EnsureManagedAcpToolRequest,
-    EnsureManagedAcpToolResponse, EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, FetchModelsAnonymousRequest,
-    FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse,
-    SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
-    UpdateProviderRequest, UpdateSettingsRequest,
+    EnsureManagedAcpToolResponse, EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery,
+    FeedbackDiagnosticsResponse, FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse,
+    ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest,
+    UpdateCheckResult, UpdateClientPreferencesRequest, UpdateProviderRequest, UpdateSettingsRequest,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
 use crate::client_pref::ClientPrefService;
+use crate::diagnostics::FeedbackDiagnosticsService;
 use crate::error::SystemError;
 use crate::model_fetcher::ModelFetchService;
 use crate::protocol::ProtocolDetectionService;
@@ -34,6 +36,7 @@ pub struct SystemRouterState {
     pub protocol_detection_service: ProtocolDetectionService,
     pub version_check_service: VersionCheckService,
     pub runtime_prepare_service: RuntimePrepareService,
+    pub feedback_diagnostics_service: FeedbackDiagnosticsService,
 }
 
 impl From<SystemError> for ApiError {
@@ -70,6 +73,7 @@ impl From<SystemError> for ApiError {
 /// - `POST /api/system/check-update`         — check GitHub for new versions
 /// - `POST /api/system/ensure-node-runtime`  — prepare managed Node runtime
 /// - `POST /api/system/ensure-managed-acp-tool` — prepare managed ACP tool artifact
+/// - `GET  /api/system/diagnostics/feedback-report` — collect sanitized feedback diagnostics
 pub fn system_routes(state: SystemRouterState) -> Router {
     Router::new()
         .route("/api/settings", get(get_settings).patch(update_settings))
@@ -89,6 +93,7 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         .route("/api/system/check-update", post(check_update))
         .route("/api/system/ensure-node-runtime", post(ensure_node_runtime))
         .route("/api/system/ensure-managed-acp-tool", post(ensure_managed_acp_tool))
+        .route("/api/system/diagnostics/feedback-report", get(get_feedback_diagnostics))
         .with_state(state)
 }
 
@@ -106,6 +111,19 @@ async fn get_settings(
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, ApiError> {
     let settings = state.settings_service.get_settings().await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(settings)))
+}
+
+async fn get_feedback_diagnostics(
+    State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<FeedbackDiagnosticsQuery>,
+) -> Result<Json<ApiResponse<FeedbackDiagnosticsResponse>>, ApiError> {
+    let diagnostics = state
+        .feedback_diagnostics_service
+        .collect(&user.id, query)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(diagnostics)))
 }
 
 async fn update_settings(

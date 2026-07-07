@@ -27,4 +27,5 @@ dirs.workspace = true
 tower = { workspace = true }
 http-body-util.workspace = true
 reqwest.workspace = true
+sqlx.workspace = true
 wiremock = "0.6"

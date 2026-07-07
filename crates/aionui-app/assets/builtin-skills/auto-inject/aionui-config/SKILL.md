@@ -115,8 +115,7 @@ Key fields in the create/update body:
 | Field | Meaning |
 | --- | --- |
 | `name`, `description` | display text (required: name) |
-| `agent_id` | **engine binding** — the id of an agent row from `/api/agents/management` (see "Picking the engine" below). This, not `preset_agent_type`, is what actually sets the engine |
-| `preset_agent_type` | display/i18n hint only; does **not** bind the engine in the current backend |
+| `agent_id` | **engine binding** — the id of an agent row from `/api/agents/management` (see "Picking the engine" below). This is the only field that sets the engine |
 | `prompts` | quick-start prompts shown on the assistant (NOT the system prompt) |
 | `avatar` | emoji, image URL, `data:` URI, or absolute local path |
 | `enabled_skills` | skill names attached to this assistant |
@@ -152,12 +151,13 @@ python3 scripts/aionui_api.py put /api/assistants/<id> '{"agent_id":"2d23ff1c"}'
 > (`claude`, `gemini`, `codex`, …) must be opted into explicitly with their
 > `agent_id` — an Anthropic key alone doesn't put the Claude CLI on `PATH`.
 > On read, the bound engine shows up in the assistant's `engine.agent_id` /
-> `engine.agent.acp_backend`; the create-body `preset_agent_type` is display-only
-> and reads back `null`, so don't rely on it to tell you the engine.
+> `engine.agent.acp_backend`. There is no `preset_agent_type` request field — the
+> create/update bodies don't accept it (it's silently dropped and never read
+> back), so bind the engine only via `agent_id`.
 
 ### Per-assistant defaults
 
-`defaults` holds four entries; each is `{mode}` or `{mode, value}`. `mode:"auto"`
+`defaults` holds five entries; each is `{mode}` or `{mode, value}`. `mode:"auto"`
 means "inherit the global default / let the user pick each time" and carries NO
 `value`. `mode:"fixed"` locks the assistant to `value` (the user can't change it
 while using this assistant). Send only the entries you want to change; read the
@@ -170,6 +170,7 @@ modes the backend accepts. The `value` is what `fixed` locks to:
 | --- | --- | --- |
 | `model` | a model name (string) | `{"mode":"fixed","value":"gemini-2.5-pro"}` |
 | `permission` | a permission-name string (free-form; the backend does not enum-validate it). Common names: `plan`, `default` | `{"mode":"fixed","value":"plan"}` |
+| `thought_level` | a thinking-level string (opaque; stored, not enum-validated) | `{"mode":"fixed","value":"high"}` |
 | `skills` | skill names (string[]) | `{"mode":"fixed","value":["aionui-config"]}` |
 | `mcps` | MCP server names (string[]) | `{"mode":"fixed","value":["filesystem"]}` |
 
@@ -181,18 +182,23 @@ modes the backend accepts. The `value` is what `fixed` locks to:
 ```bash
 python3 scripts/aionui_api.py put /api/assistants/<id> '{
   "defaults": {
-    "model":      {"mode": "fixed", "value": "gemini-2.5-pro"},
-    "permission": {"mode": "fixed", "value": "plan"},
-    "skills":     {"mode": "auto"},
-    "mcps":       {"mode": "fixed", "value": ["filesystem"]}
+    "model":         {"mode": "fixed", "value": "gemini-2.5-pro"},
+    "permission":    {"mode": "fixed", "value": "plan"},
+    "thought_level": {"mode": "auto"},
+    "skills":        {"mode": "auto"},
+    "mcps":          {"mode": "fixed", "value": ["filesystem"]}
   }
 }'
 ```
 
-> Verified end-to-end: the backend stores all four entries verbatim and returns
+> Verified end-to-end: the backend stores all five entries verbatim and returns
 > them on the `?locale=` detail read. On read, `defaults` is always present with
-> all four entries — a brand-new assistant has each set to `{"mode":"auto"}` (no
-> `value`), never `null`. Lock one by sending `{"mode":"fixed","value":...}`.
+> all five entries, never `null`. A brand-new assistant starts with `model`,
+> `permission`, `thought_level`, and `mcps` at `{"mode":"auto"}` (no `value`),
+> while `skills` starts at `{"mode":"fixed"}` seeded with the assistant's
+> `enabled_skills` (an empty list when it has none). Lock any entry by sending
+> `{"mode":"fixed","value":...}`, or set `skills` to `{"mode":"auto"}` to let the
+> user pick.
 
 ### Update
 
@@ -491,8 +497,9 @@ for a not-yet-saved endpoint. Its body differs from detect-protocol: `platform`,
 
 ### Create
 
-`POST /api/providers`. Required: `platform`, `name`, `base_url`. Provide
-`models` (the ones to expose) and `enabled`.
+`POST /api/providers`. Required: `platform`, `name`, `base_url`, `api_key`
+(`api_key` may be empty only for the `bedrock` platform, which authenticates via
+`bedrock_config`). Provide `models` (the ones to expose) and `enabled`.
 
 ```bash
 python3 scripts/aionui_api.py post /api/providers '{
@@ -619,9 +626,23 @@ python3 scripts/aionui_api.py post /api/cron/jobs '{
   "conversation_id": "<conv-id>",
   "created_by": "agent",
   "execution_mode": "new_conversation",
-  "agent_config": {"name": "AionUi Butler", "assistant_id": "<assistant-id>"}
+  "agent_config": {
+    "name": "AionUi Butler",
+    "assistant_id": "<assistant-id>",
+    "model": {"provider_id": "<provider-id>", "model": "<model-name>"}
+  }
 }'
 ```
+
+> **⚠️ `aionrs`-engine jobs must include `agent_config.model`.** If the target
+> assistant runs on the built-in `aionrs` engine, the backend rejects the job with
+> *"aionrs cron jobs require agent_config.model.provider_id and
+> agent_config.model.model"* unless you pass a non-empty
+> `model: {"provider_id": "...", "model": "..."}`. This bites easily: an assistant
+> created without an explicit `agent_id` falls back to `aionrs` (see *Picking the
+> engine*), so its scheduled jobs need `agent_config.model` too. CLI-engine
+> assistants (`claude`, `gemini`, `codex`, …) don't require it — omit `model` for
+> them. Read `GET /api/providers` for a valid `provider_id` + `model` pair.
 
 | Field | Required | Meaning |
 | --- | --- | --- |
@@ -631,7 +652,7 @@ python3 scripts/aionui_api.py post /api/cron/jobs '{
 | `created_by` | ✅ | `"agent"` when you create it on the user's behalf, `"user"` for a user-initiated one. **Only these two values** |
 | `message` (or `prompt`) | — | the instruction sent on each run. `message` wins if both are given; with neither, the run sends an empty prompt |
 | `execution_mode` | — | `"existing"` (default) reuses `conversation_id` every run; `"new_conversation"` spins up a fresh conversation each run |
-| `agent_config` | — | which assistant runs the task. **In practice required for a new job**: omit it and the API 400s with *"assistant_id is required for new cron jobs"*. Pass `{"name":"<label>","assistant_id":"<id>"}` |
+| `agent_config` | — | which assistant runs the task. **In practice required for a new job**: omit it and the API 400s with *"assistant_id is required for new cron jobs"*. Pass `{"name":"<label>","assistant_id":"<id>"}`; for an `aionrs`-engine assistant also add `"model":{"provider_id":"<id>","model":"<name>"}` (see the ⚠️ note above) |
 | `description` | — | optional longer description |
 
 > `agent_config` is strict (`deny_unknown_fields`): only `name`, `assistant_id`,
@@ -641,8 +662,12 @@ python3 scripts/aionui_api.py post /api/cron/jobs '{
 > `GET /api/assistants`.
 
 The response is the created job (HTTP 201) with its generated `id` (prefixed
-`cron_…`), resolved `agent_type`, and a `state` block (`next_run_at_ms`,
-`run_count`, …).
+`cron_…`). Note the **read shape is nested** and differs from the flat create
+body: the instruction is at `target.payload.text`, `execution_mode` at
+`target.execution_mode`, and `conversation_id` / `agent_type` / `created_by` /
+`agent_config` under `metadata`; run state is a `state` block (`next_run_at_ms`,
+`last_run_at_ms`, `last_status`, `run_count`, …). So you `POST` a flat body but
+read it back nested — don't look for a top-level `message` or `agent_config`.
 
 ### List / inspect / change / run / delete
 

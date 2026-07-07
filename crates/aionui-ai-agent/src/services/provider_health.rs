@@ -65,7 +65,7 @@ impl ProviderHealthCheckService {
     fn resolve_probe_config(&self, row: &Provider, model_id: &str) -> Result<AionrsResolvedConfig, AgentError> {
         let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &self.encryption_key)
             .map_err(|e| AgentError::internal(e.to_string()))?;
-        let provider = map_aionrs_provider(&row.platform, model_id, row.model_protocols.as_deref());
+        let provider = map_aionrs_provider(&row.platform, model_id, row.model_protocols.as_deref())?;
         let (base_url, compat_overrides) =
             resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, row.is_full_url);
         let bedrock_config = if row.platform == "bedrock" {

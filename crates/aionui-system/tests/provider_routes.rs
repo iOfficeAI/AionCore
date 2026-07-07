@@ -14,11 +14,12 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use aionui_db::{
-    SqliteClientPreferenceRepository, SqliteProviderRepository, SqliteSettingsRepository, init_database_memory,
+    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
+    SqliteSettingsRepository, init_database_memory,
 };
 use aionui_system::{
-    ClientPrefService, ModelFetchService, ProtocolDetectionService, ProviderService, RuntimePrepareService,
-    SettingsService, SystemRouterState, VersionCheckService, system_routes,
+    ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
+    RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService, system_routes,
 };
 
 // ---------------------------------------------------------------------------
@@ -38,6 +39,9 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, "0.1.0".to_owned()),
         runtime_prepare_service: RuntimePrepareService::new(Arc::new(BroadcastEventBus::new(16))),
+        feedback_diagnostics_service: FeedbackDiagnosticsService::new(Arc::new(
+            SqliteFeedbackDiagnosticsRepository::new(db.pool().clone()),
+        )),
     }
 }
 
