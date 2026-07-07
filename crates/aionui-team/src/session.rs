@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    TeamRunAckResponse, TeamRunTargetRole, TeamSendMessageDelivery, TeamSendMessageReason,
+    TeamAgentRuntimeStatus, TeamRunAckResponse, TeamRunTargetRole, TeamSendMessageDelivery, TeamSendMessageReason,
     TeamSendMessageTargetQueueState, TeamSlotRuntimeHealth, TeamSlotWorkPayload,
 };
 use aionui_common::{AgentKillReason, generate_id};
@@ -1690,6 +1690,12 @@ pub(crate) fn spawn_attach_agent_process_bg(
         if let Err(err) =
             TeamSession::attach_spawned_agent_process(&service, &agent, mcp_stdio_cfg, &user_id, &task_manager).await
         {
+            service.broadcast_agent_runtime_status(
+                &team_id,
+                &agent,
+                TeamAgentRuntimeStatus::Failed,
+                Some(err.to_string()),
+            );
             warn!(
                 team_id = %team_id,
                 slot_id = %agent.slot_id,
@@ -1718,6 +1724,7 @@ pub(crate) fn spawn_attach_agent_process_bg(
             return;
         }
 
+        service.broadcast_agent_runtime_status(&team_id, &agent, TeamAgentRuntimeStatus::Ready, None);
         service.register_event_loop(&team_id, &agent.slot_id);
 
         match wake_plan {

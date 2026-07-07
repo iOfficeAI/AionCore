@@ -58,6 +58,12 @@ impl From<TeamError> for ApiError {
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
             TeamError::DuplicateAgentName(msg) => ApiError::BadRequest(format!("Agent name already taken: {msg}")),
+            TeamError::RuntimeNotReady { conversation_id } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_RUNTIME_NOT_READY",
+                format!("Team agent runtime is not ready for conversation: {conversation_id}"),
+                Some(serde_json::json!({ "conversation_id": conversation_id })),
+            ),
             TeamError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
             TeamError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
             TeamError::Database(db_err) => db_error_to_api_error(db_err),
@@ -442,6 +448,17 @@ mod tests {
     fn duplicate_agent_name_maps_to_bad_request() {
         let err: ApiError = TeamError::DuplicateAgentName("alice".into()).into();
         assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("alice")));
+    }
+
+    #[test]
+    fn runtime_not_ready_maps_to_coded_conflict() {
+        let err: ApiError = TeamError::RuntimeNotReady {
+            conversation_id: "conv-1".into(),
+        }
+        .into();
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "TEAM_RUNTIME_NOT_READY");
+        assert_eq!(err.error_details(), Some(json!({ "conversation_id": "conv-1" })));
     }
 
     #[test]

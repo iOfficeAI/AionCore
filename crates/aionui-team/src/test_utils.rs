@@ -250,6 +250,18 @@ pub(crate) mod workspace_harness {
                 .find(|c| c.id == id)
                 .and_then(|c| serde_json::from_str(&c.extra).ok())
         }
+
+        pub(crate) fn mark_runtime_not_ready(&self, id: &str) {
+            let mut conversations = self.conversations.lock().unwrap();
+            let conversation = conversations
+                .iter_mut()
+                .find(|c| c.id == id)
+                .expect("conversation exists");
+            let mut extra: serde_json::Value =
+                serde_json::from_str(&conversation.extra).unwrap_or_else(|_| serde_json::json!({}));
+            extra["runtime_not_ready"] = serde_json::Value::Bool(true);
+            conversation.extra = serde_json::to_string(&extra).unwrap();
+        }
     }
 
     #[async_trait]
@@ -634,6 +646,15 @@ pub(crate) mod workspace_harness {
                 .repo
                 .get_extra(conversation_id)
                 .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+            if extra
+                .get("runtime_not_ready")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Err(TeamError::RuntimeNotReady {
+                    conversation_id: conversation_id.to_owned(),
+                });
+            }
             let model = extra
                 .get("current_model_id")
                 .and_then(serde_json::Value::as_str)
@@ -702,10 +723,32 @@ pub(crate) mod workspace_harness {
         }
     }
 
-    struct NullBroadcaster;
+    pub(crate) struct RecordingBroadcaster {
+        events: std::sync::Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+    }
 
-    impl EventBroadcaster for NullBroadcaster {
-        fn broadcast(&self, _event: WebSocketMessage<serde_json::Value>) {}
+    impl RecordingBroadcaster {
+        pub(crate) fn new() -> Self {
+            Self {
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(crate) fn events_by_name(&self, name: &str) -> Vec<WebSocketMessage<serde_json::Value>> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.name == name)
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl EventBroadcaster for RecordingBroadcaster {
+        fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+            self.events.lock().unwrap().push(event);
+        }
     }
 
     struct NoopTaskManager;
@@ -951,10 +994,23 @@ pub(crate) mod workspace_harness {
         Arc<dyn IWorkerTaskManager>,
         Arc<MockConversationRepo>,
     ) {
+        let (svc, team_repo, task_manager, conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster();
+        (svc, team_repo, task_manager, conv_repo)
+    }
+
+    pub(crate) fn setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster() -> (
+        Arc<TeamSessionService>,
+        Arc<FullMockTeamRepo>,
+        Arc<dyn IWorkerTaskManager>,
+        Arc<MockConversationRepo>,
+        Arc<RecordingBroadcaster>,
+    ) {
         let team_repo = Arc::new(FullMockTeamRepo::new());
         let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
         let conv_repo = Arc::new(MockConversationRepo::new());
-        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
         let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
         let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
         let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
@@ -968,13 +1024,13 @@ pub(crate) mod workspace_harness {
             Arc::new(EmptyProviderRepo),
             conversation_port,
             projection_store,
-            broadcaster,
+            broadcaster_dyn,
             task_manager.clone(),
             Arc::new(NoopTurnPort),
             Arc::new(NoopCancellationPort),
             Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
         );
-        (svc, team_repo, task_manager, conv_repo)
+        (svc, team_repo, task_manager, conv_repo, broadcaster)
     }
 
     pub(crate) async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {

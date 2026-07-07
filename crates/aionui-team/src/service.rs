@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager};
 use aionui_api_types::{
-    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamMcpPhase,
-    TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole,
+    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
+    TeamMcpPhase, TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole,
     TeamSlotRuntimeHealth, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, generate_id, now_ms};
@@ -513,6 +513,7 @@ impl TeamSessionService {
                 .self_ref
                 .upgrade()
                 .ok_or_else(|| TeamError::InvalidRequest("add_agent requires a live TeamSessionService".into()))?;
+            self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
             spawn_attach_agent_process_bg(
                 service,
                 team_id.to_owned(),
@@ -866,6 +867,17 @@ impl TeamSessionService {
         ));
     }
 
+    pub(crate) fn broadcast_agent_runtime_status(
+        &self,
+        team_id: &str,
+        agent: &TeamAgent,
+        status: TeamAgentRuntimeStatus,
+        error: Option<String>,
+    ) {
+        TeamEventEmitter::new(team_id.to_owned(), self.broadcaster.clone())
+            .broadcast_agent_runtime_status(agent, status, error);
+    }
+
     async fn rebuild_agent_processes(
         &self,
         team_id: &str,
@@ -931,6 +943,7 @@ impl TeamSessionService {
             }
 
             let cfg = session.mcp_stdio_config(&agent.slot_id);
+            self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
             spawn_rebuild_agent_process(
                 &mut jobs,
                 provisioner.clone(),
@@ -966,6 +979,9 @@ impl TeamSessionService {
         );
 
         if failures.is_empty() {
+            for success in outcomes.iter().filter(|outcome| outcome.result.is_ok()) {
+                self.broadcast_agent_runtime_status(team_id, &success.agent, TeamAgentRuntimeStatus::Ready, None);
+            }
             return Ok(());
         }
 
@@ -989,6 +1005,12 @@ impl TeamSessionService {
                 .err()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "unknown rebuild failure".to_owned());
+            self.broadcast_agent_runtime_status(
+                team_id,
+                &failure.agent,
+                TeamAgentRuntimeStatus::Failed,
+                Some(error.clone()),
+            );
             let agent_identity = format_rebuild_agent_identity(&failure.agent);
             let msg = format!("failed to attach rebuilt agent {agent_identity}: {error}");
             self.broadcast_mcp_phase(team_id, &failure.agent.slot_id, TeamMcpPhase::SessionError, None, |p| {
@@ -1403,8 +1425,11 @@ async fn set_active_agent_session_mode(instance: &AgentInstance, mode: &str) -> 
 
 #[cfg(test)]
 mod tests {
+    use aionui_api_types::AddAgentRequest;
+
     use crate::test_utils::workspace_harness::{
-        setup_with_factory_metadata_team_repo_and_conversation_repo, single_agent_team_request,
+        setup_with_factory_metadata_team_repo_and_conversation_repo,
+        setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster, single_agent_team_request,
     };
 
     #[tokio::test]
@@ -1419,6 +1444,95 @@ mod tests {
 
         assert!(svc.session_has_slow_monitor(&created.id));
         svc.stop_session("user-test", &created.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_session_emits_agent_runtime_ready_after_member_warmup() {
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Runtime Events"))
+            .await
+            .unwrap();
+        let assistant = created.assistants.first().expect("team assistant");
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        let events = broadcaster.events_by_name("team.agentRuntimeStatusChanged");
+        let statuses: Vec<&str> = events
+            .iter()
+            .map(|event| event.data.get("status").and_then(serde_json::Value::as_str).unwrap())
+            .collect();
+
+        assert_eq!(statuses, vec!["pending", "ready"]);
+        assert_eq!(
+            events[0].data.get("team_id").and_then(serde_json::Value::as_str),
+            Some(created.id.as_str())
+        );
+        assert_eq!(
+            events[0].data.get("slot_id").and_then(serde_json::Value::as_str),
+            Some(assistant.slot_id.as_str())
+        );
+        assert_eq!(
+            events[0]
+                .data
+                .get("conversation_id")
+                .and_then(serde_json::Value::as_str),
+            Some(assistant.conversation_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_add_agent_in_active_session_emits_runtime_ready_after_background_attach() {
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Manual Runtime Events"))
+            .await
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        let added = svc
+            .add_agent(
+                "user-test",
+                &created.id,
+                AddAgentRequest {
+                    name: "Worker".to_owned(),
+                    role: "teammate".to_owned(),
+                    backend: Some("acp".to_owned()),
+                    model: "claude".to_owned(),
+                    assistant_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let events = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let events = broadcaster.events_by_name("team.agentRuntimeStatusChanged");
+                let added_events: Vec<_> = events
+                    .into_iter()
+                    .filter(|event| {
+                        event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(added.slot_id.as_str())
+                    })
+                    .collect();
+                if added_events
+                    .iter()
+                    .any(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready"))
+                {
+                    break added_events;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime ready event should be emitted");
+        let statuses: Vec<&str> = events
+            .iter()
+            .map(|event| event.data.get("status").and_then(serde_json::Value::as_str).unwrap())
+            .collect();
+
+        assert_eq!(statuses, vec!["pending", "ready"]);
     }
 
     #[tokio::test]
@@ -1500,6 +1614,29 @@ mod tests {
             .find(|option| option.id == "model")
             .expect("model config option");
         assert_eq!(model.current_value.as_deref(), Some("claude"));
+    }
+
+    #[tokio::test]
+    async fn config_options_reports_runtime_not_ready_for_member_conversation() {
+        let (svc, _repo, _task_manager, conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Team Config Pending"))
+            .await
+            .unwrap();
+        let conversation_id = created.assistants[0].conversation_id.clone();
+        conv_repo.mark_runtime_not_ready(&conversation_id);
+
+        let err = svc
+            .get_conversation_config_options("user-test", &created.id, &conversation_id)
+            .await
+            .expect_err("member runtime readiness should be reported distinctly");
+
+        assert!(matches!(
+            err,
+            crate::error::TeamError::RuntimeNotReady {
+                conversation_id: ref id
+            } if id == &conversation_id
+        ));
     }
 
     #[tokio::test]

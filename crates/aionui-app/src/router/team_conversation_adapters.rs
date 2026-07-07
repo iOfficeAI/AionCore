@@ -334,6 +334,7 @@ fn map_conversation_update_error(error: ConversationError) -> TeamError {
         ConversationError::WorkspacePathUnavailable { path } => TeamError::WorkspacePathUnavailable(path),
         ConversationError::WorkspacePathRuntimeUnavailable { path } => TeamError::WorkspacePathRuntimeUnavailable(path),
         ConversationError::Forbidden { reason } => TeamError::Forbidden(reason),
+        ConversationError::ActiveAgentNotFound { conversation_id } => TeamError::RuntimeNotReady { conversation_id },
         ConversationError::NotFound { id } => TeamError::InvalidRequest(format!("conversation not found: {id}")),
         ConversationError::NotFoundReason { reason } => TeamError::InvalidRequest(reason),
         other => TeamError::InvalidRequest(other.to_string()),
@@ -346,5 +347,24 @@ fn map_conversation_turn_error(error: ConversationError) -> AgentTurnExecutionEr
         other => AgentTurnExecutionError::Failed {
             reason: other.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_agent_missing_maps_to_team_runtime_not_ready() {
+        let err = map_conversation_update_error(ConversationError::ActiveAgentNotFound {
+            conversation_id: "conv-1".into(),
+        });
+
+        assert!(matches!(
+            err,
+            TeamError::RuntimeNotReady {
+                conversation_id: ref id
+            } if id == "conv-1"
+        ));
     }
 }

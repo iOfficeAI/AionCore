@@ -35,6 +35,9 @@ pub enum TeamError {
     #[error("Agent name already taken: {0}")]
     DuplicateAgentName(String),
 
+    #[error("Team agent runtime is not ready for conversation: {conversation_id}")]
+    RuntimeNotReady { conversation_id: String },
+
     #[error("Workspace path is unavailable: {0}")]
     WorkspacePathUnavailable(String),
 

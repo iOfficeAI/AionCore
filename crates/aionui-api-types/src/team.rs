@@ -537,6 +537,28 @@ pub struct TeamAgentRenamedPayload {
     pub name: String,
 }
 
+/// Runtime attach/warmup status for a team agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamAgentRuntimeStatus {
+    Pending,
+    Ready,
+    Failed,
+}
+
+/// Payload for `team.agentRuntimeStatusChanged` WebSocket event.
+///
+/// Pushed when a team member's runtime attach/warmup lifecycle changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamAgentRuntimeStatusPayload {
+    pub team_id: String,
+    pub slot_id: String,
+    pub conversation_id: String,
+    pub status: TeamAgentRuntimeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Lifecycle phases of the per-team MCP stdio bridge + ACP session.
 ///
 /// Emitted by the MCP supervisor whenever a teammate slot transitions

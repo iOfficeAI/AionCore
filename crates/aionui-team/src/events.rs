@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload,
-    TeamChildTurnPayload, TeamRunPayload, WebSocketMessage,
+    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload,
+    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamRunPayload, WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
 use tracing::debug;
@@ -14,6 +14,7 @@ pub const TEAM_AGENT_STATUS_CHANGED_EVENT: &str = "team.agentStatusChanged";
 pub const TEAM_AGENT_SPAWNED_EVENT: &str = "team.agentSpawned";
 pub const TEAM_AGENT_REMOVED_EVENT: &str = "team.agentRemoved";
 pub const TEAM_AGENT_RENAMED_EVENT: &str = "team.agentRenamed";
+pub const TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT: &str = "team.agentRuntimeStatusChanged";
 pub const TEAM_LIST_CHANGED_EVENT: &str = "team.listChanged";
 pub const TEAM_CREATED_EVENT: &str = "team.created";
 pub const TEAM_REMOVED_EVENT: &str = "team.removed";
@@ -95,6 +96,26 @@ impl TeamEventEmitter {
         self.broadcaster.broadcast(event);
     }
 
+    pub fn broadcast_agent_runtime_status(
+        &self,
+        agent: &TeamAgent,
+        status: TeamAgentRuntimeStatus,
+        error: Option<String>,
+    ) {
+        let payload = TeamAgentRuntimeStatusPayload {
+            team_id: self.team_id.clone(),
+            slot_id: agent.slot_id.clone(),
+            conversation_id: agent.conversation_id.clone(),
+            status,
+            error,
+        };
+        let event = WebSocketMessage::new(
+            TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT,
+            serde_json::to_value(payload).expect("serialize agent runtime status payload"),
+        );
+        self.broadcaster.broadcast(event);
+    }
+
     pub fn broadcast_team_run(&self, event_name: &'static str, payload: TeamRunPayload) {
         debug!(
             event_name = event_name,
@@ -141,7 +162,8 @@ mod tests {
     use super::*;
     use crate::types::TeammateRole;
     use aionui_api_types::{
-        TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload,
+        TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload,
+        TeamAgentStatusPayload,
     };
 
     struct RecordingBroadcaster {
@@ -213,6 +235,36 @@ mod tests {
         assert_eq!(payload.assistant.slot_id, "slot-2");
         assert_eq!(payload.assistant.name, "Worker");
         assert_eq!(payload.assistant.role, "teammate");
+    }
+
+    #[test]
+    fn agent_runtime_status_event_has_correct_shape() {
+        let (emitter, bc) = make_emitter();
+        let agent = TeamAgent {
+            slot_id: "slot-runtime".into(),
+            name: "Worker".into(),
+            role: TeammateRole::Teammate,
+            conversation_id: "conv-runtime".into(),
+            backend: "acp".into(),
+            model: "claude".into(),
+            assistant_id: None,
+            status: Some(TeammateStatus::Idle),
+            conversation_type: None,
+            cli_path: None,
+        };
+
+        emitter.broadcast_agent_runtime_status(&agent, TeamAgentRuntimeStatus::Ready, None);
+
+        let events = bc.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "team.agentRuntimeStatusChanged");
+
+        let payload: TeamAgentRuntimeStatusPayload = serde_json::from_value(events[0].data.clone()).unwrap();
+        assert_eq!(payload.team_id, "team-1");
+        assert_eq!(payload.slot_id, "slot-runtime");
+        assert_eq!(payload.conversation_id, "conv-runtime");
+        assert_eq!(payload.status, TeamAgentRuntimeStatus::Ready);
+        assert_eq!(payload.error, None);
     }
 
     #[test]
