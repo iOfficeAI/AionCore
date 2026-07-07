@@ -753,6 +753,46 @@ impl ClaudeSessionBackend {
     /// Callers that don't care discard it with `let _ =`. The id is returned whether
     /// the frame was written immediately or queued (claude echoes it verbatim in the
     /// control_response either way, after the queue drains).
+    /// Whether `value` is an effort level the CURRENT model advertises
+    /// (`supportedEffortLevels` → `reasoning_efforts`). The ACP `is_*_valid` semantic
+    /// ported to effort: an EMPTY / not-yet-discovered catalog is permissive (the
+    /// initialize control_response has not landed, or the model advertises no efforts —
+    /// we cannot invalidate against an absent catalog). Only a NON-empty catalog that
+    /// omits `value` returns false. Resolves the current model from the discovery
+    /// catalog (matching `capabilities()` current_model precedence: config snapshot
+    /// first, then the system/init discovered model), falling back to the sole model or
+    /// the union of all advertised efforts when the current model is ambiguous.
+    fn effort_is_supported(&self, value: &str) -> bool {
+        let discovered = self.discovered_caps.lock().unwrap_or_else(|e| e.into_inner());
+        if discovered.models.is_empty() {
+            // Catalog not yet discovered → cannot validate → permissive.
+            return true;
+        }
+        // Resolve the current model id the same way `capabilities()` does.
+        let current = self
+            .capabilities
+            .current_model
+            .clone()
+            .or_else(|| self.discovered_model.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        // Efforts of the current model if we can pin it; otherwise the union across all
+        // advertised models (don't reject a level some selectable model supports when
+        // the current model is unknown).
+        let efforts: Vec<&str> = match current
+            .as_deref()
+            .and_then(|id| discovered.models.iter().find(|m| m.id == id))
+        {
+            Some(model) => model.reasoning_efforts.iter().map(String::as_str).collect(),
+            None => discovered
+                .models
+                .iter()
+                .flat_map(|m| m.reasoning_efforts.iter().map(String::as_str))
+                .collect(),
+        };
+        // A model (or the union) with no advertised efforts → permissive (absent
+        // catalog can't invalidate, same as ACP empty-catalog semantics).
+        efforts.is_empty() || efforts.contains(&value)
+    }
+
     async fn write_or_queue_control(&self, request: serde_json::Value) -> Result<String, BackendError> {
         use std::sync::atomic::Ordering;
         let request_id = format!("ctl-{}", self.control_seq.fetch_add(1, Ordering::SeqCst) + 1);
@@ -2187,6 +2227,20 @@ impl SessionBackend for ClaudeSessionBackend {
             // (get_settings). Any other option_id rejects (cap=false ↔ reject).
             Command::SetConfigOption { option_id, value } => match option_id.as_str() {
                 "effort" | "reasoning_effort" | "thought_level" => {
+                    // Validate against the current model's advertised effort catalog
+                    // (`supportedEffortLevels` → `reasoning_efforts`) BEFORE sending —
+                    // the ACP `clear_invalid_desired_*` semantic ported to effort. An
+                    // unsupported level (e.g. a stale picker "max" against a model that
+                    // only offers low/medium/high) would be rejected by claude next turn
+                    // AND poison the optimistic `current_effort` we store below. Empty /
+                    // unknown catalog → permissive (matches ACP `is_*_valid`: absent
+                    // catalog can't invalidate). REJECT (not silent-drop): the caller
+                    // asked for a level the model can't honor.
+                    if !self.effort_is_supported(&value) {
+                        return Err(BackendError::Transport(format!(
+                            "effort level '{value}' is not supported by the current model"
+                        )));
+                    }
                     let request_id = self
                         .write_or_queue_control(serde_json::json!({
                             "subtype": "apply_flag_settings",
@@ -3789,6 +3843,72 @@ mod tests {
             .await
             .expect_err("unknown config option → CommandNotSupported");
         assert!(matches!(err, BackendError::CommandNotSupported { command } if command == "set_config_option"));
+    }
+
+    /// #1 effort catalog validation (ACP `clear_invalid_desired_*` ported to effort).
+    /// Once the initialize control_response has advertised a model with a bounded
+    /// `supportedEffortLevels` set, a `SetConfigOption{effort}` for a level OUTSIDE that
+    /// set is REJECTED (BadRequest-style Transport error) instead of being written and
+    /// poisoning `current_effort` — while a level INSIDE the set still applies. Before
+    /// the catalog lands (empty), any level is permissive (matches the empty-catalog
+    /// semantics of ACP `is_*_valid`, covered by the test above).
+    #[tokio::test]
+    async fn set_config_option_effort_validates_against_model_catalog() {
+        // Catalog: one model advertising only low/medium/high (NO "max").
+        let init_resp = r#"{"type":"control_response","response":{"subtype":"success","request_id":"ctl-1","response":{"models":[{"value":"default","displayName":"Default","supportedEffortLevels":["low","medium","high"]}]}}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{init_resp}\n").into_bytes());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+        let _events = backend.events();
+        // Wait for the catalog to land.
+        for _ in 0..40 {
+            if !backend.capabilities().available_models.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // An UNSUPPORTED level ("max") is rejected — no wire, no current_effort poison.
+        let err = backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "effort".into(),
+                value: "max".into(),
+            })
+            .await
+            .expect_err("effort not in the model's catalog → rejected");
+        assert!(
+            matches!(err, BackendError::Transport(msg) if msg.contains("not supported")),
+            "unsupported effort must be rejected as an error"
+        );
+        assert!(
+            backend.capabilities().current_effort.is_none(),
+            "a rejected effort must NOT poison current_effort"
+        );
+
+        // A SUPPORTED level ("high") still applies.
+        backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "effort".into(),
+                value: "high".into(),
+            })
+            .await
+            .expect("a catalog-valid effort is accepted");
+        let written = {
+            let mut s = String::new();
+            for _ in 0..40 {
+                s = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+                if s.contains("apply_flag_settings") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            s
+        };
+        assert!(
+            written.contains(r#""effortLevel":"high""#),
+            "a valid effort reaches the wire, got: {written}"
+        );
+        assert_eq!(backend.capabilities().current_effort.as_deref(), Some("high"));
     }
 
     /// Mode read/advertise parity: claude advertises its FIXED 4 permission modes in

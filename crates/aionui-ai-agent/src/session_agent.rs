@@ -42,6 +42,14 @@ const PERM_ALLOW: &str = "allow";
 const PERM_ALLOW_ALWAYS: &str = "allow_always";
 const PERM_REJECT: &str = "reject";
 
+/// The `config_selections` key under which a claude session's chosen reasoning-effort
+/// level is persisted. claude emits NO `ConfigChanged` for effort (only mode/model), so
+/// `set_config_option` persists it here directly and `build_session_instance` re-applies
+/// it after open (there is no spawn-time effort flag; it rides a post-open
+/// control_request). The three accepted incoming option ids (`effort`/`reasoning_effort`/
+/// `thought_level`) all normalize to this one storage key.
+const EFFORT_CONFIG_KEY: &str = "effort";
+
 /// Shared, cheaply-cloneable runtime state for a session task: the broadcast sender
 /// the translator writes and `subscribe()` reads, plus liveness bookkeeping.
 struct SessionRuntime {
@@ -109,6 +117,13 @@ pub struct SessionAgentTask {
     workspace: String,
     backend: Arc<dyn SessionBackend>,
     runtime: Arc<SessionRuntime>,
+    /// The `acp_session` persistence sink, retained so `set_config_option` can persist
+    /// the chosen EFFORT level into `config_selections` — claude does NOT emit a
+    /// `ConfigChanged` for effort (only for mode/model), so the event-pump's
+    /// `persist_side_effects` never sees it. Without this write, effort would be lost
+    /// across a respawn/resume (unlike mode/model, which persist via ConfigChanged).
+    /// `None` (tests) = no persistence. Shared with the pump (same Arc).
+    session_repo: Option<Arc<dyn IAcpSessionRepository>>,
     /// Command-id counter for `CommandMeta` (dispatch correlation).
     command_seq: AtomicI64,
 }
@@ -144,13 +159,14 @@ impl SessionAgentTask {
         // stream to the pump — never a backend Arc (see `spawn_event_pump` for why
         // capturing a backend Arc there would leak the child process).
         let events = backend.events();
-        spawn_event_pump(events, runtime.clone(), conversation_id.clone(), session_repo);
+        spawn_event_pump(events, runtime.clone(), conversation_id.clone(), session_repo.clone());
         Arc::new(Self {
             agent_type,
             conversation_id,
             workspace,
             backend,
             runtime,
+            session_repo,
             command_seq: AtomicI64::new(0),
         })
     }
@@ -218,6 +234,7 @@ impl SessionAgentTask {
     ///   - anything else   → an AskUserQuestion answer LABEL → Approved + `selected`
     ///     (claude keys the AskUserQuestion answer by the chosen label — see
     ///     claude_conn `build_control_response`; single-select single-question path).
+    ///
     /// `always_allow` (legacy flag) forces AllowAlways regardless.
     pub fn confirm(
         &self,
@@ -355,6 +372,41 @@ impl SessionAgentTask {
         option_id: &str,
         value: &str,
     ) -> Result<aionui_api_types::SetConfigOptionResponse, AgentError> {
+        // Validate a runtime mode/model switch against the advertised catalog BEFORE
+        // dispatch — the ACP `clear_invalid_desired_*` semantic, but as REJECT+report
+        // (not silent-drop) since this is an explicit user action at the single runtime
+        // chokepoint. An EMPTY / not-yet-discovered catalog is permissive (matches ACP
+        // `is_mode_valid`/`is_model_valid`: an absent catalog cannot invalidate — the
+        // capabilities snapshot may simply not have the list yet). Only a NON-empty
+        // catalog that omits `value` rejects. Other option ids (effort/thought_level)
+        // are validated by the backend itself (claude effort catalog check).
+        let caps = self.backend.capabilities();
+        // A NON-empty catalog that omits `value` is the only rejection case (empty
+        // catalog = permissive, per the comment above). `known` = catalog carries value.
+        let invalid = |catalog_has_value: bool, catalog_empty: bool| !catalog_empty && !catalog_has_value;
+        match option_id {
+            "mode"
+                if invalid(
+                    caps.available_modes.iter().any(|m| m.id == value),
+                    caps.available_modes.is_empty(),
+                ) =>
+            {
+                return Err(AgentError::bad_request(format!(
+                    "mode '{value}' is not one of the available modes"
+                )));
+            }
+            "model"
+                if invalid(
+                    caps.available_models.iter().any(|m| m.id == value),
+                    caps.available_models.is_empty(),
+                ) =>
+            {
+                return Err(AgentError::bad_request(format!(
+                    "model '{value}' is not one of the available models"
+                )));
+            }
+            _ => {}
+        }
         let cmd = match option_id {
             "mode" => Command::SetMode {
                 mode: value.to_string(),
@@ -385,6 +437,19 @@ impl SessionAgentTask {
         match option_id {
             "mode" => self.runtime.set_mode_override(value.to_string()),
             "model" => self.runtime.set_model_override(value.to_string()),
+            "effort" | "reasoning_effort" | "thought_level" => {
+                // Persist the chosen effort into `config_selections` so it survives a
+                // respawn/resume. Unlike mode/model (persisted by the pump on
+                // ConfigChanged), claude emits no ConfigChanged for effort, so this is
+                // the ONLY place the choice is durably recorded. Backend already accepted
+                // + validated it (dispatch above); best-effort persist (a DB failure must
+                // not fail the switch the CLI already applied).
+                self.persist_effort(value).await;
+                return Ok(aionui_api_types::SetConfigOptionResponse {
+                    confirmation: aionui_api_types::ConfigOptionConfirmation::CommandAck,
+                    config_options: None,
+                });
+            }
             _ => {
                 return Ok(aionui_api_types::SetConfigOptionResponse {
                     confirmation: aionui_api_types::ConfigOptionConfirmation::CommandAck,
@@ -407,6 +472,49 @@ impl SessionAgentTask {
             },
             config_options: Some(snapshot.config_options),
         })
+    }
+
+    /// Persist the chosen effort level into `acp_session.config_selections` (under
+    /// [`EFFORT_CONFIG_KEY`]) so it survives a respawn/resume. Reads the existing
+    /// selections first and MERGES (rather than overwriting the whole map) so any other
+    /// future config key is preserved. Best-effort: a repo miss/failure is logged, not
+    /// propagated — the backend already applied the effort, and losing only the
+    /// persistence (not the live switch) is the safe degradation. No-op without a repo.
+    async fn persist_effort(&self, value: &str) {
+        let Some(repo) = self.session_repo.as_ref() else {
+            return;
+        };
+        // Merge into the existing selection map (preserve unrelated keys).
+        let mut selections: std::collections::HashMap<String, String> = match repo
+            .load_runtime_state(&self.conversation_id)
+            .await
+        {
+            Ok(Some(state)) => state
+                .config_selections_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default(),
+            Ok(None) => std::collections::HashMap::new(),
+            Err(err) => {
+                tracing::warn!(conversation_id = %self.conversation_id, error = %err, "persist_effort: load_runtime_state failed; skipping effort persist");
+                return;
+            }
+        };
+        selections.insert(EFFORT_CONFIG_KEY.to_owned(), value.to_owned());
+        let json = match serde_json::to_string(&selections) {
+            Ok(j) => j,
+            Err(err) => {
+                tracing::warn!(conversation_id = %self.conversation_id, error = %err, "persist_effort: encode config_selections failed");
+                return;
+            }
+        };
+        let params = SaveRuntimeStateParams {
+            config_selections_json: Some(Some(&json)),
+            ..Default::default()
+        };
+        if let Err(err) = repo.save_runtime_state(&self.conversation_id, &params).await {
+            tracing::warn!(conversation_id = %self.conversation_id, error = %err, "persist_effort: save_runtime_state failed");
+        }
     }
 
     /// Session usage snapshot. Not tracked on the capabilities snapshot yet;
@@ -743,10 +851,47 @@ pub async fn build_session_instance(
         }
     }
 
+    // #4 — the persisted reasoning-effort level (claude only). There is no spawn-time
+    // effort flag (effort rides a post-open control_request, NOT `--`args like
+    // model/mode), so it cannot go into `SessionConfig`; instead we re-apply it AFTER
+    // open. codex effort is not a standalone selection (it rides collaborationMode via
+    // SetMode), so this is claude-scoped. Read from the snapshot's config_selections
+    // (the map `set_config_option` persisted under EFFORT_CONFIG_KEY).
+    let persisted_effort = (backend_label == "claude")
+        .then(|| {
+            session_snapshot.and_then(|s| {
+                s.config_selections
+                    .iter()
+                    .find(|(k, _)| k.as_str() == EFFORT_CONFIG_KEY)
+                    .map(|(_, v)| v.as_str().to_owned())
+            })
+        })
+        .flatten()
+        .filter(|s| !s.is_empty());
+
     let backend = connection
         .open_session(spec, session_config)
         .await
         .map_err(|e| AgentError::bad_gateway(format!("open {backend_label} session: {e}")))?;
+
+    // Re-apply the persisted effort now that the session is open. The backend validates
+    // it against the current model's advertised catalog (permissive until the catalog
+    // is discovered) and drops it if unsupported — the same clear_invalid_desired_*
+    // semantics as the codex model/mode reconcile. Best-effort: a dispatch failure must
+    // not fail the open (the session is usable; only the persisted effort is lost).
+    if let Some(effort) = persisted_effort {
+        if let Err(e) = backend
+            .dispatch(Command::SetConfigOption {
+                option_id: EFFORT_CONFIG_KEY.to_owned(),
+                value: effort.clone(),
+            })
+            .await
+        {
+            tracing::warn!(conv_id = %conversation_id, effort = %effort, error = %e, "session-port: re-applying persisted effort failed (session usable, effort not restored)");
+        } else {
+            tracing::info!(conv_id = %conversation_id, effort = %effort, "session-port: re-applied persisted reasoning effort after open");
+        }
+    }
 
     // GAP #7 (G5): project the backend's discovered catalog back into agent_metadata
     // so the cold-start picker stays fresh. Best-effort, detached, off the open path.
@@ -2274,6 +2419,49 @@ mod persist_tests {
         assert_eq!(state.current_model_id.as_deref(), Some("claude-opus-4-8"));
     }
 
+    // #4: a `set_config_option("effort", ...)` must persist the level into
+    // config_selections — claude emits NO ConfigChanged for effort, so unless
+    // set_config_option writes it directly, effort is lost across respawn/resume.
+    // This drives the real chokepoint (a task built around a NoStreamBackend + the
+    // seeded repo) and asserts the level lands in the persisted config_selections.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_config_option_effort_persists_into_config_selections() {
+        use super::pump_tests::StaticCapsBackend;
+        let (repo, _db) = seeded_repo().await;
+        let backend: Arc<dyn SessionBackend> = Arc::new(StaticCapsBackend);
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            Some(repo.clone()),
+        );
+
+        let resp = task.set_config_option("effort", "high").await.unwrap();
+        assert!(
+            matches!(
+                resp.confirmation,
+                aionui_api_types::ConfigOptionConfirmation::CommandAck
+            ),
+            "effort reports CommandAck (no picker current_value to observe)"
+        );
+
+        // Persisted under the effort key so build_session_instance can re-apply it.
+        let state = repo.load_runtime_state("conv-1").await.unwrap().expect("runtime state");
+        let selections: std::collections::HashMap<String, String> = serde_json::from_str(
+            state
+                .config_selections_json
+                .as_deref()
+                .expect("config_selections persisted"),
+        )
+        .unwrap();
+        assert_eq!(
+            selections.get(EFFORT_CONFIG_KEY).map(String::as_str),
+            Some("high"),
+            "the chosen effort must be persisted into config_selections"
+        );
+    }
+
     // ── Defect 2: dead-resume-anchor self-heal ────────────────────────────
     // A turn that fails *because* the stored backend session no longer resolves must
     // NULL that anchor, or every subsequent send re-resumes the same dead id and the
@@ -2781,7 +2969,7 @@ mod pump_tests {
     /// changes — models the claude constraint that an in-band switch is NOT reflected
     /// in capabilities(). Proves set_config_option's optimistic override makes the
     /// response satisfy the frontend's Observed contract regardless.
-    struct StaticCapsBackend;
+    pub(super) struct StaticCapsBackend;
 
     #[async_trait::async_trait]
     impl SessionBackend for StaticCapsBackend {
@@ -2870,6 +3058,39 @@ mod pump_tests {
         // And get_model reflects the override too (picker highlight follows).
         let m = task.get_model().await.unwrap().model_info.expect("model_info");
         assert_eq!(m.current_model_id.as_deref(), Some("sonnet"));
+    }
+
+    // #3: a runtime switch to a value NOT in the advertised catalog is REJECTED
+    // (bad_request), not silently dropped and not dispatched — the user's chosen
+    // reject-and-report behavior. Non-empty catalog that omits the value → reject.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_config_option_rejects_invalid_mode_and_model() {
+        let backend: Arc<dyn SessionBackend> = Arc::new(StaticCapsBackend);
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+
+        let mode_err = task
+            .set_config_option("mode", "no-such-mode")
+            .await
+            .expect_err("a mode outside the catalog must be rejected");
+        assert!(
+            matches!(mode_err, AgentError::BadRequest(_)),
+            "invalid mode → BadRequest, got {mode_err:?}"
+        );
+
+        let model_err = task
+            .set_config_option("model", "no-such-model")
+            .await
+            .expect_err("a model outside the catalog must be rejected");
+        assert!(
+            matches!(model_err, AgentError::BadRequest(_)),
+            "invalid model → BadRequest, got {model_err:?}"
+        );
+
+        // The optimistic overrides must NOT have moved (nothing was dispatched).
+        assert!(
+            task.runtime.mode_override().is_none() && task.runtime.model_override().is_none(),
+            "a rejected switch must not set an optimistic override"
+        );
     }
 
     // codex ToolOutputDelta (streamed command stdout) must surface as tool_call

@@ -97,7 +97,7 @@ impl BackendConnection for CodexConnection {
         // Seed the current model (M1): codex's collaborationMode for SetMode
         // requires settings.model, so the backend must track it from the start.
         // OPTIMISTIC seed: the model is not actually bound at thread/start anymore
-        // (codex-model-gating). `spawn_codex_model_reconcile` clears this back to None
+        // (codex-model-gating). `reconcile_codex_model` clears this back to None
         // if the requested model turns out NOT to be in the discovered catalog, so a
         // later SetMode never builds a collaborationMode around a model codex rejects.
         if let Some(model) = &config.model {
@@ -118,7 +118,7 @@ impl BackendConnection for CodexConnection {
         // aion-probe transcripts in protocols/verification fixtures):
         //   initialize{clientInfo} → thread/start{approvalPolicy,sandbox,cwd}
         //   (Fresh; NO model — applied later via a validated SetModel, see
-        //   spawn_codex_model_reconcile) | thread/resume{threadId}. The threadId comes back BOTH in the
+        //   reconcile_codex_model) | thread/resume{threadId}. The threadId comes back BOTH in the
         // thread/* RESULT and the `thread/started` NOTIFICATION; the reader binds it
         // from the latter (two-id, §4.1). For Resume we already hold it, so
         // run_handshake pre-seeds the binding so the first `turn/start` has a
@@ -133,17 +133,18 @@ impl BackendConnection for CodexConnection {
 
         // codex-model-gating: `thread/start` intentionally did NOT bind `config.model`
         // (see `thread_start_params`) — the thread launched on codex's own default
-        // model. Now apply the requested model the ACP way: wait for `model/list` to
-        // fill the catalog, then dispatch a VALIDATED `SetModel` (dropped if the model
-        // is not in the catalog, so a stale picker default never poisons every turn).
-        // Detached + off the open hot path; a Fresh session with a requested model is
-        // the only case that does any work (Resume keeps codex's bound model; no
-        // requested model → nothing to reconcile).
-        if matches!(spec, SessionSpec::Fresh { .. })
-            && let Some(model) = config.model.clone()
-        {
+        // model. Now apply the requested model+mode the ACP way: wait for `model/list` /
+        // `collaborationMode/list` to fill the catalogs, then dispatch VALIDATED
+        // `SetModel`/`SetMode` (each dropped if not in its catalog, so a stale picker
+        // default never poisons every turn). Detached + off the open hot path; only a
+        // Fresh session with a requested model and/or mode does any work (Resume keeps
+        // codex's bound model+mode; no requested config → nothing to reconcile). The two
+        // are SEQUENCED (model first): SetMode's collaborationMode requires a known
+        // current_model, so the mode reconcile runs only after the model reconcile has
+        // settled current_model.
+        if matches!(spec, SessionSpec::Fresh { .. }) && (config.model.is_some() || config.mode.is_some()) {
             let backend = Arc::new(backend);
-            spawn_codex_model_reconcile(backend.clone(), model);
+            spawn_codex_reconcile(backend.clone(), config.model.clone(), config.mode.clone());
             return Ok(backend);
         }
 
@@ -166,78 +167,143 @@ impl BackendConnection for CodexConnection {
     }
 }
 
-/// How long the post-handshake model reconcile waits for `model/list` to fill the
+/// How long a post-handshake reconcile waits for a `*/list` response to fill its
 /// catalog before giving up. 100 × 50ms = 5s — the same bound `spawn_catalog_writeback`
 /// uses to wait for models (codex answers modes before models). If the catalog never
-/// arrives we do NOT apply the requested model (we cannot validate it), leaving the
-/// thread on codex's launch default rather than risk binding a bad model.
-const CODEX_MODEL_RECONCILE_POLLS: u32 = 100;
+/// arrives we do NOT apply the requested value (we cannot validate it), leaving the
+/// thread on codex's launch default rather than risk binding a bad model/mode.
+const CODEX_RECONCILE_POLLS: u32 = 100;
 
-/// codex-model-gating self-heal (the ACP `clear_invalid_desired_model` +
-/// `reconcile_session` port). `thread/start` launched the thread on codex's OWN
-/// default model (it deliberately did not embed `config.model`). This detached task
-/// waits for `model/list` to fill the discovered catalog, then:
-///   - if `requested` IS in the catalog → dispatch a `SetModel` so the thread uses it
-///     (the validated apply; success converges via `thread/settings/updated`);
-///   - if `requested` is NOT in the catalog → DROP it (WARN) and clear the optimistic
-///     open-time `current_model` seed, so a stale frontend default (e.g. `gpt-5.5`
-///     the local codex lacks) never binds and poisons every turn with an opaque
-///     UNKNOWN_UPSTREAM_ERROR. This is the exact ACP contract (`session/new` carried
-///     no model; the model was applied only after being validated against the
-///     session/new catalog), adapted to codex's `model/list`-after-`thread/start`
-///     ordering.
-fn spawn_codex_model_reconcile(backend: Arc<CodexSessionBackend>, requested: String) {
+/// codex-model/mode-gating self-heal (the ACP `clear_invalid_desired_*` +
+/// `reconcile_session` port). `thread/start` launched the thread on codex's OWN default
+/// model+mode (it deliberately did not embed `config.model`, and codex has no
+/// `thread/start` mode param at all). This detached task applies the requested model
+/// then mode, each validated against its discovered catalog. The two are SEQUENCED —
+/// model MUST settle first because `SetMode` builds a `collaborationMode` around the
+/// tracked `current_model`; running them concurrently could fire `SetMode` while
+/// `current_model` is still the (possibly-invalid) optimistic seed or already cleared.
+fn spawn_codex_reconcile(backend: Arc<CodexSessionBackend>, model: Option<String>, mode: Option<String>) {
     tokio::spawn(async move {
-        // Wait for the catalog (model/list response → `discovered.models`). The reader
-        // fills it asynchronously after `run_handshake` fired the request.
-        let mut catalog: Vec<String> = Vec::new();
-        for _ in 0..CODEX_MODEL_RECONCILE_POLLS {
-            {
-                let disc = backend.discovered.lock().unwrap_or_else(|e| e.into_inner());
-                if !disc.models.is_empty() {
-                    catalog = disc.models.iter().map(|m| m.id.clone()).collect();
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Some(model) = model {
+            reconcile_codex_model(&backend, model).await;
         }
-
-        if catalog.is_empty() {
-            // Never learned the catalog → cannot validate. Leave codex on its launch
-            // default (the safe choice) rather than bind a possibly-invalid model.
-            tracing::warn!(
-                requested_model = %requested,
-                "codex model reconcile: model/list never populated; leaving thread on codex default \
-                 (requested model NOT applied — cannot validate)"
-            );
-            return;
-        }
-
-        if !catalog.contains(&requested) {
-            // DROP the invalid desire (ACP `clear_invalid_desired_model`). Clear the
-            // optimistic open-time seed so SetMode can't later build a collaborationMode
-            // around a model codex rejected, and the UI intent doesn't outlive reality.
-            tracing::warn!(
-                requested_model = %requested,
-                catalog = ?catalog,
-                "codex model reconcile: requested model not in catalog; dropping it \
-                 (thread stays on codex default)"
-            );
-            *backend.current_model.lock().await = None;
-            return;
-        }
-
-        // Valid → apply via the normal SetModel wire (validated apply). Success
-        // converges to the UI via the `thread/settings/updated` → ConfigChanged notif;
-        // a rejection surfaces as a Notice{Warning} (pending_set path).
-        tracing::info!(
-            model = %requested,
-            "codex model reconcile: applying requested model (validated against catalog)"
-        );
-        if let Err(e) = backend.dispatch(Command::SetModel { model: requested }).await {
-            tracing::error!(error = %e, "codex model reconcile: SetModel dispatch failed");
+        if let Some(mode) = mode {
+            reconcile_codex_mode(&backend, mode).await;
         }
     });
+}
+
+/// Wait for a codex `*/list` catalog to populate `discovered`, returning the id list.
+/// Empty vec = never populated within the poll bound (cannot validate).
+async fn await_codex_catalog(
+    backend: &CodexSessionBackend,
+    extract: impl Fn(&Discovered) -> Vec<String>,
+) -> Vec<String> {
+    for _ in 0..CODEX_RECONCILE_POLLS {
+        {
+            let disc = backend.discovered.lock().unwrap_or_else(|e| e.into_inner());
+            let ids = extract(&disc);
+            if !ids.is_empty() {
+                return ids;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Vec::new()
+}
+
+/// Apply `requested` model the ACP way: wait for `model/list` to fill the catalog, then
+///   - if `requested` IS in the catalog → dispatch a `SetModel` (validated apply;
+///     success converges via `thread/settings/updated`);
+///   - if `requested` is NOT in the catalog → DROP it (WARN) and clear the optimistic
+///     open-time `current_model` seed, so a stale frontend default (e.g. `gpt-5.5` the
+///     local codex lacks) never binds and poisons every turn with an opaque
+///     UNKNOWN_UPSTREAM_ERROR. Exact ACP contract (`session/new` carried no model; the
+///     model was applied only after `clear_invalid_desired_model` validated it against
+///     the session/new catalog), adapted to codex's `model/list`-after-`thread/start`
+///     ordering.
+async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String) {
+    let catalog = await_codex_catalog(backend, |d| d.models.iter().map(|m| m.id.clone()).collect()).await;
+
+    if catalog.is_empty() {
+        // Never learned the catalog → cannot validate. Leave codex on its launch
+        // default (the safe choice) rather than bind a possibly-invalid model.
+        tracing::warn!(
+            requested_model = %requested,
+            "codex model reconcile: model/list never populated; leaving thread on codex default \
+             (requested model NOT applied — cannot validate)"
+        );
+        return;
+    }
+
+    if !catalog.contains(&requested) {
+        // DROP the invalid desire (ACP `clear_invalid_desired_model`). Clear the
+        // optimistic open-time seed so SetMode can't later build a collaborationMode
+        // around a model codex rejected, and the UI intent doesn't outlive reality.
+        tracing::warn!(
+            requested_model = %requested,
+            catalog = ?catalog,
+            "codex model reconcile: requested model not in catalog; dropping it \
+             (thread stays on codex default)"
+        );
+        *backend.current_model.lock().await = None;
+        return;
+    }
+
+    // Valid → apply via the normal SetModel wire (validated apply). Success converges to
+    // the UI via the `thread/settings/updated` → ConfigChanged notif; a rejection
+    // surfaces as a Notice{Warning} (pending_set path).
+    tracing::info!(
+        model = %requested,
+        "codex model reconcile: applying requested model (validated against catalog)"
+    );
+    if let Err(e) = backend.dispatch(Command::SetModel { model: requested }).await {
+        tracing::error!(error = %e, "codex model reconcile: SetModel dispatch failed");
+    }
+}
+
+/// Apply `requested` mode the ACP way, symmetric to [`reconcile_codex_model`]. codex has
+/// NO `thread/start` mode param — a thread always launches on codex's default
+/// collaborationMode — so `config.mode` was never applied at open before this (unlike
+/// claude, which passes `--permission-mode` at spawn). This closes that gap AND
+/// validates: wait for `collaborationMode/list` to fill the catalog, then apply a
+/// `SetMode` if `requested` IS in the catalog (validated apply), or DROP it (WARN,
+/// leaving codex's default) if it is NOT. Empty/never-populated catalog → do NOT apply
+/// (cannot validate). Runs only after [`reconcile_codex_model`] so `SetMode` can build
+/// its `collaborationMode` around a settled `current_model` (SetMode rejects outright
+/// without a known model).
+async fn reconcile_codex_mode(backend: &CodexSessionBackend, requested: String) {
+    let catalog = await_codex_catalog(backend, |d| d.modes.iter().map(|m| m.id.clone()).collect()).await;
+
+    if catalog.is_empty() {
+        tracing::warn!(
+            requested_mode = %requested,
+            "codex mode reconcile: collaborationMode/list never populated; leaving thread on codex default \
+             (requested mode NOT applied — cannot validate)"
+        );
+        return;
+    }
+
+    if !catalog.contains(&requested) {
+        tracing::warn!(
+            requested_mode = %requested,
+            catalog = ?catalog,
+            "codex mode reconcile: requested mode not in catalog; dropping it \
+             (thread stays on codex default)"
+        );
+        return;
+    }
+
+    tracing::info!(
+        mode = %requested,
+        "codex mode reconcile: applying requested mode (validated against catalog)"
+    );
+    if let Err(e) = backend.dispatch(Command::SetMode { mode: requested }).await {
+        // SetMode with no known current_model rejects here (Transport error). That is
+        // expected when the model reconcile dropped an invalid model: no model → no
+        // valid collaborationMode → mode simply stays on codex's default. WARN, not ERROR.
+        tracing::warn!(error = %e, "codex mode reconcile: SetMode dispatch failed (likely no current_model); mode not applied");
+    }
 }
 
 /// A pure params object that knows how to wrap itself in a JSON-RPC request frame.
@@ -4987,7 +5053,7 @@ mod tests {
     /// codex enum values. MODEL IS NEVER EMBEDDED (codex-model-gating regression fix):
     /// the model binds the whole thread and cannot be validated at this instant
     /// (model/list comes AFTER thread/start), so a requested model is applied later
-    /// via a validated `SetModel` (`spawn_codex_model_reconcile`), never here.
+    /// via a validated `SetModel` (`reconcile_codex_model`), never here.
     #[test]
     fn thread_start_frame_threads_cwd_and_never_model() {
         let frame = thread_start_params(&SessionConfig {
@@ -5251,7 +5317,7 @@ mod tests {
 
     /// Build a backend whose reader has already learned a two-model catalog
     /// (`openai.gpt-5.5`, `openai.gpt-5.4`) AND bound a thread — the state
-    /// `spawn_codex_model_reconcile` runs against. Returns (Arc<backend>, captured
+    /// `reconcile_codex_model` runs against. Returns (Arc<backend>, captured
     /// stdin) so a test can drive the reconcile and inspect the frames it writes.
     async fn backend_with_catalog_and_binding() -> (Arc<CodexSessionBackend>, Arc<tokio::sync::Mutex<Vec<u8>>>) {
         let started = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-rec"}}}"#;
@@ -5286,7 +5352,7 @@ mod tests {
     #[tokio::test]
     async fn codex_model_reconcile_applies_valid_model() {
         let (backend, captured) = backend_with_catalog_and_binding().await;
-        spawn_codex_model_reconcile(backend.clone(), "openai.gpt-5.4".into());
+        reconcile_codex_model(&backend, "openai.gpt-5.4".into()).await;
         let written = captured_str(&captured).await;
         assert!(
             written.contains(r#""method":"thread/settings/update""#),
@@ -5309,19 +5375,10 @@ mod tests {
         let (backend, captured) = backend_with_catalog_and_binding().await;
         // Optimistic open-time seed (open_session sets this from config.model).
         *backend.current_model.lock().await = Some("gpt-5.5-that-local-codex-lacks".into());
-        // Run the reconcile inline (await the spawned task's effect by polling).
-        spawn_codex_model_reconcile(backend.clone(), "gpt-5.5-that-local-codex-lacks".into());
-        // Give the detached task time to observe the catalog + drop the seed.
-        let mut cleared = false;
-        for _ in 0..40 {
-            if backend.current_model.lock().await.is_none() {
-                cleared = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        // Run the reconcile inline (awaited directly — no detached task).
+        reconcile_codex_model(&backend, "gpt-5.5-that-local-codex-lacks".into()).await;
         assert!(
-            cleared,
+            backend.current_model.lock().await.is_none(),
             "an invalid requested model must clear the optimistic current_model seed"
         );
         let written = captured_str_allow_empty(&captured).await;
@@ -5337,6 +5394,74 @@ mod tests {
     async fn captured_str_allow_empty(captured: &Arc<tokio::sync::Mutex<Vec<u8>>>) -> String {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         String::from_utf8_lossy(&captured.lock().await.clone()).to_string()
+    }
+
+    // ===== codex-mode-gating: post-handshake validated mode reconcile =====
+
+    /// Build a backend whose reader has already learned a two-mode catalog
+    /// (`default`, `plan`) AND bound a thread — the state `reconcile_codex_mode` runs
+    /// against. Returns (Arc<backend>, captured stdin). The caller seeds `current_model`
+    /// (SetMode needs it to build a collaborationMode).
+    async fn backend_with_mode_catalog_and_binding() -> (Arc<CodexSessionBackend>, Arc<tokio::sync::Mutex<Vec<u8>>>) {
+        let started = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-mode"}}}"#;
+        let mode_resp = r#"{"jsonrpc":"2.0","id":60,"result":{"data":[{"mode":"default","name":"Default"},{"mode":"plan","name":"Plan"}],"nextCursor":null}}"#;
+        let bytes = format!("{started}\n{mode_resp}\n").into_bytes();
+        let fake = FakeAgentIo::never_exits(bytes);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-mode-rec", Box::new(fake)).await;
+        backend.pending_discovery.lock().await.insert(60, DiscoveryKind::Modes);
+        let _events = backend.events();
+        for _ in 0..40 {
+            let filled = !backend
+                .discovered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .modes
+                .is_empty();
+            let bound = backend.thread_binding.lock().await.is_some();
+            if filled && bound {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        (Arc::new(backend), captured)
+    }
+
+    /// A requested mode that IS in the discovered catalog is applied via a real
+    /// `thread/settings/update{collaborationMode}` (the validated apply) — the codex
+    /// analogue of ACP's reconcile issuing `set_mode` only for a desire that survived
+    /// `clear_invalid_desired_mode`. codex has NO thread/start mode param, so this is
+    /// ALSO the first time `config.mode` reaches codex at all.
+    #[tokio::test]
+    async fn codex_mode_reconcile_applies_valid_mode() {
+        let (backend, captured) = backend_with_mode_catalog_and_binding().await;
+        // SetMode needs a known current_model to build collaborationMode.settings.
+        *backend.current_model.lock().await = Some("openai.gpt-5.4".into());
+        reconcile_codex_mode(&backend, "plan".into()).await;
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"thread/settings/update""#),
+            "a catalog-valid mode is applied via thread/settings/update, got: {written}"
+        );
+        assert!(
+            written.contains(r#""collaborationMode""#) && written.contains(r#""mode":"plan""#),
+            "carries the requested (valid) mode inside collaborationMode, got: {written}"
+        );
+    }
+
+    /// A requested mode that is NOT in the catalog is DROPPED: no `thread/settings/update`
+    /// is written (the thread stays on codex's default collaborationMode). Port of ACP's
+    /// `clear_invalid_desired_mode`.
+    #[tokio::test]
+    async fn codex_mode_reconcile_drops_invalid_mode() {
+        let (backend, captured) = backend_with_mode_catalog_and_binding().await;
+        *backend.current_model.lock().await = Some("openai.gpt-5.4".into());
+        reconcile_codex_mode(&backend, "mode-local-codex-lacks".into()).await;
+        let written = captured_str_allow_empty(&captured).await;
+        assert!(
+            !written.contains(r#""method":"thread/settings/update""#),
+            "an invalid mode must NOT be applied to codex (no thread/settings/update), got: {written}"
+        );
     }
 
     // ===== O2: thread/turns/list response → CheckpointList event (up-leg) =====
