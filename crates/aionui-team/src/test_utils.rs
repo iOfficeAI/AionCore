@@ -442,6 +442,9 @@ pub(crate) mod workspace_harness {
             if let Some(ref lead_id) = params.lead_agent_id {
                 team.lead_agent_id = Some(lead_id.clone());
             }
+            if let Some(ref session_mode) = params.session_mode {
+                team.session_mode = Some(session_mode.clone());
+            }
             team.updated_at = now_ms();
             Ok(())
         }

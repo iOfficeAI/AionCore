@@ -51,6 +51,7 @@ struct NewAgentProvisioning {
     model: String,
     assistant_id: Option<String>,
     workspace: Option<String>,
+    session_mode: Option<String>,
 }
 
 pub(crate) struct PersistSpawnedAgentRequest {
@@ -186,6 +187,7 @@ impl TeamAgentProvisioner {
                 &leader_input.model,
                 leader_assistant_id.as_deref(),
                 shared_workspace,
+                None,
             )
             .await?;
 
@@ -236,6 +238,7 @@ impl TeamAgentProvisioner {
                     &input.model,
                     assistant_id.as_deref(),
                     Some(&team_workspace),
+                    None,
                 )
                 .await?;
             agents.push(TeamAgent {
@@ -300,6 +303,7 @@ impl TeamAgentProvisioner {
                 model: req.model,
                 assistant_id,
                 workspace: Some(workspace),
+                session_mode: row.session_mode.clone(),
             })
             .await?;
         team.agents.push(agent.clone());
@@ -354,6 +358,7 @@ impl TeamAgentProvisioner {
                 model: req.model,
                 assistant_id: req.assistant_id,
                 workspace: Some(workspace),
+                session_mode: row.session_mode.clone(),
             })
             .await?;
         team.agents.push(agent.clone());
@@ -444,6 +449,7 @@ impl TeamAgentProvisioner {
                 &input.model,
                 input.assistant_id.as_deref(),
                 input.workspace.as_deref(),
+                input.session_mode.as_deref(),
             )
             .await?;
         Ok(TeamAgent {
@@ -472,6 +478,7 @@ impl TeamAgentProvisioner {
         model: &str,
         assistant_id: Option<&str>,
         workspace: Option<&str>,
+        session_mode: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
         let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, backend).await?;
         let agent_type = if acp_metadata.is_some() {
@@ -489,6 +496,7 @@ impl TeamAgentProvisioner {
             workspace,
             agent_type,
             acp_metadata.as_ref(),
+            session_mode,
         );
         let provider_id = if agent_type == AgentType::Aionrs {
             self.resolve_provider_for_model(model)
@@ -590,8 +598,13 @@ impl TeamAgentProvisioner {
         workspace: Option<&str>,
         agent_type: AgentType,
         acp_metadata: Option<&AgentMetadataRow>,
+        session_mode: Option<&str>,
     ) -> serde_json::Value {
-        let session_mode = session_mode_for_backend(backend, agent_type, acp_metadata);
+        let session_mode = session_mode
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| session_mode_for_backend(backend, agent_type, acp_metadata));
         let mut extra = serde_json::json!({
             "teamId": team_id,
             "slot_id": slot_id,

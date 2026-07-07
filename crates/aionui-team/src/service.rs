@@ -1247,6 +1247,15 @@ impl TeamSessionService {
     pub async fn set_session_mode(&self, user_id: &str, team_id: &str, mode: &str) -> Result<(), TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
         let provisioner = self.provisioner();
+        self.repo
+            .update_team(
+                team_id,
+                &UpdateTeamParams {
+                    session_mode: Some(mode.to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         for agent in &team.agents {
             if let Some(instance) = self.task_manager.get_task(&agent.conversation_id)
@@ -1426,6 +1435,7 @@ async fn set_active_agent_session_mode(instance: &AgentInstance, mode: &str) -> 
 #[cfg(test)]
 mod tests {
     use aionui_api_types::AddAgentRequest;
+    use aionui_db::ITeamRepository;
 
     use crate::test_utils::workspace_harness::{
         setup_with_factory_metadata_team_repo_and_conversation_repo,
@@ -1533,6 +1543,45 @@ mod tests {
             .collect();
 
         assert_eq!(statuses, vec!["pending", "ready"]);
+    }
+
+    #[tokio::test]
+    async fn set_session_mode_persists_team_mode_and_new_agents_inherit_it() {
+        let (svc, repo, _task_manager, conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Team Mode Seed"))
+            .await
+            .unwrap();
+
+        svc.set_session_mode("user-test", &created.id, "full_auto")
+            .await
+            .unwrap();
+
+        let row = repo.get_team(&created.id).await.unwrap().expect("team row");
+        assert_eq!(row.session_mode.as_deref(), Some("full_auto"));
+
+        let added = svc
+            .add_agent(
+                "user-test",
+                &created.id,
+                AddAgentRequest {
+                    name: "Worker".to_owned(),
+                    role: "teammate".to_owned(),
+                    backend: Some("acp".to_owned()),
+                    model: "claude".to_owned(),
+                    assistant_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let extra = conv_repo
+            .get_extra(&added.conversation_id)
+            .expect("added conversation extra");
+
+        assert_eq!(
+            extra.get("session_mode").and_then(serde_json::Value::as_str),
+            Some("full_auto")
+        );
     }
 
     #[tokio::test]
