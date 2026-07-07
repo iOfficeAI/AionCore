@@ -8,6 +8,7 @@ use crate::repository::diagnostics::{
     FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest,
     FeedbackDiagnosticsResult, IFeedbackDiagnosticsRepository,
 };
+use crate::repository::diagnostics_sanitizer::sanitize_mcp_original_json;
 
 const RECENT_CONVERSATION_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const RECENT_CONVERSATION_LIMIT: i64 = 20;
@@ -688,6 +689,7 @@ impl SqliteFeedbackDiagnosticsRepository {
         let servers = rows
             .into_iter()
             .map(|row| {
+                let original_json = row.try_get::<Option<String>, _>("original_json")?;
                 Ok(json!({
                     "id": row.try_get::<String, _>("id")?,
                     "name": row.try_get::<String, _>("name")?,
@@ -696,7 +698,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                     "tool_count": json_array_count(row.try_get::<Option<String>, _>("tools")?.as_deref()),
                     "last_test_status": row.try_get::<String, _>("last_test_status")?,
                     "last_connected": row.try_get::<Option<i64>, _>("last_connected")?,
-                    "original_json": row.try_get::<Option<String>, _>("original_json")?,
+                    "original_json": sanitize_mcp_original_json(original_json.as_deref()),
                     "builtin": row.try_get::<bool, _>("builtin")?,
                     "deleted": row.try_get::<Option<i64>, _>("deleted_at")?.is_some(),
                     "transport_config_bytes": row.try_get::<Option<i64>, _>("transport_config_bytes")?,

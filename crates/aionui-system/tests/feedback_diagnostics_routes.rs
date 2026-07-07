@@ -181,13 +181,14 @@ async fn diagnostics_privacy_statement_matches_included_raw_diagnostics() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["privacy"]["raw_content_included"], true);
-    assert_eq!(json["data"]["privacy"]["api_keys_included"], true);
+    assert_eq!(json["data"]["privacy"]["api_keys_included"], false);
 
     let redaction = json["data"]["privacy"]["redaction"]
         .as_str()
         .expect("privacy redaction should be text");
     assert!(redaction.contains("raw error and tool-call diagnostic content may be included"));
-    assert!(redaction.contains("MCP original_json is returned as stored"));
+    assert!(redaction.contains("MCP original_json keeps connection structure"));
+    assert!(redaction.contains("credential values are redacted"));
     assert!(redaction.contains("non-error message content and prompts are summarized or redacted"));
 }
 

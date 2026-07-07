@@ -539,10 +539,11 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
 
 async fn insert_mcp_feedback_fixture(db: &aionui_db::Database) {
     let original_json = json!({
-        "command": "npx",
-        "args": ["raw-config-mcp", "--access-token=raw-token-for-diagnostics"],
+        "command": "npx @sentry/mcp-server@latest --access-token=raw-token-for-diagnostics --organization-slug=iofficeai",
+        "args": ["raw-config-mcp", "--header=Authorization: Bearer raw-bearer-for-diagnostics"],
         "env": {
-            "MCP_API_KEY": "raw-api-key-for-diagnostics"
+            "MCP_API_KEY": "raw-api-key-for-diagnostics",
+            "MCP_MODEL": "diagnostic-model"
         }
     })
     .to_string();
@@ -665,15 +666,16 @@ async fn collects_conversation_auth_signals_without_sensitive_payloads() {
 }
 
 #[tokio::test]
-async fn mcp_tools_profile_includes_original_json_raw() {
+async fn mcp_tools_profile_preserves_original_json_shape_with_redacted_credentials() {
     let db = init_database_memory().await.unwrap();
     insert_mcp_feedback_fixture(&db).await;
     let repo = SqliteFeedbackDiagnosticsRepository::new(db.pool().clone());
-    let expected_original_json = json!({
-        "command": "npx",
-        "args": ["raw-config-mcp", "--access-token=raw-token-for-diagnostics"],
+    let raw_original_json = json!({
+        "command": "npx @sentry/mcp-server@latest --access-token=raw-token-for-diagnostics --organization-slug=iofficeai",
+        "args": ["raw-config-mcp", "--header=Authorization: Bearer raw-bearer-for-diagnostics"],
         "env": {
-            "MCP_API_KEY": "raw-api-key-for-diagnostics"
+            "MCP_API_KEY": "raw-api-key-for-diagnostics",
+            "MCP_MODEL": "diagnostic-model"
         }
     })
     .to_string();
@@ -695,8 +697,34 @@ async fn mcp_tools_profile_includes_original_json_raw() {
     let server = &mcp_tools.data["servers"][0];
 
     assert_eq!(server["name"], "raw-config-mcp");
-    assert_eq!(server["original_json"], expected_original_json);
-    assert_eq!(server["original_json_bytes"], expected_original_json.len());
+    assert_eq!(server["original_json_bytes"], raw_original_json.len());
+
+    let original_json = server["original_json"]
+        .as_str()
+        .expect("sanitized original_json should remain a JSON string");
+    let parsed: serde_json::Value = serde_json::from_str(original_json).unwrap();
+    assert_eq!(
+        parsed["command"],
+        "npx @sentry/mcp-server@latest --access-token=<redacted> --organization-slug=iofficeai"
+    );
+    assert_eq!(
+        parsed["args"],
+        json!(["raw-config-mcp", "--header=Authorization: Bearer <redacted>"])
+    );
+    assert_eq!(parsed["env"]["MCP_API_KEY"], "<redacted>");
+    assert_eq!(parsed["env"]["MCP_MODEL"], "diagnostic-model");
+
+    let serialized = serde_json::to_string(&result).unwrap();
+    for secret in [
+        "raw-token-for-diagnostics",
+        "raw-api-key-for-diagnostics",
+        "raw-bearer-for-diagnostics",
+    ] {
+        assert!(
+            !serialized.contains(secret),
+            "diagnostics response leaked MCP credential payload: {secret}"
+        );
+    }
 }
 
 #[tokio::test]
