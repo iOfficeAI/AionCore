@@ -1144,7 +1144,7 @@ async fn reader_task(
                 // channel — the data init frame above carries neither). Fills
                 // discovered_caps; capabilities() merges it on read. Done on the RAW
                 // frame (parse_chunk drops control frames to opaque).
-                sniff_control_initialize(v, &discovered_caps);
+                sniff_control_initialize(v, &discovered_caps, &event_tx, &session_id, cur_gen);
                 // AUTHORITATIVE mode signal (design §9.10.1 option A / README #10):
                 // claude stamps `permissionMode` on system/init AND system/status. This
                 // single inbound path confirms EVERY mode change — user-driven (a
@@ -1594,7 +1594,13 @@ fn sniff_mode(
 /// those keys is unambiguously the initialize reply. No-op for any other frame
 /// (can_use_tool success, set_model ack, etc. carry no `models`). Done on the RAW
 /// frame (parse_chunk drops control frames to opaque) — keeps the parse zero-diff.
-fn sniff_control_initialize(frame: &serde_json::Value, discovered_caps: &Arc<std::sync::Mutex<DiscoveredCaps>>) {
+fn sniff_control_initialize(
+    frame: &serde_json::Value,
+    discovered_caps: &Arc<std::sync::Mutex<DiscoveredCaps>>,
+    event_tx: &broadcast::Sender<SessionEnvelope>,
+    session_id: &str,
+    turn_gen: u64,
+) {
     use crate::capability::{ModelInfo, SlashCommandInfo};
     use serde_json::Value;
     if frame.get("type").and_then(Value::as_str) != Some("control_response") {
@@ -1616,37 +1622,64 @@ fn sniff_control_initialize(frame: &serde_json::Value, discovered_caps: &Arc<std
     if models.is_none() && commands.is_none() {
         return;
     }
-    let mut caps = discovered_caps.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(models) = models {
-        caps.models = models
-            .iter()
-            .filter_map(|m| {
-                let id = m.get("value").and_then(Value::as_str)?.to_string();
-                Some(ModelInfo {
-                    name: m.get("displayName").and_then(Value::as_str).unwrap_or(&id).to_string(),
-                    description: m.get("description").and_then(Value::as_str).map(str::to_string),
-                    reasoning_efforts: m
-                        .get("supportedEffortLevels")
-                        .and_then(Value::as_array)
-                        .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                        .unwrap_or_default(),
-                    id,
+    let parsed_models: Vec<ModelInfo> = models
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| {
+                    let id = m.get("value").and_then(Value::as_str)?.to_string();
+                    Some(ModelInfo {
+                        name: m.get("displayName").and_then(Value::as_str).unwrap_or(&id).to_string(),
+                        description: m.get("description").and_then(Value::as_str).map(str::to_string),
+                        reasoning_efforts: m
+                            .get("supportedEffortLevels")
+                            .and_then(Value::as_array)
+                            .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                            .unwrap_or_default(),
+                        id,
+                    })
                 })
-            })
-            .collect();
-    }
-    if let Some(commands) = commands {
-        caps.slash_commands = commands
-            .iter()
-            .filter_map(|c| {
-                let name = c.get("name").and_then(Value::as_str)?.to_string();
-                Some(SlashCommandInfo {
-                    name,
-                    description: c.get("description").and_then(Value::as_str).map(str::to_string),
+                .collect()
+        })
+        .unwrap_or_default();
+    let parsed_commands: Vec<SlashCommandInfo> = commands
+        .map(|commands| {
+            commands
+                .iter()
+                .filter_map(|c| {
+                    let name = c.get("name").and_then(Value::as_str)?.to_string();
+                    Some(SlashCommandInfo {
+                        name,
+                        description: c.get("description").and_then(Value::as_str).map(str::to_string),
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        })
+        .unwrap_or_default();
+    {
+        let mut caps = discovered_caps.lock().unwrap_or_else(|e| e.into_inner());
+        if models.is_some() {
+            caps.models = parsed_models.clone();
+        }
+        if commands.is_some() {
+            caps.slash_commands = parsed_commands.clone();
+        }
     }
+    // Signal the async catalog arrival so the conversation re-projects the picker
+    // (the ACP `emit_snapshot_events` analogue). Without this the frontend, which
+    // read an empty `config_options` on open, never re-fetches and the model
+    // selector stays disabled. Carry claude's fixed permission modes too: the
+    // frontend replaces the WHOLE config_options snapshot on this frame, so omitting
+    // modes would wipe the (synchronously-available) mode picker — a fresh regression.
+    let _ = event_tx.send(SessionEnvelope {
+        session_id: session_id.to_string(),
+        turn_gen,
+        event: SessionEvent::CatalogUpdated {
+            models: parsed_models,
+            modes: crate::adapter::claude_permission_modes(),
+            slash_commands: parsed_commands,
+        },
+    });
 }
 
 /// Handle a REJECTED `set_permission_mode` — the ONE mode signal `sniff_mode` cannot
@@ -4359,6 +4392,55 @@ mod tests {
             Some("Deep research harness")
         );
         assert_eq!(caps.slash_commands[1].name, "verify");
+    }
+
+    /// The FIX (async catalog-arrival signal): when the `initialize` RESPONSE lands the
+    /// reader must BROADCAST a `CatalogUpdated` so the conversation re-projects the
+    /// picker — before this, the catalog silently filled `discovered_caps` with no
+    /// upward signal and the frontend (which read an empty `config_options` on open)
+    /// never re-fetched, leaving the model selector permanently disabled. Asserts the
+    /// event carries the parsed models AND claude's fixed permission modes (the frontend
+    /// replaces its whole snapshot on this frame, so the modes must ride along or the
+    /// mode picker would be wiped).
+    #[tokio::test]
+    async fn control_initialize_response_broadcasts_catalog_updated() {
+        use futures_util::StreamExt as _;
+        let init_resp = r#"{"type":"control_response","response":{"subtype":"success","request_id":"ctl-1","response":{"models":[{"value":"default","displayName":"Default"},{"value":"opus","displayName":"global.anthropic.claude-opus-4-8"}],"commands":[{"name":"verify","description":"Verify claims"}]}}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{init_resp}\n").into_bytes());
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+        // Subscribe BEFORE the reader drains the frame so the broadcast is observed.
+        let mut events = backend.events();
+
+        let mut catalog = None;
+        for _ in 0..40 {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await {
+                Ok(Some(env)) => {
+                    if let SessionEvent::CatalogUpdated {
+                        models,
+                        modes,
+                        slash_commands,
+                    } = env.event
+                    {
+                        catalog = Some((models, modes, slash_commands));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (models, modes, slash_commands) = catalog.expect("a CatalogUpdated must be broadcast on initialize");
+        assert_eq!(models.len(), 2, "parsed models ride the event");
+        assert_eq!(models[0].id, "default");
+        assert_eq!(models[1].id, "opus");
+        // claude's fixed permission modes must ride along (whole-snapshot replace).
+        let mode_ids: Vec<&str> = modes.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            mode_ids,
+            vec!["default", "plan", "acceptEdits", "bypassPermissions"],
+            "the fixed permission modes ride the catalog event so the mode picker survives the snapshot replace"
+        );
+        assert_eq!(slash_commands.len(), 1, "slash commands ride the event");
+        assert_eq!(slash_commands[0].name, "verify");
     }
 
     /// A non-initialize success control_response (e.g. a set_model ack, which has no

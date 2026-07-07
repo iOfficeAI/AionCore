@@ -14,6 +14,7 @@ use crate::capability::Capabilities;
 use crate::event::{ExitStatusLite, SessionEvent};
 
 mod claude;
+pub(crate) use claude::claude_permission_modes;
 pub use claude::{ClaudeAdapter, is_valid_claude_permission_mode};
 
 /// How a persistent session process should be started (feature 004 R16/D12/S17).

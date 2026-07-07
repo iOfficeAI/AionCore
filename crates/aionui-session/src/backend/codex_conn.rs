@@ -1238,6 +1238,29 @@ async fn reader_task(
                                 match kind {
                                     DiscoveryKind::Models | DiscoveryKind::Modes => {
                                         fill_discovery(kind, result, &discovered);
+                                        // Signal the async catalog arrival so the conversation
+                                        // re-projects the model/mode picker (the ACP
+                                        // `emit_snapshot_events` analogue). model/list and
+                                        // collaborationMode/list are SEPARATE responses; emit a
+                                        // full snapshot of whatever `discovered` holds now, so the
+                                        // first arrival already lights the picker and the second
+                                        // refines it. Without this the frontend, which read an
+                                        // empty `config_options` on open, never re-fetches and the
+                                        // model selector stays disabled.
+                                        let (models, modes) = {
+                                            let disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
+                                            (disc.models.clone(), disc.modes.clone())
+                                        };
+                                        emit(
+                                            &event_tx,
+                                            &session_id,
+                                            turn_gen.load(Ordering::SeqCst),
+                                            SessionEvent::CatalogUpdated {
+                                                models,
+                                                modes,
+                                                slash_commands: Vec::new(),
+                                            },
+                                        );
                                     }
                                     DiscoveryKind::Checkpoints => {
                                         emit(
@@ -5283,6 +5306,52 @@ mod tests {
             caps.available_modes.iter().any(|m| m.id == "plan" && m.name == "Plan"),
             "mode id = the lowercase `mode` token SetMode sends (NOT the display name), got {:?}",
             caps.available_modes
+        );
+    }
+
+    /// The FIX (async catalog-arrival signal): each `model/list` /
+    /// `collaborationMode/list` RESPONSE must BROADCAST a `CatalogUpdated` carrying the
+    /// current `discovered` snapshot — before this the parser silently filled the cache
+    /// with no upward signal, so the frontend (which read an empty `config_options` on
+    /// open) never re-fetched and the model selector stayed disabled. The two responses
+    /// are SEPARATE, so we assert a snapshot arrives that carries BOTH lists (the second
+    /// arrival refines the first).
+    #[tokio::test]
+    async fn model_list_response_broadcasts_catalog_updated() {
+        use futures_util::StreamExt as _;
+        let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"openai.gpt-5.5","displayName":"GPT-5.5"}],"nextCursor":null}}"#;
+        let mode_resp = r#"{"jsonrpc":"2.0","id":51,"result":{"data":[{"name":"Plan","mode":"plan"}]}}"#;
+        let bytes = format!("{model_resp}\n{mode_resp}\n").into_bytes();
+        let fake = FakeAgentIo::never_exits(bytes);
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        {
+            let mut pd = backend.pending_discovery.lock().await;
+            pd.insert(50, DiscoveryKind::Models);
+            pd.insert(51, DiscoveryKind::Modes);
+        }
+        let mut events = backend.events();
+        // Collect CatalogUpdated events until one carries both a model and a mode (the
+        // second, refining, snapshot) — or time out.
+        let mut saw_both = false;
+        for _ in 0..80 {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await {
+                Ok(Some(env)) => {
+                    if let SessionEvent::CatalogUpdated { models, modes, .. } = env.event
+                        && !models.is_empty()
+                        && !modes.is_empty()
+                    {
+                        assert_eq!(models[0].id, "openai.gpt-5.5");
+                        assert_eq!(modes[0].id, "plan");
+                        saw_both = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_both,
+            "a CatalogUpdated snapshot carrying both the model and the mode must be broadcast"
         );
     }
 

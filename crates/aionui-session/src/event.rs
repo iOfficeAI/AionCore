@@ -293,6 +293,28 @@ pub enum SessionEvent {
         model: Option<String>,
     },
 
+    /// The selectable model/mode/slash-command catalog became available. Unlike
+    /// ACP (whose `session/new` RESPONSE carries the catalog synchronously, so the
+    /// frontend picker is populated the instant `open_session` returns), the direct-
+    /// CLI backends learn their catalog ASYNCHRONOUSLY, well after `open_session`:
+    /// claude from the `control_request{initialize}` RESPONSE (~6s post-open on
+    /// Bedrock), codex from the `model/list` / `collaborationMode/list` RESPONSEs.
+    /// Before this event existed the adapters merely wrote the catalog into their
+    /// private `discovered` cache with NO upward signal, so the frontend — which had
+    /// already read an empty `config_options` on open — never re-fetched and the
+    /// model selector stayed permanently disabled. This event is the direct-CLI
+    /// analogue of the ACP path's `emit_snapshot_events` catalog push: the event-pump
+    /// translates it into an `AcpConfigOption` frame so the frontend's existing
+    /// `useAcpConfigOptions` re-fetch path fires. Reducer no-op (pure UI surface, like
+    /// `ConfigChanged`); non-persistent (a fresh open re-discovers it). The payload is
+    /// self-contained because the pump holds ONLY the event stream, never a backend
+    /// handle (leak-prevention), so it cannot call `capabilities()` to assemble it.
+    CatalogUpdated {
+        models: Vec<crate::capability::ModelInfo>,
+        modes: Vec<crate::capability::ModeInfo>,
+        slash_commands: Vec<crate::capability::SlashCommandInfo>,
+    },
+
     /// ⭐ Subagent lifecycle normalization (Addendum 8 / §9.12-9.14 / U22). THE
     /// ONE additive variant the reducer READS (§6b b1): `step()` upserts it into
     /// `Running.subagents` (key=`r#ref`, last-write-wins). claude Task subagent
@@ -729,6 +751,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | Provisioning { .. }
         | Rewound { .. }
         | ConfigChanged { .. }
+        | CatalogUpdated { .. }
         | SubagentUpdate { .. }
         | SubagentDetail { .. }
         | Notice { .. }
@@ -768,6 +791,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             ToolOutputDelta { .. } | TurnDiffUpdated { .. } => PersistTier::Ephemeral,
             ItemStarted { .. } | ItemCompleted { .. } => PersistTier::Ephemeral, // lifecycle brackets
             CheckpointList { .. } => PersistTier::Ephemeral,                     // query response, not history
+            CatalogUpdated { .. } => PersistTier::Ephemeral, // async catalog discovery, re-discovered on open (not history)
             SessionInfo { .. } => PersistTier::Ephemeral, // on-demand query snapshot, re-queryable (not history)
             SubagentDetail { .. } => PersistTier::Ephemeral, // transient per-agent progress (roster fill, re-derivable)
             Plan { .. } => PersistTier::Ephemeral, // LC-8a: live to-do snapshot, full-replace + re-derivable (not history)

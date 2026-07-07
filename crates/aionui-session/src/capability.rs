@@ -73,7 +73,8 @@ pub struct Capabilities {
 /// #101: an advertised slash command (discovery, open set). `description` is the
 /// human-readable summary; claude/ACP both carry it (claude also has an argument
 /// hint we drop — the conversation layer's `SlashCommandItem` has no field for it).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// serde-derived so `SessionEvent::CatalogUpdated` can carry it across the seam.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct SlashCommandInfo {
     pub name: String,
     pub description: Option<String>,
@@ -154,7 +155,8 @@ pub enum PromptAcceptedSource {
 }
 
 /// 007 §9.10: an advertised model (discovery, open set).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// serde-derived so `SessionEvent::CatalogUpdated` can carry it across the seam.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
@@ -163,7 +165,8 @@ pub struct ModelInfo {
 }
 
 /// 007 §9.10: an advertised mode (discovery, open set).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// serde-derived so `SessionEvent::CatalogUpdated` can carry it across the seam.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModeInfo {
     pub id: String,
     pub name: String,

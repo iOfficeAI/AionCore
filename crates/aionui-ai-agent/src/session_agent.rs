@@ -1221,6 +1221,73 @@ fn spawn_event_pump(
                 continue;
             }
 
+            // Async catalog discovery (claude `initialize` / codex `model/list` +
+            // `collaborationMode/list` RESPONSE). Project it into an `AcpConfigOption`
+            // frame — the direct-CLI analogue of the ACP path's `emit_snapshot_events`
+            // catalog push. The frontend's `useAcpConfigOptions` handler REPLACES its
+            // whole snapshot on this frame and re-derives the picker's `canSwitch`, so a
+            // catalog that arrived ~6s after `open_session` (long after the frontend read
+            // an empty `config_options`) finally lights the model/mode selector. Built
+            // here, not in the stateless `translate_event`, because the current-value
+            // highlight needs the runtime's optimistic overrides. Emitted whole (model +
+            // mode categories together) so it never wipes a sibling category.
+            if let SessionEvent::CatalogUpdated {
+                models,
+                modes,
+                slash_commands: _,
+            } = &env.event
+            {
+                let mut config_options: Vec<aionui_api_types::AcpConfigOptionDto> = Vec::new();
+                if !modes.is_empty() {
+                    config_options.push(aionui_api_types::AcpConfigOptionDto {
+                        id: "mode".into(),
+                        name: Some("Mode".into()),
+                        label: None,
+                        description: None,
+                        category: Some("mode".into()),
+                        option_type: "select".into(),
+                        current_value: runtime.mode_override(),
+                        options: modes
+                            .iter()
+                            .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
+                                value: m.id.clone(),
+                                name: Some(m.name.clone()),
+                                label: None,
+                                description: m.description.clone(),
+                            })
+                            .collect(),
+                    });
+                }
+                if !models.is_empty() {
+                    config_options.push(aionui_api_types::AcpConfigOptionDto {
+                        id: "model".into(),
+                        name: Some("Model".into()),
+                        label: None,
+                        description: None,
+                        category: Some("model".into()),
+                        option_type: "select".into(),
+                        current_value: runtime.model_override(),
+                        options: models
+                            .iter()
+                            .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
+                                value: m.id.clone(),
+                                name: Some(m.name.clone()),
+                                label: None,
+                                description: m.description.clone(),
+                            })
+                            .collect(),
+                    });
+                }
+                // No categories (both lists empty) → nothing to re-project; a spurious
+                // empty-snapshot frame would only clobber the frontend's picker.
+                if !config_options.is_empty()
+                    && let Ok(v) = serde_json::to_value(serde_json::json!({ "config_options": config_options }))
+                {
+                    let _ = runtime.tx.send(AgentStreamEvent::AcpConfigOption(v));
+                }
+                continue;
+            }
+
             // Track in-flight workflow/subagent refs so a non-blocking Workflow's
             // intermediate `result` frame does not prematurely terminate the turn.
             // Mirrors `state::background_active`: a ref is in-flight while its status
@@ -1795,6 +1862,10 @@ fn translate_event(event: SessionEvent, _conversation_id: &str) -> Vec<AgentStre
         // the "switching mode shows a spurious timer" regression. So emit nothing here;
         // the selection persist is handled separately by `persist_side_effects`.
         SessionEvent::ConfigChanged { .. } => Vec::new(),
+        // Handled earlier in the pump (needs runtime overrides for the current-value
+        // highlight; projected to an AcpConfigOption frame there). Never reaches this
+        // stateless translator, but the match is total so give it an explicit no-op arm.
+        SessionEvent::CatalogUpdated { .. } => Vec::new(),
         // Live plan / to-do snapshot (codex `turn/plan/updated`; claude never emits it).
         // origin has `AgentStreamEvent::Plan` + a `MessagePlan` renderer that reads
         // `entries[].content` + `entries[].status` where status is snake_case
@@ -2919,6 +2990,79 @@ mod pump_tests {
             data.session_id.as_deref(),
             Some("sid-xyz"),
             "resume anchor rides Finish"
+        );
+    }
+
+    // The FIX (async catalog-arrival push): a `CatalogUpdated` (the direct-CLI
+    // analogue of ACP's `emit_snapshot_events`) MUST project to exactly one
+    // `AcpConfigOption` frame carrying BOTH the model and mode categories — the
+    // frontend's `useAcpConfigOptions` replaces its whole snapshot on this frame, so
+    // omitting a sibling category would wipe that picker. Before this the catalog
+    // arrived ~6s after open with no upward frame, so the model selector stayed
+    // disabled. Unlike `ConfigChanged` (suppressed), this frame is the intended signal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_updated_projects_config_option_with_model_and_mode() {
+        use aionui_session::{ModeInfo, ModelInfo};
+        let script = vec![env(SessionEvent::CatalogUpdated {
+            models: vec![
+                ModelInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                    reasoning_efforts: Vec::new(),
+                },
+                ModelInfo {
+                    id: "opus".into(),
+                    name: "Opus".into(),
+                    description: None,
+                    reasoning_efforts: Vec::new(),
+                },
+            ],
+            modes: vec![ModeInfo {
+                id: "plan".into(),
+                name: "Plan".into(),
+                description: None,
+            }],
+            slash_commands: Vec::new(),
+        })];
+        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(script));
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        let frames = drain(&task).await;
+        let config = frames
+            .iter()
+            .find_map(|f| match f {
+                AgentStreamEvent::AcpConfigOption(v) => Some(v),
+                _ => None,
+            })
+            .expect("CatalogUpdated must project to an AcpConfigOption frame");
+        let options = config
+            .get("config_options")
+            .and_then(|v| v.as_array())
+            .expect("config_options array");
+        let categories: Vec<&str> = options
+            .iter()
+            .filter_map(|o| o.get("category").and_then(|c| c.as_str()))
+            .collect();
+        assert!(
+            categories.contains(&"model") && categories.contains(&"mode"),
+            "both categories must ride the snapshot (else a sibling picker is wiped), got {categories:?}"
+        );
+        // The model category carries the parsed catalog so `canSwitch` derives true.
+        let model_opt = options
+            .iter()
+            .find(|o| o.get("category").and_then(|c| c.as_str()) == Some("model"))
+            .expect("model category");
+        let model_values: Vec<&str> = model_opt
+            .get("options")
+            .and_then(|v| v.as_array())
+            .expect("model options array")
+            .iter()
+            .filter_map(|o| o.get("value").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            model_values,
+            vec!["default", "opus"],
+            "the parsed model ids ride the frame"
         );
     }
 
