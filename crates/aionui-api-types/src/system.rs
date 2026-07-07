@@ -65,6 +65,61 @@ pub type ClientPreferencesResponse = HashMap<String, Value>;
 /// the key should be deleted. Non-null values are persisted as-is.
 pub type UpdateClientPreferencesRequest = HashMap<String, Value>;
 
+/// Query parameters for `GET /api/system/diagnostics/feedback-report`.
+///
+/// The UI sends only routing and explicit context. aionCore owns profile
+/// resolution, SQL selection, and redaction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeedbackDiagnosticsQuery {
+    pub route_at_open: Option<String>,
+    pub route_at_submit: Option<String>,
+    pub selected_module: Option<String>,
+    /// Optional comma-separated kebab-case profile names.
+    pub profiles: Option<String>,
+    pub conversation_id: Option<String>,
+    pub provider_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub team_id: Option<String>,
+    pub mcp_server_id: Option<String>,
+}
+
+/// Response for `GET /api/system/diagnostics/feedback-report`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FeedbackDiagnosticsResponse {
+    pub schema_version: String,
+    pub context: FeedbackDiagnosticsContextResponse,
+    pub profiles: Vec<FeedbackDiagnosticsProfileResponse>,
+    pub privacy: FeedbackDiagnosticsPrivacyResponse,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeedbackDiagnosticsContextResponse {
+    pub route_at_open: Option<String>,
+    pub route_at_submit: Option<String>,
+    pub selected_module: Option<String>,
+    pub conversation_id: Option<String>,
+    pub provider_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub team_id: Option<String>,
+    pub mcp_server_id: Option<String>,
+    pub selected_profiles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FeedbackDiagnosticsProfileResponse {
+    pub name: String,
+    pub mode: String,
+    pub data: Value,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeedbackDiagnosticsPrivacyResponse {
+    pub redaction: String,
+    pub raw_content_included: bool,
+    pub api_keys_included: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
