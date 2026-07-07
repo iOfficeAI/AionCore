@@ -1258,18 +1258,23 @@ impl TeamSessionService {
             .await?;
 
         for agent in &team.agents {
-            if let Some(instance) = self.task_manager.get_task(&agent.conversation_id)
-                && let Err(e) = set_active_agent_session_mode(&instance, mode).await
-            {
-                warn!(
-                    team_id,
-                    slot_id = %agent.slot_id,
-                    conversation_id = %agent.conversation_id,
-                    error = %e,
-                    "failed to set session mode on agent"
-                );
-            }
-            if let Err(e) = provisioner.update_session_mode_seed(agent, mode).await {
+            let mode_applied = match self.task_manager.get_task(&agent.conversation_id) {
+                Some(instance) => match set_active_agent_session_mode(&instance, mode).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            team_id,
+                            slot_id = %agent.slot_id,
+                            conversation_id = %agent.conversation_id,
+                            error = %e,
+                            "failed to set session mode on agent"
+                        );
+                        false
+                    }
+                },
+                None => true,
+            };
+            if mode_applied && let Err(e) = provisioner.update_session_mode_seed(agent, mode).await {
                 warn!(
                     team_id,
                     slot_id = %agent.slot_id,
@@ -1434,13 +1439,150 @@ async fn set_active_agent_session_mode(instance: &AgentInstance, mode: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use aionui_api_types::AddAgentRequest;
-    use aionui_db::ITeamRepository;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+    use aionui_ai_agent::{
+        AgentError, AgentInstance, AgentSendError, AgentStreamEvent, IAgentTask, IMockAgent, IWorkerTaskManager,
+    };
+    use aionui_api_types::{AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionResponse};
+    use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs, now_ms};
+    use aionui_db::{IConversationRepository, ITeamRepository};
+    use tokio::sync::broadcast;
 
     use crate::test_utils::workspace_harness::{
         setup_with_factory_metadata_team_repo_and_conversation_repo,
-        setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster, single_agent_team_request,
+        setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster,
+        setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager,
+        single_agent_team_request,
     };
+
+    struct ModeSettingAgent {
+        conversation_id: String,
+        mode_result: Mutex<Result<(), String>>,
+        event_tx: broadcast::Sender<AgentStreamEvent>,
+    }
+
+    impl ModeSettingAgent {
+        fn accepts_mode(conversation_id: &str) -> Self {
+            Self::new(conversation_id, Ok(()))
+        }
+
+        fn rejects_mode(conversation_id: &str, message: &str) -> Self {
+            Self::new(conversation_id, Err(message.to_owned()))
+        }
+
+        fn new(conversation_id: &str, mode_result: Result<(), String>) -> Self {
+            let (event_tx, _) = broadcast::channel(1);
+            Self {
+                conversation_id: conversation_id.to_owned(),
+                mode_result: Mutex::new(mode_result),
+                event_tx,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IAgentTask for ModeSettingAgent {
+        fn agent_type(&self) -> AgentType {
+            AgentType::Acp
+        }
+
+        fn conversation_id(&self) -> &str {
+            &self.conversation_id
+        }
+
+        fn workspace(&self) -> &str {
+            "/tmp/aioncore-team-mode-test"
+        }
+
+        fn status(&self) -> Option<ConversationStatus> {
+            None
+        }
+
+        fn last_activity_at(&self) -> TimestampMs {
+            now_ms()
+        }
+
+        fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+            self.event_tx.subscribe()
+        }
+
+        async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
+            Ok(())
+        }
+
+        async fn cancel(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IMockAgent for ModeSettingAgent {
+        async fn set_config_option(&self, option_id: &str, value: &str) -> Result<SetConfigOptionResponse, AgentError> {
+            assert_eq!(option_id, "mode");
+            assert_eq!(value, "read-only");
+            match self.mode_result.lock().unwrap().clone() {
+                Ok(()) => Ok(SetConfigOptionResponse {
+                    confirmation: ConfigOptionConfirmation::Observed,
+                    config_options: None,
+                }),
+                Err(message) => Err(AgentError::bad_request(message)),
+            }
+        }
+    }
+
+    struct StaticTaskManager {
+        tasks: HashMap<String, AgentInstance>,
+    }
+
+    impl StaticTaskManager {
+        fn new(tasks: HashMap<String, AgentInstance>) -> Self {
+            Self { tasks }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IWorkerTaskManager for StaticTaskManager {
+        fn get_task(&self, conversation_id: &str) -> Option<AgentInstance> {
+            self.tasks.get(conversation_id).cloned()
+        }
+
+        async fn get_or_build_task(
+            &self,
+            _conversation_id: &str,
+            _options: BuildTaskOptions,
+        ) -> Result<AgentInstance, AgentError> {
+            Err(AgentError::internal("static task manager does not build tasks"))
+        }
+
+        fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        fn kill_and_wait(
+            &self,
+            _conversation_id: &str,
+            _reason: Option<AgentKillReason>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            Box::pin(std::future::ready(()))
+        }
+
+        async fn clear(&self) {}
+
+        fn active_count(&self) -> usize {
+            self.tasks.len()
+        }
+
+        fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+            Vec::new()
+        }
+    }
 
     #[tokio::test]
     async fn session_has_slow_monitor() {
@@ -1581,6 +1723,125 @@ mod tests {
         assert_eq!(
             extra.get("session_mode").and_then(serde_json::Value::as_str),
             Some("full_auto")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_session_mode_does_not_persist_agent_seed_when_active_runtime_rejects_mode() {
+        let accepting_conversation_id = "conv-accepts";
+        let rejecting_conversation_id = "conv-rejects";
+        let task_manager = Arc::new(StaticTaskManager::new(HashMap::from([
+            (
+                accepting_conversation_id.to_owned(),
+                AgentInstance::Mock(Arc::new(ModeSettingAgent::accepts_mode(accepting_conversation_id))),
+            ),
+            (
+                rejecting_conversation_id.to_owned(),
+                AgentInstance::Mock(Arc::new(ModeSettingAgent::rejects_mode(
+                    rejecting_conversation_id,
+                    "Value 'read-only' is not selectable for config option 'mode'",
+                ))),
+            ),
+        ])));
+        let (svc, repo, _task_manager, conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager);
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Partial Mode Seed"))
+            .await
+            .unwrap();
+        let mut row = repo.get_team(&created.id).await.unwrap().expect("team row");
+        row.agents = serde_json::json!([
+            {
+                "slot_id": "slot-accepts",
+                "name": "Codex CLI",
+                "role": "lead",
+                "conversation_id": accepting_conversation_id,
+                "backend": "codex",
+                "model": "openai.gpt-5.5",
+                "assistant_id": "bare:codex"
+            },
+            {
+                "slot_id": "slot-rejects",
+                "name": "Claude Code",
+                "role": "teammate",
+                "conversation_id": rejecting_conversation_id,
+                "backend": "claude",
+                "model": "global.anthropic.claude-opus-4-8",
+                "assistant_id": "bare:claude"
+            }
+        ])
+        .to_string();
+        repo.update_team(
+            &created.id,
+            &aionui_db::UpdateTeamParams {
+                agents: Some(row.agents),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        conv_repo
+            .create(&aionui_db::models::ConversationRow {
+                id: accepting_conversation_id.to_owned(),
+                user_id: "user-test".to_owned(),
+                name: "Codex CLI".to_owned(),
+                r#type: AgentType::Acp.serde_name().to_owned(),
+                extra: serde_json::json!({
+                    "current_mode_id": "default",
+                    "session_mode": "default"
+                })
+                .to_string(),
+                model: None,
+                status: Some("pending".to_owned()),
+                source: None,
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: now_ms(),
+                updated_at: now_ms(),
+            })
+            .await
+            .unwrap();
+        conv_repo
+            .create(&aionui_db::models::ConversationRow {
+                id: rejecting_conversation_id.to_owned(),
+                user_id: "user-test".to_owned(),
+                name: "Claude Code".to_owned(),
+                r#type: AgentType::Acp.serde_name().to_owned(),
+                extra: serde_json::json!({
+                    "current_mode_id": "default",
+                    "session_mode": "default"
+                })
+                .to_string(),
+                model: None,
+                status: Some("pending".to_owned()),
+                source: None,
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: now_ms(),
+                updated_at: now_ms(),
+            })
+            .await
+            .unwrap();
+
+        svc.set_session_mode("user-test", &created.id, "read-only")
+            .await
+            .unwrap();
+
+        let team = repo.get_team(&created.id).await.unwrap().expect("team row");
+        assert_eq!(team.session_mode.as_deref(), Some("read-only"));
+
+        let accepting_extra = conv_repo.get_extra(accepting_conversation_id).unwrap();
+        assert_eq!(
+            accepting_extra.get("session_mode").and_then(serde_json::Value::as_str),
+            Some("read-only")
+        );
+
+        let rejecting_extra = conv_repo.get_extra(rejecting_conversation_id).unwrap();
+        assert_eq!(
+            rejecting_extra.get("session_mode").and_then(serde_json::Value::as_str),
+            Some("default")
         );
     }
 

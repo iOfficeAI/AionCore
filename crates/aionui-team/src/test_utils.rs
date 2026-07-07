@@ -1009,6 +1009,19 @@ pub(crate) mod workspace_harness {
         Arc<MockConversationRepo>,
         Arc<RecordingBroadcaster>,
     ) {
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+        setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager)
+    }
+
+    pub(crate) fn setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(
+        task_manager: Arc<dyn IWorkerTaskManager>,
+    ) -> (
+        Arc<TeamSessionService>,
+        Arc<FullMockTeamRepo>,
+        Arc<dyn IWorkerTaskManager>,
+        Arc<MockConversationRepo>,
+        Arc<RecordingBroadcaster>,
+    ) {
         let team_repo = Arc::new(FullMockTeamRepo::new());
         let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
         let conv_repo = Arc::new(MockConversationRepo::new());
@@ -1017,7 +1030,6 @@ pub(crate) mod workspace_harness {
         let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
         let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
         let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
         let svc = TeamSessionService::new(
             team_repo_dyn,
             Arc::new(EmptyAgentMetadataRepo),
