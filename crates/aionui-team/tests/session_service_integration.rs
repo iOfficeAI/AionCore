@@ -47,12 +47,14 @@ use common::MockTeamRepo;
 
 struct MockConversationRepo {
     conversations: std::sync::Mutex<Vec<ConversationRow>>,
+    messages: std::sync::Mutex<Vec<MessageRow>>,
 }
 
 impl MockConversationRepo {
     fn new() -> Self {
         Self {
             conversations: std::sync::Mutex::new(Vec::new()),
+            messages: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -66,6 +68,16 @@ impl MockConversationRepo {
 
     fn conversation_count(&self) -> usize {
         self.conversations.lock().unwrap().len()
+    }
+
+    fn messages_for(&self, conversation_id: &str) -> Vec<MessageRow> {
+        self.messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| message.conversation_id == conversation_id)
+            .cloned()
+            .collect()
     }
 
     fn patch_extra(&self, id: &str, patch: serde_json::Value) -> Result<(), DbError> {
@@ -159,7 +171,8 @@ impl IConversationRepository for MockConversationRepo {
             has_more_after: false,
         })
     }
-    async fn insert_message(&self, _message: &MessageRow) -> Result<(), DbError> {
+    async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
+        self.messages.lock().unwrap().push(message.clone());
         Ok(())
     }
     async fn update_message(&self, _id: &str, _updates: &MessageRowUpdate) -> Result<(), DbError> {
@@ -170,11 +183,19 @@ impl IConversationRepository for MockConversationRepo {
     }
     async fn get_message_by_msg_id(
         &self,
-        _conv_id: &str,
-        _msg_id: &str,
-        _msg_type: &str,
+        conv_id: &str,
+        msg_id: &str,
+        msg_type: &str,
     ) -> Result<Option<MessageRow>, DbError> {
-        Ok(None)
+        Ok(self
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row.conversation_id == conv_id && row.msg_id.as_deref() == Some(msg_id) && row.r#type == msg_type
+            })
+            .cloned())
     }
     async fn search_messages(
         &self,
@@ -3308,6 +3329,71 @@ async fn aa1_add_agent_to_team() {
 }
 
 #[tokio::test]
+async fn manual_add_agent_projects_team_system_messages_without_active_team_run() {
+    let (svc, _, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    let added = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Worker".into(),
+                role: "teammate".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let leader_conversation_id = &created.assistants[0].conversation_id;
+    let leader_messages = conv_repo.messages_for(leader_conversation_id);
+    assert_eq!(leader_messages.len(), 1);
+    assert_eq!(leader_messages[0].position.as_deref(), Some("left"));
+    let leader_content: serde_json::Value = serde_json::from_str(&leader_messages[0].content).unwrap();
+    assert_eq!(leader_content["sender_name"], "team_system");
+    assert_eq!(leader_content["teammate_message"], true);
+    assert!(
+        leader_content["content"]
+            .as_str()
+            .unwrap()
+            .contains("manually added teammate")
+    );
+    assert!(leader_content["content"].as_str().unwrap().contains(&added.slot_id));
+
+    let added_messages = conv_repo.messages_for(&added.conversation_id);
+    assert_eq!(added_messages.len(), 1);
+    assert_eq!(added_messages[0].position.as_deref(), Some("left"));
+    let added_content: serde_json::Value = serde_json::from_str(&added_messages[0].content).unwrap();
+    assert_eq!(added_content["sender_name"], "team_system");
+    assert_eq!(added_content["teammate_message"], true);
+    assert!(added_content["content"].as_str().unwrap().contains("manually added"));
+}
+
+#[tokio::test]
 async fn add_agent_rejects_leader_role() {
     let svc = setup();
     let created = svc
@@ -3981,6 +4067,44 @@ async fn ar1_remove_agent_from_team() {
     let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.assistants.len(), 1);
     assert!(got.assistants.iter().all(|a| a.slot_id != worker_slot));
+}
+
+#[tokio::test]
+async fn manual_remove_agent_projects_team_system_message_without_active_team_run() {
+    let (svc, _, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let leader_conversation_id = created.assistants[0].conversation_id.clone();
+    let worker_slot = created.assistants[1].slot_id.clone();
+
+    svc.remove_agent("user1", &created.id, &worker_slot).await.unwrap();
+
+    let leader_messages = conv_repo.messages_for(&leader_conversation_id);
+    assert_eq!(leader_messages.len(), 1);
+    assert_eq!(leader_messages[0].position.as_deref(), Some("left"));
+    let content: serde_json::Value = serde_json::from_str(&leader_messages[0].content).unwrap();
+    assert_eq!(content["sender_name"], "team_system");
+    assert_eq!(content["teammate_message"], true);
+    assert!(
+        content["content"]
+            .as_str()
+            .unwrap()
+            .contains("was removed from the team")
+    );
+    assert!(content["content"].as_str().unwrap().contains(&worker_slot));
 }
 
 #[tokio::test]

@@ -1335,6 +1335,8 @@ impl TeamSession {
                 None,
             )
             .await?;
+        self.project_team_system_message(&agent.slot_id, &agent.conversation_id, &welcome.id, &welcome.content)
+            .await;
         let leader_notice = self
             .mailbox
             .write(
@@ -1352,6 +1354,14 @@ impl TeamSession {
                 None,
             )
             .await?;
+        let lead_agent = self.scheduler.get_agent(&lead_slot_id).await?;
+        self.project_team_system_message(
+            &lead_slot_id,
+            &lead_agent.conversation_id,
+            &leader_notice.id,
+            &leader_notice.content,
+        )
+        .await;
 
         let spawn_wake_plan = if self.team_run_manager.active_run_id().await.is_some() {
             let spawn_welcome_role = match self
@@ -1411,6 +1421,9 @@ impl TeamSession {
                 None,
             )
             .await?;
+        let lead_agent = self.scheduler.get_agent(&lead_slot_id).await?;
+        self.project_team_system_message(&lead_slot_id, &lead_agent.conversation_id, &notice.id, &notice.content)
+            .await;
 
         if self.team_run_manager.active_run_id().await.is_some() {
             if let Some(role) = self
@@ -1424,6 +1437,33 @@ impl TeamSession {
         }
 
         Ok(())
+    }
+
+    async fn project_team_system_message(
+        &self,
+        slot_id: &str,
+        conversation_id: &str,
+        mailbox_message_id: &str,
+        content: &str,
+    ) {
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        let request = TeamProjectionRequest::team_system_visible(
+            &self.team.id,
+            slot_id,
+            conversation_id,
+            content,
+            mailbox_message_id,
+        );
+        if let Err(err) = projection.project(request).await {
+            warn!(
+                team_id = %self.team.id,
+                slot_id = %slot_id,
+                conversation_id = %conversation_id,
+                mailbox_message_id = %mailbox_message_id,
+                error = %err,
+                "team system message projection failed (non-fatal)"
+            );
+        }
     }
 
     pub async fn remove_agent(&self, slot_id: &str) -> Result<(), TeamError> {

@@ -15,6 +15,7 @@ const TEXT_MESSAGE_TYPE: &str = "text";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TeamProjectionSource {
     User,
+    TeamSystem,
     Teammate {
         from_slot_id: String,
         from_name: String,
@@ -84,9 +85,32 @@ impl TeamProjectionRequest {
         }
     }
 
+    pub fn team_system_visible(
+        team_id: impl Into<String>,
+        slot_id: impl Into<String>,
+        conversation_id: impl Into<String>,
+        content: impl Into<String>,
+        mailbox_message_id: impl Into<String>,
+    ) -> Self {
+        let team_id = team_id.into();
+        let conversation_id = conversation_id.into();
+        let mailbox_message_id = mailbox_message_id.into();
+        Self {
+            dedupe_key: Some(teammate_dedupe_key(&team_id, &mailbox_message_id, &conversation_id)),
+            team_id,
+            slot_id: slot_id.into(),
+            conversation_id,
+            source: TeamProjectionSource::TeamSystem,
+            content: content.into(),
+            files: Vec::new(),
+            visibility: TeamVisibilityPolicy::teammate_message(),
+        }
+    }
+
     fn should_insert_visible_bubble(&self) -> bool {
         match self.source {
             TeamProjectionSource::User => self.visibility.insert_user_visible_bubble,
+            TeamProjectionSource::TeamSystem => self.visibility.insert_teammate_visible_bubble,
             TeamProjectionSource::Teammate { .. } => self.visibility.insert_teammate_visible_bubble,
         }
     }
@@ -171,14 +195,13 @@ where
         let row = Self::build_message_row(&request, &msg_id, aionui_common::now_ms())?;
         self.store.insert_projected_message(&row).await?;
 
-        if let TeamProjectionSource::Teammate {
-            from_slot_id,
-            from_name,
-            sender_backend,
-            sender_conversation_id,
-        } = &request.source
-        {
-            let payload = serde_json::json!({
+        let teammate_event_payload = match &request.source {
+            TeamProjectionSource::Teammate {
+                from_slot_id,
+                from_name,
+                sender_backend,
+                sender_conversation_id,
+            } => Some(serde_json::json!({
                 "team_id": request.team_id,
                 "slot_id": request.slot_id,
                 "conversation_id": request.conversation_id,
@@ -189,7 +212,22 @@ where
                 "teammate_message": true,
                 "sender_backend": sender_backend,
                 "sender_conversation_id": sender_conversation_id,
-            });
+            })),
+            TeamProjectionSource::TeamSystem => Some(serde_json::json!({
+                "team_id": request.team_id,
+                "slot_id": request.slot_id,
+                "conversation_id": request.conversation_id,
+                "msg_id": msg_id,
+                "content": request.content,
+                "from_slot_id": "team_system",
+                "from_name": "team_system",
+                "teammate_message": true,
+                "sender_backend": null,
+                "sender_conversation_id": null,
+            })),
+            TeamProjectionSource::User => None,
+        };
+        if let Some(payload) = teammate_event_payload {
             self.broadcaster
                 .broadcast(WebSocketMessage::new(TEAMMATE_MESSAGE_EVENT, payload));
         }
@@ -200,6 +238,7 @@ where
             conversation_id = %request.conversation_id,
             event_name = match request.source {
                 TeamProjectionSource::User => "message.stream",
+                TeamProjectionSource::TeamSystem => TEAMMATE_MESSAGE_EVENT,
                 TeamProjectionSource::Teammate { .. } => TEAMMATE_MESSAGE_EVENT,
             },
             outcome = "inserted",
@@ -228,6 +267,16 @@ where
                     }),
                 )
             }
+            TeamProjectionSource::TeamSystem => (
+                "left",
+                serde_json::json!({
+                    "content": request.content,
+                    "teammate_message": true,
+                    "sender_name": "team_system",
+                    "sender_backend": null,
+                    "sender_conversation_id": null,
+                }),
+            ),
             TeamProjectionSource::Teammate {
                 from_slot_id: _,
                 from_name,

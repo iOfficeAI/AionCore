@@ -139,6 +139,24 @@ fn projection_request_for_teammate_mirror_uses_stable_mailbox_dedupe_key() {
     assert!(!req.visibility.allow_hidden_conversation_message);
 }
 
+#[test]
+fn projection_request_for_team_system_message_uses_stable_mailbox_dedupe_key() {
+    let req = TeamProjectionRequest::team_system_visible(
+        "team-1",
+        "lead-1",
+        "conv-lead",
+        "Roster changed",
+        "mailbox-system-123",
+    );
+
+    assert_eq!(
+        req.dedupe_key.as_deref(),
+        Some("team:team-1:mailbox:mailbox-system-123:conversation:conv-lead")
+    );
+    assert!(req.visibility.insert_teammate_visible_bubble);
+    assert!(!req.visibility.allow_hidden_conversation_message);
+}
+
 #[tokio::test]
 async fn projection_inserts_user_visible_bubble_with_stripped_system_notes() {
     let store = Arc::new(RecordingProjectionStore::default());
@@ -207,6 +225,43 @@ async fn projection_dedupes_teammate_mirror_and_broadcasts_persisted_msg_id() {
     assert_eq!(events[0].data["msg_id"], first_msg_id);
     assert_eq!(events[0].data["from_slot_id"], "worker-1");
     assert_eq!(events[0].data["from_name"], "Worker");
+}
+
+#[tokio::test]
+async fn projection_inserts_team_system_bubble_and_broadcasts_it_like_existing_mirror() {
+    let store = Arc::new(RecordingProjectionStore::default());
+    let bc = Arc::new(RecordingBroadcaster::new());
+    let projection = TeamMessageProjection::new(store.clone(), bc.clone());
+    let req = TeamProjectionRequest::team_system_visible(
+        "team-1",
+        "lead-1",
+        "conv-lead",
+        "Roster changed",
+        "mailbox-system-123",
+    );
+
+    let projected = projection.project(req).await.unwrap();
+
+    let msg_id = match projected {
+        ProjectedTeamMessage::Inserted { msg_id } => msg_id,
+        other => panic!("expected insert, got {other:?}"),
+    };
+    let rows = store.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].position.as_deref(), Some("left"));
+    assert_eq!(rows[0].msg_id.as_deref(), Some(msg_id.as_str()));
+    let content: serde_json::Value = serde_json::from_str(&rows[0].content).unwrap();
+    assert_eq!(content["content"], "Roster changed");
+    assert_eq!(content["teammate_message"], true);
+    assert_eq!(content["sender_name"], "team_system");
+
+    let events = bc.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "team.teammateMessage");
+    assert_eq!(events[0].data["conversation_id"], "conv-lead");
+    assert_eq!(events[0].data["msg_id"], msg_id);
+    assert_eq!(events[0].data["from_slot_id"], "team_system");
+    assert_eq!(events[0].data["from_name"], "team_system");
 }
 
 // ===========================================================================
