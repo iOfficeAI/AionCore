@@ -20,6 +20,7 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
@@ -27,6 +28,7 @@ use crate::event_loop::AgentLoopContext;
 use crate::events::{
     TEAM_CREATED_EVENT, TEAM_MCP_STATUS_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT, TeamEventEmitter,
 };
+use crate::mcp::TeamMcpStdioConfig;
 use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogPort};
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
@@ -52,11 +54,84 @@ struct TeamAgentRebuildOutcome {
     result: Result<(), TeamError>,
 }
 
+const TEAM_REBUILD_MAX_CONCURRENCY: usize = 3;
+const TEAM_REBUILD_START_STAGGER: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn format_rebuild_agent_identity(agent: &TeamAgent) -> String {
     format!(
         "{} (backend={}, model={}, role={}, slot_id={}, conversation_id={})",
         agent.name, agent.backend, agent.model, agent.role, agent.slot_id, agent.conversation_id
     )
+}
+
+fn spawn_rebuild_agent_process(
+    jobs: &mut JoinSet<TeamAgentRebuildOutcome>,
+    provisioner: TeamAgentProvisioner,
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    user_id: String,
+    agent: TeamAgent,
+    cfg: TeamMcpStdioConfig,
+) {
+    jobs.spawn(async move {
+        let team_id = cfg.team_id.clone();
+        info!(
+            team_id = %team_id,
+            slot_id = %agent.slot_id,
+            agent_name = %agent.name,
+            conversation_id = %agent.conversation_id,
+            backend = %agent.backend,
+            model = %agent.model,
+            role = %agent.role,
+            "team agent rebuild attach started"
+        );
+        let attach_started_at = Instant::now();
+        let result = provisioner
+            .attach_agent_process(&user_id, &agent, cfg, &task_manager)
+            .await;
+        let duration_ms = attach_started_at.elapsed().as_millis();
+        match &result {
+            Ok(()) => info!(
+                team_id = %team_id,
+                slot_id = %agent.slot_id,
+                agent_name = %agent.name,
+                conversation_id = %agent.conversation_id,
+                backend = %agent.backend,
+                model = %agent.model,
+                role = %agent.role,
+                duration_ms,
+                "team agent rebuild attach finished"
+            ),
+            Err(error) => warn!(
+                team_id = %team_id,
+                slot_id = %agent.slot_id,
+                agent_name = %agent.name,
+                conversation_id = %agent.conversation_id,
+                backend = %agent.backend,
+                model = %agent.model,
+                role = %agent.role,
+                duration_ms,
+                error = %error,
+                "team agent rebuild attach failed"
+            ),
+        }
+        TeamAgentRebuildOutcome {
+            agent,
+            duration_ms,
+            result,
+        }
+    });
+}
+
+async fn join_next_rebuild_outcome(
+    jobs: &mut JoinSet<TeamAgentRebuildOutcome>,
+) -> Result<Option<TeamAgentRebuildOutcome>, TeamError> {
+    match jobs.join_next().await {
+        Some(Ok(outcome)) => Ok(Some(outcome)),
+        Some(Err(error)) => Err(TeamError::InvalidRequest(format!(
+            "team agent rebuild task failed: {error}"
+        ))),
+        None => Ok(None),
+    }
 }
 
 pub struct TeamSessionService {
@@ -768,60 +843,67 @@ impl TeamSessionService {
             TeammateRole::Teammate => 1,
         });
 
-        info!(team_id, agent_count = agents.len(), "team agent rebuild started");
+        info!(
+            team_id,
+            agent_count = agents.len(),
+            max_concurrency = TEAM_REBUILD_MAX_CONCURRENCY,
+            start_stagger_ms = TEAM_REBUILD_START_STAGGER.as_millis(),
+            "team agent rebuild started"
+        );
 
         let mut outcomes = Vec::new();
-        for agent in rebuild_jobs {
-            let cfg = session.mcp_stdio_config(&agent.slot_id);
-            info!(
-                team_id = %cfg.team_id,
-                slot_id = %agent.slot_id,
-                agent_name = %agent.name,
-                conversation_id = %agent.conversation_id,
-                backend = %agent.backend,
-                model = %agent.model,
-                role = %agent.role,
-                "team agent rebuild attach started"
-            );
-            let attach_started_at = Instant::now();
-            let result = provisioner
-                .attach_agent_process(user_id, &agent, cfg, &task_manager)
-                .await;
-            let duration_ms = attach_started_at.elapsed().as_millis();
-            match &result {
-                Ok(()) => info!(
-                    team_id,
-                    slot_id = %agent.slot_id,
-                    agent_name = %agent.name,
-                    conversation_id = %agent.conversation_id,
-                    backend = %agent.backend,
-                    model = %agent.model,
-                    role = %agent.role,
-                    duration_ms,
-                    "team agent rebuild attach finished"
-                ),
-                Err(error) => warn!(
-                    team_id,
-                    slot_id = %agent.slot_id,
-                    agent_name = %agent.name,
-                    conversation_id = %agent.conversation_id,
-                    backend = %agent.backend,
-                    model = %agent.model,
-                    role = %agent.role,
-                    duration_ms,
-                    error = %error,
-                    "team agent rebuild attach failed"
-                ),
+        let mut jobs = JoinSet::new();
+        let mut failed = false;
+
+        for (launched_count, agent) in rebuild_jobs.into_iter().enumerate() {
+            while jobs.len() >= TEAM_REBUILD_MAX_CONCURRENCY {
+                if let Some(outcome) = join_next_rebuild_outcome(&mut jobs).await? {
+                    failed = outcome.result.is_err();
+                    outcomes.push(outcome);
+                }
+                if failed {
+                    break;
+                }
             }
-            let failed = result.is_err();
-            outcomes.push(TeamAgentRebuildOutcome {
-                agent,
-                duration_ms,
-                result,
-            });
             if failed {
                 break;
             }
+
+            if launched_count > 0 {
+                let stagger = tokio::time::sleep(TEAM_REBUILD_START_STAGGER);
+                tokio::pin!(stagger);
+                loop {
+                    tokio::select! {
+                        _ = &mut stagger => break,
+                        outcome = join_next_rebuild_outcome(&mut jobs), if !jobs.is_empty() => {
+                            if let Some(outcome) = outcome? {
+                                failed = outcome.result.is_err();
+                                outcomes.push(outcome);
+                            }
+                            if failed {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if failed {
+                    break;
+                }
+            }
+
+            let cfg = session.mcp_stdio_config(&agent.slot_id);
+            spawn_rebuild_agent_process(
+                &mut jobs,
+                provisioner.clone(),
+                task_manager.clone(),
+                user_id.to_owned(),
+                agent,
+                cfg,
+            );
+        }
+
+        while let Some(outcome) = join_next_rebuild_outcome(&mut jobs).await? {
+            outcomes.push(outcome);
         }
 
         let mut success_count = 0usize;
@@ -839,6 +921,8 @@ impl TeamSessionService {
             success_count,
             failure_count = failures.len(),
             duration_ms = started_at.elapsed().as_millis(),
+            max_concurrency = TEAM_REBUILD_MAX_CONCURRENCY,
+            start_stagger_ms = TEAM_REBUILD_START_STAGGER.as_millis(),
             "team agent rebuild completed"
         );
 

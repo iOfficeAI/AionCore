@@ -1858,11 +1858,24 @@ fn five_agent_input_leader_not_first() -> Vec<TeamAgentInput> {
     ]
 }
 
-#[derive(Default)]
 struct WarmupConcurrencyProbe {
     active: AtomicUsize,
     max_active: AtomicUsize,
     starts: Mutex<Vec<String>>,
+    start_times: Mutex<Vec<(String, std::time::Duration)>>,
+    started_at: tokio::time::Instant,
+}
+
+impl Default for WarmupConcurrencyProbe {
+    fn default() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            starts: Mutex::new(Vec::new()),
+            start_times: Mutex::new(Vec::new()),
+            started_at: tokio::time::Instant::now(),
+        }
+    }
 }
 
 impl WarmupConcurrencyProbe {
@@ -1874,7 +1887,13 @@ impl WarmupConcurrencyProbe {
             let probe = Arc::clone(&probe);
             async move {
                 let conversation_id = opts.context.conversation.conversation_id.clone();
+                let elapsed = probe.started_at.elapsed();
                 probe.starts.lock().unwrap().push(conversation_id.clone());
+                probe
+                    .start_times
+                    .lock()
+                    .unwrap()
+                    .push((conversation_id.clone(), elapsed));
                 let current = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
                 probe.max_active.fetch_max(current, Ordering::SeqCst);
                 tokio::time::sleep(delay).await;
@@ -1894,6 +1913,10 @@ impl WarmupConcurrencyProbe {
 
     fn starts(&self) -> Vec<String> {
         self.starts.lock().unwrap().clone()
+    }
+
+    fn start_times(&self) -> Vec<(String, std::time::Duration)> {
+        self.start_times.lock().unwrap().clone()
     }
 }
 
@@ -4687,10 +4710,10 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
     }
 }
 
-#[tokio::test]
-async fn d9_ensure_session_rebuilds_agents_serially_with_leader_first() {
+#[tokio::test(start_paused = true)]
+async fn d9_ensure_session_rebuilds_agents_with_staggered_bounded_parallelism() {
     let probe = Arc::new(WarmupConcurrencyProbe::default());
-    let (svc, _tm) = setup_with_factory(probe.factory(std::time::Duration::from_millis(40)));
+    let (svc, _tm) = setup_with_factory(probe.factory(std::time::Duration::from_secs(20)));
     let created = svc
         .create_team(
             "user1",
@@ -4718,18 +4741,36 @@ async fn d9_ensure_session_rebuilds_agents_serially_with_leader_first() {
             .map(|assistant| assistant.conversation_id.clone()),
     );
 
-    svc.ensure_session("user1", &created.id).await.unwrap();
+    let svc_for_task = Arc::clone(&svc);
+    let team_id = created.id.clone();
+    let handle = tokio::spawn(async move { svc_for_task.ensure_session("user1", &team_id).await });
+
+    tokio::time::advance(std::time::Duration::from_secs(120)).await;
+    handle.await.unwrap().unwrap();
 
     let starts = probe.starts();
     assert_eq!(
         starts, expected_starts,
-        "team rebuild warmup must run leader first and then teammates serially"
+        "team rebuild warmup must start leader first and preserve teammate order"
+    );
+    assert!(
+        probe.max_active() > 1,
+        "team rebuild warmup should overlap staggered agents when warmup takes longer than the launch interval"
     );
     assert_eq!(
         probe.max_active(),
-        1,
-        "team rebuild warmup should not run multiple agents concurrently"
+        3,
+        "team rebuild warmup should cap concurrent agents at 3"
     );
+    let start_times = probe.start_times();
+    assert_eq!(start_times.len(), expected_starts.len());
+    for pair in start_times.windows(2) {
+        let delta = pair[1].1.saturating_sub(pair[0].1);
+        assert!(
+            delta >= std::time::Duration::from_secs(5),
+            "agent starts should be staggered by at least 5s; observed {delta:?}"
+        );
+    }
 }
 
 #[tokio::test]
