@@ -250,10 +250,10 @@ mod tests {
         assert!(prompt.contains("Wait for explicit confirmation before using team_spawn_agent"));
         assert!(prompt.contains("End your turn after the proposal"));
 
-        // Model Selection Guidelines
-        assert!(prompt.contains("## Model Selection Guidelines"));
-        assert!(prompt.contains("exact model ID strings"));
-        assert!(prompt.contains("omit the model parameter"));
+        // Assistant selection, not model selection.
+        assert!(prompt.contains("## Assistant Selection Guidelines"));
+        assert!(prompt.contains("Do not call `team_list_models` as part of normal teammate creation"));
+        assert!(prompt.contains("Do not pass a model to `team_spawn_agent`"));
 
         // Conversation Style — don't pitch proposals up-front
         assert!(prompt.contains("## Conversation Style"));
@@ -282,7 +282,6 @@ mod tests {
         assert!(!prompt.contains("## Available Assistants for Spawning"));
         assert!(!prompt.contains("- `word-creator` (Word Creator) — Drafts Word documents"));
         assert!(prompt.contains("team_list_assistants"));
-        assert!(prompt.contains("team_list_models"));
     }
 
     #[test]

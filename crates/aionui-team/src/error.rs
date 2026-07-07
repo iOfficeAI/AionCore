@@ -92,6 +92,16 @@ pub fn classify_public_error(message: &str) -> Option<TeamPublicError> {
         }
     }
 
+    if message == "model is no longer accepted; use the assistant configuration or UI model selector" {
+        return Some(TeamPublicError::new(
+            "TEAM_ASSISTANT_FIELD_UNSUPPORTED",
+            Some(json!({
+                "field": "model",
+                "required_field": "assistant_id",
+            })),
+        ));
+    }
+
     if message == "team_list_assistants does not accept arguments" {
         return Some(TeamPublicError::new(
             "TEAM_TOOL_ARGUMENTS_NOT_ALLOWED",
@@ -139,6 +149,18 @@ mod tests {
             legacy.details,
             Some(json!({
                 "field": "backend",
+                "required_field": "assistant_id",
+            }))
+        );
+
+        let model =
+            classify_public_error("model is no longer accepted; use the assistant configuration or UI model selector")
+                .expect("model field");
+        assert_eq!(model.code, "TEAM_ASSISTANT_FIELD_UNSUPPORTED");
+        assert_eq!(
+            model.details,
+            Some(json!({
+                "field": "model",
                 "required_field": "assistant_id",
             }))
         );

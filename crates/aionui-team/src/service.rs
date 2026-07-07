@@ -55,7 +55,7 @@ struct TeamAgentRebuildOutcome {
 }
 
 const TEAM_REBUILD_MAX_CONCURRENCY: usize = 3;
-const TEAM_REBUILD_START_STAGGER: std::time::Duration = std::time::Duration::from_secs(5);
+const TEAM_REBUILD_START_STAGGER: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn format_rebuild_agent_identity(agent: &TeamAgent) -> String {
     format!(

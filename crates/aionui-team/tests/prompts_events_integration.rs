@@ -276,7 +276,6 @@ fn lp2_lead_prompt_contains_tool_descriptions() {
         "team_members",
         "team_rename_agent",
         "team_shutdown_agent",
-        "team_list_models",
     ];
     for tool in expected_tools {
         assert!(prompt.contains(tool), "missing tool: {tool}");

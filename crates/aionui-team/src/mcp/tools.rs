@@ -52,8 +52,8 @@ pub struct SendMessageInput {
 
 /// Arguments for the `team_spawn_agent` MCP tool call.
 ///
-/// Team spawning is assistant-first. The MCP tool only accepts
-/// `assistant_id` and optional `model`.
+/// Team spawning is assistant-first. The MCP tool accepts an assistant identity;
+/// model selection comes from the assistant configuration or UI model selector.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnAgentInput {
@@ -61,8 +61,6 @@ pub struct SpawnAgentInput {
     #[serde(default)]
     #[serde(alias = "assistantId")]
     pub assistant_id: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,13 +339,16 @@ mod tests {
     }
 
     #[test]
-    fn team_spawn_agent_schema_exposes_model_and_assistant_id_only() {
+    fn team_spawn_agent_schema_exposes_assistant_id_without_model_override() {
         let desc = all_tool_descriptors()
             .into_iter()
             .find(|d| d.name == "team_spawn_agent")
             .unwrap();
         let props = desc.input_schema["properties"].as_object().unwrap();
-        assert!(props.contains_key("model"), "schema must expose 'model' field");
+        assert!(
+            !props.contains_key("model"),
+            "team_spawn_agent must not expose model override; model comes from assistant configuration/UI"
+        );
         assert!(
             props.contains_key("assistant_id"),
             "schema must expose 'assistant_id' field"
@@ -368,6 +369,17 @@ mod tests {
         }));
 
         assert!(result.is_err(), "role must be denied as an unknown field");
+    }
+
+    #[test]
+    fn team_spawn_agent_rejects_model_argument() {
+        let result = serde_json::from_value::<SpawnAgentInput>(json!({
+            "name": "Helper",
+            "assistant_id": "word-creator",
+            "model": "claude-sonnet-4"
+        }));
+
+        assert!(result.is_err(), "model must be denied as an unknown field");
     }
 
     #[test]
@@ -622,6 +634,7 @@ mod tests {
         let props = desc.input_schema["properties"].as_object().unwrap();
         let assistant_desc = props["assistant_id"]["description"].as_str().unwrap();
         assert!(assistant_desc.starts_with("Assistant ID to spawn"));
+        assert!(!props.contains_key("model"));
         assert!(!props.contains_key("agent_type"));
         assert!(!props.contains_key("backend"));
     }
@@ -632,10 +645,9 @@ mod tests {
             .into_iter()
             .find(|d| d.name == "team_spawn_agent")
             .unwrap();
-        assert!(
-            desc.description
-                .contains("recommended assistant, and recommended model")
-        );
+        assert!(desc.description.contains("recommended assistant"));
+        assert!(!desc.description.contains("recommended model"));
+        assert!(!desc.description.contains("model parameter"));
         assert!(!desc.description.contains("recommended assistant or backend"));
     }
 

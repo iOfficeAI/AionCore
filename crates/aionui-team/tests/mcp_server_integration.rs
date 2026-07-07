@@ -386,7 +386,27 @@ async fn ts3_send_message_to_nonexistent_agent() {
 
     assert!(is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(text.contains("No agent matches 'nonexistent'"));
+    assert!(text.contains("expected slot_id or \"*\""), "unexpected error: {text}");
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn team_send_message_rejects_display_name_target() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+
+    let resp = call_tool(
+        &mut stream,
+        2,
+        "team_send_message",
+        json!({"to": "Worker", "message": "Hello by name"}),
+    )
+    .await;
+
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(text.contains("expected slot_id or \"*\""), "unexpected error: {text}");
 
     env.server.stop();
 }
@@ -747,6 +767,26 @@ async fn tra1_rename_existing_agent() {
     assert_eq!(payload["action"], "agent_renamed");
     assert_eq!(payload["agent"]["slot_id"], "worker-1");
     assert_eq!(payload["agent"]["name"], "Senior Worker");
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn team_rename_agent_rejects_display_name_target() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+
+    let resp = call_tool(
+        &mut stream,
+        2,
+        "team_rename_agent",
+        json!({"slot_id": "Worker", "new_name": "Senior Worker"}),
+    )
+    .await;
+
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(text.contains("expected slot_id"), "unexpected error: {text}");
 
     env.server.stop();
 }

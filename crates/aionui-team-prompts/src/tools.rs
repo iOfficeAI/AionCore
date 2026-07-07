@@ -31,14 +31,14 @@ Use this only when one of the following is true:
 Before calling this tool in the normal planning flow:
 - Start with one short sentence explaining why additional teammates would help
 - Tell the user which teammate(s) you recommend
-- Present the proposal as a table with: name, responsibility, recommended assistant, and recommended model
-- Include each teammate's responsibility, recommended assistant, and model
+- Present the proposal as a table with: name, responsibility, and recommended assistant
+- Include each teammate's responsibility and recommended assistant
 - Ask whether to create them as proposed or change any names, responsibilities, or assistant choices
 - In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well
 - Do NOT call this tool in that same turn; wait for explicit approval in a later user message
 
 When calling this tool, always provide assistant_id from the available assistants catalog.
-When calling this tool, provide the model parameter if a specific model was recommended and approved.
+Do not provide a model. The new teammate uses the selected assistant's configured/default model; users can adjust models from the UI model selector.
 
 The new agent will be created and added to the team. You can then assign tasks and send messages to it."#;
 
@@ -46,10 +46,11 @@ pub const TEAM_LIST_MODELS_DESCRIPTION: &str =
     "Query available models for assistant backends. Returns the real-time model list that matches the frontend model selector.
 
 Use this to:
-- Check what models are available before spawning an assistant-backed teammate with a specific model
+- Inspect what models are available for a selected assistant/backend
 - See all available backends and their models at once
-- Verify a model ID is valid for the backend behind a chosen assistant or fallback backend
+- Diagnose model availability shown by the UI
 
+This tool is informational. Do not use it to choose or pass a model to team_spawn_agent.
 Pass assistant_id to query models for a specific assistant, or omit it to see all backends.";
 
 pub const TEAM_DESCRIBE_ASSISTANT_DESCRIPTION: &str =
@@ -90,7 +91,6 @@ pub fn team_tool_specs() -> Vec<TeamToolSpec> {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Agent display name" },
-                    "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be valid for the chosen assistant backend. Query team_list_models to see available models." },
                     "assistant_id": { "type": "string", "description": "Assistant ID to spawn. Call team_list_assistants when you need candidates; the runtime backend is derived from this assistant." }
                 },
                 "required": ["name", "assistant_id"]

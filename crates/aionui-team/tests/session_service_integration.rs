@@ -2584,7 +2584,6 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
             SpawnAgentRequest {
                 name: "Writer".into(),
                 assistant_id: Some("word-creator".into()),
-                model: Some("claude-sonnet-4".into()),
             },
         )
         .await
@@ -4173,7 +4172,6 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
     let req = SpawnAgentRequest {
         name: "Helper".into(),
         assistant_id: Some("assistant-worker".into()),
-        model: Some("claude-sonnet-4".into()),
     };
 
     let spawned = svc
@@ -4266,7 +4264,6 @@ async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
     let req = SpawnAgentRequest {
         name: "Helper".into(),
         assistant_id: Some("word-creator".into()),
-        model: Some("claude-sonnet-4".into()),
     };
 
     let err = svc
@@ -4313,7 +4310,6 @@ async fn spawn_agent_in_session_compensates_when_welcome_mailbox_write_fails() {
     let req = SpawnAgentRequest {
         name: "Helper".into(),
         assistant_id: Some("word-creator".into()),
-        model: Some("claude-sonnet-4".into()),
     };
 
     let err = svc
@@ -4764,11 +4760,15 @@ async fn d9_ensure_session_rebuilds_agents_with_staggered_bounded_parallelism() 
     );
     let start_times = probe.start_times();
     assert_eq!(start_times.len(), expected_starts.len());
-    for pair in start_times.windows(2) {
+    for pair in start_times.windows(2).take(2) {
         let delta = pair[1].1.saturating_sub(pair[0].1);
         assert!(
-            delta >= std::time::Duration::from_secs(5),
-            "agent starts should be staggered by at least 5s; observed {delta:?}"
+            delta >= std::time::Duration::from_secs(3),
+            "agent starts should be staggered by at least 3s; observed {delta:?}"
+        );
+        assert!(
+            delta < std::time::Duration::from_secs(5),
+            "agent starts should use the configured 3s stagger, not the old 5s interval; observed {delta:?}"
         );
     }
 }

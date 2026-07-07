@@ -569,17 +569,23 @@ async fn exec_describe_assistant(args: &Value, service: &Weak<TeamSessionService
 // Individual tool handlers
 // ---------------------------------------------------------------------------
 
-async fn resolve_agent_target(scheduler: &TeammateManager, target: &str) -> Result<String, String> {
+async fn resolve_agent_target(
+    scheduler: &TeammateManager,
+    target: &str,
+    allow_broadcast: bool,
+) -> Result<String, String> {
     let agents = scheduler.list_agents().await;
     if agents.iter().any(|a| a.slot_id == target) {
         return Ok(target.to_owned());
     }
-    let query = target.to_lowercase();
-    let hits: Vec<_> = agents.iter().filter(|a| a.name.to_lowercase() == query).collect();
-    match hits.len() {
-        0 => Err(format!("No agent matches '{target}'")),
-        1 => Ok(hits[0].slot_id.clone()),
-        _ => Err(format!("Multiple agents match '{target}'")),
+    if allow_broadcast {
+        Err(format!(
+            "Invalid agent target '{target}': expected slot_id or \"*\". Call team_members to get slot_id."
+        ))
+    } else {
+        Err(format!(
+            "Invalid agent target '{target}': expected slot_id. Call team_members to get slot_id."
+        ))
     }
 }
 
@@ -648,7 +654,7 @@ async fn exec_send_message(
     let resolved_to = if input.to == "*" {
         "*".to_owned()
     } else {
-        resolve_agent_target(scheduler, &input.to)
+        resolve_agent_target(scheduler, &input.to, true)
             .await
             .map_err(ToolCallError::from_message)?
     };
@@ -747,6 +753,11 @@ async fn exec_spawn_agent(
             "agent_type is no longer accepted; use assistant_id",
         ));
     }
+    if args.get("model").is_some() {
+        return Err(ToolCallError::from_message(
+            "model is no longer accepted; use the assistant configuration or UI model selector",
+        ));
+    }
 
     let input: SpawnAgentInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
@@ -765,7 +776,6 @@ async fn exec_spawn_agent(
     let req = SpawnAgentRequest {
         name: requested_name.clone(),
         assistant_id: Some(assistant_id),
-        model: input.model,
     };
 
     let service = service
@@ -862,7 +872,7 @@ async fn exec_rename_agent(
     let input: RenameAgentInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
-    let resolved_slot = resolve_agent_target(scheduler, &input.slot_id)
+    let resolved_slot = resolve_agent_target(scheduler, &input.slot_id, false)
         .await
         .map_err(ToolCallError::from_message)?;
 
@@ -906,7 +916,7 @@ async fn exec_shutdown_agent(
     let input: ShutdownAgentInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
-    let target_slot_id = resolve_agent_target(scheduler, &input.slot_id)
+    let target_slot_id = resolve_agent_target(scheduler, &input.slot_id, false)
         .await
         .map_err(ToolCallError::from_message)?;
     let service = service
@@ -1164,14 +1174,29 @@ mod tests {
         let service: Weak<TeamSessionService> = Weak::new();
         let args = json!({
             "name": "Helper",
-            "assistant_id": "word-creator",
-            "model": "claude-sonnet-4"
+            "assistant_id": "word-creator"
         });
         let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
         let err = result.expect_err("dead Weak<TeamSessionService> must not succeed");
         assert!(
             err.message.contains("Team service not available"),
             "dead service weak must surface the unavailable message, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_spawn_agent_rejects_model_override() {
+        let service: Weak<TeamSessionService> = Weak::new();
+        let args = json!({
+            "name": "Helper",
+            "assistant_id": "word-creator",
+            "model": "claude-sonnet-4"
+        });
+        let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
+        let err = result.expect_err("model override must be rejected before service lookup");
+        assert!(
+            err.message.contains("model is no longer accepted"),
+            "expected explicit model rejection, got {err:?}"
         );
     }
 

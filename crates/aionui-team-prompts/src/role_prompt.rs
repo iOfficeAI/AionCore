@@ -119,7 +119,7 @@ Name: {{AGENT_NAME}}, Role: {{ROLE_DESC}}
 
 ## Your Team
 Team: {{TEAM_NAME}}
-Leader: {{LEADER_NAME}}{{WORKSPACE}}
+Leader: {{LEADER_NAME}} (slot_id: {{LEADER_SLOT_ID}}){{WORKSPACE}}
 
 ## Team Coordination Tools
 You MUST use the `team_*` MCP tools for ALL team coordination.
@@ -128,6 +128,10 @@ TaskCreate, TaskUpdate). Do NOT use those — they belong to a different
 system and will break team coordination. Always use the `team_*` versions.
 
 Use `team_task_list` and `team_members` to check current team state.
+Display names are only for user-facing text. For tool arguments such as
+`team_send_message.to`, `team_rename_agent.slot_id`, and
+`team_shutdown_agent.slot_id`, use `slot_id` values from this prompt or the
+latest `team_members` result. Never pass display names as agent targets.
 
 ## How to Work
 1. Read your unread messages to understand your assignment
@@ -135,7 +139,7 @@ Use `team_task_list` and `team_members` to check current team state.
 3. Use team_task_update to mark your task as "in_progress" when you start
 4. Do the actual work (read files, write code, search, etc.)
 5. When done, use team_task_update to mark the task "completed"
-6. Use team_send_message to report results to the leader
+6. Use team_send_message to report results to the leader slot_id
 
 ## Standing By (CRITICAL — read carefully)
 "Standing by" or "waiting" means **end your current turn**, not generate idle text in a live LLM stream. The system holds you in an idle state and re-wakes you the instant new mailbox messages arrive — there is nothing you need to do meanwhile.
@@ -146,7 +150,7 @@ You are in a "standing by" situation when ANY of these is true:
 - You finished your current task and have nothing else assigned
 
 **The correct way to stand by:**
-1. (Optional) Send ONE short acknowledgement via `team_send_message` to the leader, e.g. `"Acknowledged, standing by until reviewer-1 finishes"` or `"Ready, no task yet — standing by"`
+1. (Optional) Send ONE short acknowledgement via `team_send_message` to the leader slot_id, e.g. `"Acknowledged, standing by until reviewer-1 finishes"` or `"Ready, no task yet — standing by"`
 2. **STOP GENERATING.** Do NOT continue producing text like "I am waiting...", "still standing by...", reasoning loops, or repeated status updates. End your turn and return control.
 
 **Why this matters:** if you keep your turn open while "waiting", your underlying LLM request stays open and will hit the provider's hard request timeout (often 300 seconds) — the system will then mark you as failed. Ending the turn is the correct, lossless way to wait. The mailbox + wake mechanism guarantees you will be re-activated the moment work is ready for you.
@@ -185,6 +189,7 @@ Always use the team workspace path for any project-related operations."
         .replace("{{ROLE_DESC}}", &role_description(&params.agent.backend))
         .replace("{{TEAM_NAME}}", params.team_name)
         .replace("{{LEADER_NAME}}", &params.leader.name)
+        .replace("{{LEADER_SLOT_ID}}", &params.leader.slot_id)
         .replace("{{WORKSPACE}}", &workspace_section)
 }
 
@@ -258,7 +263,10 @@ mod tests {
 
         assert!(prompt.contains("## Team Governance"));
         assert!(prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
-        assert!(prompt.contains("Use team_send_message to report results to the leader"));
+        assert!(prompt.contains("Use team_send_message to report results to the leader slot_id"));
+        assert!(prompt.contains("Leader: Lead (slot_id: lead-1)"));
+        assert!(prompt.contains("Display names are only for user-facing text"));
+        assert!(prompt.contains("Never pass display names as agent targets"));
         assert!(prompt.contains("STOP GENERATING"));
         assert!(!prompt.contains("Teammates: Worker"));
     }

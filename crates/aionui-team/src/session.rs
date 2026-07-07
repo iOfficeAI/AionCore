@@ -69,7 +69,6 @@ pub struct AgentMessageQueueResult {
 pub struct SpawnAgentRequest {
     pub name: String,
     pub assistant_id: Option<String>,
-    pub model: Option<String>,
 }
 
 pub(crate) enum SpawnWakePlan {
@@ -1435,12 +1434,7 @@ impl TeamSession {
         // capability checks. Assistant spawns derive backend from the preset
         // identity rather than inheriting the caller backend.
         let (backend, model) = service
-            .resolve_spawn_backend_and_model(
-                Some(assistant_id),
-                req.model.as_deref(),
-                caller.backend.as_str(),
-                caller.model.as_str(),
-            )
+            .resolve_spawn_backend_and_model(Some(assistant_id), None, caller.backend.as_str(), caller.model.as_str())
             .await?;
 
         // Step 4: backend capability check. Hard whitelist passes immediately;
@@ -3056,7 +3050,6 @@ mod tests {
         SpawnAgentRequest {
             name: "Helper".into(),
             assistant_id: Some("word-creator".into()),
-            model: None,
         }
     }
 
@@ -3781,7 +3774,6 @@ mod tests {
         SpawnAgentRequest {
             name: "Helper".into(),
             assistant_id: assistant_id.map(str::to_owned),
-            model: None,
         }
     }
 
