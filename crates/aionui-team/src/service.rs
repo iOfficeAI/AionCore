@@ -615,6 +615,13 @@ impl TeamSessionService {
     }
 
     pub async fn rename_agent(&self, user_id: &str, team_id: &str, slot_id: &str, name: &str) -> Result<(), TeamError> {
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
         let mut team = self.load_owned_team(user_id, team_id).await?;
 
         let normalized = crate::scheduler::normalize_name(name);

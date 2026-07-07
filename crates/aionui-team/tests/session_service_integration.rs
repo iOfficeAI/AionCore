@@ -5223,6 +5223,60 @@ async fn ensure_session_serializes_manual_remove_until_rebuild_completes() {
     assert!(agents.iter().all(|agent| agent.slot_id != worker_slot));
 }
 
+#[tokio::test]
+async fn ensure_session_serializes_manual_rename_until_rebuild_completes() {
+    let build_started = Arc::new(tokio::sync::Notify::new());
+    let release_build = Arc::new(tokio::sync::Notify::new());
+    let (svc, _tm) = setup_with_factory(blocking_first_build_factory(
+        Arc::clone(&build_started),
+        Arc::clone(&release_build),
+    ));
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker_slot = created.assistants[1].slot_id.clone();
+
+    let svc_for_ensure = Arc::clone(&svc);
+    let ensure_team_id = created.id.clone();
+    let ensure_handle = tokio::spawn(async move { svc_for_ensure.ensure_session("user1", &ensure_team_id).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), build_started.notified())
+        .await
+        .expect("ensure_session should start rebuilding before mutation attempt");
+
+    let svc_for_rename = Arc::clone(&svc);
+    let rename_team_id = created.id.clone();
+    let rename_slot = worker_slot.clone();
+    let mut rename_handle = tokio::spawn(async move {
+        svc_for_rename
+            .rename_agent("user1", &rename_team_id, &rename_slot, "Senior Worker")
+            .await
+    });
+
+    tokio::select! {
+        result = &mut rename_handle => panic!("rename_agent completed while ensure_session was rebuilding: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+    }
+
+    release_build.notify_waiters();
+    ensure_handle.await.unwrap().unwrap();
+    rename_handle.await.unwrap().unwrap();
+
+    let scheduler = svc
+        .get_session_scheduler(&created.id)
+        .expect("session should be registered after ensure_session");
+    let agents = scheduler.list_agents().await;
+    let renamed = agents.iter().find(|agent| agent.slot_id == worker_slot).unwrap();
+    assert_eq!(renamed.name, "Senior Worker");
+}
+
 // ===========================================================================
 // Test: D11.5 remove_team cascades kill to every agent process
 // ===========================================================================
