@@ -29,6 +29,7 @@ pub(super) async fn build(
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
     let mut overrides = build_context.config;
+    let resolved_skills = overrides.skills.clone();
 
     // Merge preset assistant rules into system_prompt (used as custom_prompt
     // in aionrs's build_system_prompt). Mirrors the old architecture's
@@ -166,9 +167,11 @@ pub(super) async fn build(
         compat_overrides,
         session_directory,
         session_mode: overrides.session_mode,
+        skills: resolved_skills,
         extra_mcp_servers,
         bedrock_config,
         runtime_env: ctx.runtime_env,
+        prompt_dump_dir: crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts),
     };
 
     if let Some(system_prompt) = config.system_prompt.as_deref()
