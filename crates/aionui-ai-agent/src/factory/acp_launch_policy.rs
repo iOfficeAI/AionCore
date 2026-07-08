@@ -218,8 +218,10 @@ mod tests {
 
     #[test]
     fn initial_mode_from_build_context_prefers_persisted_snapshot() {
-        let mut snapshot = PersistedSessionState::default();
-        snapshot.current_mode_id = Some(crate::shared_kernel::ModeId::new("full-access"));
+        let snapshot = PersistedSessionState {
+            current_mode_id: Some(crate::shared_kernel::ModeId::new("full-access")),
+            ..Default::default()
+        };
         let config = AcpBuildExtra {
             session_mode: Some("auto".into()),
             ..Default::default()

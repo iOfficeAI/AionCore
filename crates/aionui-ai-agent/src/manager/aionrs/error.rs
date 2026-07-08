@@ -35,10 +35,10 @@ pub(super) fn aionrs_engine_error_to_send_error(error: &AionrsAgentError) -> Age
 fn aionrs_provider_error_to_send_error(error: &ProviderError, detail: String) -> AgentSendError {
     match error {
         ProviderError::Api { status, .. } => aionrs_provider_status_to_send_error(*status, detail),
-        ProviderError::RateLimited { .. } => provider_send_error(
+        ProviderError::RateLimited { body, .. } => provider_send_error(
             "The model provider rate limited the request",
             AgentErrorCode::UserLlmProviderRateLimited,
-            detail,
+            append_provider_body(detail, body.as_deref()),
             true,
             AgentErrorResolutionKind::Retry,
             None,
@@ -181,6 +181,19 @@ fn unknown_upstream_send_error(detail: String) -> AgentSendError {
     )
 }
 
+/// Append the raw upstream response body (if any) to the detail string so
+/// the UI's technical-details drawer surfaces provider-specific hints such
+/// as `insufficient_quota`, `payment_required`, or per-endpoint rate-limit
+/// notes. The body is passed through the existing `sanitize_error_detail`
+/// pipeline downstream (redaction + truncation), so no extra scrubbing is
+/// needed here.
+fn append_provider_body(detail: String, body: Option<&str>) -> String {
+    match body.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(body) => format!("{detail}\nProvider response: {body}"),
+        None => detail,
+    }
+}
+
 fn tool_call_failure_send_error(detail: String) -> AgentSendError {
     AgentSendError::new(
         "The upstream Agent repeatedly failed while executing tool calls",
@@ -211,6 +224,77 @@ mod tests {
             Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
         );
         assert_eq!(send_error.stream_error().retryable, Some(false));
+    }
+
+    #[test]
+    fn aionrs_provider_rate_limited_appends_response_body_to_detail() {
+        let error = AionrsAgentError::Provider(ProviderError::RateLimited {
+            retry_after_ms: 5000,
+            body: Some(
+                r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#.to_owned(),
+            ),
+        });
+        let send_error = aionrs_engine_error_to_send_error(&error);
+
+        assert_eq!(
+            send_error.code(),
+            Some(aionui_api_types::AgentErrorCode::UserLlmProviderRateLimited)
+        );
+        let detail = send_error
+            .stream_error()
+            .detail
+            .as_deref()
+            .expect("rate-limited errors must carry a detail");
+        assert!(
+            detail.contains("Provider response: "),
+            "detail should include the provider body marker; got: {detail}"
+        );
+        assert!(
+            detail.contains("insufficient_quota"),
+            "detail should surface the raw provider signal; got: {detail}"
+        );
+    }
+
+    #[test]
+    fn aionrs_provider_rate_limited_without_body_falls_back_to_bare_detail() {
+        let error = AionrsAgentError::Provider(ProviderError::RateLimited {
+            retry_after_ms: 5000,
+            body: None,
+        });
+        let send_error = aionrs_engine_error_to_send_error(&error);
+
+        let detail = send_error
+            .stream_error()
+            .detail
+            .as_deref()
+            .expect("rate-limited errors must carry a detail");
+        assert!(
+            !detail.contains("Provider response:"),
+            "detail must not add the body marker when body is absent; got: {detail}"
+        );
+        assert!(
+            detail.contains("Rate limited"),
+            "detail should still include the base message; got: {detail}"
+        );
+    }
+
+    #[test]
+    fn aionrs_provider_rate_limited_ignores_whitespace_only_body() {
+        let error = AionrsAgentError::Provider(ProviderError::RateLimited {
+            retry_after_ms: 5000,
+            body: Some("   \n\t  ".to_owned()),
+        });
+        let send_error = aionrs_engine_error_to_send_error(&error);
+
+        let detail = send_error
+            .stream_error()
+            .detail
+            .as_deref()
+            .expect("rate-limited errors must carry a detail");
+        assert!(
+            !detail.contains("Provider response:"),
+            "whitespace-only body should be treated as absent; got: {detail}"
+        );
     }
 
     #[test]

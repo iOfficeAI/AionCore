@@ -1,7 +1,5 @@
-use std::ffi::OsString;
-use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aion_agent::bootstrap::AgentBootstrap;
@@ -34,7 +32,6 @@ use super::error::aionrs_engine_error_to_send_error;
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
-    runtime_env: Vec<(String, String)>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
     slash_commands: Vec<SlashCommandItem>,
@@ -62,62 +59,6 @@ impl Drop for AionrsAgentManager {
         // connection. This impl exists to document the intentional Drop-order
         // semantics rather than as a lint escape hatch.
     }
-}
-
-static AIONRS_RUNTIME_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-struct RuntimeEnvGuard {
-    previous: Vec<(String, Option<OsString>)>,
-}
-
-impl RuntimeEnvGuard {
-    fn apply(runtime_env: &[(String, String)]) -> Self {
-        let previous = runtime_env
-            .iter()
-            .map(|(key, _)| (key.clone(), std::env::var_os(key)))
-            .collect();
-
-        for (key, value) in runtime_env {
-            // SAFETY: aionrs v0.1.37 has no API for per-command env injection.
-            // AIONRS_RUNTIME_ENV_LOCK serializes all aionrs turns using this bridge,
-            // and the guard restores every changed key when the future completes or
-            // is cancelled.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-        }
-
-        Self { previous }
-    }
-}
-
-impl Drop for RuntimeEnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.previous.iter().rev() {
-            // SAFETY: see RuntimeEnvGuard::apply. Restoration happens while the
-            // same process-wide aionrs env lock is still held.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
-}
-
-async fn run_with_runtime_env<F, T>(runtime_env: &[(String, String)], future: F) -> T
-where
-    F: Future<Output = T>,
-{
-    if runtime_env.is_empty() {
-        return future.await;
-    }
-
-    let lock = AIONRS_RUNTIME_ENV_LOCK.get_or_init(|| Mutex::new(()));
-    let _lock = lock.lock().await;
-    let _guard = RuntimeEnvGuard::apply(runtime_env);
-    future.await
 }
 
 impl AionrsAgentManager {
@@ -168,7 +109,7 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink);
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,
@@ -226,7 +167,6 @@ impl AionrsAgentManager {
         Ok(Self {
             runtime,
             engine: Mutex::new(engine),
-            runtime_env,
             slash_commands,
             mcp_managers: result.mcp_managers,
             approval_manager,
@@ -299,7 +239,7 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         let mut engine = self.engine.lock().await;
 
         let result = tokio::select! {
-            res = run_with_runtime_env(&self.runtime_env, engine.run(&data.content, &data.msg_id)) => Some(res),
+            res = engine.run(&data.content, &data.msg_id) => Some(res),
             _ = self.cancel_notify.notified() => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
@@ -555,30 +495,6 @@ mod tests {
             extra_mcp_servers: std::collections::HashMap::new(),
             bedrock_config: None,
             runtime_env: Vec::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn run_with_runtime_env_sets_values_during_future_and_restores_after() {
-        const KEY: &str = "AIONUI_TEST_RUNTIME_ENV_BRIDGE";
-        let original = std::env::var_os(KEY);
-        unsafe {
-            std::env::set_var(KEY, "original");
-        }
-
-        let observed = run_with_runtime_env(&[(KEY.to_owned(), "in-turn".to_owned())], async {
-            std::env::var(KEY).unwrap()
-        })
-        .await;
-
-        assert_eq!(observed, "in-turn");
-        assert_eq!(std::env::var(KEY).unwrap(), "original");
-
-        unsafe {
-            match original {
-                Some(value) => std::env::set_var(KEY, value),
-                None => std::env::remove_var(KEY),
-            }
         }
     }
 
