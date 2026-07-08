@@ -1061,10 +1061,7 @@ mod tests {
         };
         let args = TaskListParams {
             owner: Some("worker-1".into()),
-            status: Some(TaskListStatusParam::Many(vec![
-                "pending".into(),
-                "in_progress".into(),
-            ])),
+            status: Some(TaskListStatusParam::Many(vec!["pending".into(), "in_progress".into()])),
             include_deleted: Some(false),
             limit: Some(50),
         };

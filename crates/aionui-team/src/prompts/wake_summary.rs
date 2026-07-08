@@ -23,14 +23,8 @@ pub(super) fn render_task_board_summary(agent: &TeamAgent, tasks: &[TeamTask]) -
         .iter()
         .filter(|task| task.status == TaskStatus::Completed)
         .count();
-    let total_completed = tasks
-        .iter()
-        .filter(|task| task.status == TaskStatus::Completed)
-        .count();
-    let total_deleted = tasks
-        .iter()
-        .filter(|task| task.status == TaskStatus::Deleted)
-        .count();
+    let total_completed = tasks.iter().filter(|task| task.status == TaskStatus::Completed).count();
+    let total_deleted = tasks.iter().filter(|task| task.status == TaskStatus::Deleted).count();
     let hidden_completed = total_completed.saturating_sub(displayed_completed);
     let hidden_deleted = total_deleted;
     let hidden_over_limit = tasks
@@ -316,14 +310,7 @@ mod tests {
     #[test]
     fn deleted_tasks_are_hidden_and_counted() {
         let tasks = vec![
-            task(
-                "aaaaaaaa-1111",
-                "Active",
-                TaskStatus::Pending,
-                Some("worker-1"),
-                1,
-                1,
-            ),
+            task("aaaaaaaa-1111", "Active", TaskStatus::Pending, Some("worker-1"), 1, 1),
             task(
                 "dddddddd-1111",
                 "Deleted history",
@@ -386,24 +373,10 @@ mod tests {
 
     #[test]
     fn active_dependency_neighbors_sort_after_owned_tasks() {
-        let mut owned = task(
-            "ownedaaa-1111",
-            "Owned",
-            TaskStatus::InProgress,
-            Some("worker-1"),
-            1,
-            1,
-        );
+        let mut owned = task("ownedaaa-1111", "Owned", TaskStatus::InProgress, Some("worker-1"), 1, 1);
         owned.blocked_by = vec!["blockera-1111".to_owned()];
         owned.blocks = vec!["downstrm-1111".to_owned()];
-        let blocker = task(
-            "blockera-1111",
-            "Blocker",
-            TaskStatus::Pending,
-            Some("worker-2"),
-            2,
-            20,
-        );
+        let blocker = task("blockera-1111", "Blocker", TaskStatus::Pending, Some("worker-2"), 2, 20);
         let downstream = task(
             "downstrm-1111",
             "Downstream",
@@ -428,14 +401,7 @@ mod tests {
 
     #[test]
     fn reverse_blocked_by_downstream_sorts_after_owned_tasks() {
-        let owned = task(
-            "ownedaaa-1111",
-            "Owned",
-            TaskStatus::InProgress,
-            Some("worker-1"),
-            1,
-            1,
-        );
+        let owned = task("ownedaaa-1111", "Owned", TaskStatus::InProgress, Some("worker-1"), 1, 1);
         let mut downstream = task(
             "downstrm-1111",
             "Downstream reverse",
@@ -460,14 +426,7 @@ mod tests {
 
     #[test]
     fn completed_and_deleted_do_not_create_dependency_priority() {
-        let mut owned = task(
-            "ownedaaa-1111",
-            "Owned",
-            TaskStatus::InProgress,
-            Some("worker-1"),
-            1,
-            1,
-        );
+        let mut owned = task("ownedaaa-1111", "Owned", TaskStatus::InProgress, Some("worker-1"), 1, 1);
         owned.blocked_by = vec!["doneaaaa-1111".to_owned(), "delddddd-1111".to_owned()];
         let completed = task(
             "doneaaaa-1111",
@@ -604,9 +563,9 @@ mod tests {
         );
         active.blocked_by = vec!["bbbbbbbb-1234-5678".to_owned()];
         let payload = render_task_board_summary(&agent("worker-1"), &[active]);
-        assert!(payload.contains(
-            "| aaaaaaaa… | Active | pending | 019f4056-fd18-7411-ab09-8868ff17cb36 | bbbbbbbb… |"
-        ));
+        assert!(
+            payload.contains("| aaaaaaaa… | Active | pending | 019f4056-fd18-7411-ab09-8868ff17cb36 | bbbbbbbb… |")
+        );
         assert!(!payload.contains("bbbbbbbb-1234-5678"));
     }
 }

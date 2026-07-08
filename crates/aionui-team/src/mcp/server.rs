@@ -796,7 +796,9 @@ fn parse_task_list_filters(args: &Value) -> Result<TaskListFilters, ToolCallErro
     };
     let limit = match input.limit {
         Some(value) if value <= 0 => {
-            return Err(ToolCallError::from_message("Invalid params: limit must be greater than 0"));
+            return Err(ToolCallError::from_message(
+                "Invalid params: limit must be greater than 0",
+            ));
         }
         Some(value) => Some((value as usize).min(MAX_TASK_LIST_LIMIT)),
         None => None,

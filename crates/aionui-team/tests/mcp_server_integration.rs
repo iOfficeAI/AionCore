@@ -716,12 +716,7 @@ async fn ttl4_task_list_filters_owner_status_include_deleted_and_limit() {
     assert_eq!(pending_tasks.len(), 2);
     assert!(pending_tasks.iter().all(|task| task["status"] == "pending"));
 
-    let active_tasks = list_tasks_with_args(
-        &mut stream,
-        10,
-        json!({"status": ["pending", "in_progress"]}),
-    )
-    .await;
+    let active_tasks = list_tasks_with_args(&mut stream, 10, json!({"status": ["pending", "in_progress"]})).await;
     assert_eq!(active_tasks.len(), 3);
     assert!(active_tasks.iter().any(|task| task["id"] == worker_progress));
     assert!(!active_tasks.iter().any(|task| task["id"] == deleted));
