@@ -127,10 +127,10 @@ fn compare_same_status_recency(left: &TeamTask, right: &TeamTask) -> Ordering {
             .updated_at
             .cmp(&left.updated_at)
             .then_with(|| left.created_at.cmp(&right.created_at)),
-        TaskStatus::Pending => left
-            .created_at
-            .cmp(&right.created_at)
-            .then_with(|| right.updated_at.cmp(&left.updated_at)),
+        TaskStatus::Pending => right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.created_at.cmp(&right.created_at)),
         TaskStatus::Completed | TaskStatus::Deleted => Ordering::Equal,
     }
 }
@@ -340,7 +340,8 @@ mod tests {
         assert_eq!(row_count(&payload), MAX_WAKE_TASK_ROWS);
         assert!(payload.contains("Showing 40 of 45 tasks."));
         assert!(payload.contains("Hidden: completed=0, deleted=0, over_limit=5."));
-        assert!(!payload.contains("Active 44"));
+        assert!(payload.contains("| task0044… | Active 44 | pending | worker-2 | - |"));
+        assert!(!payload.contains("| task0004… | Active 4 | pending | worker-2 | - |"));
     }
 
     #[test]
@@ -485,6 +486,30 @@ mod tests {
         let payload = render_task_board_summary(&agent("worker-1"), &tasks);
         assert!(payload.find("In progress new").unwrap() < payload.find("In progress old").unwrap());
         assert!(payload.find("In progress old").unwrap() < payload.find("Pending newest").unwrap());
+    }
+
+    #[test]
+    fn pending_tasks_with_same_priority_sort_by_updated_at_desc() {
+        let tasks = vec![
+            task(
+                "aaaaaaaa-1111",
+                "Pending older update",
+                TaskStatus::Pending,
+                Some("worker-2"),
+                1,
+                10,
+            ),
+            task(
+                "bbbbbbbb-1111",
+                "Pending newer update",
+                TaskStatus::Pending,
+                Some("worker-2"),
+                2,
+                20,
+            ),
+        ];
+        let payload = render_task_board_summary(&agent("worker-1"), &tasks);
+        assert!(payload.find("Pending newer update").unwrap() < payload.find("Pending older update").unwrap());
     }
 
     #[test]
