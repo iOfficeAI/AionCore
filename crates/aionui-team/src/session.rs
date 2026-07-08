@@ -319,7 +319,9 @@ impl TeamSession {
 
         let first_message = if needs_role_prompt {
             let role_prompt = match agent.role {
-                TeammateRole::Lead => build_lead_prompt(&self.team.name, &self.scheduler.list_agents().await, &[]),
+                TeammateRole::Lead => {
+                    build_lead_prompt(&agent, &self.team.name, &self.scheduler.list_agents().await, &[])
+                }
                 TeammateRole::Teammate => {
                     let members = self.scheduler.list_agents().await;
                     build_teammate_prompt(&agent, &self.team.name, &members)
@@ -3206,6 +3208,9 @@ mod tests {
             "expected lead role prompt, got: {}",
             input.first_message
         );
+        assert!(input.first_message.contains("Name: Lead"));
+        assert!(input.first_message.contains("Slot ID: lead-1"));
+        assert!(input.first_message.contains("Role: lead"));
         assert!(input.first_message.contains("## Current Task Board Summary"));
         assert!(input.first_message.contains("kick off"));
         session.stop();
@@ -3243,6 +3248,7 @@ mod tests {
         assert!(content.contains("unread_count: 1\n"));
         assert!(content.contains("---- prompt ----\n"));
         assert!(content.contains("You are the Team Leader"));
+        assert!(content.contains("Slot ID: lead-1"));
         assert!(content.contains("kick off"));
         session.stop();
     }

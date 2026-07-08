@@ -304,7 +304,8 @@ fn lp1_lead_prompt_does_not_contain_member_snapshot() {
         make_agent("w2", "Bob", TeammateRole::Teammate),
     ];
     let assistants = default_assistants();
-    let prompt = build_lead_prompt("Alpha", &members, &assistants);
+    let lead = make_agent("lead-1", "Lead", TeammateRole::Lead);
+    let prompt = build_lead_prompt(&lead, "Alpha", &members, &assistants);
 
     assert!(!prompt.contains("## Your Teammates"));
     assert!(!prompt.contains("- Lead ("), "lead snapshot leaked");
@@ -318,7 +319,8 @@ fn lp1_lead_prompt_does_not_contain_member_snapshot() {
 
 #[test]
 fn lp2_lead_prompt_contains_tool_descriptions() {
-    let prompt = build_lead_prompt("Beta", &[], &default_assistants());
+    let lead = make_agent("lead-1", "Lead", TeammateRole::Lead);
+    let prompt = build_lead_prompt(&lead, "Beta", &[], &default_assistants());
 
     // AionUi lead prompt references the `team_*` coordination tools that the
     // leader must use; the MCP layer enumerates them with arguments, so the
@@ -343,7 +345,8 @@ fn lp2_lead_prompt_contains_tool_descriptions() {
 
 #[test]
 fn lp3_lead_prompt_contains_task_management_guidance() {
-    let prompt = build_lead_prompt("Gamma", &[], &default_assistants());
+    let lead = make_agent("lead-1", "Lead", TeammateRole::Lead);
+    let prompt = build_lead_prompt(&lead, "Gamma", &[], &default_assistants());
 
     assert!(
         prompt.contains("Break the work into tasks"),

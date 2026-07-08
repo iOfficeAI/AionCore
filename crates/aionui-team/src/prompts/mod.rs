@@ -34,14 +34,17 @@ fn to_prompt_agent(agent: &TeamAgent) -> aionui_team_prompts::TeamPromptAgent {
 /// staffing the team. Callers should only include assistants that are both
 /// enabled and team-selectable.
 pub fn build_lead_prompt(
+    agent: &TeamAgent,
     team_name: &str,
     members: &[TeamAgent],
     available_assistants: &[AvailableAssistant],
 ) -> String {
+    let prompt_agent = to_prompt_agent(agent);
     let prompt_members: Vec<_> = members.iter().map(to_prompt_agent).collect();
     let renamed: HashMap<String, String> = HashMap::new();
 
     let body = aionui_team_prompts::build_lead_prompt(&aionui_team_prompts::LeadPromptParams {
+        agent: &prompt_agent,
         team_name,
         teammates: &prompt_members,
         available_agent_types: &[],
@@ -199,7 +202,7 @@ mod tests {
     #[test]
     fn lead_prompt_contains_team_name() {
         let assistants = default_assistants();
-        let prompt = build_lead_prompt("Alpha", &[], &assistants);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &assistants);
         assert!(prompt.contains("\"Alpha\""));
     }
 
@@ -207,7 +210,7 @@ mod tests {
     fn lead_prompt_uses_tool_for_member_list() {
         let assistants = default_assistants();
         let members = vec![make_lead(), make_teammate("w1", "Worker1")];
-        let prompt = build_lead_prompt("Alpha", &members, &assistants);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &members, &assistants);
 
         assert!(!prompt.contains("- Lead (acp, status:"));
         assert!(!prompt.contains("- Worker1 (acp, status:"));
@@ -217,7 +220,7 @@ mod tests {
     #[test]
     fn lead_prompt_contains_core_sections() {
         let assistants = default_assistants();
-        let prompt = build_lead_prompt("Alpha", &[], &assistants);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &assistants);
 
         // Workflow uses tools for dynamic state.
         assert!(prompt.contains("## Workflow"));
@@ -253,7 +256,7 @@ mod tests {
     #[test]
     fn lead_prompt_omits_dynamic_available_assistants_section() {
         let assistants = default_assistants();
-        let prompt = build_lead_prompt("Alpha", &[], &assistants);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &assistants);
 
         assert!(!prompt.contains("## Available Assistants for Spawning"));
         assert!(!prompt.contains("- `word-creator` (Word Creator) — Drafts Word documents"));
@@ -262,14 +265,14 @@ mod tests {
 
     #[test]
     fn lead_prompt_omits_available_assistants_section_when_empty() {
-        let prompt = build_lead_prompt("Alpha", &[], &[]);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &[]);
         assert!(!prompt.contains("## Available Assistants for Spawning"));
     }
 
     #[test]
     fn lead_prompt_does_not_include_dynamic_member_snapshot() {
         let assistants = default_assistants();
-        let prompt = build_lead_prompt("Solo", &[], &assistants);
+        let prompt = build_lead_prompt(&make_lead(), "Solo", &[], &assistants);
         assert!(!prompt.contains("## Your Teammates"));
         assert!(!prompt.contains("(no teammates yet"));
         assert!(prompt.to_lowercase().contains("first team turn"));
@@ -280,7 +283,7 @@ mod tests {
     fn lead_prompt_has_no_unsubstituted_placeholders() {
         let assistants = default_assistants();
         let members = vec![make_lead(), make_teammate("w1", "Worker1")];
-        let prompt = build_lead_prompt("Alpha", &members, &assistants);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &members, &assistants);
         assert!(
             !prompt.contains("${"),
             "unsubstituted template placeholder leaked:\n{prompt}"
@@ -289,6 +292,9 @@ mod tests {
         assert!(!prompt.contains("Available Generic Backends"));
         assert!(!prompt.contains("## Your Teammates"));
         assert!(!prompt.contains("## Available Assistants for Spawning"));
+        assert!(prompt.contains("Name: Lead"));
+        assert!(prompt.contains("Slot ID: lead-1"));
+        assert!(prompt.contains("Role: lead"));
     }
 
     // -- Teammate prompt ------------------------------------------------------
