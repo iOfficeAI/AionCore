@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
+mod wake_summary;
+
 pub use aionui_team_prompts::AvailableAssistant;
 
-use crate::types::{MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask};
+use crate::types::{MailboxMessage, MailboxMessageType, TeamAgent, TeamTask};
 
 fn to_prompt_role(role: crate::types::TeammateRole) -> aionui_team_prompts::TeamPromptRole {
     match role {
@@ -106,33 +108,7 @@ pub fn build_wake_payload(agent: &TeamAgent, tasks: &[TeamTask], unread_messages
         payload.push_str("## New Messages\n\nNo new messages.\n\n");
     }
 
-    if !tasks.is_empty() {
-        payload.push_str("## Current Task Board\n\n");
-        payload.push_str("| ID | Subject | Status | Owner | Blocked By |\n");
-        payload.push_str("|---|---|---|---|---|\n");
-        for task in tasks {
-            let status = match task.status {
-                TaskStatus::Pending => "pending",
-                TaskStatus::InProgress => "in_progress",
-                TaskStatus::Completed => "completed",
-                TaskStatus::Deleted => "deleted",
-            };
-            let owner = task.owner.as_deref().unwrap_or("-");
-            let blocked = if task.blocked_by.is_empty() {
-                "-".to_owned()
-            } else {
-                task.blocked_by.join(", ")
-            };
-            let short_id = if task.id.len() > 8 { &task.id[..8] } else { &task.id };
-            payload.push_str(&format!(
-                "| {short_id}… | {} | {status} | {owner} | {blocked} |\n",
-                task.subject,
-            ));
-        }
-        payload.push('\n');
-    } else {
-        payload.push_str("## Current Task Board\n\nNo tasks on the board.\n\n");
-    }
+    payload.push_str(&wake_summary::render_task_board_summary(agent, tasks));
 
     payload.push_str(&format!(
         "You are **{}** (role: {}). Proceed with your work.\n",
@@ -145,7 +121,7 @@ pub fn build_wake_payload(agent: &TeamAgent, tasks: &[TeamTask], unread_messages
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TeammateRole;
+    use crate::types::{TaskStatus, TeammateRole};
 
     fn make_lead() -> TeamAgent {
         TeamAgent {
@@ -402,7 +378,8 @@ mod tests {
         ];
         let payload = build_wake_payload(&agent, &tasks, &[]);
 
-        assert!(payload.contains("Current Task Board"));
+        assert!(payload.contains("Current Task Board Summary"));
+        assert!(payload.contains("Showing 2 of 2 tasks."));
         assert!(payload.contains("Implement X"));
         assert!(payload.contains("in_progress"));
         assert!(payload.contains("Test Y"));
@@ -417,7 +394,9 @@ mod tests {
         task.blocked_by = vec!["task-a".into(), "task-b".into()];
         let payload = build_wake_payload(&agent, &[task], &[]);
 
-        assert!(payload.contains("task-a, task-b"));
+        assert!(payload.contains("task-a…"));
+        assert!(payload.contains("task-b…"));
+        assert!(!payload.contains("task-a, task-b"));
     }
 
     #[test]
