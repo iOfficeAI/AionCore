@@ -1200,6 +1200,15 @@ fn spawn_event_pump(
         // gets a diagnostic Tip so the user isn't left staring at an empty bubble. Set as
         // events are observed, reset at the per-turn terminal (with `tool_output`/`tool_name`).
         let mut saw_visible_output = false;
+        // Did the CURRENT turn already reach a terminal `TurnResult`? Mirrors the
+        // reducer's `Running{terminal_result_seen}` flag. The pump consumes RAW
+        // pre-reducer events, so to classify a `Detached` the way the reducer's
+        // `crash_outcome` does — a crash mid-turn (no result yet) → Crashed, a
+        // Detached AFTER the turn's result → absorbed (I10) — it must track this
+        // itself. Without it, a Detached that trails a completed turn (idle-kill,
+        // clean shutdown) would be misread as a mid-turn crash. Set on the terminal
+        // TurnResult, reset on the next TurnStarted.
+        let mut terminal_result_seen = false;
         while let Some(env) = events.next().await {
             runtime.touch();
             tracing::debug!(conv_id = %conversation_id, event = session_event_name(&env.event), "session-pump: backend event");
@@ -1340,9 +1349,18 @@ fn spawn_event_pump(
             // Drive the coarse status off the turn-boundary events so `status()`
             // reflects running/finished (the app gates the sidebar spinner on it).
             match &env.event {
-                SessionEvent::TurnStarted { .. } => runtime.set_status(ConversationStatus::Running),
+                SessionEvent::TurnStarted { .. } => {
+                    runtime.set_status(ConversationStatus::Running);
+                    // New turn: the prior turn's terminal no longer applies.
+                    terminal_result_seen = false;
+                }
                 SessionEvent::TurnResult { .. } | SessionEvent::Detached { .. } if !suppress_intermediate_finish => {
                     runtime.set_status(ConversationStatus::Finished);
+                    // A terminal TurnResult decided this turn; a later Detached is then
+                    // an absorbed teardown, not a mid-turn crash (see `crash_outcome`).
+                    if matches!(env.event, SessionEvent::TurnResult { .. }) {
+                        terminal_result_seen = true;
+                    }
                     // Empty-turn (blank-reply) diagnostic, mirroring the ACP path
                     // (agent_session_flow.rs `prompt_outcome_from_stop_reason`): a turn
                     // that reached a CLEAN terminal (`TurnResult{is_error:false}`, not
@@ -1382,7 +1400,7 @@ fn spawn_event_pump(
             if let Some(repo) = session_repo.as_ref() {
                 persist_side_effects(repo.as_ref(), &conversation_id, &env.event).await;
             }
-            for mut ev in translate_event(env.event, &conversation_id) {
+            for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
                 // Keep the tool name alive across a call's multi-frame lifecycle (see
                 // `stamp_tool_name`): the terminal ToolResult frame leaves the name
                 // empty, and the upsert-by-call_id persistence would otherwise clobber
@@ -1696,7 +1714,11 @@ fn empty_turn_tip(outcome: &aionui_session::TurnOutcome) -> Option<TipsEventData
     })
 }
 
-fn translate_event(event: SessionEvent, _conversation_id: &str) -> Vec<AgentStreamEvent> {
+/// `terminal_result_seen`: did the current turn already reach a terminal
+/// `TurnResult`? Only consulted for `Detached` — it lets this stateless fn
+/// replicate the reducer's `crash_outcome` guard (a Detached AFTER the turn's
+/// result is an absorbed teardown, not a crash). Immaterial for every other arm.
+fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_seen: bool) -> Vec<AgentStreamEvent> {
     match event {
         // NOTE: the Start lifecycle frame is emitted by `send_message` (before
         // dispatch), mirroring the ACP path which emits Start right before prompt().
@@ -1782,8 +1804,45 @@ fn translate_event(event: SessionEvent, _conversation_id: &str) -> Vec<AgentStre
             }
             vec![AgentStreamEvent::Finish(FinishEventData::default())]
         }
-        SessionEvent::Detached { .. } => {
-            vec![AgentStreamEvent::Finish(FinishEventData::default())]
+        SessionEvent::Detached { exit, redacted_summary } => {
+            // A process exit is only an ERROR when it is a genuine mid-turn crash.
+            // Classify it EXACTLY as the clean-slate reducer's `crash_outcome` does
+            // (the pump consumes raw pre-reducer events, so it must replicate that
+            // pure fn rather than inherit its verdict):
+            //   - terminal result already seen this turn → absorbed teardown (I10);
+            //   - clean exit-0, no result → EmptyTurn-class (a blank turn, not a
+            //     crash) — the empty-turn Tip already rode the status match above;
+            //   - signal / non-zero / unknown(None) exit, no result → CRASH.
+            // Only the crash case surfaces as an error; the rest end with a plain
+            // Finish (behaviour-preserving). This restores the legacy ACP path's
+            // `AcpError::Disconnected → UserAgentDisconnected` terminal that the
+            // direct-CLI bridge previously dropped: a CLI that dies mid-reply used
+            // to render as a normal (empty) completion instead of a "disconnected,
+            // reconnect" error card.
+            match aionui_session::crash_outcome(terminal_result_seen, exit) {
+                aionui_session::Outcome::Crashed => {
+                    // Route through the SAME classifier legacy used, so the frontend
+                    // gets the identical code/ownership/retryable/resolution. The
+                    // allowlisted `redacted_summary` (already stripped of secrets at
+                    // the backend boundary) rides the error message as the user-facing
+                    // reason — mirroring `CloseReason::ProcessExited: {summary}`;
+                    // without it the card shows only a bare exit code.
+                    let acp_err = crate::protocol::error::AcpError::Disconnected {
+                        exit_code: exit.and_then(|e| e.code),
+                        signal: exit.and_then(|e| e.signal).map(|s| s.to_string()),
+                        stderr: redacted_summary.clone().unwrap_or_default(),
+                    };
+                    let mut stream_error =
+                        AgentSendError::from_agent_error(AgentError::Acp(acp_err)).into_stream_error();
+                    if let Some(summary) = redacted_summary.filter(|s| !s.trim().is_empty()) {
+                        stream_error.message = format!("{}: {summary}", stream_error.message);
+                    }
+                    vec![AgentStreamEvent::Error(stream_error)]
+                }
+                aionui_session::Outcome::CleanNoResult | aionui_session::Outcome::FollowResult => {
+                    vec![AgentStreamEvent::Finish(FinishEventData::default())]
+                }
+            }
         }
         // Interactive tool approval: surface as an AcpPermission Request so the
         // frontend renders the allow/deny card. The `tool_call_id` MUST equal the
@@ -1821,7 +1880,7 @@ fn translate_event(event: SessionEvent, _conversation_id: &str) -> Vec<AgentStre
             vec![AgentStreamEvent::AcpPermission(
                 crate::protocol::events::AcpPermissionEventData::Request(
                     crate::protocol::events::AcpPermissionRequestData {
-                        session_id: _conversation_id.to_owned(),
+                        session_id: conversation_id.to_owned(),
                         tool_call: crate::protocol::events::AcpPermissionToolCall {
                             tool_call_id: request_id,
                             status: None,
@@ -2305,6 +2364,7 @@ mod translate_tests {
                 input: Some(serde_json::json!({"command": "ls"})),
             },
             "conv-1",
+            false,
         );
         assert_eq!(events.len(), 1, "permission must project to exactly one card");
         let crate::protocol::events::AgentStreamEvent::AcpPermission(
@@ -2349,6 +2409,7 @@ mod translate_tests {
                 })),
             },
             "conv-1",
+            false,
         );
         let crate::protocol::events::AgentStreamEvent::AcpPermission(
             crate::protocol::events::AcpPermissionEventData::Request(req),
@@ -2382,6 +2443,7 @@ mod translate_tests {
                 input: Some(serde_json::json!({"questions": []})),
             },
             "conv-1",
+            false,
         );
         let crate::protocol::events::AgentStreamEvent::AcpPermission(
             crate::protocol::events::AcpPermissionEventData::Request(req),
@@ -2403,6 +2465,7 @@ mod translate_tests {
                 cost_usd: Some(0.5),
             },
             "conv-1",
+            false,
         );
         assert_eq!(events.len(), 1);
         let crate::protocol::events::AgentStreamEvent::AcpContextUsage(v) = &events[0] else {
@@ -2434,6 +2497,7 @@ mod translate_tests {
                 model: Some("claude-opus-4-8".into()),
             },
             "conv-1",
+            false,
         );
         assert!(
             events.is_empty(),
@@ -2465,6 +2529,7 @@ mod translate_tests {
                 explanation: None,
             },
             "conv-1",
+            false,
         );
         assert_eq!(events.len(), 1);
         let crate::protocol::events::AgentStreamEvent::Plan(data) = &events[0] else {
@@ -2496,6 +2561,7 @@ mod translate_tests {
                 },
             },
             "conv-1",
+            false,
         );
         assert!(
             !events.iter().any(|e| matches!(e, AgentStreamEvent::Error(_))),
@@ -2525,6 +2591,7 @@ mod translate_tests {
                 },
             },
             "conv-1",
+            false,
         );
         assert_eq!(
             events.len(),
@@ -2542,6 +2609,101 @@ mod translate_tests {
         assert!(data.retryable.is_some(), "error must carry a retryable flag");
         // Must NOT also emit a Finish (Error is the terminal).
         assert!(!events.iter().any(|e| matches!(e, AgentStreamEvent::Finish(_))));
+    }
+
+    // A mid-turn process crash (Detached with a signal / non-zero / unknown exit and
+    // NO prior terminal result) surfaces as a rich AgentStreamEvent::Error carrying the
+    // legacy `UserAgentDisconnected` classification (code + retryable + ownership), with
+    // the allowlisted redacted_summary appended to the message. This restores the ACP
+    // path's `AcpError::Disconnected` terminal the direct-CLI bridge had collapsed to a
+    // bare Finish (a dead CLI used to render as a normal empty completion).
+    #[test]
+    fn detached_crash_surfaces_as_rich_disconnect_error() {
+        use aionui_session::ExitStatusLite;
+        let events = translate_event(
+            SessionEvent::Detached {
+                exit: Some(ExitStatusLite {
+                    code: None,
+                    signal: Some(9),
+                }),
+                redacted_summary: Some("process killed (SIGKILL)".into()),
+            },
+            // No terminal TurnResult was seen this turn → a genuine mid-turn crash.
+            "conv-1",
+            false,
+        );
+        assert_eq!(events.len(), 1, "a crash is a single Error terminal, got {events:?}");
+        let AgentStreamEvent::Error(data) = &events[0] else {
+            panic!("expected Error terminal, got {:?}", events[0]);
+        };
+        // Classified through the SAME path legacy used → carries code + retryable, and
+        // the allowlisted summary rides the user-facing message.
+        assert!(data.code.is_some(), "crash must carry a classified code");
+        assert!(data.retryable.is_some(), "crash must carry a retryable flag");
+        assert!(
+            data.message.contains("process killed (SIGKILL)"),
+            "redacted_summary must ride the message, got {:?}",
+            data.message
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentStreamEvent::Finish(_))),
+            "Error is the terminal — must NOT also emit Finish"
+        );
+    }
+
+    // A Detached that ARRIVES AFTER a terminal TurnResult is an absorbed teardown (the
+    // reducer's I10 / `crash_outcome → FollowResult`), NOT a crash — it must end with a
+    // plain Finish, never an error card (otherwise every normal turn's process exit
+    // would pop a spurious "disconnected" error).
+    #[test]
+    fn detached_after_terminal_result_is_plain_finish() {
+        use aionui_session::ExitStatusLite;
+        let events = translate_event(
+            SessionEvent::Detached {
+                exit: Some(ExitStatusLite {
+                    code: Some(1),
+                    signal: None,
+                }),
+                redacted_summary: Some("exited".into()),
+            },
+            // The turn already reached its terminal TurnResult.
+            "conv-1",
+            true,
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentStreamEvent::Error(_))),
+            "a post-terminal Detached must not emit an Error, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentStreamEvent::Finish(_))),
+            "an absorbed teardown still finishes, got {events:?}"
+        );
+    }
+
+    // A clean exit-0 with no result (a genuinely blank turn) is NOT a crash — it ends
+    // with a plain Finish (the empty-turn Tip rides the pump's status match, not here).
+    #[test]
+    fn detached_clean_exit_zero_is_plain_finish() {
+        use aionui_session::ExitStatusLite;
+        let events = translate_event(
+            SessionEvent::Detached {
+                exit: Some(ExitStatusLite {
+                    code: Some(0),
+                    signal: None,
+                }),
+                redacted_summary: None,
+            },
+            "conv-1",
+            false,
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentStreamEvent::Error(_))),
+            "a clean exit-0 must not emit an Error, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentStreamEvent::Finish(_))),
+            "a clean exit-0 finishes, got {events:?}"
+        );
     }
 
     // --- empty-turn (blank-reply) diagnostic Tip, mirroring the ACP path ---
