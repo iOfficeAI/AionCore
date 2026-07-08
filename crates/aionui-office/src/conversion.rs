@@ -1,11 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::{Read, Seek},
+    path::{Path, PathBuf},
+};
 
 use aionui_api_types::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionResponse, ExcelSheetData,
     ExcelWorkbookData,
 };
 use aionui_runtime::Builder as CmdBuilder;
-use calamine::{DataType, Reader, Sheets, open_workbook_auto};
+use calamine::{Data, DataType, Range, Reader, Sheets, open_workbook_auto};
 use serde_json::Value;
 use tracing::warn;
 
@@ -153,7 +156,7 @@ fn validate_file_exists(file_path: &str) -> Result<(), OfficeError> {
     Ok(())
 }
 
-fn convert_range_to_2d_array(range: &calamine::Range<calamine::Data>) -> Vec<Vec<Value>> {
+fn convert_range_to_2d_array(range: &Range<Data>) -> Vec<Vec<Value>> {
     let (rows, cols) = range.get_size();
     let mut data = Vec::with_capacity(rows);
 
@@ -170,7 +173,7 @@ fn convert_range_to_2d_array(range: &calamine::Range<calamine::Data>) -> Vec<Vec
     data
 }
 
-fn cell_to_json_value(cell: &calamine::Data) -> Value {
+fn cell_to_json_value(cell: &Data) -> Value {
     if cell.is_empty() {
         return Value::Null;
     }
@@ -191,28 +194,26 @@ fn cell_to_json_value(cell: &calamine::Data) -> Value {
     Value::Null
 }
 
-fn extract_merge_regions<RS: std::io::Read + std::io::Seek>(
-    workbook: &mut Sheets<RS>,
-    sheet_name: &str,
-) -> Option<Vec<CellRange>> {
+fn extract_merge_regions<RS: Read + Seek>(workbook: &mut Sheets<RS>, sheet_name: &str) -> Option<Vec<CellRange>> {
     let xlsx = match workbook {
         Sheets::Xlsx(wb) => wb,
         _ => return None,
     };
 
-    if xlsx.load_merged_regions().is_err() {
-        warn!("failed to load merged regions");
-        return None;
-    }
-
-    let regions = xlsx.merged_regions_by_sheet(sheet_name);
+    let regions = match xlsx.merge_cells_by_sheet_name(sheet_name) {
+        Ok(regions) => regions,
+        Err(_) => {
+            warn!("failed to load merged regions");
+            return None;
+        }
+    };
     if regions.is_empty() {
         return None;
     }
 
     let ranges: Vec<CellRange> = regions
         .into_iter()
-        .map(|(_, _, dim)| CellRange {
+        .map(|dim| CellRange {
             s: CellCoord {
                 r: dim.start.0 as usize,
                 c: dim.start.1 as usize,

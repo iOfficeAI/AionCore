@@ -53,12 +53,12 @@ aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.38" }
-aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.38" }
-aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.38" }
-aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.38" }
-aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.38" }
-aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.1.38" }
+aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.0" }
+aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.0" }
+aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.0" }
+aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.0" }
+aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.0" }
+aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.0" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
@@ -147,7 +147,7 @@ open = "5"
 which = "7"
 
 # Office
-calamine = "0.26"
+calamine = "0.36"
 rust_xlsxwriter = "0.82"
 sha1 = "0.10"
 sha2 = "0.10"
