@@ -376,6 +376,7 @@ fn tp1_teammate_prompt_contains_execution_guidance() {
     assert!(prompt.contains("shutdown_request"), "missing shutdown protocol");
     assert!(prompt.contains("shutdown_approved"), "missing shutdown_approved");
     assert!(prompt.contains("STOP GENERATING"), "missing stop protocol");
+    assert!(prompt.contains("Slot ID: w1"), "missing teammate slot id");
     assert!(
         !prompt.contains("Teammates:"),
         "static teammate list must not be injected"
@@ -469,16 +470,18 @@ fn wp2_wake_payload_includes_task_list() {
     ];
     let payload = build_wake_payload(&agent, &tasks, &[]);
 
-    assert!(payload.contains("Current Task Board"));
+    assert!(payload.contains("Current Task Board Summary"));
+    assert!(payload.contains("Showing 2 of 2 tasks."));
     assert!(payload.contains("Implement auth"));
     assert!(payload.contains("in_progress"));
     assert!(payload.contains("Write tests"));
     assert!(payload.contains("pending"));
     assert!(payload.contains("w1"));
     assert!(payload.contains("w2"));
+    assert!(payload.contains("aaaaaaaa…"));
     assert!(
-        payload.contains("aaaaaaaa-1111-2222-3333-444444444444"),
-        "blocker task ID should appear in blocked_by column"
+        !payload.contains("aaaaaaaa-1111-2222-3333-444444444444"),
+        "summary blocked_by column should use short task IDs"
     );
 }
 

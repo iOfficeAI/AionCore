@@ -3206,6 +3206,7 @@ mod tests {
             "expected lead role prompt, got: {}",
             input.first_message
         );
+        assert!(input.first_message.contains("## Current Task Board Summary"));
         assert!(input.first_message.contains("kick off"));
         session.stop();
     }
@@ -3272,6 +3273,8 @@ mod tests {
             "expected teammate role prompt, got: {}",
             input.first_message
         );
+        assert!(input.first_message.contains("Slot ID: worker-1"));
+        assert!(input.first_message.contains("Leader: Lead (slot_id: lead-1)"));
         assert!(input.first_message.contains("do X"));
         session.stop();
     }
@@ -3329,6 +3332,7 @@ mod tests {
             "should not re-inject role prompt, got: {}",
             input.first_message
         );
+        assert!(input.first_message.contains("## Current Task Board Summary"));
         assert!(input.first_message.contains("follow-up"));
         session.stop();
     }
