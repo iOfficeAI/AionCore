@@ -679,6 +679,8 @@ async fn tools_list_dumps_team_tool_schema_when_enabled() {
     assert_eq!(dumps.len(), 1);
     let dump: Value = serde_json::from_str(&std::fs::read_to_string(&dumps[0]).unwrap()).unwrap();
     assert_eq!(dump["kind"], "team-tools-list");
+    assert_eq!(dump["scope"], "team-mcp-server-tools-only");
+    assert_eq!(dump["not_final_agent_tools"], true);
     assert_eq!(dump["team_id"], "team-1");
     assert_eq!(dump["caller_slot_id"], "lead-1");
     assert_eq!(dump["caller_role"], "lead");

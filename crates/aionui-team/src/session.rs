@@ -3232,6 +3232,8 @@ mod tests {
         assert_eq!(dumps.len(), 1);
         let content = std::fs::read_to_string(&dumps[0]).unwrap();
         assert!(content.contains("kind: team-wake-prompt\n"));
+        assert!(content.contains("scope: team-wake-content-only\n"));
+        assert!(content.contains("not_final_agent_input: true\n"));
         assert!(content.contains("team_id: t1\n"));
         assert!(content.contains("slot_id: lead-1\n"));
         assert!(content.contains("conversation_id: c1\n"));

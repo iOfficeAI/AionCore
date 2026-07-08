@@ -71,7 +71,7 @@ pub(crate) fn dump_team_wake_prompt(
     ));
 
     let body = format!(
-        "kind: team-wake-prompt\nteam_id: {}\nslot_id: {}\nconversation_id: {}\nrole: {}\nneeds_role_prompt: {}\nunread_count: {}\ncreated_at_ms: {}\n\n---- prompt ----\n{}\n",
+        "kind: team-wake-prompt\nscope: team-wake-content-only\nnot_final_agent_input: true\nteam_id: {}\nslot_id: {}\nconversation_id: {}\nrole: {}\nneeds_role_prompt: {}\nunread_count: {}\ncreated_at_ms: {}\n\n---- prompt ----\n{}\n",
         dump.team_id,
         dump.slot_id,
         dump.conversation_id,
@@ -102,6 +102,8 @@ pub(crate) fn dump_team_tools_list(
     ));
     let body = serde_json::to_vec_pretty(&serde_json::json!({
         "kind": "team-tools-list",
+        "scope": "team-mcp-server-tools-only",
+        "not_final_agent_tools": true,
         "team_id": dump.team_id,
         "caller_slot_id": dump.caller_slot_id,
         "caller_role": role_label(dump.caller_role),
