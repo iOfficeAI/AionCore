@@ -51,8 +51,8 @@ pub async fn try_connect_custom_agent(
     reporter: Option<&dyn NodeRuntimeProgressReporter>,
 ) -> TryConnectCustomAgentResponse {
     // ── Step 1 — which check ────────────────────────────────────────
-    let head = first_token(command);
-    let resolved = match ensure_runtime_command_with_reporter(head, reporter).await {
+    let probe_command = command_for_runtime_probe(command);
+    let resolved = match ensure_runtime_command_with_reporter(probe_command, reporter).await {
         Ok(resolved) => resolved,
         Err(error) => {
             return TryConnectCustomAgentResponse::FailCli {
@@ -86,8 +86,26 @@ pub async fn try_connect_custom_agent(
     outcome
 }
 
+fn command_for_runtime_probe(command: &str) -> &str {
+    let trimmed = command.trim();
+    let head = first_token(trimmed);
+    if head != trimmed && token_looks_path_like(head) {
+        return trimmed;
+    }
+    head
+}
+
 fn first_token(command: &str) -> &str {
     command.split_whitespace().next().unwrap_or(command)
+}
+
+fn token_looks_path_like(token: &str) -> bool {
+    let path = Path::new(token);
+    path.is_absolute()
+        || token.starts_with(r#".\"#)
+        || token.starts_with(r#"..\"#)
+        || token.contains('/')
+        || token.contains('\\')
 }
 
 async fn spawn_probe_process(
@@ -251,6 +269,25 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn runtime_probe_preserves_windows_path_with_spaces() {
+        let command = r#"C:\Users\meau_\AppData\Local\Programs\Facilis Desktop\resources\bundled-jarvis\win32-x64\bin\jarvis.cmd"#;
+
+        assert_eq!(command_for_runtime_probe(command), command);
+    }
+
+    #[test]
+    fn runtime_probe_preserves_posix_path_with_spaces() {
+        let command = "/Applications/Facilis Desktop.app/Contents/Resources/bundled-jarvis/darwin-arm64/bin/jarvis";
+
+        assert_eq!(command_for_runtime_probe(command), command);
+    }
+
+    #[test]
+    fn runtime_probe_uses_first_token_for_bare_commands_with_args() {
+        assert_eq!(command_for_runtime_probe("npx @facilis/acp --stdio"), "npx");
+    }
 
     #[tokio::test]
     async fn probe_returns_fail_cli_when_command_missing() {
