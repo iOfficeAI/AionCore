@@ -38,11 +38,7 @@ pub(super) fn render_task_board_summary(agent: &TeamAgent, tasks: &[TeamTask]) -
         "Hidden: completed={hidden_completed}, deleted={hidden_deleted}, over_limit={hidden_over_limit}.\n"
     ));
     if hidden_completed + hidden_deleted + hidden_over_limit > 0 {
-        output.push_str(
-            "Use `team_task_list({})` for the full board, \
-             `team_task_list({\"status\":[\"pending\",\"in_progress\"]})` for active team work, \
-             or `team_task_list({\"owner\":\"<slot_id>\",\"status\":[\"pending\",\"in_progress\"]})` for an owner's active tasks.\n",
-        );
+        output.push_str("More tasks are available via `team_task_list`; use filters when needed.\n");
     }
     output.push('\n');
     output.push_str("| ID | Subject | Status | Owner | Blocked By |\n");
@@ -302,9 +298,9 @@ mod tests {
         assert!(payload.contains("Completed 2"));
         assert!(!payload.contains("Completed 1"));
         assert!(payload.contains("Hidden: completed=2, deleted=0, over_limit=0."));
-        assert!(payload.contains("team_task_list({})"));
-        assert!(payload.contains(r#"team_task_list({"status":["pending","in_progress"]})"#));
-        assert!(payload.contains(r#"team_task_list({"owner":"<slot_id>","status":["pending","in_progress"]})"#));
+        assert!(payload.contains("More tasks are available via `team_task_list`; use filters when needed."));
+        assert!(!payload.contains("team_task_list({})"));
+        assert!(!payload.contains(r#"team_task_list({"status":["pending","in_progress"]})"#));
     }
 
     #[test]
