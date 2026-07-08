@@ -1,10 +1,11 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use crate::types::{TaskStatus, TeamAgent, TeamTask};
+use crate::types::{TaskStatus, TeamAgent, TeamTask, TeammateRole};
 
 pub(super) const MAX_WAKE_TASK_ROWS: usize = 40;
 pub(super) const MAX_RECENT_COMPLETED_ROWS: usize = 8;
+pub(super) const MAX_TEAMMATE_RECENT_COMPLETED_ROWS: usize = 3;
 pub(super) const MAX_SUBJECT_CHARS: usize = 120;
 pub(super) const MAX_BLOCKED_BY_IDS: usize = 5;
 
@@ -17,8 +18,14 @@ pub(super) fn render_task_board_summary(agent: &TeamAgent, tasks: &[TeamTask]) -
         return output;
     }
 
-    let selected = select_summary_tasks(agent, tasks);
+    let selection = select_summary_tasks(agent, tasks);
+    let selected = selection.tasks;
     let displayed_ids: HashSet<&str> = selected.iter().map(|task| task.id.as_str()).collect();
+    let hidden_active = tasks
+        .iter()
+        .filter(|task| is_active(task.status))
+        .filter(|task| !displayed_ids.contains(task.id.as_str()))
+        .count();
     let displayed_completed = selected
         .iter()
         .filter(|task| task.status == TaskStatus::Completed)
@@ -27,17 +34,12 @@ pub(super) fn render_task_board_summary(agent: &TeamAgent, tasks: &[TeamTask]) -
     let total_deleted = tasks.iter().filter(|task| task.status == TaskStatus::Deleted).count();
     let hidden_completed = total_completed.saturating_sub(displayed_completed);
     let hidden_deleted = total_deleted;
-    let hidden_over_limit = tasks
-        .iter()
-        .filter(|task| is_active(task.status))
-        .filter(|task| !displayed_ids.contains(task.id.as_str()))
-        .count();
 
     output.push_str(&format!("Showing {} of {} tasks.\n", selected.len(), tasks.len()));
     output.push_str(&format!(
-        "Hidden: completed={hidden_completed}, deleted={hidden_deleted}, over_limit={hidden_over_limit}.\n"
+        "Hidden: active={hidden_active}, completed={hidden_completed}, deleted={hidden_deleted}.\n"
     ));
-    if hidden_completed + hidden_deleted + hidden_over_limit > 0 {
+    if hidden_active + hidden_completed + hidden_deleted > 0 {
         output.push_str("More tasks are available via `team_task_list`; use filters when needed.\n");
     }
     output.push('\n');
@@ -57,7 +59,11 @@ pub(super) fn render_task_board_summary(agent: &TeamAgent, tasks: &[TeamTask]) -
     output
 }
 
-fn select_summary_tasks<'a>(agent: &TeamAgent, tasks: &'a [TeamTask]) -> Vec<&'a TeamTask> {
+struct SummarySelection<'a> {
+    tasks: Vec<&'a TeamTask>,
+}
+
+fn select_summary_tasks<'a>(agent: &TeamAgent, tasks: &'a [TeamTask]) -> SummarySelection<'a> {
     let own_active_ids: HashSet<&str> = tasks
         .iter()
         .filter(|task| is_active(task.status))
@@ -84,8 +90,21 @@ fn select_summary_tasks<'a>(agent: &TeamAgent, tasks: &'a [TeamTask]) -> Vec<&'a
             .map(|task| task.id.as_str()),
     );
 
+    if agent.role == TeammateRole::Teammate {
+        return select_teammate_summary_tasks(tasks, &own_active_ids, &blocker_ids, &blocked_by_own_ids, agent);
+    }
+
+    select_leader_summary_tasks(tasks, &own_active_ids, &blocker_ids, &blocked_by_own_ids)
+}
+
+fn select_leader_summary_tasks<'a>(
+    tasks: &'a [TeamTask],
+    own_active_ids: &HashSet<&str>,
+    blocker_ids: &HashSet<&str>,
+    blocked_by_own_ids: &HashSet<&str>,
+) -> SummarySelection<'a> {
     let mut active: Vec<&TeamTask> = tasks.iter().filter(|task| is_active(task.status)).collect();
-    active.sort_by(|left, right| compare_active_tasks(left, right, &own_active_ids, &blocker_ids, &blocked_by_own_ids));
+    active.sort_by(|left, right| compare_active_tasks(left, right, own_active_ids, blocker_ids, blocked_by_own_ids));
 
     let mut selected: Vec<&TeamTask> = active.into_iter().take(MAX_WAKE_TASK_ROWS).collect();
     if selected.len() < MAX_WAKE_TASK_ROWS {
@@ -104,7 +123,51 @@ fn select_summary_tasks<'a>(agent: &TeamAgent, tasks: &'a [TeamTask]) -> Vec<&'a
         selected.extend(completed.into_iter().take(MAX_RECENT_COMPLETED_ROWS.min(remaining)));
     }
 
-    selected
+    SummarySelection { tasks: selected }
+}
+
+fn select_teammate_summary_tasks<'a>(
+    tasks: &'a [TeamTask],
+    own_active_ids: &HashSet<&str>,
+    blocker_ids: &HashSet<&str>,
+    blocked_by_own_ids: &HashSet<&str>,
+    agent: &TeamAgent,
+) -> SummarySelection<'a> {
+    let mut relevant_active: Vec<&TeamTask> = tasks
+        .iter()
+        .filter(|task| is_active(task.status))
+        .filter(|task| {
+            own_active_ids.contains(task.id.as_str())
+                || blocker_ids.contains(task.id.as_str())
+                || blocked_by_own_ids.contains(task.id.as_str())
+        })
+        .collect();
+    relevant_active
+        .sort_by(|left, right| compare_active_tasks(left, right, own_active_ids, blocker_ids, blocked_by_own_ids));
+
+    let mut selected: Vec<&TeamTask> = relevant_active.into_iter().take(MAX_WAKE_TASK_ROWS).collect();
+    if selected.len() < MAX_WAKE_TASK_ROWS {
+        let mut completed: Vec<&TeamTask> = tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Completed)
+            .filter(|task| task.owner.as_deref() == Some(agent.slot_id.as_str()))
+            .collect();
+        completed.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let remaining = MAX_WAKE_TASK_ROWS - selected.len();
+        selected.extend(
+            completed
+                .into_iter()
+                .take(MAX_TEAMMATE_RECENT_COMPLETED_ROWS.min(remaining)),
+        );
+    }
+
+    SummarySelection { tasks: selected }
 }
 
 fn compare_active_tasks(
@@ -197,13 +260,20 @@ fn render_blocked_by(blocked_by: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TeammateRole;
 
     fn agent(slot_id: &str) -> TeamAgent {
+        agent_with_role(slot_id, TeammateRole::Lead)
+    }
+
+    fn teammate(slot_id: &str) -> TeamAgent {
+        agent_with_role(slot_id, TeammateRole::Teammate)
+    }
+
+    fn agent_with_role(slot_id: &str, role: TeammateRole) -> TeamAgent {
         TeamAgent {
             slot_id: slot_id.to_owned(),
             name: "Worker".to_owned(),
-            role: TeammateRole::Teammate,
+            role,
             conversation_id: "conv-1".to_owned(),
             backend: "acp".to_owned(),
             model: "claude".to_owned(),
@@ -273,7 +343,7 @@ mod tests {
         ];
         let payload = render_task_board_summary(&agent("worker-1"), &tasks);
         assert!(payload.contains("Showing 2 of 2 tasks."));
-        assert!(payload.contains("Hidden: completed=0, deleted=0, over_limit=0."));
+        assert!(payload.contains("Hidden: active=0, completed=0, deleted=0."));
         assert!(payload.contains("| aaaaaaaa… | Owned active | in_progress | worker-1 | - |"));
         assert!(payload.contains("| bbbbbbbb… | Other pending | pending | worker-2 | - |"));
     }
@@ -297,7 +367,7 @@ mod tests {
         assert!(payload.contains("Completed 9"));
         assert!(payload.contains("Completed 2"));
         assert!(!payload.contains("Completed 1"));
-        assert!(payload.contains("Hidden: completed=2, deleted=0, over_limit=0."));
+        assert!(payload.contains("Hidden: active=0, completed=2, deleted=0."));
         assert!(payload.contains("More tasks are available via `team_task_list`; use filters when needed."));
         assert!(!payload.contains("team_task_list({})"));
         assert!(!payload.contains(r#"team_task_list({"status":["pending","in_progress"]})"#));
@@ -319,7 +389,7 @@ mod tests {
         let payload = render_task_board_summary(&agent("worker-1"), &tasks);
         assert!(payload.contains("Active"));
         assert!(!payload.contains("Deleted history"));
-        assert!(payload.contains("Hidden: completed=0, deleted=1, over_limit=0."));
+        assert!(payload.contains("Hidden: active=0, completed=0, deleted=1."));
     }
 
     #[test]
@@ -339,7 +409,7 @@ mod tests {
         let payload = render_task_board_summary(&agent("worker-1"), &tasks);
         assert_eq!(row_count(&payload), MAX_WAKE_TASK_ROWS);
         assert!(payload.contains("Showing 40 of 45 tasks."));
-        assert!(payload.contains("Hidden: completed=0, deleted=0, over_limit=5."));
+        assert!(payload.contains("Hidden: active=5, completed=0, deleted=0."));
         assert!(payload.contains("| task0044… | Active 44 | pending | worker-2 | - |"));
         assert!(!payload.contains("| task0004… | Active 4 | pending | worker-2 | - |"));
     }
@@ -394,6 +464,110 @@ mod tests {
         assert!(payload.find("Owned").unwrap() < payload.find("Blocker").unwrap());
         assert!(payload.find("Blocker").unwrap() < payload.find("Downstream").unwrap());
         assert!(payload.find("Downstream").unwrap() < payload.find("Other").unwrap());
+    }
+
+    #[test]
+    fn teammate_summary_keeps_owned_and_related_active_tasks_only() {
+        let mut owned = task(
+            "ownedaaa-1111",
+            "Owned active",
+            TaskStatus::InProgress,
+            Some("worker-1"),
+            1,
+            10,
+        );
+        owned.blocked_by = vec!["blockera-1111".to_owned()];
+        owned.blocks = vec!["downstrm-1111".to_owned()];
+        let blocker = task(
+            "blockera-1111",
+            "Active blocker",
+            TaskStatus::Pending,
+            Some("worker-2"),
+            2,
+            20,
+        );
+        let downstream = task(
+            "downstrm-1111",
+            "Active downstream",
+            TaskStatus::Pending,
+            Some("worker-3"),
+            3,
+            30,
+        );
+        let unrelated_active = task(
+            "unrelact-1111",
+            "Unrelated active",
+            TaskStatus::InProgress,
+            Some("worker-4"),
+            4,
+            40,
+        );
+        let own_completed = task(
+            "owndonea-1111",
+            "Own completed",
+            TaskStatus::Completed,
+            Some("worker-1"),
+            5,
+            50,
+        );
+        let unrelated_completed = task(
+            "othdonea-1111",
+            "Other completed",
+            TaskStatus::Completed,
+            Some("worker-4"),
+            6,
+            60,
+        );
+
+        let payload = render_task_board_summary(
+            &teammate("worker-1"),
+            &[
+                unrelated_active,
+                unrelated_completed,
+                own_completed,
+                downstream,
+                blocker,
+                owned,
+            ],
+        );
+
+        assert!(payload.contains("Owned active"));
+        assert!(payload.contains("Active blocker"));
+        assert!(payload.contains("Active downstream"));
+        assert!(payload.contains("Own completed"));
+        assert!(!payload.contains("Unrelated active"));
+        assert!(!payload.contains("Other completed"));
+        assert!(payload.contains("Hidden: active=1, completed=1, deleted=0."));
+    }
+
+    #[test]
+    fn teammate_recent_completed_rows_are_limited_to_three_owned_tasks() {
+        let mut tasks = vec![task(
+            "otherdon-1111",
+            "Other newest completed",
+            TaskStatus::Completed,
+            Some("worker-2"),
+            10,
+            100,
+        )];
+        tasks.extend((0..4).map(|index| {
+            task(
+                &format!("owndone{index}-1111"),
+                &format!("Own completed {index}"),
+                TaskStatus::Completed,
+                Some("worker-1"),
+                index,
+                index,
+            )
+        }));
+
+        let payload = render_task_board_summary(&teammate("worker-1"), &tasks);
+
+        assert_eq!(row_count(&payload), 3);
+        assert!(payload.contains("Own completed 3"));
+        assert!(payload.contains("Own completed 1"));
+        assert!(!payload.contains("Own completed 0"));
+        assert!(!payload.contains("Other newest completed"));
     }
 
     #[test]
@@ -544,7 +718,7 @@ mod tests {
         ));
         let payload = render_task_board_summary(&agent("worker-1"), &tasks);
         assert!(payload.contains("Showing 40 of 44 tasks."));
-        assert!(payload.contains("Hidden: completed=1, deleted=1, over_limit=2."));
+        assert!(payload.contains("Hidden: active=2, completed=1, deleted=1."));
     }
 
     #[test]
