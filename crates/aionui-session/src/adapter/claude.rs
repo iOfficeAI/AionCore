@@ -62,13 +62,23 @@ enum StreamBlockKind {
 }
 
 /// The EXACT wire values claude's `--permission-mode` / `set_permission_mode`
-/// accept — the SINGLE source for both the advertised mode picker
-/// ([`claude_permission_modes`]) and the seed-time whitelist
+/// accept — the SINGLE source for the seed-time whitelist
 /// ([`is_valid_claude_permission_mode`]). Feeding claude anything outside this set
 /// makes the spawn fail (exit 1), so any value sourced from unconstrained storage
 /// (e.g. an assistant default `permission_value`, a free-text TEXT column) MUST be
 /// validated against this before it reaches a `--permission-mode` flag.
-const CLAUDE_PERMISSION_MODE_IDS: [&str; 4] = ["default", "plan", "acceptEdits", "bypassPermissions"];
+///
+/// These are the 6 canonical `PermissionMode` values the bundled SDK
+/// (`@anthropic-ai/claude-agent-sdk` 0.3.156, `sdk.d.ts` `PermissionMode`) and the
+/// CLI both accept: `default | acceptEdits | bypassPermissions | plan | dontAsk |
+/// auto`. NOTE this whitelist is a SUPERSET of the advertised picker
+/// ([`claude_permission_modes`], which omits `auto` — see there): validation must
+/// accept `auto` because a session resumed/persisted from the legacy ACP path (which
+/// DID advertise `auto` when the model reported `supportsAutoMode`) may carry
+/// `current_mode = "auto"`, and downgrading/rejecting it would crash the spawn.
+/// The CLI-only alias `manual` is deliberately excluded — we never emit it.
+const CLAUDE_PERMISSION_MODE_IDS: [&str; 6] =
+    ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"];
 
 /// True iff `mode` is one of claude's exact accepted permission-mode wire values.
 /// Use this to guard any seed/persist of `current_mode_id` for a claude session
@@ -79,17 +89,47 @@ pub fn is_valid_claude_permission_mode(mode: &str) -> bool {
     CLAUDE_PERMISSION_MODE_IDS.contains(&mode)
 }
 
-/// claude's FIXED permission-mode enum, advertised as `available_modes` so the UI
-/// mode picker has data (the write path — `--permission-mode` /
+/// claude's permission-mode picker, advertised as `available_modes` so the UI mode
+/// picker has data (the write path — `--permission-mode` /
 /// control_request{set_permission_mode} — was already wired). The `id`s are the
-/// EXACT wire values claude accepts; only name/description are display copy. Unlike
-/// models/effort these are static (no `initialize`-response discovery).
+/// EXACT wire values claude accepts; name/description are display copy.
+///
+/// VERBATIM-EQUIVALENT to the legacy ACP bridge's `buildAvailableModes(modelInfo)`
+/// (`@agentclientprotocol/claude-agent-acp` 0.39.0, `acp-agent.js`): same ids, same
+/// names, same descriptions, same order — so the frontend (which renders whatever
+/// `available_modes` the backend sends, i18n-keyed on `agentMode.<id>`) receives
+/// byte-identical data and needs zero change (the claude arm of feature-012 "Plan B").
+///
+/// Two of the bridge's six modes are conditionally advertised; we reproduce the
+/// condition, not just the mode list:
+///
+/// - `auto` — bridge gates it on `modelInfo?.supportsAutoMode === true` (recomputed
+///   on model switch). The direct-CLI `initialize`/`system.init` response carries NO
+///   `supportsAutoMode` for ANY model (live-verified across default/sonnet/opus/
+///   haiku/fable-5; SDK 0.3.156 passes CLI models through without synthesizing the
+///   field), and [`ModelInfo`] has no such field to thread. So legacy-exact behavior
+///   under the current CLI = `auto` is NEVER advertised. We OMIT it here rather than
+///   emit dead structure. `is_valid_claude_permission_mode` still ACCEPTS `auto`
+///   (superset) so a session that carries it (legacy-persisted / future CLI) does not
+///   crash the spawn. TRIPWIRE: if a future CLI starts reporting `supportsAutoMode`,
+///   this omission becomes a real divergence — thread the current model's flag in and
+///   prepend the `auto` entry below.
+/// - `bypassPermissions` — bridge gates on `ALLOW_BYPASS` (`!IS_ROOT ||
+///   $IS_SANDBOX`), i.e. shown for every non-root user. We advertise it
+///   unconditionally (per product decision: bypass always selectable), which matches
+///   the legacy path for the non-root desktop user it actually runs as.
+///
+/// Unlike models/effort these are static (no `initialize`-response discovery).
 pub(crate) fn claude_permission_modes() -> Vec<ModeInfo> {
+    // `auto` is intentionally absent — see the doc comment (gated on
+    // supportsAutoMode, which the direct CLI never reports). Order and copy match the
+    // bridge's buildAvailableModes verbatim for the remaining five.
     [
-        ("default", "Default", "Standard permission prompts"),
-        ("plan", "Plan", "Plan first, no edits until approved"),
-        ("acceptEdits", "Accept Edits", "Auto-accept file edits"),
-        ("bypassPermissions", "Bypass Permissions", "Skip all permission prompts"),
+        ("default", "Default", "Standard behavior, prompts for dangerous operations"),
+        ("acceptEdits", "Accept Edits", "Auto-accept file edit operations"),
+        ("plan", "Plan Mode", "Planning mode, no actual tool execution"),
+        ("dontAsk", "Don't Ask", "Don't prompt for permissions, deny if not pre-approved"),
+        ("bypassPermissions", "Bypass Permissions", "Bypass all permission checks"),
     ]
     .into_iter()
     .map(|(id, name, description)| ModeInfo {

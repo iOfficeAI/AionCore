@@ -1079,20 +1079,32 @@ fn catalog_partial_from_caps(caps: &aionui_session::Capabilities) -> Option<aion
 /// (including `None`) stays at the safe default (returned here as `None` so the
 /// backend's `unwrap_or("workspace-write")` applies). Verbatim port of clean-slate
 /// `session_runtime::codex_sandbox_for_mode`.
+///
+/// This runs at OPEN time and pre-seeds `thread/start.sandboxPolicy` — the sandbox axis
+/// the tier reaches the first turn through, since `thread/start` carries no `permissions`
+/// field and `permissions` is mutually exclusive with `sandboxPolicy` (U1). The
+/// post-open `reconcile_codex_mode` then applies the matching permission profile via
+/// SetMode. The mode value reaching this boot helper is the persisted/config selection,
+/// which under feature 012 "Plan B" is the LEGACY bare token (`full-access`); the colon
+/// profile id (`:danger-full-access`, e.g. from a readback that skipped bare-mapping) and
+/// the legacy `yoloNoSandbox` alias stay recognized for robustness. Kept in lockstep with
+/// `codex_conn::codex_perm::{normalize_to_profile_id, profile_id_to_legacy_value}`.
 fn codex_sandbox_for_mode(mode: Option<&str>) -> Option<&'static str> {
     match mode.map(str::trim) {
-        Some("full-access" | "yoloNoSandbox") => Some("danger-full-access"),
+        Some(":danger-full-access" | "full-access" | "yoloNoSandbox") => Some("danger-full-access"),
         _ => None,
     }
 }
 
 /// Map a conversation's requested mode → the codex `approvalPolicy` string, or
 /// `None` to keep the default (`on-request`). Sibling of `codex_sandbox_for_mode`:
-/// a full-access / yolo agent runs unattended → `"never"`. Verbatim port of
-/// clean-slate `session_runtime::codex_approval_for_mode`.
+/// a full-access / yolo agent runs unattended → `"never"`. Recognizes the legacy bare
+/// token `full-access` (the Plan B canonical value), the colon id `:danger-full-access`,
+/// and the legacy `yoloNoSandbox` alias. Verbatim port of clean-slate
+/// `session_runtime::codex_approval_for_mode`.
 fn codex_approval_for_mode(mode: Option<&str>) -> Option<&'static str> {
     match mode.map(str::trim) {
-        Some("full-access" | "yoloNoSandbox") => Some("never"),
+        Some(":danger-full-access" | "full-access" | "yoloNoSandbox") => Some("never"),
         _ => None,
     }
 }
@@ -2128,15 +2140,24 @@ mod build_mapping_tests {
     /// other mode (and None) keeps None ⇒ workspace-write. Ported verbatim.
     #[test]
     fn codex_sandbox_maps_only_full_access_modes() {
+        // Plan B canonical value: the legacy bare token.
         assert_eq!(codex_sandbox_for_mode(Some("full-access")), Some("danger-full-access"));
+        // The colon profile id (e.g. a readback that skipped bare-mapping) stays recognized.
+        assert_eq!(
+            codex_sandbox_for_mode(Some(":danger-full-access")),
+            Some("danger-full-access")
+        );
         assert_eq!(
             codex_sandbox_for_mode(Some("yoloNoSandbox")),
             Some("danger-full-access")
         );
         assert_eq!(
-            codex_sandbox_for_mode(Some("  full-access  ")),
+            codex_sandbox_for_mode(Some("  :danger-full-access  ")),
             Some("danger-full-access")
         );
+        // read-only and workspace tiers do NOT escalate — the safe sandbox default applies.
+        assert_eq!(codex_sandbox_for_mode(Some(":read-only")), None);
+        assert_eq!(codex_sandbox_for_mode(Some(":workspace")), None);
         assert_eq!(codex_sandbox_for_mode(Some("plan")), None);
         assert_eq!(codex_sandbox_for_mode(Some("default")), None);
         assert_eq!(codex_sandbox_for_mode(None), None);
@@ -2146,9 +2167,12 @@ mod build_mapping_tests {
     /// (→ "never"); everything else stays at on-request (None). Ported verbatim.
     #[test]
     fn codex_approval_maps_only_full_access_modes() {
+        assert_eq!(codex_approval_for_mode(Some(":danger-full-access")), Some("never"));
         assert_eq!(codex_approval_for_mode(Some("full-access")), Some("never"));
         assert_eq!(codex_approval_for_mode(Some("yoloNoSandbox")), Some("never"));
-        assert_eq!(codex_approval_for_mode(Some("  full-access  ")), Some("never"));
+        assert_eq!(codex_approval_for_mode(Some("  :danger-full-access  ")), Some("never"));
+        assert_eq!(codex_approval_for_mode(Some(":read-only")), None);
+        assert_eq!(codex_approval_for_mode(Some(":workspace")), None);
         assert_eq!(codex_approval_for_mode(Some("plan")), None);
         assert_eq!(codex_approval_for_mode(Some("default")), None);
         assert_eq!(codex_approval_for_mode(None), None);

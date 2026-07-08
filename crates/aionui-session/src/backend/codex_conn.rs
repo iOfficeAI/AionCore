@@ -94,12 +94,14 @@ impl BackendConnection for CodexConnection {
             config: config.clone(),
         };
         let mut backend = CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms).await;
-        // Seed the current model (M1): codex's collaborationMode for SetMode
-        // requires settings.model, so the backend must track it from the start.
-        // OPTIMISTIC seed: the model is not actually bound at thread/start anymore
-        // (codex-model-gating). `reconcile_codex_model` clears this back to None
-        // if the requested model turns out NOT to be in the discovered catalog, so a
-        // later SetMode never builds a collaborationMode around a model codex rejects.
+        // Seed the current model (M1): the backend tracks it from the start so the
+        // model selector's current value and a subsequent SetModel are consistent.
+        // OPTIMISTIC seed: the model is not actually bound at thread/start
+        // (codex-model-gating). `reconcile_codex_model` clears this back to None if the
+        // requested model turns out NOT to be in the discovered catalog, so a stale
+        // picker default never poisons every turn. (Feature 012 removed the old
+        // collaborationMode dependency: SetMode now uses the permissions channel and
+        // needs no current_model — this seed is purely for the model axis.)
         if let Some(model) = &config.model {
             *backend.current_model.lock().await = Some(model.clone());
         }
@@ -111,7 +113,29 @@ impl BackendConnection for CodexConnection {
         // the model/mode selector. SetModel/SetMode updates flow via ConfigChanged,
         // not by mutating this open-time snapshot — §5.5.)
         backend.capabilities.current_model = config.model.clone();
-        backend.capabilities.current_mode = config.mode.clone();
+        // Present the current mode in the SAME value space as the catalog (frontend-facing
+        // legacy bare token): a persisted colon id (`:danger-full-access` from older data)
+        // is mapped to its bare form so the picker highlights the matching catalog entry.
+        //
+        // P9 (fresh-session parity): a fresh thread carries no requested tier
+        // (`config.mode` None) and `thread/start` launches on codex's workspace-write
+        // default, so seed the current mode to that tier's value (`:workspace` → `auto`) —
+        // exactly what the legacy `@zed-industries/codex-acp` path advertised as
+        // `currentModeId` on a fresh `session/new` (live-verified: `"auto"`, never empty),
+        // so the picker shows a highlighted default instead of a blank. This is a faithful
+        // replication of the thread's real launch tier, not a masking default.
+        //
+        // The fresh-default is gated to `SessionSpec::Fresh`: on Resume codex restores the
+        // thread's own tier and surfaces it via `thread/settings/updated`, so falsely
+        // seeding `auto` for a resumed thread that was actually on another tier would
+        // mis-highlight until the notification lands (and Resume's fresh currentModeId is
+        // not live-verified). Resume therefore keeps only the normalized persisted value.
+        let normalized_config_mode = config.mode.as_deref().map(codex_perm::profile_id_to_legacy_value);
+        backend.capabilities.current_mode = match &spec {
+            SessionSpec::Fresh { .. } => normalized_config_mode
+                .or_else(|| Some(codex_perm::profile_id_to_legacy_value(":workspace"))),
+            SessionSpec::Resume { .. } => normalized_config_mode,
+        };
 
         // JSON-RPC handshake over the retained stdin (the reader task is already
         // draining stdout). REAL codex 0.137.0 wire (verified against the
@@ -132,16 +156,17 @@ impl BackendConnection for CodexConnection {
         backend.run_handshake(resume_tid.as_deref()).await?;
 
         // codex-model-gating: `thread/start` intentionally did NOT bind `config.model`
-        // (see `thread_start_params`) — the thread launched on codex's own default
-        // model. Now apply the requested model+mode the ACP way: wait for `model/list` /
-        // `collaborationMode/list` to fill the catalogs, then dispatch VALIDATED
-        // `SetModel`/`SetMode` (each dropped if not in its catalog, so a stale picker
-        // default never poisons every turn). Detached + off the open hot path; only a
-        // Fresh session with a requested model and/or mode does any work (Resume keeps
-        // codex's bound model+mode; no requested config → nothing to reconcile). The two
-        // are SEQUENCED (model first): SetMode's collaborationMode requires a known
-        // current_model, so the mode reconcile runs only after the model reconcile has
-        // settled current_model.
+        // (see `thread_start_params`), nor a permission tier (`thread/start` carries no
+        // `permissions` field, U1) — the thread launched on codex's own default model +
+        // default permission profile. Now apply the requested model+mode the ACP way:
+        // wait for `model/list` / `permissionProfile/list` to fill the catalogs, then
+        // dispatch VALIDATED `SetModel`/`SetMode` (each dropped if not in its catalog, so
+        // a stale picker default never poisons every turn). Detached + off the open hot
+        // path; only a Fresh session with a requested model and/or mode does any work
+        // (Resume keeps codex's rollout-restored model + permission tier; no requested
+        // config → nothing to reconcile). The two are SEQUENCED (model first) only to keep
+        // the two writes deterministic — SetMode no longer depends on current_model
+        // (feature 012置换: permissions channel), but sequencing keeps the wire order stable.
         if matches!(spec, SessionSpec::Fresh { .. }) && (config.model.is_some() || config.mode.is_some()) {
             let backend = Arc::new(backend);
             spawn_codex_reconcile(backend.clone(), config.model.clone(), config.mode.clone());
@@ -262,31 +287,45 @@ async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String)
     }
 }
 
-/// Apply `requested` mode the ACP way, symmetric to [`reconcile_codex_model`]. codex has
-/// NO `thread/start` mode param — a thread always launches on codex's default
-/// collaborationMode — so `config.mode` was never applied at open before this (unlike
-/// claude, which passes `--permission-mode` at spawn). This closes that gap AND
-/// validates: wait for `collaborationMode/list` to fill the catalog, then apply a
-/// `SetMode` if `requested` IS in the catalog (validated apply), or DROP it (WARN,
+/// Apply `requested` mode the ACP way, symmetric to [`reconcile_codex_model`]. For codex
+/// the mode axis IS the permission axis: a thread always launches on codex's default
+/// permission profile (`thread/start` carries NO `permissions` field, U1), so a persisted
+/// non-default tier was never applied at open before this. This closes that gap AND
+/// validates against the DISCOVERED catalog, exactly as legacy ACP `set_mode` gated on
+/// `is_mode_valid` (advertised `availableModes`): wait for `permissionProfile/list` to
+/// fill the catalog (colon-prefixed profile ids), normalize a legacy persisted value onto
+/// its colon id, then apply a `SetMode` if the value IS in the catalog, or DROP it (WARN,
 /// leaving codex's default) if it is NOT. Empty/never-populated catalog → do NOT apply
-/// (cannot validate). Runs only after [`reconcile_codex_model`] so `SetMode` can build
-/// its `collaborationMode` around a settled `current_model` (SetMode rejects outright
-/// without a known model).
+/// (cannot validate). Unlike the old collaborationMode path this needs no settled
+/// `current_model`.
 async fn reconcile_codex_mode(backend: &CodexSessionBackend, requested: String) {
-    let catalog = await_codex_catalog(backend, |d| d.modes.iter().map(|m| m.id.clone()).collect()).await;
+    // The discovered catalog's `ModeInfo.id` is now the FRONTEND-facing legacy bare token
+    // (`auto` for the workspace tier); the wire/validation axis speaks colon ids. Normalize
+    // each catalog id back to its colon profile id so both sides of the `contains` check
+    // below are colon-shaped (a custom profile is already colon → normalize is a no-op).
+    let catalog: Vec<String> =
+        await_codex_catalog(backend, |d| d.modes.iter().map(|m| codex_perm::normalize_to_profile_id(&m.id)).collect())
+            .await;
 
     if catalog.is_empty() {
         tracing::warn!(
             requested_mode = %requested,
-            "codex mode reconcile: collaborationMode/list never populated; leaving thread on codex default \
+            "codex mode reconcile: permissionProfile/list never populated; leaving thread on codex default \
              (requested mode NOT applied — cannot validate)"
         );
         return;
     }
 
-    if !catalog.contains(&requested) {
+    // Normalize the persisted/legacy value onto its colon-prefixed profile id BEFORE
+    // validating: a stored legacy `yolo`/`full-access` must resolve to `:danger-full-access`
+    // (a discovered id) rather than miss the catalog; a already-colon discovered id passes
+    // through. Then validate against the LIVE catalog — a colon id no longer advertised
+    // (a removed custom profile) is dropped, mirroring legacy `is_mode_valid`.
+    let normalized = codex_perm::normalize_to_profile_id(&requested);
+    if !catalog.contains(&normalized) {
         tracing::warn!(
             requested_mode = %requested,
+            normalized_mode = %normalized,
             catalog = ?catalog,
             "codex mode reconcile: requested mode not in catalog; dropping it \
              (thread stays on codex default)"
@@ -295,14 +334,14 @@ async fn reconcile_codex_mode(backend: &CodexSessionBackend, requested: String) 
     }
 
     tracing::info!(
-        mode = %requested,
+        mode = %normalized,
         "codex mode reconcile: applying requested mode (validated against catalog)"
     );
-    if let Err(e) = backend.dispatch(Command::SetMode { mode: requested }).await {
-        // SetMode with no known current_model rejects here (Transport error). That is
-        // expected when the model reconcile dropped an invalid model: no model → no
-        // valid collaborationMode → mode simply stays on codex's default. WARN, not ERROR.
-        tracing::warn!(error = %e, "codex mode reconcile: SetMode dispatch failed (likely no current_model); mode not applied");
+    if let Err(e) = backend.dispatch(Command::SetMode { mode: normalized }).await {
+        // The permissions channel needs no current_model, so a dispatch error here is a
+        // genuine transport/reject — surface it (still WARN: the thread stays on codex's
+        // default, which is safe, so this is not a turn-blocking contract violation).
+        tracing::warn!(error = %e, "codex mode reconcile: SetMode dispatch failed; mode not applied");
     }
 }
 
@@ -578,7 +617,9 @@ pub struct CodexSessionBackend {
 #[derive(Clone, Copy)]
 enum DiscoveryKind {
     Models,
-    Modes,
+    /// codex's mode axis: filled from `permissionProfile/list` and mapped to the fixed
+    /// permission-tier enum (feature 012). codex sends no `collaborationMode/list`.
+    Permissions,
     Checkpoints,
     Rewind,
 }
@@ -587,6 +628,8 @@ enum DiscoveryKind {
 #[derive(Default, Clone)]
 struct Discovered {
     models: Vec<crate::capability::ModelInfo>,
+    /// For codex this holds the fixed permission-tier mode enum mapped from
+    /// `permissionProfile/list` (feature 012), NOT collaborationMode.
     modes: Vec<crate::capability::ModeInfo>,
 }
 
@@ -938,13 +981,19 @@ impl CodexSessionBackend {
             "params": { "includeHidden": false }
         }))
         .await?;
-        let mode_list_id = self.next_rpc_id();
+        // feature 012: codex's mode selector IS its permission axis, so we discover
+        // `permissionProfile/list` (mapped to the fixed mode enum in `fill_discovery`)
+        // and do NOT send `collaborationMode/list` (plan/default has no UI entry,
+        // matching legacy ACP). The reader claims the response and fills `disc.modes`.
+        // Backends without this list (older codex) simply never respond → modes stay
+        // empty → no frontend mode selector.
+        let perm_list_id = self.next_rpc_id();
         self.pending_discovery
             .lock()
             .await
-            .insert(mode_list_id, DiscoveryKind::Modes);
+            .insert(perm_list_id, DiscoveryKind::Permissions);
         self.write_frame(json!({
-            "jsonrpc": "2.0", "id": mode_list_id, "method": "collaborationMode/list", "params": {}
+            "jsonrpc": "2.0", "id": perm_list_id, "method": "permissionProfile/list", "params": {}
         }))
         .await?;
         Ok(())
@@ -1236,17 +1285,18 @@ async fn reader_task(
                                 && let Some(result) = frame.get("result")
                             {
                                 match kind {
-                                    DiscoveryKind::Models | DiscoveryKind::Modes => {
+                                    DiscoveryKind::Models | DiscoveryKind::Permissions => {
                                         fill_discovery(kind, result, &discovered);
                                         // Signal the async catalog arrival so the conversation
                                         // re-projects the model/mode picker (the ACP
                                         // `emit_snapshot_events` analogue). model/list and
-                                        // collaborationMode/list are SEPARATE responses; emit a
+                                        // permissionProfile/list are SEPARATE responses; emit a
                                         // full snapshot of whatever `discovered` holds now, so the
-                                        // first arrival already lights the picker and the second
-                                        // refines it. Without this the frontend, which read an
-                                        // empty `config_options` on open, never re-fetches and the
-                                        // model selector stays disabled.
+                                        // first arrival already lights the picker and later ones
+                                        // refine it. Without this the frontend, which read an empty
+                                        // `config_options` on open, never re-fetches and the
+                                        // selectors stay disabled. (codex's modes come from
+                                        // permissionProfile/list — the fixed permission-tier enum.)
                                         let (models, modes) = {
                                             let disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
                                             (disc.models.clone(), disc.modes.clone())
@@ -1395,6 +1445,125 @@ fn emit(tx: &broadcast::Sender<SessionEnvelope>, session_id: &str, turn_gen: u64
     });
 }
 
+/// feature 012 — codex permission-profile ↔ fixed-mode-enum mapping (SSOT).
+///
+/// codex's permission tiers are DISCOVERED, not a fixed AionUi enum — mirroring the
+/// legacy ACP mechanism (`manager/acp/session.rs`: `availableModes[]` advertised by the
+/// agent, `is_mode_valid` validates against that live list, AionCore defines no values).
+/// codex advertises them via `permissionProfile/list`, each identified by a COLON-
+/// PREFIXED id (`:workspace` / `:danger-full-access` / `:read-only`, plus any user
+/// `[permissions.<id>]` custom profile — the bare form is rejected on the wire,
+/// live-verified 0.139.0). We surface those ids VERBATIM as the mode catalog; codex has
+/// no separately-exposed collaborationMode selector, so its mode axis IS the permission
+/// axis.
+///
+/// This module owns the codex mode-value translation, in BOTH directions, so the colon
+/// wire id stays an internal/wire detail and the value the FRONTEND sees is byte-identical
+/// to what the legacy `@zed-industries/codex-acp` path advertised (live-verified: the
+/// bridge's `availableModes[].id` were the BARE tokens `read-only` / `auto` / `full-access`,
+/// never colon-prefixed):
+///   - inbound  (`normalize_to_profile_id`): a persisted/legacy value → colon profile id,
+///     the codex analogue of legacy ACP `mode_normalize::normalize_requested_mode`.
+///   - outbound (`profile_id_to_legacy_value`): a discovered colon id → the legacy bare
+///     token the frontend keys its i18n / picker off, so all 12 locales auto-adapt with no
+///     frontend change. It is the exact inverse of `normalize_to_profile_id` over the three
+///     built-in tiers; a custom `[permissions.<id>]` profile (which legacy could not
+///     express — the bridge hardcoded only the three tiers) has no bare equivalent, so it
+///     flows through colon-and-all in BOTH directions (round-trip preserved).
+mod codex_perm {
+    /// Normalize a persisted/legacy mode value into a colon-prefixed permission-profile
+    /// id, so an upgrading user's stored value (or a legacy alias) maps onto a real codex
+    /// profile with no fallback to a value codex would reject. This is the codex analogue
+    /// of legacy ACP `mode_normalize.rs` (alias → native id) + `codex_sandbox.rs` (2-tier
+    /// bucketing):
+    ///   - already colon-prefixed (`:workspace`, a discovered/custom id) → passed through
+    ///     verbatim (the discovery path already speaks colon ids)
+    ///   - `full-access` / `yolo` / `yoloNoSandbox`  → `:danger-full-access`
+    ///   - `read-only`                               → `:read-only`
+    ///   - `default` / `auto` / `autoEdit` / else    → `:workspace`
+    ///
+    /// The catch-all lands on `:workspace` (the safe workspace-write tier), never a value
+    /// codex would reject. Validation against the DISCOVERED catalog (a custom id that no
+    /// longer exists) happens at the call site, exactly as legacy `is_mode_valid` did.
+    pub(super) fn normalize_to_profile_id(mode: &str) -> String {
+        let trimmed = mode.trim();
+        if let Some(rest) = trimmed.strip_prefix(':') {
+            // Already a profile id (discovery / custom / re-persisted colon value):
+            // pass through verbatim, unless it is empty (`":"`) which is nonsense.
+            if !rest.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+        match trimmed {
+            "full-access" | "yolo" | "yoloNoSandbox" => ":danger-full-access".to_owned(),
+            "read-only" => ":read-only".to_owned(),
+            _ => ":workspace".to_owned(),
+        }
+    }
+
+    /// Map a colon-prefixed permission-profile id back to the legacy bare mode token the
+    /// FRONTEND expects, so the direct-CLI path presents the SAME value legacy ACP did
+    /// (`read-only` / `auto` / `full-access`) — the picker's i18n keys off this value, and
+    /// `agentMode.json` only carries the bare keys, so this is what makes all 12 locales
+    /// render "Read Only / Default / Full Access" instead of an English fallback on a colon
+    /// id that misses every key.
+    ///
+    /// The three built-in tiers are the EXACT inverse of `normalize_to_profile_id`
+    /// (`:workspace` ↔ the workspace-write tier legacy advertised as `auto`), so a value
+    /// round-trips losslessly: outbound colon → bare here, inbound bare → colon there.
+    /// A custom `[permissions.<id>]` profile has NO legacy bare form (the bridge hardcoded
+    /// only the three tiers), so it MUST flow through colon-and-all — stripping its colon to
+    /// `<id>` would send the frontend a value that `normalize_to_profile_id` cannot recover
+    /// (it would bucket the unknown bare token into the `:workspace` catch-all → wrong tier
+    /// applied). Passing the colon through keeps the round-trip intact (the frontend renders
+    /// its `name` via `defaultValue`, and echoes the colon id back unchanged).
+    pub(super) fn profile_id_to_legacy_value(profile_id: &str) -> String {
+        match profile_id {
+            ":read-only" => "read-only".to_owned(),
+            ":workspace" => "auto".to_owned(),
+            ":danger-full-access" => "full-access".to_owned(),
+            other => other.to_owned(),
+        }
+    }
+
+    /// Friendly display `(name, description)` for a built-in codex permission profile.
+    ///
+    /// codex's `permissionProfile/list` returns the built-in profiles with `description:
+    /// null` and NO display name (live-verified 0.139.0 — the wire is just
+    /// `{"id":":read-only","description":null}`), so a verbatim pass-through would surface
+    /// bare colon ids (`:workspace`) with no tooltip in the picker. The legacy ACP path did
+    /// NOT do that: the `@zed-industries/codex-acp` bridge enriched each profile into an ACP
+    /// `SessionMode{id,name,description}` with a human label and a full sentence before
+    /// advertising it. This table reproduces that display layer so the direct-CLI path
+    /// matches the old UX — the strings are copied VERBATIM from the bridge binary
+    /// (`codex-acp` 0.14.0). It is a codex-specific DISPLAY adaptation (the analogue of
+    /// `codex_sandbox.rs`'s param adaptation), NOT a value-set definition: the id set still
+    /// comes from codex, and a custom `[permissions.<id>]` profile (unknown here) keeps
+    /// falling back to whatever codex sends.
+    ///
+    /// Id note: legacy advertised the workspace tier as `auto` displayed "Default"; the
+    /// direct app-server id for the same tier is `:workspace`. Semantics are identical
+    /// (workspace-write, approval for network / out-of-workspace edits), so we keep the
+    /// legacy "Default" label + sentence.
+    pub(super) fn builtin_profile_display(profile_id: &str) -> Option<(&'static str, &'static str)> {
+        match profile_id {
+            ":read-only" => Some((
+                "Read Only",
+                "Codex can read files in the current workspace. Approval is required to edit files or access the internet.",
+            )),
+            ":workspace" => Some((
+                "Default",
+                "Codex can read and edit files in the current workspace, and run commands. Approval is required to access the internet or edit other files. (Identical to Agent mode)",
+            )),
+            ":danger-full-access" => Some((
+                "Full Access",
+                "Codex can edit files outside this workspace and access the internet without asking for approval. Exercise caution when using.",
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// B-CODEX-MODEL-LIST: map a `model/list` / `collaborationMode/list` response
 /// `result` into the `discovered` cache.
 ///
@@ -1471,34 +1640,64 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
             }
             discovered.lock().unwrap_or_else(|e| e.into_inner()).models = models;
         }
-        DiscoveryKind::Modes => {
-            let arr = list("data", "modes");
+        DiscoveryKind::Permissions => {
+            // codex's mode axis IS the permission axis. This is the DISCOVERY half of the
+            // legacy-ACP mechanism (`session.rs::apply_advertised_modes`): every profile
+            // codex advertises via `permissionProfile/list` is surfaced VERBATIM as a mode
+            // — colon-prefixed id and all (`:workspace` / `:danger-full-access` /
+            // `:read-only`, plus any user `[permissions.<id>]` custom profile). We no
+            // longer translate to a fixed AionUi enum or drop custom profiles: codex
+            // defines the value set, AionCore only transports it (parity with legacy ACP,
+            // where `availableModes[]` came straight off the wire). `disc.modes` is the
+            // SAME cache slot `reconcile_codex_mode` validates against and the capabilities
+            // snapshot exposes; `collaborationMode/list` is not sent (plan/default has no
+            // UI entry, matching legacy ACP).
+            let arr = list("data", "permissions");
             let present = arr.is_some();
             let modes = arr
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|m| {
-                            // id = the lowercase `mode` token SetMode sends; fall back to
-                            // `name` only if `mode` is absent (older shape).
-                            let id = m
-                                .get("mode")
+                        .filter_map(|p| {
+                            // Wire id retains the leading colon (`:workspace`) — that is
+                            // what SetMode sends back and what the reader matches. Skip only
+                            // a malformed entry with no id.
+                            let profile_id = p.get("id").and_then(Value::as_str)?;
+                            // Display layer (matches legacy ACP): codex's built-in profiles
+                            // arrive with no name and `description:null`, so prefer codex's
+                            // own fields when present (a custom `[permissions.<id>]` may carry
+                            // them), then the built-in friendly table (verbatim bridge copy),
+                            // then the bare id as a last resort.
+                            let builtin = codex_perm::builtin_profile_display(profile_id);
+                            let name = p
+                                .get("name")
+                                .or_else(|| p.get("displayName"))
                                 .and_then(Value::as_str)
-                                .or_else(|| m.get("name").and_then(Value::as_str))?
-                                .to_string();
-                            let name = m.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
+                                .map(str::to_string)
+                                .or_else(|| builtin.map(|(n, _)| n.to_string()))
+                                .unwrap_or_else(|| profile_id.to_string());
+                            let description = p
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .or_else(|| builtin.map(|(_, d)| d.to_string()));
+                            // The catalog's `id` is the value the FRONTEND sees and keys its
+                            // i18n / picker off. Present the legacy bare token
+                            // (`:workspace`→`auto`) so all 12 locales auto-adapt exactly as
+                            // they did on the legacy ACP path; a custom profile keeps its
+                            // colon (no bare equivalent). SetMode's `normalize_to_profile_id`
+                            // is the inverse on the return trip, and `reconcile_codex_mode`
+                            // re-normalizes before validating against the colon wire catalog.
                             Some(ModeInfo {
-                                id,
+                                id: codex_perm::profile_id_to_legacy_value(profile_id),
                                 name,
-                                description: None,
+                                description,
                             })
                         })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
             if present && modes.is_empty() {
-                tracing::warn!(
-                    "codex collaborationMode/list parsed to empty (wire shape may have drifted from result.data[])"
-                );
+                tracing::warn!("codex permissionProfile/list parsed to empty (no profile with an id)");
             }
             discovered.lock().unwrap_or_else(|e| e.into_inner()).modes = modes;
         }
@@ -1796,8 +1995,19 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
         // thread/settings/updated → ConfigChanged (frozen C6 §6): the
         // non-optimistic confirmation that a SetMode/SetModel applied. The
         // conversation updates its mode/model selector on THIS, not on the
-        // sent-assume-done dispatch return. Carries threadSettings.{model,
-        // collaborationMode.mode}.
+        // sent-assume-done dispatch return.
+        //
+        // feature 012: for codex the mode axis IS the permission axis. The confirmation
+        // carries `threadSettings.activePermissionProfile.id` = the colon-prefixed profile
+        // id (LIVE 0.139.0: `:workspace`/`:read-only`/`:danger-full-access`, plus any
+        // custom `[permissions.<id>]`), which we surface VERBATIM as the current mode —
+        // the SAME colon id `permissionProfile/list` advertised, so the selector matches a
+        // discovered entry (legacy-ACP parity: `current_mode_update.currentModeId` was the
+        // advertised id, untranslated). `activePermissionProfile` is `null` when the tier
+        // was set via the raw sandboxPolicy channel (not our path) — then we carry no mode
+        // (leaving the last-known selection). We deliberately do NOT read
+        // `collaborationMode.mode` (plan/default): codex has no separately-exposed
+        // collaboration selector in AionUi, and that field would clobber the permission mode.
         "thread/settings/updated" => {
             let settings = params
                 .get("threadSettings")
@@ -1805,10 +2015,13 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 .unwrap_or(&Value::Null);
             let model = settings.get("model").and_then(Value::as_str).map(str::to_string);
             let mode = settings
-                .get("collaborationMode")
-                .and_then(|c| c.get("mode"))
+                .get("activePermissionProfile")
+                .and_then(|p| p.get("id"))
                 .and_then(Value::as_str)
-                .map(str::to_string);
+                // Map the colon wire id back to the legacy bare token the catalog/frontend
+                // uses (`:workspace`→`auto`), so the picker highlights the matching entry;
+                // a custom profile keeps its colon (matches its verbatim catalog entry).
+                .map(codex_perm::profile_id_to_legacy_value);
             vec![SessionEvent::ConfigChanged { mode, model }]
         }
         // (No `item/userMessage/delta` arm: codex never emits that method — the user
@@ -2649,31 +2862,35 @@ impl SessionBackend for CodexSessionBackend {
                 self.suspend
                     .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
                     .await?;
-                // codex `thread/settings/update{threadId, collaborationMode}` (M1).
-                // ⚠️ collaborationMode is an OBJECT, not a bare string: schema
-                // CollaborationMode = `{mode: ModeKind[plan|default], settings:
-                // {model: <required>}}`. A bare string fails deserialization. We
-                // therefore build the object with the tracked current_model; without
-                // a known model we CANNOT form a valid frame → reject (rather than
-                // ship a frame codex rejects). Overrides apply to the NEXT turn;
-                // confirmed via the thread/settings/updated notif.
-                let model = self.current_model.lock().await.clone();
-                let Some(model) = model else {
-                    return Err(BackendError::Transport(
-                        "codex SetMode needs a known model for collaborationMode.settings (set a model first)".into(),
-                    ));
-                };
+                // for codex the mode axis IS the permission axis. The mode value is a
+                // DISCOVERED colon-prefixed profile id (`permissionProfile/list`), applied
+                // via `thread/settings/update{threadId, permissions:":workspace"}` — NOT the
+                // old collaborationMode object. U1 (live 0.139.0) froze the wire: the id
+                // MUST retain its leading colon (a bare id is rejected with
+                // "default_permissions requires a [permissions] table"), and `permissions`
+                // is mutually exclusive with `sandboxPolicy`. Unlike the old
+                // collaborationMode path this needs NO current_model. Applies to the NEXT
+                // turn; confirmed via the thread/settings/updated notif.
+                //
+                // `normalize_to_profile_id` is the codex analogue of legacy ACP
+                // `normalize_requested_mode`: a discovered colon id flows through verbatim,
+                // while an upgrading user's legacy bare value (`full-access`/`yolo`/… from
+                // an older persisted selection) rewrites onto its colon-id equivalent —
+                // never producing a value codex would reject. Validation against the LIVE
+                // catalog (a stale custom id) is the reader's job on the response (a reject
+                // surfaces as a Notice), exactly as legacy `set_mode` relied on the backend.
+                let profile_id = codex_perm::normalize_to_profile_id(&mode);
                 let tid = self.bound_thread().await?;
                 let id = self.next_rpc_id();
                 // Register the rpc id so the reader claims the response: a JSON-RPC
-                // error (codex rejected the mode) surfaces as a Notice instead of
+                // error (codex rejected the profile) surfaces as a Notice instead of
                 // being dropped (success converges via thread/settings/updated).
-                self.pending_set.lock().await.insert(id, format!("mode\u{2192}{mode}"));
+                self.pending_set.lock().await.insert(id, format!("mode\u{2192}{profile_id}"));
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
                     "params": {
                         "threadId": tid,
-                        "collaborationMode": { "mode": mode, "settings": { "model": model } }
+                        "permissions": profile_id
                     }
                 });
                 self.write_frame(frame).await?;
@@ -2916,7 +3133,8 @@ impl SessionBackend for CodexSessionBackend {
     fn capabilities(&self) -> Capabilities {
         // B-CODEX-MODEL-LIST: merge the handshake-discovered models/modes into the
         // snapshot (the static base has them empty; the reader fills `discovered`
-        // from model/list + collaborationMode/list responses). Read-only sync lock.
+        // from model/list + permissionProfile/list responses — the latter mapped to the
+        // fixed permission-tier mode enum, feature 012). Read-only sync lock.
         let mut caps = self.capabilities.clone();
         let disc = self.discovered.lock().unwrap_or_else(|e| e.into_inner());
         if !disc.models.is_empty() {
@@ -4622,18 +4840,42 @@ mod tests {
 
     #[tokio::test]
     async fn config_changed_emitted_on_thread_settings_updated() {
-        // C6 §6: thread/settings/updated → ConfigChanged (the non-optimistic
-        // confirmation), NOT AdapterSpecific. Carries model + collaborationMode.mode.
+        // C6 §6: thread/settings/updated → ConfigChanged (the non-optimistic confirmation),
+        // NOT AdapterSpecific. Carries model + the permission tier read from
+        // `activePermissionProfile.id`. The colon wire id is mapped to the legacy bare token
+        // the catalog/frontend uses (`:danger-full-access` → `full-access`) so the picker
+        // highlights the matching catalog entry and all locales key off the same value the
+        // legacy ACP path presented. Verbatim 0.139.0 shape (the frame ALSO carries
+        // collaborationMode, which we must ignore).
         let events = drive_codex(&[
-            r#"{"jsonrpc":"2.0","method":"thread/settings/updated","params":{"threadId":"th1","threadSettings":{"model":"gpt-5.5","collaborationMode":{"mode":"plan","settings":{"model":"gpt-5.5"}}}}}"#,
+            r#"{"jsonrpc":"2.0","method":"thread/settings/updated","params":{"threadId":"th1","threadSettings":{"model":"gpt-5.5","activePermissionProfile":{"id":":danger-full-access","extends":null},"collaborationMode":{"mode":"default","settings":{"model":"gpt-5.5"}}}}}"#,
         ])
         .await;
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                SessionEvent::ConfigChanged { model: Some(m), mode: Some(md) } if m == "gpt-5.5" && md == "plan"
+                SessionEvent::ConfigChanged { model: Some(m), mode: Some(md) } if m == "gpt-5.5" && md == "full-access"
             )),
-            "thread/settings/updated → ConfigChanged{{model,mode}}, got {events:?}"
+            "thread/settings/updated → ConfigChanged{{model, mode=legacy bare token of activePermissionProfile.id}}, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_changed_mode_none_when_permission_profile_null() {
+        // feature 012: when the tier was set via the raw sandboxPolicy channel (not our
+        // permissions path), `activePermissionProfile` is null → carry no mode (keep the
+        // last-known selection) rather than clobber it. We must NOT fall back to
+        // collaborationMode.mode.
+        let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"thread/settings/updated","params":{"threadId":"th1","threadSettings":{"model":"gpt-5.5","activePermissionProfile":null,"collaborationMode":{"mode":"default","settings":{"model":"gpt-5.5"}}}}}"#,
+        ])
+        .await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SessionEvent::ConfigChanged { model: Some(m), mode: None } if m == "gpt-5.5"
+            )),
+            "null activePermissionProfile → ConfigChanged with mode:None, got {events:?}"
         );
     }
 
@@ -4706,21 +4948,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_set_mode_writes_collaboration_mode_object() {
-        // M1: SetMode → `thread/settings/update{threadId, collaborationMode}` where
-        // collaborationMode is the OBJECT {mode, settings:{model}} (NOT a bare
-        // string). Requires a known model — set one first via SetModel.
+    async fn dispatch_set_mode_writes_permissions_profile_id() {
+        // SetMode → `thread/settings/update{threadId, permissions}` where `permissions` is
+        // the DISCOVERED colon-prefixed profile id. A colon id passes through verbatim; a
+        // legacy bare value (`full-access`) normalizes onto its colon id. NOT the old
+        // collaborationMode object, and NOT a bare id (codex rejects a colon-less id).
+        // Needs no known model.
         let fake = fake_with_binding("th-6", None);
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        // A discovered colon id flows through unchanged (legacy-ACP parity: the wire id IS
+        // the selector value).
         backend
-            .dispatch(Command::SetModel {
-                model: "gpt-5.5".into(),
+            .dispatch(Command::SetMode {
+                mode: ":danger-full-access".into(),
             })
-            .await
-            .expect("set model");
-        backend
-            .dispatch(Command::SetMode { mode: "plan".into() })
             .await
             .expect("accepted");
         let written = captured_str(&captured).await;
@@ -4728,14 +4970,59 @@ mod tests {
             written.contains(r#""method":"thread/settings/update""#),
             "wrote thread/settings/update, got: {written}"
         );
-        // The OBJECT form, not a bare string — assert nested mode + settings.model.
         assert!(
-            written.contains(r#""collaborationMode":{"mode":"plan","settings":{"model":"gpt-5.5"}}"#),
-            "collaborationMode is the {{mode,settings{{model}}}} object, got: {written}"
+            written.contains(r#""permissions":":danger-full-access""#),
+            "carries the discovered colon-prefixed profile id verbatim, got: {written}"
         );
         assert!(
-            !written.contains(r#""collaborationMode":"plan""#),
-            "must NOT send the bare-string form codex rejects"
+            !written.contains(r#""collaborationMode""#),
+            "must NOT send the old collaborationMode object, got: {written}"
+        );
+        assert!(
+            !written.contains(r#""permissions":"danger-full-access""#),
+            "must NOT strip the mandatory leading colon, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_mode_normalizes_legacy_persisted_value() {
+        // A legacy persisted BARE value (`yolo`) — from an older AionUi that stored the
+        // pre-discovery alias — normalizes onto the `:danger-full-access` colon id, so an
+        // upgrading user's stored mode applies straight through with zero fallback. This is
+        // the codex analogue of legacy ACP `normalize_requested_mode` (alias → native id).
+        let fake = fake_with_binding("th-6", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        backend
+            .dispatch(Command::SetMode { mode: "yolo".into() })
+            .await
+            .expect("accepted");
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""permissions":":danger-full-access""#),
+            "legacy `yolo` normalizes to :danger-full-access, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_mode_passes_custom_profile_id_verbatim() {
+        // A user `[permissions.<id>]` custom profile — discovered via permissionProfile/list
+        // and NOT one of the built-in tiers — must reach the wire UNCHANGED. This is the
+        // heart of the legacy-ACP parity: codex owns the value set, AionCore only transports
+        // it (no fixed-enum whitelist that would drop a custom profile).
+        let fake = fake_with_binding("th-6", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        backend
+            .dispatch(Command::SetMode {
+                mode: ":team-review".into(),
+            })
+            .await
+            .expect("accepted");
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""permissions":":team-review""#),
+            "custom profile id reaches the wire verbatim, got: {written}"
         );
     }
 
@@ -4790,16 +5077,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_set_mode_without_known_model_is_rejected() {
-        // M1: collaborationMode.settings.model is REQUIRED; with no known model the
-        // backend cannot form a valid frame → reject rather than ship a bad one.
+    async fn dispatch_set_mode_obsolete_and_unknown_bare_values_fall_to_workspace() {
+        // Legacy-ACP parity: AionCore never ships a frame codex would reject. Any unknown
+        // or obsolete BARE value normalizes to the safe `:workspace` tier rather than
+        // erroring. `plan` (the OLD collaborationMode token) is the key case — it no longer
+        // collaboration-maps but lands on the workspace profile, proving the
+        // collaborationMode axis is gone. (Validation of a stale DISCOVERED colon id is the
+        // reconcile/reader's job against the live catalog, not this normalize step.)
         let fake = fake_with_binding("th-6", None);
+        let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
-        let err = backend
+        backend
             .dispatch(Command::SetMode { mode: "plan".into() })
             .await
-            .expect_err("no known model → reject");
-        assert!(matches!(err, BackendError::Transport(m) if m.contains("needs a known model")));
+            .expect("plan normalizes to :workspace, accepted");
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""permissions":":workspace""#),
+            "the obsolete `plan` token normalizes to the default workspace profile, got: {written}"
+        );
     }
 
     #[tokio::test]
@@ -5237,7 +5533,32 @@ mod tests {
         assert_eq!(spec.cwd.as_deref(), Some("/tmp/work"), "cwd threaded (workspace)");
     }
 
-    // ===== B-CODEX-MODEL-LIST: discovery (model/list + collaborationMode/list) =====
+    // ===== B-CODEX-MODEL-LIST: discovery (model/list + permissionProfile/list) =====
+
+    /// feature 012 (R1): the handshake MUST discover `permissionProfile/list` (codex's
+    /// mode axis IS its permission axis) and MUST NOT send `collaborationMode/list`
+    /// (plan/default has no UI entry — matches legacy ACP). Drives a real `run_handshake`
+    /// against captured stdin and asserts the wire.
+    #[tokio::test]
+    async fn handshake_discovers_permission_profiles_not_collaboration_mode() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-hs", Box::new(fake)).await;
+        backend.run_handshake(None).await.expect("handshake writes");
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"model/list""#),
+            "handshake discovers model/list, got: {written}"
+        );
+        assert!(
+            written.contains(r#""method":"permissionProfile/list""#),
+            "feature 012: handshake discovers permissionProfile/list, got: {written}"
+        );
+        assert!(
+            !written.contains(r#""method":"collaborationMode/list""#),
+            "feature 012: handshake must NOT send collaborationMode/list, got: {written}"
+        );
+    }
 
     #[tokio::test]
     async fn b_codex_model_list_response_fills_discovered_and_capabilities() {
@@ -5252,8 +5573,10 @@ mod tests {
         // + bare-string efforts — a self-confirming shape that never matched the wire,
         // so model discovery silently produced an empty list → Bedrock 404.
         let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"openai.gpt-5.5","model":"openai.gpt-5.5","displayName":"GPT-5.5","description":"Frontier model","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast"},{"reasoningEffort":"medium","description":"Balanced"},{"reasoningEffort":"high","description":"Deep"},{"reasoningEffort":"xhigh","description":"Deepest"}],"defaultReasoningEffort":"medium","isDefault":true},{"id":"openai.gpt-5.4","model":"openai.gpt-5.4","displayName":"gpt-5.4","isDefault":false}],"nextCursor":null}}"#;
-        let mode_resp = r#"{"jsonrpc":"2.0","id":51,"result":{"data":[{"name":"Plan","mode":"plan","model":null,"reasoning_effort":"medium"},{"name":"Default","mode":"default","model":null,"reasoning_effort":null}]}}"#;
-        let bytes = format!("{model_resp}\n{mode_resp}\n").into_bytes();
+        // feature 012: codex's mode catalog is the permission-profile list mapped to the
+        // fixed enum (NOT collaborationMode). Verbatim 0.139.0 permissionProfile/list shape.
+        let perm_resp = r#"{"jsonrpc":"2.0","id":51,"result":{"data":[{"id":":read-only","description":null},{"id":":workspace","description":null},{"id":":danger-full-access","description":null}],"nextCursor":null}}"#;
+        let bytes = format!("{model_resp}\n{perm_resp}\n").into_bytes();
         let fake = FakeAgentIo::never_exits(bytes);
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
         // Register the pending discovery ids the reader will claim (open_session does
@@ -5261,7 +5584,7 @@ mod tests {
         {
             let mut pd = backend.pending_discovery.lock().await;
             pd.insert(50, DiscoveryKind::Models);
-            pd.insert(51, DiscoveryKind::Modes);
+            pd.insert(51, DiscoveryKind::Permissions);
         }
         // Subscribe to drive the reader; it consumes the two responses → fill_discovery.
         let _events = backend.events();
@@ -5297,14 +5620,14 @@ mod tests {
             "supportedReasoningEfforts OBJECT array → reasoningEffort tokens, got {:?}",
             caps.available_models
         );
+        // The three built-in permission tiers surface as the LEGACY bare tokens the old ACP
+        // path advertised (`:workspace` → `auto`), in discovery order, so the picker's i18n
+        // keys off the same value it always did. `normalize_to_profile_id` is the inverse on
+        // the return trip; a custom profile (none here) would keep its colon id verbatim.
         assert_eq!(
-            caps.available_modes.len(),
-            2,
-            "collaborationMode/list result.data[] filled available_modes"
-        );
-        assert!(
-            caps.available_modes.iter().any(|m| m.id == "plan" && m.name == "Plan"),
-            "mode id = the lowercase `mode` token SetMode sends (NOT the display name), got {:?}",
+            caps.available_modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["read-only", "auto", "full-access"],
+            "permissionProfile/list built-ins → legacy bare tokens, got {:?}",
             caps.available_modes
         );
     }
@@ -5320,33 +5643,32 @@ mod tests {
     async fn model_list_response_broadcasts_catalog_updated() {
         use futures_util::StreamExt as _;
         let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"openai.gpt-5.5","displayName":"GPT-5.5"}],"nextCursor":null}}"#;
-        let mode_resp = r#"{"jsonrpc":"2.0","id":51,"result":{"data":[{"name":"Plan","mode":"plan"}]}}"#;
-        let bytes = format!("{model_resp}\n{mode_resp}\n").into_bytes();
+        // codex's modes come from permissionProfile/list (colon ids on the wire); the
+        // built-in `:workspace` tier surfaces to the frontend as the legacy bare token `auto`.
+        let perm_resp = r#"{"jsonrpc":"2.0","id":51,"result":{"data":[{"id":":workspace","description":null}],"nextCursor":null}}"#;
+        let bytes = format!("{model_resp}\n{perm_resp}\n").into_bytes();
         let fake = FakeAgentIo::never_exits(bytes);
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
         {
             let mut pd = backend.pending_discovery.lock().await;
             pd.insert(50, DiscoveryKind::Models);
-            pd.insert(51, DiscoveryKind::Modes);
+            pd.insert(51, DiscoveryKind::Permissions);
         }
         let mut events = backend.events();
         // Collect CatalogUpdated events until one carries both a model and a mode (the
         // second, refining, snapshot) — or time out.
         let mut saw_both = false;
         for _ in 0..80 {
-            match tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await {
-                Ok(Some(env)) => {
-                    if let SessionEvent::CatalogUpdated { models, modes, .. } = env.event
-                        && !models.is_empty()
-                        && !modes.is_empty()
-                    {
-                        assert_eq!(models[0].id, "openai.gpt-5.5");
-                        assert_eq!(modes[0].id, "plan");
-                        saw_both = true;
-                        break;
-                    }
-                }
-                _ => {}
+            if let Ok(Some(env)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await
+                && let SessionEvent::CatalogUpdated { models, modes, .. } = env.event
+                && !models.is_empty()
+                && !modes.is_empty()
+            {
+                assert_eq!(models[0].id, "openai.gpt-5.5");
+                assert_eq!(modes[0].id, "auto", ":workspace surfaces as the legacy bare token `auto`");
+                saw_both = true;
+                break;
             }
         }
         assert!(
@@ -5356,20 +5678,18 @@ mod tests {
     }
 
     /// Cross-version fallback (README discipline #9): if a future codex renamed the
-    /// wrapper back to `models`/`modes` or emitted bare-string reasoning efforts, the
+    /// model wrapper back to `models` or emitted bare-string reasoning efforts, the
     /// parser must still degrade gracefully (data-first, legacy-fallback) — so a rename
-    /// in either direction never silently empties the list again.
+    /// never silently empties the model list again.
     #[tokio::test]
-    async fn fill_discovery_accepts_legacy_models_modes_keys_and_string_efforts() {
+    async fn fill_discovery_accepts_legacy_models_key_and_string_efforts() {
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         // Legacy shape: result.models[] + bare-string supportedReasoningEfforts.
         let model_result: Value = serde_json::from_str(
             r#"{"models":[{"id":"legacy-1","displayName":"Legacy","supportedReasoningEfforts":["low","high"]}]}"#,
         )
         .unwrap();
-        let mode_result: Value = serde_json::from_str(r#"{"modes":[{"name":"plan"}]}"#).unwrap();
         fill_discovery(DiscoveryKind::Models, &model_result, &discovered);
-        fill_discovery(DiscoveryKind::Modes, &mode_result, &discovered);
         let d = discovered.lock().unwrap();
         assert_eq!(d.models.len(), 1, "legacy result.models[] still parses");
         assert_eq!(
@@ -5377,9 +5697,137 @@ mod tests {
             vec!["low".to_string(), "high".to_string()],
             "bare-string efforts still accepted"
         );
-        // mode with only `name` (no `mode` token) falls back to name as the id.
-        assert_eq!(d.modes.len(), 1, "legacy result.modes[] still parses");
-        assert_eq!(d.modes[0].id, "plan", "mode id falls back to `name` when `mode` absent");
+    }
+
+    /// UT-1: `permissionProfile/list` response (0.139.0 live shape) surfaces every profile
+    /// VERBATIM as a colon-prefixed mode id — built-in tiers AND a user custom profile,
+    /// preserving discovery order. Legacy-ACP parity: codex defines the value set (like an
+    /// ACP agent's `availableModes[]`), AionCore does not translate or whitelist.
+    #[tokio::test]
+    async fn fill_discovery_surfaces_permission_profiles_verbatim() {
+        let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
+        // 0.139.0 built-in tiers + a user `[permissions.team-review]` custom profile with a
+        // display name/description (which we must carry, not drop).
+        let perm_result: Value = serde_json::from_str(
+            r#"{"data":[{"id":":read-only","description":null},{"id":":workspace","description":null},{"id":":danger-full-access","description":null},{"id":":team-review","name":"Team Review","description":"Custom profile"}],"nextCursor":null}"#,
+        )
+        .unwrap();
+        fill_discovery(DiscoveryKind::Permissions, &perm_result, &discovered);
+        let d = discovered.lock().unwrap();
+        // The catalog `id` is the FRONTEND-facing value: the three built-in tiers are mapped
+        // to the legacy bare tokens the old ACP path advertised (`:workspace` → `auto`) so
+        // the picker's i18n keys off the same value; a custom profile has no legacy bare
+        // form and keeps its colon id verbatim. SetMode's `normalize_to_profile_id` is the
+        // inverse on the return trip.
+        assert_eq!(
+            d.modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["read-only", "auto", "full-access", ":team-review"],
+            "built-in tiers map to legacy bare tokens; custom keeps its colon id, in discovery order"
+        );
+        // The custom profile's own name/description are carried through (codex sent them).
+        let custom = d.modes.iter().find(|m| m.id == ":team-review").expect("custom profile present");
+        assert_eq!(custom.name, "Team Review", "custom profile display name carried");
+        assert_eq!(custom.description.as_deref(), Some("Custom profile"));
+        // A name-less built-in profile gets the friendly display copied from the legacy ACP
+        // bridge (NOT the bare id) — this is the display parity with the old path. The
+        // display table is keyed on the colon wire id, so the lookup still resolves after the
+        // catalog id was mapped to its bare token.
+        let workspace = d.modes.iter().find(|m| m.id == "auto").unwrap();
+        assert_eq!(workspace.name, "Default", "built-in workspace tier gets the legacy friendly name");
+        assert_eq!(
+            workspace.description.as_deref(),
+            Some("Codex can read and edit files in the current workspace, and run commands. Approval is required to access the internet or edit other files. (Identical to Agent mode)"),
+            "built-in workspace tier gets the legacy friendly description"
+        );
+        let read_only = d.modes.iter().find(|m| m.id == "read-only").unwrap();
+        assert_eq!(read_only.name, "Read Only");
+        let full = d.modes.iter().find(|m| m.id == "full-access").unwrap();
+        assert_eq!(full.name, "Full Access");
+    }
+
+    /// UT-1b: `normalize_to_profile_id` — the ONE translation AionCore still owns —
+    /// rewrites a legacy persisted BARE value onto its colon-prefixed profile id, passes a
+    /// discovered/custom colon id through VERBATIM, and never yields a value codex rejects.
+    /// Mirrors legacy ACP `normalize_requested_mode` (alias → native id).
+    #[test]
+    fn codex_perm_normalize_to_profile_id_maps_legacy_and_passes_colon_ids() {
+        // Legacy bare values rewrite onto the danger-full-access colon id (parity with
+        // legacy `codex_sandbox`: full-access/yolo/yoloNoSandbox → danger-full-access).
+        for legacy in ["full-access", "yolo", "yoloNoSandbox"] {
+            assert_eq!(codex_perm::normalize_to_profile_id(legacy), ":danger-full-access");
+        }
+        // read-only bare → its colon id.
+        assert_eq!(codex_perm::normalize_to_profile_id("read-only"), ":read-only");
+        // Unknown / blank / default-ish bare → the safe workspace-write tier.
+        for legacy in ["default", "auto", "autoEdit", "", "  ", "anything-unknown"] {
+            assert_eq!(
+                codex_perm::normalize_to_profile_id(legacy),
+                ":workspace",
+                "unknown/blank persisted mode falls to the safe workspace-write tier"
+            );
+        }
+        // A colon-prefixed id (discovered built-in OR user custom profile) passes through
+        // verbatim — codex, not AionCore, owns the value set (legacy-ACP parity).
+        for id in [":workspace", ":danger-full-access", ":read-only", ":my-custom", ":team-review"] {
+            assert_eq!(codex_perm::normalize_to_profile_id(id), id);
+        }
+        // Whitespace around a colon id is trimmed, not treated as a bare value.
+        assert_eq!(codex_perm::normalize_to_profile_id("  :read-only  "), ":read-only");
+        // A degenerate bare colon is nonsense → safe default, not a passthrough of ":".
+        assert_eq!(codex_perm::normalize_to_profile_id(":"), ":workspace");
+    }
+
+    /// feature 012 UT-2: an empty `permissionProfile/list` (older codex or drift) leaves
+    /// `modes` empty and takes the present-but-empty warn path without panicking.
+    #[tokio::test]
+    async fn fill_discovery_permissions_empty_does_not_panic() {
+        let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
+        let perm_result: Value = serde_json::from_str(r#"{"data":[],"nextCursor":null}"#).unwrap();
+        fill_discovery(DiscoveryKind::Permissions, &perm_result, &discovered);
+        assert!(
+            discovered.lock().unwrap().modes.is_empty(),
+            "empty data[] → no modes"
+        );
+    }
+
+    /// UT-3: a `permissionProfile/list` RESPONSE broadcasts a `CatalogUpdated` whose
+    /// `modes` carry the verbatim colon profile ids, and the models field is preserved
+    /// (orthogonal, not clobbered).
+    #[tokio::test]
+    async fn permission_profile_response_broadcasts_catalog_updated() {
+        use futures_util::StreamExt as _;
+        let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"openai.gpt-5.5","displayName":"GPT-5.5"}],"nextCursor":null}}"#;
+        let perm_resp = r#"{"jsonrpc":"2.0","id":52,"result":{"data":[{"id":":read-only","description":null},{"id":":workspace","description":null},{"id":":danger-full-access","description":null}],"nextCursor":null}}"#;
+        let bytes = format!("{model_resp}\n{perm_resp}\n").into_bytes();
+        let fake = FakeAgentIo::never_exits(bytes);
+        let backend = CodexSessionBackend::build_with_io("codex-perm", Box::new(fake)).await;
+        {
+            let mut pd = backend.pending_discovery.lock().await;
+            pd.insert(50, DiscoveryKind::Models);
+            pd.insert(52, DiscoveryKind::Permissions);
+        }
+        let mut events = backend.events();
+        let mut saw_modes = false;
+        for _ in 0..80 {
+            if let Ok(Some(env)) = tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await
+                && let SessionEvent::CatalogUpdated { models, modes, .. } = env.event
+                && !modes.is_empty()
+            {
+                assert_eq!(
+                    modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+                    vec!["read-only", "auto", "full-access"],
+                    "three built-in tiers surface as legacy bare tokens on the event"
+                );
+                // models already arrived → the snapshot must preserve it (orthogonal).
+                assert_eq!(models.len(), 1, "permission modes do not clobber the model list");
+                saw_modes = true;
+                break;
+            }
+        }
+        assert!(
+            saw_modes,
+            "a CatalogUpdated snapshot carrying the permission-tier modes must be broadcast"
+        );
     }
 
     // ===== codex-model-gating: post-handshake validated model reconcile =====
@@ -5467,18 +5915,20 @@ mod tests {
 
     // ===== codex-mode-gating: post-handshake validated mode reconcile =====
 
-    /// Build a backend whose reader has already learned a two-mode catalog
-    /// (`default`, `plan`) AND bound a thread — the state `reconcile_codex_mode` runs
-    /// against. Returns (Arc<backend>, captured stdin). The caller seeds `current_model`
-    /// (SetMode needs it to build a collaborationMode).
+    /// Build a backend whose reader has already learned the discovered permission-tier
+    /// catalog (a `permissionProfile/list` response; the wire ids are the colon ids
+    /// `:read-only`/`:workspace`/`:danger-full-access`, surfaced to the frontend as the
+    /// legacy bare tokens `read-only`/`auto`/`full-access`) AND bound a thread — the state
+    /// `reconcile_codex_mode` runs against. Returns (Arc<backend>, captured stdin). The
+    /// permissions channel needs no current_model, so the caller seeds nothing.
     async fn backend_with_mode_catalog_and_binding() -> (Arc<CodexSessionBackend>, Arc<tokio::sync::Mutex<Vec<u8>>>) {
         let started = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-mode"}}}"#;
-        let mode_resp = r#"{"jsonrpc":"2.0","id":60,"result":{"data":[{"mode":"default","name":"Default"},{"mode":"plan","name":"Plan"}],"nextCursor":null}}"#;
-        let bytes = format!("{started}\n{mode_resp}\n").into_bytes();
+        let perm_resp = r#"{"jsonrpc":"2.0","id":60,"result":{"data":[{"id":":read-only","description":null},{"id":":workspace","description":null},{"id":":danger-full-access","description":null}],"nextCursor":null}}"#;
+        let bytes = format!("{started}\n{perm_resp}\n").into_bytes();
         let fake = FakeAgentIo::never_exits(bytes);
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-mode-rec", Box::new(fake)).await;
-        backend.pending_discovery.lock().await.insert(60, DiscoveryKind::Modes);
+        backend.pending_discovery.lock().await.insert(60, DiscoveryKind::Permissions);
         let _events = backend.events();
         for _ in 0..40 {
             let filled = !backend
@@ -5496,40 +5946,73 @@ mod tests {
         (Arc::new(backend), captured)
     }
 
-    /// A requested mode that IS in the discovered catalog is applied via a real
-    /// `thread/settings/update{collaborationMode}` (the validated apply) — the codex
-    /// analogue of ACP's reconcile issuing `set_mode` only for a desire that survived
-    /// `clear_invalid_desired_mode`. codex has NO thread/start mode param, so this is
-    /// ALSO the first time `config.mode` reaches codex at all.
+    /// A requested tier that IS in the discovered catalog is applied via a real
+    /// `thread/settings/update{permissions}` (the validated apply) — the codex analogue of
+    /// ACP's reconcile issuing `set_mode` only for a desire that survived
+    /// `clear_invalid_desired_mode`. codex has NO thread/start permissions param, so this
+    /// is ALSO the first time the persisted tier reaches codex at all.
     #[tokio::test]
     async fn codex_mode_reconcile_applies_valid_mode() {
         let (backend, captured) = backend_with_mode_catalog_and_binding().await;
-        // SetMode needs a known current_model to build collaborationMode.settings.
-        *backend.current_model.lock().await = Some("openai.gpt-5.4".into());
-        reconcile_codex_mode(&backend, "plan".into()).await;
+        reconcile_codex_mode(&backend, "full-access".into()).await;
         let written = captured_str(&captured).await;
         assert!(
             written.contains(r#""method":"thread/settings/update""#),
-            "a catalog-valid mode is applied via thread/settings/update, got: {written}"
+            "a catalog-valid tier is applied via thread/settings/update, got: {written}"
         );
         assert!(
-            written.contains(r#""collaborationMode""#) && written.contains(r#""mode":"plan""#),
-            "carries the requested (valid) mode inside collaborationMode, got: {written}"
+            written.contains(r#""permissions":":danger-full-access""#),
+            "carries the requested tier as its colon profile id, got: {written}"
         );
     }
 
-    /// A requested mode that is NOT in the catalog is DROPPED: no `thread/settings/update`
-    /// is written (the thread stays on codex's default collaborationMode). Port of ACP's
-    /// `clear_invalid_desired_mode`.
+    /// A legacy persisted BARE value (`yolo`) normalizes onto the `:danger-full-access`
+    /// colon id that IS in the discovered catalog and applies straight through — zero
+    /// fallback for an upgrading user.
     #[tokio::test]
-    async fn codex_mode_reconcile_drops_invalid_mode() {
+    async fn codex_mode_reconcile_normalizes_legacy_persisted_value() {
         let (backend, captured) = backend_with_mode_catalog_and_binding().await;
-        *backend.current_model.lock().await = Some("openai.gpt-5.4".into());
-        reconcile_codex_mode(&backend, "mode-local-codex-lacks".into()).await;
+        reconcile_codex_mode(&backend, "yolo".into()).await;
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""permissions":":danger-full-access""#),
+            "legacy `yolo` normalizes to full-access → :danger-full-access, got: {written}"
+        );
+    }
+
+    /// A requested value that normalizes to a tier NOT in the catalog is DROPPED: no
+    /// `thread/settings/update` is written (the thread stays on codex's default). This can
+    /// only happen when discovery returned a partial catalog (e.g. only `:workspace`), so
+    /// we seed a single-tier catalog and request `read-only`.
+    #[tokio::test]
+    async fn codex_mode_reconcile_drops_tier_absent_from_partial_catalog() {
+        // Build a backend whose catalog has ONLY the default tier.
+        let started = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-mode"}}}"#;
+        let perm_resp = r#"{"jsonrpc":"2.0","id":61,"result":{"data":[{"id":":workspace","description":null}],"nextCursor":null}}"#;
+        let bytes = format!("{started}\n{perm_resp}\n").into_bytes();
+        let fake = FakeAgentIo::never_exits(bytes);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-mode-partial", Box::new(fake)).await;
+        backend.pending_discovery.lock().await.insert(61, DiscoveryKind::Permissions);
+        let _events = backend.events();
+        for _ in 0..40 {
+            let filled = !backend
+                .discovered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .modes
+                .is_empty();
+            let bound = backend.thread_binding.lock().await.is_some();
+            if filled && bound {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        reconcile_codex_mode(&backend, "read-only".into()).await;
         let written = captured_str_allow_empty(&captured).await;
         assert!(
             !written.contains(r#""method":"thread/settings/update""#),
-            "an invalid mode must NOT be applied to codex (no thread/settings/update), got: {written}"
+            "a tier absent from the (partial) catalog must NOT be applied, got: {written}"
         );
     }
 

@@ -30,7 +30,17 @@ pub struct Capabilities {
     /// NEW (007 §9.10/Addendum 7): models this backend advertises (handshake-
     /// filled; UI renders the switcher). Open set, not a fixed enum.
     pub available_models: Vec<ModelInfo>,
-    /// NEW (007 §9.10): modes this backend advertises.
+    /// NEW (007 §9.10): modes this backend advertises. Open set, discovery-filled —
+    /// codex (feature 012) carries the permission-profile ids `permissionProfile/list`
+    /// advertises. The three BUILT-IN tiers are surfaced as the LEGACY bare tokens the old
+    /// ACP path used (`:read-only`→`read-only`, `:workspace`→`auto`, `:danger-full-access`
+    /// →`full-access`) so the frontend receives byte-identical values and needs zero change
+    /// (feature 012 "Plan B"); a user-custom `[permissions.<id>]` profile has no bare form
+    /// and keeps its colon id. The colon↔bare pair `profile_id_to_legacy_value`↔
+    /// `normalize_to_profile_id` is the sole translation, mirroring legacy ACP's
+    /// `apply_advertised_modes` + `normalize_requested_mode`. codex has no separately-exposed
+    /// collaborationMode selector; its mode axis IS the permission axis (see codex_conn
+    /// `fill_discovery` Permissions arm).
     pub available_modes: Vec<ModeInfo>,
     /// NEW (007 §9.10): currently-selected model (persisted with the Node;
     /// preloaded on resume).

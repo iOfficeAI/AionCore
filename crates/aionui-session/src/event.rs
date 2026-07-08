@@ -311,6 +311,11 @@ pub enum SessionEvent {
     /// handle (leak-prevention), so it cannot call `capabilities()` to assemble it.
     CatalogUpdated {
         models: Vec<crate::capability::ModelInfo>,
+        /// The selectable mode catalog. For codex (feature 012) this carries the three
+        /// fixed permission-profile tiers (`default`/`full-access`/`read-only`) mapped
+        /// from `permissionProfile/list` — codex exposes NO separate collaborationMode
+        /// selector; its mode axis IS the permission axis. Other backends carry their
+        /// own mode semantics (claude permission-mode, etc.).
         modes: Vec<crate::capability::ModeInfo>,
         slash_commands: Vec<crate::capability::SlashCommandInfo>,
     },

@@ -158,8 +158,10 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     // back into config.mode on the next spawn), so gating the flag on `Some` silently
     // downgraded every default session to the most-permissive mode. Default to
     // "default" (standard prompts) so a session with no explicit choice is gated, not
-    // bypassed. `default`/`plan`/`acceptEdits`/`bypassPermissions` are claude's exact
-    // wire values (see `claude_permission_modes`).
+    // bypassed. `default`/`acceptEdits`/`bypassPermissions`/`plan`/`dontAsk`/`auto` are
+    // claude's exact accepted wire values — the whitelist is a SUPERSET of the advertised
+    // picker (which omits `auto`; see `claude_permission_modes`) so a resumed session that
+    // carries `auto` is not downgraded/crashed.
     // VALIDATE before the flag reaches the spawn: an invalid `--permission-mode`
     // makes claude exit 1 at spawn (LIVE-PROBED), which surfaces as an opaque
     // "agent crashed" with no diagnosis. `config.mode` is sourced from unconstrained
@@ -2671,17 +2673,21 @@ mod tests {
                 .position(|a| a == "--permission-mode")
                 .and_then(|i| args.get(i + 1).cloned())
         };
-        // Every valid enum value passes through verbatim.
-        for valid in ["default", "plan", "acceptEdits", "bypassPermissions"] {
+        // Every valid enum value passes through verbatim. This is claude's full
+        // accepted set (SDK `PermissionMode` + CLI): a SUPERSET of the advertised
+        // picker — `auto`/`dontAsk` are legal wire values (CLI-accepted, live-probed)
+        // even though `auto` is not advertised, so a resumed session carrying either
+        // must pass through, never crash.
+        for valid in ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"] {
             assert_eq!(
                 permission_mode(valid).as_deref(),
                 Some(valid),
                 "valid mode {valid:?} must pass through unchanged"
             );
         }
-        // Anything else (a stale alias, a codex-ism, free text) falls back to
-        // `default` instead of crashing the spawn.
-        for invalid in ["yolo", "yoloNoSandbox", "auto", "acceptedits", "danger", "Plan"] {
+        // Anything else (a stale alias, a codex-ism, free text, the CLI-only `manual`
+        // alias we never emit) falls back to `default` instead of crashing the spawn.
+        for invalid in ["yolo", "yoloNoSandbox", "manual", "acceptedits", "danger", "Plan"] {
             assert_eq!(
                 permission_mode(invalid).as_deref(),
                 Some("default"),
@@ -3944,12 +3950,15 @@ mod tests {
         assert_eq!(backend.capabilities().current_effort.as_deref(), Some("high"));
     }
 
-    /// Mode read/advertise parity: claude advertises its FIXED 4 permission modes in
-    /// `available_modes` (so the picker has data). current_mode is now REMEMBERED from
-    /// claude's inbound `system/status{permissionMode}` (design §9.10.1 option A —
-    /// de-optimistic), NOT optimistically at dispatch. This drives a system/status
-    /// through the reader (as claude emits when a mode actually applies) and asserts
-    /// current_mode reflects it.
+    /// Mode read/advertise parity: claude advertises its permission modes in
+    /// `available_modes` (so the picker has data), VERBATIM-EQUIVALENT to the legacy
+    /// ACP bridge `buildAvailableModes` — same ids, same order (default, acceptEdits,
+    /// plan, dontAsk, bypassPermissions). `auto` is omitted because the bridge gates it
+    /// on `supportsAutoMode`, which the direct CLI never reports (see
+    /// `claude_permission_modes`). current_mode is now REMEMBERED from claude's inbound
+    /// `system/status{permissionMode}` (design §9.10.1 option A — de-optimistic), NOT
+    /// optimistically at dispatch. This drives a system/status through the reader (as
+    /// claude emits when a mode actually applies) and asserts current_mode reflects it.
     #[tokio::test]
     async fn claude_advertises_fixed_modes_and_remembers_mode_from_status() {
         // The fake emits a system/status{permissionMode:plan} (the real applied-mode
@@ -3958,13 +3967,14 @@ mod tests {
         let fake = FakeAgentIo::never_exits(format!("{status}\n").into_bytes());
         let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
 
-        // The 4 fixed modes are advertised with the EXACT wire ids claude accepts.
+        // The advertised modes carry the EXACT wire ids claude accepts, in the legacy
+        // bridge's order. `auto` is gated out (see claude_permission_modes doc).
         let caps = backend.capabilities();
         let ids: Vec<&str> = caps.available_modes.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["default", "plan", "acceptEdits", "bypassPermissions"],
-            "claude advertises its fixed permission-mode enum (picker data source)"
+            vec!["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"],
+            "claude advertises the legacy-equivalent permission-mode picker (picker data source)"
         );
         assert!(
             caps.available_modes
@@ -4432,12 +4442,13 @@ mod tests {
         assert_eq!(models.len(), 2, "parsed models ride the event");
         assert_eq!(models[0].id, "default");
         assert_eq!(models[1].id, "opus");
-        // claude's fixed permission modes must ride along (whole-snapshot replace).
+        // claude's permission modes must ride along (whole-snapshot replace),
+        // legacy-bridge order, `auto` gated out (see claude_permission_modes).
         let mode_ids: Vec<&str> = modes.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             mode_ids,
-            vec!["default", "plan", "acceptEdits", "bypassPermissions"],
-            "the fixed permission modes ride the catalog event so the mode picker survives the snapshot replace"
+            vec!["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"],
+            "the permission modes ride the catalog event so the mode picker survives the snapshot replace"
         );
         assert_eq!(slash_commands.len(), 1, "slash commands ride the event");
         assert_eq!(slash_commands[0].name, "verify");
