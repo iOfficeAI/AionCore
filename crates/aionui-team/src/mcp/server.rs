@@ -16,7 +16,7 @@ use crate::prompt_dump::{TeamPromptDumpConfig, TeamToolsListDump, dump_team_tool
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
-use crate::types::{TeamAgent, TeamTask, TeammateRole, TeammateStatus};
+use crate::types::{TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
 use crate::wake::TeamWakeSource;
 
 use super::protocol::{
@@ -24,8 +24,8 @@ use super::protocol::{
     read_request, write_response,
 };
 use super::tools::{
-    RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskUpdateInput,
-    all_tool_descriptors_for_role,
+    RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskListInput,
+    TaskListStatusInput, TaskUpdateInput, all_tool_descriptors_for_role,
 };
 
 // ---------------------------------------------------------------------------
@@ -557,7 +557,7 @@ pub(crate) async fn dispatch_tool(
         "team_spawn_agent" => exec_spawn_agent(arguments, service, team_id, caller_slot_id, caller_role).await,
         "team_task_create" => exec_task_create(arguments, scheduler).await,
         "team_task_update" => exec_task_update(arguments, scheduler).await,
-        "team_task_list" => exec_task_list(scheduler).await,
+        "team_task_list" => exec_task_list(arguments, scheduler).await,
         "team_members" => exec_members(scheduler).await,
         "team_rename_agent" => exec_rename_agent(arguments, scheduler, service, team_id).await,
         "team_shutdown_agent" => {
@@ -767,6 +767,53 @@ fn task_json(task: &TeamTask) -> Value {
     })
 }
 
+const MAX_TASK_LIST_LIMIT: usize = 200;
+
+#[derive(Debug)]
+struct TaskListFilters {
+    owner: Option<String>,
+    statuses: Option<Vec<TaskStatus>>,
+    include_deleted: bool,
+    limit: Option<usize>,
+}
+
+fn parse_task_list_filters(args: &Value) -> Result<TaskListFilters, ToolCallError> {
+    let input: TaskListInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let statuses = match input.status {
+        Some(TaskListStatusInput::Single(status)) => Some(vec![parse_task_status_arg(&status)?]),
+        Some(TaskListStatusInput::Many(statuses)) => {
+            if statuses.is_empty() {
+                return Err(ToolCallError::from_message("Invalid params: status must not be empty"));
+            }
+            let parsed = statuses
+                .iter()
+                .map(|status| parse_task_status_arg(status))
+                .collect::<Result<Vec<_>, _>>()?;
+            Some(parsed)
+        }
+        None => None,
+    };
+    let limit = match input.limit {
+        Some(value) if value <= 0 => {
+            return Err(ToolCallError::from_message("Invalid params: limit must be greater than 0"));
+        }
+        Some(value) => Some((value as usize).min(MAX_TASK_LIST_LIMIT)),
+        None => None,
+    };
+    Ok(TaskListFilters {
+        owner: input.owner,
+        statuses,
+        include_deleted: input.include_deleted.unwrap_or(true),
+        limit,
+    })
+}
+
+fn parse_task_status_arg(status: &str) -> Result<TaskStatus, ToolCallError> {
+    TaskStatus::parse(status)
+        .ok_or_else(|| ToolCallError::from_message(format!("Invalid params: unsupported task status '{status}'")))
+}
+
 fn json_text(value: &Value) -> Result<String, ToolCallError> {
     serde_json::to_string_pretty(value).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
 }
@@ -873,13 +920,23 @@ async fn exec_task_update(args: &Value, scheduler: &TeammateManager) -> Result<S
     json_text(&json!({ "status": "ok", "task": task_json(&task) }))
 }
 
-async fn exec_task_list(scheduler: &TeammateManager) -> Result<String, ToolCallError> {
+async fn exec_task_list(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
+    let filters = parse_task_list_filters(args)?;
     let tasks = scheduler
         .list_tasks()
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
-    let output: Vec<Value> = tasks
+    let mut output: Vec<Value> = tasks
         .iter()
+        .filter(|task| match filters.owner.as_deref() {
+            Some(owner) => task.owner.as_deref() == Some(owner),
+            None => true,
+        })
+        .filter(|task| match filters.statuses.as_ref() {
+            Some(statuses) => statuses.contains(&task.status),
+            None if !filters.include_deleted => task.status != TaskStatus::Deleted,
+            None => true,
+        })
         .map(|t| {
             json!({
                 "id": t.id,
@@ -892,6 +949,9 @@ async fn exec_task_list(scheduler: &TeammateManager) -> Result<String, ToolCallE
             })
         })
         .collect();
+    if let Some(limit) = filters.limit {
+        output.truncate(limit);
+    }
     serde_json::to_string_pretty(&output).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
 }
 

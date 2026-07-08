@@ -79,6 +79,26 @@ pub struct TaskUpdateInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TaskListStatusInput {
+    Single(String),
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskListInput {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub status: Option<TaskListStatusInput>,
+    #[serde(default)]
+    pub include_deleted: Option<bool>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RenameAgentInput {
     pub slot_id: String,
     pub new_name: String,

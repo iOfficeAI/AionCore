@@ -211,6 +211,34 @@ fn is_error_response(resp: &Value) -> bool {
     resp["result"]["isError"].as_bool().unwrap_or(false)
 }
 
+async fn create_task(stream: &mut TcpStream, id: u64, subject: &str, owner: Option<&str>) -> String {
+    let mut args = json!({ "subject": subject });
+    if let Some(owner) = owner {
+        args["owner"] = json!(owner);
+    }
+    let resp = call_tool(stream, id, "team_task_create", args).await;
+    assert!(!is_error_response(&resp), "team_task_create failed: {resp}");
+    let payload: Value = serde_json::from_str(&extract_text(&resp)).unwrap();
+    payload["task"]["task_id"].as_str().unwrap().to_owned()
+}
+
+async fn update_task_status(stream: &mut TcpStream, id: u64, task_id: &str, status: &str) {
+    let resp = call_tool(
+        stream,
+        id,
+        "team_task_update",
+        json!({ "task_id": task_id, "status": status }),
+    )
+    .await;
+    assert!(!is_error_response(&resp), "team_task_update failed: {resp}");
+}
+
+async fn list_tasks_with_args(stream: &mut TcpStream, id: u64, args: Value) -> Vec<Value> {
+    let resp = call_tool(stream, id, "team_task_list", args).await;
+    assert!(!is_error_response(&resp), "team_task_list failed: {resp}");
+    serde_json::from_str(&extract_text(&resp)).unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Tests: Connection & Authentication (MC-1, MC-2, MC-3)
 // ---------------------------------------------------------------------------
@@ -649,6 +677,104 @@ async fn ttl1_task_list_after_create() {
     let tasks: Vec<Value> = serde_json::from_str(&text).unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0]["subject"], "Task A");
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn ttl3_task_list_empty_args_still_returns_full_board() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+    let keep_id = create_task(&mut stream, 2, "Keep", Some("worker-1")).await;
+    let deleted_id = create_task(&mut stream, 3, "Deleted", Some("worker-2")).await;
+    update_task_status(&mut stream, 4, &deleted_id, "deleted").await;
+
+    let tasks = list_tasks_with_args(&mut stream, 5, json!({})).await;
+    assert_eq!(tasks.len(), 2);
+    assert!(tasks.iter().any(|task| task["id"] == keep_id));
+    assert!(tasks.iter().any(|task| task["id"] == deleted_id));
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn ttl4_task_list_filters_owner_status_include_deleted_and_limit() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+    let worker_pending = create_task(&mut stream, 2, "Worker pending", Some("worker-1")).await;
+    let lead_pending = create_task(&mut stream, 3, "Lead pending", Some("lead-1")).await;
+    let worker_progress = create_task(&mut stream, 4, "Worker progress", Some("worker-1")).await;
+    let deleted = create_task(&mut stream, 5, "Deleted", Some("worker-1")).await;
+    update_task_status(&mut stream, 6, &worker_progress, "in_progress").await;
+    update_task_status(&mut stream, 7, &deleted, "deleted").await;
+
+    let owner_tasks = list_tasks_with_args(&mut stream, 8, json!({"owner": "worker-1"})).await;
+    assert_eq!(owner_tasks.len(), 3);
+    assert!(owner_tasks.iter().all(|task| task["owner"] == "worker-1"));
+
+    let pending_tasks = list_tasks_with_args(&mut stream, 9, json!({"status": "pending"})).await;
+    assert_eq!(pending_tasks.len(), 2);
+    assert!(pending_tasks.iter().all(|task| task["status"] == "pending"));
+
+    let active_tasks = list_tasks_with_args(
+        &mut stream,
+        10,
+        json!({"status": ["pending", "in_progress"]}),
+    )
+    .await;
+    assert_eq!(active_tasks.len(), 3);
+    assert!(active_tasks.iter().any(|task| task["id"] == worker_progress));
+    assert!(!active_tasks.iter().any(|task| task["id"] == deleted));
+
+    let no_deleted = list_tasks_with_args(&mut stream, 11, json!({"include_deleted": false})).await;
+    assert_eq!(no_deleted.len(), 3);
+    assert!(!no_deleted.iter().any(|task| task["id"] == deleted));
+
+    let status_with_deleted_flag =
+        list_tasks_with_args(&mut stream, 12, json!({"status": "pending", "include_deleted": true})).await;
+    assert_eq!(status_with_deleted_flag.len(), 2);
+    assert!(status_with_deleted_flag.iter().all(|task| task["status"] == "pending"));
+    assert!(!status_with_deleted_flag.iter().any(|task| task["id"] == deleted));
+
+    let limited = list_tasks_with_args(&mut stream, 13, json!({"owner": "worker-1", "limit": 1})).await;
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0]["id"], worker_pending);
+    assert_ne!(limited[0]["id"], lead_pending);
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn ttl5_task_list_clamps_large_limit_after_filtering() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+    for index in 0..205 {
+        create_task(&mut stream, 2 + index, &format!("Task {index}"), Some("worker-1")).await;
+    }
+
+    let tasks = list_tasks_with_args(&mut stream, 300, json!({"limit": 10000})).await;
+    assert_eq!(tasks.len(), 200);
+    assert_eq!(tasks[0]["subject"], "Task 0");
+    assert_eq!(tasks[199]["subject"], "Task 199");
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn ttl6_task_list_rejects_invalid_filter_arguments() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+
+    for (id, args, expected) in [
+        (2, json!({"slot_id": "worker-1"}), "Invalid params"),
+        (3, json!({"status": "blocked"}), "Invalid params"),
+        (4, json!({"status": []}), "Invalid params"),
+        (5, json!({"limit": 0}), "Invalid params"),
+    ] {
+        let resp = call_tool(&mut stream, id, "team_task_list", args).await;
+        assert!(is_error_response(&resp), "expected error response: {resp}");
+        assert!(extract_text(&resp).contains(expected));
+    }
 
     env.server.stop();
 }
