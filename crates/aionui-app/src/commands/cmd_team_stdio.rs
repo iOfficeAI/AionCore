@@ -1013,6 +1013,69 @@ mod tests {
         assert_eq!(first_text(&result), "ok");
     }
 
+    #[tokio::test]
+    async fn task_list_forwards_filter_arguments() {
+        let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _init = read_frame(&mut socket).await.unwrap();
+            let init_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {}
+            }))
+            .unwrap();
+            write_frame(&mut socket, &init_response).await.unwrap();
+
+            let call = read_frame(&mut socket).await.unwrap();
+            let call_value: serde_json::Value = serde_json::from_slice(&call).unwrap();
+            assert_eq!(call_value["params"]["name"], json!("team_task_list"));
+            assert_eq!(call_value["params"]["arguments"]["owner"], json!("worker-1"));
+            assert_eq!(
+                call_value["params"]["arguments"]["status"],
+                json!(["pending", "in_progress"])
+            );
+            assert_eq!(call_value["params"]["arguments"]["include_deleted"], json!(false));
+            assert_eq!(call_value["params"]["arguments"]["limit"], json!(50));
+
+            let tool_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "[]"
+                        }
+                    ]
+                }
+            }))
+            .unwrap();
+            write_frame(&mut socket, &tool_response).await.unwrap();
+        });
+        let server = TeamStdioServer {
+            port,
+            token: "dummy-token".into(),
+            slot_id: "dummy-slot".into(),
+        };
+        let args = TaskListParams {
+            owner: Some("worker-1".into()),
+            status: Some(TaskListStatusParam::Many(vec![
+                "pending".into(),
+                "in_progress".into(),
+            ])),
+            include_deleted: Some(false),
+            limit: Some(50),
+        };
+
+        let result = server.forward_to_tcp("team_task_list", &args.into_json()).await;
+
+        accept_task.await.unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(first_text(&result), "[]");
+    }
+
     #[test]
     fn parse_tool_response_extracts_content_text() {
         let result = parse_tool_response(
