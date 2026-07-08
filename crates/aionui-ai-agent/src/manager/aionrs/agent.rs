@@ -325,8 +325,12 @@ impl AionrsAgentManager {
             return;
         };
 
-        let value =
-            build_aionrs_final_input_dump_value(self.runtime.conversation_id(), self.runtime.workspace(), context, data);
+        let value = build_aionrs_final_input_dump_value(
+            self.runtime.conversation_id(),
+            self.runtime.workspace(),
+            context,
+            data,
+        );
         let input = value.get("input").cloned().unwrap_or(Value::Null);
         let resolved_context = value.get("resolved_context").cloned().unwrap_or(Value::Null);
 
