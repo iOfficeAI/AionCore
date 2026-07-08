@@ -8,6 +8,36 @@ Project-specific rules and conventions for AI assistants and contributors.
 
 ## High-Priority Rules
 
+### NEVER guess an agent CLI's behavior — only assert what an approved source proves
+
+Absolutely forbidden: inferring, guessing, or "reasoning about likely behavior" of any agent CLI
+(claude, codex, gemini, opencode, hermes, aionrs, …) — its wire protocol, message shapes, field
+semantics, timing, defaults, or capabilities — from a CLI's name, a plausible mental model, prior
+training knowledge, or how you *think* it probably works. Every claim about an agent CLI's behavior
+MUST be backed by one of these approved sources, cited explicitly by path:
+
+1. **Captured real data** — actual sampled wire traffic under
+   `~/aion/protocols/samples/` (e.g. `codex-cli/<ver>/`, `claude-cli/<ver>/`, `codex-acp/`,
+   `opencode/`, `capture/`). This is ground truth for what the CLI actually emitted.
+2. **The ACP library source** — `agent-client-protocol` (main crate + `agent-client-protocol-schema`),
+   vendored at `~/.cargo/registry/src/*/agent-client-protocol-*` — for the canonical ACP wire types
+   and semantics we translate to.
+3. **An official adapter's code** — the codex `app-server` machine-generated JSON schema under
+   `~/aion/protocols/samples/codex-cli/<ver>/schema-full/` (ground truth from the codex binary
+   itself), the official claude-code / claude-code-acp adapter source, or an equivalent
+   first-party adapter — for inferring a CLI's contract from the reference implementation.
+
+Additional reliable sources, when a claim can be grounded in them: **the CLI binary's own
+`--help` / self-describing schema output** (run it and read it), and **our own passing
+integration/live-e2e fixtures** that were recorded against the real CLI (not hand-authored
+mocks). If none of these can substantiate a claim, the honest answer is "not yet verified —
+need a capture/schema", and the next step is to capture or read a source — NOT to guess.
+
+When you state any agent-CLI behavior, cite the source inline: `verified: samples/codex-cli/0.137.0/schema-full/ClientRequest.json`
+or `verified: agent-client-protocol-schema-0.12.0/src/session.rs`. A claim with no such citation
+is a guess and violates this rule. This is a non-negotiable, standing constraint — it outranks
+convenience and applies to every statement, plan, commit message, and design doc.
+
 ### Do NOT state a claim as fact until you have verified it in the code yourself
 
 This rule exists because of a repeated, costly failure mode: forming a confident conclusion from a *proxy* for the truth instead of the truth itself, then reporting it to the user as fact. Concrete instances that must never recur:
