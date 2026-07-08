@@ -110,7 +110,9 @@ fn render_workspace_section(team_workspace: Option<&str>) -> String {
 const TEAMMATE_PROMPT_TEMPLATE: &str = r#"# You are a Team Member
 
 ## Your Identity
-Name: {{AGENT_NAME}}, Role: {{ROLE_DESC}}
+Name: {{AGENT_NAME}}
+Slot ID: {{AGENT_SLOT_ID}}
+Role: {{ROLE_DESC}}
 
 ## Conversation Style
 - If the user greets you, starts a new chat, or asks what you can do without assigning concrete work yet, reply warmly and naturally
@@ -186,6 +188,7 @@ Always use the team workspace path for any project-related operations."
 
     TEAMMATE_PROMPT_TEMPLATE
         .replace("{{AGENT_NAME}}", &params.agent.name)
+        .replace("{{AGENT_SLOT_ID}}", &params.agent.slot_id)
         .replace("{{ROLE_DESC}}", &role_description(&params.agent.backend))
         .replace("{{TEAM_NAME}}", params.team_name)
         .replace("{{LEADER_NAME}}", &params.leader.name)
@@ -262,6 +265,9 @@ mod tests {
         });
 
         assert!(prompt.contains("## Team Governance"));
+        assert!(prompt.contains("Name: Worker"));
+        assert!(prompt.contains("Slot ID: worker-1"));
+        assert!(prompt.contains("Role: general-purpose AI assistant"));
         assert!(prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
         assert!(prompt.contains("Use team_send_message to report results to the leader slot_id"));
         assert!(prompt.contains("Leader: Lead (slot_id: lead-1)"));

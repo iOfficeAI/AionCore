@@ -325,6 +325,7 @@ mod tests {
 
         assert!(prompt.contains("## Team Governance"));
         assert!(prompt.contains("Name: Worker1"));
+        assert!(prompt.contains("Slot ID: w1"));
         assert!(prompt.contains("Team: Alpha"));
         assert!(prompt.contains("Leader: Lead"));
         assert!(!prompt.contains("Teammates:"));

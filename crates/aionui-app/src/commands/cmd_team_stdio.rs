@@ -168,6 +168,50 @@ struct TaskUpdateParams {
     blocked_by: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum TaskListStatusParam {
+    Single(String),
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TaskListParams {
+    /// Return only tasks owned by this exact agent slot_id.
+    #[serde(default)]
+    owner: Option<String>,
+    /// Return only tasks with the requested status or statuses.
+    #[serde(default)]
+    status: Option<TaskListStatusParam>,
+    /// Include deleted tasks when status is omitted. Defaults server-side to true.
+    #[serde(default)]
+    include_deleted: Option<bool>,
+    /// Maximum number of returned tasks. The TCP server validates and clamps.
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+impl TaskListParams {
+    fn into_json(self) -> serde_json::Value {
+        let status = match self.status {
+            Some(TaskListStatusParam::Single(value)) => serde_json::json!(value),
+            Some(TaskListStatusParam::Many(values)) => serde_json::json!(values),
+            None => serde_json::Value::Null,
+        };
+        let mut args = serde_json::json!({
+            "owner": self.owner,
+            "status": status,
+            "include_deleted": self.include_deleted,
+            "limit": self.limit,
+        });
+        args.as_object_mut()
+            .expect("task list params must serialize to object")
+            .retain(|_, value| !value.is_null());
+        args
+    }
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RenameAgentParams {
     /// Agent slot_id to rename.
@@ -260,9 +304,12 @@ impl TeamStdioServer {
         .await
     }
 
-    #[tool(name = "team_task_list", description = "List all tasks on the team task board.")]
-    async fn task_list(&self) -> CallToolResult {
-        self.forward_to_tcp("team_task_list", &serde_json::json!({})).await
+    #[tool(
+        name = "team_task_list",
+        description = "List tasks on the team task board. Pass {} for the full board, or use owner/status/include_deleted/limit for filtered views."
+    )]
+    async fn task_list(&self, Parameters(params): Parameters<TaskListParams>) -> CallToolResult {
+        self.forward_to_tcp("team_task_list", &params.into_json()).await
     }
 
     #[tool(
@@ -676,6 +723,47 @@ mod tests {
 
         assert!(err.to_string().contains("unknown field"));
         assert!(err.to_string().contains("custom_agent_id"));
+    }
+
+    #[test]
+    fn task_list_params_accept_filter_arguments() {
+        let parsed = serde_json::from_value::<TaskListParams>(json!({
+            "owner": "worker-1",
+            "status": ["pending", "in_progress"],
+            "include_deleted": false,
+            "limit": 50
+        }))
+        .expect("task_list filters should parse");
+
+        let forwarded = parsed.into_json();
+        assert_eq!(forwarded["owner"], "worker-1");
+        assert_eq!(forwarded["status"], json!(["pending", "in_progress"]));
+        assert_eq!(forwarded["include_deleted"], false);
+        assert_eq!(forwarded["limit"], 50);
+    }
+
+    #[test]
+    fn task_list_params_reject_unknown_fields() {
+        let parsed = serde_json::from_value::<TaskListParams>(json!({
+            "slot_id": "worker-1"
+        }));
+        assert!(parsed.is_err());
+        assert!(parsed.unwrap_err().to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn team_stdio_task_list_schema_exposes_filters() {
+        let router = TeamStdioServer::tool_router();
+        let tools = router.list_all();
+        let task_list = tools
+            .iter()
+            .find(|tool| tool.name == "team_task_list")
+            .expect("team_task_list tool missing");
+        let properties = task_list.input_schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("owner"));
+        assert!(properties.contains_key("status"));
+        assert!(properties.contains_key("include_deleted"));
+        assert!(properties.contains_key("limit"));
     }
 
     #[test]

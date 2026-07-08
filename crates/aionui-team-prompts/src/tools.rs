@@ -119,10 +119,42 @@ pub fn team_tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: "team_task_list",
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "List all tasks on the team task board.",
+            description: "List tasks on the team task board. Pass {} for the full board, or use owner/status/include_deleted/limit for filtered views.",
             input_schema: json!({
                 "type": "object",
-                "properties": {}
+                "additionalProperties": false,
+                "properties": {
+                    "owner": {
+                        "type": "string",
+                        "description": "Return only tasks owned by this exact agent slot_id"
+                    },
+                    "status": {
+                        "description": "Return only tasks with these statuses. Accepts one status string or an array of status strings.",
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed", "deleted"]
+                            },
+                            {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed", "deleted"]
+                                }
+                            }
+                        ]
+                    },
+                    "include_deleted": {
+                        "type": "boolean",
+                        "description": "When status is omitted, include deleted tasks. Defaults to true so {} returns the full board."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum number of returned tasks. Values above 200 are clamped to 200."
+                    }
+                }
             }),
         },
         TeamToolSpec {
@@ -265,5 +297,22 @@ mod tests {
         assert!(!props.contains_key("agent_type"));
         assert!(!props.contains_key("backend"));
         assert!(required_names.contains(&"assistant_id"));
+    }
+
+    #[test]
+    fn task_list_schema_exposes_bounded_filter_arguments() {
+        let descriptor = visible_team_tool_descriptors(false)
+            .into_iter()
+            .find(|tool| tool.name == "team_task_list")
+            .expect("team_task_list descriptor");
+        let props = descriptor.input_schema["properties"].as_object().unwrap();
+
+        assert!(props.contains_key("owner"));
+        assert!(props.contains_key("status"));
+        assert!(props.contains_key("include_deleted"));
+        assert!(props.contains_key("limit"));
+        assert_eq!(descriptor.input_schema["additionalProperties"], false);
+        assert!(props["limit"].get("maximum").is_none());
+        assert_eq!(props["limit"]["minimum"], 1);
     }
 }
