@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-ai-agent"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "agent-client-protocol",
  "aion-agent",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-api-types"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-common",
  "serde",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-app"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assets"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-common",
  "axum",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assistant"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-auth"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-channel"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-common"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-conversation"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-cron"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-db"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-common",
  "async-trait",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-extension"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-file"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-mcp"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-office"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-realtime"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-api-types",
  "axum",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-runtime"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "dirs",
  "flate2",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-shell"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-system"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-team"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "agent-client-protocol",
  "aionui-ai-agent",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-team-prompts"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "serde",
  "serde_json",
