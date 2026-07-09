@@ -4654,12 +4654,19 @@ async fn ensure_session_existing_ready_session_broadcasts_ready_terminal_status(
 
     let events = recorder.events_by_name("team.sessionStatusChanged");
     assert!(
+        events.iter().all(|event| {
+            event.data.get("team_id").and_then(|v| v.as_str()) != Some(created.id.as_str())
+                || event.data.get("status").and_then(|v| v.as_str()) != Some("starting")
+        }),
+        "existing ready session fast path must not emit starting because no lifecycle transition is happening"
+    );
+    assert!(
         events.iter().any(|event| {
             event.data.get("team_id").and_then(|v| v.as_str()) == Some(created.id.as_str())
                 && event.data.get("status").and_then(|v| v.as_str()) == Some("ready")
                 && event.data.get("server_count").and_then(|v| v.as_u64()) == Some(2)
         }),
-        "existing ready session fast path must emit a ready terminal status after any starting status"
+        "existing ready session fast path must emit a ready terminal status"
     );
 }
 

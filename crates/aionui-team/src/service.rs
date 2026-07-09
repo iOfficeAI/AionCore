@@ -731,13 +731,6 @@ impl TeamSessionService {
             .clone();
         let _guard = lock.lock().await;
 
-        self.broadcast_session_status(
-            team_id,
-            TeamSessionStatus::Starting,
-            Some(TeamSessionPhase::LoadingTeam),
-            |_| {},
-        );
-
         let row = match self.repo.get_team(team_id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
@@ -784,6 +777,13 @@ impl TeamSessionService {
             );
             self.stop_session_unchecked(team_id);
         }
+
+        self.broadcast_session_status(
+            team_id,
+            TeamSessionStatus::Starting,
+            Some(TeamSessionPhase::LoadingTeam),
+            |_| {},
+        );
 
         self.broadcast_session_status(
             team_id,
