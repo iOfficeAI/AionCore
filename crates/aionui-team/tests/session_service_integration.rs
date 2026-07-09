@@ -668,6 +668,10 @@ impl RecordingBroadcaster {
             .cloned()
             .collect()
     }
+
+    fn clear(&self) {
+        self.events.lock().unwrap().clear();
+    }
 }
 
 impl EventBroadcaster for RecordingBroadcaster {
@@ -4625,6 +4629,37 @@ async fn ensure_session_broadcasts_starting_and_ready_session_status() {
                 && event.data.get("server_count").and_then(|v| v.as_u64()) == Some(2)
         }),
         "ensure_session must emit ready with server_count"
+    );
+}
+
+#[tokio::test]
+async fn ensure_session_existing_ready_session_broadcasts_ready_terminal_status() {
+    let (svc, recorder) = setup_with_recording_broadcaster();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    recorder.clear();
+
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    let events = recorder.events_by_name("team.sessionStatusChanged");
+    assert!(
+        events.iter().any(|event| {
+            event.data.get("team_id").and_then(|v| v.as_str()) == Some(created.id.as_str())
+                && event.data.get("status").and_then(|v| v.as_str()) == Some("ready")
+                && event.data.get("server_count").and_then(|v| v.as_u64()) == Some(2)
+        }),
+        "existing ready session fast path must emit a ready terminal status after any starting status"
     );
 }
 

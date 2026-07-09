@@ -770,6 +770,9 @@ impl TeamSessionService {
         if self.sessions.contains_key(team_id) {
             let missing_runtime_tasks = self.missing_agent_runtime_tasks(&agents_snapshot);
             if missing_runtime_tasks.is_empty() {
+                self.broadcast_session_status(team_id, TeamSessionStatus::Ready, None, |p| {
+                    p.server_count = Some(agents_snapshot.len());
+                });
                 return Ok(());
             }
 
