@@ -38,7 +38,7 @@ pub const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionr
 /// Returns `true` if:
 /// 1. The backend is in the hard whitelist, OR
 /// 2. The `agent_capabilities` JSON contains an `mcp_capabilities` / `mcpCapabilities` / `mcp`
-///    field (per ACP spec, presence of any MCP transport implies stdio support).
+///    field with at least one explicitly supported MCP transport.
 pub fn is_team_capable(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
     if TEAM_CAPABLE_BACKENDS.contains(&backend) {
         return true;
@@ -46,16 +46,47 @@ pub fn is_team_capable(backend: &str, agent_capabilities: Option<&serde_json::Va
     has_mcp_capability(agent_capabilities)
 }
 
-/// Check whether `agent_capabilities` JSON declares any MCP transport.
-/// Per ACP spec: stdio is the baseline; if any transport is declared, the agent supports MCP.
+/// Check whether `agent_capabilities` JSON declares a supported MCP transport.
 pub fn has_mcp_capability(agent_capabilities: Option<&serde_json::Value>) -> bool {
     let Some(caps) = agent_capabilities else {
         return false;
     };
-    caps.get("mcp_capabilities")
+    let Some(mcp_caps) = caps
+        .get("mcp_capabilities")
         .or_else(|| caps.get("mcpCapabilities"))
         .or_else(|| caps.get("mcp"))
-        .is_some()
+    else {
+        return false;
+    };
+
+    ["stdio", "http", "sse"]
+        .iter()
+        .any(|transport| mcp_caps.get(*transport).and_then(serde_json::Value::as_bool) == Some(true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn has_mcp_capability_requires_explicit_supported_transport() {
+        assert!(!has_mcp_capability(None));
+        assert!(!has_mcp_capability(Some(&json!({}))));
+        assert!(!has_mcp_capability(Some(&json!({
+            "mcp_capabilities": { "http": false, "sse": false }
+        }))));
+
+        assert!(has_mcp_capability(Some(&json!({
+            "mcp_capabilities": { "stdio": true }
+        }))));
+        assert!(has_mcp_capability(Some(&json!({
+            "mcpCapabilities": { "http": true, "sse": false }
+        }))));
+        assert!(has_mcp_capability(Some(&json!({
+            "mcp": { "http": false, "sse": true }
+        }))));
+    }
 }
 
 // --- Image processing ---
