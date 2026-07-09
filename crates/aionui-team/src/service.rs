@@ -795,6 +795,9 @@ impl TeamSessionService {
             .rebuild_agent_processes(team_id, &session, &user_id, &agents_snapshot)
             .await
         {
+            self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionError, None, |p| {
+                p.error = Some(e.to_string());
+            });
             session.stop();
             return Err(e);
         }

@@ -5102,7 +5102,7 @@ async fn d9_ensure_session_cleans_up_successful_rebuilds_when_one_agent_fails() 
         }
         .boxed()
     });
-    let (svc, tm) = setup_with_factory(factory);
+    let (svc, _team_repo, tm, recorder) = setup_with_factory_and_recording_broadcaster(factory);
     let created = svc
         .create_team(
             "user1",
@@ -5148,6 +5148,16 @@ async fn d9_ensure_session_cleans_up_successful_rebuilds_when_one_agent_fails() 
     assert!(
         svc.get_session_scheduler(&created.id).is_none(),
         "session must not be registered after partial rebuild failure"
+    );
+
+    let team_session_error = recorder.events_by_name("team.mcpStatus").into_iter().find(|event| {
+        event.data.get("team_id").and_then(|v| v.as_str()) == Some(created.id.as_str())
+            && event.data.get("slot_id").and_then(|v| v.as_str()) == Some("")
+            && event.data.get("phase").and_then(|v| v.as_str()) == Some("session_error")
+    });
+    assert!(
+        team_session_error.is_some(),
+        "partial rebuild failure must emit a team-level session_error terminal event"
     );
 }
 
