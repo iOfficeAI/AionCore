@@ -559,39 +559,39 @@ pub struct TeamAgentRuntimeStatusPayload {
     pub error: Option<String>,
 }
 
-/// Lifecycle phases of the per-team MCP stdio bridge + ACP session.
-///
-/// Emitted by the MCP supervisor whenever a teammate slot transitions
-/// through its bring-up / degraded / ready states so the frontend can
-/// surface actionable status for each agent.
+/// Team-level session availability status for `team.sessionStatusChanged`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum TeamMcpPhase {
-    TcpReady,
-    TcpError,
-    SessionInjecting,
-    SessionReady,
-    SessionError,
-    LoadFailed,
-    Degraded,
-    ConfigWriteFailed,
-    McpToolsWaiting,
-    McpToolsReady,
+pub enum TeamSessionStatus {
+    Starting,
+    Ready,
+    Failed,
 }
 
-/// Payload for `team.mcpStatus` WebSocket event.
+/// Diagnostic phase for team session startup.
 ///
-/// Pushed whenever a teammate's MCP bridge or ACP session transitions to
-/// a new [`TeamMcpPhase`]. Optional fields carry phase-specific detail:
-/// `port` for TCP bring-up, `server_count` for tool readiness, `error`
-/// for failure phases.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TeamMcpStatusPayload {
+/// Frontend gating must use [`TeamSessionStatus`]. This phase identifies
+/// which ensure-session step is currently running or failed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamSessionPhase {
+    LoadingTeam,
+    StartingBridge,
+    AttachingAgents,
+    Recovering,
+}
+
+/// Payload for `team.sessionStatusChanged` WebSocket event.
+///
+/// Pushed when the whole team session moves through startup, ready, or
+/// failed states. Member runtime details are reported separately through
+/// `team.agentRuntimeStatusChanged`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamSessionStatusPayload {
     pub team_id: String,
-    pub slot_id: String,
-    pub phase: TeamMcpPhase,
+    pub status: TeamSessionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
+    pub phase: Option<TeamSessionPhase>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1272,101 +1272,69 @@ mod tests {
         assert_eq!(team.created_at, 1000);
     }
 
-    // -- F. TeamMcpPhase serde roundtrip --------------------------------------
+    // -- F. TeamSessionStatus / TeamSessionPhase serde roundtrip -----------------
 
-    fn assert_phase_roundtrip(phase: TeamMcpPhase, wire: &str) {
+    fn assert_session_status_roundtrip(status: TeamSessionStatus, wire: &str) {
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json, serde_json::Value::String(wire.into()));
+        let parsed: TeamSessionStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, status);
+    }
+
+    fn assert_session_phase_roundtrip(phase: TeamSessionPhase, wire: &str) {
         let json = serde_json::to_value(&phase).unwrap();
         assert_eq!(json, serde_json::Value::String(wire.into()));
-        let parsed: TeamMcpPhase = serde_json::from_value(json).unwrap();
+        let parsed: TeamSessionPhase = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, phase);
     }
 
     #[test]
-    fn team_mcp_phase_tcp_ready_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::TcpReady, "tcp_ready");
+    fn team_session_status_roundtrips() {
+        assert_session_status_roundtrip(TeamSessionStatus::Starting, "starting");
+        assert_session_status_roundtrip(TeamSessionStatus::Ready, "ready");
+        assert_session_status_roundtrip(TeamSessionStatus::Failed, "failed");
     }
 
     #[test]
-    fn team_mcp_phase_tcp_error_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::TcpError, "tcp_error");
+    fn team_session_phase_roundtrips() {
+        assert_session_phase_roundtrip(TeamSessionPhase::LoadingTeam, "loading_team");
+        assert_session_phase_roundtrip(TeamSessionPhase::StartingBridge, "starting_bridge");
+        assert_session_phase_roundtrip(TeamSessionPhase::AttachingAgents, "attaching_agents");
+        assert_session_phase_roundtrip(TeamSessionPhase::Recovering, "recovering");
     }
 
-    #[test]
-    fn team_mcp_phase_session_injecting_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::SessionInjecting, "session_injecting");
-    }
+    // -- G. TeamSessionStatusPayload & TeammateMessagePayload --------------------
 
     #[test]
-    fn team_mcp_phase_session_ready_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::SessionReady, "session_ready");
-    }
-
-    #[test]
-    fn team_mcp_phase_session_error_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::SessionError, "session_error");
-    }
-
-    #[test]
-    fn team_mcp_phase_load_failed_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::LoadFailed, "load_failed");
-    }
-
-    #[test]
-    fn team_mcp_phase_degraded_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::Degraded, "degraded");
-    }
-
-    #[test]
-    fn team_mcp_phase_config_write_failed_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::ConfigWriteFailed, "config_write_failed");
-    }
-
-    #[test]
-    fn team_mcp_phase_mcp_tools_waiting_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::McpToolsWaiting, "mcp_tools_waiting");
-    }
-
-    #[test]
-    fn team_mcp_phase_mcp_tools_ready_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::McpToolsReady, "mcp_tools_ready");
-    }
-
-    // -- G. TeamMcpStatusPayload & TeammateMessagePayload ---------------------
-
-    #[test]
-    fn serialize_team_mcp_status_payload_all_fields_present() {
-        let payload = TeamMcpStatusPayload {
+    fn serialize_team_session_status_payload_all_fields_present() {
+        let payload = TeamSessionStatusPayload {
             team_id: "team-1".into(),
-            slot_id: "slot-2".into(),
-            phase: TeamMcpPhase::SessionReady,
-            port: Some(54321),
+            status: TeamSessionStatus::Ready,
+            phase: Some(TeamSessionPhase::Recovering),
             server_count: Some(7),
             error: Some("boom".into()),
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["team_id"], "team-1");
-        assert_eq!(json["slot_id"], "slot-2");
-        assert_eq!(json["phase"], "session_ready");
-        assert_eq!(json["port"], 54321);
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["phase"], "recovering");
         assert_eq!(json["server_count"], 7);
         assert_eq!(json["error"], "boom");
     }
 
     #[test]
-    fn serialize_team_mcp_status_payload_optional_fields_omitted() {
-        let payload = TeamMcpStatusPayload {
+    fn serialize_team_session_status_payload_optional_fields_omitted() {
+        let payload = TeamSessionStatusPayload {
             team_id: "team-1".into(),
-            slot_id: "slot-2".into(),
-            phase: TeamMcpPhase::TcpReady,
-            port: None,
+            status: TeamSessionStatus::Starting,
+            phase: None,
             server_count: None,
             error: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["team_id"], "team-1");
-        assert_eq!(json["slot_id"], "slot-2");
-        assert_eq!(json["phase"], "tcp_ready");
-        assert!(json.get("port").is_none());
+        assert_eq!(json["status"], "starting");
+        assert!(json.get("phase").is_none());
         assert!(json.get("server_count").is_none());
         assert!(json.get("error").is_none());
     }

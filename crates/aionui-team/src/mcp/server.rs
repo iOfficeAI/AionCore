@@ -1,9 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
-use aionui_api_types::{
-    TeamMcpPhase, TeamMcpStatusPayload, TeamSendMessageQueuedResponse, TeamSendMessageStatus, WebSocketMessage,
-};
+use aionui_api_types::{TeamSendMessageQueuedResponse, TeamSendMessageStatus};
 use aionui_realtime::EventBroadcaster;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,7 +9,6 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{TeamError, classify_public_error};
-use crate::events::TEAM_MCP_STATUS_EVENT;
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamToolsListDump, dump_team_tools_list};
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
@@ -62,42 +59,19 @@ impl TeamMcpServer {
         auth_token: String,
         scheduler: Arc<TeammateManager>,
         team_id: String,
-        broadcaster: Arc<dyn EventBroadcaster>,
+        _broadcaster: Arc<dyn EventBroadcaster>,
         service: Weak<TeamSessionService>,
         prompt_dump: Option<TeamPromptDumpConfig>,
     ) -> Result<Self, TeamError> {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
             Err(e) => {
-                broadcast_mcp_status(
-                    broadcaster.as_ref(),
-                    TeamMcpStatusPayload {
-                        team_id: team_id.clone(),
-                        slot_id: String::new(),
-                        phase: TeamMcpPhase::TcpError,
-                        port: None,
-                        server_count: None,
-                        error: Some(e.to_string()),
-                    },
-                );
                 return Err(TeamError::InvalidRequest(format!("Failed to bind TCP: {e}")));
             }
         };
         let addr = listener
             .local_addr()
             .map_err(|e| TeamError::InvalidRequest(format!("Failed to get local addr: {e}")))?;
-
-        broadcast_mcp_status(
-            broadcaster.as_ref(),
-            TeamMcpStatusPayload {
-                team_id: team_id.clone(),
-                slot_id: String::new(),
-                phase: TeamMcpPhase::TcpReady,
-                port: Some(addr.port()),
-                server_count: None,
-                error: None,
-            },
-        );
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -176,14 +150,6 @@ impl Drop for TeamMcpServer {
     fn drop(&mut self) {
         let _ = self.shutdown_tx.send(true);
     }
-}
-
-fn broadcast_mcp_status(broadcaster: &dyn EventBroadcaster, payload: TeamMcpStatusPayload) {
-    let event = WebSocketMessage::new(
-        TEAM_MCP_STATUS_EVENT,
-        serde_json::to_value(payload).expect("serialize mcp status payload"),
-    );
-    broadcaster.broadcast(event);
 }
 
 // ---------------------------------------------------------------------------

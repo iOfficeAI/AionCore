@@ -24,10 +24,6 @@ impl RecordingBroadcaster {
             events: std::sync::Mutex::new(vec![]),
         }
     }
-
-    fn events(&self) -> Vec<WebSocketMessage<Value>> {
-        self.events.lock().unwrap().clone()
-    }
 }
 
 impl EventBroadcaster for RecordingBroadcaster {
@@ -72,7 +68,6 @@ fn make_agents() -> Vec<TeamAgent> {
 struct TestEnv {
     server: TeamMcpServer,
     _repo: Arc<MockTeamRepo>,
-    broadcaster: Arc<RecordingBroadcaster>,
 }
 
 async fn setup() -> TestEnv {
@@ -109,11 +104,7 @@ async fn setup_with_prompt_dump(prompt_dump: Option<TeamPromptDumpConfig>) -> Te
     .await
     .unwrap();
 
-    TestEnv {
-        server,
-        _repo: repo,
-        broadcaster: recorder,
-    }
+    TestEnv { server, _repo: repo }
 }
 
 async fn connect_and_init(port: u16, token: &str, slot_id: &str) -> TcpStream {
@@ -1286,39 +1277,6 @@ async fn sb3_different_agents_get_different_slot_ids() {
         kv_lead[TeamMcpStdioConfig::ENV_SLOT_ID],
         kv_worker[TeamMcpStdioConfig::ENV_SLOT_ID]
     );
-}
-
-// ---------------------------------------------------------------------------
-// Tests: mcpStatus broadcast (W5-D31b-1)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn mcp_status_tcp_ready_is_broadcast_on_successful_bind() {
-    use aionui_api_types::{TeamMcpPhase, TeamMcpStatusPayload};
-
-    let env = setup().await;
-    let port = env.server.port();
-
-    let events = env.broadcaster.events();
-    let status_events: Vec<_> = events.iter().filter(|e| e.name == "team.mcpStatus").collect();
-    assert_eq!(
-        status_events.len(),
-        1,
-        "expected exactly one team.mcpStatus event after bind, got {}",
-        status_events.len()
-    );
-
-    let payload: TeamMcpStatusPayload = serde_json::from_value(status_events[0].data.clone()).unwrap();
-    assert_eq!(payload.team_id, "team-1");
-    assert_eq!(payload.slot_id, "");
-    assert!(matches!(payload.phase, TeamMcpPhase::TcpReady));
-    assert_eq!(payload.port, Some(port));
-    assert!(payload.server_count.is_none());
-    assert!(payload.error.is_none());
-
-    env.server.stop();
-
-    env.server.stop();
 }
 
 // ---------------------------------------------------------------------------

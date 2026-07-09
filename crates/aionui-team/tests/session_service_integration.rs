@@ -4566,33 +4566,66 @@ async fn es4_ensure_session_rejects_cross_user_access() {
     assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
-// -- W5-D31b-2: team.mcpStatus service-layer broadcasts ---------------------
+// -- W5-D31b-2: team.sessionStatusChanged service-layer broadcasts -----------
 //
 // The happy-path phase transitions are covered by focused service/session
 // assertions. This test keeps the load-failed broadcast covered end-to-end.
 
 #[tokio::test]
-async fn d31b2_ensure_session_broadcasts_load_failed_for_missing_team() {
+async fn d31b2_ensure_session_broadcasts_failed_loading_team_for_missing_team() {
     let (svc, recorder) = setup_with_recording_broadcaster();
     let err = svc.ensure_session("user1", "nonexistent-team-xyz").await.unwrap_err();
     assert!(matches!(err, aionui_team::TeamError::TeamNotFound(_)));
 
-    let load_failed = recorder
-        .events_by_name("team.mcpStatus")
+    let failed = recorder
+        .events_by_name("team.sessionStatusChanged")
         .into_iter()
         .find(|e| {
-            e.data
-                .get("phase")
-                .and_then(|v| v.as_str())
-                .map(|s| s == "load_failed")
-                .unwrap_or(false)
+            e.data.get("status").and_then(|v| v.as_str()) == Some("failed")
+                && e.data.get("phase").and_then(|v| v.as_str()) == Some("loading_team")
         })
-        .expect("load_failed broadcast expected");
+        .expect("failed/loading_team broadcast expected");
     assert_eq!(
-        load_failed.data.get("team_id").and_then(|v| v.as_str()),
+        failed.data.get("team_id").and_then(|v| v.as_str()),
         Some("nonexistent-team-xyz")
     );
-    assert!(load_failed.data.get("error").is_some());
+    assert!(failed.data.get("error").is_some());
+}
+
+#[tokio::test]
+async fn ensure_session_broadcasts_starting_and_ready_session_status() {
+    let (svc, recorder) = setup_with_recording_broadcaster();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    let events = recorder.events_by_name("team.sessionStatusChanged");
+    assert!(
+        events.iter().any(|event| {
+            event.data.get("team_id").and_then(|v| v.as_str()) == Some(created.id.as_str())
+                && event.data.get("status").and_then(|v| v.as_str()) == Some("starting")
+                && event.data.get("phase").and_then(|v| v.as_str()) == Some("loading_team")
+        }),
+        "ensure_session must emit starting/loading_team"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.data.get("team_id").and_then(|v| v.as_str()) == Some(created.id.as_str())
+                && event.data.get("status").and_then(|v| v.as_str()) == Some("ready")
+                && event.data.get("server_count").and_then(|v| v.as_u64()) == Some(2)
+        }),
+        "ensure_session must emit ready with server_count"
+    );
 }
 
 #[tokio::test]
@@ -5150,14 +5183,17 @@ async fn d9_ensure_session_cleans_up_successful_rebuilds_when_one_agent_fails() 
         "session must not be registered after partial rebuild failure"
     );
 
-    let team_session_error = recorder.events_by_name("team.mcpStatus").into_iter().find(|event| {
-        event.data.get("team_id").and_then(|v| v.as_str()) == Some(created.id.as_str())
-            && event.data.get("slot_id").and_then(|v| v.as_str()) == Some("")
-            && event.data.get("phase").and_then(|v| v.as_str()) == Some("session_error")
-    });
+    let team_session_failed = recorder
+        .events_by_name("team.sessionStatusChanged")
+        .into_iter()
+        .find(|event| {
+            event.data.get("team_id").and_then(|v| v.as_str()) == Some(created.id.as_str())
+                && event.data.get("status").and_then(|v| v.as_str()) == Some("failed")
+                && event.data.get("phase").and_then(|v| v.as_str()) == Some("attaching_agents")
+        });
     assert!(
-        team_session_error.is_some(),
-        "partial rebuild failure must emit a team-level session_error terminal event"
+        team_session_failed.is_some(),
+        "partial rebuild failure must emit a team-level failed/attaching_agents terminal event"
     );
 }
 

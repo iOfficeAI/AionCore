@@ -10,8 +10,8 @@ use std::time::Instant;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamMcpPhase, TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole,
-    TeamSlotRuntimeHealth, WebSocketMessage,
+    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole, TeamSessionPhase, TeamSessionStatus,
+    TeamSessionStatusPayload, TeamSlotRuntimeHealth, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 use crate::error::TeamError;
 use crate::event_loop::AgentLoopContext;
 use crate::events::{
-    TEAM_CREATED_EVENT, TEAM_MCP_STATUS_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT, TeamEventEmitter,
+    TEAM_CREATED_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT, TEAM_SESSION_STATUS_CHANGED_EVENT, TeamEventEmitter,
 };
 use crate::mcp::TeamMcpStdioConfig;
 use crate::message_projection::TeamProjectionMessageStore;
@@ -731,18 +731,35 @@ impl TeamSessionService {
             .clone();
         let _guard = lock.lock().await;
 
+        self.broadcast_session_status(
+            team_id,
+            TeamSessionStatus::Starting,
+            Some(TeamSessionPhase::LoadingTeam),
+            |_| {},
+        );
+
         let row = match self.repo.get_team(team_id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
-                self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::LoadFailed, None, |p| {
-                    p.error = Some(format!("team not found: {team_id}"));
-                });
+                self.broadcast_session_status(
+                    team_id,
+                    TeamSessionStatus::Failed,
+                    Some(TeamSessionPhase::LoadingTeam),
+                    |p| {
+                        p.error = Some(format!("team not found: {team_id}"));
+                    },
+                );
                 return Err(TeamError::TeamNotFound(team_id.into()));
             }
             Err(e) => {
-                self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::LoadFailed, None, |p| {
-                    p.error = Some(e.to_string());
-                });
+                self.broadcast_session_status(
+                    team_id,
+                    TeamSessionStatus::Failed,
+                    Some(TeamSessionPhase::LoadingTeam),
+                    |p| {
+                        p.error = Some(e.to_string());
+                    },
+                );
                 return Err(e.into());
             }
         };
@@ -765,6 +782,13 @@ impl TeamSessionService {
             self.stop_session_unchecked(team_id);
         }
 
+        self.broadcast_session_status(
+            team_id,
+            TeamSessionStatus::Starting,
+            Some(TeamSessionPhase::StartingBridge),
+            |_| {},
+        );
+
         let session = match TeamSession::start_with_prompt_dump(
             team,
             self.repo.clone(),
@@ -782,22 +806,37 @@ impl TeamSessionService {
         {
             Ok(session) => session,
             Err(e) => {
-                self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionError, None, |p| {
-                    p.error = Some(e.to_string());
-                });
+                self.broadcast_session_status(
+                    team_id,
+                    TeamSessionStatus::Failed,
+                    Some(TeamSessionPhase::StartingBridge),
+                    |p| {
+                        p.error = Some(e.to_string());
+                    },
+                );
                 return Err(e);
             }
         };
 
-        self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionInjecting, None, |_| {});
+        self.broadcast_session_status(
+            team_id,
+            TeamSessionStatus::Starting,
+            Some(TeamSessionPhase::AttachingAgents),
+            |_| {},
+        );
 
         if let Err(e) = self
             .rebuild_agent_processes(team_id, &session, &user_id, &agents_snapshot)
             .await
         {
-            self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionError, None, |p| {
-                p.error = Some(e.to_string());
-            });
+            self.broadcast_session_status(
+                team_id,
+                TeamSessionStatus::Failed,
+                Some(TeamSessionPhase::AttachingAgents),
+                |p| {
+                    p.error = Some(e.to_string());
+                },
+            );
             session.stop();
             return Err(e);
         }
@@ -814,6 +853,13 @@ impl TeamSessionService {
         };
         self.sessions.insert(team_id.to_owned(), entry);
 
+        self.broadcast_session_status(
+            team_id,
+            TeamSessionStatus::Starting,
+            Some(TeamSessionPhase::Recovering),
+            |_| {},
+        );
+
         if let Err(err) = session.try_start_recovery_drain("ensure_session_ready").await {
             warn!(
                 team_id,
@@ -822,7 +868,7 @@ impl TeamSessionService {
             );
         }
 
-        self.broadcast_mcp_phase(team_id, "", TeamMcpPhase::SessionReady, None, |p| {
+        self.broadcast_session_status(team_id, TeamSessionStatus::Ready, None, |p| {
             p.server_count = Some(agents_snapshot.len());
         });
 
@@ -863,22 +909,26 @@ impl TeamSessionService {
         self.conversation_port.get_config_options(conversation_id).await
     }
 
-    fn broadcast_mcp_phase<F>(&self, team_id: &str, slot_id: &str, phase: TeamMcpPhase, port: Option<u16>, customize: F)
-    where
-        F: FnOnce(&mut TeamMcpStatusPayload),
+    fn broadcast_session_status<F>(
+        &self,
+        team_id: &str,
+        status: TeamSessionStatus,
+        phase: Option<TeamSessionPhase>,
+        customize: F,
+    ) where
+        F: FnOnce(&mut TeamSessionStatusPayload),
     {
-        let mut payload = TeamMcpStatusPayload {
+        let mut payload = TeamSessionStatusPayload {
             team_id: team_id.to_owned(),
-            slot_id: slot_id.to_owned(),
+            status,
             phase,
-            port,
             server_count: None,
             error: None,
         };
         customize(&mut payload);
         let event = WebSocketMessage::new(
-            TEAM_MCP_STATUS_EVENT,
-            serde_json::to_value(payload).expect("serialize mcp status payload"),
+            TEAM_SESSION_STATUS_CHANGED_EVENT,
+            serde_json::to_value(payload).expect("serialize team session status payload"),
         );
         self.broadcaster.broadcast(event);
     }
@@ -1073,11 +1123,6 @@ impl TeamSessionService {
                 TeamAgentRuntimeStatus::Failed,
                 Some(error.clone()),
             );
-            let agent_identity = format_rebuild_agent_identity(&failure.agent);
-            let msg = format!("failed to attach rebuilt agent {agent_identity}: {error}");
-            self.broadcast_mcp_phase(team_id, &failure.agent.slot_id, TeamMcpPhase::SessionError, None, |p| {
-                p.error = Some(msg);
-            });
             warn!(
                 team_id,
                 slot_id = %failure.agent.slot_id,
