@@ -1269,6 +1269,20 @@ async fn reader_task(
     // loop). Like `hung`, it routes to a terminal Detached without waiting on the
     // process (which is still alive) so the turn ends as a crash instead of hanging.
     let mut panicked = false;
+    // Windows pipe-EOF gap (F48-adjacent): claude's stdout write handle can be
+    // inherited by a surviving grandchild (a detached MCP/tool descendant). When the
+    // user kills the claude leaf, the pipe's write end is NOT fully closed while such
+    // a descendant lives, so `stdout.read()` NEVER returns 0 — the reader would park
+    // forever, `Detached` would never fire, and the UI would wedge at `pending` with
+    // no error. (macOS has close-on-exec on the fd, so EOF is prompt there and this
+    // race never wins — but the guard is unconditional: it is correct on every OS and
+    // simply never fires when EOF/error already terminate first.) So we cannot rely on
+    // EOF alone; we race the unbounded read against the process's exit watch
+    // (`io.wait_for_exit()`, backed by a cancel-safe `watch::Receiver` over the direct
+    // child's `child.wait()` — orthogonal to the stdout pipe). When the exit leg wins,
+    // `proc_exited` carries the status so the terminal `Detached` reuses it instead of
+    // re-awaiting `wait_for_exit` (which would race a second borrow / re-resolve).
+    let mut proc_exited: Option<Option<crate::event::ExitStatusLite>> = None;
     loop {
         // DIAGNOSTIC: mark each read-loop iteration entry. If the log shows this line
         // but then NO matching stdout/eof/error outcome for a long time, the reader is
@@ -1285,8 +1299,68 @@ async fn reader_task(
             );
         }
         let read = if seen_frame {
-            // Proven alive → unbounded read (a long turn is never timed).
-            stdout.read(&mut chunk).await.map_err(|_| ())
+            // Proven alive → unbounded read (a long turn is never timed), BUT raced
+            // against the process's exit watch so a Windows pipe-EOF stall (a surviving
+            // grandchild holding the write end → no `Ok(0)` ever) still terminates the
+            // turn. Both `select!` legs are cancel-safe: `stdout.read` is; `wait_for_exit`
+            // is a `watch::Receiver::changed()` (loses nothing when the read leg wins).
+            tokio::select! {
+                biased;
+                // Prefer the read: while bytes are flowing we must drain them (a turn
+                // that also just exited still has its `result` frame to deliver). The
+                // exit leg only wins once the read is genuinely parked with no bytes.
+                r = stdout.read(&mut chunk) => r.map_err(|_| ()),
+                exit = io.wait_for_exit() => {
+                    // The direct child exited but stdout has not EOF'd (the Windows
+                    // inherited-handle case). Do NOT tear down yet: the pipe buffer may
+                    // still hold the final `result` frame. Bounded-drain it (EOF may
+                    // never come, so we cannot wait for `Ok(0)`), then break to the
+                    // existing terminal path with the captured exit status.
+                    if claude_wire_dump_enabled() {
+                        tracing::info!(
+                            target: "aionui_session::claude_wire",
+                            direction = "read",
+                            conversation_id = %session_id,
+                            outcome = "process_exited",
+                            "claude process exited while stdout still open (no EOF); bounded-draining tail"
+                        );
+                    }
+                    loop {
+                        match tokio::time::timeout(std::time::Duration::from_millis(200), stdout.read(&mut chunk)).await {
+                            // More buffered bytes: process them exactly as the live loop
+                            // would (same panic net → `panicked` short-circuits the drain).
+                            Ok(Ok(n)) if n > 0 => {
+                                if claude_wire_dump_enabled() {
+                                    dump_wire("stdout", &session_id, turn_gen.load(Ordering::SeqCst), &chunk[..n]);
+                                }
+                                let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    parser.frame_lines(&chunk[..n])
+                                }));
+                                match parsed {
+                                    Ok(batch) => process_batch(batch),
+                                    Err(_) => {
+                                        tracing::error!(
+                                            target: "aionui_session::backend::claude_conn",
+                                            conversation_id = %session_id,
+                                            "claude frame parser panicked during post-exit drain; ending turn as crash"
+                                        );
+                                        panicked = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            // Drain complete (EOF, error, or the 200ms budget elapsed
+                            // with no more bytes) → stop draining.
+                            _ => break,
+                        }
+                    }
+                    // Remember the captured status so the terminal path below reuses it
+                    // (do NOT re-await wait_for_exit). `Some(None)` = exited, status
+                    // unknown (WaitErrored) — still a real terminal, distinct from `hung`.
+                    proc_exited = Some(exit);
+                    break;
+                }
+            }
         } else {
             // Startup window: bound the FIRST frame by the handshake budget.
             match tokio::time::timeout(super::handshake_budget(), stdout.read(&mut chunk)).await {
@@ -1397,11 +1471,16 @@ async fn reader_task(
     // A zero-frame hang OR a parse panic leaves the process ALIVE — `wait_for_exit`
     // would block forever, so skip it and report `exit: None` (the reducer maps a
     // None-exit Detached to Error{Crashed}, same as an unknown-status exit). The husk
-    // process is reaped by the next get_or_build eviction (kill_on_drop). On a real
-    // EOF/exit we wait for (and redact) the exit as before. `peek_stderr` is still
-    // safe on either path (it reads the buffered tail, never blocks on the process).
+    // process is reaped by the next get_or_build eviction (kill_on_drop). If the exit
+    // watch ALREADY won the read race (`proc_exited`), reuse that captured status — do
+    // NOT re-await `wait_for_exit` (the process is gone; re-awaiting is redundant and
+    // the status is in hand). Otherwise (clean EOF / read error) wait for and redact
+    // the exit as before. `peek_stderr` is still safe on either path (it reads the
+    // buffered tail, never blocks on the process).
     let exit = if hung || panicked {
         None
+    } else if let Some(captured) = proc_exited {
+        captured
     } else {
         io.wait_for_exit().await
     };
@@ -3078,6 +3157,87 @@ mod tests {
         assert!(
             !saw_terminal,
             "a long SILENT turn (alive, just slow) must NOT be timed out after the first frame"
+        );
+    }
+
+    /// Windows pipe-EOF gap: after the first frame proves the process alive
+    /// (`seen_frame` latched), the process EXITS but its stdout NEVER EOFs — modelling
+    /// a surviving grandchild (detached MCP/tool descendant) that inherited the write
+    /// handle and keeps the pipe's write end open, so `stdout.read()` never returns
+    /// `Ok(0)`. The reader must NOT park forever: the exit-watch leg of the read race
+    /// wins, and a terminal `Detached` fires carrying the captured exit status → the
+    /// reducer folds Error{Crashed}/CleanNoResult → the UI unlocks instead of wedging
+    /// at `pending` with no error.
+    ///
+    /// This is the mirror of `first_frame_disarms_startup_guard_long_silent_turn_not_killed`:
+    /// there the process is ALIVE (never_exits) and must stay parked; here the process
+    /// is GONE (release_exit) and must terminate. The two together pin the exact
+    /// boundary — terminate on real exit, never on mere silence.
+    /// MUTATION-PROVEN: revert the `seen_frame` branch to a bare `stdout.read().await`
+    /// (drop the exit-watch select) and this test hangs (the process exited but the
+    /// pipe never EOFs → no terminal → the 3s guard fails).
+    #[tokio::test]
+    async fn process_exit_without_eof_surfaces_terminal_detached() {
+        let prefix = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec();
+        // Prefix flows immediately (one frame → seen_frame latches). The gated tail is
+        // NEVER released → the writer parks holding the duplex open, so stdout NEVER
+        // EOFs (the Windows inherited-handle case). But the process DOES exit
+        // (release_exit), which is the orthogonal signal the reader must react to.
+        let fake = FakeAgentIo::new(
+            prefix,
+            Some(crate::event::ExitStatusLite {
+                code: Some(137), // SIGKILL-style exit, as a `taskkill`'d leaf would report
+                signal: None,
+            }),
+        )
+        .with_gated_tail(b"never-released".to_vec());
+        fake.release_exit(); // the process is gone, even though stdout stays open
+
+        let backend = ClaudeSessionBackend::build_with_io("win-eof-1", Box::new(fake)).await;
+        let mut events = backend.events();
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("hello".into())],
+                metadata: CommandMeta {
+                    client_msg_id: Some("m1".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect("dispatch accepted");
+
+        let mut saw_message = false;
+        let mut detached_exit: Option<Option<crate::event::ExitStatusLite>> = None;
+        for _ in 0..20 {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), events.next()).await {
+                Ok(Some(env)) => match env.event {
+                    SessionEvent::MessageDelta { .. } => saw_message = true,
+                    SessionEvent::Detached { exit, .. } => {
+                        detached_exit = Some(exit);
+                        break;
+                    }
+                    _ => {}
+                },
+                _ => break,
+            }
+        }
+
+        assert!(
+            saw_message,
+            "the pre-exit assistant frame must surface (proves seen_frame)"
+        );
+        assert_eq!(
+            detached_exit,
+            Some(Some(crate::event::ExitStatusLite {
+                code: Some(137),
+                signal: None,
+            })),
+            "process exit without EOF must surface a terminal Detached reusing the captured exit status"
         );
     }
 
