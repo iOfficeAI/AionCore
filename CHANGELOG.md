@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.44](https://github.com/iOfficeAI/AionCore/compare/v0.1.43...v0.1.44) (2026-07-08)
+
+
+### Features
+
+* **agent:** use aionrs runtime env API ([#586](https://github.com/iOfficeAI/AionCore/issues/586)) ([2f6f43f](https://github.com/iOfficeAI/AionCore/commit/2f6f43f305221701ca2baa58123180caf2342055))
+* **ai-agent:** surface upstream 429 body in AgentSendError detail ([#591](https://github.com/iOfficeAI/AionCore/issues/591)) ([b8fe5b6](https://github.com/iOfficeAI/AionCore/commit/b8fe5b6f3c6f93f7b8fc730b658772da3f4f83fa))
+* **system:** add feedback diagnostics report ([#585](https://github.com/iOfficeAI/AionCore/issues/585)) ([a3eb1e4](https://github.com/iOfficeAI/AionCore/commit/a3eb1e49396e715ce8464700dca5e50a966552ee))
+
+
+### Bug Fixes
+
+* **agent:** preserve ACP error cause detail ([#581](https://github.com/iOfficeAI/AionCore/issues/581)) ([220f682](https://github.com/iOfficeAI/AionCore/commit/220f6823c1d29fde640427cfdd77de7e981758b2))
+* **skills:** correct aionui-config butler skill drift (2026-07) ([#584](https://github.com/iOfficeAI/AionCore/issues/584)) ([e72e03f](https://github.com/iOfficeAI/AionCore/commit/e72e03ff6e1366f705352bcefec474887a85adfa))
+* use provider and model protocol to determine llm request. ([37f76a8](https://github.com/iOfficeAI/AionCore/commit/37f76a8bf1ba8aafabb5dd6b6062da40173ef010))
+
 ## [0.1.43](https://github.com/iOfficeAI/AionCore/compare/v0.1.42...v0.1.43) (2026-07-06)
 
 
