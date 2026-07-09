@@ -112,6 +112,75 @@ impl SessionRuntime {
     }
 }
 
+/// Cold-start catalog snapshot extracted from a persisted `agent_metadata`
+/// handshake, in the SAME `aionui_session` shape the getters read off live
+/// `capabilities()` — so serving the preload is a drop-in fallback with no shape
+/// translation at read time. Empty vectors + `None` currents = nothing persisted.
+#[derive(Default, Clone)]
+struct CatalogPreload {
+    available_models: Vec<aionui_session::ModelInfo>,
+    current_model: Option<String>,
+    available_modes: Vec<aionui_session::ModeInfo>,
+    current_mode: Option<String>,
+}
+
+impl CatalogPreload {
+    /// Parse the persisted handshake's `available_models` / `available_modes`
+    /// columns into the live-capabilities shape. Reuses the ACP path's
+    /// `extract_models_from_value` / `extract_modes_from_value` (the same
+    /// multi-shape parser that accepts both the `{available_models:[{id,label}]}`
+    /// column shape `spawn_catalog_writeback` persists AND a live-claude handshake),
+    /// so the two paths stay byte-compatible. `reasoning_efforts` is intentionally
+    /// dropped: the handshake catalog does not carry per-model efforts, and the
+    /// getters this feeds do not surface efforts.
+    fn from_handshake(handshake: &aionui_api_types::AgentHandshake) -> Self {
+        use crate::manager::acp::config_option_catalog::{extract_models_from_value, extract_modes_from_value};
+        let (available_models, current_model) = handshake
+            .available_models
+            .as_ref()
+            .and_then(extract_models_from_value)
+            .map(|state| {
+                let models = state
+                    .available_models
+                    .iter()
+                    .map(|m| aionui_session::ModelInfo {
+                        id: m.model_id.to_string(),
+                        name: m.name.clone(),
+                        description: m.description.clone(),
+                        reasoning_efforts: Vec::new(),
+                    })
+                    .collect::<Vec<_>>();
+                let current = state.current_model_id.to_string();
+                (models, (!current.is_empty()).then_some(current))
+            })
+            .unwrap_or_default();
+        let (available_modes, current_mode) = handshake
+            .available_modes
+            .as_ref()
+            .and_then(extract_modes_from_value)
+            .map(|state| {
+                let modes = state
+                    .available_modes
+                    .iter()
+                    .map(|m| aionui_session::ModeInfo {
+                        id: m.id.to_string(),
+                        name: m.name.clone(),
+                        description: m.description.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let current = state.current_mode_id.to_string();
+                (modes, (!current.is_empty()).then_some(current))
+            })
+            .unwrap_or_default();
+        Self {
+            available_models,
+            current_model,
+            available_modes,
+            current_mode,
+        }
+    }
+}
+
 /// One claude/codex session, presented as an `IAgentTask`.
 pub struct SessionAgentTask {
     agent_type: AgentType,
@@ -126,6 +195,15 @@ pub struct SessionAgentTask {
     /// across a respawn/resume (unlike mode/model, which persist via ConfigChanged).
     /// `None` (tests) = no persistence. Shared with the pump (same Arc).
     session_repo: Option<Arc<dyn IAcpSessionRepository>>,
+    /// Cold-start catalog preload parsed from the persisted `agent_metadata`
+    /// handshake (what a PRIOR session discovered and `spawn_catalog_writeback`
+    /// stored). The backend's live `capabilities()` is empty until the initialize
+    /// round-trip lands (~seconds on resume); the mode/model getters serve this in
+    /// the meantime so the `/api/agents` picker is populated immediately instead of
+    /// blank, then the live catalog overwrites it the moment it arrives. Empty on
+    /// paths with no persisted catalog (fresh agent, tests). Mirrors the ACP path's
+    /// `preload_advertised_catalogs` "fill-when-empty, live-overwrites" semantics.
+    catalog_preload: CatalogPreload,
     /// Command-id counter for `CommandMeta` (dispatch correlation).
     command_seq: AtomicI64,
 }
@@ -148,6 +226,48 @@ impl SessionAgentTask {
         backend: Arc<dyn SessionBackend>,
         session_repo: Option<Arc<dyn IAcpSessionRepository>>,
     ) -> Arc<Self> {
+        Self::build(
+            agent_type,
+            conversation_id,
+            workspace,
+            backend,
+            session_repo,
+            CatalogPreload::default(),
+        )
+    }
+
+    /// Same as [`new`], plus a cold-start catalog preload parsed from the
+    /// persisted `agent_metadata` handshake. Production resume path uses this so
+    /// the model/mode picker is populated immediately from the last discovered
+    /// catalog while the backend's live `capabilities()` is still empty (the
+    /// initialize round-trip lands a beat later and overwrites it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_preload(
+        agent_type: AgentType,
+        conversation_id: String,
+        workspace: String,
+        backend: Arc<dyn SessionBackend>,
+        session_repo: Option<Arc<dyn IAcpSessionRepository>>,
+        handshake: &aionui_api_types::AgentHandshake,
+    ) -> Arc<Self> {
+        Self::build(
+            agent_type,
+            conversation_id,
+            workspace,
+            backend,
+            session_repo,
+            CatalogPreload::from_handshake(handshake),
+        )
+    }
+
+    fn build(
+        agent_type: AgentType,
+        conversation_id: String,
+        workspace: String,
+        backend: Arc<dyn SessionBackend>,
+        session_repo: Option<Arc<dyn IAcpSessionRepository>>,
+        catalog_preload: CatalogPreload,
+    ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let runtime = Arc::new(SessionRuntime {
             tx,
@@ -169,6 +289,7 @@ impl SessionAgentTask {
             backend,
             runtime,
             session_repo,
+            catalog_preload,
             command_seq: AtomicI64::new(0),
         })
     }
@@ -276,12 +397,51 @@ impl SessionAgentTask {
         Ok(())
     }
 
+    /// Resolve the catalog to serve: the backend's LIVE `capabilities()` when it has
+    /// discovered models/modes, else the cold-start `catalog_preload` (last session's
+    /// persisted handshake). Each axis (models, modes) falls back independently, so a
+    /// backend that answers modes-before-models still serves the preloaded models in
+    /// the gap. Live overwrites preload the instant it lands (non-empty live wins).
+    /// Currents likewise prefer live, then preload. Returns owned data (the getters
+    /// map it into wire DTOs).
+    fn effective_catalog(
+        &self,
+    ) -> (
+        Vec<aionui_session::ModelInfo>,
+        Option<String>,
+        Vec<aionui_session::ModeInfo>,
+        Option<String>,
+    ) {
+        let caps = self.backend.capabilities();
+        let (models, current_model) = if caps.available_models.is_empty() {
+            (
+                self.catalog_preload.available_models.clone(),
+                self.catalog_preload.current_model.clone(),
+            )
+        } else {
+            (caps.available_models, caps.current_model)
+        };
+        let (modes, current_mode) = if caps.available_modes.is_empty() {
+            (
+                self.catalog_preload.available_modes.clone(),
+                self.catalog_preload.current_mode.clone(),
+            )
+        } else {
+            (caps.available_modes, caps.current_mode)
+        };
+        (models, current_model, modes, current_mode)
+    }
+
     /// Current mode: the optimistic override (last `set_config_option("mode")`) wins
     /// over the capabilities snapshot, which lags an in-band switch.
     pub async fn mode(&self) -> Result<aionui_api_types::AgentModeResponse, AgentError> {
         let caps = self.backend.capabilities();
+        // Preload fallback: on cold-start resume the live catalog is empty until the
+        // initialize round-trip lands, so serve the last-discovered current_mode
+        // until then (override still wins; live current_mode overwrites once present).
+        let current_mode = caps.current_mode.or_else(|| self.catalog_preload.current_mode.clone());
         Ok(aionui_api_types::AgentModeResponse {
-            mode: self.runtime.mode_override().or(caps.current_mode).unwrap_or_default(),
+            mode: self.runtime.mode_override().or(current_mode).unwrap_or_default(),
             initialized: true,
         })
     }
@@ -290,20 +450,21 @@ impl SessionAgentTask {
     /// "model") wins over the capabilities snapshot (claude gives set_model no
     /// confirmation wire, so caps.current_model never reflects the switch).
     pub async fn get_model(&self) -> Result<aionui_api_types::GetModelInfoResponse, AgentError> {
-        let caps = self.backend.capabilities();
+        // Live catalog wins; cold-start resume falls back to the persisted-handshake
+        // preload so the picker is populated before the initialize round-trip lands.
+        let (models, current_model, _modes, _mode) = self.effective_catalog();
         let override_model = self.runtime.model_override();
-        if caps.available_models.is_empty() && caps.current_model.is_none() && override_model.is_none() {
+        if models.is_empty() && current_model.is_none() && override_model.is_none() {
             return Ok(aionui_api_types::GetModelInfoResponse { model_info: None });
         }
-        let available_models: Vec<aionui_api_types::ModelInfoEntry> = caps
-            .available_models
+        let available_models: Vec<aionui_api_types::ModelInfoEntry> = models
             .iter()
             .map(|m| aionui_api_types::ModelInfoEntry {
                 id: m.id.clone(),
                 label: m.name.clone(),
             })
             .collect();
-        let current_id = override_model.or_else(|| caps.current_model.clone());
+        let current_id = override_model.or(current_model);
         let current_label = current_id
             .as_ref()
             .and_then(|id| available_models.iter().find(|e| &e.id == id).map(|e| e.label.clone()));
@@ -321,9 +482,11 @@ impl SessionAgentTask {
     /// this is what makes set_config_option's observed re-read succeed (the snapshot
     /// lags an in-band claude switch).
     pub async fn get_config_options(&self) -> Result<aionui_api_types::GetConfigOptionsResponse, AgentError> {
-        let caps = self.backend.capabilities();
+        // Live catalog wins; cold-start resume falls back to the persisted-handshake
+        // preload (per-axis) so the picker renders before the initialize round-trip lands.
+        let (models, current_model, modes, current_mode) = self.effective_catalog();
         let mut config_options = Vec::new();
-        if !caps.available_modes.is_empty() {
+        if !modes.is_empty() {
             config_options.push(aionui_api_types::AcpConfigOptionDto {
                 id: "mode".into(),
                 name: Some("Mode".into()),
@@ -331,9 +494,8 @@ impl SessionAgentTask {
                 description: None,
                 category: Some("mode".into()),
                 option_type: "select".into(),
-                current_value: self.runtime.mode_override().or_else(|| caps.current_mode.clone()),
-                options: caps
-                    .available_modes
+                current_value: self.runtime.mode_override().or(current_mode),
+                options: modes
                     .iter()
                     .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
                         value: m.id.clone(),
@@ -344,7 +506,7 @@ impl SessionAgentTask {
                     .collect(),
             });
         }
-        if !caps.available_models.is_empty() {
+        if !models.is_empty() {
             config_options.push(aionui_api_types::AcpConfigOptionDto {
                 id: "model".into(),
                 name: Some("Model".into()),
@@ -352,9 +514,8 @@ impl SessionAgentTask {
                 description: None,
                 category: Some("model".into()),
                 option_type: "select".into(),
-                current_value: self.runtime.model_override().or_else(|| caps.current_model.clone()),
-                options: caps
-                    .available_models
+                current_value: self.runtime.model_override().or(current_model),
+                options: models
                     .iter()
                     .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
                         value: m.id.clone(),
@@ -901,7 +1062,14 @@ pub async fn build_session_instance(
         spawn_catalog_writeback(agent_id, backend.clone(), catalog_tx);
     }
 
-    let task = SessionAgentTask::new(AgentType::Acp, conversation_id, workspace, backend, acp_session_repo);
+    let task = SessionAgentTask::new_with_preload(
+        AgentType::Acp,
+        conversation_id,
+        workspace,
+        backend,
+        acp_session_repo,
+        &metadata.handshake,
+    );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
 
@@ -3733,5 +3901,103 @@ mod pump_tests {
             .await
             .expect("backend must be dropped (reaped) promptly after the task Arc is dropped")
             .expect("reap signal delivered");
+    }
+
+    // Build a persisted-handshake value in the SHAPE `spawn_catalog_writeback` stores
+    // (the top-level `{available_models:[{id,label}], current_model_id}` column shape).
+    fn handshake_with_catalog() -> aionui_api_types::AgentHandshake {
+        aionui_api_types::AgentHandshake {
+            available_models: Some(serde_json::json!({
+                "available_models": [
+                    {"id": "opus", "label": "Opus"},
+                    {"id": "sonnet", "label": "Sonnet"},
+                ],
+                "current_model_id": "sonnet",
+            })),
+            available_modes: Some(serde_json::json!({
+                "available_modes": [
+                    {"id": "default", "name": "Default"},
+                    {"id": "plan", "name": "Plan"},
+                ],
+                "current_mode_id": "plan",
+            })),
+            ..Default::default()
+        }
+    }
+
+    // Cold-start resume: the backend's live capabilities() is still empty (initialize
+    // round-trip not landed), but the persisted-handshake preload populates the picker
+    // so it is NOT blank. This is the fix for "session-port history-open shows an empty
+    // model list for ~seconds while ACP's persisted preload keeps it filled".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preload_serves_catalog_when_live_capabilities_empty() {
+        // ScriptBackend has empty capabilities() → live catalog is absent.
+        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(Vec::new()));
+        let task = SessionAgentTask::new_with_preload(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            None,
+            &handshake_with_catalog(),
+        );
+
+        // get_model serves the preloaded catalog + persisted current model.
+        let m = task
+            .get_model()
+            .await
+            .unwrap()
+            .model_info
+            .expect("model_info from preload");
+        assert_eq!(
+            m.available_models.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["opus", "sonnet"],
+        );
+        assert_eq!(m.current_model_id.as_deref(), Some("sonnet"));
+
+        // get_config_options renders both mode+model selects from the preload.
+        let opts = task.get_config_options().await.unwrap().config_options;
+        let model_opt = opts
+            .iter()
+            .find(|o| o.id == "model")
+            .expect("model select from preload");
+        assert_eq!(
+            model_opt.options.iter().map(|o| o.value.as_str()).collect::<Vec<_>>(),
+            vec!["opus", "sonnet"],
+        );
+        assert_eq!(model_opt.current_value.as_deref(), Some("sonnet"));
+        let mode_opt = opts.iter().find(|o| o.id == "mode").expect("mode select from preload");
+        assert_eq!(mode_opt.current_value.as_deref(), Some("plan"));
+
+        // mode() serves the preloaded current mode.
+        assert_eq!(task.mode().await.unwrap().mode, "plan");
+    }
+
+    // The live catalog OVERWRITES the preload the instant it is present: even though a
+    // (stale) preload is supplied, a backend with non-empty capabilities() serves the
+    // live values — matching ACP's "fill-when-empty, live-overwrites" semantics and
+    // preventing a stale persisted catalog from masking a fresh engine's model list.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_capabilities_overwrite_stale_preload() {
+        use super::pump_tests::StaticCapsBackend;
+        // Preload advertises a codex-shaped catalog; live StaticCapsBackend advertises
+        // opus/sonnet with current=opus. Live must win on every axis.
+        let stale = aionui_api_types::AgentHandshake {
+            available_models: Some(serde_json::json!({
+                "available_models": [{"id": "stale-model", "label": "Stale"}],
+                "current_model_id": "stale-model",
+            })),
+            ..Default::default()
+        };
+        let backend: Arc<dyn SessionBackend> = Arc::new(StaticCapsBackend);
+        let task =
+            SessionAgentTask::new_with_preload(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None, &stale);
+        let m = task.get_model().await.unwrap().model_info.expect("model_info");
+        assert_eq!(
+            m.available_models.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["opus", "sonnet"],
+            "live capabilities must overwrite the stale preload"
+        );
+        assert_eq!(m.current_model_id.as_deref(), Some("opus"));
     }
 }
