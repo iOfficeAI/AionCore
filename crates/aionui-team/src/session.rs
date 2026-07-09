@@ -304,8 +304,15 @@ impl TeamSession {
             return Ok(None);
         }
         let tasks = self.scheduler.list_tasks().await?;
+        let current_slot_ids = self
+            .scheduler
+            .list_agents()
+            .await
+            .into_iter()
+            .map(|agent| agent.slot_id)
+            .collect();
 
-        let mut wake_body = build_wake_payload(&agent, &tasks, &unread);
+        let mut wake_body = build_wake_payload(&agent, &tasks, &unread, &current_slot_ids);
         if matches!(
             next_wake.as_ref().map(|wake| wake.source),
             Some(TeamWakeSource::UserIntervention)

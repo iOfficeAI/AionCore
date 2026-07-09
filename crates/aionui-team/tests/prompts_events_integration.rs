@@ -1,5 +1,6 @@
 mod common;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use aionui_api_types::{
@@ -45,6 +46,10 @@ impl EventBroadcaster for RecordingBroadcaster {
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
         self.events.lock().unwrap().push(event);
     }
+}
+
+fn roster(ids: &[&str]) -> HashSet<String> {
+    ids.iter().map(|id| (*id).to_owned()).collect()
 }
 
 #[derive(Default)]
@@ -428,7 +433,7 @@ fn wp1_wake_payload_includes_unread_messages() {
             created_at: 0,
         },
     ];
-    let payload = build_wake_payload(&agent, &[], &messages);
+    let payload = build_wake_payload(&agent, &[], &messages, &roster(&["lead-1", "w1", "w2"]));
 
     assert!(payload.contains("Feature X is done"));
     assert!(payload.contains("`w1`"));
@@ -471,7 +476,7 @@ fn wp2_wake_payload_includes_task_list() {
             updated_at: 0,
         },
     ];
-    let payload = build_wake_payload(&agent, &tasks, &[]);
+    let payload = build_wake_payload(&agent, &tasks, &[], &roster(&["lead-1", "w1", "w2"]));
 
     assert!(payload.contains("Current Task Board Summary"));
     assert!(payload.contains("Showing 2 of 2 tasks."));
@@ -493,7 +498,7 @@ fn wp2_wake_payload_includes_task_list() {
 #[test]
 fn wp3_wake_payload_empty_builds_normally() {
     let agent = make_agent("w1", "Worker1", TeammateRole::Teammate);
-    let payload = build_wake_payload(&agent, &[], &[]);
+    let payload = build_wake_payload(&agent, &[], &[], &roster(&["w1"]));
 
     assert!(payload.contains("No new messages"));
     assert!(payload.contains("No tasks on the board"));

@@ -9,7 +9,11 @@ pub(super) const MAX_TEAMMATE_RECENT_COMPLETED_ROWS: usize = 3;
 pub(super) const MAX_SUBJECT_CHARS: usize = 120;
 pub(super) const MAX_BLOCKED_BY_IDS: usize = 5;
 
-pub(super) fn render_task_board_summary(agent: &TeamAgent, tasks: &[TeamTask]) -> String {
+pub(super) fn render_task_board_summary(
+    agent: &TeamAgent,
+    tasks: &[TeamTask],
+    current_slot_ids: &HashSet<String>,
+) -> String {
     let mut output = String::with_capacity(1024);
     output.push_str("## Current Task Board Summary\n\n");
 
@@ -18,7 +22,8 @@ pub(super) fn render_task_board_summary(agent: &TeamAgent, tasks: &[TeamTask]) -
         return output;
     }
 
-    let selection = select_summary_tasks(agent, tasks);
+    let visible_tasks = filter_summary_input(tasks, current_slot_ids);
+    let selection = select_summary_tasks(agent, &visible_tasks);
     let selected = selection.tasks;
     let displayed_ids: HashSet<&str> = selected.iter().map(|task| task.id.as_str()).collect();
     let hidden_active = tasks
@@ -51,7 +56,7 @@ pub(super) fn render_task_board_summary(agent: &TeamAgent, tasks: &[TeamTask]) -
             short_task_id(&task.id),
             truncate_subject(&task.subject),
             task.status,
-            task.owner.as_deref().unwrap_or("-"),
+            render_owner(task, current_slot_ids),
             render_blocked_by(&task.blocked_by),
         ));
     }
@@ -63,9 +68,38 @@ struct SummarySelection<'a> {
     tasks: Vec<&'a TeamTask>,
 }
 
-fn select_summary_tasks<'a>(agent: &TeamAgent, tasks: &'a [TeamTask]) -> SummarySelection<'a> {
+fn filter_summary_input<'a>(tasks: &'a [TeamTask], current_slot_ids: &HashSet<String>) -> Vec<&'a TeamTask> {
+    let visible_base_ids: HashSet<&str> = tasks
+        .iter()
+        .filter(|task| is_active(task.status))
+        .filter(|task| is_current_or_ownerless(task, current_slot_ids))
+        .map(|task| task.id.as_str())
+        .collect();
+
+    let visible_blocker_ids: HashSet<&str> = tasks
+        .iter()
+        .filter(|task| visible_base_ids.contains(task.id.as_str()))
+        .flat_map(|task| task.blocked_by.iter().map(String::as_str))
+        .collect();
+
+    tasks
+        .iter()
+        .filter(|task| {
+            if is_current_or_ownerless(task, current_slot_ids) {
+                return true;
+            }
+
+            is_active(task.status)
+                && is_removed_owner(task, current_slot_ids)
+                && visible_blocker_ids.contains(task.id.as_str())
+        })
+        .collect()
+}
+
+fn select_summary_tasks<'a>(agent: &TeamAgent, tasks: &[&'a TeamTask]) -> SummarySelection<'a> {
     let own_active_ids: HashSet<&str> = tasks
         .iter()
+        .copied()
         .filter(|task| is_active(task.status))
         .filter(|task| task.owner.as_deref() == Some(agent.slot_id.as_str()))
         .map(|task| task.id.as_str())
@@ -73,18 +107,21 @@ fn select_summary_tasks<'a>(agent: &TeamAgent, tasks: &'a [TeamTask]) -> Summary
 
     let blocker_ids: HashSet<&str> = tasks
         .iter()
+        .copied()
         .filter(|task| own_active_ids.contains(task.id.as_str()))
         .flat_map(|task| task.blocked_by.iter().map(String::as_str))
         .collect();
 
     let mut blocked_by_own_ids: HashSet<&str> = tasks
         .iter()
+        .copied()
         .filter(|task| own_active_ids.contains(task.id.as_str()))
         .flat_map(|task| task.blocks.iter().map(String::as_str))
         .collect();
     blocked_by_own_ids.extend(
         tasks
             .iter()
+            .copied()
             .filter(|task| is_active(task.status))
             .filter(|task| task.blocked_by.iter().any(|id| own_active_ids.contains(id.as_str())))
             .map(|task| task.id.as_str()),
@@ -98,18 +135,19 @@ fn select_summary_tasks<'a>(agent: &TeamAgent, tasks: &'a [TeamTask]) -> Summary
 }
 
 fn select_leader_summary_tasks<'a>(
-    tasks: &'a [TeamTask],
+    tasks: &[&'a TeamTask],
     own_active_ids: &HashSet<&str>,
     blocker_ids: &HashSet<&str>,
     blocked_by_own_ids: &HashSet<&str>,
 ) -> SummarySelection<'a> {
-    let mut active: Vec<&TeamTask> = tasks.iter().filter(|task| is_active(task.status)).collect();
+    let mut active: Vec<&TeamTask> = tasks.iter().copied().filter(|task| is_active(task.status)).collect();
     active.sort_by(|left, right| compare_active_tasks(left, right, own_active_ids, blocker_ids, blocked_by_own_ids));
 
     let mut selected: Vec<&TeamTask> = active.into_iter().take(MAX_WAKE_TASK_ROWS).collect();
     if selected.len() < MAX_WAKE_TASK_ROWS {
         let mut completed: Vec<&TeamTask> = tasks
             .iter()
+            .copied()
             .filter(|task| task.status == TaskStatus::Completed)
             .collect();
         completed.sort_by(|left, right| {
@@ -127,7 +165,7 @@ fn select_leader_summary_tasks<'a>(
 }
 
 fn select_teammate_summary_tasks<'a>(
-    tasks: &'a [TeamTask],
+    tasks: &[&'a TeamTask],
     own_active_ids: &HashSet<&str>,
     blocker_ids: &HashSet<&str>,
     blocked_by_own_ids: &HashSet<&str>,
@@ -135,6 +173,7 @@ fn select_teammate_summary_tasks<'a>(
 ) -> SummarySelection<'a> {
     let mut relevant_active: Vec<&TeamTask> = tasks
         .iter()
+        .copied()
         .filter(|task| is_active(task.status))
         .filter(|task| {
             own_active_ids.contains(task.id.as_str())
@@ -149,6 +188,7 @@ fn select_teammate_summary_tasks<'a>(
     if selected.len() < MAX_WAKE_TASK_ROWS {
         let mut completed: Vec<&TeamTask> = tasks
             .iter()
+            .copied()
             .filter(|task| task.status == TaskStatus::Completed)
             .filter(|task| task.owner.as_deref() == Some(agent.slot_id.as_str()))
             .collect();
@@ -230,6 +270,27 @@ fn is_active(status: TaskStatus) -> bool {
     matches!(status, TaskStatus::Pending | TaskStatus::InProgress)
 }
 
+fn is_current_or_ownerless(task: &TeamTask, current_slot_ids: &HashSet<String>) -> bool {
+    match task.owner.as_deref() {
+        Some(owner) => current_slot_ids.contains(owner),
+        None => true,
+    }
+}
+
+fn is_removed_owner(task: &TeamTask, current_slot_ids: &HashSet<String>) -> bool {
+    task.owner
+        .as_deref()
+        .is_some_and(|owner| !current_slot_ids.contains(owner))
+}
+
+fn render_owner(task: &TeamTask, current_slot_ids: &HashSet<String>) -> String {
+    match task.owner.as_deref() {
+        Some(owner) if current_slot_ids.contains(owner) => owner.to_owned(),
+        Some(owner) => format!("{owner} (removed)"),
+        None => "-".to_owned(),
+    }
+}
+
 fn short_task_id(id: &str) -> String {
     format!("{}…", id.chars().take(8).collect::<String>())
 }
@@ -260,6 +321,7 @@ fn render_blocked_by(blocked_by: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn agent(slot_id: &str) -> TeamAgent {
         agent_with_role(slot_id, TeammateRole::Lead)
@@ -314,9 +376,23 @@ mod tests {
             .count()
     }
 
+    fn roster(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    fn default_roster() -> HashSet<String> {
+        roster(&[
+            "worker-1",
+            "worker-2",
+            "worker-3",
+            "worker-4",
+            "019f4056-fd18-7411-ab09-8868ff17cb36",
+        ])
+    }
+
     #[test]
     fn empty_board_renders_empty_summary() {
-        let payload = render_task_board_summary(&agent("worker-1"), &[]);
+        let payload = render_task_board_summary(&agent("worker-1"), &[], &roster(&["worker-1"]));
         assert!(payload.contains("## Current Task Board Summary"));
         assert!(payload.contains("No tasks on the board."));
     }
@@ -341,7 +417,7 @@ mod tests {
                 20,
             ),
         ];
-        let payload = render_task_board_summary(&agent("worker-1"), &tasks);
+        let payload = render_task_board_summary(&agent("worker-1"), &tasks, &default_roster());
         assert!(payload.contains("Showing 2 of 2 tasks."));
         assert!(payload.contains("Hidden: active=0, completed=0, deleted=0."));
         assert!(payload.contains("| aaaaaaaa… | Owned active | in_progress | worker-1 | - |"));
@@ -362,7 +438,7 @@ mod tests {
                 )
             })
             .collect();
-        let payload = render_task_board_summary(&agent("worker-1"), &tasks);
+        let payload = render_task_board_summary(&agent("worker-1"), &tasks, &default_roster());
         assert_eq!(row_count(&payload), MAX_RECENT_COMPLETED_ROWS);
         assert!(payload.contains("Completed 9"));
         assert!(payload.contains("Completed 2"));
@@ -386,7 +462,7 @@ mod tests {
                 2,
             ),
         ];
-        let payload = render_task_board_summary(&agent("worker-1"), &tasks);
+        let payload = render_task_board_summary(&agent("worker-1"), &tasks, &default_roster());
         assert!(payload.contains("Active"));
         assert!(!payload.contains("Deleted history"));
         assert!(payload.contains("Hidden: active=0, completed=0, deleted=1."));
@@ -406,7 +482,7 @@ mod tests {
                 )
             })
             .collect();
-        let payload = render_task_board_summary(&agent("worker-1"), &tasks);
+        let payload = render_task_board_summary(&agent("worker-1"), &tasks, &default_roster());
         assert_eq!(row_count(&payload), MAX_WAKE_TASK_ROWS);
         assert!(payload.contains("Showing 40 of 45 tasks."));
         assert!(payload.contains("Hidden: active=5, completed=0, deleted=0."));
@@ -434,7 +510,7 @@ mod tests {
                 1,
             ),
         ];
-        let payload = render_task_board_summary(&agent("worker-1"), &tasks);
+        let payload = render_task_board_summary(&agent("worker-1"), &tasks, &default_roster());
         assert!(payload.find("Owned old").unwrap() < payload.find("Other new").unwrap());
     }
 
@@ -460,7 +536,11 @@ mod tests {
             4,
             40,
         );
-        let payload = render_task_board_summary(&agent("worker-1"), &[other, downstream, blocker, owned]);
+        let payload = render_task_board_summary(
+            &agent("worker-1"),
+            &[other, downstream, blocker, owned],
+            &default_roster(),
+        );
         assert!(payload.find("Owned").unwrap() < payload.find("Blocker").unwrap());
         assert!(payload.find("Blocker").unwrap() < payload.find("Downstream").unwrap());
         assert!(payload.find("Downstream").unwrap() < payload.find("Other").unwrap());
@@ -529,6 +609,7 @@ mod tests {
                 blocker,
                 owned,
             ],
+            &default_roster(),
         );
 
         assert!(payload.contains("Owned active"));
@@ -561,7 +642,7 @@ mod tests {
             )
         }));
 
-        let payload = render_task_board_summary(&teammate("worker-1"), &tasks);
+        let payload = render_task_board_summary(&teammate("worker-1"), &tasks, &default_roster());
 
         assert_eq!(row_count(&payload), 3);
         assert!(payload.contains("Own completed 3"));
@@ -590,7 +671,7 @@ mod tests {
             4,
             40,
         );
-        let payload = render_task_board_summary(&agent("worker-1"), &[other, downstream, owned]);
+        let payload = render_task_board_summary(&agent("worker-1"), &[other, downstream, owned], &default_roster());
         assert!(payload.find("Owned").unwrap() < payload.find("Downstream reverse").unwrap());
         assert!(payload.find("Downstream reverse").unwrap() < payload.find("Other").unwrap());
     }
@@ -623,7 +704,11 @@ mod tests {
             4,
             400,
         );
-        let payload = render_task_board_summary(&agent("worker-1"), &[completed, deleted, other, owned]);
+        let payload = render_task_board_summary(
+            &agent("worker-1"),
+            &[completed, deleted, other, owned],
+            &default_roster(),
+        );
         assert!(payload.find("Owned").unwrap() < payload.find("Other active").unwrap());
         assert!(payload.find("Other active").unwrap() < payload.find("Completed blocker").unwrap());
         assert!(!payload.contains("Deleted blocker"));
@@ -657,7 +742,7 @@ mod tests {
                 20,
             ),
         ];
-        let payload = render_task_board_summary(&agent("worker-1"), &tasks);
+        let payload = render_task_board_summary(&agent("worker-1"), &tasks, &default_roster());
         assert!(payload.find("In progress new").unwrap() < payload.find("In progress old").unwrap());
         assert!(payload.find("In progress old").unwrap() < payload.find("Pending newest").unwrap());
     }
@@ -682,7 +767,7 @@ mod tests {
                 20,
             ),
         ];
-        let payload = render_task_board_summary(&agent("worker-1"), &tasks);
+        let payload = render_task_board_summary(&agent("worker-1"), &tasks, &default_roster());
         assert!(payload.find("Pending newer update").unwrap() < payload.find("Pending older update").unwrap());
     }
 
@@ -716,7 +801,7 @@ mod tests {
             101,
             101,
         ));
-        let payload = render_task_board_summary(&agent("worker-1"), &tasks);
+        let payload = render_task_board_summary(&agent("worker-1"), &tasks, &default_roster());
         assert!(payload.contains("Showing 40 of 44 tasks."));
         assert!(payload.contains("Hidden: active=2, completed=1, deleted=1."));
     }
@@ -739,7 +824,7 @@ mod tests {
             "block005-1111".to_owned(),
             "block006-1111".to_owned(),
         ];
-        let payload = render_task_board_summary(&agent("worker-1"), &[active]);
+        let payload = render_task_board_summary(&agent("worker-1"), &[active], &default_roster());
         assert!(payload.contains(&format!("{}...", "x".repeat(MAX_SUBJECT_CHARS))));
         assert!(payload.contains("block001…"));
         assert!(payload.contains("+1 more"));
@@ -757,10 +842,139 @@ mod tests {
             1,
         );
         active.blocked_by = vec!["bbbbbbbb-1234-5678".to_owned()];
-        let payload = render_task_board_summary(&agent("worker-1"), &[active]);
+        let payload = render_task_board_summary(&agent("worker-1"), &[active], &default_roster());
         assert!(
             payload.contains("| aaaaaaaa… | Active | pending | 019f4056-fd18-7411-ab09-8868ff17cb36 | bbbbbbbb… |")
         );
         assert!(!payload.contains("bbbbbbbb-1234-5678"));
+    }
+
+    #[test]
+    fn removed_owner_active_task_is_hidden_when_unrelated() {
+        let removed = task(
+            "removeda-1111",
+            "Removed member active",
+            TaskStatus::InProgress,
+            Some("worker-2"),
+            1,
+            10,
+        );
+        let current = task(
+            "currenta-1111",
+            "Current member active",
+            TaskStatus::Pending,
+            Some("worker-1"),
+            2,
+            20,
+        );
+
+        let payload =
+            render_task_board_summary(&agent("lead-1"), &[removed, current], &roster(&["lead-1", "worker-1"]));
+
+        assert!(payload.contains("Current member active"));
+        assert!(!payload.contains("Removed member active"));
+        assert!(!payload.contains("worker-2 (removed)"));
+        assert!(payload.contains("Showing 1 of 2 tasks."));
+        assert!(payload.contains("Hidden: active=1, completed=0, deleted=0."));
+    }
+
+    #[test]
+    fn removed_owner_active_task_is_shown_when_it_blocks_visible_work() {
+        let blocker = task(
+            "blockera-1111",
+            "Removed member blocker",
+            TaskStatus::InProgress,
+            Some("worker-2"),
+            1,
+            10,
+        );
+        let mut current = task(
+            "currenta-1111",
+            "Current member blocked",
+            TaskStatus::Pending,
+            Some("worker-1"),
+            2,
+            20,
+        );
+        current.blocked_by = vec!["blockera-1111".to_owned()];
+
+        let payload =
+            render_task_board_summary(&agent("lead-1"), &[blocker, current], &roster(&["lead-1", "worker-1"]));
+
+        assert!(payload.contains("Removed member blocker"));
+        assert!(payload.contains("Current member blocked"));
+        assert!(payload.contains("| blockera… | Removed member blocker | in_progress | worker-2 (removed) | - |"));
+        assert!(payload.contains("| currenta… | Current member blocked | pending | worker-1 | blockera… |"));
+        assert!(payload.contains("Hidden: active=0, completed=0, deleted=0."));
+    }
+
+    #[test]
+    fn removed_owner_active_task_is_shown_when_it_blocks_ownerless_visible_work() {
+        let blocker = task(
+            "blockera-1111",
+            "Removed owner blocker",
+            TaskStatus::Pending,
+            Some("worker-2"),
+            1,
+            10,
+        );
+        let mut ownerless = task(
+            "ownerlsa-1111",
+            "Ownerless blocked task",
+            TaskStatus::Pending,
+            None,
+            2,
+            20,
+        );
+        ownerless.blocked_by = vec!["blockera-1111".to_owned()];
+
+        let payload = render_task_board_summary(
+            &agent("lead-1"),
+            &[blocker, ownerless],
+            &roster(&["lead-1", "worker-1"]),
+        );
+
+        assert!(payload.contains("Removed owner blocker"));
+        assert!(payload.contains("Ownerless blocked task"));
+        assert!(payload.contains("worker-2 (removed)"));
+    }
+
+    #[test]
+    fn removed_owner_completed_and_deleted_tasks_are_hidden() {
+        let completed = task(
+            "doneaaaa-1111",
+            "Removed completed",
+            TaskStatus::Completed,
+            Some("worker-2"),
+            1,
+            10,
+        );
+        let deleted = task(
+            "delddddd-1111",
+            "Removed deleted",
+            TaskStatus::Deleted,
+            Some("worker-2"),
+            2,
+            20,
+        );
+        let current = task(
+            "currenta-1111",
+            "Current active",
+            TaskStatus::Pending,
+            Some("worker-1"),
+            3,
+            30,
+        );
+
+        let payload = render_task_board_summary(
+            &agent("lead-1"),
+            &[completed, deleted, current],
+            &roster(&["lead-1", "worker-1"]),
+        );
+
+        assert!(payload.contains("Current active"));
+        assert!(!payload.contains("Removed completed"));
+        assert!(!payload.contains("Removed deleted"));
+        assert!(payload.contains("Hidden: active=0, completed=1, deleted=1."));
     }
 }
