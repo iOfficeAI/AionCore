@@ -399,11 +399,19 @@ impl SessionAgentTask {
 
     /// Resolve the catalog to serve: the backend's LIVE `capabilities()` when it has
     /// discovered models/modes, else the cold-start `catalog_preload` (last session's
-    /// persisted handshake). Each axis (models, modes) falls back independently, so a
-    /// backend that answers modes-before-models still serves the preloaded models in
-    /// the gap. Live overwrites preload the instant it lands (non-empty live wins).
-    /// Currents likewise prefer live, then preload. Returns owned data (the getters
-    /// map it into wire DTOs).
+    /// persisted handshake). The LIST and the CURRENT of each axis fall back
+    /// INDEPENDENTLY — this matters at cold-start: the backend seeds `caps.current_model`
+    /// /`caps.current_mode` from the RESOLVED snapshot at spawn (claude_conn spawn:
+    /// `caps.current_model = config.model`, where config.model came from the persisted
+    /// `current_model_id` column), so it is already the user's last interactive switch
+    /// even before the initialize round-trip lands and fills `available_models`. The
+    /// preload's current, by contrast, is frozen at the PRIOR session's write-back
+    /// (`spawn_catalog_writeback` runs once at open, not on a mid-turn switch), so a
+    /// list-emptiness-gated fallback would show a stale model in the pre-init window
+    /// whenever the user switched mid-turn last session (backend runs the right model,
+    /// picker briefly showed the old one). So: the LIST prefers live (non-empty) then
+    /// preload; the CURRENT prefers `caps` (already snapshot-seeded) then preload.
+    /// `None`-current + no preload = None (getters then lean on the runtime override).
     fn effective_catalog(
         &self,
     ) -> (
@@ -413,22 +421,20 @@ impl SessionAgentTask {
         Option<String>,
     ) {
         let caps = self.backend.capabilities();
-        let (models, current_model) = if caps.available_models.is_empty() {
-            (
-                self.catalog_preload.available_models.clone(),
-                self.catalog_preload.current_model.clone(),
-            )
+        let models = if caps.available_models.is_empty() {
+            self.catalog_preload.available_models.clone()
         } else {
-            (caps.available_models, caps.current_model)
+            caps.available_models
         };
-        let (modes, current_mode) = if caps.available_modes.is_empty() {
-            (
-                self.catalog_preload.available_modes.clone(),
-                self.catalog_preload.current_mode.clone(),
-            )
+        let current_model = caps
+            .current_model
+            .or_else(|| self.catalog_preload.current_model.clone());
+        let modes = if caps.available_modes.is_empty() {
+            self.catalog_preload.available_modes.clone()
         } else {
-            (caps.available_modes, caps.current_mode)
+            caps.available_modes
         };
+        let current_mode = caps.current_mode.or_else(|| self.catalog_preload.current_mode.clone());
         (models, current_model, modes, current_mode)
     }
 
@@ -3999,5 +4005,76 @@ mod pump_tests {
             "live capabilities must overwrite the stale preload"
         );
         assert_eq!(m.current_model_id.as_deref(), Some("opus"));
+    }
+
+    // Cold-start pre-init: the backend has already seeded `current_model`/`current_mode`
+    // from the RESOLVED snapshot (claude_conn spawn: `caps.current_model = config.model`,
+    // config.model = persisted `current_model_id`), but `available_models` is still empty
+    // (the initialize round-trip has not landed). The persisted-handshake preload's
+    // current is STALE (frozen at the prior session's write-back, which does not re-run on
+    // a mid-turn switch). The picker must show the backend's snapshot-seeded current — the
+    // model claude actually runs — NOT the stale preload current, even though the LIST is
+    // served from preload in this same window. This is the per-axis-independent fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caps_current_wins_over_stale_preload_while_list_is_empty() {
+        // Backend: current seeded (user last switched to opus), but lists still empty.
+        struct CurrentOnlyBackend;
+        #[async_trait::async_trait]
+        impl SessionBackend for CurrentOnlyBackend {
+            async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: 0,
+                })
+            }
+            fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+                use futures_util::StreamExt as _;
+                futures_util::stream::empty().boxed()
+            }
+            fn capabilities(&self) -> Capabilities {
+                Capabilities {
+                    current_model: Some("opus".into()),
+                    current_mode: Some("default".into()),
+                    ..Default::default()
+                }
+            }
+        }
+
+        // Preload (prior write-back) still says sonnet/plan — the pre-switch values.
+        let backend: Arc<dyn SessionBackend> = Arc::new(CurrentOnlyBackend);
+        let task = SessionAgentTask::new_with_preload(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            None,
+            &handshake_with_catalog(),
+        );
+
+        let m = task.get_model().await.unwrap().model_info.expect("model_info");
+        // LIST comes from the preload (backend list is empty pre-init)...
+        assert_eq!(
+            m.available_models.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["opus", "sonnet"],
+            "list falls back to preload while the backend list is empty"
+        );
+        // ...but the CURRENT is the backend's snapshot-seeded model, NOT the stale preload.
+        assert_eq!(
+            m.current_model_id.as_deref(),
+            Some("opus"),
+            "current_model must be the backend's snapshot-seeded value, not the stale preload's sonnet"
+        );
+
+        let opts = task.get_config_options().await.unwrap().config_options;
+        let model_opt = opts.iter().find(|o| o.id == "model").expect("model select");
+        assert_eq!(model_opt.current_value.as_deref(), Some("opus"));
+        let mode_opt = opts.iter().find(|o| o.id == "mode").expect("mode select");
+        assert_eq!(
+            mode_opt.current_value.as_deref(),
+            Some("default"),
+            "current_mode must be the backend's snapshot-seeded value, not the stale preload's plan"
+        );
+        assert_eq!(task.mode().await.unwrap().mode, "default");
     }
 }
