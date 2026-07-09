@@ -2,17 +2,18 @@ mod describe_support;
 mod response_builder;
 pub(crate) mod spawn_support;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager};
+use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
     TeamMcpPhase, TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole,
     TeamSlotRuntimeHealth, WebSocketMessage,
 };
-use aionui_common::{AgentKillReason, generate_id, now_ms};
+use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
@@ -47,6 +48,30 @@ pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &
 struct SessionEntry {
     session: Arc<TeamSession>,
     slow_monitor_handle: tokio::task::JoinHandle<()>,
+}
+
+pub struct TeamIdleCleanupCoordinator {
+    service: Arc<TeamSessionService>,
+    active_leases: Arc<ActiveLeaseRegistry>,
+}
+
+impl TeamIdleCleanupCoordinator {
+    pub fn new(service: Arc<TeamSessionService>, active_leases: Arc<ActiveLeaseRegistry>) -> Self {
+        Self { service, active_leases }
+    }
+}
+
+#[async_trait::async_trait]
+impl IdleCleanupCoordinator for TeamIdleCleanupCoordinator {
+    async fn cleanup_idle_conversations(
+        &self,
+        idle_conversation_ids: Vec<String>,
+        idle_threshold_ms: TimestampMs,
+    ) -> Vec<String> {
+        self.service
+            .cleanup_idle_team_runtime_tasks(idle_conversation_ids, &self.active_leases, idle_threshold_ms)
+            .await
+    }
 }
 
 struct TeamAgentRebuildOutcome {
@@ -692,10 +717,6 @@ impl TeamSessionService {
     }
 
     async fn ensure_session_inner(&self, team_id: &str) -> Result<(), TeamError> {
-        if self.sessions.contains_key(team_id) {
-            return Ok(());
-        }
-
         let membership_lock = self
             .add_agent_locks
             .entry(team_id.to_owned())
@@ -703,24 +724,12 @@ impl TeamSessionService {
             .clone();
         let _membership_guard = membership_lock.lock().await;
 
-        // Re-check after acquiring the membership lock. A preceding add/remove
-        // may have completed while this call was waiting, and another ensure
-        // caller may also have finished startup.
-        if self.sessions.contains_key(team_id) {
-            return Ok(());
-        }
-
         let lock = self
             .ensure_session_locks
             .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
-
-        // Re-check after acquiring lock (another caller may have completed).
-        if self.sessions.contains_key(team_id) {
-            return Ok(());
-        }
 
         let row = match self.repo.get_team(team_id).await {
             Ok(Some(row)) => row,
@@ -740,6 +749,21 @@ impl TeamSessionService {
         let user_id = row.user_id.clone();
         let team = Team::from_row(&row)?;
         let agents_snapshot: Vec<TeamAgent> = team.agents.clone();
+
+        if self.sessions.contains_key(team_id) {
+            let missing_runtime_tasks = self.missing_agent_runtime_tasks(&agents_snapshot);
+            if missing_runtime_tasks.is_empty() {
+                return Ok(());
+            }
+
+            warn!(
+                team_id,
+                missing_count = missing_runtime_tasks.len(),
+                missing_runtime_tasks = ?missing_runtime_tasks,
+                "team session has missing agent runtime tasks; rebuilding session"
+            );
+            self.stop_session_unchecked(team_id);
+        }
 
         let session = match TeamSession::start_with_prompt_dump(
             team,
@@ -800,6 +824,14 @@ impl TeamSessionService {
         });
 
         Ok(())
+    }
+
+    fn missing_agent_runtime_tasks(&self, agents: &[TeamAgent]) -> Vec<String> {
+        agents
+            .iter()
+            .filter(|agent| self.task_manager.get_task(&agent.conversation_id).is_none())
+            .map(|agent| format!("{}:{}", agent.slot_id, agent.conversation_id))
+            .collect()
     }
 
     pub async fn get_conversation_config_options(
@@ -1172,6 +1204,93 @@ impl TeamSessionService {
         }
     }
 
+    pub async fn cleanup_idle_team_runtime_tasks(
+        &self,
+        idle_conversation_ids: Vec<String>,
+        active_leases: &ActiveLeaseRegistry,
+        idle_threshold_ms: TimestampMs,
+    ) -> Vec<String> {
+        if idle_conversation_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let idle_conversation_set: HashSet<String> = idle_conversation_ids.iter().cloned().collect();
+        let now = now_ms();
+        let mut handled_conversations = HashSet::new();
+        let mut cleanup_teams = Vec::new();
+
+        for entry in self.sessions.iter() {
+            let team_id = entry.key().clone();
+            let session = Arc::clone(&entry.session);
+            let agents = session.scheduler().list_agents().await;
+            let matched_idle_count = agents
+                .iter()
+                .filter(|agent| idle_conversation_set.contains(&agent.conversation_id))
+                .count();
+            if matched_idle_count == 0 {
+                continue;
+            }
+
+            for agent in &agents {
+                handled_conversations.insert(agent.conversation_id.clone());
+            }
+
+            if session.team_run_manager().active_run_id().await.is_some() {
+                debug!(
+                    team_id,
+                    matched_idle_count, "team idle cleanup skipped because team run is active"
+                );
+                continue;
+            }
+
+            if agents
+                .iter()
+                .any(|agent| active_leases.active_until(&agent.conversation_id).is_some())
+            {
+                debug!(
+                    team_id,
+                    matched_idle_count, "team idle cleanup skipped because at least one member has an active lease"
+                );
+                continue;
+            }
+
+            if !agents.iter().all(|agent| {
+                self.task_manager
+                    .get_task(&agent.conversation_id)
+                    .map(|task| is_idle_collectable_team_member(&task, now, idle_threshold_ms))
+                    .unwrap_or(true)
+            }) {
+                debug!(
+                    team_id,
+                    matched_idle_count, "team idle cleanup skipped because at least one member runtime task is active"
+                );
+                continue;
+            }
+
+            cleanup_teams.push((team_id, agents, matched_idle_count));
+        }
+
+        for (team_id, agents, matched_idle_count) in cleanup_teams {
+            info!(
+                team_id,
+                matched_idle_count,
+                member_count = agents.len(),
+                "team idle cleanup stopping idle team session"
+            );
+            self.stop_session_unchecked(&team_id);
+            for agent in agents {
+                self.task_manager
+                    .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::IdleTimeout))
+                    .await;
+            }
+        }
+
+        idle_conversation_ids
+            .into_iter()
+            .filter(|conversation_id| !handled_conversations.contains(conversation_id))
+            .collect()
+    }
+
     pub async fn send_message(
         &self,
         user_id: &str,
@@ -1464,6 +1583,16 @@ async fn set_active_agent_session_mode(instance: &AgentInstance, mode: &str) -> 
     }
 }
 
+fn is_idle_collectable_team_member(task: &AgentInstance, now: TimestampMs, idle_threshold_ms: TimestampMs) -> bool {
+    if !matches!(
+        task.status(),
+        None | Some(ConversationStatus::Pending | ConversationStatus::Finished)
+    ) {
+        return false;
+    }
+    now.saturating_sub(task.last_activity_at()) > idle_threshold_ms
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1471,13 +1600,15 @@ mod tests {
 
     use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
     use aionui_ai_agent::{
-        AgentError, AgentInstance, AgentSendError, AgentStreamEvent, IAgentTask, IMockAgent, IWorkerTaskManager,
+        ActiveLeaseRegistry, AgentError, AgentInstance, AgentSendError, AgentStreamEvent, IAgentTask, IMockAgent,
+        IWorkerTaskManager, IdleCleanupCoordinator,
     };
     use aionui_api_types::{AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionResponse};
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs, now_ms};
     use aionui_db::{IConversationRepository, ITeamRepository};
     use tokio::sync::broadcast;
 
+    use super::TeamIdleCleanupCoordinator;
     use crate::test_utils::workspace_harness::{
         setup_with_factory_metadata_team_repo_and_conversation_repo,
         setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster,
@@ -1487,8 +1618,11 @@ mod tests {
 
     struct ModeSettingAgent {
         conversation_id: String,
+        agent_type: AgentType,
         mode_result: Mutex<Result<(), String>>,
         event_tx: broadcast::Sender<AgentStreamEvent>,
+        status: Option<ConversationStatus>,
+        last_activity_at: TimestampMs,
     }
 
     impl ModeSettingAgent {
@@ -1504,16 +1638,47 @@ mod tests {
             let (event_tx, _) = broadcast::channel(1);
             Self {
                 conversation_id: conversation_id.to_owned(),
+                agent_type: AgentType::Acp,
                 mode_result: Mutex::new(mode_result),
                 event_tx,
+                status: None,
+                last_activity_at: now_ms(),
             }
+        }
+
+        fn idle_finished(conversation_id: &str) -> Self {
+            Self::accepts_mode(conversation_id)
+                .with_status(Some(ConversationStatus::Finished))
+                .with_last_activity(now_ms() - 600_000)
+        }
+
+        fn idle_pending_aionrs(conversation_id: &str) -> Self {
+            Self::accepts_mode(conversation_id)
+                .with_agent_type(AgentType::Aionrs)
+                .with_status(Some(ConversationStatus::Pending))
+                .with_last_activity(now_ms() - 600_000)
+        }
+
+        fn with_agent_type(mut self, agent_type: AgentType) -> Self {
+            self.agent_type = agent_type;
+            self
+        }
+
+        fn with_status(mut self, status: Option<ConversationStatus>) -> Self {
+            self.status = status;
+            self
+        }
+
+        fn with_last_activity(mut self, last_activity_at: TimestampMs) -> Self {
+            self.last_activity_at = last_activity_at;
+            self
         }
     }
 
     #[async_trait::async_trait]
     impl IAgentTask for ModeSettingAgent {
         fn agent_type(&self) -> AgentType {
-            AgentType::Acp
+            self.agent_type
         }
 
         fn conversation_id(&self) -> &str {
@@ -1525,11 +1690,11 @@ mod tests {
         }
 
         fn status(&self) -> Option<ConversationStatus> {
-            None
+            self.status
         }
 
         fn last_activity_at(&self) -> TimestampMs {
-            now_ms()
+            self.last_activity_at
         }
 
         fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
@@ -1611,6 +1776,122 @@ mod tests {
         }
     }
 
+    struct MutableTaskManager {
+        tasks: Mutex<HashMap<String, AgentInstance>>,
+    }
+
+    impl MutableTaskManager {
+        fn new() -> Self {
+            Self {
+                tasks: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn insert_mode_agent(&self, conversation_id: &str) {
+            self.tasks.lock().unwrap().insert(
+                conversation_id.to_owned(),
+                AgentInstance::Mock(Arc::new(ModeSettingAgent::accepts_mode(conversation_id))),
+            );
+        }
+
+        fn insert_idle_finished_agent(&self, conversation_id: &str) {
+            self.tasks.lock().unwrap().insert(
+                conversation_id.to_owned(),
+                AgentInstance::Mock(Arc::new(ModeSettingAgent::idle_finished(conversation_id))),
+            );
+        }
+
+        fn insert_idle_pending_aionrs_agent(&self, conversation_id: &str) {
+            self.tasks.lock().unwrap().insert(
+                conversation_id.to_owned(),
+                AgentInstance::Mock(Arc::new(ModeSettingAgent::idle_pending_aionrs(conversation_id))),
+            );
+        }
+
+        fn remove(&self, conversation_id: &str) {
+            self.tasks.lock().unwrap().remove(conversation_id);
+        }
+    }
+
+    fn two_agent_team_request(name: &str) -> aionui_api_types::CreateTeamRequest {
+        aionui_api_types::CreateTeamRequest {
+            name: name.into(),
+            agents: vec![
+                aionui_api_types::TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                },
+                aionui_api_types::TeamAgentInput {
+                    name: "Worker".into(),
+                    role: "teammate".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                },
+            ],
+            workspace: None,
+        }
+    }
+
+    fn team_with_aionrs_worker_request(name: &str) -> aionui_api_types::CreateTeamRequest {
+        let mut request = two_agent_team_request(name);
+        request.agents.push(aionui_api_types::TeamAgentInput {
+            name: "Butler".into(),
+            role: "teammate".into(),
+            backend: Some("aionrs".into()),
+            model: "claude-sonnet".into(),
+            assistant_id: None,
+            conversation_id: None,
+        });
+        request
+    }
+
+    #[async_trait::async_trait]
+    impl IWorkerTaskManager for MutableTaskManager {
+        fn get_task(&self, conversation_id: &str) -> Option<AgentInstance> {
+            self.tasks.lock().unwrap().get(conversation_id).cloned()
+        }
+
+        async fn get_or_build_task(
+            &self,
+            _conversation_id: &str,
+            _options: BuildTaskOptions,
+        ) -> Result<AgentInstance, AgentError> {
+            Err(AgentError::internal("mutable task manager does not build tasks"))
+        }
+
+        fn kill(&self, conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            self.remove(conversation_id);
+            Ok(())
+        }
+
+        fn kill_and_wait(
+            &self,
+            conversation_id: &str,
+            reason: Option<AgentKillReason>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let _ = self.kill(conversation_id, reason);
+            Box::pin(std::future::ready(()))
+        }
+
+        async fn clear(&self) {
+            self.tasks.lock().unwrap().clear();
+        }
+
+        fn active_count(&self) -> usize {
+            self.tasks.lock().unwrap().len()
+        }
+
+        fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
     #[tokio::test]
     async fn session_has_slow_monitor() {
         let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
@@ -1659,6 +1940,139 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(assistant.conversation_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_session_rebuilds_when_existing_session_lost_member_runtime_task() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Runtime Rebuild"))
+            .await
+            .unwrap();
+        let assistant = created.assistants.first().expect("team assistant");
+        task_manager.insert_mode_agent(&assistant.conversation_id);
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        task_manager.remove(&assistant.conversation_id);
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        let events = broadcaster.events_by_name("team.agentRuntimeStatusChanged");
+        let statuses: Vec<&str> = events
+            .iter()
+            .filter(|event| {
+                event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(assistant.slot_id.as_str())
+            })
+            .map(|event| event.data.get("status").and_then(serde_json::Value::as_str).unwrap())
+            .collect();
+
+        assert_eq!(statuses, vec!["pending", "ready", "pending", "ready"]);
+    }
+
+    #[tokio::test]
+    async fn idle_cleanup_stops_team_session_and_kills_all_members_when_team_is_collectable() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Idle Cleanup"))
+            .await
+            .unwrap();
+        let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        task_manager.insert_idle_finished_agent(&lead.conversation_id);
+        task_manager.insert_idle_finished_agent(&worker.conversation_id);
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        let unhandled = svc
+            .cleanup_idle_team_runtime_tasks(vec![lead.conversation_id.clone()], &ActiveLeaseRegistry::new(), 300_000)
+            .await;
+
+        assert!(unhandled.is_empty());
+        assert_eq!(svc.session_count_for_test(), 0);
+        assert_eq!(task_manager.active_count(), 0);
+    }
+
+    #[test]
+    fn idle_collectable_team_member_accepts_idle_pending_aionrs_runtime() {
+        let task = AgentInstance::Mock(Arc::new(ModeSettingAgent::idle_pending_aionrs("aionrs-idle")));
+
+        assert!(super::is_idle_collectable_team_member(&task, now_ms(), 300_000));
+    }
+
+    #[test]
+    fn idle_collectable_team_member_rejects_running_aionrs_runtime() {
+        let task = AgentInstance::Mock(Arc::new(
+            ModeSettingAgent::accepts_mode("aionrs-running")
+                .with_agent_type(AgentType::Aionrs)
+                .with_status(Some(ConversationStatus::Running))
+                .with_last_activity(now_ms() - 600_000),
+        ));
+
+        assert!(!super::is_idle_collectable_team_member(&task, now_ms(), 300_000));
+    }
+
+    #[tokio::test]
+    async fn idle_cleanup_stops_team_session_when_aionrs_member_is_idle_pending() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", team_with_aionrs_worker_request("Idle Aionrs Cleanup"))
+            .await
+            .unwrap();
+        let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+        let acp_worker = created.assistants.iter().find(|agent| agent.name == "Worker").unwrap();
+        let aionrs_worker = created.assistants.iter().find(|agent| agent.name == "Butler").unwrap();
+        task_manager.insert_idle_finished_agent(&lead.conversation_id);
+        task_manager.insert_idle_finished_agent(&acp_worker.conversation_id);
+        task_manager.insert_idle_pending_aionrs_agent(&aionrs_worker.conversation_id);
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        let unhandled = svc
+            .cleanup_idle_team_runtime_tasks(
+                vec![lead.conversation_id.clone(), acp_worker.conversation_id.clone()],
+                &ActiveLeaseRegistry::new(),
+                300_000,
+            )
+            .await;
+
+        assert!(unhandled.is_empty());
+        assert_eq!(svc.session_count_for_test(), 0);
+        assert_eq!(task_manager.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn team_idle_cleanup_coordinator_delegates_to_team_service() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Idle Coordinator"))
+            .await
+            .unwrap();
+        for agent in &created.assistants {
+            task_manager.insert_idle_finished_agent(&agent.conversation_id);
+        }
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let coordinator = TeamIdleCleanupCoordinator::new(svc.clone(), Arc::new(ActiveLeaseRegistry::new()));
+
+        let unhandled = coordinator
+            .cleanup_idle_conversations(vec![created.assistants[0].conversation_id.clone()], 300_000)
+            .await;
+
+        assert!(unhandled.is_empty());
+        assert_eq!(svc.session_count_for_test(), 0);
+        assert_eq!(task_manager.active_count(), 0);
     }
 
     #[tokio::test]

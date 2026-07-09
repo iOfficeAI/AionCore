@@ -3,6 +3,7 @@
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{future::Future, pin::Pin};
 
@@ -10,8 +11,9 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use aionui_api_types::{RuntimeStatusScope, RuntimeStatusScopeKind};
-use aionui_app::{AppConfig, AppServices, RouterBuildError, create_router};
+use aionui_app::{AppConfig, AppServices, RouterBuildError, create_router_with_runtime};
 use aionui_system::RuntimePrepareService;
+use aionui_team::TeamIdleCleanupCoordinator;
 
 use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, ServerEnvironment};
 
@@ -218,7 +220,7 @@ pub(crate) async fn run_server(
         info!("No configured users detected — initial setup required via /api/auth/status");
     }
 
-    let router = create_router(&services)
+    let (router, router_runtime) = create_router_with_runtime(&services)
         .await
         .map_err(router_build_error_to_bootstrap)?;
     info!(
@@ -271,8 +273,18 @@ pub(crate) async fn run_server(
     // propagates graceful-shutdown so the scanner exits on SIGINT/SIGTERM.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (shutdown_error_tx, shutdown_error_rx) = tokio::sync::oneshot::channel::<BootstrapError>();
-    let idle_scanner_handle =
-        aionui_ai_agent::start_idle_scanner(services.worker_task_manager.clone(), shutdown_rx, None, None);
+    let idle_cleanup_coordinator: Arc<dyn aionui_ai_agent::IdleCleanupCoordinator> =
+        Arc::new(TeamIdleCleanupCoordinator::new(
+            router_runtime.team_service.clone(),
+            services.active_lease_registry.clone(),
+        ));
+    let idle_scanner_handle = aionui_ai_agent::start_idle_scanner_with_coordinator(
+        services.worker_task_manager.clone(),
+        shutdown_rx,
+        None,
+        None,
+        Some(idle_cleanup_coordinator),
+    );
     let conversation_runtime_state = services.conversation_runtime_state.clone();
     let worker_task_manager = services.worker_task_manager.clone();
 
