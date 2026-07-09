@@ -38,7 +38,7 @@ pub const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionr
 /// Returns `true` if:
 /// 1. The backend is in the hard whitelist, OR
 /// 2. The `agent_capabilities` JSON contains an `mcp_capabilities` / `mcpCapabilities` / `mcp`
-///    field with at least one explicitly supported MCP transport.
+///    field.
 pub fn is_team_capable(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
     if TEAM_CAPABLE_BACKENDS.contains(&backend) {
         return true;
@@ -46,22 +46,15 @@ pub fn is_team_capable(backend: &str, agent_capabilities: Option<&serde_json::Va
     has_mcp_capability(agent_capabilities)
 }
 
-/// Check whether `agent_capabilities` JSON declares a supported MCP transport.
+/// Check whether `agent_capabilities` JSON declares MCP capability metadata.
 pub fn has_mcp_capability(agent_capabilities: Option<&serde_json::Value>) -> bool {
     let Some(caps) = agent_capabilities else {
         return false;
     };
-    let Some(mcp_caps) = caps
-        .get("mcp_capabilities")
+    caps.get("mcp_capabilities")
         .or_else(|| caps.get("mcpCapabilities"))
         .or_else(|| caps.get("mcp"))
-    else {
-        return false;
-    };
-
-    ["stdio", "http", "sse"]
-        .iter()
-        .any(|transport| mcp_caps.get(*transport).and_then(serde_json::Value::as_bool) == Some(true))
+        .is_some()
 }
 
 #[cfg(test)]
@@ -70,11 +63,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn has_mcp_capability_requires_explicit_supported_transport() {
+    fn has_mcp_capability_requires_mcp_capability_field() {
         assert!(!has_mcp_capability(None));
         assert!(!has_mcp_capability(Some(&json!({}))));
-        assert!(!has_mcp_capability(Some(&json!({
+
+        assert!(has_mcp_capability(Some(&json!({
             "mcp_capabilities": { "http": false, "sse": false }
+        }))));
+        assert!(has_mcp_capability(Some(&json!({
+            "mcp_capabilities": {}
         }))));
 
         assert!(has_mcp_capability(Some(&json!({

@@ -4,7 +4,7 @@ use aionui_common::constants::is_team_capable;
 /// Determine if a backend supports team mode.
 ///
 /// Hard whitelist always passes. For non-whitelisted backends, checks the
-/// persisted `agent_capabilities` JSON for MCP transport declarations.
+/// persisted `agent_capabilities` JSON for MCP capability metadata.
 pub fn is_team_capable_backend(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
     is_team_capable(backend, agent_capabilities)
 }
@@ -34,6 +34,12 @@ mod tests {
 
         let caps_mcp = json!({"mcp": {"stdio": true}});
         assert!(is_team_capable_backend("goose", Some(&caps_mcp)));
+
+        let caps_disabled_transport = json!({"mcp_capabilities": {"http": false, "sse": false}});
+        assert!(is_team_capable_backend("zed", Some(&caps_disabled_transport)));
+
+        let caps_empty = json!({"mcp_capabilities": {}});
+        assert!(is_team_capable_backend("cursor", Some(&caps_empty)));
     }
 
     #[test]
