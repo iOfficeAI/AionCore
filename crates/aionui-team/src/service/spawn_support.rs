@@ -1,11 +1,10 @@
 use super::*;
-use aionui_api_types::BehaviorPolicy;
 use aionui_common::AgentType;
-use aionui_common::constants::{TEAM_CAPABLE_BACKENDS, has_mcp_capability};
 use aionui_db::models::AgentMetadataRow;
 use aionui_db::{IAgentMetadataRepository, resolve_agent_binding_from_rows};
 use std::sync::Arc;
 
+use crate::ports::TeamAssistantCatalogEntry;
 use crate::prompts::AvailableAssistant;
 
 use crate::provisioning::PersistSpawnedAgentRequest;
@@ -61,6 +60,18 @@ pub(crate) async fn resolve_runtime_backend(
 }
 
 impl TeamSessionService {
+    pub(crate) async fn resolve_team_selectable_assistant(
+        &self,
+        assistant_id: &str,
+    ) -> Result<TeamAssistantCatalogEntry, TeamError> {
+        self.assistant_catalog
+            .resolve_team_selectable_assistant(assistant_id)
+            .await?
+            .ok_or_else(|| {
+                TeamError::InvalidRequest(format!("Assistant is not available for team mode: {assistant_id}"))
+            })
+    }
+
     pub(crate) async fn resolve_spawn_backend_and_model(
         &self,
         assistant_id: Option<&str>,
@@ -69,18 +80,13 @@ impl TeamSessionService {
         fallback_model: &str,
     ) -> Result<(String, String), TeamError> {
         if let Some(assistant_id) = assistant_id.map(str::trim).filter(|value| !value.is_empty()) {
+            let selectable = self.resolve_team_selectable_assistant(assistant_id).await?;
             let definition = self
                 .assistant_definition_repo
                 .get_by_assistant_id(assistant_id)
                 .await?
                 .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_id}")))?;
-            let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
-            let effective_agent_id = overlay
-                .as_ref()
-                .and_then(|row| row.agent_id_override.as_deref())
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(definition.agent_id.as_str());
-            let backend = resolve_runtime_backend(&self.agent_metadata_repo, effective_agent_id).await?;
+            let backend = selectable.backend;
             let requested_model = requested_model
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -108,31 +114,6 @@ impl TeamSessionService {
             .or(backend_default_model)
             .unwrap_or_else(|| fallback_model.to_owned());
         Ok((backend, model))
-    }
-
-    /// Check if a backend is allowed to participate in team mode.
-    /// Hard whitelist passes immediately; then checks behavior_policy.supports_team;
-    /// finally queries persisted `agent_capabilities` for MCP transport declarations.
-    pub(crate) async fn is_backend_team_capable(&self, backend: &str) -> bool {
-        if TEAM_CAPABLE_BACKENDS.contains(&backend) {
-            return true;
-        }
-        let Ok(Some(row)) = self.agent_metadata_repo.find_builtin_by_backend(backend).await else {
-            return false;
-        };
-        let bp_supports = row
-            .behavior_policy
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<BehaviorPolicy>(s).ok())
-            .is_some_and(|bp| bp.supports_team);
-        if bp_supports {
-            return true;
-        }
-        let caps = row
-            .agent_capabilities
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-        has_mcp_capability(caps.as_ref())
     }
 
     /// Return all enabled assistants that can currently participate in team mode.
@@ -517,6 +498,69 @@ mod tests {
         }
     }
 
+    fn assistant_definition(assistant_id: &str, agent_id: &str) -> AssistantDefinitionRow {
+        AssistantDefinitionRow {
+            id: format!("def-{assistant_id}"),
+            assistant_id: assistant_id.into(),
+            source: "builtin".into(),
+            owner_type: "system".into(),
+            source_ref: Some(assistant_id.into()),
+            source_version: None,
+            source_hash: None,
+            name: assistant_id.into(),
+            name_i18n: "{}".into(),
+            description: None,
+            description_i18n: "{}".into(),
+            avatar_type: "emoji".into(),
+            avatar_value: None,
+            agent_id: agent_id.into(),
+            rule_resource_type: "inline".into(),
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]".into(),
+            recommended_prompts_i18n: "{}".into(),
+            default_model_mode: "auto".into(),
+            default_model_value: None,
+            default_permission_mode: "auto".into(),
+            default_permission_value: None,
+            default_thought_level_mode: "auto".into(),
+            default_thought_level_value: None,
+            default_skills_mode: "auto".into(),
+            default_skill_ids: "[]".into(),
+            custom_skill_names: "[]".into(),
+            default_disabled_builtin_skill_ids: "[]".into(),
+            default_mcps_mode: "auto".into(),
+            default_mcp_ids: "[]".into(),
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        }
+    }
+
+    fn service_with_selectable_catalog(
+        assistants: Vec<crate::ports::TeamAssistantCatalogEntry>,
+        definitions: Vec<AssistantDefinitionRow>,
+    ) -> Arc<TeamSessionService> {
+        let (base, _, _, _) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        TeamSessionService::new(
+            base.repo.clone(),
+            base.agent_metadata_repo.clone(),
+            Arc::new(RowsTeamAssistantCatalog { rows: assistants }),
+            Arc::new(MultiAssistantDefinitionRepo { rows: definitions }),
+            Arc::new(MultiAssistantOverlayRepo { rows: vec![] }),
+            Arc::new(SingleProviderRepo {
+                rows: vec![provider_row("openai", &["gpt-5-mini"])],
+            }),
+            base.conversation_port.clone(),
+            base.projection_store.clone(),
+            base.broadcaster.clone(),
+            base.task_manager.clone(),
+            base.turn_port.clone(),
+            base.cancellation_port.clone(),
+            base.backend_binary_path.clone(),
+        )
+    }
+
     #[test]
     fn parse_agent_type_accepts_top_level_supported_runtimes() {
         assert_eq!(parse_agent_type("acp").unwrap(), AgentType::Acp);
@@ -577,6 +621,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_team_rejects_assistant_missing_from_team_selectable_catalog() {
+        let svc = service_with_selectable_catalog(vec![], vec![assistant_definition("word-creator", "aionrs")]);
+        let mut req = single_agent_team_request("Catalog Gate");
+        req.agents[0].assistant_id = Some("word-creator".into());
+        req.agents[0].backend = None;
+        req.agents[0].model = "gpt-5-mini".into();
+
+        let err = svc
+            .create_team("user1", req)
+            .await
+            .expect_err("assistant must be rejected when not team selectable");
+
+        assert!(
+            matches!(&err, TeamError::InvalidRequest(msg) if msg.contains("not available for team mode")),
+            "expected team-selectable assistant error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_agent_rejects_assistant_missing_from_team_selectable_catalog() {
+        let svc = service_with_selectable_catalog(vec![], vec![assistant_definition("word-creator", "aionrs")]);
+        let created = svc
+            .create_team("user1", single_agent_team_request("Catalog Gate Add"))
+            .await
+            .unwrap();
+
+        let err = svc
+            .add_agent(
+                "user1",
+                &created.id,
+                aionui_api_types::AddAgentRequest {
+                    name: "Worker".into(),
+                    role: "teammate".into(),
+                    backend: None,
+                    model: "gpt-5-mini".into(),
+                    assistant_id: Some("word-creator".into()),
+                },
+            )
+            .await
+            .expect_err("assistant must be rejected when not team selectable");
+
+        assert!(
+            matches!(&err, TeamError::InvalidRequest(msg) if msg.contains("not available for team mode")),
+            "expected team-selectable assistant error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_spawn_backend_and_model_rejects_assistant_missing_from_team_selectable_catalog() {
+        let svc = service_with_selectable_catalog(vec![], vec![assistant_definition("word-creator", "aionrs")]);
+
+        let err = svc
+            .resolve_spawn_backend_and_model(Some("word-creator"), None, "gemini", "gemini-2.5-pro")
+            .await
+            .expect_err("spawn must reject assistants outside the team-selectable catalog");
+
+        assert!(
+            matches!(&err, TeamError::InvalidRequest(msg) if msg.contains("not available for team mode")),
+            "expected team-selectable assistant error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn persist_spawned_agent_uses_team_workspace_resolver() {
         let (svc, team_repo, _, conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
         let created = svc
@@ -618,7 +725,9 @@ mod tests {
         let svc = TeamSessionService::new(
             svc.repo.clone(),
             svc.agent_metadata_repo.clone(),
-            Arc::new(RowsTeamAssistantCatalog { rows: vec![] }),
+            Arc::new(RowsTeamAssistantCatalog {
+                rows: vec![team_assistant_entry("word-creator", "Word Creator", "aionrs")],
+            }),
             Arc::new(SingleAssistantDefinitionRepo {
                 row: AssistantDefinitionRow {
                     id: "def-1".into(),

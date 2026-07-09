@@ -24,7 +24,7 @@ use aionui_db::models::{
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
     IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessagePageParams,
-    MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    MessagePageResult, MessageRowUpdate, MessageSearchRow, resolve_agent_binding_from_rows,
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -1175,6 +1175,45 @@ impl TeamAssistantCatalogPort for EmptyTeamAssistantCatalog {
     }
 }
 
+struct TestTeamAssistantCatalog {
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+}
+
+#[async_trait::async_trait]
+impl TeamAssistantCatalogPort for TestTeamAssistantCatalog {
+    async fn list_team_selectable_assistants(&self) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
+        let agent_rows = self.agent_metadata_repo.list_all().await?;
+        let definitions = self.assistant_definition_repo.list().await?;
+        let mut result = Vec::new();
+
+        for definition in definitions {
+            let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+            if overlay.as_ref().is_some_and(|row| !row.enabled) {
+                continue;
+            }
+            let effective_agent_id = overlay
+                .as_ref()
+                .and_then(|row| row.agent_id_override.as_deref())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(definition.agent_id.as_str());
+            let backend = resolve_agent_binding_from_rows(&agent_rows, effective_agent_id)
+                .map(|binding| binding.runtime_backend)
+                .unwrap_or_else(|| effective_agent_id.to_owned());
+            result.push(TeamAssistantCatalogEntry {
+                assistant_id: definition.assistant_id,
+                name: definition.name,
+                backend,
+                description: definition.description.unwrap_or_default(),
+                skills: Vec::new(),
+            });
+        }
+
+        Ok(result)
+    }
+}
+
 struct EmptyProviderRepo;
 
 #[async_trait::async_trait]
@@ -1400,10 +1439,15 @@ fn setup_with_factory_metadata_assistants_and_conversation_repo(
     let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let assistant_catalog: Arc<dyn TeamAssistantCatalogPort> = Arc::new(TestTeamAssistantCatalog {
+        agent_metadata_repo: agent_metadata_repo.clone(),
+        assistant_definition_repo: assistant_definition_repo.clone(),
+        assistant_overlay_repo: assistant_overlay_repo.clone(),
+    });
     let svc = TeamSessionService::new(
         team_repo_dyn,
         agent_metadata_repo,
-        Arc::new(EmptyTeamAssistantCatalog),
+        assistant_catalog,
         assistant_definition_repo,
         assistant_overlay_repo,
         provider_repo,
@@ -1456,10 +1500,15 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(factory));
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let assistant_catalog: Arc<dyn TeamAssistantCatalogPort> = Arc::new(TestTeamAssistantCatalog {
+        agent_metadata_repo: agent_metadata_repo.clone(),
+        assistant_definition_repo: assistant_definition_repo.clone(),
+        assistant_overlay_repo: assistant_overlay_repo.clone(),
+    });
     let svc = TeamSessionService::new(
         team_repo_dyn,
         agent_metadata_repo,
-        Arc::new(EmptyTeamAssistantCatalog),
+        assistant_catalog,
         assistant_definition_repo,
         assistant_overlay_repo,
         provider_repo,

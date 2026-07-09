@@ -244,8 +244,7 @@ impl TeamSessionService {
         TeamAgentProvisioner::new(
             self.repo.clone(),
             self.agent_metadata_repo.clone(),
-            self.assistant_definition_repo.clone(),
-            self.assistant_overlay_repo.clone(),
+            self.assistant_catalog.clone(),
             self.provider_repo.clone(),
             self.conversation_port.clone(),
         )

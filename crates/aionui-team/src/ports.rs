@@ -28,6 +28,17 @@ pub trait TeamConversationLookupPort: Send + Sync {
 #[async_trait]
 pub trait TeamAssistantCatalogPort: Send + Sync {
     async fn list_team_selectable_assistants(&self) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError>;
+
+    async fn resolve_team_selectable_assistant(
+        &self,
+        assistant_id: &str,
+    ) -> Result<Option<TeamAssistantCatalogEntry>, TeamError> {
+        Ok(self
+            .list_team_selectable_assistants()
+            .await?
+            .into_iter()
+            .find(|assistant| assistant.assistant_id == assistant_id))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

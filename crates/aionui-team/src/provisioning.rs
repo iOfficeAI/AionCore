@@ -4,19 +4,15 @@ use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{AddAgentRequest, GetConfigOptionsResponse, TeamAgentInput};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::{AgentMetadataRow, TeamRow};
-use aionui_db::{
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
-    ITeamRepository, UpdateTeamParams,
-};
+use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
 use async_trait::async_trait;
 use tracing::{info, warn};
 
 use crate::error::TeamError;
 use crate::mcp::TeamMcpStdioConfig;
+use crate::ports::TeamAssistantCatalogPort;
 use crate::service::inherit_team_workspace;
-use crate::service::spawn_support::{
-    acp_backend_metadata, parse_agent_type, resolve_runtime_backend, session_mode_for_backend,
-};
+use crate::service::spawn_support::{acp_backend_metadata, parse_agent_type, session_mode_for_backend};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::workspace::TeamWorkspaceResolver;
 
@@ -24,8 +20,7 @@ use crate::workspace::TeamWorkspaceResolver;
 pub struct TeamAgentProvisioner {
     repo: Arc<dyn ITeamRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
-    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
-    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
     provider_repo: Arc<dyn IProviderRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
 }
@@ -124,16 +119,14 @@ impl TeamAgentProvisioner {
     pub(crate) fn new(
         repo: Arc<dyn ITeamRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
-        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
-        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+        assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
         provider_repo: Arc<dyn IProviderRepository>,
         conversation_port: Arc<dyn TeamConversationProvisioningPort>,
     ) -> Self {
         Self {
             repo,
             agent_metadata_repo,
-            assistant_definition_repo,
-            assistant_overlay_repo,
+            assistant_catalog,
             provider_repo,
             conversation_port,
         }
@@ -318,17 +311,14 @@ impl TeamAgentProvisioner {
     ) -> Result<String, TeamError> {
         let assistant_id = assistant_id.map(str::trim).filter(|value| !value.is_empty());
         if let Some(assistant_id) = assistant_id {
-            let definition = self
-                .assistant_definition_repo
-                .get_by_assistant_id(assistant_id)
+            return self
+                .assistant_catalog
+                .resolve_team_selectable_assistant(assistant_id)
                 .await?
-                .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_id}")))?;
-            let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
-            let effective_agent_id = overlay
-                .and_then(|row| row.agent_id_override)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(definition.agent_id);
-            return resolve_runtime_backend(&self.agent_metadata_repo, &effective_agent_id).await;
+                .map(|assistant| assistant.backend)
+                .ok_or_else(|| {
+                    TeamError::InvalidRequest(format!("Assistant is not available for team mode: {assistant_id}"))
+                });
         }
 
         let Some(requested_backend) = requested_backend.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -659,9 +649,8 @@ mod tests {
     use aionui_ai_agent::types::BuildTaskOptions;
     use aionui_ai_agent::{AgentError, AgentInstance};
     use aionui_db::models::{
-        AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, Provider, UpdateAgentAvailabilitySnapshotParams,
-        UpdateAgentHandshakeParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
-        UpsertAssistantOverlayParams,
+        AgentMetadataRow, Provider, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
+        UpsertAgentMetadataParams,
     };
     use aionui_db::{CreateProviderParams, DbError, UpdateProviderParams};
     use std::sync::Mutex;
@@ -785,6 +774,17 @@ mod tests {
 
     struct UnusedAgentMetadataRepo;
 
+    struct EmptyTeamAssistantCatalog;
+
+    #[async_trait]
+    impl TeamAssistantCatalogPort for EmptyTeamAssistantCatalog {
+        async fn list_team_selectable_assistants(
+            &self,
+        ) -> Result<Vec<crate::ports::TeamAssistantCatalogEntry>, TeamError> {
+            Ok(Vec::new())
+        }
+    }
+
     #[async_trait]
     impl IAgentMetadataRepository for UnusedAgentMetadataRepo {
         async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
@@ -836,55 +836,6 @@ mod tests {
         }
     }
 
-    struct UnusedAssistantDefinitionRepo;
-
-    #[async_trait]
-    impl IAssistantDefinitionRepository for UnusedAssistantDefinitionRepo {
-        async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
-            Ok(Vec::new())
-        }
-        async fn get_by_assistant_id(&self, _assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
-            Ok(None)
-        }
-        async fn get_by_id(&self, _id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
-            Ok(None)
-        }
-        async fn get_by_source_ref(
-            &self,
-            _source: &str,
-            _source_ref: &str,
-        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
-            Ok(None)
-        }
-        async fn upsert(
-            &self,
-            _params: &UpsertAssistantDefinitionParams<'_>,
-        ) -> Result<AssistantDefinitionRow, DbError> {
-            Err(DbError::Init("unused".into()))
-        }
-        async fn soft_delete(&self, _id: &str, _deleted_at: i64) -> Result<bool, DbError> {
-            Ok(false)
-        }
-    }
-
-    struct UnusedAssistantOverlayRepo;
-
-    #[async_trait]
-    impl IAssistantOverlayRepository for UnusedAssistantOverlayRepo {
-        async fn get(&self, _assistant_definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
-            Ok(None)
-        }
-        async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
-            Ok(Vec::new())
-        }
-        async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
-            Err(DbError::Init("unused".into()))
-        }
-        async fn delete(&self, _assistant_definition_id: &str) -> Result<bool, DbError> {
-            Ok(false)
-        }
-    }
-
     struct EmptyProviderRepo;
 
     #[async_trait]
@@ -910,8 +861,7 @@ mod tests {
         TeamAgentProvisioner::new(
             Arc::new(crate::test_utils::MockTeamRepo::new()),
             Arc::new(UnusedAgentMetadataRepo),
-            Arc::new(UnusedAssistantDefinitionRepo),
-            Arc::new(UnusedAssistantOverlayRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
             Arc::new(EmptyProviderRepo),
             Arc::new(RecordingProvisioningPort { events }),
         )

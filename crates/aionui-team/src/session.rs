@@ -1545,16 +1545,9 @@ impl TeamSession {
             .resolve_spawn_backend_and_model(Some(assistant_id), None, caller.backend.as_str(), caller.model.as_str())
             .await?;
 
-        // Step 4: backend capability check. Hard whitelist passes immediately;
-        // otherwise query persisted agent_capabilities for MCP support.
-        if !crate::capability::TEAM_CAPABLE_BACKENDS.contains(&backend.as_str()) {
-            let capable = service.is_backend_team_capable(&backend).await;
-            if !capable {
-                return Err(TeamError::BackendNotAllowed(backend));
-            }
-        }
-
-        // Step 5: DB side-effects (new conversation + persisted agent slot).
+        // Step 4: DB side-effects (new conversation + persisted agent slot).
+        // Assistant-first spawn has already passed the team-selectable catalog
+        // gate while resolving the backend/model above.
         let new_slot_id = generate_id();
         let new_agent = service
             .persist_spawned_agent(PersistSpawnedAgentRequest {
