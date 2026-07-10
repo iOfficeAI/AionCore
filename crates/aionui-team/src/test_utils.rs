@@ -8,6 +8,7 @@ pub struct MockState {
     pub messages: Vec<MailboxMessageRow>,
     pub tasks: Vec<TeamTaskRow>,
     pub fail_message_writes: bool,
+    pub fail_task_lists: bool,
 }
 
 pub struct MockTeamRepo {
@@ -19,12 +20,6 @@ impl MockTeamRepo {
         Self {
             state: Mutex::new(MockState::default()),
         }
-    }
-
-    pub fn with_message_write_failure() -> Self {
-        let repo = Self::new();
-        repo.state.lock().unwrap().fail_message_writes = true;
-        repo
     }
 }
 
@@ -163,6 +158,9 @@ impl ITeamRepository for MockTeamRepo {
 
     async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
         let state = self.state.lock().unwrap();
+        if state.fail_task_lists {
+            return Err(DbError::Init("forced task list failure".into()));
+        }
         let tasks = state.tasks.iter().filter(|t| t.team_id == team_id).cloned().collect();
         Ok(tasks)
     }
@@ -204,7 +202,9 @@ pub(crate) mod workspace_harness {
     use std::sync::{Arc, Mutex};
 
     use aionui_ai_agent::{AgentError, IWorkerTaskManager};
-    use aionui_api_types::{CreateTeamRequest, WebSocketMessage};
+    use aionui_api_types::{
+        AcpConfigOptionDto, AcpConfigSelectOptionDto, CreateTeamRequest, GetConfigOptionsResponse, WebSocketMessage,
+    };
     use aionui_common::{AgentKillReason, AgentType, PaginatedResult, now_ms};
     use aionui_db::models::{
         AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow, TeamRow,
@@ -247,6 +247,18 @@ pub(crate) mod workspace_harness {
                 .iter()
                 .find(|c| c.id == id)
                 .and_then(|c| serde_json::from_str(&c.extra).ok())
+        }
+
+        pub(crate) fn mark_runtime_not_ready(&self, id: &str) {
+            let mut conversations = self.conversations.lock().unwrap();
+            let conversation = conversations
+                .iter_mut()
+                .find(|c| c.id == id)
+                .expect("conversation exists");
+            let mut extra: serde_json::Value =
+                serde_json::from_str(&conversation.extra).unwrap_or_else(|_| serde_json::json!({}));
+            extra["runtime_not_ready"] = serde_json::Value::Bool(true);
+            conversation.extra = serde_json::to_string(&extra).unwrap();
         }
     }
 
@@ -427,6 +439,9 @@ pub(crate) mod workspace_harness {
             }
             if let Some(ref lead_id) = params.lead_agent_id {
                 team.lead_agent_id = Some(lead_id.clone());
+            }
+            if let Some(ref session_mode) = params.session_mode {
+                team.session_mode = Some(session_mode.clone());
             }
             team.updated_at = now_ms();
             Ok(())
@@ -627,6 +642,44 @@ pub(crate) mod workspace_harness {
                 .await
         }
 
+        async fn get_config_options(&self, conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError> {
+            let extra = self
+                .repo
+                .get_extra(conversation_id)
+                .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+            if extra
+                .get("runtime_not_ready")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Err(TeamError::RuntimeNotReady {
+                    conversation_id: conversation_id.to_owned(),
+                });
+            }
+            let model = extra
+                .get("current_model_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("mock-model")
+                .to_owned();
+            Ok(GetConfigOptionsResponse {
+                config_options: vec![AcpConfigOptionDto {
+                    id: "model".to_owned(),
+                    name: None,
+                    label: Some("Model".to_owned()),
+                    description: None,
+                    category: Some("model".to_owned()),
+                    option_type: "select".to_owned(),
+                    current_value: Some(model.clone()),
+                    options: vec![AcpConfigSelectOptionDto {
+                        value: model.clone(),
+                        name: None,
+                        label: Some(model),
+                        description: None,
+                    }],
+                }],
+            })
+        }
+
         async fn warmup_agent_process(
             &self,
             _user_id: &str,
@@ -671,10 +724,44 @@ pub(crate) mod workspace_harness {
         }
     }
 
-    struct NullBroadcaster;
+    type BroadcastObserver = Arc<dyn Fn(&WebSocketMessage<serde_json::Value>) + Send + Sync>;
 
-    impl EventBroadcaster for NullBroadcaster {
-        fn broadcast(&self, _event: WebSocketMessage<serde_json::Value>) {}
+    pub(crate) struct RecordingBroadcaster {
+        events: std::sync::Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+        observer: std::sync::Mutex<Option<BroadcastObserver>>,
+    }
+
+    impl RecordingBroadcaster {
+        pub(crate) fn new() -> Self {
+            Self {
+                events: std::sync::Mutex::new(Vec::new()),
+                observer: std::sync::Mutex::new(None),
+            }
+        }
+
+        pub(crate) fn events_by_name(&self, name: &str) -> Vec<WebSocketMessage<serde_json::Value>> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.name == name)
+                .cloned()
+                .collect()
+        }
+
+        pub(crate) fn set_observer(&self, observer: BroadcastObserver) {
+            *self.observer.lock().unwrap() = Some(observer);
+        }
+    }
+
+    impl EventBroadcaster for RecordingBroadcaster {
+        fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+            self.events.lock().unwrap().push(event.clone());
+            let observer = self.observer.lock().unwrap().clone();
+            if let Some(observer) = observer {
+                observer(&event);
+            }
+        }
     }
 
     struct NoopTaskManager;
@@ -883,7 +970,7 @@ pub(crate) mod workspace_harness {
         async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
             if let Some(on_started) = request.on_started.as_ref() {
                 on_started(AgentTurnStarted {
-                    team_run_id: request.team_run_id.clone().expect("team run id"),
+                    team_run_id: request.team_run_id.clone(),
                     slot_id: request.slot_id.clone(),
                     role: request.role.clone(),
                     conversation_id: request.conversation_id.clone(),
@@ -920,14 +1007,35 @@ pub(crate) mod workspace_harness {
         Arc<dyn IWorkerTaskManager>,
         Arc<MockConversationRepo>,
     ) {
+        let (svc, team_repo, task_manager, conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster();
+        (svc, team_repo, task_manager, conv_repo)
+    }
+
+    type ServiceHarness = (
+        Arc<TeamSessionService>,
+        Arc<FullMockTeamRepo>,
+        Arc<dyn IWorkerTaskManager>,
+        Arc<MockConversationRepo>,
+        Arc<RecordingBroadcaster>,
+    );
+
+    pub(crate) fn setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster() -> ServiceHarness {
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+        setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager)
+    }
+
+    pub(crate) fn setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(
+        task_manager: Arc<dyn IWorkerTaskManager>,
+    ) -> ServiceHarness {
         let team_repo = Arc::new(FullMockTeamRepo::new());
         let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
         let conv_repo = Arc::new(MockConversationRepo::new());
-        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
         let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
         let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
         let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
         let svc = TeamSessionService::new(
             team_repo_dyn,
             Arc::new(EmptyAgentMetadataRepo),
@@ -937,13 +1045,13 @@ pub(crate) mod workspace_harness {
             Arc::new(EmptyProviderRepo),
             conversation_port,
             projection_store,
-            broadcaster,
+            broadcaster_dyn,
             task_manager.clone(),
             Arc::new(NoopTurnPort),
             Arc::new(NoopCancellationPort),
             Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
         );
-        (svc, team_repo, task_manager, conv_repo)
+        (svc, team_repo, task_manager, conv_repo, broadcaster)
     }
 
     pub(crate) async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {

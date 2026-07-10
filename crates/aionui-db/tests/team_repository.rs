@@ -199,6 +199,25 @@ async fn update_team_can_patch_workspace() {
 }
 
 #[tokio::test]
+async fn update_team_can_patch_session_mode() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+
+    repo.update_team(
+        "t1",
+        &UpdateTeamParams {
+            session_mode: Some("full_auto".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let updated = repo.get_team("t1").await.unwrap().unwrap();
+    assert_eq!(updated.session_mode.as_deref(), Some("full_auto"));
+}
+
+#[tokio::test]
 async fn update_nonexistent_team_returns_not_found() {
     let (repo, _db) = repo().await;
     let result = repo

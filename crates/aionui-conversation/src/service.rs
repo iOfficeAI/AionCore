@@ -3050,6 +3050,25 @@ impl ConversationService {
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(conversation_id)
+            .await?
+            .filter(|r| r.user_id == user_id)
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if let Some(team_id) = team_id_from_extra(&row.extra) {
+            info!(
+                conversation_id,
+                team_id, "Rejected standalone runtime ensure for team-owned conversation"
+            );
+            return Err(ConversationError::TeamRuntimeRequired {
+                conversation_id: conversation_id.to_owned(),
+                team_id,
+            });
+        }
+
         let (agent, recovered) = self
             .ensure_runtime_agent(user_id, conversation_id, task_manager, "runtime_ensure")
             .await?;

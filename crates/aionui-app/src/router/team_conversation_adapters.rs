@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest};
+use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse};
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
     ConversationService,
@@ -44,7 +44,7 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
         let team_run_id = request.team_run_id.clone();
         let slot_id = request.slot_id.clone();
         let role = request.role.clone();
-        let on_started = team_started.zip(team_run_id).map(|(callback, team_run_id)| {
+        let on_started = team_started.map(|callback| {
             Arc::new(move |started: ConversationAgentTurnStarted| {
                 let callback = callback.clone();
                 let team_run_id = team_run_id.clone();
@@ -258,6 +258,13 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
+    async fn get_config_options(&self, conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError> {
+        self.conversation_service
+            .get_config_options(conversation_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
     async fn warmup_agent_process(
         &self,
         user_id: &str,
@@ -327,6 +334,7 @@ fn map_conversation_update_error(error: ConversationError) -> TeamError {
         ConversationError::WorkspacePathUnavailable { path } => TeamError::WorkspacePathUnavailable(path),
         ConversationError::WorkspacePathRuntimeUnavailable { path } => TeamError::WorkspacePathRuntimeUnavailable(path),
         ConversationError::Forbidden { reason } => TeamError::Forbidden(reason),
+        ConversationError::ActiveAgentNotFound { conversation_id } => TeamError::RuntimeNotReady { conversation_id },
         ConversationError::NotFound { id } => TeamError::InvalidRequest(format!("conversation not found: {id}")),
         ConversationError::NotFoundReason { reason } => TeamError::InvalidRequest(reason),
         other => TeamError::InvalidRequest(other.to_string()),
@@ -339,5 +347,24 @@ fn map_conversation_turn_error(error: ConversationError) -> AgentTurnExecutionEr
         other => AgentTurnExecutionError::Failed {
             reason: other.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_agent_missing_maps_to_team_runtime_not_ready() {
+        let err = map_conversation_update_error(ConversationError::ActiveAgentNotFound {
+            conversation_id: "conv-1".into(),
+        });
+
+        assert!(matches!(
+            err,
+            TeamError::RuntimeNotReady {
+                conversation_id: ref id
+            } if id == "conv-1"
+        ));
     }
 }

@@ -53,6 +53,27 @@ pub(super) fn user_facing_message(err: &AgentError) -> String {
     full.split_once(": ").map(|(_, rest)| rest.to_owned()).unwrap_or(full)
 }
 
+fn build_acp_final_input_dump_value(
+    conversation_id: &str,
+    session_id: &str,
+    data: &SendMessageData,
+    final_content: &str,
+    resolved_context: Value,
+) -> Value {
+    serde_json::json!({
+        "kind": "acp-final-input",
+        "backend": "acp",
+        "conversation_id": conversation_id,
+        "session_id": session_id,
+        "msg_id": data.msg_id,
+        "turn_id": data.turn_id.as_deref().unwrap_or("none"),
+        "input": {
+            "content": final_content,
+        },
+        "resolved_context": resolved_context,
+    })
+}
+
 use super::config_option_catalog::{extract_models_from_value, extract_modes_from_value};
 use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
 use super::mode_normalize::normalize_requested_mode;
@@ -914,9 +935,8 @@ impl AcpAgentManager {
                 .and_then(|commands| matched_slash_command(&raw_user_input, commands))
         };
 
-        let (content, dump_first_prompt) = {
+        let content = {
             let mut s = self.session.write().await;
-            let dump_first_prompt = s.has_pending_session_new_prelude();
             let mut ctx = PromptCtx {
                 session: &mut s,
                 params: &self.params,
@@ -925,41 +945,10 @@ impl AcpAgentManager {
             };
             let transformed = self.pipeline.pre_send(&mut ctx, data.content.clone()).await;
             self.commit_session_changes(&mut s).await;
-            (transformed, dump_first_prompt)
+            transformed
         };
 
-        if dump_first_prompt
-            && let Some(dump_dir) =
-                crate::dev_prompt_dump::dump_dir_for_data_dir(&self.params.data_dir, self.params.dump_prompts)
-        {
-            match crate::dev_prompt_dump::dump_prompt(
-                &dump_dir,
-                crate::dev_prompt_dump::PromptDump {
-                    kind: "acp-first-prompt",
-                    backend: self.backend(),
-                    conversation_id: &self.params.conversation_id,
-                    session_id: Some(&sid),
-                    msg_id: Some(&data.msg_id),
-                    turn_id: data.turn_id.as_deref(),
-                    prompt: &content,
-                },
-            ) {
-                Ok(path) => {
-                    debug!(
-                        conversation_id = %self.params.conversation_id,
-                        path = %path.display(),
-                        "DEV prompt dump written"
-                    );
-                }
-                Err(error) => {
-                    warn!(
-                        conversation_id = %self.params.conversation_id,
-                        error = %error,
-                        "DEV prompt dump failed"
-                    );
-                }
-            }
-        }
+        self.dump_acp_final_input(&sid, data, &content);
 
         let data = SendMessageData {
             content,
@@ -967,6 +956,67 @@ impl AcpAgentManager {
         };
         self.prompt_existing_session(&data, Some(&sid), matched_command.as_ref())
             .await
+    }
+
+    fn dump_acp_final_input(&self, session_id: &str, data: &SendMessageData, final_content: &str) {
+        let Some(dump_dir) =
+            crate::dev_prompt_dump::dump_dir_for_data_dir(&self.params.data_dir, self.params.dump_prompts)
+        else {
+            return;
+        };
+
+        let resolved_context = serde_json::json!({
+            "agent_id": &self.params.metadata.id,
+            "agent_backend": self.params.metadata.backend.as_deref(),
+            "workspace": {
+                "path": &self.params.workspace.path,
+                "is_custom": self.params.workspace.is_custom,
+            },
+            "preset_context": self.params.preset_context.as_deref(),
+            "skills": &self.params.config.skills,
+            "mcp_servers": serde_json::to_value(&self.params.mcp_servers).unwrap_or(Value::Null),
+            "config": serde_json::to_value(&self.params.config).unwrap_or(Value::Null),
+        });
+        let value = build_acp_final_input_dump_value(
+            &self.params.conversation_id,
+            session_id,
+            data,
+            final_content,
+            resolved_context,
+        );
+        let input = value.get("input").cloned().unwrap_or(Value::Null);
+        let resolved_context = value.get("resolved_context").cloned().unwrap_or(Value::Null);
+
+        match crate::dev_prompt_dump::dump_agent_final_input(
+            &dump_dir,
+            crate::dev_prompt_dump::AgentFinalInputDump {
+                kind: "acp-final-input",
+                backend: "acp",
+                conversation_id: &self.params.conversation_id,
+                session_id: Some(session_id),
+                msg_id: Some(data.msg_id.as_str()),
+                turn_id: data.turn_id.as_deref(),
+                input,
+                resolved_context,
+            },
+        ) {
+            Ok(path) => {
+                debug!(
+                    conversation_id = %self.params.conversation_id,
+                    msg_id = %data.msg_id,
+                    path = %path.display(),
+                    "DEV agent final input dump written"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    conversation_id = %self.params.conversation_id,
+                    msg_id = %data.msg_id,
+                    error = %error,
+                    "DEV agent final input dump failed"
+                );
+            }
+        }
     }
 
     /// Pre-open the ACP session without sending a prompt. Called by the
@@ -1292,7 +1342,7 @@ impl AcpAgentManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_status_parts, user_facing_message};
+    use super::{build_acp_final_input_dump_value, exit_status_parts, user_facing_message};
     use crate::agent_runtime::AgentRuntime;
     use crate::error::AgentError;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
@@ -1339,6 +1389,50 @@ mod tests {
         tracing::subscriber::with_default(subscriber, f);
 
         String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn acp_final_input_dump_value_contains_post_hook_prompt_and_context() {
+        let data = crate::types::SendMessageData {
+            content: "original team wake".into(),
+            msg_id: "msg-acp-final".into(),
+            turn_id: Some("turn-acp-final".into()),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+        };
+        let resolved_context = serde_json::json!({
+            "agent_id": "agent-claude",
+            "agent_backend": "claude",
+            "workspace": {
+                "path": "/tmp",
+                "is_custom": true,
+            },
+            "preset_context": "Rule A",
+            "skills": [],
+            "mcp_servers": [],
+        });
+
+        let value = build_acp_final_input_dump_value(
+            "conv-acp-final",
+            "session-acp-final",
+            &data,
+            "[Assistant Rules]\nRule A\n[/Assistant Rules]\n\noriginal team wake",
+            resolved_context,
+        );
+
+        assert_eq!(value["kind"], "acp-final-input");
+        assert_eq!(value["backend"], "acp");
+        assert_eq!(value["conversation_id"], "conv-acp-final");
+        assert_eq!(value["session_id"], "session-acp-final");
+        assert_eq!(value["msg_id"], "msg-acp-final");
+        assert_eq!(value["turn_id"], "turn-acp-final");
+        assert_eq!(
+            value["input"]["content"],
+            "[Assistant Rules]\nRule A\n[/Assistant Rules]\n\noriginal team wake"
+        );
+        assert_eq!(value["resolved_context"]["workspace"]["path"], "/tmp");
+        assert_eq!(value["resolved_context"]["skills"], serde_json::json!([]));
+        assert!(value["resolved_context"]["mcp_servers"].is_array());
     }
 
     #[test]

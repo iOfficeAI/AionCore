@@ -1,9 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
-use aionui_api_types::{
-    TeamMcpPhase, TeamMcpStatusPayload, TeamSendMessageQueuedResponse, TeamSendMessageStatus, WebSocketMessage,
-};
+use aionui_api_types::TeamSendMessageQueuedResponse;
 use aionui_realtime::EventBroadcaster;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,20 +9,20 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{TeamError, classify_public_error};
-use crate::events::TEAM_MCP_STATUS_EVENT;
+use crate::prompt_dump::{TeamPromptDumpConfig, TeamToolsListDump, dump_team_tools_list};
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
-use crate::types::{TeammateRole, TeammateStatus};
-use crate::wake::TeamWakeSource;
+use crate::types::{TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
+use crate::work_source::WorkSource;
 
 use super::protocol::{
     INVALID_PARAMS, INVALID_REQUEST, JsonRpcResponse, METHOD_NOT_FOUND, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION,
     read_request, write_response,
 };
 use super::tools::{
-    RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskUpdateInput,
-    all_tool_descriptors_for_role, handle_team_list_models,
+    RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskListInput,
+    TaskListStatusInput, TaskUpdateInput, all_tool_descriptors_for_role,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,20 +44,28 @@ impl TeamMcpServer {
         broadcaster: Arc<dyn EventBroadcaster>,
         service: Weak<TeamSessionService>,
     ) -> Result<Self, TeamError> {
+        Self::start_with_prompt_dump(
+            auth_token,
+            scheduler,
+            team_id,
+            broadcaster,
+            service,
+            Some(TeamPromptDumpConfig::disabled()),
+        )
+        .await
+    }
+
+    pub async fn start_with_prompt_dump(
+        auth_token: String,
+        scheduler: Arc<TeammateManager>,
+        team_id: String,
+        _broadcaster: Arc<dyn EventBroadcaster>,
+        service: Weak<TeamSessionService>,
+        prompt_dump: Option<TeamPromptDumpConfig>,
+    ) -> Result<Self, TeamError> {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
             Err(e) => {
-                broadcast_mcp_status(
-                    broadcaster.as_ref(),
-                    TeamMcpStatusPayload {
-                        team_id: team_id.clone(),
-                        slot_id: String::new(),
-                        phase: TeamMcpPhase::TcpError,
-                        port: None,
-                        server_count: None,
-                        error: Some(e.to_string()),
-                    },
-                );
                 return Err(TeamError::InvalidRequest(format!("Failed to bind TCP: {e}")));
             }
         };
@@ -67,30 +73,21 @@ impl TeamMcpServer {
             .local_addr()
             .map_err(|e| TeamError::InvalidRequest(format!("Failed to get local addr: {e}")))?;
 
-        broadcast_mcp_status(
-            broadcaster.as_ref(),
-            TeamMcpStatusPayload {
-                team_id: team_id.clone(),
-                slot_id: String::new(),
-                phase: TeamMcpPhase::TcpReady,
-                port: Some(addr.port()),
-                server_count: None,
-                error: None,
-            },
-        );
-
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let token = auth_token.clone();
         let sched_for_tcp = scheduler.clone();
         let service_for_tcp = service.clone();
         let team_id_for_tcp = team_id.clone();
+        let prompt_dump = prompt_dump.unwrap_or_else(TeamPromptDumpConfig::disabled);
+        let prompt_dump_for_tcp = prompt_dump.clone();
         tokio::spawn(accept_loop(
             listener,
             token,
             sched_for_tcp,
             service_for_tcp,
             team_id_for_tcp,
+            prompt_dump_for_tcp,
             shutdown_rx.clone(),
         ));
 
@@ -106,12 +103,14 @@ impl TeamMcpServer {
         let http_sched = scheduler.clone();
         let http_service = service.clone();
         let http_team_id = team_id.clone();
+        let http_prompt_dump = prompt_dump.clone();
         tokio::spawn(http_mcp_loop(
             http_listener,
             http_token,
             http_sched,
             http_service,
             http_team_id,
+            http_prompt_dump,
             shutdown_rx,
         ));
 
@@ -153,14 +152,6 @@ impl Drop for TeamMcpServer {
     }
 }
 
-fn broadcast_mcp_status(broadcaster: &dyn EventBroadcaster, payload: TeamMcpStatusPayload) {
-    let event = WebSocketMessage::new(
-        TEAM_MCP_STATUS_EVENT,
-        serde_json::to_value(payload).expect("serialize mcp status payload"),
-    );
-    broadcaster.broadcast(event);
-}
-
 // ---------------------------------------------------------------------------
 // Accept loop
 // ---------------------------------------------------------------------------
@@ -171,6 +162,7 @@ async fn accept_loop(
     scheduler: Arc<TeammateManager>,
     service: Weak<TeamSessionService>,
     team_id: String,
+    prompt_dump: TeamPromptDumpConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -183,7 +175,8 @@ async fn accept_loop(
                         let sched = Arc::clone(&scheduler);
                         let svc = service.clone();
                         let tid = team_id.clone();
-                        tokio::spawn(handle_connection(stream, token, sched, svc, tid));
+                        let dump = prompt_dump.clone();
+                        tokio::spawn(handle_connection(stream, token, sched, svc, tid, dump));
                     }
                     Err(e) => {
                         error!("Accept error: {e}");
@@ -210,6 +203,7 @@ async fn handle_connection(
     scheduler: Arc<TeammateManager>,
     service: Weak<TeamSessionService>,
     team_id: String,
+    prompt_dump: TeamPromptDumpConfig,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
@@ -250,6 +244,7 @@ async fn handle_connection(
                 &service,
                 &team_id,
                 caller_slot_id.as_deref().unwrap_or("unknown"),
+                &prompt_dump,
             )
             .await
         };
@@ -329,10 +324,11 @@ async fn handle_method(
     service: &Weak<TeamSessionService>,
     team_id: &str,
     caller_slot_id: &str,
+    prompt_dump: &TeamPromptDumpConfig,
 ) -> JsonRpcResponse {
     match request.method.as_str() {
         "notifications/initialized" => JsonRpcResponse::success(request.id, json!({})),
-        "tools/list" => handle_tools_list(request.id, scheduler, caller_slot_id).await,
+        "tools/list" => handle_tools_list(request.id, scheduler, team_id, caller_slot_id, prompt_dump).await,
         "tools/call" => handle_tools_call(request, scheduler, service, team_id, caller_slot_id).await,
         _ => JsonRpcResponse::error(
             request.id,
@@ -350,10 +346,46 @@ async fn caller_role_for_tools_list(scheduler: &TeammateManager, caller_slot_id:
         .unwrap_or(TeammateRole::Teammate)
 }
 
-async fn handle_tools_list(id: Option<u64>, scheduler: &TeammateManager, caller_slot_id: &str) -> JsonRpcResponse {
+async fn handle_tools_list(
+    id: Option<u64>,
+    scheduler: &TeammateManager,
+    team_id: &str,
+    caller_slot_id: &str,
+    prompt_dump: &TeamPromptDumpConfig,
+) -> JsonRpcResponse {
     let caller_role = caller_role_for_tools_list(scheduler, caller_slot_id).await;
     let tools = all_tool_descriptors_for_role(caller_role);
+    let tools_for_dump = tool_descriptors_to_mcp_json(&tools);
+    if let Err(error) = dump_team_tools_list(
+        prompt_dump,
+        TeamToolsListDump {
+            team_id,
+            caller_slot_id,
+            caller_role,
+            tools: &tools_for_dump,
+        },
+    ) {
+        warn!(
+            team_id,
+            caller_slot_id,
+            error = %error,
+            "team tools/list prompt dump failed"
+        );
+    }
     JsonRpcResponse::success(id, json!({ "tools": tools }))
+}
+
+fn tool_descriptors_to_mcp_json(tools: &[super::tools::ToolDescriptor]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|d| {
+            json!({
+                "name": d.name,
+                "description": d.description,
+                "inputSchema": d.input_schema,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -491,14 +523,13 @@ pub(crate) async fn dispatch_tool(
         "team_spawn_agent" => exec_spawn_agent(arguments, service, team_id, caller_slot_id, caller_role).await,
         "team_task_create" => exec_task_create(arguments, scheduler).await,
         "team_task_update" => exec_task_update(arguments, scheduler).await,
-        "team_task_list" => exec_task_list(scheduler).await,
+        "team_task_list" => exec_task_list(arguments, scheduler).await,
         "team_members" => exec_members(scheduler).await,
         "team_rename_agent" => exec_rename_agent(arguments, scheduler, service, team_id).await,
         "team_shutdown_agent" => {
             exec_shutdown_agent(arguments, scheduler, service, team_id, caller_slot_id, caller_role).await
         }
         "team_list_assistants" => exec_list_assistants(arguments, service).await,
-        "team_list_models" => exec_list_models(arguments, service).await,
         "team_describe_assistant" => exec_describe_assistant(arguments, service).await,
         _ => Err(ToolCallError::from_message(format!("Unknown tool: {tool_name}"))),
     }
@@ -516,29 +547,6 @@ async fn exec_list_assistants(args: &Value, service: &Weak<TeamSessionService>) 
         .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
     let assistants = service.list_team_selectable_assistants().await;
     let value = json!({ "assistants": assistants });
-    serde_json::to_string_pretty(&value).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
-}
-
-async fn exec_list_models(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, ToolCallError> {
-    if args.get("backend").is_some() {
-        return Err(ToolCallError::from_message(
-            "backend is no longer accepted; use assistant_id",
-        ));
-    }
-    if args.get("agent_type").is_some() {
-        return Err(ToolCallError::from_message(
-            "agent_type is no longer accepted; use assistant_id",
-        ));
-    }
-    let assistant_id_filter = args.get("assistant_id").and_then(Value::as_str);
-
-    let value = match service.upgrade() {
-        Some(svc) => svc
-            .list_models_from_db(assistant_id_filter)
-            .await
-            .map_err(|error| ToolCallError::from_message(error.to_string()))?,
-        None => handle_team_list_models(args),
-    };
     serde_json::to_string_pretty(&value).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
 }
 
@@ -569,17 +577,23 @@ async fn exec_describe_assistant(args: &Value, service: &Weak<TeamSessionService
 // Individual tool handlers
 // ---------------------------------------------------------------------------
 
-async fn resolve_agent_target(scheduler: &TeammateManager, target: &str) -> Result<String, String> {
+async fn resolve_agent_target(
+    scheduler: &TeammateManager,
+    target: &str,
+    allow_broadcast: bool,
+) -> Result<String, String> {
     let agents = scheduler.list_agents().await;
     if agents.iter().any(|a| a.slot_id == target) {
         return Ok(target.to_owned());
     }
-    let query = target.to_lowercase();
-    let hits: Vec<_> = agents.iter().filter(|a| a.name.to_lowercase() == query).collect();
-    match hits.len() {
-        0 => Err(format!("No agent matches '{target}'")),
-        1 => Ok(hits[0].slot_id.clone()),
-        _ => Err(format!("Multiple agents match '{target}'")),
+    if allow_broadcast {
+        Err(format!(
+            "Invalid agent target '{target}': expected slot_id or \"*\". Call team_members to get slot_id."
+        ))
+    } else {
+        Err(format!(
+            "Invalid agent target '{target}': expected slot_id. Call team_members to get slot_id."
+        ))
     }
 }
 
@@ -625,25 +639,30 @@ async fn exec_send_message(
             .map_err(|e| ToolCallError::from_message(e.to_string()))?;
         if let Some(svc) = service.upgrade()
             && let Err(e) = svc
-                .wake_leader_after_recovery_message(team_id, caller_slot_id, TeamWakeSource::ShutdownRejected)
+                .wake_leader_after_recovery_message(team_id, caller_slot_id, WorkSource::ShutdownRejected)
                 .await
         {
             warn!(
                 team_id,
                 slot_id = %caller_slot_id,
-                wake_source = %TeamWakeSource::ShutdownRejected,
+                wake_source = %WorkSource::ShutdownRejected,
                 error = %e,
                 "failed to apply shutdown_rejected wake policy"
             );
         }
         debug!(from = caller_slot_id, reason, "shutdown_rejected handled");
-        return Ok(format!("shutdown_rejected: {reason}"));
+        return Ok(json!({
+            "status": "ok",
+            "action": "shutdown_rejected",
+            "reason": reason,
+        })
+        .to_string());
     }
 
     let resolved_to = if input.to == "*" {
         "*".to_owned()
     } else {
-        resolve_agent_target(scheduler, &input.to)
+        resolve_agent_target(scheduler, &input.to, true)
             .await
             .map_err(ToolCallError::from_message)?
     };
@@ -684,12 +703,84 @@ fn build_send_message_queued_response(
         .first()
         .ok_or_else(|| "No message targets resolved".to_string())?;
     Ok(TeamSendMessageQueuedResponse {
-        status: TeamSendMessageStatus::Queued,
-        delivery: first.delivery.clone(),
-        reason: first.target.queue_state.clone(),
         team_run_id: first.team_run_id.clone(),
-        targets: target_results.into_iter().map(|result| result.target).collect(),
+        target: first.target.clone(),
     })
+}
+
+fn agent_json(agent: &TeamAgent) -> Value {
+    let status = agent.status.unwrap_or(TeammateStatus::Idle);
+    json!({
+        "slot_id": agent.slot_id,
+        "name": agent.name,
+        "role": agent.role,
+        "status": status,
+        "assistant_id": agent.assistant_id,
+        "model": agent.model,
+    })
+}
+
+fn task_json(task: &TeamTask) -> Value {
+    json!({
+        "task_id": task.id,
+        "subject": task.subject,
+        "status": task.status,
+        "owner": task.owner,
+        "blocked_by": task.blocked_by,
+    })
+}
+
+const MAX_TASK_LIST_LIMIT: usize = 200;
+
+#[derive(Debug)]
+struct TaskListFilters {
+    owner: Option<String>,
+    statuses: Option<Vec<TaskStatus>>,
+    include_deleted: bool,
+    limit: Option<usize>,
+}
+
+fn parse_task_list_filters(args: &Value) -> Result<TaskListFilters, ToolCallError> {
+    let input: TaskListInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let statuses = match input.status {
+        Some(TaskListStatusInput::Single(status)) => Some(vec![parse_task_status_arg(&status)?]),
+        Some(TaskListStatusInput::Many(statuses)) => {
+            if statuses.is_empty() {
+                return Err(ToolCallError::from_message("Invalid params: status must not be empty"));
+            }
+            let parsed = statuses
+                .iter()
+                .map(|status| parse_task_status_arg(status))
+                .collect::<Result<Vec<_>, _>>()?;
+            Some(parsed)
+        }
+        None => None,
+    };
+    let limit = match input.limit {
+        Some(value) if value <= 0 => {
+            return Err(ToolCallError::from_message(
+                "Invalid params: limit must be greater than 0",
+            ));
+        }
+        Some(value) => Some((value as usize).min(MAX_TASK_LIST_LIMIT)),
+        None => None,
+    };
+    Ok(TaskListFilters {
+        owner: input.owner,
+        statuses,
+        include_deleted: input.include_deleted.unwrap_or(true),
+        limit,
+    })
+}
+
+fn parse_task_status_arg(status: &str) -> Result<TaskStatus, ToolCallError> {
+    TaskStatus::parse(status)
+        .ok_or_else(|| ToolCallError::from_message(format!("Invalid params: unsupported task status '{status}'")))
+}
+
+fn json_text(value: &Value) -> Result<String, ToolCallError> {
+    serde_json::to_string_pretty(value).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
 }
 
 async fn exec_spawn_agent(
@@ -716,6 +807,11 @@ async fn exec_spawn_agent(
             "agent_type is no longer accepted; use assistant_id",
         ));
     }
+    if args.get("model").is_some() {
+        return Err(ToolCallError::from_message(
+            "model is no longer accepted; use the assistant configuration or UI model selector",
+        ));
+    }
 
     let input: SpawnAgentInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
@@ -734,7 +830,6 @@ async fn exec_spawn_agent(
     let req = SpawnAgentRequest {
         name: requested_name.clone(),
         assistant_id: Some(assistant_id),
-        model: input.model,
     };
 
     let service = service
@@ -744,7 +839,14 @@ async fn exec_spawn_agent(
     service
         .spawn_agent_in_session(team_id, caller_slot_id, req)
         .await
-        .map(|agent| format!("Agent '{}' spawned (slot_id={})", agent.name, agent.slot_id))
+        .and_then(|agent| {
+            serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "action": "agent_spawned",
+                "agent": agent_json(&agent),
+            }))
+            .map_err(TeamError::Json)
+        })
         .map_err(|e| ToolCallError::from_message(e.to_string()))
 }
 
@@ -752,46 +854,54 @@ async fn exec_task_create(args: &Value, scheduler: &TeammateManager) -> Result<S
     let input: TaskCreateInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
-    let action = crate::scheduler::SchedulerAction::TaskCreate {
-        subject: input.subject.clone(),
-        description: input.description,
-        owner: input.owner,
-        blocked_by: input.blocked_by.unwrap_or_default(),
-    };
-    scheduler
-        .execute_action("system", &action)
+    let task = scheduler
+        .create_task(
+            &input.subject,
+            input.description.as_deref(),
+            input.owner.as_deref(),
+            &input.blocked_by.unwrap_or_default(),
+        )
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
 
-    Ok(format!("Task '{}' created", input.subject))
+    json_text(&json!({ "status": "ok", "task": task_json(&task) }))
 }
 
 async fn exec_task_update(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
     let input: TaskUpdateInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
-    let action = crate::scheduler::SchedulerAction::TaskUpdate {
-        task_id: input.task_id.clone(),
-        status: input.status,
-        description: input.description,
-        owner: input.owner,
-        blocked_by: input.blocked_by,
-    };
-    scheduler
-        .execute_action("system", &action)
+    let task = scheduler
+        .update_task(
+            &input.task_id,
+            input.status.as_deref(),
+            input.description,
+            input.owner,
+            input.blocked_by,
+        )
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
 
-    Ok(format!("Task '{}' updated", input.task_id))
+    json_text(&json!({ "status": "ok", "task": task_json(&task) }))
 }
 
-async fn exec_task_list(scheduler: &TeammateManager) -> Result<String, ToolCallError> {
+async fn exec_task_list(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
+    let filters = parse_task_list_filters(args)?;
     let tasks = scheduler
         .list_tasks()
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
-    let output: Vec<Value> = tasks
+    let mut output: Vec<Value> = tasks
         .iter()
+        .filter(|task| match filters.owner.as_deref() {
+            Some(owner) => task.owner.as_deref() == Some(owner),
+            None => true,
+        })
+        .filter(|task| match filters.statuses.as_ref() {
+            Some(statuses) => statuses.contains(&task.status),
+            None if !filters.include_deleted => task.status != TaskStatus::Deleted,
+            None => true,
+        })
         .map(|t| {
             json!({
                 "id": t.id,
@@ -804,32 +914,19 @@ async fn exec_task_list(scheduler: &TeammateManager) -> Result<String, ToolCallE
             })
         })
         .collect();
+    if let Some(limit) = filters.limit {
+        output.truncate(limit);
+    }
     serde_json::to_string_pretty(&output).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
 }
 
 async fn exec_members(scheduler: &TeammateManager) -> Result<String, ToolCallError> {
-    let agents = scheduler.list_agents().await;
-    let output: Vec<Value> = agents
-        .iter()
-        .map(|a| {
-            // `TeamAgent::status` is `None` for cold-start agents that have not
-            // yet transitioned through `set_status` (e.g. the lead before its
-            // first wake). The scheduler already tracks them as `Idle`
-            // internally (see `TeammateManager::new`), and AionUi's
-            // TeammateManager exposes `'idle'` as the initial value. Mirror
-            // that here so MCP clients never see `null` and misread a live
-            // teammate as offline.
-            let status = a.status.unwrap_or(TeammateStatus::Idle);
-            json!({
-                "slot_id": a.slot_id,
-                "name": a.name,
-                "role": a.role,
-                "status": status,
-                "backend": a.backend,
-                "model": a.model,
-            })
-        })
-        .collect();
+    let mut agents = scheduler.list_agents().await;
+    agents.sort_by_key(|agent| match agent.role {
+        TeammateRole::Lead => 0,
+        TeammateRole::Teammate => 1,
+    });
+    let output: Vec<Value> = agents.iter().map(agent_json).collect();
     serde_json::to_string_pretty(&output).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
 }
 
@@ -842,7 +939,7 @@ async fn exec_rename_agent(
     let input: RenameAgentInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
-    let resolved_slot = resolve_agent_target(scheduler, &input.slot_id)
+    let resolved_slot = resolve_agent_target(scheduler, &input.slot_id, false)
         .await
         .map_err(ToolCallError::from_message)?;
 
@@ -861,7 +958,15 @@ async fn exec_rename_agent(
             .map_err(|e| ToolCallError::from_message(e.to_string()))?;
     }
 
-    Ok(format!("Agent '{}' renamed to '{}'", input.slot_id, input.new_name))
+    let agent = scheduler
+        .get_agent(&resolved_slot)
+        .await
+        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+    json_text(&json!({
+        "status": "ok",
+        "action": "agent_renamed",
+        "agent": agent_json(&agent),
+    }))
 }
 
 async fn exec_shutdown_agent(
@@ -878,18 +983,24 @@ async fn exec_shutdown_agent(
     let input: ShutdownAgentInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
-    let target_slot_id = resolve_agent_target(scheduler, &input.slot_id)
+    let target_slot_id = resolve_agent_target(scheduler, &input.slot_id, false)
         .await
         .map_err(ToolCallError::from_message)?;
     let service = service
         .upgrade()
         .ok_or_else(|| ToolCallError::from_message("Team service not available; cannot wake shutdown target"))?;
+    let reason = input.reason.clone();
     service
         .shutdown_agent_in_session(team_id, caller_slot_id, &target_slot_id, input.reason)
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
 
-    Ok(format!("Shutdown request sent to agent '{}'", target_slot_id))
+    json_text(&json!({
+        "status": "ok",
+        "action": "shutdown_requested",
+        "target_slot_id": target_slot_id,
+        "reason": reason,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -902,6 +1013,7 @@ async fn http_mcp_loop(
     scheduler: Arc<TeammateManager>,
     service: Weak<TeamSessionService>,
     team_id: String,
+    prompt_dump: TeamPromptDumpConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -915,6 +1027,7 @@ async fn http_mcp_loop(
                 let sched = scheduler.clone();
                 let svc = service.clone();
                 let tid = team_id.clone();
+                let dump = prompt_dump.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
                     let n = match stream.read(&mut buf).await {
@@ -973,14 +1086,24 @@ async fn http_mcp_loop(
                             return;
                         }
                         "tools/list" => {
-                            let tools: Vec<Value> = all_tool_descriptors_for_role(caller_role)
-                                .iter()
-                                .map(|d| json!({
-                                    "name": d.name,
-                                    "description": d.description,
-                                    "inputSchema": d.input_schema,
-                                }))
-                                .collect();
+                            let descriptors = all_tool_descriptors_for_role(caller_role);
+                            let tools: Vec<Value> = tool_descriptors_to_mcp_json(&descriptors);
+                            if let Err(error) = dump_team_tools_list(
+                                &dump,
+                                TeamToolsListDump {
+                                    team_id: &tid,
+                                    caller_slot_id,
+                                    caller_role,
+                                    tools: &tools,
+                                },
+                            ) {
+                                warn!(
+                                    team_id = %tid,
+                                    caller_slot_id,
+                                    error = %error,
+                                    "team HTTP tools/list prompt dump failed"
+                                );
+                            }
                             json!({ "tools": tools })
                         }
                         "tools/call" => {
@@ -1061,34 +1184,35 @@ fn http_bearer_token(request: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aionui_api_types::{
-        TeamRunTargetRole, TeamSendMessageDelivery, TeamSendMessageReason, TeamSendMessageTargetQueueState,
-    };
+    use aionui_api_types::{TeamRunTargetRole, TeamSlotWorkPayload, TeamSlotWorkState};
 
     #[test]
     fn build_send_message_queued_response_serializes_json_contract() {
         let response = build_send_message_queued_response(vec![AgentMessageQueueResult {
-            team_run_id: "run-1".into(),
-            delivery: TeamSendMessageDelivery::WakeRecorded,
-            target: TeamSendMessageTargetQueueState {
+            team_run_id: Some("run-1".into()),
+            target: TeamSlotWorkPayload {
                 slot_id: "worker-1".into(),
                 role: TeamRunTargetRole::Teammate,
-                queue_state: TeamSendMessageReason::QueuedForIdle,
-                pending_wake_count: 1,
-                starting_child_count: 0,
+                state: TeamSlotWorkState::Queued,
+                queued_foreground_count: 0,
+                queued_background_count: 1,
                 active_turn_id: None,
-                suppressed_wake_count: 0,
+                active_turn_started_at_ms: None,
+                active_turn_elapsed_ms: None,
+                active_turn_slow: None,
+                active_turn_slow_threshold_ms: None,
+                blocked_reason: None,
+                team_run_id: Some("run-1".into()),
             },
         }])
         .unwrap();
 
         let text = serde_json::to_string(&response).unwrap();
         let payload: serde_json::Value = serde_json::from_str(&text).expect("team_send_message result must be JSON");
-        assert_eq!(payload["status"], "queued");
-        assert_eq!(payload["delivery"], "wake_recorded");
-        assert_eq!(payload["reason"], "queued_for_idle");
-        assert_eq!(payload["targets"][0]["slot_id"], "worker-1");
-        assert_eq!(payload["targets"][0]["queue_state"], "queued_for_idle");
+        assert_eq!(payload["team_run_id"], "run-1");
+        assert_eq!(payload["target"]["slot_id"], "worker-1");
+        assert_eq!(payload["target"]["state"], "queued");
+        assert_eq!(payload["target"]["queued_background_count"], 1);
     }
 
     /// Non-Lead callers are rejected at the dispatch layer with the
@@ -1130,14 +1254,29 @@ mod tests {
         let service: Weak<TeamSessionService> = Weak::new();
         let args = json!({
             "name": "Helper",
-            "assistant_id": "word-creator",
-            "model": "claude-sonnet-4"
+            "assistant_id": "word-creator"
         });
         let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
         let err = result.expect_err("dead Weak<TeamSessionService> must not succeed");
         assert!(
             err.message.contains("Team service not available"),
             "dead service weak must surface the unavailable message, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_spawn_agent_rejects_model_override() {
+        let service: Weak<TeamSessionService> = Weak::new();
+        let args = json!({
+            "name": "Helper",
+            "assistant_id": "word-creator",
+            "model": "claude-sonnet-4"
+        });
+        let result = exec_spawn_agent(&args, &service, "team-1", "lead-1", TeammateRole::Lead).await;
+        let err = result.expect_err("model override must be rejected before service lookup");
+        assert!(
+            err.message.contains("model is no longer accepted"),
+            "expected explicit model rejection, got {err:?}"
         );
     }
 
@@ -1178,32 +1317,6 @@ mod tests {
             "expected assistant_id requirement, got {err:?}"
         );
         assert_eq!(err.domain_code, Some("TEAM_ASSISTANT_ID_REQUIRED"));
-    }
-
-    #[tokio::test]
-    async fn exec_list_models_rejects_legacy_backend_alias() {
-        let service: Weak<TeamSessionService> = Weak::new();
-        let args = json!({ "backend": "claude" });
-        let result = exec_list_models(&args, &service).await;
-        let err = result.expect_err("legacy backend alias must be rejected");
-        assert!(
-            err.message.contains("backend is no longer accepted"),
-            "expected explicit backend rejection, got {err:?}"
-        );
-        assert_eq!(err.domain_code, Some("TEAM_ASSISTANT_FIELD_UNSUPPORTED"));
-    }
-
-    #[tokio::test]
-    async fn exec_list_models_rejects_legacy_agent_type_alias() {
-        let service: Weak<TeamSessionService> = Weak::new();
-        let args = json!({ "agent_type": "claude" });
-        let result = exec_list_models(&args, &service).await;
-        let err = result.expect_err("legacy agent_type alias must be rejected");
-        assert!(
-            err.message.contains("agent_type is no longer accepted"),
-            "expected explicit agent_type rejection, got {err:?}"
-        );
-        assert_eq!(err.domain_code, Some("TEAM_ASSISTANT_FIELD_UNSUPPORTED"));
     }
 
     #[tokio::test]

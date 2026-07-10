@@ -1472,16 +1472,34 @@ impl AssistantService {
     /// Read an assistant rule file, dispatching by source.
     pub async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, AssistantError> {
         match self.classify_source(id).await {
-            AssistantSource::Builtin => {
-                let locale = locale.unwrap_or("");
-                Ok(self
-                    .builtin
-                    .rule_bytes(id, locale)
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .unwrap_or_default())
-            }
+            AssistantSource::Builtin => Ok(self.read_builtin_rule_with_fallback(id, locale)),
             AssistantSource::Generated | AssistantSource::User => Ok(self.read_user_rule_with_fallback(id, locale)),
         }
+    }
+
+    fn read_builtin_rule_with_fallback(&self, id: &str, locale: Option<&str>) -> String {
+        const DEFAULT_LOCALE: &str = "en-US";
+
+        let requested = locale.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(locale) = requested
+            && let Some(content) = self.read_builtin_rule(id, locale)
+        {
+            return content;
+        }
+
+        if requested != Some(DEFAULT_LOCALE)
+            && let Some(content) = self.read_builtin_rule(id, DEFAULT_LOCALE)
+        {
+            return content;
+        }
+
+        String::new()
+    }
+
+    fn read_builtin_rule(&self, id: &str, locale: &str) -> Option<String> {
+        self.builtin
+            .rule_bytes(id, locale)
+            .and_then(|b| String::from_utf8(b).ok())
     }
 
     /// Read a user assistant's rule, falling back to any saved `<id>.*.md` file
@@ -5408,7 +5426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_rule_builtin_dispatches_to_manifest() {
+    async fn read_rule_builtin_dispatches_to_manifest_and_falls_back_to_default_locale() {
         let tmp = TempDir::new().unwrap();
         let db = init_database_memory().await.unwrap();
 
@@ -5457,6 +5475,10 @@ mod tests {
         );
         let content = service.read_rule("builtin-office", Some("en-US")).await.unwrap();
         assert_eq!(content, "office rules");
+        let content_without_locale = service.read_rule("builtin-office", None).await.unwrap();
+        assert_eq!(content_without_locale, "office rules");
+        let content_missing_locale = service.read_rule("builtin-office", Some("zh-CN")).await.unwrap();
+        assert_eq!(content_missing_locale, "office rules");
     }
 
     #[tokio::test]

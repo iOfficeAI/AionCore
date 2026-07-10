@@ -9,8 +9,9 @@ use crate::TeamMcpStdioConfig;
 
 /// Input for a single agent when creating a team or adding an agent.
 ///
-/// Each agent gets its own conversation; the first agent in a create
-/// request becomes the team lead.
+/// Each agent gets its own conversation. Create requests must include exactly
+/// one agent with role `lead` or `leader`; that explicit role becomes the team
+/// lead.
 ///
 #[derive(Debug, Clone)]
 pub struct TeamAgentInput {
@@ -67,7 +68,7 @@ impl<'de> Deserialize<'de> for TeamAgentInput {
 /// Request body for `POST /api/teams`.
 ///
 /// Creates a team with the given name and agent list.
-/// The first agent in the array is designated as the lead.
+/// Exactly one agent with role `lead` or `leader` is designated as the lead.
 #[derive(Debug, Deserialize)]
 pub struct CreateTeamRequest {
     pub name: String,
@@ -287,7 +288,6 @@ pub enum TeamRunStatus {
 #[serde(rename_all = "snake_case")]
 pub enum TeamRunSource {
     UserMessage,
-    RecoveryDrain,
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,48 +312,53 @@ pub struct PauseTeamSlotRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamRunAckResponse {
-    pub team_run_id: String,
-    pub team_id: String,
-    pub source: TeamRunSource,
-    pub has_user_intervention: bool,
-    pub target_slot_id: String,
-    pub target_role: TeamRunTargetRole,
-    pub accepted_slot_id: String,
-    pub accepted_role: TeamRunTargetRole,
-    pub status: TeamRunStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<String>,
+    pub enqueue_status: TeamMessageEnqueueStatus,
+    pub message_id: String,
+    pub run: TeamRunPayload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum TeamSlotRuntimeHealth {
-    Disconnected,
-    Unhealthy,
+pub enum TeamSlotWorkState {
+    Idle,
+    Queued,
+    Starting,
+    Running,
+    Paused,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamSlotBlockedReason {
+    RuntimeStarting,
+    RuntimeFailed,
+    Removing,
+    SessionStopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamMessageEnqueueStatus {
+    Accepted,
+    Queued,
+    BlockedRuntimeStarting,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamSlotWorkPayload {
     pub slot_id: String,
     pub role: TeamRunTargetRole,
-    pub pending_wake_count: usize,
-    pub starting_child_count: usize,
-    #[serde(default)]
-    pub paused: bool,
-    #[serde(default)]
-    pub suppressed_wake_count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: TeamSlotWorkState,
+    pub queued_foreground_count: usize,
+    pub queued_background_count: usize,
     pub active_turn_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_started_at_ms: Option<TimestampMs>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_elapsed_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_slow: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_slow_threshold_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_health: Option<TeamSlotRuntimeHealth>,
+    pub blocked_reason: Option<TeamSlotBlockedReason>,
+    pub team_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -365,16 +370,18 @@ pub struct TeamRunPayload {
     pub target_slot_id: String,
     pub target_role: TeamRunTargetRole,
     pub status: TeamRunStatus,
-    pub active_child_count: usize,
-    pub pending_wake_count: usize,
-    pub starting_child_count: usize,
-    #[serde(default)]
+    pub queued_intent_count: usize,
+    pub starting_batch_count: usize,
+    pub running_batch_count: usize,
+    pub active_enqueue_lease_count: usize,
     pub slot_work: Vec<TeamSlotWorkPayload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamRunStateResponse {
+    pub session_generation: Option<String>,
     pub active_run: Option<TeamRunPayload>,
+    pub slot_work: Vec<TeamSlotWorkPayload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -389,54 +396,9 @@ pub struct TeamChildTurnPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TeamSendMessageStatus {
-    Queued,
-    Rejected,
-    Error,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TeamSendMessageDelivery {
-    WakeRecorded,
-    WakeSuppressed,
-    NotRecorded,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TeamSendMessageReason {
-    QueuedForIdle,
-    BehindStartingTurn,
-    BehindActiveTurn,
-    SuppressedByPause,
-    NoActiveTeamRun,
-    TargetNotFound,
-    TargetDisconnected,
-    TargetUnhealthy,
-    InternalError,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TeamSendMessageTargetQueueState {
-    pub slot_id: String,
-    pub role: TeamRunTargetRole,
-    pub queue_state: TeamSendMessageReason,
-    pub pending_wake_count: usize,
-    pub starting_child_count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_turn_id: Option<String>,
-    pub suppressed_wake_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamSendMessageQueuedResponse {
-    pub status: TeamSendMessageStatus,
-    pub delivery: TeamSendMessageDelivery,
-    pub reason: TeamSendMessageReason,
-    pub team_run_id: String,
-    pub targets: Vec<TeamSendMessageTargetQueueState>,
+    pub team_run_id: Option<String>,
+    pub target: TeamSlotWorkPayload,
 }
 
 // ---------------------------------------------------------------------------
@@ -536,39 +498,61 @@ pub struct TeamAgentRenamedPayload {
     pub name: String,
 }
 
-/// Lifecycle phases of the per-team MCP stdio bridge + ACP session.
-///
-/// Emitted by the MCP supervisor whenever a teammate slot transitions
-/// through its bring-up / degraded / ready states so the frontend can
-/// surface actionable status for each agent.
+/// Runtime attach/warmup status for a team agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum TeamMcpPhase {
-    TcpReady,
-    TcpError,
-    SessionInjecting,
-    SessionReady,
-    SessionError,
-    LoadFailed,
-    Degraded,
-    ConfigWriteFailed,
-    McpToolsWaiting,
-    McpToolsReady,
+pub enum TeamAgentRuntimeStatus {
+    Pending,
+    Ready,
+    Failed,
 }
 
-/// Payload for `team.mcpStatus` WebSocket event.
+/// Payload for `team.agentRuntimeStatusChanged` WebSocket event.
 ///
-/// Pushed whenever a teammate's MCP bridge or ACP session transitions to
-/// a new [`TeamMcpPhase`]. Optional fields carry phase-specific detail:
-/// `port` for TCP bring-up, `server_count` for tool readiness, `error`
-/// for failure phases.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TeamMcpStatusPayload {
+/// Pushed when a team member's runtime attach/warmup lifecycle changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamAgentRuntimeStatusPayload {
     pub team_id: String,
     pub slot_id: String,
-    pub phase: TeamMcpPhase,
+    pub conversation_id: String,
+    pub status: TeamAgentRuntimeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
+    pub error: Option<String>,
+}
+
+/// Team-level session availability status for `team.sessionStatusChanged`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamSessionStatus {
+    Starting,
+    Ready,
+    Failed,
+}
+
+/// Diagnostic phase for team session startup.
+///
+/// Frontend gating must use [`TeamSessionStatus`]. This phase identifies
+/// which ensure-session step is currently running or failed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamSessionPhase {
+    LoadingTeam,
+    StartingBridge,
+    AttachingAgents,
+    Recovering,
+}
+
+/// Payload for `team.sessionStatusChanged` WebSocket event.
+///
+/// Pushed when the whole team session moves through startup, ready, or
+/// failed states. Member runtime details are reported separately through
+/// `team.agentRuntimeStatusChanged`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamSessionStatusPayload {
+    pub team_id: String,
+    pub status: TeamSessionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<TeamSessionPhase>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1249,101 +1233,69 @@ mod tests {
         assert_eq!(team.created_at, 1000);
     }
 
-    // -- F. TeamMcpPhase serde roundtrip --------------------------------------
+    // -- F. TeamSessionStatus / TeamSessionPhase serde roundtrip -----------------
 
-    fn assert_phase_roundtrip(phase: TeamMcpPhase, wire: &str) {
+    fn assert_session_status_roundtrip(status: TeamSessionStatus, wire: &str) {
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json, serde_json::Value::String(wire.into()));
+        let parsed: TeamSessionStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, status);
+    }
+
+    fn assert_session_phase_roundtrip(phase: TeamSessionPhase, wire: &str) {
         let json = serde_json::to_value(&phase).unwrap();
         assert_eq!(json, serde_json::Value::String(wire.into()));
-        let parsed: TeamMcpPhase = serde_json::from_value(json).unwrap();
+        let parsed: TeamSessionPhase = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, phase);
     }
 
     #[test]
-    fn team_mcp_phase_tcp_ready_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::TcpReady, "tcp_ready");
+    fn team_session_status_roundtrips() {
+        assert_session_status_roundtrip(TeamSessionStatus::Starting, "starting");
+        assert_session_status_roundtrip(TeamSessionStatus::Ready, "ready");
+        assert_session_status_roundtrip(TeamSessionStatus::Failed, "failed");
     }
 
     #[test]
-    fn team_mcp_phase_tcp_error_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::TcpError, "tcp_error");
+    fn team_session_phase_roundtrips() {
+        assert_session_phase_roundtrip(TeamSessionPhase::LoadingTeam, "loading_team");
+        assert_session_phase_roundtrip(TeamSessionPhase::StartingBridge, "starting_bridge");
+        assert_session_phase_roundtrip(TeamSessionPhase::AttachingAgents, "attaching_agents");
+        assert_session_phase_roundtrip(TeamSessionPhase::Recovering, "recovering");
     }
 
-    #[test]
-    fn team_mcp_phase_session_injecting_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::SessionInjecting, "session_injecting");
-    }
+    // -- G. TeamSessionStatusPayload & TeammateMessagePayload --------------------
 
     #[test]
-    fn team_mcp_phase_session_ready_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::SessionReady, "session_ready");
-    }
-
-    #[test]
-    fn team_mcp_phase_session_error_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::SessionError, "session_error");
-    }
-
-    #[test]
-    fn team_mcp_phase_load_failed_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::LoadFailed, "load_failed");
-    }
-
-    #[test]
-    fn team_mcp_phase_degraded_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::Degraded, "degraded");
-    }
-
-    #[test]
-    fn team_mcp_phase_config_write_failed_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::ConfigWriteFailed, "config_write_failed");
-    }
-
-    #[test]
-    fn team_mcp_phase_mcp_tools_waiting_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::McpToolsWaiting, "mcp_tools_waiting");
-    }
-
-    #[test]
-    fn team_mcp_phase_mcp_tools_ready_roundtrip() {
-        assert_phase_roundtrip(TeamMcpPhase::McpToolsReady, "mcp_tools_ready");
-    }
-
-    // -- G. TeamMcpStatusPayload & TeammateMessagePayload ---------------------
-
-    #[test]
-    fn serialize_team_mcp_status_payload_all_fields_present() {
-        let payload = TeamMcpStatusPayload {
+    fn serialize_team_session_status_payload_all_fields_present() {
+        let payload = TeamSessionStatusPayload {
             team_id: "team-1".into(),
-            slot_id: "slot-2".into(),
-            phase: TeamMcpPhase::SessionReady,
-            port: Some(54321),
+            status: TeamSessionStatus::Ready,
+            phase: Some(TeamSessionPhase::Recovering),
             server_count: Some(7),
             error: Some("boom".into()),
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["team_id"], "team-1");
-        assert_eq!(json["slot_id"], "slot-2");
-        assert_eq!(json["phase"], "session_ready");
-        assert_eq!(json["port"], 54321);
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["phase"], "recovering");
         assert_eq!(json["server_count"], 7);
         assert_eq!(json["error"], "boom");
     }
 
     #[test]
-    fn serialize_team_mcp_status_payload_optional_fields_omitted() {
-        let payload = TeamMcpStatusPayload {
+    fn serialize_team_session_status_payload_optional_fields_omitted() {
+        let payload = TeamSessionStatusPayload {
             team_id: "team-1".into(),
-            slot_id: "slot-2".into(),
-            phase: TeamMcpPhase::TcpReady,
-            port: None,
+            status: TeamSessionStatus::Starting,
+            phase: None,
             server_count: None,
             error: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["team_id"], "team-1");
-        assert_eq!(json["slot_id"], "slot-2");
-        assert_eq!(json["phase"], "tcp_ready");
-        assert!(json.get("port").is_none());
+        assert_eq!(json["status"], "starting");
+        assert!(json.get("phase").is_none());
         assert!(json.get("server_count").is_none());
         assert!(json.get("error").is_none());
     }
@@ -1363,328 +1315,130 @@ mod tests {
         assert_eq!(json["from_name"], "Lead");
     }
 
-    #[test]
-    fn team_run_ack_serializes_snake_case_enums() {
-        let ack = TeamRunAckResponse {
-            team_run_id: "trun-1".into(),
-            team_id: "team-1".into(),
-            source: TeamRunSource::UserMessage,
-            has_user_intervention: true,
-            target_slot_id: "lead-1".into(),
-            target_role: TeamRunTargetRole::Lead,
-            accepted_slot_id: "lead-1".into(),
-            accepted_role: TeamRunTargetRole::Lead,
-            status: TeamRunStatus::Accepted,
-            message_id: Some("msg-1".into()),
-        };
-
-        let value = serde_json::to_value(&ack).unwrap();
-        assert_eq!(value["target_role"], "lead");
-        assert_eq!(value["status"], "accepted");
-        assert_eq!(value["message_id"], "msg-1");
-    }
-
-    #[test]
-    fn team_run_ack_distinguishes_initial_target_from_accepted_slot() {
-        let ack = TeamRunAckResponse {
-            team_run_id: "trun-1".into(),
-            team_id: "team-1".into(),
-            source: TeamRunSource::UserMessage,
-            has_user_intervention: true,
-            target_slot_id: "lead-1".into(),
-            target_role: TeamRunTargetRole::Lead,
-            accepted_slot_id: "worker-1".into(),
-            accepted_role: TeamRunTargetRole::Teammate,
-            status: TeamRunStatus::Accepted,
-            message_id: Some("msg-1".into()),
-        };
-
-        let value = serde_json::to_value(&ack).unwrap();
-        assert_eq!(value["target_slot_id"], "lead-1");
-        assert_eq!(value["target_role"], "lead");
-        assert_eq!(value["accepted_slot_id"], "worker-1");
-        assert_eq!(value["accepted_role"], "teammate");
-    }
-
-    #[test]
-    fn team_run_source_serializes_snake_case() {
-        let user = serde_json::to_value(TeamRunSource::UserMessage).unwrap();
-        let recovery = serde_json::to_value(TeamRunSource::RecoveryDrain).unwrap();
-
-        assert_eq!(user, serde_json::json!("user_message"));
-        assert_eq!(recovery, serde_json::json!("recovery_drain"));
-    }
-
-    #[test]
-    fn team_run_payload_serializes_source_metadata() {
-        let payload = TeamRunPayload {
-            team_id: "team-1".into(),
-            team_run_id: "run-1".into(),
-            source: TeamRunSource::RecoveryDrain,
-            has_user_intervention: false,
-            target_slot_id: "lead-1".into(),
-            target_role: TeamRunTargetRole::Lead,
-            status: TeamRunStatus::Accepted,
-            active_child_count: 0,
-            pending_wake_count: 1,
-            starting_child_count: 0,
-            slot_work: vec![],
-        };
-
-        let json = serde_json::to_value(payload).unwrap();
-        assert_eq!(json["source"], "recovery_drain");
-        assert_eq!(json["has_user_intervention"], false);
-    }
-
-    #[test]
-    fn team_run_ack_serializes_source_metadata() {
-        let ack = TeamRunAckResponse {
-            team_run_id: "run-1".into(),
-            team_id: "team-1".into(),
-            source: TeamRunSource::UserMessage,
-            has_user_intervention: true,
-            target_slot_id: "lead-1".into(),
-            target_role: TeamRunTargetRole::Lead,
-            accepted_slot_id: "lead-1".into(),
-            accepted_role: TeamRunTargetRole::Lead,
-            status: TeamRunStatus::Accepted,
-            message_id: Some("mailbox-1".into()),
-        };
-
-        let json = serde_json::to_value(ack).unwrap();
-        assert_eq!(json["source"], "user_message");
-        assert_eq!(json["has_user_intervention"], true);
-        assert_eq!(json["message_id"], "mailbox-1");
+    fn active_slot_work() -> TeamSlotWorkPayload {
+        TeamSlotWorkPayload {
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            state: TeamSlotWorkState::Running,
+            queued_foreground_count: 2,
+            queued_background_count: 1,
+            active_turn_id: Some("turn-1".into()),
+            active_turn_started_at_ms: Some(10),
+            active_turn_elapsed_ms: Some(25),
+            active_turn_slow: Some(false),
+            active_turn_slow_threshold_ms: Some(600_000),
+            blocked_reason: None,
+            team_run_id: Some("run-1".into()),
+        }
     }
 
     fn active_run_payload() -> TeamRunPayload {
         TeamRunPayload {
-            team_id: "team-1".to_owned(),
-            team_run_id: "run-1".to_owned(),
-            source: TeamRunSource::UserMessage,
-            has_user_intervention: true,
-            target_slot_id: "lead".to_owned(),
-            target_role: TeamRunTargetRole::Lead,
-            status: TeamRunStatus::Running,
-            active_child_count: 1,
-            pending_wake_count: 0,
-            starting_child_count: 0,
-            slot_work: vec![TeamSlotWorkPayload {
-                slot_id: "lead".to_owned(),
-                role: TeamRunTargetRole::Lead,
-                pending_wake_count: 0,
-                starting_child_count: 0,
-                paused: false,
-                suppressed_wake_count: 0,
-                active_turn_id: Some("turn-1".to_owned()),
-                active_turn_started_at_ms: Some(10),
-                active_turn_elapsed_ms: Some(20),
-                active_turn_slow: Some(false),
-                active_turn_slow_threshold_ms: Some(600_000),
-                runtime_health: None,
-            }],
-        }
-    }
-
-    #[test]
-    fn team_run_state_response_serializes_null_active_run() {
-        let value = serde_json::to_value(TeamRunStateResponse { active_run: None }).unwrap();
-        assert_eq!(value, serde_json::json!({ "active_run": null }));
-    }
-
-    #[test]
-    fn team_run_state_response_serializes_some_active_run() {
-        let payload = active_run_payload();
-        let value = serde_json::to_value(TeamRunStateResponse {
-            active_run: Some(payload.clone()),
-        })
-        .unwrap();
-
-        assert_eq!(value["active_run"]["team_id"], payload.team_id);
-        assert_eq!(value["active_run"]["team_run_id"], payload.team_run_id);
-        assert_eq!(value["active_run"]["source"], "user_message");
-        assert_eq!(value["active_run"]["has_user_intervention"], true);
-        assert_eq!(value["active_run"]["status"], "running");
-        assert_eq!(value["active_run"]["slot_work"][0]["slot_id"], "lead");
-    }
-
-    #[test]
-    fn team_run_payload_omits_sensitive_content() {
-        let payload = TeamRunPayload {
             team_id: "team-1".into(),
-            team_run_id: "trun-1".into(),
-            source: TeamRunSource::UserMessage,
-            has_user_intervention: true,
-            target_slot_id: "worker-1".into(),
-            target_role: TeamRunTargetRole::Teammate,
-            status: TeamRunStatus::Running,
-            active_child_count: 1,
-            pending_wake_count: 0,
-            starting_child_count: 2,
-            slot_work: Vec::new(),
-        };
-
-        let value = serde_json::to_value(&payload).unwrap();
-        assert_eq!(value["starting_child_count"], 2);
-        assert!(value.get("content").is_none());
-        assert!(value.get("prompt").is_none());
-        assert!(value.get("tool_input").is_none());
-    }
-
-    #[test]
-    fn team_run_payload_includes_defaulted_slot_work() {
-        let payload = TeamRunPayload {
-            team_id: "team-1".into(),
-            team_run_id: "trun-1".into(),
+            team_run_id: "run-1".into(),
             source: TeamRunSource::UserMessage,
             has_user_intervention: true,
             target_slot_id: "lead-1".into(),
             target_role: TeamRunTargetRole::Lead,
             status: TeamRunStatus::Running,
-            active_child_count: 1,
-            pending_wake_count: 2,
-            starting_child_count: 1,
-            slot_work: vec![
-                TeamSlotWorkPayload {
-                    slot_id: "lead-1".into(),
-                    role: TeamRunTargetRole::Lead,
-                    pending_wake_count: 1,
-                    starting_child_count: 0,
-                    paused: false,
-                    suppressed_wake_count: 0,
-                    active_turn_id: Some("turn-lead".into()),
-                    active_turn_started_at_ms: None,
-                    active_turn_elapsed_ms: None,
-                    active_turn_slow: None,
-                    active_turn_slow_threshold_ms: None,
-                    runtime_health: None,
-                },
-                TeamSlotWorkPayload {
-                    slot_id: "worker-1".into(),
-                    role: TeamRunTargetRole::Teammate,
-                    pending_wake_count: 1,
-                    starting_child_count: 1,
-                    paused: false,
-                    suppressed_wake_count: 0,
-                    active_turn_id: None,
-                    active_turn_started_at_ms: None,
-                    active_turn_elapsed_ms: None,
-                    active_turn_slow: None,
-                    active_turn_slow_threshold_ms: None,
-                    runtime_health: None,
-                },
-            ],
+            queued_intent_count: 2,
+            starting_batch_count: 0,
+            running_batch_count: 1,
+            active_enqueue_lease_count: 0,
+            slot_work: vec![active_slot_work()],
+        }
+    }
+
+    #[test]
+    fn team_run_source_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(TeamRunSource::UserMessage).unwrap(),
+            serde_json::json!("user_message")
+        );
+    }
+
+    #[test]
+    fn team_slot_work_payload_serializes_authoritative_coordinator_state() {
+        assert_eq!(
+            serde_json::to_value(active_slot_work()).unwrap(),
+            serde_json::json!({
+                "slot_id": "lead-1",
+                "role": "lead",
+                "state": "running",
+                "queued_foreground_count": 2,
+                "queued_background_count": 1,
+                "active_turn_id": "turn-1",
+                "active_turn_started_at_ms": 10,
+                "active_turn_elapsed_ms": 25,
+                "active_turn_slow": false,
+                "active_turn_slow_threshold_ms": 600000,
+                "blocked_reason": null,
+                "team_run_id": "run-1"
+            })
+        );
+    }
+
+    #[test]
+    fn team_run_payload_serializes_authoritative_work_counts() {
+        let value = serde_json::to_value(active_run_payload()).unwrap();
+        assert_eq!(value["queued_intent_count"], 2);
+        assert_eq!(value["running_batch_count"], 1);
+        assert_eq!(value["slot_work"][0]["state"], "running");
+        assert!(value.get("content").is_none());
+    }
+
+    #[test]
+    fn team_run_ack_embeds_the_complete_run_snapshot() {
+        let ack = TeamRunAckResponse {
+            enqueue_status: TeamMessageEnqueueStatus::Queued,
+            message_id: "message-1".into(),
+            run: active_run_payload(),
         };
 
-        let value = serde_json::to_value(&payload).unwrap();
-        assert_eq!(value["slot_work"][0]["slot_id"], "lead-1");
-        assert_eq!(value["slot_work"][0]["active_turn_id"], "turn-lead");
-        assert_eq!(value["slot_work"][1]["starting_child_count"], 1);
+        let value = serde_json::to_value(ack).unwrap();
+        assert_eq!(value["enqueue_status"], "queued");
+        assert_eq!(value["message_id"], "message-1");
+        assert_eq!(value["run"]["team_run_id"], "run-1");
+        assert_eq!(value["run"]["slot_work"][0]["active_turn_id"], "turn-1");
+    }
 
-        let decoded: TeamRunPayload = serde_json::from_value(serde_json::json!({
-            "team_id": "team-1",
-            "team_run_id": "trun-1",
-            "source": "user_message",
-            "has_user_intervention": true,
-            "target_slot_id": "lead-1",
-            "target_role": "lead",
-            "status": "running",
-            "active_child_count": 0,
-            "pending_wake_count": 0,
-            "starting_child_count": 0
-        }))
+    #[test]
+    fn team_run_state_response_keeps_global_slot_work_without_active_run() {
+        let value = serde_json::to_value(TeamRunStateResponse {
+            session_generation: Some("generation-1".into()),
+            active_run: None,
+            slot_work: vec![active_slot_work()],
+        })
         .unwrap();
-        assert!(decoded.slot_work.is_empty());
+
+        assert_eq!(value["session_generation"], "generation-1");
+        assert!(value["active_run"].is_null());
+        assert_eq!(value["slot_work"][0]["slot_id"], "lead-1");
     }
 
     #[test]
-    fn team_slot_work_payload_includes_only_retained_pause_fields_when_non_default() {
-        let payload = TeamSlotWorkPayload {
-            slot_id: "lead-1".into(),
-            role: TeamRunTargetRole::Lead,
-            pending_wake_count: 0,
-            starting_child_count: 0,
-            active_turn_id: None,
-            paused: true,
-            suppressed_wake_count: 2,
-            active_turn_started_at_ms: None,
-            active_turn_elapsed_ms: None,
-            active_turn_slow: None,
-            active_turn_slow_threshold_ms: None,
-            runtime_health: None,
-        };
-
-        let value = serde_json::to_value(&payload).unwrap();
-        assert_eq!(value["paused"], true);
-        assert_eq!(value["suppressed_wake_count"], 2);
-        assert!(value.get(format!("{}_pending_count", "foreground")).is_none());
-        assert!(value.get(format!("{}_pending_count", "background")).is_none());
+    fn team_slot_work_block_reasons_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_value(TeamSlotBlockedReason::RuntimeStarting).unwrap(),
+            serde_json::json!("runtime_starting")
+        );
+        assert_eq!(
+            serde_json::to_value(TeamSlotBlockedReason::SessionStopped).unwrap(),
+            serde_json::json!("session_stopped")
+        );
     }
 
     #[test]
-    fn team_slot_work_payload_serializes_active_turn_slow_fields() {
-        let payload = TeamSlotWorkPayload {
-            slot_id: "worker-1".into(),
-            role: TeamRunTargetRole::Teammate,
-            pending_wake_count: 0,
-            starting_child_count: 0,
-            paused: false,
-            suppressed_wake_count: 0,
-            active_turn_id: Some("turn-worker".into()),
-            active_turn_started_at_ms: Some(1_000),
-            active_turn_elapsed_ms: Some(600_001),
-            active_turn_slow: Some(true),
-            active_turn_slow_threshold_ms: Some(600_000),
-            runtime_health: Some(TeamSlotRuntimeHealth::Unhealthy),
-        };
-
-        let value = serde_json::to_value(payload).unwrap();
-
-        assert_eq!(value["active_turn_started_at_ms"], 1_000);
-        assert_eq!(value["active_turn_elapsed_ms"], 600_001);
-        assert_eq!(value["active_turn_slow"], true);
-        assert_eq!(value["active_turn_slow_threshold_ms"], 600_000);
-        assert_eq!(value["runtime_health"], "unhealthy");
-    }
-
-    #[test]
-    fn team_send_message_queued_response_serializes_stable_contract() {
+    fn team_send_message_queued_response_serializes_authoritative_target() {
         let response = TeamSendMessageQueuedResponse {
-            status: TeamSendMessageStatus::Queued,
-            delivery: TeamSendMessageDelivery::WakeRecorded,
-            reason: TeamSendMessageReason::BehindActiveTurn,
-            team_run_id: "run-1".into(),
-            targets: vec![TeamSendMessageTargetQueueState {
-                slot_id: "worker-1".into(),
-                role: TeamRunTargetRole::Teammate,
-                queue_state: TeamSendMessageReason::BehindActiveTurn,
-                pending_wake_count: 1,
-                starting_child_count: 0,
-                active_turn_id: Some("turn-worker".into()),
-                suppressed_wake_count: 0,
-            }],
+            team_run_id: Some("run-1".into()),
+            target: active_slot_work(),
         };
-
         let value = serde_json::to_value(response).unwrap();
 
-        assert_eq!(value["status"], "queued");
-        assert_eq!(value["delivery"], "wake_recorded");
-        assert_eq!(value["reason"], "behind_active_turn");
-        assert_eq!(value["targets"][0]["queue_state"], "behind_active_turn");
-    }
-
-    #[test]
-    fn team_slot_work_payload_defaults_pause_fields_for_old_payloads() {
-        let decoded: TeamSlotWorkPayload = serde_json::from_value(serde_json::json!({
-            "slot_id": "worker-1",
-            "role": "teammate",
-            "pending_wake_count": 0,
-            "starting_child_count": 0
-        }))
-        .unwrap();
-
-        assert!(!decoded.paused);
-        assert_eq!(decoded.suppressed_wake_count, 0);
+        assert_eq!(value["team_run_id"], "run-1");
+        assert_eq!(value["target"]["state"], "running");
+        assert_eq!(value["target"]["queued_foreground_count"], 2);
     }
 
     #[test]
