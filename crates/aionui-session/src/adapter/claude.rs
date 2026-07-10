@@ -125,11 +125,23 @@ pub(crate) fn claude_permission_modes() -> Vec<ModeInfo> {
     // supportsAutoMode, which the direct CLI never reports). Order and copy match the
     // bridge's buildAvailableModes verbatim for the remaining five.
     [
-        ("default", "Default", "Standard behavior, prompts for dangerous operations"),
+        (
+            "default",
+            "Default",
+            "Standard behavior, prompts for dangerous operations",
+        ),
         ("acceptEdits", "Accept Edits", "Auto-accept file edit operations"),
         ("plan", "Plan Mode", "Planning mode, no actual tool execution"),
-        ("dontAsk", "Don't Ask", "Don't prompt for permissions, deny if not pre-approved"),
-        ("bypassPermissions", "Bypass Permissions", "Bypass all permission checks"),
+        (
+            "dontAsk",
+            "Don't Ask",
+            "Don't prompt for permissions, deny if not pre-approved",
+        ),
+        (
+            "bypassPermissions",
+            "Bypass Permissions",
+            "Bypass all permission checks",
+        ),
     ]
     .into_iter()
     .map(|(id, name, description)| ModeInfo {

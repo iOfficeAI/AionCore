@@ -22,9 +22,9 @@ use tokio::sync::broadcast;
 
 use crate::agent_task::IAgentTask;
 use crate::error::AgentError;
+use crate::protocol::events::session_updates::AvailableCommandsEventData;
 use crate::protocol::events::session_updates::ThinkingEventData;
 use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
-use crate::protocol::events::session_updates::AvailableCommandsEventData;
 use crate::protocol::events::{
     AgentStreamEvent, FinishEventData, StartEventData, TextEventData, TipType, TipsEventData,
 };
@@ -1609,7 +1609,9 @@ fn spawn_event_pump(
                         .collect();
                     let _ = runtime
                         .tx
-                        .send(AgentStreamEvent::AvailableCommands(AvailableCommandsEventData { commands }));
+                        .send(AgentStreamEvent::AvailableCommands(AvailableCommandsEventData {
+                            commands,
+                        }));
                 }
                 continue;
             }
@@ -3289,10 +3291,17 @@ mod persist_tests {
             .iter()
             .find(|o| o.category.as_deref() == Some("thought_level"))
             .expect("effort axis must be surfaced as a thought_level config option");
-        assert_eq!(effort.id, "reasoning_effort", "canonical id the frontend fallback matches");
+        assert_eq!(
+            effort.id, "reasoning_effort",
+            "canonical id the frontend fallback matches"
+        );
         assert_eq!(effort.option_type, "select");
         let values: Vec<&str> = effort.options.iter().map(|o| o.value.as_str()).collect();
-        assert_eq!(values, vec!["low", "medium", "high", "max"], "the current model's advertised efforts");
+        assert_eq!(
+            values,
+            vec!["low", "medium", "high", "max"],
+            "the current model's advertised efforts"
+        );
     }
 
     // A model with no advertised efforts (claude `haiku`) must NOT get an effort option —
@@ -3331,7 +3340,10 @@ mod persist_tests {
         let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
         let snapshot = task.get_config_options().await.unwrap();
         assert!(
-            snapshot.config_options.iter().all(|o| o.category.as_deref() != Some("thought_level")),
+            snapshot
+                .config_options
+                .iter()
+                .all(|o| o.category.as_deref() != Some("thought_level")),
             "a model with no advertised efforts must not surface an (empty) effort option"
         );
     }
@@ -3355,7 +3367,11 @@ mod persist_tests {
             .as_ref()
             .and_then(|opts| opts.iter().find(|o| o.category.as_deref() == Some("thought_level")))
             .expect("effort option in the observed snapshot");
-        assert_eq!(effort.current_value.as_deref(), Some("high"), "the requested level is highlighted");
+        assert_eq!(
+            effort.current_value.as_deref(),
+            Some("high"),
+            "the requested level is highlighted"
+        );
     }
 
     // ── Defect 2: dead-resume-anchor self-heal ────────────────────────────

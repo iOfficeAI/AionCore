@@ -132,8 +132,9 @@ impl BackendConnection for CodexConnection {
         // not live-verified). Resume therefore keeps only the normalized persisted value.
         let normalized_config_mode = config.mode.as_deref().map(codex_perm::profile_id_to_legacy_value);
         backend.capabilities.current_mode = match &spec {
-            SessionSpec::Fresh { .. } => normalized_config_mode
-                .or_else(|| Some(codex_perm::profile_id_to_legacy_value(":workspace"))),
+            SessionSpec::Fresh { .. } => {
+                normalized_config_mode.or_else(|| Some(codex_perm::profile_id_to_legacy_value(":workspace")))
+            }
             SessionSpec::Resume { .. } => normalized_config_mode,
         };
 
@@ -303,9 +304,13 @@ async fn reconcile_codex_mode(backend: &CodexSessionBackend, requested: String) 
     // (`auto` for the workspace tier); the wire/validation axis speaks colon ids. Normalize
     // each catalog id back to its colon profile id so both sides of the `contains` check
     // below are colon-shaped (a custom profile is already colon → normalize is a no-op).
-    let catalog: Vec<String> =
-        await_codex_catalog(backend, |d| d.modes.iter().map(|m| codex_perm::normalize_to_profile_id(&m.id)).collect())
-            .await;
+    let catalog: Vec<String> = await_codex_catalog(backend, |d| {
+        d.modes
+            .iter()
+            .map(|m| codex_perm::normalize_to_profile_id(&m.id))
+            .collect()
+    })
+    .await;
 
     if catalog.is_empty() {
         tracing::warn!(
@@ -2885,7 +2890,10 @@ impl SessionBackend for CodexSessionBackend {
                 // Register the rpc id so the reader claims the response: a JSON-RPC
                 // error (codex rejected the profile) surfaces as a Notice instead of
                 // being dropped (success converges via thread/settings/updated).
-                self.pending_set.lock().await.insert(id, format!("mode\u{2192}{profile_id}"));
+                self.pending_set
+                    .lock()
+                    .await
+                    .insert(id, format!("mode\u{2192}{profile_id}"));
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
                     "params": {
@@ -5028,7 +5036,12 @@ mod tests {
             .await
             .expect_err("a non-effort config option must reject");
         assert!(
-            matches!(err, BackendError::CommandNotSupported { command: "set_config_option" }),
+            matches!(
+                err,
+                BackendError::CommandNotSupported {
+                    command: "set_config_option"
+                }
+            ),
             "got: {err:?}"
         );
     }
@@ -5731,7 +5744,8 @@ mod tests {
         let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"openai.gpt-5.5","displayName":"GPT-5.5"}],"nextCursor":null}}"#;
         // codex's modes come from permissionProfile/list (colon ids on the wire); the
         // built-in `:workspace` tier surfaces to the frontend as the legacy bare token `auto`.
-        let perm_resp = r#"{"jsonrpc":"2.0","id":51,"result":{"data":[{"id":":workspace","description":null}],"nextCursor":null}}"#;
+        let perm_resp =
+            r#"{"jsonrpc":"2.0","id":51,"result":{"data":[{"id":":workspace","description":null}],"nextCursor":null}}"#;
         let bytes = format!("{model_resp}\n{perm_resp}\n").into_bytes();
         let fake = FakeAgentIo::never_exits(bytes);
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
@@ -5745,14 +5759,16 @@ mod tests {
         // second, refining, snapshot) — or time out.
         let mut saw_both = false;
         for _ in 0..80 {
-            if let Ok(Some(env)) =
-                tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await
+            if let Ok(Some(env)) = tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await
                 && let SessionEvent::CatalogUpdated { models, modes, .. } = env.event
                 && !models.is_empty()
                 && !modes.is_empty()
             {
                 assert_eq!(models[0].id, "openai.gpt-5.5");
-                assert_eq!(modes[0].id, "auto", ":workspace surfaces as the legacy bare token `auto`");
+                assert_eq!(
+                    modes[0].id, "auto",
+                    ":workspace surfaces as the legacy bare token `auto`"
+                );
                 saw_both = true;
                 break;
             }
@@ -5811,7 +5827,11 @@ mod tests {
             "built-in tiers map to legacy bare tokens; custom keeps its colon id, in discovery order"
         );
         // The custom profile's own name/description are carried through (codex sent them).
-        let custom = d.modes.iter().find(|m| m.id == ":team-review").expect("custom profile present");
+        let custom = d
+            .modes
+            .iter()
+            .find(|m| m.id == ":team-review")
+            .expect("custom profile present");
         assert_eq!(custom.name, "Team Review", "custom profile display name carried");
         assert_eq!(custom.description.as_deref(), Some("Custom profile"));
         // A name-less built-in profile gets the friendly display copied from the legacy ACP
@@ -5819,10 +5839,15 @@ mod tests {
         // display table is keyed on the colon wire id, so the lookup still resolves after the
         // catalog id was mapped to its bare token.
         let workspace = d.modes.iter().find(|m| m.id == "auto").unwrap();
-        assert_eq!(workspace.name, "Default", "built-in workspace tier gets the legacy friendly name");
+        assert_eq!(
+            workspace.name, "Default",
+            "built-in workspace tier gets the legacy friendly name"
+        );
         assert_eq!(
             workspace.description.as_deref(),
-            Some("Codex can read and edit files in the current workspace, and run commands. Approval is required to access the internet or edit other files. (Identical to Agent mode)"),
+            Some(
+                "Codex can read and edit files in the current workspace, and run commands. Approval is required to access the internet or edit other files. (Identical to Agent mode)"
+            ),
             "built-in workspace tier gets the legacy friendly description"
         );
         let read_only = d.modes.iter().find(|m| m.id == "read-only").unwrap();
@@ -5854,7 +5879,13 @@ mod tests {
         }
         // A colon-prefixed id (discovered built-in OR user custom profile) passes through
         // verbatim — codex, not AionCore, owns the value set (legacy-ACP parity).
-        for id in [":workspace", ":danger-full-access", ":read-only", ":my-custom", ":team-review"] {
+        for id in [
+            ":workspace",
+            ":danger-full-access",
+            ":read-only",
+            ":my-custom",
+            ":team-review",
+        ] {
             assert_eq!(codex_perm::normalize_to_profile_id(id), id);
         }
         // Whitespace around a colon id is trimmed, not treated as a bare value.
@@ -5870,10 +5901,7 @@ mod tests {
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let perm_result: Value = serde_json::from_str(r#"{"data":[],"nextCursor":null}"#).unwrap();
         fill_discovery(DiscoveryKind::Permissions, &perm_result, &discovered);
-        assert!(
-            discovered.lock().unwrap().modes.is_empty(),
-            "empty data[] → no modes"
-        );
+        assert!(discovered.lock().unwrap().modes.is_empty(), "empty data[] → no modes");
     }
 
     /// UT-3: a `permissionProfile/list` RESPONSE broadcasts a `CatalogUpdated` whose
@@ -6014,7 +6042,11 @@ mod tests {
         let fake = FakeAgentIo::never_exits(bytes);
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-mode-rec", Box::new(fake)).await;
-        backend.pending_discovery.lock().await.insert(60, DiscoveryKind::Permissions);
+        backend
+            .pending_discovery
+            .lock()
+            .await
+            .insert(60, DiscoveryKind::Permissions);
         let _events = backend.events();
         for _ in 0..40 {
             let filled = !backend
@@ -6074,12 +6106,17 @@ mod tests {
     async fn codex_mode_reconcile_drops_tier_absent_from_partial_catalog() {
         // Build a backend whose catalog has ONLY the default tier.
         let started = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-mode"}}}"#;
-        let perm_resp = r#"{"jsonrpc":"2.0","id":61,"result":{"data":[{"id":":workspace","description":null}],"nextCursor":null}}"#;
+        let perm_resp =
+            r#"{"jsonrpc":"2.0","id":61,"result":{"data":[{"id":":workspace","description":null}],"nextCursor":null}}"#;
         let bytes = format!("{started}\n{perm_resp}\n").into_bytes();
         let fake = FakeAgentIo::never_exits(bytes);
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-mode-partial", Box::new(fake)).await;
-        backend.pending_discovery.lock().await.insert(61, DiscoveryKind::Permissions);
+        backend
+            .pending_discovery
+            .lock()
+            .await
+            .insert(61, DiscoveryKind::Permissions);
         let _events = backend.events();
         for _ in 0..40 {
             let filled = !backend
