@@ -1709,14 +1709,25 @@ fn sniff_control_initialize(
                 .iter()
                 .filter_map(|m| {
                     let id = m.get("value").and_then(Value::as_str)?.to_string();
+                    let mut reasoning_efforts: Vec<String> = m
+                        .get("supportedEffortLevels")
+                        .and_then(Value::as_array)
+                        .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                        .unwrap_or_default();
+                    // Surface the synthetic `ultracode` level (xhigh + standing dynamic
+                    // workflow orchestration) — the CLI's own effort-picker entry — but
+                    // only for xhigh-capable models, mirroring the CLI gate. It rides the
+                    // same picker + `effort_is_supported` path as real levels; only the
+                    // dispatch wire differs (see `ULTRACODE_LEVEL`).
+                    if reasoning_efforts.iter().any(|e| e == XHIGH_LEVEL)
+                        && !reasoning_efforts.iter().any(|e| e == ULTRACODE_LEVEL)
+                    {
+                        reasoning_efforts.push(ULTRACODE_LEVEL.to_string());
+                    }
                     Some(ModelInfo {
                         name: m.get("displayName").and_then(Value::as_str).unwrap_or(&id).to_string(),
                         description: m.get("description").and_then(Value::as_str).map(str::to_string),
-                        reasoning_efforts: m
-                            .get("supportedEffortLevels")
-                            .and_then(Value::as_array)
-                            .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                            .unwrap_or_default(),
+                        reasoning_efforts,
                         id,
                     })
                 })
@@ -1877,6 +1888,23 @@ fn sniff_set_config_reject(
 /// different, so we disambiguate on the id we minted).
 const QSI_USAGE_PREFIX: &str = "ctl-qsi-usage-";
 const QSI_COST_PREFIX: &str = "ctl-qsi-cost-";
+
+/// The synthetic reasoning-effort level that mirrors the claude CLI's own interactive
+/// effort-picker entry `"ultracode (xhigh + dynamic workflow orchestration; this session
+/// only)"`. It is NOT a model-advertised `supportedEffortLevels` value — `fill_discovery`
+/// injects it into a model's `reasoning_efforts` (so it surfaces in the picker and passes
+/// `effort_is_supported`) ONLY when that model advertises `xhigh`, matching the CLI's gate
+/// (`ultracode` requires an xhigh-capable model + dynamic workflows). On dispatch it does
+/// NOT ride the `effortLevel` field: it is sent as the dedicated boolean
+/// `apply_flag_settings{settings:{ultracode:true}}` — LIVE-PROBED 2.1.206
+/// (samples/claude-cli/2.1.206/ultracode_wire.result.md): the flag returns
+/// control_response{success} and `get_settings.applied` reads back `{effort:"xhigh",
+/// ultracode:true}`, whereas sending `effortLevel:"ultracode"` would be rejected by our
+/// own `effort_is_supported` gate since it is absent from `supportedEffortLevels`.
+const ULTRACODE_LEVEL: &str = "ultracode";
+/// The base effort level `ultracode` extends (and which the CLI auto-forces when the flag
+/// is set). Used to gate ultracode injection to xhigh-capable models.
+const XHIGH_LEVEL: &str = "xhigh";
 
 /// Sniff the success control_response to a `QuerySessionInfo` (G): claude answers
 /// `control_request{get_context_usage}` with `response.response.{totalTokens,
@@ -2355,10 +2383,19 @@ impl SessionBackend for ClaudeSessionBackend {
                             "effort level '{value}' is not supported by the current model"
                         )));
                     }
+                    // `ultracode` is not an `effortLevel` value; it is the dedicated
+                    // boolean flag `settings.ultracode` (which the CLI auto-forces to
+                    // xhigh). Every other level rides `effortLevel`. LIVE-PROBED 2.1.206
+                    // (samples/claude-cli/2.1.206/ultracode_wire.result.md).
+                    let settings = if value == ULTRACODE_LEVEL {
+                        serde_json::json!({ "ultracode": true })
+                    } else {
+                        serde_json::json!({ "effortLevel": value })
+                    };
                     let request_id = self
                         .write_or_queue_control(serde_json::json!({
                             "subtype": "apply_flag_settings",
-                            "settings": { "effortLevel": value },
+                            "settings": settings,
                         }))
                         .await?;
                     // #99: register the minted ctl-id so the reader surfaces a REJECTION
@@ -4108,6 +4145,104 @@ mod tests {
             "a valid effort reaches the wire, got: {written}"
         );
         assert_eq!(backend.capabilities().current_effort.as_deref(), Some("high"));
+    }
+
+    /// `ultracode` is surfaced as an effort level for xhigh-capable models (mirroring the
+    /// CLI's own picker entry) but dispatches the DEDICATED boolean flag
+    /// `apply_flag_settings{settings:{ultracode:true}}` — NOT `effortLevel:"ultracode"`
+    /// (which our own `effort_is_supported` gate would reject since it is absent from
+    /// `supportedEffortLevels`). Wire LIVE-PROBED 2.1.206
+    /// (samples/claude-cli/2.1.206/ultracode_wire.result.md).
+    #[tokio::test]
+    async fn set_config_option_ultracode_writes_boolean_flag() {
+        // Catalog: a model advertising xhigh → fill_discovery injects "ultracode".
+        let init_resp = r#"{"type":"control_response","response":{"subtype":"success","request_id":"ctl-1","response":{"models":[{"value":"default","displayName":"Default","supportedEffortLevels":["low","medium","high","xhigh"]}]}}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{init_resp}\n").into_bytes());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+        let _events = backend.events();
+        for _ in 0..40 {
+            if !backend.capabilities().available_models.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // The synthetic level is advertised (so the picker shows it AND the gate passes).
+        assert!(
+            backend
+                .capabilities()
+                .available_models
+                .iter()
+                .any(|m| m.reasoning_efforts.iter().any(|e| e == "ultracode")),
+            "ultracode must be injected into an xhigh-capable model's efforts"
+        );
+
+        backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "reasoning_effort".into(),
+                value: "ultracode".into(),
+            })
+            .await
+            .expect("ultracode SetConfigOption accepted");
+
+        let written = {
+            let mut s = String::new();
+            for _ in 0..40 {
+                s = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+                if s.contains("apply_flag_settings") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            s
+        };
+        assert!(
+            written.contains(r#""subtype":"apply_flag_settings""#) && written.contains(r#""ultracode":true"#),
+            "ultracode → apply_flag_settings{{ultracode:true}} on the wire, got: {written}"
+        );
+        assert!(
+            !written.contains(r#""effortLevel":"ultracode""#),
+            "ultracode must NOT ride the effortLevel field, got: {written}"
+        );
+        assert_eq!(
+            backend.capabilities().current_effort.as_deref(),
+            Some("ultracode"),
+            "the backend remembers ultracode for the picker highlight"
+        );
+    }
+
+    /// `ultracode` is injected ONLY for xhigh-capable models — a model that tops out at
+    /// `high` must NOT gain the synthetic level (matches the CLI gate: ultracode requires
+    /// xhigh). Guards against offering a level the model can never engage.
+    #[tokio::test]
+    async fn ultracode_not_injected_for_non_xhigh_model() {
+        let init_resp = r#"{"type":"control_response","response":{"subtype":"success","request_id":"ctl-1","response":{"models":[{"value":"default","displayName":"Default","supportedEffortLevels":["low","medium","high"]}]}}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{init_resp}\n").into_bytes());
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+        let _events = backend.events();
+        for _ in 0..40 {
+            if !backend.capabilities().available_models.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            backend
+                .capabilities()
+                .available_models
+                .iter()
+                .all(|m| m.reasoning_efforts.iter().all(|e| e != "ultracode")),
+            "a non-xhigh model must not advertise ultracode"
+        );
+        // And the gate rejects it (not in this model's catalog).
+        let err = backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "reasoning_effort".into(),
+                value: "ultracode".into(),
+            })
+            .await
+            .expect_err("ultracode not offered by a non-xhigh model → rejected");
+        assert!(matches!(err, BackendError::Transport(msg) if msg.contains("not supported")));
     }
 
     /// Mode read/advertise parity: claude advertises its permission modes in
