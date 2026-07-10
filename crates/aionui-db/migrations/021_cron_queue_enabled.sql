@@ -1,0 +1,1 @@
+ALTER TABLE cron_jobs ADD COLUMN queue_enabled INTEGER NOT NULL DEFAULT 0;
