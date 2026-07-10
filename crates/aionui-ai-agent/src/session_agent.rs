@@ -24,6 +24,7 @@ use crate::agent_task::IAgentTask;
 use crate::error::AgentError;
 use crate::protocol::events::session_updates::ThinkingEventData;
 use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+use crate::protocol::events::session_updates::AvailableCommandsEventData;
 use crate::protocol::events::{
     AgentStreamEvent, FinishEventData, StartEventData, TextEventData, TipType, TipsEventData,
 };
@@ -1508,7 +1509,7 @@ fn spawn_event_pump(
             if let SessionEvent::CatalogUpdated {
                 models,
                 modes,
-                slash_commands: _,
+                slash_commands,
             } = &env.event
             {
                 let mut config_options: Vec<aionui_api_types::AcpConfigOptionDto> = Vec::new();
@@ -1587,6 +1588,28 @@ fn spawn_event_pump(
                     && let Ok(v) = serde_json::to_value(serde_json::json!({ "config_options": config_options }))
                 {
                     let _ = runtime.tx.send(AgentStreamEvent::AcpConfigOption(v));
+                }
+                // Slash-command catalog. claude advertises its command list in the
+                // async `initialize` response — the same late-catalog timing that
+                // strands the model/mode picker — and the frontend's mount-time REST
+                // read (`fetchAcpSlashCommands`) returns empty before it lands. The
+                // legacy ACP path recovers via a live `AvailableCommands` push
+                // (translate.rs `AvailableCommandsUpdate` arm); this is its direct-CLI
+                // analogue, so the `/` menu fills once discovery completes instead of
+                // staying empty until a manual refetch.
+                if !slash_commands.is_empty() {
+                    let commands = slash_commands
+                        .iter()
+                        .map(|c| {
+                            agent_client_protocol::schema::AvailableCommand::new(
+                                c.name.clone(),
+                                c.description.clone().unwrap_or_default(),
+                            )
+                        })
+                        .collect();
+                    let _ = runtime
+                        .tx
+                        .send(AgentStreamEvent::AvailableCommands(AvailableCommandsEventData { commands }));
                 }
                 continue;
             }
@@ -3660,6 +3683,75 @@ mod pump_tests {
             model_values,
             vec!["default", "opus"],
             "the parsed model ids ride the frame"
+        );
+    }
+
+    // The FIX (async slash-command arrival push): claude advertises its command
+    // list in the same late `initialize` response that carries the model/mode
+    // catalog. The frontend's mount-time REST read returns empty before that
+    // lands, and the legacy ACP path recovers via a live `AvailableCommands`
+    // push — so the direct-CLI pump MUST emit one too, or the `/` menu stays
+    // empty until a manual refetch. A CatalogUpdated carrying slash_commands
+    // projects to an AvailableCommands frame whose commands carry name+description.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_updated_projects_available_commands_frame() {
+        use aionui_session::SlashCommandInfo;
+        let script = vec![env(SessionEvent::CatalogUpdated {
+            models: Vec::new(),
+            modes: Vec::new(),
+            slash_commands: vec![
+                SlashCommandInfo {
+                    name: "compact".into(),
+                    description: Some("Compact the conversation".into()),
+                },
+                SlashCommandInfo {
+                    name: "clear".into(),
+                    description: None,
+                },
+            ],
+        })];
+        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(script));
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        let frames = drain(&task).await;
+        let commands = frames
+            .iter()
+            .find_map(|f| match f {
+                AgentStreamEvent::AvailableCommands(data) => Some(&data.commands),
+                _ => None,
+            })
+            .expect("CatalogUpdated with slash_commands must project to an AvailableCommands frame");
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["compact", "clear"], "both commands ride the frame");
+        assert_eq!(
+            commands[0].description, "Compact the conversation",
+            "description carries through"
+        );
+        assert_eq!(commands[1].description, "", "missing description becomes empty string");
+    }
+
+    // A CatalogUpdated with NO slash commands must not emit a spurious empty
+    // AvailableCommands frame (which would clobber a REST-loaded menu).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_updated_without_slash_commands_emits_no_available_commands() {
+        use aionui_session::ModelInfo;
+        let script = vec![env(SessionEvent::CatalogUpdated {
+            models: vec![ModelInfo {
+                id: "opus".into(),
+                name: "Opus".into(),
+                description: None,
+                reasoning_efforts: Vec::new(),
+            }],
+            modes: Vec::new(),
+            slash_commands: Vec::new(),
+        })];
+        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(script));
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        let frames = drain(&task).await;
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, AgentStreamEvent::AvailableCommands(_))),
+            "empty slash_commands must not emit an AvailableCommands frame"
         );
     }
 
