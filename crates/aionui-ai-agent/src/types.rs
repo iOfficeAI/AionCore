@@ -117,8 +117,8 @@ pub struct AionrsResolvedConfig {
     pub base_url: Option<String>,
     /// System prompt override.
     pub system_prompt: Option<String>,
-    /// Max tokens per response.
-    pub max_tokens: u32,
+    /// Optional max tokens per response.
+    pub max_tokens: Option<u32>,
     /// Max agentic turns.
     pub max_turns: Option<usize>,
     /// Max repeated malformed tool-call turns before stopping.
@@ -341,7 +341,7 @@ mod tests {
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert!(extra.system_prompt.is_none());
         assert!(extra.preset_rules.is_none());
-        assert_eq!(extra.max_tokens, 8192);
+        assert_eq!(extra.max_tokens, None);
         assert!(extra.max_turns.is_none());
         assert!(extra.max_tool_call_malformed_turns.is_none());
         assert!(extra.max_tool_call_failure_turns.is_none());
@@ -358,7 +358,7 @@ mod tests {
         });
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert_eq!(extra.system_prompt.unwrap(), "You are a helpful assistant.");
-        assert_eq!(extra.max_tokens, 4096);
+        assert_eq!(extra.max_tokens, Some(4096));
         assert_eq!(extra.max_turns.unwrap(), 10);
         assert_eq!(extra.max_tool_call_malformed_turns.unwrap(), 2);
         assert_eq!(extra.max_tool_call_failure_turns.unwrap(), 3);

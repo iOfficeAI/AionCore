@@ -590,7 +590,7 @@ mod tests {
             args: vec![
                 "x".into(),
                 "--bun".into(),
-                "@agentclientprotocol/claude-agent-acp@0.39.0".into(),
+                "@agentclientprotocol/claude-agent-acp@0.58.1".into(),
             ],
             env: vec![],
             native_skills_dirs: Some(vec![".claude/skills".into()]),

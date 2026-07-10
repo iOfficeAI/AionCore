@@ -167,6 +167,29 @@ async fn fetch_models_openai_compatible_success() {
 }
 
 #[tokio::test]
+async fn fetch_models_persisted_multi_key_uses_first_key_in_authorization_header() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("Authorization", "Bearer first-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "gpt-4o"}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "openai", &mock_server.uri(), "first-key\nsecond-key").await;
+
+    let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": false}));
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["models"][0], "gpt-4o");
+}
+
+#[tokio::test]
 async fn fetch_models_openai_remote_error() {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -439,6 +462,35 @@ async fn fetch_models_anonymous_returns_models_for_valid_input() {
     let models = json["data"]["models"].as_array().unwrap();
     assert_eq!(models.len(), 2);
     assert_eq!(models[0], "gpt-4o");
+}
+
+#[tokio::test]
+async fn fetch_models_anonymous_multi_key_uses_first_key_in_authorization_header() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("Authorization", "Bearer first-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "gpt-4o"}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let (router, _db) = setup().await;
+    let req = post_request(
+        "/api/providers/fetch-models",
+        json!({
+            "platform": "openai",
+            "base_url": mock_server.uri(),
+            "api_key": "first-key\nsecond-key",
+            "try_fix": false
+        }),
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["models"][0], "gpt-4o");
 }
 
 #[tokio::test]

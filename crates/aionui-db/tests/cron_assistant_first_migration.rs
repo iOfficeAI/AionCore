@@ -323,6 +323,46 @@ async fn migration_019_deletes_retired_runtime_client_preferences_only() {
     );
 }
 
+#[tokio::test]
+async fn migration_020_clears_legacy_codex_acp_bridge_without_fixed_id() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    run_migrations_through(&pool, 19).await;
+
+    sqlx::query(
+        "INSERT INTO agent_metadata (
+             id, name, backend, command, args, agent_type, enabled, agent_source,
+             agent_source_info, sort_order, created_at, updated_at
+         ) VALUES (
+             'custom-codex-id', 'Codex CLI', 'codex', 'npx',
+             '[\"-y\",\"@zed-industries/codex-acp@0.14.0\"]',
+             'acp', 1, 'builtin', '{\"binary_name\":\"codex\",\"bridge_binary\":\"npx\"}',
+             3110, 1, 1
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    run_migration(&pool, 20).await;
+
+    let row = sqlx::query(
+        "SELECT command, args, json_extract(agent_source_info, '$.bridge_binary') AS bridge_binary
+         FROM agent_metadata
+         WHERE id = 'custom-codex-id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.get::<Option<String>, _>("command").is_none());
+    assert_eq!(row.get::<String, _>("args"), "[]");
+    assert!(row.get::<Option<String>, _>("bridge_binary").is_none());
+}
+
 async fn insert_legacy_cron(
     pool: &sqlx::SqlitePool,
     id: &str,

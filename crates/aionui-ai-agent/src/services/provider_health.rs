@@ -20,6 +20,7 @@ use crate::factory::aionrs::{map_aionrs_provider, resolve_aionrs_url_and_compat,
 use crate::types::AionrsResolvedConfig;
 
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const HEALTH_CHECK_MAX_TOKENS: u32 = 16;
 const HEALTH_CHECK_PROMPT: &str = "Reply with exactly OK.";
 const HEALTH_CHECK_MSG_ID: &str = "provider-health-check";
 
@@ -80,7 +81,7 @@ impl ProviderHealthCheckService {
             model: model_id.to_owned(),
             base_url,
             system_prompt: Some("You are a provider health probe. Reply with exactly OK and do not use tools.".into()),
-            max_tokens: 16,
+            max_tokens: Some(HEALTH_CHECK_MAX_TOKENS),
             max_turns: Some(1),
             max_tool_call_malformed_turns: Some(1),
             max_tool_call_failure_turns: Some(1),
@@ -195,13 +196,15 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
         api_key: Some(config_extra.api_key),
         base_url: config_extra.base_url,
         model: Some(config_extra.model),
-        max_tokens: Some(config_extra.max_tokens),
+        max_tokens: config_extra.max_tokens,
         max_turns: config_extra.max_turns,
         max_tool_call_malformed_turns: config_extra.max_tool_call_malformed_turns,
         max_tool_call_failure_turns: config_extra.max_tool_call_failure_turns,
         system_prompt: config_extra.system_prompt,
         profile: None,
         auto_approve: false,
+        thinking: None,
+        thinking_budget: None,
         project_dir: Some(PathBuf::from(&workspace)),
     };
     let mut config =
@@ -311,6 +314,74 @@ pub(crate) fn extract_http_status(message: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_common::encrypt_string;
+    use aionui_db::{CreateProviderParams, DbError, UpdateProviderParams};
+
+    const TEST_KEY: [u8; 32] = [0xAB; 32];
+
+    struct UnusedProviderRepository;
+
+    #[async_trait::async_trait]
+    impl IProviderRepository for UnusedProviderRepository {
+        async fn list(&self) -> Result<Vec<Provider>, DbError> {
+            unreachable!("provider repo is not used by resolve_probe_config")
+        }
+
+        async fn find_by_id(&self, _id: &str) -> Result<Option<Provider>, DbError> {
+            unreachable!("provider repo is not used by resolve_probe_config")
+        }
+
+        async fn create(&self, _params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
+            unreachable!("provider repo is not used by resolve_probe_config")
+        }
+
+        async fn update(&self, _id: &str, _params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+            unreachable!("provider repo is not used by resolve_probe_config")
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+            unreachable!("provider repo is not used by resolve_probe_config")
+        }
+    }
+
+    fn test_service() -> ProviderHealthCheckService {
+        ProviderHealthCheckService {
+            provider_repo: Arc::new(UnusedProviderRepository),
+            encryption_key: TEST_KEY,
+            data_dir: PathBuf::from("/tmp/aioncore-provider-health-test"),
+        }
+    }
+
+    fn test_provider() -> Provider {
+        Provider {
+            id: "provider-1".to_owned(),
+            platform: "anthropic".to_owned(),
+            name: "Test Anthropic".to_owned(),
+            base_url: "https://api.anthropic.com".to_owned(),
+            api_key_encrypted: encrypt_string("sk-test", &TEST_KEY).unwrap(),
+            models: r#"["claude-sonnet-4-20250514"]"#.to_owned(),
+            enabled: true,
+            capabilities: "[]".to_owned(),
+            context_limit: None,
+            model_protocols: None,
+            model_enabled: None,
+            model_health: None,
+            bedrock_config: None,
+            is_full_url: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn resolve_probe_config_keeps_health_check_token_cap() {
+        let config = test_service()
+            .resolve_probe_config(&test_provider(), "claude-sonnet-4-20250514")
+            .unwrap();
+
+        assert_eq!(config.max_tokens, Some(HEALTH_CHECK_MAX_TOKENS));
+        assert_eq!(config.max_turns, Some(1));
+    }
 
     #[test]
     fn classify_error_detects_quota_message() {

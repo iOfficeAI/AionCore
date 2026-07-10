@@ -653,17 +653,7 @@ fn validate_platform_binary(
     spec: PlatformSpec,
 ) -> Result<(), ManagedAcpToolError> {
     let expected = match tool {
-        ManagedAcpToolId::CodexAcp => {
-            let mut path = project_dir
-                .join("node_modules")
-                .join(format!("@zed-industries/codex-acp-{}", spec.manifest_key))
-                .join("bin")
-                .join("codex-acp");
-            if spec.manifest_key.starts_with("win32-") {
-                path.set_extension("exe");
-            }
-            path
-        }
+        ManagedAcpToolId::CodexAcp => codex_platform_binary_path(project_dir, spec)?,
         ManagedAcpToolId::ClaudeAgentAcp => {
             let mut path = project_dir
                 .join("node_modules")
@@ -685,6 +675,35 @@ fn validate_platform_binary(
             expected.display()
         )))
     }
+}
+
+fn codex_platform_binary_path(project_dir: &Path, spec: PlatformSpec) -> Result<PathBuf, ManagedAcpToolError> {
+    let vendor_triple = match spec.manifest_key {
+        "darwin-arm64" => "aarch64-apple-darwin",
+        "darwin-x64" => "x86_64-apple-darwin",
+        "linux-arm64" => "aarch64-unknown-linux-musl",
+        "linux-x64" => "x86_64-unknown-linux-musl",
+        "win32-arm64" => "aarch64-pc-windows-msvc",
+        "win32-x64" => "x86_64-pc-windows-msvc",
+        _ => {
+            return Err(ManagedAcpToolError::invalid(format!(
+                "unsupported Codex ACP platform {}",
+                spec.manifest_key
+            )));
+        }
+    };
+
+    let mut path = project_dir
+        .join("node_modules")
+        .join(format!("@openai/codex-{}", spec.manifest_key))
+        .join("vendor")
+        .join(vendor_triple)
+        .join("bin")
+        .join("codex");
+    if spec.manifest_key.starts_with("win32-") {
+        path.set_extension("exe");
+    }
+    Ok(path)
 }
 
 async fn validate_dependency_tree(
@@ -812,20 +831,32 @@ fn resolve_package_smoke_target(
     project_dir: &Path,
     package_json: &InstalledPackageJson,
 ) -> Result<PackageSmokeTarget, ManagedAcpToolError> {
-    if let Some(entry) = resolve_package_import_entry(&package_json.exports, package_json.main.as_deref()) {
+    if let Some(entry) = resolve_package_exports_import_entry(&package_json.exports) {
         return Ok(PackageSmokeTarget::Import(
             package_root(project_dir, &package_json.name).join(entry),
         ));
     }
 
-    let bin_entry = resolve_package_bin_entry(package_json.name.as_str(), &package_json.bin)?;
-    Ok(PackageSmokeTarget::SyntaxCheck(
-        package_root(project_dir, &package_json.name).join(bin_entry),
-    ))
+    if let Ok(bin_entry) = resolve_package_bin_entry(package_json.name.as_str(), &package_json.bin) {
+        return Ok(PackageSmokeTarget::SyntaxCheck(
+            package_root(project_dir, &package_json.name).join(bin_entry),
+        ));
+    }
+
+    if let Some(entry) = package_json.main.as_deref().filter(|value| !value.is_empty()) {
+        return Ok(PackageSmokeTarget::Import(
+            package_root(project_dir, &package_json.name).join(entry),
+        ));
+    }
+
+    Err(ManagedAcpToolError::invalid(format!(
+        "package {} does not expose a usable smoke-test entry",
+        package_json.name
+    )))
 }
 
-fn resolve_package_import_entry(exports_field: &serde_json::Value, main_field: Option<&str>) -> Option<String> {
-    let exports_entry = match exports_field {
+fn resolve_package_exports_import_entry(exports_field: &serde_json::Value) -> Option<String> {
+    match exports_field {
         serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
         serde_json::Value::Object(entries) => entries.get(".").and_then(|root| match root {
             serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
@@ -844,9 +875,7 @@ fn resolve_package_import_entry(exports_field: &serde_json::Value, main_field: O
             _ => None,
         }),
         _ => None,
-    };
-
-    exports_entry.or_else(|| main_field.and_then(|value| if value.is_empty() { None } else { Some(value.to_owned()) }))
+    }
 }
 
 fn normalize_slashes(path: &Path) -> String {
@@ -1074,15 +1103,15 @@ mod tests {
 
         let entrypoint = root
             .join("node_modules")
-            .join("@zed-industries")
+            .join("@agentclientprotocol")
             .join("codex-acp")
-            .join("bin")
-            .join("codex-acp.js");
+            .join("dist")
+            .join("index.js");
         std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
         std::fs::write(&entrypoint, "console.log('codex bridge');\n").unwrap();
         std::fs::write(
             root.join("manifest.json"),
-            br#"{"entrypoint":"node_modules/@zed-industries/codex-acp/bin/codex-acp.js","path_entries":["node_modules/.bin"]}"#,
+            br#"{"entrypoint":"node_modules/@agentclientprotocol/codex-acp/dist/index.js","path_entries":["node_modules/.bin"]}"#,
         )
         .unwrap();
 
@@ -1212,15 +1241,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_package_smoke_target_falls_back_to_bin_check_for_cli_only_package() {
+    fn resolve_package_smoke_target_prefers_bin_check_for_cli_package_with_main() {
         let tmp = tempfile::tempdir().unwrap();
         let project_dir = tmp.path();
         let package_json = InstalledPackageJson {
-            name: "@zed-industries/codex-acp".into(),
+            name: "@agentclientprotocol/codex-acp".into(),
             bin: json!({
-                "codex-acp": "bin/codex-acp.js",
+                "codex-acp": "dist/index.js",
             }),
-            main: None,
+            main: Some("dist/index.js".into()),
             exports: serde_json::Value::Null,
         };
 
@@ -1231,10 +1260,10 @@ mod tests {
             PackageSmokeTarget::SyntaxCheck(
                 project_dir
                     .join("node_modules")
-                    .join("@zed-industries")
+                    .join("@agentclientprotocol")
                     .join("codex-acp")
-                    .join("bin")
-                    .join("codex-acp.js")
+                    .join("dist")
+                    .join("index.js")
             )
         );
     }
@@ -1242,8 +1271,8 @@ mod tests {
     #[test]
     fn package_path_segments_preserve_scoped_package_structure() {
         assert_eq!(
-            package_path_segments("@zed-industries/codex-acp"),
-            vec!["@zed-industries", "codex-acp"]
+            package_path_segments("@agentclientprotocol/codex-acp"),
+            vec!["@agentclientprotocol", "codex-acp"]
         );
     }
 
