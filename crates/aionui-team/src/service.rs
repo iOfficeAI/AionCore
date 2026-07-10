@@ -1444,6 +1444,25 @@ impl TeamSessionService {
             .and_then(|entry| std::ptr::eq(entry.session.as_ref(), expected).then(|| Arc::clone(&entry.session)))
     }
 
+    /// Run a synchronous side effect only while `expected` is still the
+    /// published session. Keeping the map guard alive through `action`
+    /// serializes the effect with session removal/replacement.
+    pub(crate) fn with_published_session<R>(
+        &self,
+        expected: &TeamSession,
+        action: impl FnOnce(&TeamSession) -> R,
+    ) -> Option<R> {
+        let entry = self.sessions.get(expected.team_id())?;
+        std::ptr::eq(entry.session.as_ref(), expected).then(|| action(&entry.session))
+    }
+
+    pub(crate) fn publish_member_runtime_ready_if_current(&self, expected: &TeamSession, agent: &TeamAgent) -> bool {
+        self.with_published_session(expected, |_| {
+            self.broadcast_agent_runtime_status(expected.team_id(), agent, TeamAgentRuntimeStatus::Ready, None);
+        })
+        .is_some()
+    }
+
     pub async fn get_run_state(&self, user_id: &str, team_id: &str) -> Result<TeamRunStateResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
@@ -2226,6 +2245,35 @@ mod tests {
             .complete_member_runtime_reconciliation(&created.id, "user-test", old, Vec::new())
             .await;
         assert!(matches!(result, Err(crate::TeamError::SessionNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn replaced_session_cannot_publish_dynamic_runtime_ready() {
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Runtime ready generation fence"))
+            .await
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let old = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        let agent = old.scheduler().list_agents().await.remove(0);
+
+        svc.stop_session("user-test", &created.id).await.unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let ready_before = broadcaster
+            .events_by_name("team.agentRuntimeStatusChanged")
+            .into_iter()
+            .filter(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready"))
+            .count();
+
+        assert!(!svc.publish_member_runtime_ready_if_current(&old, &agent));
+        let ready_after = broadcaster
+            .events_by_name("team.agentRuntimeStatusChanged")
+            .into_iter()
+            .filter(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready"))
+            .count();
+        assert_eq!(ready_after, ready_before, "old generations must not publish Ready");
     }
 
     #[tokio::test]

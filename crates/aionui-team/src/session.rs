@@ -1752,18 +1752,16 @@ pub(crate) fn spawn_attach_agent_process_bg(
             return;
         }
 
-        match wake_plan {
-            SpawnWakePlan::RunScoped(spawn_welcome_role) => {
-                session.notify_reserved_wake_for_team_work(
-                    &agent.slot_id,
-                    spawn_welcome_role,
-                    TeamWakeSource::SpawnWelcome,
-                );
-            }
+        let _ = service.with_published_session(&session, |current| match wake_plan {
+            SpawnWakePlan::RunScoped(spawn_welcome_role) => current.notify_reserved_wake_for_team_work(
+                &agent.slot_id,
+                spawn_welcome_role,
+                TeamWakeSource::SpawnWelcome,
+            ),
             SpawnWakePlan::MailboxOnly => {
-                session.notify_mailbox_only_wake(&agent.slot_id, TeamWakeSource::SpawnWelcome);
+                current.notify_mailbox_only_wake(&agent.slot_id, TeamWakeSource::SpawnWelcome);
             }
-        }
+        });
     });
 }
 
@@ -1904,7 +1902,13 @@ pub(crate) async fn attach_member_runtime(
         return lease.waiter().wait().await;
     }
 
-    service.broadcast_agent_runtime_status(session.team_id(), &agent, TeamAgentRuntimeStatus::Ready, None);
+    if !service.publish_member_runtime_ready_if_current(&session, &agent) {
+        if registered_event_loop {
+            session.event_loops.remove(&agent.slot_id);
+        }
+        cleanup_stale_attach(&service, &session, &agent, operation_id, &generation, started_at).await;
+        return AttachOutcome::SessionStopped;
+    }
     info!(
         team_id = session.team_id(),
         slot_id = agent.slot_id,
