@@ -3,7 +3,7 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use aionui_ai_agent::session_context::{
     AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
@@ -948,6 +948,16 @@ impl CountingTaskManager {
     fn snapshot(&self) -> TaskManagerCalls {
         self.calls.lock().unwrap().clone()
     }
+
+    fn reset_calls(&self) {
+        *self.calls.lock().unwrap() = TaskManagerCalls::default();
+    }
+
+    async fn remove_task_without_recording(&self, conversation_id: &str) {
+        self.inner
+            .kill_and_wait(conversation_id, Some(AgentKillReason::TeamMcpRebuild))
+            .await;
+    }
 }
 
 #[async_trait::async_trait]
@@ -976,8 +986,12 @@ impl IWorkerTaskManager for CountingTaskManager {
         conversation_id: &str,
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let _ = self.kill(conversation_id, reason);
-        Box::pin(std::future::ready(()))
+        self.calls
+            .lock()
+            .unwrap()
+            .kill
+            .push((conversation_id.to_owned(), reason));
+        self.inner.kill_and_wait(conversation_id, reason)
     }
     async fn clear(&self) {
         self.inner.clear().await
@@ -1109,6 +1123,69 @@ fn blocking_first_build_factory(started: Arc<tokio::sync::Notify>, release: Arc<
         }
         .boxed()
     })
+}
+
+struct GatedProvisioningFactory {
+    enabled: AtomicBool,
+    starts: Mutex<Vec<String>>,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+impl Default for GatedProvisioningFactory {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            starts: Mutex::new(Vec::new()),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+impl GatedProvisioningFactory {
+    fn factory(self: &Arc<Self>) -> AgentFactory {
+        use futures_util::FutureExt;
+
+        let gate = Arc::clone(self);
+        Arc::new(move |opts: BuildTaskOptions| {
+            let gate = Arc::clone(&gate);
+            async move {
+                let conversation_id = opts.context.conversation.conversation_id.clone();
+                if gate.enabled.swap(false, Ordering::SeqCst) {
+                    gate.starts.lock().unwrap().push(conversation_id.clone());
+                    gate.started.notify_waiters();
+                    gate.release.acquire().await.expect("provisioning gate closed").forget();
+                }
+                Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                    mock_agent::MockAgent::new(conversation_id, opts.context.workspace.path),
+                )))
+            }
+            .boxed()
+        })
+    }
+
+    fn enable(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_for_starts(&self, count: usize) {
+        loop {
+            let notified = self.started.notified();
+            if self.starts.lock().unwrap().len() >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn starts(&self) -> Vec<String> {
+        self.starts.lock().unwrap().clone()
+    }
+
+    fn release(&self, count: usize) {
+        self.release.add_permits(count);
+    }
 }
 
 fn confirmations_factory(count: usize) -> AgentFactory {
@@ -5121,6 +5198,238 @@ async fn d9_ensure_session_is_idempotent() {
 }
 
 #[tokio::test]
+async fn manual_add_then_immediate_ensure_joins_attach_without_rebuilding_session() {
+    let gate = Arc::new(GatedProvisioningFactory::default());
+    let (svc, _repo, task_manager, _recorder) = setup_with_factory_and_recording_broadcaster(gate.factory());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Join dynamic attach".into(),
+                agents: vec![team_agent_input("Lead", "lead", "claude")],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let original_scheduler = svc.get_session_scheduler(&created.id).expect("published session");
+    let lead_conversation_id = created.assistants[0].conversation_id.clone();
+    task_manager.reset_calls();
+    gate.enable();
+
+    let added = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Worker".into(),
+                role: "teammate".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    gate.wait_for_starts(1).await;
+
+    let svc_for_ensure = Arc::clone(&svc);
+    let team_id = created.id.clone();
+    let ensure = tokio::spawn(async move { svc_for_ensure.ensure_session("user1", &team_id).await });
+    tokio::task::yield_now().await;
+    assert!(!ensure.is_finished(), "ensure must join the pending dynamic attach");
+    assert_eq!(gate.starts(), vec![added.conversation_id.clone()]);
+    assert!(Arc::ptr_eq(
+        &original_scheduler,
+        &svc.get_session_scheduler(&created.id).expect("same published session")
+    ));
+    assert!(
+        task_manager
+            .snapshot()
+            .kill
+            .iter()
+            .all(|(conversation_id, _)| conversation_id != &lead_conversation_id),
+        "joining a dynamic attach must not kill a healthy member"
+    );
+
+    gate.release(1);
+    ensure.await.unwrap().unwrap();
+    assert_eq!(
+        task_manager
+            .snapshot()
+            .build
+            .iter()
+            .filter(|conversation_id| *conversation_id == &added.conversation_id)
+            .count(),
+        1,
+        "the dynamic conversation must be built once"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_ensures_launch_one_dynamic_attach() {
+    let gate = Arc::new(GatedProvisioningFactory::default());
+    let (svc, task_manager) = setup_with_factory(gate.factory());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Concurrent repair".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let original_scheduler = svc.get_session_scheduler(&created.id).expect("published session");
+    let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .unwrap();
+    task_manager
+        .remove_task_without_recording(&worker.conversation_id)
+        .await;
+    task_manager.reset_calls();
+    gate.enable();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let svc = Arc::clone(&svc);
+        let team_id = created.id.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            svc.ensure_session("user1", &team_id).await
+        }));
+    }
+    barrier.wait().await;
+    gate.wait_for_starts(1).await;
+    tokio::task::yield_now().await;
+    assert!(handles.iter().all(|handle| !handle.is_finished()));
+    assert_eq!(gate.starts(), vec![worker.conversation_id.clone()]);
+    assert_eq!(task_manager.snapshot().build, vec![worker.conversation_id.clone()]);
+    assert!(
+        task_manager
+            .snapshot()
+            .kill
+            .iter()
+            .all(|(conversation_id, _)| conversation_id != &lead.conversation_id),
+        "healthy members must not be killed during a one-slot repair"
+    );
+    assert!(Arc::ptr_eq(
+        &original_scheduler,
+        &svc.get_session_scheduler(&created.id).expect("same published session")
+    ));
+
+    gate.release(1);
+    for handle in handles {
+        handle.await.unwrap().unwrap();
+    }
+    assert_eq!(gate.starts(), vec![worker.conversation_id.clone()]);
+}
+
+#[tokio::test]
+async fn stopped_session_rejects_late_attach_completion() {
+    let gate = Arc::new(GatedProvisioningFactory::default());
+    let (svc, _repo, task_manager, recorder) = setup_with_factory_and_recording_broadcaster(gate.factory());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Stopped late attach".into(),
+                agents: vec![team_agent_input("Lead", "lead", "claude")],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    task_manager.reset_calls();
+    gate.enable();
+
+    let added = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Worker".into(),
+                role: "teammate".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    gate.wait_for_starts(1).await;
+    svc.stop_session("user1", &created.id).await.unwrap();
+    let svc_for_replacement = Arc::clone(&svc);
+    let replacement_team_id = created.id.clone();
+    let replacement =
+        tokio::spawn(async move { svc_for_replacement.ensure_session("user1", &replacement_team_id).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let replacement_kill_started = task_manager
+                .snapshot()
+                .kill
+                .iter()
+                .filter(|(conversation_id, _)| conversation_id == &added.conversation_id)
+                .count();
+            if replacement_kill_started >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement bootstrap must begin replacing the same member before old attach release");
+    assert!(!replacement.is_finished());
+    gate.release(1);
+    replacement.await.unwrap().unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let cleanup_kills = task_manager
+                .snapshot()
+                .kill
+                .iter()
+                .filter(|(conversation_id, _)| conversation_id == &added.conversation_id)
+                .count();
+            if cleanup_kills >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late completion must clean up its partial task");
+
+    let added_events = recorder
+        .events_by_name("team.agentRuntimeStatusChanged")
+        .into_iter()
+        .filter(|event| event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(added.slot_id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        added_events
+            .iter()
+            .filter(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready"))
+            .count(),
+        1,
+        "only the replacement session may publish Ready for the member"
+    );
+    assert!(
+        task_manager.get_task(&added.conversation_id).is_some(),
+        "stale cleanup must not kill the replacement session runtime"
+    );
+    assert!(svc.get_session_scheduler(&created.id).is_some());
+}
+
+#[tokio::test]
 async fn d9_ensure_session_rollbacks_when_build_fails() {
     // Factory always fails → ensure_session must propagate error and not
     // insert into sessions, so send_message afterwards still errors.
@@ -5147,7 +5456,11 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
     // Serial rebuild stops at the first failing agent, and no session is
     // inserted after the failure.
     let calls = tm.snapshot();
-    assert_eq!(calls.kill.len(), 1);
+    assert_eq!(
+        calls.kill.len(),
+        3,
+        "failed bootstrap cleans the full two-member snapshot"
+    );
     assert_eq!(calls.build.len(), 1);
 
     let send_result = svc.send_message("user1", &created.id, "Hello", None).await;
@@ -5217,9 +5530,22 @@ async fn d9_ensure_session_cleans_up_successful_rebuilds_when_one_agent_fails() 
     );
     assert_eq!(
         calls.kill.len(),
-        7,
-        "four initial rebuild kills plus cleanup kills for the three successful rebuilds"
+        11,
+        "cleanup is idempotent after partial-success cleanup"
     );
+    for agent in &created.assistants {
+        assert!(
+            calls
+                .kill
+                .iter()
+                .filter(|(conversation_id, _)| conversation_id == &agent.conversation_id)
+                .count()
+                >= 2,
+            "bootstrap failure must issue final cleanup for {}",
+            agent.conversation_id
+        );
+    }
+    assert_eq!(tm.active_count(), 0);
     assert!(
         svc.get_session_scheduler(&created.id).is_none(),
         "session must not be registered after partial rebuild failure"

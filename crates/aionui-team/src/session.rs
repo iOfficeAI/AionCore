@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
@@ -17,6 +18,9 @@ use crate::event_loop::EventLoopRegistry;
 use crate::events::TeamEventEmitter;
 use crate::mailbox::Mailbox;
 use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
+use crate::member_runtime::{
+    AttachLease, AttachOutcome, BeginRemove, MemberRuntimeFailure, MemberRuntimeRegistry, ReserveAttach,
+};
 use crate::message_projection::{
     TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
 };
@@ -104,6 +108,12 @@ pub struct TeamSession {
     /// Per-agent event loop registry. Each agent has a dedicated tokio task
     /// that drains its mailbox whenever notified.
     event_loops: Arc<EventLoopRegistry>,
+    /// Per-member runtime lifecycle for this exact session incarnation.
+    /// Created once with a fresh generation, seeded before publication, read
+    /// by dynamic attach/reconcile operations, and permanently stopped before
+    /// bridge/event-loop shutdown. A generation is never reused by another
+    /// `TeamSession`, even for the same team id.
+    member_runtimes: Arc<MemberRuntimeRegistry>,
     prompt_dump: TeamPromptDumpConfig,
     /// Set after the session lifecycle performs its system recovery mailbox scan.
     /// Written by `try_start_recovery_drain` and read by later scan attempts so
@@ -184,6 +194,7 @@ impl TeamSession {
         .await?;
 
         let event_loops = Arc::new(EventLoopRegistry::new());
+        let member_runtimes = Arc::new(MemberRuntimeRegistry::new(generate_id()));
 
         info!(
             team_id = %team.id,
@@ -207,6 +218,7 @@ impl TeamSession {
             service,
             broadcaster,
             event_loops,
+            member_runtimes,
             prompt_dump,
             recovery_scan_completed: AtomicBool::new(false),
         })
@@ -226,6 +238,14 @@ impl TeamSession {
 
     pub fn event_loops(&self) -> &Arc<EventLoopRegistry> {
         &self.event_loops
+    }
+
+    pub(crate) fn member_runtimes(&self) -> &Arc<MemberRuntimeRegistry> {
+        &self.member_runtimes
+    }
+
+    pub(crate) fn generation(&self) -> &str {
+        self.member_runtimes.generation()
     }
 
     pub fn turn_port(&self) -> &Arc<dyn AgentTurnExecutionPort> {
@@ -1476,18 +1496,22 @@ impl TeamSession {
     }
 
     pub async fn remove_agent(&self, slot_id: &str) -> Result<(), TeamError> {
+        let removal = match self.member_runtimes.begin_remove(slot_id) {
+            BeginRemove::Join(waiter) => {
+                let _ = waiter.wait().await;
+                return Ok(());
+            }
+            removal => removal,
+        };
         self.event_loops.remove(slot_id);
         let conversation_id = self.scheduler.remove_agent(slot_id).await?;
-        if let Some(conv_id) = conversation_id
-            && let Err(e) = self.task_manager.kill(&conv_id, Some(AgentKillReason::TeamDeleted))
-        {
-            warn!(
-                team_id = %self.team.id,
-                slot_id,
-                conversation_id = %conv_id,
-                error = %e,
-                "remove_agent: task_manager.kill failed (non-fatal)"
-            );
+        if let Some(conv_id) = conversation_id {
+            self.task_manager
+                .kill_and_wait(&conv_id, Some(AgentKillReason::TeamDeleted))
+                .await;
+        }
+        if let BeginRemove::Start(lease) = removal {
+            self.member_runtimes.finish_remove(&lease);
         }
         Ok(())
     }
@@ -1634,14 +1658,18 @@ impl TeamSession {
         // time (10-30s). Running it asynchronously ensures `spawn_agent`
         // returns promptly so the MCP tool call completes without blocking
         // the leader's connection loop.
+        let captured_session = service
+            .capture_published_session(self)
+            .ok_or_else(|| TeamError::SessionNotFound(self.team.id.clone()))?;
+        let reservation = self.member_runtimes.reserve_attach(&new_agent.slot_id, false);
         spawn_attach_agent_process_bg(
             service,
-            self.team.id.clone(),
+            captured_session,
             self.user_id.clone(),
             new_agent.clone(),
-            self.mcp_stdio_config(&new_agent.slot_id),
             self.task_manager.clone(),
             spawn_wake_plan,
+            reservation,
         );
 
         Ok(new_agent)
@@ -1666,7 +1694,9 @@ impl TeamSession {
     }
 
     pub fn stop(&self) {
-        info!(team_id = %self.team.id, "TeamSession stopping");
+        info!(team_id = %self.team.id, generation = %self.generation(), "TeamSession stopping");
+        self.member_runtimes.stop();
+        self.event_loops.shutdown();
         self.mcp_server.stop();
     }
 
@@ -1681,68 +1711,244 @@ impl TeamSession {
 
 pub(crate) fn spawn_attach_agent_process_bg(
     service: Arc<TeamSessionService>,
-    team_id: String,
+    session: Arc<TeamSession>,
     user_id: String,
     agent: TeamAgent,
-    mcp_stdio_cfg: TeamMcpStdioConfig,
     task_manager: Arc<dyn IWorkerTaskManager>,
     wake_plan: SpawnWakePlan,
+    reservation: ReserveAttach,
 ) {
     tokio::spawn(async move {
-        if let Err(err) =
-            TeamSession::attach_spawned_agent_process(&service, &agent, mcp_stdio_cfg, &user_id, &task_manager).await
-        {
-            service.broadcast_agent_runtime_status(
-                &team_id,
-                &agent,
-                TeamAgentRuntimeStatus::Failed,
-                Some(err.to_string()),
-            );
-            warn!(
-                team_id = %team_id,
-                slot_id = %agent.slot_id,
-                error = %err,
-                "failed to attach teammate agent process; agent is persisted but not yet running"
-            );
-            if let Err(status_err) = service.mark_agent_attach_failed(&team_id, &agent.slot_id).await {
-                warn!(
-                    team_id = %team_id,
-                    slot_id = %agent.slot_id,
-                    error = %status_err,
-                    "failed to mark teammate attach failure"
-                );
-            }
-            if let Err(notify_err) = service
-                .notify_leader_spawn_attach_failed(&team_id, &agent.slot_id, &err.to_string())
+        let outcome = match reservation {
+            ReserveAttach::Start(lease) => {
+                attach_member_runtime(
+                    Arc::clone(&service),
+                    Arc::clone(&session),
+                    user_id,
+                    agent.clone(),
+                    task_manager,
+                    lease,
+                )
                 .await
-            {
-                warn!(
-                    team_id = %team_id,
-                    slot_id = %agent.slot_id,
-                    error = %notify_err,
-                    "failed to notify leader about teammate attach failure"
-                );
             }
+            ReserveAttach::Join(waiter) | ReserveAttach::Removing(waiter) => {
+                info!(
+                    team_id = session.team_id(),
+                    slot_id = agent.slot_id,
+                    conversation_id = agent.conversation_id,
+                    operation_id = waiter.operation_id(),
+                    generation = session.generation(),
+                    duration_ms = 0,
+                    error_classification = "none",
+                    "team member runtime attach waiting"
+                );
+                waiter.wait().await
+            }
+            ReserveAttach::AlreadyReady => AttachOutcome::Ready,
+            ReserveAttach::SessionStopped => AttachOutcome::SessionStopped,
+        };
+
+        if outcome != AttachOutcome::Ready {
             return;
         }
 
-        service.broadcast_agent_runtime_status(&team_id, &agent, TeamAgentRuntimeStatus::Ready, None);
-        service.register_event_loop(&team_id, &agent.slot_id);
-
         match wake_plan {
             SpawnWakePlan::RunScoped(spawn_welcome_role) => {
-                service.notify_reserved_wake_for_team_work(
-                    &team_id,
+                session.notify_reserved_wake_for_team_work(
                     &agent.slot_id,
                     spawn_welcome_role,
                     TeamWakeSource::SpawnWelcome,
                 );
             }
             SpawnWakePlan::MailboxOnly => {
-                service.notify_mailbox_only_wake(&team_id, &agent.slot_id, TeamWakeSource::SpawnWelcome);
+                session.notify_mailbox_only_wake(&agent.slot_id, TeamWakeSource::SpawnWelcome);
             }
         }
     });
+}
+
+pub(crate) async fn attach_member_runtime(
+    service: Arc<TeamSessionService>,
+    session: Arc<TeamSession>,
+    user_id: String,
+    agent: TeamAgent,
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    lease: AttachLease,
+) -> AttachOutcome {
+    let started_at = Instant::now();
+    let operation_id = lease.operation_id();
+    let generation = session.generation().to_owned();
+    info!(
+        team_id = session.team_id(),
+        slot_id = agent.slot_id,
+        conversation_id = agent.conversation_id,
+        operation_id,
+        generation,
+        duration_ms = 0,
+        error_classification = "none",
+        "team member runtime attach started"
+    );
+
+    let attach_result = TeamSession::attach_spawned_agent_process(
+        &service,
+        &agent,
+        session.mcp_stdio_config(&agent.slot_id),
+        &user_id,
+        &task_manager,
+    )
+    .await;
+    if let Err(error) = attach_result {
+        service
+            .cleanup_stale_member_runtime_task(&session, &agent.conversation_id)
+            .await;
+        let failure = MemberRuntimeFailure {
+            classification: "attach_failed",
+            public_reason: error.to_string(),
+        };
+        if session.member_runtimes.commit_failed(&lease, failure.clone()) {
+            service.broadcast_agent_runtime_status(
+                session.team_id(),
+                &agent,
+                TeamAgentRuntimeStatus::Failed,
+                Some(failure.public_reason.clone()),
+            );
+            let _ = session
+                .scheduler
+                .set_status(&agent.slot_id, TeammateStatus::Error)
+                .await;
+            session
+                .team_run_manager
+                .mark_slot_runtime_health(&agent.slot_id, TeamSlotRuntimeHealth::Unhealthy)
+                .await;
+            if let Err(notify_error) = session
+                .notify_leader_spawn_attach_failed(&agent.slot_id, &failure.public_reason)
+                .await
+            {
+                warn!(
+                    team_id = session.team_id(),
+                    slot_id = agent.slot_id,
+                    conversation_id = agent.conversation_id,
+                    operation_id,
+                    generation,
+                    duration_ms = started_at.elapsed().as_millis(),
+                    error_classification = "leader_notification_failed",
+                    error = %notify_error,
+                    "team member runtime attach failure notification failed"
+                );
+            }
+        } else {
+            warn!(
+                team_id = session.team_id(),
+                slot_id = agent.slot_id,
+                conversation_id = agent.conversation_id,
+                operation_id,
+                generation,
+                duration_ms = started_at.elapsed().as_millis(),
+                error_classification = "stale_attach_failure",
+                "stale team member runtime attach failure ignored"
+            );
+        }
+        info!(
+            team_id = session.team_id(),
+            slot_id = agent.slot_id,
+            conversation_id = agent.conversation_id,
+            operation_id,
+            generation,
+            duration_ms = started_at.elapsed().as_millis(),
+            error_classification = failure.classification,
+            "team member runtime attach completed"
+        );
+        return lease.waiter().wait().await;
+    }
+
+    if !session.member_runtimes.owns_attach(&lease) {
+        cleanup_stale_attach(&service, &session, &agent, operation_id, &generation, started_at).await;
+        return lease.waiter().wait().await;
+    }
+
+    let registered_event_loop = if session.event_loops.has(&agent.slot_id) {
+        false
+    } else {
+        match service.register_event_loop(&session, &agent.slot_id) {
+            Ok(registered) => registered,
+            Err(error) => {
+                service
+                    .cleanup_stale_member_runtime_task(&session, &agent.conversation_id)
+                    .await;
+                let failure = MemberRuntimeFailure {
+                    classification: "event_loop_registration_failed",
+                    public_reason: "Agent runtime event loop could not be registered".to_owned(),
+                };
+                session.member_runtimes.commit_failed(&lease, failure.clone());
+                warn!(
+                    team_id = session.team_id(),
+                    slot_id = agent.slot_id,
+                    conversation_id = agent.conversation_id,
+                    operation_id,
+                    generation,
+                    duration_ms = started_at.elapsed().as_millis(),
+                    error_classification = failure.classification,
+                    error = ?error,
+                    "team member runtime attach event loop registration failed"
+                );
+                return lease.waiter().wait().await;
+            }
+        }
+    };
+
+    if !session.member_runtimes.commit_ready(&lease) {
+        if registered_event_loop {
+            session.event_loops.remove(&agent.slot_id);
+        }
+        cleanup_stale_attach(&service, &session, &agent, operation_id, &generation, started_at).await;
+        return lease.waiter().wait().await;
+    }
+
+    service.broadcast_agent_runtime_status(session.team_id(), &agent, TeamAgentRuntimeStatus::Ready, None);
+    info!(
+        team_id = session.team_id(),
+        slot_id = agent.slot_id,
+        conversation_id = agent.conversation_id,
+        operation_id,
+        generation,
+        duration_ms = started_at.elapsed().as_millis(),
+        error_classification = "none",
+        "team member runtime attach completed"
+    );
+    AttachOutcome::Ready
+}
+
+async fn cleanup_stale_attach(
+    service: &TeamSessionService,
+    session: &TeamSession,
+    agent: &TeamAgent,
+    operation_id: u64,
+    generation: &str,
+    started_at: Instant,
+) {
+    service
+        .cleanup_stale_member_runtime_task(session, &agent.conversation_id)
+        .await;
+    info!(
+        team_id = session.team_id(),
+        slot_id = agent.slot_id,
+        conversation_id = agent.conversation_id,
+        operation_id,
+        generation,
+        duration_ms = started_at.elapsed().as_millis(),
+        error_classification = "attach_cancelled",
+        "team member runtime attach cancelled"
+    );
+    warn!(
+        team_id = session.team_id(),
+        slot_id = agent.slot_id,
+        conversation_id = agent.conversation_id,
+        operation_id,
+        generation,
+        duration_ms = started_at.elapsed().as_millis(),
+        error_classification = "stale_attach_completion",
+        "stale team member runtime attach completion rejected"
+    );
 }
 
 fn classify_send_message_queue_state(
@@ -2151,18 +2357,43 @@ mod tests {
     }
 
     fn register_test_event_loop(session: &Arc<TeamSession>, slot_id: &str) {
-        session.event_loops().spawn(
-            slot_id,
-            AgentLoopContext {
-                team_id: session.team_id().to_owned(),
-                slot_id: slot_id.to_owned(),
-                user_id: session.user_id().to_owned(),
-                session: session.clone(),
-                scheduler: session.scheduler().clone(),
-                mailbox: session.mailbox().clone(),
-                turn_port: session.turn_port().clone(),
-                registry: session.event_loops().clone(),
-            },
+        session
+            .event_loops()
+            .spawn(slot_id, test_loop_context(session, slot_id))
+            .expect("test event loop registration");
+    }
+
+    fn test_loop_context(session: &Arc<TeamSession>, slot_id: &str) -> AgentLoopContext {
+        AgentLoopContext {
+            team_id: session.team_id().to_owned(),
+            slot_id: slot_id.to_owned(),
+            user_id: session.user_id().to_owned(),
+            session: session.clone(),
+            scheduler: session.scheduler().clone(),
+            mailbox: session.mailbox().clone(),
+            turn_port: session.turn_port().clone(),
+            registry: session.event_loops().clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn event_loop_registry_rejects_duplicate_and_stopped_registration() {
+        let session = Arc::new(start_session().await);
+        register_test_event_loop(&session, "worker-1");
+
+        assert_eq!(
+            session
+                .event_loops()
+                .spawn("worker-1", test_loop_context(&session, "worker-1")),
+            Err(crate::event_loop::EventLoopRegistrationError::Duplicate)
+        );
+
+        session.stop();
+        assert_eq!(
+            session
+                .event_loops()
+                .spawn("lead-1", test_loop_context(&session, "lead-1")),
+            Err(crate::event_loop::EventLoopRegistrationError::Stopped)
         );
     }
 

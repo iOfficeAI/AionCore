@@ -742,7 +742,7 @@ fn register_test_event_loops(session: &Arc<TeamSession>) {
             turn_port: session.turn_port().clone(),
             registry: registry.clone(),
         };
-        registry.spawn(&agent.slot_id, ctx);
+        registry.spawn(&agent.slot_id, ctx).expect("register test event loop");
     }
 }
 
@@ -1096,19 +1096,21 @@ async fn s4_dynamic_agent_added_then_finish_propagates() {
     // Add the agent to the session's scheduler
     session.add_agent(&new_agent).await;
     let registry = session.event_loops().clone();
-    registry.spawn(
-        &new_agent.slot_id,
-        AgentLoopContext {
-            team_id: session.team_id().to_owned(),
-            slot_id: new_agent.slot_id.clone(),
-            user_id: session.user_id().to_owned(),
-            session: session.clone(),
-            scheduler: session.scheduler().clone(),
-            mailbox: session.mailbox().clone(),
-            turn_port: session.turn_port().clone(),
-            registry: registry.clone(),
-        },
-    );
+    registry
+        .spawn(
+            &new_agent.slot_id,
+            AgentLoopContext {
+                team_id: session.team_id().to_owned(),
+                slot_id: new_agent.slot_id.clone(),
+                user_id: session.user_id().to_owned(),
+                session: session.clone(),
+                scheduler: session.scheduler().clone(),
+                mailbox: session.mailbox().clone(),
+                turn_port: session.turn_port().clone(),
+                registry: registry.clone(),
+            },
+        )
+        .expect("register test event loop");
 
     // Verify the agent is in the roster
     let agents = session.scheduler().list_agents().await;
@@ -1218,19 +1220,21 @@ async fn s4b_pending_wake_for_unregistered_dynamic_agent_survives_leader_empty_w
     );
 
     let registry = session.event_loops().clone();
-    registry.spawn(
-        &new_agent.slot_id,
-        AgentLoopContext {
-            team_id: session.team_id().to_owned(),
-            slot_id: new_agent.slot_id.clone(),
-            user_id: session.user_id().to_owned(),
-            session: session.clone(),
-            scheduler: session.scheduler().clone(),
-            mailbox: session.mailbox().clone(),
-            turn_port: session.turn_port().clone(),
-            registry: registry.clone(),
-        },
-    );
+    registry
+        .spawn(
+            &new_agent.slot_id,
+            AgentLoopContext {
+                team_id: session.team_id().to_owned(),
+                slot_id: new_agent.slot_id.clone(),
+                user_id: session.user_id().to_owned(),
+                session: session.clone(),
+                scheduler: session.scheduler().clone(),
+                mailbox: session.mailbox().clone(),
+                turn_port: session.turn_port().clone(),
+                registry: registry.clone(),
+            },
+        )
+        .expect("register test event loop");
     registry.notify("helper-1");
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

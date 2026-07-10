@@ -2,6 +2,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -29,6 +30,13 @@ pub struct EventLoopRegistry {
     handles: DashMap<String, JoinHandle<()>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    lifecycle: Mutex<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventLoopRegistrationError {
+    Duplicate,
+    Stopped,
 }
 
 impl Default for EventLoopRegistry {
@@ -45,12 +53,18 @@ impl EventLoopRegistry {
             handles: DashMap::new(),
             shutdown_tx,
             shutdown_rx,
+            lifecycle: Mutex::new(false),
         }
     }
 
     /// Check if an event loop is registered for this slot.
     pub fn has(&self, slot_id: &str) -> bool {
         self.notifiers.contains_key(slot_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.notifiers.len()
     }
 
     /// Poke the named agent's event loop so it drains its mailbox.
@@ -61,7 +75,11 @@ impl EventLoopRegistry {
     }
 
     /// Register and spawn an event loop for one agent.
-    pub fn spawn(&self, slot_id: &str, ctx: AgentLoopContext) -> bool {
+    pub fn spawn(&self, slot_id: &str, ctx: AgentLoopContext) -> Result<(), EventLoopRegistrationError> {
+        let stopped = self.lock_lifecycle();
+        if *stopped {
+            return Err(EventLoopRegistrationError::Stopped);
+        }
         let notify = Arc::new(Notify::new());
         match self.notifiers.entry(slot_id.to_owned()) {
             Entry::Occupied(_) => {
@@ -70,7 +88,7 @@ impl EventLoopRegistry {
                     slot_id,
                     "agent event loop registration ignored because slot is already registered"
                 );
-                return false;
+                return Err(EventLoopRegistrationError::Duplicate);
             }
             Entry::Vacant(entry) => {
                 entry.insert(notify.clone());
@@ -78,11 +96,12 @@ impl EventLoopRegistry {
         }
         let handle = tokio::spawn(run_event_loop(notify, self.shutdown_rx.clone(), ctx));
         self.handles.insert(slot_id.to_owned(), handle);
-        true
+        Ok(())
     }
 
     /// Remove an agent's event loop (agent removed from team).
     pub fn remove(&self, slot_id: &str) {
+        let _lifecycle = self.lock_lifecycle();
         self.notifiers.remove(slot_id);
         if let Some((_, handle)) = self.handles.remove(slot_id) {
             handle.abort();
@@ -91,12 +110,21 @@ impl EventLoopRegistry {
 
     /// Shut down all event loops.
     pub fn shutdown(&self) {
+        let mut stopped = self.lock_lifecycle();
+        if *stopped {
+            return;
+        }
+        *stopped = true;
         let _ = self.shutdown_tx.send(true);
         for entry in self.handles.iter() {
             entry.value().abort();
         }
         self.handles.clear();
         self.notifiers.clear();
+    }
+
+    fn lock_lifecycle(&self) -> MutexGuard<'_, bool> {
+        self.lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -450,5 +478,32 @@ async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, input: &crat
         {
             ctx.registry.notify(&ctx.slot_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_lifecycle_tests {
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    use super::EventLoopRegistry;
+
+    #[test]
+    fn remove_waits_for_in_progress_registration_lifecycle() {
+        let registry = Arc::new(EventLoopRegistry::new());
+        let lifecycle = registry.lock_lifecycle();
+        let (calling_tx, calling_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = Arc::clone(&registry);
+        let thread = std::thread::spawn(move || {
+            calling_tx.send(()).unwrap();
+            worker.remove("worker-1");
+            done_tx.send(()).unwrap();
+        });
+        calling_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(lifecycle);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread.join().unwrap();
     }
 }

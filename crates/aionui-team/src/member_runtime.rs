@@ -1,6 +1,6 @@
 #![allow(
     dead_code,
-    reason = "this crate-private registry is wired into TeamSession in the next implementation task"
+    reason = "remove rollback lease APIs are consumed by the follow-up membership ordering task"
 )]
 
 use std::collections::HashMap;
@@ -58,7 +58,7 @@ impl AttachWaiter {
 
 #[derive(Debug)]
 pub(crate) struct AttachLease {
-    session_generation: u64,
+    session_generation: String,
     agent_id: String,
     waiter: AttachWaiter,
 }
@@ -75,7 +75,7 @@ impl AttachLease {
 
 #[derive(Debug)]
 pub(crate) struct RemoveLease {
-    session_generation: u64,
+    session_generation: String,
     agent_id: String,
     waiter: AttachWaiter,
     cancel_attach_operation_id: Option<u64>,
@@ -149,24 +149,24 @@ enum MemberRuntimeEntry {
 
 #[derive(Debug)]
 pub(crate) struct MemberRuntimeRegistry {
-    session_generation: u64,
+    session_generation: String,
     next_operation_id: AtomicU64,
     entries: Mutex<HashMap<String, MemberRuntimeEntry>>,
     stopped: AtomicBool,
 }
 
 impl MemberRuntimeRegistry {
-    pub(crate) fn new(session_generation: u64) -> Self {
+    pub(crate) fn new(session_generation: impl ToString) -> Self {
         Self {
-            session_generation,
+            session_generation: session_generation.to_string(),
             next_operation_id: AtomicU64::new(1),
             entries: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn generation(&self) -> u64 {
-        self.session_generation
+    pub(crate) fn generation(&self) -> &str {
+        &self.session_generation
     }
 
     pub(crate) fn seed_ready(&self, agent_id: impl Into<String>) -> bool {
@@ -221,12 +221,82 @@ impl MemberRuntimeRegistry {
                     },
                 );
                 ReserveAttach::Start(AttachLease {
-                    session_generation: self.session_generation,
+                    session_generation: self.session_generation.clone(),
                     agent_id: agent_id.to_owned(),
                     waiter: waiter(operation_id, outcome_rx),
                 })
             }
         }
+    }
+
+    /// Atomically converts a previously-ready slot into a repair attach.
+    ///
+    /// This is only for reconciliation after the task manager confirms the
+    /// underlying runtime disappeared. Ordinary attaches must use
+    /// [`Self::reserve_attach`].
+    pub(crate) fn reserve_repair(&self, agent_id: &str) -> ReserveAttach {
+        let mut entries = self.lock_entries();
+        if self.stopped.load(Ordering::Acquire) {
+            return ReserveAttach::SessionStopped;
+        }
+
+        match entries.get(agent_id) {
+            Some(MemberRuntimeEntry::Attaching {
+                operation_id,
+                outcome_tx,
+            }) => ReserveAttach::Join(waiter(*operation_id, outcome_tx.subscribe())),
+            Some(MemberRuntimeEntry::Ready) => {
+                let operation_id = self.next_operation_id();
+                let (outcome_tx, outcome_rx) = watch::channel(AttachSignal::Pending);
+                entries.insert(
+                    agent_id.to_owned(),
+                    MemberRuntimeEntry::Attaching {
+                        operation_id,
+                        outcome_tx,
+                    },
+                );
+                ReserveAttach::Start(AttachLease {
+                    session_generation: self.session_generation.clone(),
+                    agent_id: agent_id.to_owned(),
+                    waiter: waiter(operation_id, outcome_rx),
+                })
+            }
+            Some(MemberRuntimeEntry::Failed {
+                operation_id,
+                outcome_tx,
+                ..
+            }) => ReserveAttach::Join(waiter(*operation_id, outcome_tx.subscribe())),
+            Some(MemberRuntimeEntry::Removing {
+                operation_id,
+                outcome_tx,
+            }) => ReserveAttach::Removing(waiter(*operation_id, outcome_tx.subscribe())),
+            None => {
+                let operation_id = self.next_operation_id();
+                let (outcome_tx, outcome_rx) = watch::channel(AttachSignal::Pending);
+                entries.insert(
+                    agent_id.to_owned(),
+                    MemberRuntimeEntry::Attaching {
+                        operation_id,
+                        outcome_tx,
+                    },
+                );
+                ReserveAttach::Start(AttachLease {
+                    session_generation: self.session_generation.clone(),
+                    agent_id: agent_id.to_owned(),
+                    waiter: waiter(operation_id, outcome_rx),
+                })
+            }
+        }
+    }
+
+    pub(crate) fn owns_attach(&self, lease: &AttachLease) -> bool {
+        if lease.session_generation != self.session_generation || self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        matches!(
+            self.lock_entries().get(&lease.agent_id),
+            Some(MemberRuntimeEntry::Attaching { operation_id, .. }) if *operation_id == lease.operation_id()
+        )
     }
 
     pub(crate) fn commit_ready(&self, lease: &AttachLease) -> bool {
@@ -322,7 +392,7 @@ impl MemberRuntimeRegistry {
             cancelled_outcome_tx.send_replace(AttachSignal::Terminal(AttachOutcome::Removed));
         }
         BeginRemove::Start(RemoveLease {
-            session_generation: self.session_generation,
+            session_generation: self.session_generation.clone(),
             agent_id: agent_id.to_owned(),
             waiter: waiter(operation_id, outcome_rx),
             cancel_attach_operation_id,
@@ -510,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn failed_operation_is_retried_only_by_a_later_reconcile() {
         let registry = MemberRuntimeRegistry::new(42);
-        assert_eq!(registry.generation(), 42);
+        assert_eq!(registry.generation(), "42");
         assert!(registry.seed_ready("lead-1"));
         assert!(matches!(
             registry.reserve_attach("lead-1", false),
