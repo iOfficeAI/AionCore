@@ -8,6 +8,7 @@ pub mod event_loop;
 pub mod events;
 pub mod mailbox;
 pub mod mcp;
+mod member_runtime;
 pub mod message_projection;
 pub mod ports;
 pub mod prompt_dump;
