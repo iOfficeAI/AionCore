@@ -1345,6 +1345,12 @@ impl TeamSession {
         self.scheduler.add_agent(agent).await;
     }
 
+    /// Reserve the runtime lifecycle before a newly persisted member becomes
+    /// visible through the scheduler or membership events.
+    pub(crate) fn reserve_dynamic_member_attach(&self, agent: &TeamAgent) -> ReserveAttach {
+        self.member_runtimes.reserve_attach(&agent.slot_id, false)
+    }
+
     pub(crate) async fn add_manual_agent(&self, agent: &TeamAgent) -> Result<SpawnWakePlan, TeamError> {
         self.scheduler.add_agent(agent).await;
         let lead_slot_id = self
@@ -1592,6 +1598,8 @@ impl TeamSession {
             })
             .await?;
 
+        let reservation = self.reserve_dynamic_member_attach(&new_agent);
+
         // Step 5: attach to the in-memory scheduler so wake-from-lead finds
         // the new slot immediately.
         self.scheduler.add_agent(&new_agent).await;
@@ -1661,7 +1669,6 @@ impl TeamSession {
         let captured_session = service
             .capture_published_session(self)
             .ok_or_else(|| TeamError::SessionNotFound(self.team.id.clone()))?;
-        let reservation = self.member_runtimes.reserve_attach(&new_agent.slot_id, false);
         spawn_attach_agent_process_bg(
             service,
             captured_session,

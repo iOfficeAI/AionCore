@@ -539,8 +539,8 @@ impl TeamSessionService {
         let agent = self.provisioner().add_agent(user_id, &row, &mut team, req).await?;
 
         if let Some(session) = self.sessions.get(team_id).map(|e| Arc::clone(&e.session)) {
+            let reservation = session.reserve_dynamic_member_attach(&agent);
             let wake_plan = session.add_manual_agent(&agent).await?;
-            let reservation = session.member_runtimes().reserve_attach(&agent.slot_id, false);
             let service = self
                 .self_ref
                 .upgrade()
@@ -2459,6 +2459,55 @@ mod tests {
             session.member_runtimes().snapshot(&added.slot_id),
             crate::member_runtime::MemberRuntimeSnapshot::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn dynamic_member_is_reserved_before_membership_event() {
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Reservation ordering"))
+            .await
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let observed_for_event = Arc::clone(&observed);
+        broadcaster.set_observer(Arc::new(move |event| {
+            if event.name != crate::events::TEAM_AGENT_SPAWNED_EVENT {
+                return;
+            }
+            let slot_id = event
+                .data
+                .get("assistant")
+                .and_then(|assistant| assistant.get("slot_id"))
+                .and_then(serde_json::Value::as_str);
+            if let Some(slot_id) = slot_id {
+                *observed_for_event.lock().unwrap() = Some(session.member_runtimes().snapshot(slot_id));
+            }
+        }));
+
+        svc.add_agent(
+            "user-test",
+            &created.id,
+            AddAgentRequest {
+                name: "Worker".to_owned(),
+                role: "teammate".to_owned(),
+                backend: Some("acp".to_owned()),
+                model: "claude".to_owned(),
+                assistant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            observed.lock().unwrap().as_ref(),
+            Some(
+                crate::member_runtime::MemberRuntimeSnapshot::Attaching { .. }
+                    | crate::member_runtime::MemberRuntimeSnapshot::Ready
+            )
+        ));
     }
 
     #[tokio::test]

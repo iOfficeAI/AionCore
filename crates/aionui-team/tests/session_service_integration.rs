@@ -4473,6 +4473,74 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
 }
 
 #[tokio::test]
+async fn leader_spawn_then_immediate_ensure_joins_the_same_attach_operation() {
+    let gate = Arc::new(GatedProvisioningFactory::default());
+    let (svc, _team_repo, task_manager, _conv_repo) = setup_with_factory_metadata_assistants_and_conversation_repo(
+        gate.factory(),
+        seeded_agent_metadata_repo(),
+        Arc::new(SingleAssistantDefinitionRepo {
+            row: word_creator_definition(),
+        }),
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Leader spawn reconciliation".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let original_scheduler = svc.get_session_scheduler(&created.id).unwrap();
+    task_manager.reset_calls();
+    gate.enable();
+
+    let spawned = svc
+        .spawn_agent_in_session(
+            &created.id,
+            created.leader_assistant_id.as_deref().unwrap(),
+            SpawnAgentRequest {
+                name: "Writer".into(),
+                assistant_id: Some("word-creator".into()),
+            },
+        )
+        .await
+        .unwrap();
+    gate.wait_for_starts(1).await;
+
+    let ensure_service = Arc::clone(&svc);
+    let team_id = created.id.clone();
+    let ensure = tokio::spawn(async move { ensure_service.ensure_session("user1", &team_id).await });
+    tokio::task::yield_now().await;
+    assert!(
+        !ensure.is_finished(),
+        "ensure must join the in-flight Leader spawn attach"
+    );
+    assert_eq!(gate.starts(), vec![spawned.conversation_id.clone()]);
+    assert_eq!(task_manager.snapshot().build, vec![spawned.conversation_id.clone()]);
+    assert!(
+        task_manager
+            .snapshot()
+            .kill
+            .iter()
+            .all(|(conversation_id, _)| conversation_id == &spawned.conversation_id),
+        "Leader spawn reconciliation must not restart healthy members"
+    );
+    assert!(Arc::ptr_eq(
+        &original_scheduler,
+        &svc.get_session_scheduler(&created.id).unwrap()
+    ));
+
+    gate.release(1);
+    ensure.await.unwrap().unwrap();
+    assert_eq!(gate.starts(), vec![spawned.conversation_id]);
+}
+
+#[tokio::test]
 async fn lead_send_agent_message_in_session_requires_active_team_run() {
     let svc = setup();
     let created = svc

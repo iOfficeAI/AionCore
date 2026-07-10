@@ -726,14 +726,18 @@ pub(crate) mod workspace_harness {
         }
     }
 
+    type BroadcastObserver = Arc<dyn Fn(&WebSocketMessage<serde_json::Value>) + Send + Sync>;
+
     pub(crate) struct RecordingBroadcaster {
         events: std::sync::Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+        observer: std::sync::Mutex<Option<BroadcastObserver>>,
     }
 
     impl RecordingBroadcaster {
         pub(crate) fn new() -> Self {
             Self {
                 events: std::sync::Mutex::new(Vec::new()),
+                observer: std::sync::Mutex::new(None),
             }
         }
 
@@ -746,11 +750,19 @@ pub(crate) mod workspace_harness {
                 .cloned()
                 .collect()
         }
+
+        pub(crate) fn set_observer(&self, observer: BroadcastObserver) {
+            *self.observer.lock().unwrap() = Some(observer);
+        }
     }
 
     impl EventBroadcaster for RecordingBroadcaster {
         fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
-            self.events.lock().unwrap().push(event);
+            self.events.lock().unwrap().push(event.clone());
+            let observer = self.observer.lock().unwrap().clone();
+            if let Some(observer) = observer {
+                observer(&event);
+            }
         }
     }
 
