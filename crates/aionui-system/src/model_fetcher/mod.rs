@@ -19,6 +19,14 @@ pub(crate) struct FetchConfig {
     pub bedrock_config: Option<BedrockConfig>,
 }
 
+/// When api_key contains multiple keys separated by newlines (the official
+/// multi-key rotation format), extract only the first key for model fetching.
+/// This avoids sending a multi-line Authorization header, which the HTTP client
+/// rejects.
+fn extract_first_key(api_key: &str) -> String {
+    api_key.split('\n').next().unwrap_or(api_key).trim().to_string()
+}
+
 /// Service for fetching model lists from remote provider APIs.
 #[derive(Clone)]
 pub struct ModelFetchService {
@@ -59,7 +67,7 @@ impl ModelFetchService {
         let config = FetchConfig {
             platform: req.platform.clone(),
             base_url: req.base_url.clone(),
-            api_key: req.api_key.clone(),
+            api_key: extract_first_key(&req.api_key),
             bedrock_config: req.bedrock_config.clone(),
         };
         self.fetch_with_config(&config, req.try_fix).await
@@ -98,7 +106,7 @@ impl ModelFetchService {
         Ok(FetchConfig {
             platform: row.platform,
             base_url: row.base_url,
-            api_key,
+            api_key: extract_first_key(&api_key),
             bedrock_config,
         })
     }
@@ -296,5 +304,57 @@ mod tests {
             try_fix: false,
         };
         assert!(validate_anonymous_request(&req).is_ok());
+    }
+
+    // ── extract_first_key ─────────────────────────────────────────────
+
+    #[test]
+    fn extract_first_key_single_key() {
+        assert_eq!(extract_first_key("sk-test-key"), "sk-test-key");
+    }
+
+    #[test]
+    fn extract_first_key_multi_key_newline() {
+        assert_eq!(extract_first_key("sk-key1\nsk-key2"), "sk-key1",);
+    }
+
+    #[test]
+    fn extract_first_key_multi_key_trailing_spaces() {
+        assert_eq!(extract_first_key("  sk-key1  \nsk-key2"), "sk-key1",);
+    }
+
+    #[test]
+    fn extract_first_key_empty_fallback() {
+        assert!(extract_first_key("").is_empty());
+    }
+
+    #[test]
+    fn extract_first_key_just_newlines() {
+        assert!(extract_first_key("\n\n\n").is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_models_anonymous_multikey_uses_first_key() {
+        let (svc, _db) = setup().await;
+        // Multi-key api_key — must not fail with header parsing error
+        let req = FetchModelsAnonymousRequest {
+            platform: "minimax".into(),
+            base_url: "https://unused".into(),
+            api_key: "fake-key\nanother-key".into(),
+            bedrock_config: None,
+            try_fix: false,
+        };
+        let resp = svc.fetch_models_anonymous(&req).await.unwrap();
+        assert_eq!(resp.models.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn load_config_multi_key_stores_first_key() {
+        let (svc, db) = setup().await;
+        // Save a provider with multi-key api_key
+        let id = create_provider(&db, "openai", "https://api.openai.com", "sk-key1\nsk-key2").await;
+        let config = svc.load_provider_config(&id).await.unwrap();
+        // Must extract only the first key for model fetching
+        assert_eq!(config.api_key, "sk-key1");
     }
 }

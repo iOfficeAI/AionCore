@@ -1,240 +1,241 @@
 ---
 name: aionui-troubleshooting
 description: >-
-  Diagnose a running AionUi installation — locate and inspect conversations (including stuck/running ones), read aioncore logs, check LLM provider health, list scheduled cron jobs and their last run status, inspect teams and member state, and check MCP server health. Use when the user reports that AionUi is misbehaving: a conversation is stuck or errored, an LLM/provider call is failing, a scheduled task did not run, an MCP server has no tools, a team member is hung, or they just ask "what's wrong with AionUi" / "排查一下 aionui". Engine-agnostic — works the same for claude / aionrs / gemini / openclaw conversations.
+  Diagnose a running AionUi installation: inspect stuck or errored conversations, read provider health, scheduled task state, MCP server health, team member state, backend health, and aioncore logs. Use when the user reports AionUi is misbehaving, a conversation is stuck, an LLM/provider call is failing, a scheduled task did not run, an MCP server has no tools, a team member is hung, or they ask to troubleshoot AionUi.
 ---
-
-> **⚠️ Platform note — read before running any command.** The shell snippets in this skill are written for **macOS / Linux** (bash/zsh). Always check which OS you are on first. On **Windows** do **not** run them verbatim — the underlying tool/CLI commands are usually cross-platform, but the surrounding shell syntax is not. Translate it to PowerShell before running:
->
-> | bash (macOS / Linux) | PowerShell (Windows) |
-> | --- | --- |
-> | `a && b` | run as two steps, or `a; if ($?) { b }` |
-> | `cat <<'EOF' \| tool …` (heredoc) | write the text to a temp file, then pipe/pass that file to the tool |
-> | `VAR=$(cmd)` … `$VAR` | `$VAR = cmd` … `$VAR` |
-> | `cmd > /dev/null` | `cmd > $null` |
-> | `… \| grep PAT` | `… \| Select-String PAT` |
-> | `… \| jq …` | `… \| ConvertFrom-Json`, then read the fields |
-> | `python3 x.py` | `python x.py` (or `py x.py`) |
-> | `~/dir`, `/tmp` | `$env:USERPROFILE\dir`, `$env:TEMP` |
-> | `cp` / `mkdir -p` / `rm -rf` | `Copy-Item` / `New-Item -ItemType Directory -Force` / `Remove-Item -Recurse -Force` |
->
-> If a command has no obvious Windows equivalent, prefer the built-in file/HTTP tools over raw shell.
 
 # AionUi Troubleshooting
 
-Diagnose a running AionUi installation by reading its **project-level** data:
-the aioncore REST API, the unified SQLite store, and the aioncore log files.
+Use the bundled `aioncore diagnose` CLI for read-only troubleshooting. It uses
+the runtime context injected into the current agent conversation, so do not
+discover ports or call backend endpoints by hand.
 
-This is **engine-agnostic**. AionUi runs conversations on several backends
-(`acp`/claude, `aionrs`, `gemini`), but troubleshooting goes
-through AionUi's own data — the `conversations` API, the unified `messages`
-table, provider health, crons, teams, MCP — so the same checks work no matter
-which engine a conversation uses. Do **not** reach into engine-specific
-transcript files (e.g. `~/.claude/projects/*.jsonl` or
-`~/.aionui/aionrs-sessions/*.json`); they are implementation details of one
-backend and are already covered by the unified `messages` table.
+Examples in this skill use English. When reporting findings or writing user
+content, use the user's language.
 
-## How it works
+## Rules
 
-AionUi is front/back separated: the Electron UI talks to a local `aioncore`
-backend. The backend's REST port is **dynamic** (aioncore launches with
-`--port 0`), so the first step is always discovery. The helper script discovers
-everything from the running process and wraps every read.
+1. Use only `"$AIONUI_HELPER_BIN" diagnose ...`.
+2. Start with `diagnose overview` for broad "what is wrong" requests.
+3. Use named diagnose commands first. Use `diagnose http get` only when no named
+   command covers the diagnostic need.
+4. Treat every command as read-only. To change AionUi configuration, use the
+   separate `aionui-config` skill.
+5. Never print raw provider, MCP header, token, password, or secret values. The
+   CLI redacts known secret fields by default, but summarize sensitive findings
+   carefully.
+6. A single `running` snapshot does not prove a hang. Re-check the same
+   conversation and compare runtime fields, message progress, and logs.
 
-## Setup
+## Capability Discovery
 
-One self-contained helper — no external dependencies, read-only everywhere.
+When unsure which command or stdin fields are available, ask the CLI:
 
 ```bash
-python3 scripts/aion_diag.py discover
+"$AIONUI_HELPER_BIN" diagnose capabilities
 ```
 
-`discover` finds the live backend and prints what every other command relies on:
+The output is the agent-readable contract: domains, command names, stdin JSON
+fields, selector behavior, redacted fields, and the controlled HTTP escape
+hatch.
+
+## Runtime Context
+
+The main stable selector is the current conversation:
 
 ```json
 {
-  "pid": 86716,
-  "base_url": "http://127.0.0.1:58188",
-  "port": 58188,
-  "log_dir": "/Users/you/Library/Logs/AionUi",
-  "data_dir": "/Users/you/.aionui",
-  "version": "2.1.18",
-  "db_path": "/Users/you/.aionui/aionui-backend.db"
+  "conversation_id": "current"
 }
 ```
 
-How discovery works (and why it's robust):
-- The long-lived backend process is `aioncore`; short-lived helper subprocesses
-  may include `mcp-team-stdio` for active Team sessions.
-- Reads `--log-dir`, `--data-dir`, `--app-version` straight from its argv — so
-  if the user changed the log directory, **we follow it**, never hardcode it.
-- The REST port is NOT in argv (`--port 0`), so the script probes every port the
-  process listens on and keeps the one that answers `/health` with `status:ok`.
+The CLI resolves `"current"` from `AIONUI_CONVERSATION_ID`. Commands that read
+the backend also use `AIONUI_BASE_URL` and `AIONUI_USER_ID` from the same
+runtime context.
 
-If `discover` exits with an error / code 3, AionUi is **not running**. Tell the
-user to launch it — do not guess a port.
+## Start Wide
 
-> The script redacts secrets (`api_key`, tokens, …) in all output. Provider
-> records contain plaintext API keys; never print raw provider JSON yourself —
-> go through the helper.
-
-## Golden rule: start wide, then drill in
-
-For "something is wrong with AionUi" with no specifics, run `overview` first —
-it's a one-shot snapshot across health, providers, MCP, crons, and running
-conversations. Then drill into whatever it flags.
+For a vague "AionUi is broken" report, run:
 
 ```bash
-python3 scripts/aion_diag.py overview
+"$AIONUI_HELPER_BIN" diagnose overview
 ```
 
----
+Use the overview to decide where to drill in:
 
-## Commands by symptom
+- `providers.unhealthy` means inspect provider health.
+- `mcp.enabled_but_no_tools` means inspect MCP startup/tool registration.
+- `cron.failing` means inspect scheduled task state.
+- `running_conversations` means inspect the conversation runtime repeatedly.
 
-All commands take the discovered backend automatically. Output is JSON unless
-noted.
+## Commands By Symptom
 
-### "A conversation is stuck / errored / behaving wrong"
+### Conversation Stuck Or Errored
+
+Inspect the current conversation:
 
 ```bash
-python3 scripts/aion_diag.py conversations [--limit N]   # list: id, name, engine type, status
-python3 scripts/aion_diag.py conversation <id>           # status + runtime + recent errors + stuck hint
-python3 scripts/aion_diag.py messages <id> [--limit N] [--errors]   # message history from SQLite
+"$AIONUI_HELPER_BIN" diagnose conversations get <<'JSON'
+{
+  "conversation_id": "current"
+}
+JSON
 ```
 
-- `conversation <id>` is the workhorse. It returns the live `runtime` block
-  (`state`, `task_status`, `is_processing`, `turn_id`, plus `can_send_message`,
-  `has_task`, `pending_confirmations`), the 5 most recent **error** messages, and
-  a `stuck_hint` when `state=running` + `is_processing=true`. Note `state` (the
-  runtime machine state) and `task_status` are different fields — stuck detection
-  keys off `state`.
-- **Stuck detection is comparative, not absolute.** A single `running` snapshot
-  is normal — that may just be the active turn. To confirm a hang, run
-  `conversation <id>` a few times seconds apart: if `turn_id` and runtime never
-  change while no new messages arrive, it's stuck. Cross-check with
-  `logs --conv <id>`.
-- **Not every non-progressing turn is stuck.** `state=waiting_confirmation` (or
-  `pending_confirmations > 0`) means the turn is *blocked on a user approval*,
-  not hung — the fix is to answer the pending confirmation, not to restart the
-  conversation. The `stuck_hint` distinguishes these two cases.
-- `messages <id> --errors` pulls just the failed messages/tool-calls for that
-  conversation from the unified `messages` table (engine-agnostic).
-
-### "An LLM / provider call is failing"
+Inspect a known conversation:
 
 ```bash
-python3 scripts/aion_diag.py providers
+"$AIONUI_HELPER_BIN" diagnose conversations get <<'JSON'
+{
+  "conversation_id": "conv_123"
+}
+JSON
 ```
 
-Lists every configured provider with its `model_health` (`status`, `latency`,
-`last_check`, and an `error` string on the last failed check) and an
-`unhealthy_models` summary. A provider whose models show non-`healthy` status,
-huge `latency`, or a stale `last_check` is the suspect.
-Then confirm with the log (filter by the provider's base_url or id):
+Read recent messages:
 
 ```bash
-python3 scripts/aion_diag.py logs --errors --lines 100
+"$AIONUI_HELPER_BIN" diagnose conversations messages <<'JSON'
+{
+  "conversation_id": "current",
+  "limit": 30,
+  "errors_only": true
+}
+JSON
 ```
 
-> `model_health` only holds the **most recent** check per model — there's no
-> historical error log in it. For the actual failure cause (timeout, 401, 429,
-> bad base_url), the aioncore log is the source of truth.
+Interpretation:
 
-### "A scheduled task didn't run"
+- `state=running` with `is_processing=true` is only a suspected hang after
+  repeated checks show no `turn_id`, runtime, or message progress.
+- `state=waiting_confirmation` or `pending_confirmations > 0` means the turn is
+  waiting for user approval, not hung.
+
+### Provider Or Model Failure
 
 ```bash
-python3 scripts/aion_diag.py crons
+"$AIONUI_HELPER_BIN" diagnose providers summary
 ```
 
-This reads the `cron_jobs` table from the SQLite store directly (read-only). A
-REST API for crons does exist (`/api/cron/jobs`, used by the `aionui-config`
-skill to *create/manage* jobs), but for diagnosis the table read is more direct
-and surfaces the run-state columns in one shot. It surfaces a `failing` list
-(jobs whose `last_status` is `error` or `missed`) plus every job's `schedule_*`,
-`last_status`, `last_error`, `next_run_at`, `last_run_at`, `run_count`,
-`retry_count`. Check `enabled`, compare `next_run_at` to now, and read
-`last_error` for failed jobs.
+Look for non-`healthy` model health, stale `last_check`, high latency, or an
+error string. The summary is redacted; do not ask for raw provider JSON unless
+the named command is insufficient.
 
-### "An MCP server has no tools / isn't working"
+### Scheduled Task Did Not Run
 
 ```bash
-python3 scripts/aion_diag.py mcp
+"$AIONUI_HELPER_BIN" diagnose cron summary
 ```
 
-Lists MCP servers with `enabled`, `transport`, and `tool_count`. It flags any
-server that is **enabled but exposes 0 tools** — the classic "failed to start"
-signature (bad command, missing binary, crashed on launch). Then check the log
-around startup. A `disabled` server with 0 tools is fine — the user turned it off.
+Check `enabled`, `last_status`, `last_error`, `next_run_at`, `last_run_at`,
+`run_count`, and `retry_count` when present.
 
-### "A team / team member is hung"
+### MCP Server Has No Tools
 
 ```bash
-python3 scripts/aion_diag.py teams
+"$AIONUI_HELPER_BIN" diagnose mcp summary
 ```
 
-Lists teams and members; for each member it resolves the linked
-`conversation_id` to its live `conv_state`. A member stuck in `running` (while
-others are `idle`) is the one to drill into with `conversation <member-conv-id>`.
+An enabled server with `tool_count=0` usually means startup failed, the command
+is unavailable, credentials are invalid, or the server crashed before tool
+registration.
 
-### "Is the backend even alive? What version?"
+### Team Member Hung
 
 ```bash
-python3 scripts/aion_diag.py health      # GET /health: status + core version + build_time
-python3 scripts/aion_diag.py discover    # also shows app version, port, dirs
+"$AIONUI_HELPER_BIN" diagnose teams summary
 ```
 
-### Reading logs
+Find the member's `conversation_id`, then drill into that conversation:
 
 ```bash
-python3 scripts/aion_diag.py logs [--lines N] [--errors] [--conv <id>]
+"$AIONUI_HELPER_BIN" diagnose conversations get <<'JSON'
+{
+  "conversation_id": "member_conv_123"
+}
+JSON
 ```
 
-- Tails the latest `*.aioncore.log` in the discovered `log_dir` (NDJSON: one
-  JSON object per line — timestamp, level, target, HTTP status/path).
-- `--errors` keeps only ERROR/WARN/error/panic lines.
-- `--conv <id>` keeps only lines mentioning that conversation id — the fastest
-  way to see one conversation's request/response trace.
-- Need an arbitrary endpoint not wrapped above? `python3 scripts/aion_diag.py
-  get /api/<path>` does a raw (redacted) GET.
+### Backend Health
 
-> Known log noise: `"No onPostToolUseHook found for tool use ID: ..."` WARNs fire
-> on nearly every tool call and are benign SDK-level chatter — don't treat them
-> as the fault.
+```bash
+"$AIONUI_HELPER_BIN" diagnose health
+```
 
----
+Use this to confirm the backend is reachable and read the core version/build
+metadata.
 
-## Data source map
+### Logs
 
-| Concern | Source | Access |
-| --- | --- | --- |
-| Backend alive / version | `GET /health` | REST |
-| Conversation list + runtime state | `GET /api/conversations[/{id}]` | REST |
-| Conversation messages / errors | `messages` table (by `conversation_id`) | SQLite (read-only) |
-| LLM provider health | `GET /api/providers` → `model_health` | REST (api_key redacted) |
-| Scheduled jobs | `cron_jobs` table (REST `/api/cron/jobs` exists too) | SQLite (read-only) |
-| Teams + members | `GET /api/teams` | REST |
-| MCP servers | `GET /api/mcp/servers` | REST |
-| Logs | `*.aioncore.log` in `--log-dir` | File tail |
+Tail logs when the runtime provides `AIONUI_LOG_DIR`:
 
-`db_path` and `log_dir` are always taken from `discover` (process argv), never
-hardcoded, so they track whatever the user configured.
+```bash
+"$AIONUI_HELPER_BIN" diagnose logs tail <<'JSON'
+{
+  "lines": 100,
+  "errors_only": true,
+  "conversation_id": "current"
+}
+JSON
+```
 
-## Verification / safety notes
+If `AIONUI_LOG_DIR` is unavailable and the user gives a log directory, pass it
+explicitly:
 
-- All SQLite access is opened **read-only** (`mode=ro`) — diagnosis never mutates
-  the live store.
-- All output is run through secret redaction. If you ever need to show a provider
-  record, use the helper's `providers` command, not a raw `get`.
-- Confirm "stuck" only after repeated snapshots — one `running` reading is not a
-  fault.
-- This skill is **read-only diagnosis**. To *change* configuration (create/edit
-  assistants, add MCP servers, attach skills), use the separate
-  `aionui-config` skill.
+```bash
+"$AIONUI_HELPER_BIN" diagnose logs tail <<'JSON'
+{
+  "log_dir": "/Users/alex/Library/Logs/AionUi",
+  "lines": 100,
+  "errors_only": true,
+  "conversation_id": "conv_123"
+}
+JSON
+```
 
-## Not yet covered
+Known benign noise: `No onPostToolUseHook found for tool use ID` warnings can
+appear around tool calls and are not automatically the root cause.
 
-- No streaming/live log follow — only tail-on-demand.
-- No historical provider-error timeline (only the latest `model_health` check);
-  reconstruct history from the logs.
-- Repairing a broken conversation (vs. diagnosing it) is out of scope.
+## Controlled HTTP Escape Hatch
+
+Use this only when a named command does not cover the diagnostic read.
+
+```bash
+"$AIONUI_HELPER_BIN" diagnose http get <<'JSON'
+{
+  "path": "/api/teams",
+  "reason": "Inspect team fields not covered by diagnose teams summary."
+}
+JSON
+```
+
+Constraints:
+
+- GET only.
+- Path must be `/health` or start with `/api/`.
+- Output is redacted and may be truncated.
+- Prefer adding a named CLI command later if the same raw read becomes common.
+
+## Data Source Map
+
+| Concern | Command |
+| --- | --- |
+| Backend alive / version | `diagnose health` |
+| Cross-domain snapshot | `diagnose overview` |
+| Conversation runtime | `diagnose conversations get` |
+| Conversation messages | `diagnose conversations messages` |
+| Provider health | `diagnose providers summary` |
+| Scheduled jobs | `diagnose cron summary` |
+| MCP servers | `diagnose mcp summary` |
+| Teams and member state | `diagnose teams summary` |
+| Logs | `diagnose logs tail` |
+| Uncovered read-only API | `diagnose http get` |
+
+## Safety Notes
+
+- This skill diagnoses; it does not repair.
+- For configuration changes, switch to `aionui-config`.
+- For scheduled task creation or updates, use the `cron` skill or
+  `aionui-config` cron commands.
+- When reporting results, explain evidence and uncertainty: "suspected stuck"
+  after one snapshot, "confirmed stuck" only after repeated unchanged snapshots.

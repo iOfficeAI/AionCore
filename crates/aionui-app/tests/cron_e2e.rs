@@ -7,15 +7,8 @@
 
 mod common;
 
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post, put};
+use axum::http::StatusCode;
 use serde_json::json;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
-use tokio::process::Command;
 use tower::ServiceExt;
 
 use aionui_db::{
@@ -31,12 +24,6 @@ use common::{
 // ── Helpers ──────────────────────────────────────────────────────────
 
 const DEFAULT_CRON_ASSISTANT_ID: &str = "cron-e2e-assistant";
-
-fn cron_helper_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aioncore"));
-    command.arg("cron-helper");
-    command
-}
 
 fn default_assistant_agent_config(name: &str) -> serde_json::Value {
     json!({
@@ -152,262 +139,6 @@ async fn au2_unauthenticated_all_endpoints() {
     }
 }
 
-#[derive(Debug, Default)]
-struct CapturedCronHelperRequest {
-    conversation_id: String,
-    user_id: String,
-    job_id: Option<String>,
-    payload: Option<serde_json::Value>,
-}
-
-type CronHelperCapture = Arc<Mutex<Option<CapturedCronHelperRequest>>>;
-
-async fn fake_conversation_cron_list(
-    State(capture): State<CronHelperCapture>,
-    headers: HeaderMap,
-) -> axum::Json<serde_json::Value> {
-    *capture.lock().unwrap() = Some(CapturedCronHelperRequest {
-        conversation_id: headers
-            .get("x-aionui-conversation-id")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned(),
-        user_id: headers
-            .get("x-aionui-user-id")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned(),
-        job_id: None,
-        payload: None,
-    });
-    axum::Json(json!({ "success": true, "data": [] }))
-}
-
-async fn fake_conversation_cron_create(
-    State(capture): State<CronHelperCapture>,
-    headers: HeaderMap,
-    axum::Json(payload): axum::Json<serde_json::Value>,
-) -> axum::Json<serde_json::Value> {
-    *capture.lock().unwrap() = Some(CapturedCronHelperRequest {
-        conversation_id: headers
-            .get("x-aionui-conversation-id")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned(),
-        user_id: headers
-            .get("x-aionui-user-id")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned(),
-        job_id: None,
-        payload: Some(payload),
-    });
-    axum::Json(json!({ "success": true, "data": { "id": "cron_helper_created" } }))
-}
-
-async fn fake_conversation_cron_update(
-    State(capture): State<CronHelperCapture>,
-    Path(job_id): Path<String>,
-    headers: HeaderMap,
-    axum::Json(payload): axum::Json<serde_json::Value>,
-) -> axum::Json<serde_json::Value> {
-    *capture.lock().unwrap() = Some(CapturedCronHelperRequest {
-        conversation_id: headers
-            .get("x-aionui-conversation-id")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned(),
-        user_id: headers
-            .get("x-aionui-user-id")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned(),
-        job_id: Some(job_id),
-        payload: Some(payload),
-    });
-    axum::Json(json!({ "success": true, "data": { "id": "cron_helper_updated" } }))
-}
-
-async fn spawn_cron_helper_probe_server(capture: CronHelperCapture) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = axum::Router::new()
-        .route("/api/internal/conversation-cron/list", get(fake_conversation_cron_list))
-        .route(
-            "/api/internal/conversation-cron/create",
-            post(fake_conversation_cron_create),
-        )
-        .route(
-            "/api/internal/conversation-cron/jobs/{job_id}",
-            put(fake_conversation_cron_update),
-        )
-        .with_state(capture);
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), handle)
-}
-
-async fn spawn_health_only_server() -> (String, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = axum::Router::new().route("/health", get(|| async { axum::Json(json!({ "ok": true })) }));
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), handle)
-}
-
-#[tokio::test]
-async fn helper_list_sends_conversation_headers_from_runtime_env() {
-    let capture = Arc::new(Mutex::new(None));
-    let (base_url, handle) = spawn_cron_helper_probe_server(capture.clone()).await;
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("user-selected-project");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let output = cron_helper_command()
-        .arg("list")
-        .current_dir(&workspace)
-        .env("AIONUI_BASE_URL", base_url)
-        .env("AIONUI_CONVERSATION_ID", "conv_helper_1")
-        .env("AIONUI_USER_ID", "user_helper_1")
-        .output()
-        .await
-        .unwrap();
-
-    handle.abort();
-    assert!(
-        output.status.success(),
-        "helper failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let captured = capture
-        .lock()
-        .unwrap()
-        .take()
-        .expect("server should receive helper request");
-    assert_eq!(captured.conversation_id, "conv_helper_1");
-    assert_eq!(captured.user_id, "user_helper_1");
-}
-
-#[tokio::test]
-async fn helper_create_reads_payload_from_stdin_without_payload_file() {
-    let capture = Arc::new(Mutex::new(None));
-    let (base_url, handle) = spawn_cron_helper_probe_server(capture.clone()).await;
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("user-selected-project");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let mut child = cron_helper_command()
-        .arg("create")
-        .current_dir(&workspace)
-        .env("AIONUI_BASE_URL", base_url)
-        .env("AIONUI_CONVERSATION_ID", "conv_helper_create")
-        .env("AIONUI_USER_ID", "user_helper_create")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(
-            br#"{
-  "name": "stdin create",
-  "schedule": "30 9 * * 1-5",
-  "schedule_description": "weekday mornings",
-  "message": "Reply from stdin."
-}"#,
-        )
-        .await
-        .unwrap();
-    drop(child.stdin.take());
-
-    let output = child.wait_with_output().await.unwrap();
-
-    handle.abort();
-    assert!(
-        output.status.success(),
-        "helper failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let captured = capture
-        .lock()
-        .unwrap()
-        .take()
-        .expect("server should receive helper request");
-    assert_eq!(captured.conversation_id, "conv_helper_create");
-    assert_eq!(captured.user_id, "user_helper_create");
-    assert_eq!(captured.payload.unwrap()["name"], "stdin create");
-    assert!(
-        std::fs::read_dir(&workspace).unwrap().next().is_none(),
-        "helper create must not leave payload files in the workspace"
-    );
-}
-
-#[tokio::test]
-async fn helper_update_reads_payload_from_stdin_without_payload_file() {
-    let capture = Arc::new(Mutex::new(None));
-    let (base_url, handle) = spawn_cron_helper_probe_server(capture.clone()).await;
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("user-selected-project");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let mut child = cron_helper_command()
-        .arg("update")
-        .arg("--job-id")
-        .arg("cron_helper_update")
-        .current_dir(&workspace)
-        .env("AIONUI_BASE_URL", base_url)
-        .env("AIONUI_CONVERSATION_ID", "conv_helper_update")
-        .env("AIONUI_USER_ID", "user_helper_update")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(
-            br#"{
-  "name": "stdin update",
-  "schedule": "45 10 * * 1-5",
-  "schedule_description": "weekday later mornings",
-  "message": "Updated from stdin."
-}"#,
-        )
-        .await
-        .unwrap();
-    drop(child.stdin.take());
-
-    let output = child.wait_with_output().await.unwrap();
-
-    handle.abort();
-    assert!(
-        output.status.success(),
-        "helper failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let captured = capture
-        .lock()
-        .unwrap()
-        .take()
-        .expect("server should receive helper request");
-    assert_eq!(captured.conversation_id, "conv_helper_update");
-    assert_eq!(captured.user_id, "user_helper_update");
-    assert_eq!(captured.job_id.as_deref(), Some("cron_helper_update"));
-    assert_eq!(captured.payload.unwrap()["name"], "stdin update");
-    assert!(
-        std::fs::read_dir(&workspace).unwrap().next().is_none(),
-        "helper update must not leave payload files in the workspace"
-    );
-}
-
 #[test]
 fn cron_skill_does_not_instruct_agents_to_write_payload_files() {
     let skill = std::fs::read_to_string(
@@ -421,55 +152,14 @@ fn cron_skill_does_not_instruct_agents_to_write_payload_files() {
     assert!(!skill.contains("python3"));
     assert!(!skill.contains("aionui_cron.py"));
     assert!(skill.contains("$AIONUI_HELPER_BIN"));
-    assert!(skill.contains("cron-helper"));
+    assert!(!skill.contains("cron-helper"));
+    assert!(skill.contains("config cron current list"));
+    assert!(skill.contains("config cron current create"));
+    assert!(skill.contains("config cron current update"));
+    assert!(skill.contains("\"job_id\""));
     assert!(skill.contains("After a successful create or update"));
     assert!(skill.contains("Do not show internal ids"));
     assert!(skill.contains("cron_..."));
-}
-
-#[tokio::test]
-async fn helper_list_fails_without_runtime_env_even_in_temp_workspace() {
-    let (base_url, handle) = spawn_health_only_server().await;
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("conversations").join("codex-temp-conv_from_name");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let output = cron_helper_command()
-        .arg("list")
-        .current_dir(&workspace)
-        .env("AIONUI_BASE_URL", base_url)
-        .env_remove("AIONUI_CONVERSATION_ID")
-        .env_remove("AIONUI_USER_ID")
-        .output()
-        .await
-        .unwrap();
-
-    handle.abort();
-    assert!(!output.status.success(), "helper should require explicit context");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("AIONUI_CONVERSATION_ID"));
-}
-
-#[tokio::test]
-async fn helper_list_rejects_backend_without_conversation_cron_route() {
-    let (base_url, handle) = spawn_health_only_server().await;
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("user-selected-project");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let output = cron_helper_command()
-        .arg("list")
-        .current_dir(&workspace)
-        .env("AIONUI_BASE_URL", base_url.clone())
-        .env("AIONUI_CONVERSATION_ID", "conv_helper_2")
-        .env("AIONUI_USER_ID", "user_helper_2")
-        .output()
-        .await
-        .unwrap();
-
-    handle.abort();
-    assert!(!output.status.success(), "helper should reject a health-only backend");
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains(&format!("AionUi backend not found at AIONUI_BASE_URL: {base_url}"))
-    );
 }
 
 // ── CJ-1: Create cron job ───────────────────────────────────────────

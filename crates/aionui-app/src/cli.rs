@@ -85,8 +85,12 @@ impl From<ManagedResourcesModeArg> for aionui_runtime::ManagedResourcesMode {
 // verbatim.
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
-    /// Manage cron jobs for the current conversation from an agent skill.
-    CronHelper(CronHelperArgs),
+    /// Print the top-level agent-facing CLI capability index.
+    Capabilities,
+    /// Agent-facing automation CLI for AionUi configuration.
+    Config(ConfigArgs),
+    /// Agent-facing read-only troubleshooting CLI for AionUi diagnosis.
+    Diagnose(DiagnoseArgs),
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
     McpBridge,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
@@ -104,7 +108,9 @@ pub(crate) enum Command {
 impl Command {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
-            Self::CronHelper(_) => "cron-helper",
+            Self::Capabilities => "capabilities",
+            Self::Config(_) => "config",
+            Self::Diagnose(_) => "diagnose",
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
@@ -118,28 +124,402 @@ impl Command {
 }
 
 #[derive(Args, Debug, Clone)]
-pub(crate) struct CronHelperArgs {
+pub(crate) struct ConfigArgs {
     #[command(subcommand)]
-    pub command: CronHelperCommand,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub(crate) enum CronHelperCommand {
-    /// Print the configured aioncore base URL after validating cron helper routes.
-    Discover,
-    /// List cron jobs linked to the current conversation.
-    List,
-    /// Create a cron job from a JSON payload on stdin.
-    Create,
-    /// Update a cron job from a JSON payload on stdin.
-    Update(CronHelperUpdateArgs),
+    pub command: ConfigCommand,
 }
 
 #[derive(Args, Debug, Clone)]
-pub(crate) struct CronHelperUpdateArgs {
-    /// Cron job id to update.
-    #[arg(long)]
-    pub job_id: String,
+pub(crate) struct DiagnoseArgs {
+    #[command(subcommand)]
+    pub command: DiagnoseCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum DiagnoseCommand {
+    /// Print the agent-readable diagnose CLI capability contract.
+    Capabilities,
+    /// Print the current agent runtime context.
+    Context,
+    /// Read backend health.
+    Health,
+    /// Read a cross-domain diagnostic snapshot.
+    Overview,
+    /// Inspect conversation state and messages.
+    Conversations(DiagnoseConversationsArgs),
+    /// Inspect provider health summary.
+    Providers(DiagnoseProvidersArgs),
+    /// Inspect MCP server summary.
+    Mcp(DiagnoseMcpArgs),
+    /// Inspect scheduled task summary.
+    Cron(DiagnoseCronArgs),
+    /// Inspect team summary.
+    Teams(DiagnoseTeamsArgs),
+    /// Read aioncore logs.
+    Logs(DiagnoseLogsArgs),
+    /// Controlled HTTP read escape hatch.
+    Http(DiagnoseHttpArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct DiagnoseConversationsArgs {
+    #[command(subcommand)]
+    pub command: DiagnoseConversationsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum DiagnoseConversationsCommand {
+    List,
+    Get,
+    Messages,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct DiagnoseProvidersArgs {
+    #[command(subcommand)]
+    pub command: DiagnoseSummaryCommand,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct DiagnoseMcpArgs {
+    #[command(subcommand)]
+    pub command: DiagnoseSummaryCommand,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct DiagnoseCronArgs {
+    #[command(subcommand)]
+    pub command: DiagnoseSummaryCommand,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct DiagnoseTeamsArgs {
+    #[command(subcommand)]
+    pub command: DiagnoseSummaryCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum DiagnoseSummaryCommand {
+    Summary,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct DiagnoseLogsArgs {
+    #[command(subcommand)]
+    pub command: DiagnoseLogsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum DiagnoseLogsCommand {
+    Tail,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct DiagnoseHttpArgs {
+    #[command(subcommand)]
+    pub command: DiagnoseHttpCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum DiagnoseHttpCommand {
+    Get,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigCommand {
+    /// Print the agent-readable config CLI capability contract.
+    Capabilities,
+    /// Print the current agent runtime context.
+    Context,
+    /// Manage assistants and assistant-owned behavior.
+    Assistants(ConfigAssistantsArgs),
+    /// Manage AionUi skills.
+    Skills(ConfigSkillsArgs),
+    /// Manage MCP servers and OAuth state.
+    Mcp(ConfigMcpArgs),
+    /// Manage model providers.
+    Providers(ConfigProvidersArgs),
+    /// Manage backend and client settings.
+    Settings(ConfigSettingsArgs),
+    /// Manage agent catalog and custom agents.
+    Agents(ConfigAgentsArgs),
+    /// Manage scheduled tasks.
+    Cron(ConfigCronArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigAssistantsArgs {
+    #[command(subcommand)]
+    pub command: ConfigAssistantsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigAssistantsCommand {
+    List,
+    Get,
+    Create,
+    Update,
+    Delete,
+    Import,
+    State,
+    Rule(ConfigAssistantRuleArgs),
+    Skill(ConfigAssistantSkillArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigAssistantRuleArgs {
+    #[command(subcommand)]
+    pub command: ConfigAssistantTextCommand,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigAssistantSkillArgs {
+    #[command(subcommand)]
+    pub command: ConfigAssistantTextCommand,
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+pub(crate) enum ConfigAssistantTextCommand {
+    Read,
+    Write,
+    Delete,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigSkillsArgs {
+    #[command(subcommand)]
+    pub command: ConfigSkillsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigSkillsCommand {
+    List,
+    Info,
+    Paths,
+    Import,
+    Delete,
+    Scan,
+    ExternalPaths(ConfigSkillsExternalPathsArgs),
+    Market(ConfigSkillsMarketArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigSkillsExternalPathsArgs {
+    #[command(subcommand)]
+    pub command: ConfigSkillsExternalPathsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigSkillsExternalPathsCommand {
+    List,
+    Add,
+    Remove,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigSkillsMarketArgs {
+    #[command(subcommand)]
+    pub command: ConfigSkillsMarketCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigSkillsMarketCommand {
+    Enable,
+    Disable,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigMcpArgs {
+    #[command(subcommand)]
+    pub command: ConfigMcpCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigMcpCommand {
+    Servers(ConfigMcpServersArgs),
+    TestConnection,
+    AgentConfigs,
+    Oauth(ConfigMcpOauthArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigMcpServersArgs {
+    #[command(subcommand)]
+    pub command: ConfigMcpServersCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigMcpServersCommand {
+    List,
+    Get,
+    Create,
+    Update,
+    Delete,
+    Toggle,
+    Import,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigMcpOauthArgs {
+    #[command(subcommand)]
+    pub command: ConfigMcpOauthCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigMcpOauthCommand {
+    CheckStatus,
+    Login,
+    Logout,
+    Authenticated,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigProvidersArgs {
+    #[command(subcommand)]
+    pub command: ConfigProvidersCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigProvidersCommand {
+    List,
+    Create,
+    Update,
+    Delete,
+    DetectProtocol,
+    FetchModels,
+    Models(ConfigProviderModelsArgs),
+    HealthCheck,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigProviderModelsArgs {
+    #[command(subcommand)]
+    pub command: ConfigProviderModelsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigProviderModelsCommand {
+    Fetch,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigSettingsArgs {
+    #[command(subcommand)]
+    pub command: ConfigSettingsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigSettingsCommand {
+    Get,
+    Patch,
+    Client(ConfigSettingsClientArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigSettingsClientArgs {
+    #[command(subcommand)]
+    pub command: ConfigSettingsClientCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigSettingsClientCommand {
+    Get,
+    Put,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigAgentsArgs {
+    #[command(subcommand)]
+    pub command: ConfigAgentsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigAgentsCommand {
+    List,
+    Enable,
+    Overrides(ConfigAgentOverridesArgs),
+    Custom(ConfigAgentCustomArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigAgentOverridesArgs {
+    #[command(subcommand)]
+    pub command: ConfigAgentOverridesCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigAgentOverridesCommand {
+    Get,
+    Set,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigAgentCustomArgs {
+    #[command(subcommand)]
+    pub command: ConfigAgentCustomCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigAgentCustomCommand {
+    Create,
+    Update,
+    Delete,
+    TryConnect,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigCronArgs {
+    #[command(subcommand)]
+    pub command: ConfigCronCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigCronCommand {
+    Jobs(ConfigCronJobsArgs),
+    Current(ConfigCronCurrentArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigCronJobsArgs {
+    #[command(subcommand)]
+    pub command: ConfigCronJobsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigCronJobsCommand {
+    List,
+    Get,
+    Create,
+    Update,
+    Delete,
+    Run,
+    Skill(ConfigCronJobSkillArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigCronJobSkillArgs {
+    #[command(subcommand)]
+    pub command: ConfigCronJobSkillCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigCronJobSkillCommand {
+    Get,
+    Save,
+    Delete,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigCronCurrentArgs {
+    #[command(subcommand)]
+    pub command: ConfigCronCurrentCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigCronCurrentCommand {
+    List,
+    Create,
+    Update,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -157,7 +537,7 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
-    use super::{Cli, Command, CronHelperCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs};
+    use super::{Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs};
 
     #[test]
     fn long_version_flag_uses_workspace_package_version() {
@@ -219,19 +599,6 @@ mod tests {
     }
 
     #[test]
-    fn cron_helper_accepts_update_job_id() {
-        let cli = Cli::parse_from(["aioncore", "cron-helper", "update", "--job-id", "cron_1"]);
-
-        let Some(Command::CronHelper(args)) = cli.command else {
-            panic!("expected cron-helper command");
-        };
-        let CronHelperCommand::Update(update) = args.command else {
-            panic!("expected update subcommand");
-        };
-        assert_eq!(update.job_id, "cron_1");
-    }
-
-    #[test]
     fn managed_resources_mode_defaults_to_download() {
         let cli = Cli::parse_from(["aioncore"]);
         assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
@@ -280,15 +647,15 @@ mod tests {
         };
 
         let cases = [
+            (
+                Command::Config(ConfigArgs {
+                    command: ConfigCommand::Context,
+                }),
+                "config",
+            ),
             (Command::McpBridge, "mcp-bridge"),
             (Command::McpTeamStdio, "mcp-team-stdio"),
             (Command::Doctor, "doctor"),
-            (
-                Command::CronHelper(super::CronHelperArgs {
-                    command: CronHelperCommand::List,
-                }),
-                "cron-helper",
-            ),
             (
                 Command::PrepareManagedResources(prepare_args),
                 "prepare-managed-resources",
@@ -297,6 +664,85 @@ mod tests {
 
         for (command, expected) in cases {
             assert_eq!(command.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn config_cli_accepts_agent_facing_design_command_paths() {
+        let commands: &[&[&str]] = &[
+            &["aioncore", "config", "capabilities"],
+            &["aioncore", "config", "context"],
+            &["aioncore", "config", "assistants", "list"],
+            &["aioncore", "config", "assistants", "get"],
+            &["aioncore", "config", "assistants", "create"],
+            &["aioncore", "config", "assistants", "update"],
+            &["aioncore", "config", "assistants", "delete"],
+            &["aioncore", "config", "assistants", "import"],
+            &["aioncore", "config", "assistants", "state"],
+            &["aioncore", "config", "assistants", "rule", "read"],
+            &["aioncore", "config", "assistants", "rule", "write"],
+            &["aioncore", "config", "assistants", "rule", "delete"],
+            &["aioncore", "config", "assistants", "skill", "read"],
+            &["aioncore", "config", "assistants", "skill", "write"],
+            &["aioncore", "config", "assistants", "skill", "delete"],
+            &["aioncore", "config", "skills", "list"],
+            &["aioncore", "config", "skills", "info"],
+            &["aioncore", "config", "skills", "paths"],
+            &["aioncore", "config", "skills", "import"],
+            &["aioncore", "config", "skills", "delete"],
+            &["aioncore", "config", "skills", "scan"],
+            &["aioncore", "config", "mcp", "servers", "list"],
+            &["aioncore", "config", "mcp", "servers", "get"],
+            &["aioncore", "config", "mcp", "servers", "create"],
+            &["aioncore", "config", "mcp", "servers", "update"],
+            &["aioncore", "config", "mcp", "servers", "delete"],
+            &["aioncore", "config", "mcp", "servers", "toggle"],
+            &["aioncore", "config", "mcp", "servers", "import"],
+            &["aioncore", "config", "mcp", "test-connection"],
+            &["aioncore", "config", "mcp", "agent-configs"],
+            &["aioncore", "config", "mcp", "oauth", "check-status"],
+            &["aioncore", "config", "mcp", "oauth", "login"],
+            &["aioncore", "config", "mcp", "oauth", "logout"],
+            &["aioncore", "config", "mcp", "oauth", "authenticated"],
+            &["aioncore", "config", "providers", "list"],
+            &["aioncore", "config", "providers", "create"],
+            &["aioncore", "config", "providers", "update"],
+            &["aioncore", "config", "providers", "delete"],
+            &["aioncore", "config", "providers", "detect-protocol"],
+            &["aioncore", "config", "providers", "fetch-models"],
+            &["aioncore", "config", "providers", "models", "fetch"],
+            &["aioncore", "config", "providers", "health-check"],
+            &["aioncore", "config", "settings", "get"],
+            &["aioncore", "config", "settings", "patch"],
+            &["aioncore", "config", "settings", "client", "get"],
+            &["aioncore", "config", "settings", "client", "put"],
+            &["aioncore", "config", "agents", "list"],
+            &["aioncore", "config", "agents", "enable"],
+            &["aioncore", "config", "agents", "overrides", "get"],
+            &["aioncore", "config", "agents", "overrides", "set"],
+            &["aioncore", "config", "agents", "custom", "create"],
+            &["aioncore", "config", "agents", "custom", "update"],
+            &["aioncore", "config", "agents", "custom", "delete"],
+            &["aioncore", "config", "agents", "custom", "try-connect"],
+            &["aioncore", "config", "cron", "jobs", "list"],
+            &["aioncore", "config", "cron", "jobs", "get"],
+            &["aioncore", "config", "cron", "jobs", "create"],
+            &["aioncore", "config", "cron", "jobs", "update"],
+            &["aioncore", "config", "cron", "jobs", "delete"],
+            &["aioncore", "config", "cron", "jobs", "run"],
+            &["aioncore", "config", "cron", "jobs", "skill", "get"],
+            &["aioncore", "config", "cron", "jobs", "skill", "save"],
+            &["aioncore", "config", "cron", "jobs", "skill", "delete"],
+            &["aioncore", "config", "skills", "external-paths", "list"],
+            &["aioncore", "config", "skills", "external-paths", "add"],
+            &["aioncore", "config", "skills", "external-paths", "remove"],
+            &["aioncore", "config", "skills", "market", "enable"],
+            &["aioncore", "config", "skills", "market", "disable"],
+        ];
+
+        for command in commands {
+            let result = Cli::try_parse_from(*command);
+            assert!(result.is_ok(), "command should parse: {command:?}");
         }
     }
 

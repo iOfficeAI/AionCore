@@ -506,9 +506,12 @@ fn session_server_supported_by_capabilities(server: &SessionMcpServer, capabilit
 mod tests {
     use super::*;
     use aionui_realtime::BroadcastEventBus;
-    use aionui_runtime::init as init_runtime;
+    use aionui_runtime::{ManagedResourcesMode, init as init_runtime, set_managed_resources_mode};
     use std::sync::OnceLock;
-    use std::{mem, path::PathBuf};
+    use std::{
+        mem,
+        path::{Path, PathBuf},
+    };
 
     fn make_row(
         name: &str,
@@ -574,7 +577,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let runtime_root = tmp.path().join("node").join("node-v24.11.0-darwin-arm64");
+        let runtime_root = tmp.path().join("node").join(current_node_runtime_directory_name());
         let bin = runtime_root.join("bin");
         std::fs::create_dir_all(&bin).expect("create bin");
 
@@ -589,13 +592,66 @@ mod tests {
         tmp
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn current_node_runtime_directory_name() -> &'static str {
+        "node-v24.11.0-darwin-arm64"
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    fn current_node_runtime_directory_name() -> &'static str {
+        "node-v24.11.0-darwin-x64"
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn current_node_runtime_directory_name() -> &'static str {
+        "node-v24.11.0-linux-arm64"
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn current_node_runtime_directory_name() -> &'static str {
+        "node-v24.11.0-linux-x64"
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "x86_64")
+        ))
+    ))]
+    fn current_node_runtime_directory_name() -> &'static str {
+        panic!("unsupported managed Node runtime test platform")
+    }
+
+    #[cfg(unix)]
+    struct BundledRuntimeModeGuard;
+
+    #[cfg(unix)]
+    impl BundledRuntimeModeGuard {
+        fn install(root: &Path) -> Self {
+            unsafe { std::env::set_var("AIONUI_BUNDLED_MANAGED_RESOURCES", root) };
+            set_managed_resources_mode(ManagedResourcesMode::Bundled);
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for BundledRuntimeModeGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("AIONUI_BUNDLED_MANAGED_RESOURCES") };
+            set_managed_resources_mode(ManagedResourcesMode::Download);
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn row_to_sdk_stdio_flattens_resolved_npx_command() {
         let _lock = path_test_lock().lock().await;
         let runtime = install_fake_bundled_runtime();
         let _runtime_data_dir = test_runtime_data_dir();
-        unsafe { std::env::set_var("AIONUI_BUNDLED_MANAGED_RESOURCES", runtime.path()) };
+        let _runtime_mode = BundledRuntimeModeGuard::install(runtime.path());
 
         let row = make_row(
             "ctx7",
@@ -606,7 +662,6 @@ mod tests {
         );
 
         let server = row_to_sdk_mcp_server(&row).await.expect("convert");
-        unsafe { std::env::remove_var("AIONUI_BUNDLED_MANAGED_RESOURCES") };
         match server {
             McpServer::Stdio(s) => {
                 let command = s.command.to_string_lossy();
@@ -624,7 +679,7 @@ mod tests {
         let _lock = path_test_lock().lock().await;
         let runtime = install_fake_bundled_runtime();
         let _runtime_data_dir = test_runtime_data_dir();
-        unsafe { std::env::set_var("AIONUI_BUNDLED_MANAGED_RESOURCES", runtime.path()) };
+        let _runtime_mode = BundledRuntimeModeGuard::install(runtime.path());
 
         let meta = aionui_api_types::AgentMetadata {
             id: "agent-1".into(),
@@ -676,7 +731,6 @@ mod tests {
         .await
         .expect("resolved command spec");
 
-        unsafe { std::env::remove_var("AIONUI_BUNDLED_MANAGED_RESOURCES") };
         let command = spec.command.to_string_lossy();
         assert_ne!(command, "npx");
         assert!(command.ends_with("/npx"), "unexpected stdio command path: {command}");
@@ -685,8 +739,14 @@ mod tests {
         assert_eq!(spec.cwd.as_deref(), Some("/tmp/workspace"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn row_to_sdk_stdio_roundtrip() {
+        let _lock = path_test_lock().lock().await;
+        let runtime = install_fake_bundled_runtime();
+        let _runtime_data_dir = test_runtime_data_dir();
+        let _runtime_mode = BundledRuntimeModeGuard::install(runtime.path());
+
         let row = make_row(
             "ctx7",
             "stdio",

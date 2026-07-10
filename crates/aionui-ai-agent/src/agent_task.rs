@@ -522,7 +522,7 @@ mod aionrs_config_option_tests {
             model: "claude-sonnet-4-20250514".into(),
             base_url: None,
             system_prompt: None,
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             max_turns: None,
             max_tool_call_malformed_turns: None,
             max_tool_call_failure_turns: None,

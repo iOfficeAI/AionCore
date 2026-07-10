@@ -1,740 +1,593 @@
 ---
 name: aionui-config
 description: >-
-  Configure AionUi itself through its backend API — create and edit assistants (name, avatar, system prompt, quick-start prompts, engine), import and attach skills, manage MCP servers, configure LLM providers (add/edit a model endpoint, set the API key, fetch the model list, pick the default model), change app/UI settings (language, theme, font size, zoom, notifications), and create or manage scheduled tasks (cron jobs) from a natural-language schedule. Use when the user wants you to set up an AionUi assistant, sink a skill into AionUi's skill registry, attach skills to an assistant, change an assistant's avatar or system prompt, add or configure an MCP server, add an LLM/model provider or API key, switch the default model, change the theme or language, schedule a recurring or one-off task ("every morning at 9", "remind me in 2 hours", "run this daily"), or otherwise configure their AionUi installation. This is "Agent-assisted AionUi configuration": you act on the user's behalf via the local backend.
+  Configure AionUi itself through the bundled aioncore config CLI: create and edit assistants, update assistant rules, inspect and import skills, manage MCP servers, configure model providers, update settings, manage agents, configure scheduled tasks, and manage app configuration from an agent conversation. Use when the user wants you to set up or modify an AionUi assistant, attach skills, change an assistant's system prompt, add MCP or model provider configuration, schedule recurring work, or otherwise configure their AionUi installation, including when the user needs to know whether assistant changes affect the current conversation or only new conversations.
 ---
-
-> **⚠️ Platform note — read before running any command.** The shell snippets in this skill are written for **macOS / Linux** (bash/zsh). Always check which OS you are on first. On **Windows** do **not** run them verbatim — the underlying tool/CLI commands are usually cross-platform, but the surrounding shell syntax is not. Translate it to PowerShell before running:
->
-> | bash (macOS / Linux) | PowerShell (Windows) |
-> | --- | --- |
-> | `a && b` | run as two steps, or `a; if ($?) { b }` |
-> | `cat <<'EOF' \| tool …` (heredoc) | write the text to a temp file, then pipe/pass that file to the tool |
-> | `VAR=$(cmd)` … `$VAR` | `$VAR = cmd` … `$VAR` |
-> | `cmd > /dev/null` | `cmd > $null` |
-> | `… \| grep PAT` | `… \| Select-String PAT` |
-> | `… \| jq …` | `… \| ConvertFrom-Json`, then read the fields |
-> | `python3 x.py` | `python x.py` (or `py x.py`) |
-> | `~/dir`, `/tmp` | `$env:USERPROFILE\dir`, `$env:TEMP` |
-> | `cp` / `mkdir -p` / `rm -rf` | `Copy-Item` / `New-Item -ItemType Directory -Force` / `Remove-Item -Recurse -Force` |
->
-> If a command has no obvious Windows equivalent, prefer the built-in file/HTTP tools over raw shell.
 
 # AionUi Config
 
-Configure a running AionUi installation by calling its backend (aioncore) REST API.
-Everything here has been verified end-to-end against a live backend.
+Configure AionUi with the bundled agent-facing CLI. Do not discover ports, do
+not call raw backend paths, and do not depend on tools outside the bundled
+`aioncore` binary.
 
-## How it works
+## Rules
 
-AionUi is front/back separated. The Electron UI talks to a local `aioncore`
-backend over HTTP. Assistants, skills, and their rules all live behind that
-backend — there is no config file to edit anymore. You configure AionUi by
-calling the API.
+1. Use only `"$AIONUI_HELPER_BIN" config ...`.
+2. Never pass, inline, export, echo, or set any `AIONUI_...` environment variable.
+3. Put all command input in stdin JSON.
+4. Do not use flags for business fields.
+5. Use `"$AIONUI_HELPER_BIN" config capabilities` when unsure which config command or stdin fields are supported.
+6. Read context before changing the current assistant.
+7. Read before writing, then read back after writing.
+8. Use `"assistant_id": "current"` when the user asks to change the assistant used by this conversation.
+9. Use `"conversation_id": "current"` when a command accepts a conversation selector.
+10. Do not show internal ids unless the user needs them for a follow-up operation.
+11. Never reveal provider keys, MCP headers, environment values, or other secrets.
+12. If the CLI fails, report the stable `CONFIG_...` error from stderr in normal prose and do not claim the change was made.
+13. After assistant changes, explain both persistence and effect timing. Saving and read-back do not mean the current running conversation has reloaded the changed runtime behavior.
 
-The backend port is **dynamic** (it changes every launch and is not persisted
-to a file), so the first step is always to discover it.
+## Output
 
-## Setup
+Successful commands print a JSON envelope:
 
-A helper script wraps discovery + requests. Use it for every call.
-
-```bash
-cd <this-skill-dir>
-python3 scripts/aionui_api.py discover          # prints e.g. http://127.0.0.1:57282
+```json
+{
+  "success": true,
+  "data": {},
+  "meta": {
+    "schema_version": 1
+  }
+}
 ```
 
-If `discover` fails, AionUi is not running — tell the user to launch it, don't guess a port.
+Failures print one stable error line to stderr. Treat stderr as authoritative.
 
-Helper commands (all print the JSON response):
+## Capability Discovery
+
+Ask aioncore what this version supports:
 
 ```bash
-python3 scripts/aionui_api.py get    <path>
-python3 scripts/aionui_api.py post   <path> '<json-body>'
-python3 scripts/aionui_api.py put    <path> '<json-body>'
-python3 scripts/aionui_api.py patch  <path> '<json-body>'
-python3 scripts/aionui_api.py delete <path>
+"$AIONUI_HELPER_BIN" config capabilities
 ```
 
-## Golden rule: read before you write
+The result is a JSON envelope whose `data.domains[].commands[]` entries list
+supported command paths, input mode, expected stdin fields, selector fields,
+read-back behavior, destructive behavior, context requirements, and fields
+redacted from ordinary output.
 
-Before editing anything, `get` the current state and show the user what you're
-about to change. Configuration changes take effect on the user's live app.
-After every write, read it back to confirm. The user does not need a dry-run
-unless they ask, but they should always see what changed.
+## Context
 
----
+Read the current user, conversation, assistant, and local runtime context:
+
+```bash
+"$AIONUI_HELPER_BIN" config context
+```
+
+If `data.assistant` is `null`, the current conversation is not backed by an
+assistant. Ask the user which assistant to edit before changing assistant
+rules or defaults.
+
+## Assistant Change Timing
+
+AionUi persists assistant configuration immediately, but running conversations
+may keep the assistant snapshot created when the conversation started. Use this
+timing model when reporting successful assistant changes:
+
+- Identity fields such as name, description, avatar, and recommended prompts are
+  saved immediately. If the open UI still shows old values, tell the user to
+  refresh or reopen the assistant view.
+- Runtime fields such as agent, default model, default permission, default
+  skills, default MCPs, thought level, and rules apply to new conversations
+  created from that assistant. Do not claim they change the current running
+  conversation.
+- Skills and MCP defaults are not retroactively injected into the current agent
+  runtime. If a tool is already available in the current conversation, it can be
+  used; otherwise the user should start a new conversation with the assistant.
+
+When reporting a successful runtime-field change, say that the change was saved
+and read back, then state that it will affect new conversations only.
 
 ## Assistants
 
-An assistant has two parts stored separately:
-
-1. **Metadata** — name, description, avatar, engine, quick-start prompts, defaults.
-   Lives in the assistant record (`/api/assistants`).
-2. **System prompt (rules)** — the long instruction text that gives the
-   assistant its behavior. Stored in a **separate file** (`storage_mode:
-   user_file`), written via a dedicated endpoint. Creating an assistant does
-   NOT set its system prompt — that's a second call.
-
-Assistant `source` is `builtin` (shipped with the app, limited edits), `user`
-(custom, fully editable), or `generated` (auto-materialized from an online ACP
-agent — identity fields locked, not deletable). Custom IDs look like
-`custom-<digits>-<hex>`.
-
-### List / inspect
+List assistants:
 
 ```bash
-python3 scripts/aionui_api.py get /api/assistants
-# Add ?locale=<loc> to load the per-locale rules file into rules.content:
-python3 scripts/aionui_api.py get "/api/assistants/<id>?locale=zh-CN"
+"$AIONUI_HELPER_BIN" config assistants list
 ```
 
-> `?locale=` is optional. Without it, `rules.content` falls back to the
-> assistant's inline rule content (empty if none is stored). With it, content is
-> loaded from the per-locale rule file. Pass `?locale=` whenever you need the
-> locale-specific prompt — it's recommended, not required.
-
-### Create
-
-`POST /api/assistants`. Only `name` is required. The backend assigns the `id`.
+Inspect the current assistant:
 
 ```bash
-python3 scripts/aionui_api.py post /api/assistants '{
-  "name": "需求梳理官",
-  "description": "以新人视角梳理产品需求文档(PRD)",
-  "agent_id": "<engine-agent-id>",
+"$AIONUI_HELPER_BIN" config assistants get <<'JSON'
+{
+  "assistant_id": "current",
+  "locale": "en-US"
+}
+JSON
+```
+
+Examples use English sample text and `en-US`. For real localized assistant
+content, use the user's actual locale.
+
+Create an assistant:
+
+```bash
+"$AIONUI_HELPER_BIN" config assistants create <<'JSON'
+{
+  "name": "Requirements Analyst",
+  "description": "Turn rough product ideas into clear PRDs",
+  "agent_id": "2d23ff1c",
   "prompts": [
-    "我来描述一个需求,你帮我梳理成一份 PRD",
-    "review 这份 PRD,挑出对新人不友好的地方"
-  ]
-}'
+    "Turn this feature idea into a PRD",
+    "Review this PRD and identify confusing parts for new users"
+  ],
+  "enabled_skills": ["aionui-config"]
+}
+JSON
 ```
 
-Key fields in the create/update body:
-
-| Field | Meaning |
-| --- | --- |
-| `name`, `description` | display text (required: name) |
-| `agent_id` | **engine binding** — the id of an agent row from `/api/agents/management` (see "Picking the engine" below). This is the only field that sets the engine |
-| `prompts` | quick-start prompts shown on the assistant (NOT the system prompt) |
-| `avatar` | emoji, image URL, `data:` URI, or absolute local path |
-| `enabled_skills` | skill names attached to this assistant |
-| `custom_skill_names` | extra custom skill names to attach beyond `enabled_skills` |
-| `disabled_builtin_skills` | builtin skill names to turn OFF for this assistant |
-| `recommended_prompts` (+ `recommended_prompts_i18n`) | optional secondary prompt set |
-| `models`, `name_i18n`, `description_i18n`, `prompts_i18n` | optional |
-| `defaults` | per-assistant defaults — see below (settable on **create**, not just update) |
-
-> The create and update bodies take the same fields. On GET, the assistant also
-> carries read-only `context` / `context_i18n` and `last_used_at` (unix ms) — you
-> can't set those via POST/PUT.
-
-### Picking the engine (`agent_id`)
-
-The engine is bound by the request-body field **`agent_id`**, whose value is an
-agent row id from `/api/agents/management` — not a friendly name like
-`"claude"`. Read the engine catalog first and copy the id you want:
+Update assistant metadata or defaults:
 
 ```bash
-# the LIST response is flat — each row carries agent_id + agent directly:
-python3 scripts/aionui_api.py get /api/assistants
-#   {"id": "...", "agent_id": "2d23ff1c", "agent": {"type": "acp", "acp_backend": "claude"}, ...}
-# (only the single-assistant detail read nests these under an `engine` block:
-#   GET /api/assistants/<id>?locale=en -> "engine": {"agent_id": "...", "agent": {...}})
-# reuse an existing agent_id for a new assistant on the same engine:
-python3 scripts/aionui_api.py put /api/assistants/<id> '{"agent_id":"2d23ff1c"}'
-```
-
-> If you omit `agent_id` on create, the backend does NOT default to a CLI engine:
-> with at least one enabled provider it falls back to `aionrs` (its built-in
-> agent), and with no provider configured it returns a 400. CLI engines
-> (`claude`, `gemini`, `codex`, …) must be opted into explicitly with their
-> `agent_id` — an Anthropic key alone doesn't put the Claude CLI on `PATH`.
-> On read, the bound engine shows up in the assistant's `engine.agent_id` /
-> `engine.agent.acp_backend`. There is no `preset_agent_type` request field — the
-> create/update bodies don't accept it (it's silently dropped and never read
-> back), so bind the engine only via `agent_id`.
-
-### Per-assistant defaults
-
-`defaults` holds five entries; each is `{mode}` or `{mode, value}`. `mode:"auto"`
-means "inherit the global default / let the user pick each time" and carries NO
-`value`. `mode:"fixed"` locks the assistant to `value` (the user can't change it
-while using this assistant). Send only the entries you want to change; read the
-assistant first to keep the others.
-
-Every entry's `mode` is only ever `auto` or `fixed` — those two are the only
-modes the backend accepts. The `value` is what `fixed` locks to:
-
-| Entry | `fixed` → `value` is | Example |
-| --- | --- | --- |
-| `model` | a model name (string) | `{"mode":"fixed","value":"gemini-2.5-pro"}` |
-| `permission` | a permission-name string (free-form; the backend does not enum-validate it). Common names: `plan`, `default` | `{"mode":"fixed","value":"plan"}` |
-| `thought_level` | a thinking-level string (opaque; stored, not enum-validated) | `{"mode":"fixed","value":"high"}` |
-| `skills` | skill names (string[]) | `{"mode":"fixed","value":["aionui-config"]}` |
-| `mcps` | MCP server names (string[]) | `{"mode":"fixed","value":["filesystem"]}` |
-
-> `permission.value` is whatever permission name the active agent/permission
-> system understands — it is stored as an opaque string, not checked against a
-> fixed list. (`acceptEdits` / `bypassPermissions` / `dontAsk` are **agent-level
-> YOLO IDs**, a separate concept — don't assume they're valid here.)
-
-```bash
-python3 scripts/aionui_api.py put /api/assistants/<id> '{
+"$AIONUI_HELPER_BIN" config assistants update <<'JSON'
+{
+  "assistant_id": "current",
+  "locale": "en-US",
+  "description": "Updated assistant description",
   "defaults": {
-    "model":         {"mode": "fixed", "value": "gemini-2.5-pro"},
-    "permission":    {"mode": "fixed", "value": "plan"},
-    "thought_level": {"mode": "auto"},
-    "skills":        {"mode": "auto"},
-    "mcps":          {"mode": "fixed", "value": ["filesystem"]}
+    "permission": {
+      "mode": "fixed",
+      "value": "plan"
+    }
   }
-}'
+}
+JSON
 ```
 
-> Verified end-to-end: the backend stores all five entries verbatim and returns
-> them on the `?locale=` detail read. On read, `defaults` is always present with
-> all five entries, never `null`. A brand-new assistant starts with `model`,
-> `permission`, `thought_level`, and `mcps` at `{"mode":"auto"}` (no `value`),
-> while `skills` starts at `{"mode":"fixed"}` seeded with the assistant's
-> `enabled_skills` (an empty list when it has none). Lock any entry by sending
-> `{"mode":"fixed","value":...}`, or set `skills` to `{"mode":"auto"}` to let the
-> user pick.
+For `name`, `description`, `avatar`, or recommended prompt changes, report that
+the change is saved and may require refreshing or reopening the UI to see. For
+`agent_id`, `defaults`, `enabled_skills`, `default_mcp_ids`, or other runtime
+defaults, report that the saved change applies to new conversations only.
 
-### Update
-
-`PUT /api/assistants/<id>`, sending only the fields you want to change. The `id`
-comes from the URL path — a body `id`, if sent, is ignored.
-
-### Set the system prompt (rules)
-
-This is the separate second step — the actual behavior of the assistant.
+Enable, disable, or reorder an assistant:
 
 ```bash
-python3 scripts/aionui_api.py post /api/skills/assistant-rule/write '{
-  "assistant_id": "<id>",
-  "content": "<full system prompt markdown>",
-  "locale": "zh-CN"
-}'
+"$AIONUI_HELPER_BIN" config assistants state <<'JSON'
+{
+  "assistant_id": "current",
+  "enabled": true,
+  "sort_order": 10
+}
+JSON
 ```
 
-Read it back:
+## Assistant Rules
+
+Assistant rules are the system prompt that defines assistant behavior.
+
+Read the current assistant rule:
 
 ```bash
-python3 scripts/aionui_api.py post /api/skills/assistant-rule/read '{"assistant_id":"<id>","locale":"zh-CN"}'
+"$AIONUI_HELPER_BIN" config assistants rule read <<'JSON'
+{
+  "assistant_id": "current",
+  "locale": "en-US"
+}
+JSON
 ```
 
-For multi-line / long prompts, write the text to a temp file and build the JSON
-body in Python rather than inlining a giant shell string.
-
-> To wipe an assistant's rule across all locales, `DELETE
-> /api/skills/assistant-rule/<assistant-id>`. A parallel trio exists for
-> per-assistant **skill** content (distinct from the shared registry):
-> `POST /api/skills/assistant-skill/{read,write}` (same body shape as the rule
-> endpoints) and `DELETE /api/skills/assistant-skill/<assistant-id>`.
-
-### Avatar
-
-The `avatar` field accepts an emoji (`"📋"`), an image URL, a `data:` URI, or an
-absolute local path. A self-contained inline SVG `data:` URI is a good default —
-no external dependency, renders offline:
+Write the current assistant rule:
 
 ```bash
-python3 scripts/aionui_api.py put /api/assistants/<id> '{"avatar":"data:image/svg+xml;base64,<...>"}'
+"$AIONUI_HELPER_BIN" config assistants rule write <<'JSON'
+{
+  "assistant_id": "current",
+  "locale": "en-US",
+  "content": "# Role\nYou are..."
+}
+JSON
 ```
 
-> `GET /api/assistants/<id>/avatar` also serves the raw avatar binary (Content-Type
-> inferred; 404 if none) — handy for an `<img src>`, but a `data:` URI is still the
-> better default for self-contained config.
+For rule edits, preserve the user's existing useful instructions unless the
+user explicitly asks to replace them.
 
-### Enable / disable / reorder
-
-`PATCH /api/assistants/<id>/state` with any of `enabled`, `sort_order`, and
-`last_used_at` (unix ms). Disabling hides the assistant from the homepage and
-team picker without deleting it.
-
-### Delete
-
-`DELETE /api/assistants/<id>` — only `source: user` assistants can be deleted.
-`builtin` and `generated` assistants can only be disabled (check the `deletable`
-flag on the detail read).
-
-### Bulk import
-
-`POST /api/assistants/import` inserts many assistants at once (e.g. restoring a
-backup or migrating from a legacy Electron config). Body is `{"assistants":
-[<CreateAssistantRequest>, …]}`; the response reports `imported` / `skipped` /
-`failed` counts plus a per-row `errors` array. It's insert-only — it won't
-overwrite an existing id.
-
----
+After a successful rule write or delete, always tell the user that the rule was
+saved and read back, but it applies only to new conversations created from this
+assistant. The current conversation continues using the rule snapshot it started
+with.
 
 ## Skills
 
-A skill is a folder containing a `SKILL.md` (YAML frontmatter `name` +
-`description`, then instruction body). The `description` decides when the agent
-auto-triggers the skill, so write it carefully.
-
-Four sources: `builtin` (`~/.aionui/builtin-skills/`), `custom`
-(`~/.aionui/skills/`), `cron` (`~/.aionui/cron/skills/`, per-scheduled-task
-skills), `extension` (external, symlinked).
-
-### List / inspect the registry
+List available skills:
 
 ```bash
-python3 scripts/aionui_api.py get /api/skills
-python3 scripts/aionui_api.py get /api/skills/paths          # where skills live on disk
-python3 scripts/aionui_api.py post /api/skills/info '{"skill_path":"/abs/path/to/skill-folder"}'  # read a SKILL.md's name/description WITHOUT importing
+"$AIONUI_HELPER_BIN" config skills list
 ```
 
-### Import a skill into the registry
-
-`POST /api/skills/import` copies the skill(s) into the user skills dir and
-registers them. The one endpoint handles all three source shapes: a single skill
-folder, a PARENT folder containing many skills, or a `.zip` package.
+Inspect a skill directory before importing:
 
 ```bash
-python3 scripts/aionui_api.py post /api/skills/import '{"skill_path":"/abs/path/to/skill-or-parent-or-zip"}'
-python3 scripts/aionui_api.py get  /api/skills/import-limits   # server-side max file/total byte caps
-python3 scripts/aionui_api.py get  /api/skills/import-history  # recent import records
+"$AIONUI_HELPER_BIN" config skills info <<'JSON'
+{
+  "skill_path": "/absolute/path/to/skill"
+}
+JSON
 ```
 
-> For external skills you keep editing in place (registered without copying), see
-> "Discover & manage skill sources" below (`external-paths`) — that's how a live,
-> non-copied source is wired in. There is no `import-symlink` endpoint; the
-> reverse operation, `POST /api/skills/export-symlink`
-> (`{"skill_path":"...","target_dir":"..."}`), symlinks an already-installed skill
-> back out to an external directory.
-
-> Caution: importing (copy) from a path that is ALREADY inside the user skills
-> dir can race with the copy step. When editing an installed skill, edit the
-> files in place, then re-import from a separate staging copy — or just verify
-> the SKILL.md is non-empty afterwards. An empty SKILL.md unregisters the skill.
-
-### Discover & manage skill sources
-
-For skills that live outside the standard dirs:
+Import a skill:
 
 ```bash
-python3 scripts/aionui_api.py post   /api/skills/scan '{"folder_path":"/abs/dir"}'   # find skills under a dir
-python3 scripts/aionui_api.py get    /api/skills/detect-paths                  # candidate skill locations
-python3 scripts/aionui_api.py get    /api/skills/detect-external               # external skill dirs
-python3 scripts/aionui_api.py get    /api/skills/external-paths                # list registered external paths
-python3 scripts/aionui_api.py post   /api/skills/external-paths '{"name":"<label>","path":"/abs/dir"}'  # add one (both required)
-python3 scripts/aionui_api.py delete /api/skills/external-paths '{"path":"/abs/dir"}'   # remove one (path only)
+"$AIONUI_HELPER_BIN" config skills import <<'JSON'
+{
+  "skill_path": "/absolute/path/to/skill-or-parent-or-zip"
+}
+JSON
 ```
 
-The **skills market** is a separate, app-wide toggle:
-`POST /api/skills/market/enable` and `/disable`.
-
-### Attach a skill to an assistant
-
-Put the skill's `name` into the assistant's `enabled_skills`:
+Attach skills to an assistant by updating the assistant's full skill list:
 
 ```bash
-python3 scripts/aionui_api.py put /api/assistants/<id> '{"enabled_skills":["skill-a","skill-b"]}'
+"$AIONUI_HELPER_BIN" config assistants update <<'JSON'
+{
+  "assistant_id": "current",
+  "enabled_skills": ["aionui-config", "cron"]
+}
+JSON
 ```
 
-> `enabled_skills` is the full set — include every skill you want kept, not just
-> the new one. Read the assistant first to get the current list.
+Do not append blindly. Read the assistant first, merge the list locally, then
+send the full intended `enabled_skills` value.
 
-### Delete a skill
+Enabled skills are assistant defaults for new conversations. Do not tell the
+user that newly attached skills are available in the current conversation unless
+the current runtime already exposes them.
+
+Manage external skill paths:
 
 ```bash
-python3 scripts/aionui_api.py delete /api/skills/<skill-name>
+"$AIONUI_HELPER_BIN" config skills external-paths list
 ```
 
----
-
-## MCP servers
-
-AionUi can connect to MCP servers. The whole lifecycle is available under
-`/api/mcp/*` and is verified end-to-end (create / list / toggle / delete).
-
-### List
-
 ```bash
-python3 scripts/aionui_api.py get /api/mcp/servers
+"$AIONUI_HELPER_BIN" config skills external-paths add <<'JSON'
+{
+  "name": "Team Skills",
+  "path": "/absolute/path/to/team-skills"
+}
+JSON
 ```
 
-Each server has `id`, `name`, `description`, `enabled`, `builtin`, and a
-`transport`. Builtin servers (`builtin: true`) ship with the app — don't delete
-those; create `builtin: false` ones for the user.
-
-### Transport shapes
-
-The `transport` object is one of:
-
-| Type | Fields | For |
-| --- | --- | --- |
-| `stdio` | `command`, `args?` (string[]), `env?` (map) | local process servers (npx/uvx/binaries) |
-| `sse` | `url`, `headers?` (map) | remote Server-Sent-Events servers (legacy) |
-| `http` | `url`, `headers?` (map) | remote HTTP servers (Streamable HTTP) |
-
-> `headers` is an optional string→string map for auth (e.g. `{"Authorization":
-> "Bearer …"}`). The REST API accepts exactly these three `type` values —
-> `stdio`, `sse`, `http`. Use `http` for Streamable-HTTP servers; there is no
-> separate `streamable_http` transport type at this layer (sending it fails
-> deserialization).
-
-### Create
-
-`POST /api/mcp/servers`. Required: `name`, `transport`. Set `builtin: false`.
-
 ```bash
-# stdio (local) — e.g. a filesystem server via npx
-python3 scripts/aionui_api.py post /api/mcp/servers '{
-  "name": "filesystem",
-  "description": "local filesystem access",
-  "transport": {"type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/some/dir"]},
-  "builtin": false
-}'
-
-# remote (http)
-python3 scripts/aionui_api.py post /api/mcp/servers '{
-  "name": "my-remote",
-  "transport": {"type": "http", "url": "https://example.com/mcp"},
-  "builtin": false
-}'
+"$AIONUI_HELPER_BIN" config skills external-paths remove <<'JSON'
+{
+  "path": "/absolute/path/to/team-skills"
+}
+JSON
 ```
 
-### Test connection before trusting it
-
-`POST /api/mcp/test-connection` with the same server body actually connects and
-returns the server's tool list (or an error / `needs_auth`). Good to run after
-creating a remote server.
-
-### Fetch one / toggle / update / delete
+Enable or disable the skills market:
 
 ```bash
-python3 scripts/aionui_api.py get    /api/mcp/servers/<id>          # one server by id
-python3 scripts/aionui_api.py post   /api/mcp/servers/<id>/toggle   # enable <-> disable
-python3 scripts/aionui_api.py put    /api/mcp/servers/<id> '{"description":"..."}'
-python3 scripts/aionui_api.py delete /api/mcp/servers/<id>
+"$AIONUI_HELPER_BIN" config skills market enable
 ```
 
-> Two more list-level helpers exist: `POST /api/mcp/servers/import`
-> (`{"servers":[…]}`, bulk-restore a set at once) and `GET /api/mcp/agent-configs`
-> (scans installed Agent CLIs and returns their existing MCP configs — a source
-> for one-click import).
-
-> Remote servers may need OAuth: `/api/mcp/oauth/check-status`,
-> `/api/mcp/oauth/login`, `/api/mcp/oauth/logout` (all `post`), and
-> `GET /api/mcp/oauth/authenticated` which lists the server URLs that already
-> have a stored token. Only touch these if a `test-connection` came back with
-> `needs_auth`.
-
----
-
-## LLM providers (models & API keys)
-
-This is where the actual models come from. A **provider** is one upstream
-(Gemini, an OpenAI-compatible endpoint, Anthropic, Bedrock, …) holding a
-`base_url`, an `api_key`, and the list of `models` it exposes. Assistants then
-pick a model from an enabled provider. The whole lifecycle is verified
-end-to-end (list / create / fetch-models / detect-protocol / update / delete).
-
-> **Secret-handling rule:** `GET /api/providers` returns every `api_key` in
-> **plaintext** (a pre-launch convention for the local-store → backend migration;
-> it may be masked in a future release, so confirm before relying on it). Never
-> paste a provider response into chat, a commit, a log, or a memory file. When
-> you must show the user a provider, redact the key (`sk-…last4`). Treat keys the
-> user gives you the same way.
-
-### List / inspect
-
 ```bash
-python3 scripts/aionui_api.py get /api/providers
+"$AIONUI_HELPER_BIN" config skills market disable
 ```
 
-Each provider: `id`, `platform`, `name`, `base_url`, `api_key`, `models`
-(string[]), `enabled`, `capabilities`, `is_full_url`.
+## MCP Servers
 
-`platform` selects how the backend talks to and lists models for the upstream:
-
-- `anthropic` (alias `claude`), `gemini`, `bedrock` — native protocols.
-- `vertex-ai`, `minimax` — known vendors with a hardcoded model list (no live
-  fetch).
-- `new-api` — OpenAI protocol with `/v1` path enforcement.
-- `dashscope-coding` — DashScope coding endpoint.
-- `custom` (the default) → **OpenAI-compatible**. Use this for OpenAI itself,
-  DeepSeek, OpenRouter, Ollama, vLLM, and any other OpenAI-protocol endpoint,
-  with its `base_url`.
-
-When unsure, run `detect-protocol` (below) — it fills `platform` and `models`
-for you instead of guessing.
-
-### Detect the protocol before creating (recommended)
-
-Given a `base_url` + `api_key`, the backend probes the endpoint and tells you
-which protocol it speaks and what models it has. Use this to fill `platform` and
-`models` correctly instead of guessing.
+List MCP servers:
 
 ```bash
-python3 scripts/aionui_api.py post /api/providers/detect-protocol '{
-  "base_url": "https://api.deepseek.com/v1",
-  "api_key": "sk-..."
-}'
-# -> {"protocol":"openai","confidence":90,"models":[...]}
+"$AIONUI_HELPER_BIN" config mcp servers list
 ```
 
-Required on this body: just `base_url` + `api_key` (no `platform` — the backend
-detects it). Optional: `timeout` (ms), `preferred_protocol` (try a given protocol
-first — one of `openai`, `anthropic`, `gemini`, `unknown`), and `test_all_keys`
-(bool — probe every key when `api_key` holds several).
-
-`fetch-models` (`POST /api/providers/fetch-models`) returns just the model list
-for a not-yet-saved endpoint. Its body differs from detect-protocol: `platform`,
-`base_url`, `api_key` are all **required** (plus optional `bedrock_config`,
-`try_fix`).
-
-### Test a provider connection
-
-- `POST /api/agents/provider-health-check` with `{"provider_id":"<id>","model":"<model>"}`
-  checks that a saved provider+model actually answers. (This lives on the agents
-  router — it's what surfaces an assistant's availability.)
-- `POST /api/bedrock/test-connection` validates AWS Bedrock credentials before
-  you save a Bedrock provider.
-
-### Create
-
-`POST /api/providers`. Required: `platform`, `name`, `base_url`, `api_key`
-(`api_key` may be empty only for the `bedrock` platform, which authenticates via
-`bedrock_config`). Provide `models` (the ones to expose) and `enabled`.
+Create an MCP server:
 
 ```bash
-python3 scripts/aionui_api.py post /api/providers '{
-  "platform": "custom",
-  "name": "DeepSeek",
-  "base_url": "https://api.deepseek.com/v1",
-  "api_key": "sk-...",
-  "models": ["deepseek-chat", "deepseek-reasoner"],
-  "enabled": true
-}'
-```
-
-### Refresh the live model list of a saved provider
-
-```bash
-python3 scripts/aionui_api.py post /api/providers/<id>/models '{"try_fix": false}'
-```
-
-Returns the models the upstream currently advertises — use it to refresh a
-provider's `models` after the vendor adds new ones.
-
-### Update / delete
-
-```bash
-python3 scripts/aionui_api.py put    /api/providers/<id> '{"models": ["...","..."]}'
-python3 scripts/aionui_api.py delete /api/providers/<id>
-```
-
-> Send only the fields you want changed on `put`. To rotate a key, `put`
-> `{"api_key": "..."}`. To disable a provider without losing it, `put`
-> `{"enabled": false}`.
-
-### Which model an assistant uses
-
-Lock a model to an assistant via its per-assistant `defaults.model`
-(`{"mode":"fixed","value":"<model-name>"}`) — see *Per-assistant defaults*
-above. The model name must be one the provider exposes (`get /api/providers`).
-
----
-
-## Global & client settings
-
-Two stores, both verified:
-
-- `GET /api/settings` — app-level switches: `language`, `notification_enabled`,
-  `cron_notification_enabled`, `command_queue_enabled`, `save_upload_to_workspace`.
-  Update them with `PATCH /api/settings` (partial — not PUT).
-- `GET /api/settings/client` — read the larger UI/runtime key-value store:
-  `language`, `theme.activeId` (`light`/`dark`/custom), `ui.zoomFactor`,
-  `ui.fontSize.{chat,markdown,code}`, `webui.desktop.allowRemote`, …
-- `PUT /api/settings/client` — batch-update that store.
-
-`PUT /api/settings/client` is a **partial merge** — send only the keys you want
-to change (a key set to `null` deletes it). Its response carries no data, so
-always read the store back to confirm.
-
-```bash
-python3 scripts/aionui_api.py get /api/settings/client
-python3 scripts/aionui_api.py put /api/settings/client '{"ui.zoomFactor": 1.0}'
-python3 scripts/aionui_api.py get /api/settings/client   # confirm — PUT returns no body
-```
-
-> To set which model a given assistant uses, configure that assistant's
-> `defaults.model` (see *Per-assistant defaults*) — not a global setting.
-
----
-
-## Engines (agents)
-
-`GET /api/agents/management` lists the engine catalog (`aionrs`, `claude`,
-`codex`, …). There is **no** bare `GET /api/agents` — that path 404s; always use
-the `/management` sub-path. Each row is rich: alongside `id`, `name`, `enabled`
-(toggled on), `installed` (diagnostic spawn-command state), `team_capable`
-(can run in a team), `backend`, `agent_type`, and a `status` of `online` /
-`offline` / `missing` / `unchecked`, it also carries `config_options`,
-`available_modes`, `available_models` (when the engine advertises them), plus
-`last_check_*` diagnostics. Treat `status` as the selection source of truth:
-`online` is verified usable, `unchecked` has not been probed yet and is still
-valid to bind/select, while `missing` and `offline` are known unusable until
-repaired or rechecked. `installed` is legacy/diagnostic; do not use it by itself
-to decide whether an assistant may bind to an engine because startup no longer
-performs full availability probes.
-
-The management row is the supported engine catalog surface. Do not call legacy
-agent refresh endpoints; connectivity checks are explicit per-agent operations.
-
----
-
-## Scheduled tasks (cron)
-
-Create and manage scheduled tasks ("run this every morning at 9", "remind me in
-two hours", "every 30 minutes do X") over the REST API — `/api/cron/*` is a
-full, verified CRUD surface. Translate the user's natural-language schedule into
-one of three `schedule` shapes, then `POST /api/cron/jobs`.
-
-### The schedule (`schedule` is a tagged union — the `kind` field picks the shape)
-
-| Natural language | `schedule` body |
-| --- | --- |
-| "at 3pm today / on this exact date" (one-shot) | `{"kind":"at","at_ms":<unix-ms>}` |
-| "every 30 minutes / every 2 hours" (fixed interval) | `{"kind":"every","every_ms":<ms>}` |
-| "every day at 9am / every Monday" (calendar) | `{"kind":"cron","expr":"0 9 * * *","tz":"Asia/Shanghai"}` |
-
-- **`cron.expr` takes a standard 5-field crontab** (`min hour day month weekday`).
-  The backend auto-prepends the seconds field, so `0 9 * * *` means 09:00 daily.
-  (A 6-field `sec min hour day month weekday` is also accepted as-is.)
-- **`cron.tz`** is an IANA timezone name (`Asia/Shanghai`, `America/New_York`,
-  `UTC`). Omit it and the expression runs in UTC — always set it to the user's
-  zone for "9am" to mean their 9am.
-- **`every.every_ms`** must be `> 0`. There is no documented lower bound, but be
-  sensible — don't schedule a sub-minute loop unless asked.
-- **`at.at_ms`** is a Unix timestamp in **milliseconds**. A past time is accepted
-  by the API but will not run, so compute it from "now" in the user's zone.
-- An optional `description` can go inside any schedule variant for a
-  human-readable label.
-
-### Required fields on `POST /api/cron/jobs`
-
-```bash
-python3 scripts/aionui_api.py post /api/cron/jobs '{
-  "name": "每日早报",
-  "schedule": {"kind": "cron", "expr": "0 9 * * *", "tz": "Asia/Shanghai"},
-  "message": "总结今天的科技新闻",
-  "conversation_id": "<conv-id>",
-  "created_by": "agent",
-  "execution_mode": "new_conversation",
-  "agent_config": {
-    "name": "AionUi Butler",
-    "assistant_id": "<assistant-id>",
-    "model": {"provider_id": "<provider-id>", "model": "<model-name>"}
+"$AIONUI_HELPER_BIN" config mcp servers create <<'JSON'
+{
+  "name": "Local Tools",
+  "transport": {
+    "type": "stdio",
+    "command": "my-mcp-server",
+    "args": [],
+    "env": {}
   }
-}'
+}
+JSON
 ```
 
-> **⚠️ `aionrs`-engine jobs must include `agent_config.model`.** If the target
-> assistant runs on the built-in `aionrs` engine, the backend rejects the job with
-> *"aionrs cron jobs require agent_config.model.provider_id and
-> agent_config.model.model"* unless you pass a non-empty
-> `model: {"provider_id": "...", "model": "..."}`. This bites easily: an assistant
-> created without an explicit `agent_id` falls back to `aionrs` (see *Picking the
-> engine*), so its scheduled jobs need `agent_config.model` too. CLI-engine
-> assistants (`claude`, `gemini`, `codex`, …) don't require it — omit `model` for
-> them. Read `GET /api/providers` for a valid `provider_id` + `model` pair.
-
-| Field | Required | Meaning |
-| --- | --- | --- |
-| `name` | ✅ | display name of the task |
-| `schedule` | ✅ | one of the three shapes above |
-| `conversation_id` | ✅ | the conversation the task is tied to — get one from `GET /api/conversations` (or create one). Even `new_conversation` jobs need this set |
-| `created_by` | ✅ | `"agent"` when you create it on the user's behalf, `"user"` for a user-initiated one. **Only these two values** |
-| `message` (or `prompt`) | — | the instruction sent on each run. `message` wins if both are given; with neither, the run sends an empty prompt |
-| `execution_mode` | — | `"existing"` (default) reuses `conversation_id` every run; `"new_conversation"` spins up a fresh conversation each run |
-| `agent_config` | — | which assistant runs the task. **In practice required for a new job**: omit it and the API 400s with *"assistant_id is required for new cron jobs"*. Pass `{"name":"<label>","assistant_id":"<id>"}`; for an `aionrs`-engine assistant also add `"model":{"provider_id":"<id>","model":"<name>"}` (see the ⚠️ note above) |
-| `description` | — | optional longer description |
-
-> `agent_config` is strict (`deny_unknown_fields`): only `name`, `assistant_id`,
-> `cli_path`, `mode`, `model_id`, `model`, `config_options`, `workspace` are
-> accepted. Legacy keys `backend`, `agent_type`, `custom_agent_id`, `is_preset`
-> are **rejected** — don't send them. Get the `assistant_id` from
-> `GET /api/assistants`.
-
-The response is the created job (HTTP 201) with its generated `id` (prefixed
-`cron_…`). Note the **read shape is nested** and differs from the flat create
-body: the instruction is at `target.payload.text`, `execution_mode` at
-`target.execution_mode`, and `conversation_id` / `agent_type` / `created_by` /
-`agent_config` under `metadata`; run state is a `state` block (`next_run_at_ms`,
-`last_run_at_ms`, `last_status`, `run_count`, …). So you `POST` a flat body but
-read it back nested — don't look for a top-level `message` or `agent_config`.
-
-### List / inspect / change / run / delete
+Update an MCP server:
 
 ```bash
-python3 scripts/aionui_api.py get    /api/cron/jobs                       # all jobs
-python3 scripts/aionui_api.py get    "/api/cron/jobs?conversation_id=<id>"  # jobs for one conversation
-python3 scripts/aionui_api.py get    /api/cron/jobs/<id>                   # one job
-python3 scripts/aionui_api.py put    /api/cron/jobs/<id> '{"enabled": false}'   # partial update (pause)
-python3 scripts/aionui_api.py post   /api/cron/jobs/<id>/run              # run it once right now
-python3 scripts/aionui_api.py delete /api/cron/jobs/<id>                  # remove it
-python3 scripts/aionui_api.py get    /api/cron/jobs/<id>/conversations    # conversations this job has spawned
-python3 scripts/aionui_api.py get    /api/cron/jobs/<id>/skill            # {"has_skill": bool}
-python3 scripts/aionui_api.py post   /api/cron/jobs/<id>/skill '{"content":"<SKILL.md body>"}'  # attach/replace a per-job skill
-python3 scripts/aionui_api.py delete /api/cron/jobs/<id>/skill            # remove the attached skill
+"$AIONUI_HELPER_BIN" config mcp servers update <<'JSON'
+{
+  "server_id": "mcp_123",
+  "description": "Updated description"
+}
+JSON
 ```
 
-> A job can carry its own inline **skill** (a `SKILL.md`-style instruction body)
-> via `.../skill` — this is the `cron` skill source. Handy when a scheduled task
-> needs bespoke instructions that shouldn't live in the shared registry.
+Test a server configuration:
 
-`PUT` is a partial update — send only what changes (`name`, `description`,
-`enabled`, `schedule`, `message`, `execution_mode`, `agent_config`,
-`conversation_title`, `max_retries`). Read the job back to confirm its
-`schedule` and `state.next_run_at_ms` after any change.
+```bash
+"$AIONUI_HELPER_BIN" config mcp test-connection <<'JSON'
+{
+  "name": "Local Tools",
+  "transport": {
+    "type": "stdio",
+    "command": "my-mcp-server",
+    "args": []
+  }
+}
+JSON
+```
 
-> Note: an `existing`-mode job can't have its assistant changed after creation
-> (`agent_config` on update is rejected for ongoing-conversation jobs) — that's
-> by design, the ongoing conversation keeps its original assistant.
+OAuth helpers:
 
----
+```bash
+"$AIONUI_HELPER_BIN" config mcp oauth check-status <<'JSON'
+{
+  "server_url": "https://mcp.example.com"
+}
+JSON
+```
 
-## Verification checklist
+Never show MCP headers or stdio env values to the user. CLI output redacts
+sensitive fields by default.
 
-After a configuration task, confirm with reads:
+## Providers
 
-1. Assistant in `get /api/assistants`? Right name, avatar, engine?
-2. System prompt set? `assistant-rule/read` returns the expected text.
-3. Skill in `get /api/skills` with `source: custom`?
-4. Skill attached? Assistant detail `enabled_skills` contains it.
-5. MCP server in `get /api/mcp/servers`, enabled, right transport?
-6. Provider in `get /api/providers`, enabled, right `models`? (redact the key)
-7. Settings changed? `get /api/settings/client` shows the new value.
-8. Scheduled task created? `get /api/cron/jobs` lists it, `enabled: true`, with
-   the expected `schedule` and a non-null `state.next_run_at_ms`.
-9. Tell the user to refresh / reopen the AionUi view to see changes.
+List model providers:
 
-## Out of scope (handled elsewhere)
+```bash
+"$AIONUI_HELPER_BIN" config providers list
+```
 
-Some backend areas have `/api/*` endpoints but are intentionally NOT this
-skill's job — they already have dedicated tooling, so don't reach for the raw
-API here:
+Create a provider:
 
-- **Teams** (`/api/teams/*`) — create Teams through the Team UI or REST API.
-  Once a Team session is active, Team agents use the `team_*` MCP tools
-  provided by the per-Team `aionui-team` server.
+```bash
+"$AIONUI_HELPER_BIN" config providers create <<'JSON'
+{
+  "name": "OpenAI",
+  "platform": "openai",
+  "base_url": "https://api.openai.com/v1",
+  "api_key": "sk-..."
+}
+JSON
+```
 
-This skill stays focused on *configuration*: assistants, skills, MCP servers,
-LLM providers, app settings, and scheduled tasks.
+Update a provider:
 
-## Not yet covered
+```bash
+"$AIONUI_HELPER_BIN" config providers update <<'JSON'
+{
+  "provider_id": "provider_123",
+  "api_key": "sk-..."
+}
+JSON
+```
 
-Conversation repair (recovering a broken session from its logs) is not covered
-here yet.
+Detect protocol, fetch models, or run a provider health check:
 
-Channel and extension management (`/api/channel/*`, `/api/extensions/*`) now have
-stable request bodies and tests in the backend — they're no longer "unverified",
-but they're a large enough surface (plugin pairing, per-extension i18n/permissions,
-theme/assistant/skill extensions) that they belong in a dedicated skill rather
-than bolted onto this one. Document them there with bodies confirmed against the
-live backend — don't guess.
+```bash
+"$AIONUI_HELPER_BIN" config providers detect-protocol <<'JSON'
+{
+  "base_url": "https://api.example.com/v1",
+  "api_key": "..."
+}
+JSON
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config providers models fetch <<'JSON'
+{
+  "provider_id": "provider_123"
+}
+JSON
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config providers health-check <<'JSON'
+{
+  "provider_id": "provider_123",
+  "model": "gpt-4.1"
+}
+JSON
+```
+
+Never reveal provider keys. Do not repeat secret values from the user's input.
+
+## Settings
+
+Read backend settings:
+
+```bash
+"$AIONUI_HELPER_BIN" config settings get
+```
+
+Patch backend settings:
+
+```bash
+"$AIONUI_HELPER_BIN" config settings patch <<'JSON'
+{
+  "language": "en-US",
+  "notification_enabled": true
+}
+JSON
+```
+
+Read or update client preferences:
+
+```bash
+"$AIONUI_HELPER_BIN" config settings client get
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config settings client put <<'JSON'
+{
+  "theme": "dark",
+  "font_size": 14
+}
+JSON
+```
+
+## Agents
+
+List available agents:
+
+```bash
+"$AIONUI_HELPER_BIN" config agents list
+```
+
+Enable or disable an agent:
+
+```bash
+"$AIONUI_HELPER_BIN" config agents enable <<'JSON'
+{
+  "agent_id": "codex",
+  "enabled": true
+}
+JSON
+```
+
+Read or set per-agent overrides:
+
+```bash
+"$AIONUI_HELPER_BIN" config agents overrides get <<'JSON'
+{
+  "agent_id": "codex"
+}
+JSON
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config agents overrides set <<'JSON'
+{
+  "agent_id": "codex",
+  "command_override": "/absolute/path/to/codex"
+}
+JSON
+```
+
+Create, update, delete, or test a custom agent:
+
+```bash
+"$AIONUI_HELPER_BIN" config agents custom create <<'JSON'
+{
+  "name": "Custom Agent",
+  "command": "/absolute/path/to/agent-cli"
+}
+JSON
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config agents custom update <<'JSON'
+{
+  "agent_id": "custom_agent_123",
+  "name": "Custom Agent",
+  "command": "/absolute/path/to/agent-cli"
+}
+JSON
+```
+
+Do not reveal agent env values or secret override values.
+
+## Scheduled Tasks
+
+For tasks tied to the current conversation, use the cron current commands.
+
+List current conversation tasks:
+
+```bash
+"$AIONUI_HELPER_BIN" config cron current list
+```
+
+Create a task:
+
+```bash
+"$AIONUI_HELPER_BIN" config cron current create <<'JSON'
+{
+  "name": "Daily Summary",
+  "schedule": "0 18 * * MON-FRI",
+  "schedule_description": "Weekdays at 6:00 PM",
+  "message": "Review the conversation context and produce a concise end-of-day summary."
+}
+JSON
+```
+
+Update a task:
+
+```bash
+"$AIONUI_HELPER_BIN" config cron current update <<'JSON'
+{
+  "job_id": "cron_123",
+  "name": "Daily Summary",
+  "schedule": "0 18 * * MON-FRI",
+  "schedule_description": "Weekdays at 6:00 PM",
+  "message": "Review the conversation context and produce a concise end-of-day summary."
+}
+JSON
+```
+
+After a successful create or update, explain the task name and schedule in
+normal user-facing language. Do not show `cron_...` ids unless needed.
+
+For global cron job administration, use `config cron jobs`.
+
+List all cron jobs:
+
+```bash
+"$AIONUI_HELPER_BIN" config cron jobs list
+```
+
+Create a cron job:
+
+```bash
+"$AIONUI_HELPER_BIN" config cron jobs create <<'JSON'
+{
+  "name": "Weekly Report",
+  "schedule_type": "cron",
+  "schedule": "0 9 * * MON",
+  "timezone": "Asia/Shanghai",
+  "task_description": "Produce the weekly report."
+}
+JSON
+```
+
+Update, run, or manage a cron job skill:
+
+```bash
+"$AIONUI_HELPER_BIN" config cron jobs update <<'JSON'
+{
+  "job_id": "cron_123",
+  "name": "Weekly Report",
+  "schedule": "0 10 * * MON"
+}
+JSON
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config cron jobs run <<'JSON'
+{
+  "job_id": "cron_123"
+}
+JSON
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config cron jobs skill save <<'JSON'
+{
+  "job_id": "cron_123",
+  "content": "# Skill\nTask-specific instructions."
+}
+JSON
+```
+
+## Safety
+
+Configuration changes affect the user's live app. Keep changes narrow, show
+what changed in plain language, and avoid exposing raw JSON unless the user
+asks for implementation detail.
