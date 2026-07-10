@@ -52,6 +52,26 @@ const PERM_REJECT: &str = "reject";
 /// `thought_level`) all normalize to this one storage key.
 const EFFORT_CONFIG_KEY: &str = "effort";
 
+/// Resolve the reasoning-effort catalog to surface for the effort picker, mirroring the
+/// backend's `effort_is_supported` current-model precedence: the efforts of the resolved
+/// current model if it can be pinned, else the union across all advertised models (so we
+/// don't hide a level some selectable model supports when the current model is ambiguous /
+/// not-yet-known). Empty result = no effort axis → the caller omits the option entirely.
+fn resolve_current_model_efforts(models: &[aionui_session::ModelInfo], current_model: Option<&str>) -> Vec<String> {
+    if let Some(model) = current_model.and_then(|id| models.iter().find(|m| m.id == id)) {
+        return model.reasoning_efforts.clone();
+    }
+    let mut union: Vec<String> = Vec::new();
+    for m in models {
+        for e in &m.reasoning_efforts {
+            if !union.contains(e) {
+                union.push(e.clone());
+            }
+        }
+    }
+    union
+}
+
 /// Shared, cheaply-cloneable runtime state for a session task: the broadcast sender
 /// the translator writes and `subscribe()` reads, plus liveness bookkeeping.
 struct SessionRuntime {
@@ -75,6 +95,13 @@ struct SessionRuntime {
     /// clean-slate runtime applies. Cleared/overwritten on the next switch.
     mode_override: std::sync::Mutex<Option<String>>,
     model_override: std::sync::Mutex<Option<String>>,
+    /// Optimistic reasoning-effort ("thought level") selection, symmetric with
+    /// mode/model. claude emits NO `ConfigChanged`/echo for effort (unlike model/mode),
+    /// so the streaming catalog push — which runs in the backend-Arc-free event pump and
+    /// cannot read `capabilities().current_effort` — reads the highlight from here. REST
+    /// (`get_config_options`) prefers this over the (synchronously-seeded) caps value so
+    /// the observed re-read confirms the switch. `None` until the user picks a level.
+    effort_override: std::sync::Mutex<Option<String>>,
 }
 
 impl SessionRuntime {
@@ -109,6 +136,14 @@ impl SessionRuntime {
     }
     fn model_override(&self) -> Option<String> {
         self.model_override.lock().ok().and_then(|g| g.clone())
+    }
+    fn set_effort_override(&self, effort: String) {
+        if let Ok(mut g) = self.effort_override.lock() {
+            *g = Some(effort);
+        }
+    }
+    fn effort_override(&self) -> Option<String> {
+        self.effort_override.lock().ok().and_then(|g| g.clone())
     }
 }
 
@@ -276,6 +311,7 @@ impl SessionAgentTask {
             session_id: std::sync::Mutex::new(None),
             mode_override: std::sync::Mutex::new(None),
             model_override: std::sync::Mutex::new(None),
+            effort_override: std::sync::Mutex::new(None),
         });
         // Subscribe to the backend's event stream HERE (sync), then hand ONLY the
         // stream to the pump — never a backend Arc (see `spawn_event_pump` for why
@@ -491,6 +527,9 @@ impl SessionAgentTask {
         // Live catalog wins; cold-start resume falls back to the persisted-handshake
         // preload (per-axis) so the picker renders before the initialize round-trip lands.
         let (models, current_model, modes, current_mode) = self.effective_catalog();
+        // The effort catalog depends on the EFFECTIVE current model (override wins over the
+        // snapshot's current_model), resolved before the model option consumes it below.
+        let effective_model = self.runtime.model_override().or_else(|| current_model.clone());
         let mut config_options = Vec::new();
         if !modes.is_empty() {
             config_options.push(aionui_api_types::AcpConfigOptionDto {
@@ -528,6 +567,35 @@ impl SessionAgentTask {
                         name: Some(m.name.clone()),
                         label: None,
                         description: m.description.clone(),
+                    })
+                    .collect(),
+            });
+        }
+        // Reasoning-effort ("thought level") axis — the direct-CLI analogue of the ACP
+        // path's `thought_level` config option (category-keyed so AionUi's
+        // `deriveSelectOption(..., 'thought_level', ['reasoning_effort'])` lights the
+        // picker's effort group). Only claude advertises per-model `supportedEffortLevels`;
+        // the option is emitted only when the resolved current model actually offers
+        // efforts. `current_value` prefers the optimistic override (claude emits no echo
+        // for effort) then the backend's synchronously-seeded `current_effort`.
+        let caps = self.backend.capabilities();
+        let efforts = resolve_current_model_efforts(&models, effective_model.as_deref());
+        if !efforts.is_empty() {
+            config_options.push(aionui_api_types::AcpConfigOptionDto {
+                id: "reasoning_effort".into(),
+                name: Some("Thinking".into()),
+                label: None,
+                description: None,
+                category: Some("thought_level".into()),
+                option_type: "select".into(),
+                current_value: self.runtime.effort_override().or(caps.current_effort),
+                options: efforts
+                    .iter()
+                    .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
+                        value: e.clone(),
+                        name: Some(e.clone()),
+                        label: None,
+                        description: None,
                     })
                     .collect(),
             });
@@ -601,12 +669,17 @@ impl SessionAgentTask {
         // async system/status), so without the override the option would never read
         // back as observed and the frontend would reject the switch as `command_ack`.
         // Mirrors the clean-slate runtime's optimistic override + observed re-read.
-        // Non-mode/model options (effort/thought_level) have no picker current_value
-        // to confirm — they report CommandAck (accepted, applied live).
+        // effort/thought_level is now a surfaced picker option too (id `reasoning_effort`,
+        // category `thought_level`), so it also caches an override + falls through to the
+        // observed re-read — the frontend's `hasObservedValue` requires Observed AND the
+        // option's current_value == requested, same as mode/model.
         match option_id {
             "mode" => self.runtime.set_mode_override(value.to_string()),
             "model" => self.runtime.set_model_override(value.to_string()),
             "effort" | "reasoning_effort" | "thought_level" => {
+                // Optimistic highlight: claude emits no effort echo, so the streaming
+                // catalog push reads the current level from this override.
+                self.runtime.set_effort_override(value.to_string());
                 // Persist the chosen effort into `config_selections` so it survives a
                 // respawn/resume. Unlike mode/model (persisted by the pump on
                 // ConfigChanged), claude emits no ConfigChanged for effort, so this is
@@ -614,10 +687,6 @@ impl SessionAgentTask {
                 // + validated it (dispatch above); best-effort persist (a DB failure must
                 // not fail the switch the CLI already applied).
                 self.persist_effort(value).await;
-                return Ok(aionui_api_types::SetConfigOptionResponse {
-                    confirmation: aionui_api_types::ConfigOptionConfirmation::CommandAck,
-                    config_options: None,
-                });
             }
             _ => {
                 return Ok(aionui_api_types::SetConfigOptionResponse {
@@ -627,10 +696,20 @@ impl SessionAgentTask {
             }
         }
         let snapshot = self.get_config_options().await?;
+        // Effort is emitted under the canonical id `reasoning_effort` (category
+        // `thought_level`); a caller may address it via any of its aliases, so match by
+        // category for the effort axis and by id otherwise.
+        let is_effort_alias = matches!(option_id, "effort" | "reasoning_effort" | "thought_level");
         let observed = snapshot
             .config_options
             .iter()
-            .find(|o| o.id == option_id)
+            .find(|o| {
+                if is_effort_alias {
+                    o.category.as_deref() == Some("thought_level")
+                } else {
+                    o.id == option_id
+                }
+            })
             .and_then(|o| o.current_value.as_deref())
             == Some(value);
         Ok(aionui_api_types::SetConfigOptionResponse {
@@ -1469,6 +1548,35 @@ fn spawn_event_pump(
                                 name: Some(m.name.clone()),
                                 label: None,
                                 description: m.description.clone(),
+                            })
+                            .collect(),
+                    });
+                }
+                // Reasoning-effort axis (claude per-model `supportedEffortLevels`). The
+                // frontend REPLACES its whole config-options snapshot on this frame, so we
+                // MUST re-emit effort here too — otherwise a late catalog push would wipe
+                // the effort option that `get_config_options` (REST) surfaced. The pump has
+                // no backend Arc, so the current model is resolved from the pushed catalog
+                // and the highlight comes from the runtime's optimistic effort override
+                // (claude emits no effort echo). Emitted only when the current model
+                // advertises efforts (union fallback when the current model is unknown).
+                let efforts = resolve_current_model_efforts(models, runtime.model_override().as_deref());
+                if !efforts.is_empty() {
+                    config_options.push(aionui_api_types::AcpConfigOptionDto {
+                        id: "reasoning_effort".into(),
+                        name: Some("Thinking".into()),
+                        label: None,
+                        description: None,
+                        category: Some("thought_level".into()),
+                        option_type: "select".into(),
+                        current_value: runtime.effort_override(),
+                        options: efforts
+                            .iter()
+                            .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
+                                value: e.clone(),
+                                name: Some(e.clone()),
+                                label: None,
+                                description: None,
                             })
                             .collect(),
                     });
@@ -3095,6 +3203,138 @@ mod persist_tests {
         );
     }
 
+    // A backend that advertises per-model reasoning efforts (claude `supportedEffortLevels`),
+    // used to prove the effort axis is surfaced to the frontend picker. The prior gap:
+    // `get_config_options` emitted only mode+model, so the origin frontend's
+    // `deriveSelectOption(..., 'thought_level', ['reasoning_effort'])` found nothing and the
+    // top-right selector never showed a thinking/effort group even though claude advertises
+    // it and the backend can set it.
+    use aionui_session::{
+        Admission, BackendError, Capabilities, Command, CommandReceipt, SessionBackend, SessionEnvelope,
+    };
+    use futures_util::stream::BoxStream;
+
+    struct EffortCapsBackend;
+
+    #[async_trait::async_trait]
+    impl SessionBackend for EffortCapsBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 0,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            use aionui_session::ModelInfo;
+            Capabilities {
+                available_models: vec![
+                    ModelInfo {
+                        id: "opus".into(),
+                        name: "Opus".into(),
+                        description: None,
+                        reasoning_efforts: vec!["low".into(), "medium".into(), "high".into(), "max".into()],
+                    },
+                    ModelInfo {
+                        id: "haiku".into(),
+                        name: "Haiku".into(),
+                        description: None,
+                        reasoning_efforts: vec![],
+                    },
+                ],
+                current_model: Some("opus".into()),
+                ..Default::default()
+            }
+        }
+    }
+
+    // The effort ("thought level") axis MUST be surfaced as a config option so the origin
+    // frontend renders it in the top-right model selector (parity with the ACP path's
+    // `thought_level` option). Asserts the exact shape the frontend keys off: category
+    // `thought_level`, id `reasoning_effort`, and the current model's advertised levels.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_config_options_surfaces_reasoning_effort_for_current_model() {
+        let backend: Arc<dyn SessionBackend> = Arc::new(EffortCapsBackend);
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        let snapshot = task.get_config_options().await.unwrap();
+        let effort = snapshot
+            .config_options
+            .iter()
+            .find(|o| o.category.as_deref() == Some("thought_level"))
+            .expect("effort axis must be surfaced as a thought_level config option");
+        assert_eq!(effort.id, "reasoning_effort", "canonical id the frontend fallback matches");
+        assert_eq!(effort.option_type, "select");
+        let values: Vec<&str> = effort.options.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(values, vec!["low", "medium", "high", "max"], "the current model's advertised efforts");
+    }
+
+    // A model with no advertised efforts (claude `haiku`) must NOT get an effort option —
+    // an empty select would render a dead, choice-less group.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_config_options_omits_effort_when_current_model_has_none() {
+        struct HaikuCurrentBackend;
+        #[async_trait::async_trait]
+        impl SessionBackend for HaikuCurrentBackend {
+            async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: 0,
+                })
+            }
+            fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+                use futures_util::StreamExt as _;
+                futures_util::stream::empty().boxed()
+            }
+            fn capabilities(&self) -> Capabilities {
+                use aionui_session::ModelInfo;
+                Capabilities {
+                    available_models: vec![ModelInfo {
+                        id: "haiku".into(),
+                        name: "Haiku".into(),
+                        description: None,
+                        reasoning_efforts: vec![],
+                    }],
+                    current_model: Some("haiku".into()),
+                    ..Default::default()
+                }
+            }
+        }
+        let backend: Arc<dyn SessionBackend> = Arc::new(HaikuCurrentBackend);
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        let snapshot = task.get_config_options().await.unwrap();
+        assert!(
+            snapshot.config_options.iter().all(|o| o.category.as_deref() != Some("thought_level")),
+            "a model with no advertised efforts must not surface an (empty) effort option"
+        );
+    }
+
+    // Setting effort must read back as Observed with the requested level (the frontend's
+    // `hasObservedValue` contract), driven by the optimistic override — claude emits no
+    // effort echo, so without the override the switch would downgrade to command_ack and
+    // the frontend would reject it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_config_option_effort_returns_observed_via_override() {
+        let (repo, _db) = seeded_repo().await;
+        let backend: Arc<dyn SessionBackend> = Arc::new(EffortCapsBackend);
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, Some(repo));
+        let resp = task.set_config_option("reasoning_effort", "high").await.unwrap();
+        assert!(
+            matches!(resp.confirmation, aionui_api_types::ConfigOptionConfirmation::Observed),
+            "effort switch must be Observed (optimistic override), not command_ack"
+        );
+        let effort = resp
+            .config_options
+            .as_ref()
+            .and_then(|opts| opts.iter().find(|o| o.category.as_deref() == Some("thought_level")))
+            .expect("effort option in the observed snapshot");
+        assert_eq!(effort.current_value.as_deref(), Some("high"), "the requested level is highlighted");
+    }
+
     // ── Defect 2: dead-resume-anchor self-heal ────────────────────────────
     // A turn that fails *because* the stored backend session no longer resolves must
     // NULL that anchor, or every subsequent send re-resumes the same dead id and the
@@ -3284,11 +3524,8 @@ mod pump_tests {
         let mut out = Vec::new();
         // The scripted stream is finite; once the pump drains it, no more frames
         // arrive, so a short bounded poll settles the collection (no live agent).
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
-                Ok(Ok(ev)) => out.push(ev),
-                _ => break,
-            }
+        while let Ok(Ok(ev)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+            out.push(ev);
         }
         out
     }
