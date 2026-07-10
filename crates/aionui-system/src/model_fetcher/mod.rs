@@ -24,12 +24,7 @@ pub(crate) struct FetchConfig {
 /// This avoids sending a multi-line Authorization header, which the HTTP client
 /// rejects.
 fn extract_first_key(api_key: &str) -> String {
-    api_key
-        .split('\n')
-        .next()
-        .unwrap_or(api_key)
-        .trim()
-        .to_string()
+    api_key.split('\n').next().unwrap_or(api_key).trim().to_string()
 }
 
 /// Service for fetching model lists from remote provider APIs.
@@ -320,18 +315,12 @@ mod tests {
 
     #[test]
     fn extract_first_key_multi_key_newline() {
-        assert_eq!(
-            extract_first_key("sk-key1\nsk-key2"),
-            "sk-key1",
-        );
+        assert_eq!(extract_first_key("sk-key1\nsk-key2"), "sk-key1",);
     }
 
     #[test]
     fn extract_first_key_multi_key_trailing_spaces() {
-        assert_eq!(
-            extract_first_key("  sk-key1  \nsk-key2"),
-            "sk-key1",
-        );
+        assert_eq!(extract_first_key("  sk-key1  \nsk-key2"), "sk-key1",);
     }
 
     #[test]
