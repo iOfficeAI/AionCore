@@ -287,7 +287,7 @@ impl MemberRuntimeRegistry {
                 operation_id,
                 outcome_tx,
             }) => (Some(operation_id), Some(outcome_tx)),
-            Some(MemberRuntimeEntry::Failed { outcome_tx, .. }) => (None, Some(outcome_tx)),
+            Some(MemberRuntimeEntry::Failed { .. }) => (None, None),
             Some(MemberRuntimeEntry::Ready) => (None, None),
             Some(MemberRuntimeEntry::Removing { .. }) => unreachable!("handled above"),
             None => return BeginRemove::Absent,
@@ -395,12 +395,10 @@ impl MemberRuntimeRegistry {
         }
         for entry in entries.drain().map(|(_, entry)| entry) {
             match entry {
-                MemberRuntimeEntry::Attaching { outcome_tx, .. }
-                | MemberRuntimeEntry::Failed { outcome_tx, .. }
-                | MemberRuntimeEntry::Removing { outcome_tx, .. } => {
+                MemberRuntimeEntry::Attaching { outcome_tx, .. } | MemberRuntimeEntry::Removing { outcome_tx, .. } => {
                     outcome_tx.send_replace(AttachSignal::Terminal(AttachOutcome::SessionStopped));
                 }
-                MemberRuntimeEntry::Ready => {}
+                MemberRuntimeEntry::Ready | MemberRuntimeEntry::Failed { .. } => {}
             }
         }
         true
@@ -654,5 +652,40 @@ mod tests {
         assert!(registry.commit_ready("worker-1", 2));
         assert_eq!(second.waiter().wait().await, AttachOutcome::Ready);
         assert_eq!(registry.snapshot("worker-1"), MemberRuntimeSnapshot::Ready);
+    }
+
+    #[tokio::test]
+    async fn failed_attach_outcome_is_not_rewritten_when_remove_begins() {
+        let registry = MemberRuntimeRegistry::new(46);
+        let attach = match registry.reserve_attach("worker-1", false) {
+            ReserveAttach::Start(lease) => lease,
+            _ => panic!("first reservation must start"),
+        };
+        let attach_failure = failure("transport", "Agent connection failed");
+        assert!(registry.commit_failed("worker-1", 1, attach_failure.clone()));
+
+        let remove = match registry.begin_remove("worker-1") {
+            BeginRemove::Start(lease) => lease,
+            _ => panic!("failed runtime removal must start"),
+        };
+
+        assert_eq!(remove.operation_id(), 2);
+        assert_eq!(remove.cancel_attach_operation_id(), None);
+        assert_eq!(attach.waiter().wait().await, AttachOutcome::Failed(attach_failure));
+    }
+
+    #[tokio::test]
+    async fn failed_attach_outcome_is_not_rewritten_when_session_stops() {
+        let registry = MemberRuntimeRegistry::new(47);
+        let attach = match registry.reserve_attach("worker-1", false) {
+            ReserveAttach::Start(lease) => lease,
+            _ => panic!("first reservation must start"),
+        };
+        let attach_failure = failure("transport", "Agent connection failed");
+        assert!(registry.commit_failed("worker-1", 1, attach_failure.clone()));
+
+        assert!(registry.stop());
+
+        assert_eq!(attach.waiter().wait().await, AttachOutcome::Failed(attach_failure));
     }
 }
