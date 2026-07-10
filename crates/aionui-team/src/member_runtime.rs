@@ -1,4 +1,7 @@
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "this crate-private registry is wired into TeamSession in the next implementation task"
+)]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,8 +56,10 @@ impl AttachWaiter {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct AttachLease {
+    session_generation: u64,
+    agent_id: String,
     waiter: AttachWaiter,
 }
 
@@ -68,8 +73,10 @@ impl AttachLease {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct RemoveLease {
+    session_generation: u64,
+    agent_id: String,
     waiter: AttachWaiter,
     cancel_attach_operation_id: Option<u64>,
 }
@@ -94,6 +101,7 @@ pub(crate) enum ReserveAttach {
     Join(AttachWaiter),
     AlreadyReady,
     Removing(AttachWaiter),
+    SessionStopped,
 }
 
 #[derive(Debug)]
@@ -184,7 +192,7 @@ impl MemberRuntimeRegistry {
     pub(crate) fn reserve_attach(&self, agent_id: &str, retry_failed: bool) -> ReserveAttach {
         let mut entries = self.lock_entries();
         if self.stopped.load(Ordering::Acquire) {
-            return ReserveAttach::Removing(terminal_waiter(0, AttachOutcome::SessionStopped));
+            return ReserveAttach::SessionStopped;
         }
 
         match entries.get(agent_id) {
@@ -213,13 +221,18 @@ impl MemberRuntimeRegistry {
                     },
                 );
                 ReserveAttach::Start(AttachLease {
+                    session_generation: self.session_generation,
+                    agent_id: agent_id.to_owned(),
                     waiter: waiter(operation_id, outcome_rx),
                 })
             }
         }
     }
 
-    pub(crate) fn commit_ready(&self, agent_id: &str, operation_id: u64) -> bool {
+    pub(crate) fn commit_ready(&self, lease: &AttachLease) -> bool {
+        if lease.session_generation != self.session_generation {
+            return false;
+        }
         let mut entries = self.lock_entries();
         if self.stopped.load(Ordering::Acquire) {
             return false;
@@ -227,20 +240,23 @@ impl MemberRuntimeRegistry {
         let Some(MemberRuntimeEntry::Attaching {
             operation_id: current_operation_id,
             outcome_tx,
-        }) = entries.get(agent_id)
+        }) = entries.get(&lease.agent_id)
         else {
             return false;
         };
-        if *current_operation_id != operation_id {
+        if *current_operation_id != lease.operation_id() {
             return false;
         }
         let outcome_tx = outcome_tx.clone();
-        entries.insert(agent_id.to_owned(), MemberRuntimeEntry::Ready);
+        entries.insert(lease.agent_id.clone(), MemberRuntimeEntry::Ready);
         outcome_tx.send_replace(AttachSignal::Terminal(AttachOutcome::Ready));
         true
     }
 
-    pub(crate) fn commit_failed(&self, agent_id: &str, operation_id: u64, failure: MemberRuntimeFailure) -> bool {
+    pub(crate) fn commit_failed(&self, lease: &AttachLease, failure: MemberRuntimeFailure) -> bool {
+        if lease.session_generation != self.session_generation {
+            return false;
+        }
         let mut entries = self.lock_entries();
         if self.stopped.load(Ordering::Acquire) {
             return false;
@@ -248,18 +264,18 @@ impl MemberRuntimeRegistry {
         let Some(MemberRuntimeEntry::Attaching {
             operation_id: current_operation_id,
             outcome_tx,
-        }) = entries.get(agent_id)
+        }) = entries.get(&lease.agent_id)
         else {
             return false;
         };
-        if *current_operation_id != operation_id {
+        if *current_operation_id != lease.operation_id() {
             return false;
         }
         let outcome_tx = outcome_tx.clone();
         entries.insert(
-            agent_id.to_owned(),
+            lease.agent_id.clone(),
             MemberRuntimeEntry::Failed {
-                operation_id,
+                operation_id: lease.operation_id(),
                 failure: failure.clone(),
                 outcome_tx: outcome_tx.clone(),
             },
@@ -306,12 +322,17 @@ impl MemberRuntimeRegistry {
             cancelled_outcome_tx.send_replace(AttachSignal::Terminal(AttachOutcome::Removed));
         }
         BeginRemove::Start(RemoveLease {
+            session_generation: self.session_generation,
+            agent_id: agent_id.to_owned(),
             waiter: waiter(operation_id, outcome_rx),
             cancel_attach_operation_id,
         })
     }
 
-    pub(crate) fn finish_remove(&self, agent_id: &str, operation_id: u64) -> bool {
+    pub(crate) fn finish_remove(&self, lease: &RemoveLease) -> bool {
+        if lease.session_generation != self.session_generation {
+            return false;
+        }
         let mut entries = self.lock_entries();
         if self.stopped.load(Ordering::Acquire) {
             return false;
@@ -319,25 +340,32 @@ impl MemberRuntimeRegistry {
         let Some(MemberRuntimeEntry::Removing {
             operation_id: current_operation_id,
             outcome_tx,
-        }) = entries.get(agent_id)
+        }) = entries.get(&lease.agent_id)
         else {
             return false;
         };
-        if *current_operation_id != operation_id {
+        if *current_operation_id != lease.operation_id() {
             return false;
         }
         let outcome_tx = outcome_tx.clone();
-        entries.remove(agent_id);
+        entries.remove(&lease.agent_id);
         outcome_tx.send_replace(AttachSignal::Terminal(AttachOutcome::Removed));
         true
     }
 
-    pub(crate) fn restore_failed_after_remove_error(
+    /// Marks a removed runtime as requiring a fresh attach after persistence fails.
+    ///
+    /// Call this only after runtime cancellation and join cleanup have completed,
+    /// so no live runtime remains. A later reconcile with `retry_failed = true`
+    /// starts a new attach operation.
+    pub(crate) fn restore_attach_required_after_remove_persist_error(
         &self,
-        agent_id: &str,
-        operation_id: u64,
+        lease: &RemoveLease,
         failure: MemberRuntimeFailure,
     ) -> bool {
+        if lease.session_generation != self.session_generation {
+            return false;
+        }
         let mut entries = self.lock_entries();
         if self.stopped.load(Ordering::Acquire) {
             return false;
@@ -345,18 +373,18 @@ impl MemberRuntimeRegistry {
         let Some(MemberRuntimeEntry::Removing {
             operation_id: current_operation_id,
             outcome_tx,
-        }) = entries.get(agent_id)
+        }) = entries.get(&lease.agent_id)
         else {
             return false;
         };
-        if *current_operation_id != operation_id {
+        if *current_operation_id != lease.operation_id() {
             return false;
         }
         let outcome_tx = outcome_tx.clone();
         entries.insert(
-            agent_id.to_owned(),
+            lease.agent_id.clone(),
             MemberRuntimeEntry::Failed {
-                operation_id,
+                operation_id: lease.operation_id(),
                 failure: failure.clone(),
                 outcome_tx: outcome_tx.clone(),
             },
@@ -408,6 +436,8 @@ impl MemberRuntimeRegistry {
         self.next_operation_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Critical sections contain only short in-memory transitions with no await,
+    /// I/O, or user callbacks, so retaining the map after poisoning is safe.
     fn lock_entries(&self) -> MutexGuard<'_, HashMap<String, MemberRuntimeEntry>> {
         self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -418,11 +448,6 @@ fn waiter(operation_id: u64, outcome_rx: watch::Receiver<AttachSignal>) -> Attac
         operation_id,
         outcome_rx,
     }
-}
-
-fn terminal_waiter(operation_id: u64, outcome: AttachOutcome) -> AttachWaiter {
-    let (_outcome_tx, outcome_rx) = watch::channel(AttachSignal::Terminal(outcome));
-    waiter(operation_id, outcome_rx)
 }
 
 #[cfg(test)]
@@ -476,7 +501,7 @@ mod tests {
 
         assert_eq!(lease.operation_id(), 1);
         assert_eq!(waiter.operation_id(), 1);
-        assert!(registry.commit_ready("worker-1", 1));
+        assert!(registry.commit_ready(&lease));
         assert_eq!(lease.waiter().wait().await, AttachOutcome::Ready);
         assert_eq!(waiter.wait().await, AttachOutcome::Ready);
         assert_eq!(registry.snapshot("worker-1"), MemberRuntimeSnapshot::Ready);
@@ -498,7 +523,7 @@ mod tests {
         };
         assert_eq!(first.operation_id(), 1);
         let first_failure = failure("provider_unavailable", "Agent is temporarily unavailable");
-        assert!(registry.commit_failed("worker-1", 1, first_failure.clone()));
+        assert!(registry.commit_failed(&first, first_failure.clone()));
         assert_eq!(
             first.waiter().wait().await,
             AttachOutcome::Failed(first_failure.clone())
@@ -520,7 +545,7 @@ mod tests {
             registry.snapshot("worker-1"),
             MemberRuntimeSnapshot::Attaching { operation_id: 2 }
         );
-        assert!(registry.commit_ready("worker-1", 2));
+        assert!(registry.commit_ready(&retry));
         assert_eq!(retry.waiter().wait().await, AttachOutcome::Ready);
     }
 
@@ -544,19 +569,15 @@ mod tests {
             MemberRuntimeSnapshot::Removing { operation_id: 2 }
         );
         assert_eq!(attach.waiter().wait().await, AttachOutcome::Removed);
-        assert!(!registry.commit_ready("worker-1", 1));
-        assert!(!registry.commit_failed(
-            "worker-1",
-            1,
-            failure("late_provider_error", "Agent attach did not complete")
-        ));
+        assert!(!registry.commit_ready(&attach));
+        assert!(!registry.commit_failed(&attach, failure("late_provider_error", "Agent attach did not complete")));
 
         let removing_waiter = match registry.reserve_attach("worker-1", false) {
             ReserveAttach::Removing(waiter) => waiter,
             _ => panic!("reservation must wait while removal is active"),
         };
         assert_eq!(removing_waiter.operation_id(), 2);
-        assert!(registry.finish_remove("worker-1", 2));
+        assert!(registry.finish_remove(&remove));
         assert_eq!(removing_waiter.wait().await, AttachOutcome::Removed);
         assert_eq!(registry.snapshot("worker-1"), MemberRuntimeSnapshot::Absent);
 
@@ -568,7 +589,7 @@ mod tests {
         assert_eq!(second_remove.operation_id(), 3);
         assert_eq!(second_remove.cancel_attach_operation_id(), None);
         let remove_failure = failure("remove_rejected", "Agent removal could not be completed");
-        assert!(registry.restore_failed_after_remove_error("worker-2", 3, remove_failure.clone()));
+        assert!(registry.restore_attach_required_after_remove_persist_error(&second_remove, remove_failure.clone()));
         assert_eq!(
             second_remove.waiter().wait().await,
             AttachOutcome::Failed(remove_failure.clone())
@@ -577,9 +598,16 @@ mod tests {
             registry.snapshot("worker-2"),
             MemberRuntimeSnapshot::Failed {
                 operation_id: 3,
-                failure: remove_failure,
+                failure: remove_failure.clone(),
             }
         );
+
+        let retry = match registry.reserve_attach("worker-2", true) {
+            ReserveAttach::Start(lease) => lease,
+            _ => panic!("persistence failure must require a fresh attach"),
+        };
+        assert_eq!(retry.operation_id(), 4);
+        assert!(registry.commit_ready(&retry));
     }
 
     #[tokio::test]
@@ -615,16 +643,14 @@ mod tests {
         assert!(!registry.stop());
         assert_eq!(first_task.await.unwrap(), AttachOutcome::SessionStopped);
         assert_eq!(second_task.await.unwrap(), AttachOutcome::SessionStopped);
-        assert!(!registry.commit_ready("worker-1", 1));
-        assert!(!registry.commit_failed("worker-2", 2, failure("provider_stopped", "Agent session stopped")));
+        assert!(!registry.commit_ready(&first));
+        assert!(!registry.commit_failed(&second, failure("provider_stopped", "Agent session stopped")));
         assert_eq!(registry.snapshot("worker-1"), MemberRuntimeSnapshot::SessionStopped);
 
-        let stopped_waiter = match registry.reserve_attach("worker-3", false) {
-            ReserveAttach::Removing(waiter) => waiter,
-            _ => panic!("stopped sessions must not start new attaches"),
-        };
-        assert_eq!(stopped_waiter.operation_id(), 0);
-        assert_eq!(stopped_waiter.wait().await, AttachOutcome::SessionStopped);
+        assert!(matches!(
+            registry.reserve_attach("worker-3", false),
+            ReserveAttach::SessionStopped
+        ));
     }
 
     #[tokio::test]
@@ -635,7 +661,7 @@ mod tests {
             _ => panic!("first reservation must start"),
         };
         let first_failure = failure("transport", "Agent connection failed");
-        assert!(registry.commit_failed("worker-1", 1, first_failure.clone()));
+        assert!(registry.commit_failed(&first, first_failure.clone()));
         assert_eq!(first.waiter().wait().await, AttachOutcome::Failed(first_failure));
 
         let second = match registry.reserve_attach("worker-1", true) {
@@ -643,13 +669,13 @@ mod tests {
             _ => panic!("retry reservation must start"),
         };
         assert_eq!(second.operation_id(), 2);
-        assert!(!registry.commit_ready("worker-1", 1));
-        assert!(!registry.commit_failed("worker-1", 1, failure("stale", "Stale attach failed")));
+        assert!(!registry.commit_ready(&first));
+        assert!(!registry.commit_failed(&first, failure("stale", "Stale attach failed")));
         assert_eq!(
             registry.snapshot("worker-1"),
             MemberRuntimeSnapshot::Attaching { operation_id: 2 }
         );
-        assert!(registry.commit_ready("worker-1", 2));
+        assert!(registry.commit_ready(&second));
         assert_eq!(second.waiter().wait().await, AttachOutcome::Ready);
         assert_eq!(registry.snapshot("worker-1"), MemberRuntimeSnapshot::Ready);
     }
@@ -662,7 +688,7 @@ mod tests {
             _ => panic!("first reservation must start"),
         };
         let attach_failure = failure("transport", "Agent connection failed");
-        assert!(registry.commit_failed("worker-1", 1, attach_failure.clone()));
+        assert!(registry.commit_failed(&attach, attach_failure.clone()));
 
         let remove = match registry.begin_remove("worker-1") {
             BeginRemove::Start(lease) => lease,
@@ -682,10 +708,132 @@ mod tests {
             _ => panic!("first reservation must start"),
         };
         let attach_failure = failure("transport", "Agent connection failed");
-        assert!(registry.commit_failed("worker-1", 1, attach_failure.clone()));
+        assert!(registry.commit_failed(&attach, attach_failure.clone()));
 
         assert!(registry.stop());
 
         assert_eq!(attach.waiter().wait().await, AttachOutcome::Failed(attach_failure));
+    }
+
+    #[tokio::test]
+    async fn concurrent_remove_requests_join_the_same_remove_operation() {
+        let registry = MemberRuntimeRegistry::new(48);
+        assert!(registry.seed_ready("worker-1"));
+        let owner = match registry.begin_remove("worker-1") {
+            BeginRemove::Start(lease) => lease,
+            _ => panic!("first remove must start"),
+        };
+        let joiner = match registry.begin_remove("worker-1") {
+            BeginRemove::Join(waiter) => waiter,
+            _ => panic!("second remove must join"),
+        };
+
+        assert_eq!(owner.operation_id(), 1);
+        assert_eq!(joiner.operation_id(), 1);
+        assert!(registry.finish_remove(&owner));
+        assert_eq!(owner.waiter().wait().await, AttachOutcome::Removed);
+        assert_eq!(joiner.wait().await, AttachOutcome::Removed);
+    }
+
+    #[tokio::test]
+    async fn session_stop_unblocks_waiters_for_an_active_remove() {
+        let registry = MemberRuntimeRegistry::new(49);
+        assert!(registry.seed_ready("worker-1"));
+        let owner = match registry.begin_remove("worker-1") {
+            BeginRemove::Start(lease) => lease,
+            _ => panic!("remove must start"),
+        };
+        let reserve_waiter = match registry.reserve_attach("worker-1", false) {
+            ReserveAttach::Removing(waiter) => waiter,
+            _ => panic!("attach must wait for active remove"),
+        };
+
+        assert!(registry.stop());
+
+        assert_eq!(owner.waiter().wait().await, AttachOutcome::SessionStopped);
+        assert_eq!(reserve_waiter.wait().await, AttachOutcome::SessionStopped);
+        assert!(!registry.finish_remove(&owner));
+    }
+
+    #[test]
+    fn stale_remove_owner_cannot_finish_or_restore_a_newer_remove() {
+        let registry = MemberRuntimeRegistry::new(50);
+        assert!(registry.seed_ready("worker-1"));
+        let first = match registry.begin_remove("worker-1") {
+            BeginRemove::Start(lease) => lease,
+            _ => panic!("first remove must start"),
+        };
+        assert!(registry.finish_remove(&first));
+
+        assert!(registry.seed_ready("worker-1"));
+        let second = match registry.begin_remove("worker-1") {
+            BeginRemove::Start(lease) => lease,
+            _ => panic!("second remove must start"),
+        };
+
+        assert_eq!(first.operation_id(), 1);
+        assert_eq!(second.operation_id(), 2);
+        assert!(!registry.finish_remove(&first));
+        assert!(
+            !registry
+                .restore_attach_required_after_remove_persist_error(&first, failure("stale", "Stale remove failed"))
+        );
+        assert_eq!(
+            registry.snapshot("worker-1"),
+            MemberRuntimeSnapshot::Removing { operation_id: 2 }
+        );
+        assert!(registry.finish_remove(&second));
+    }
+
+    #[test]
+    fn attach_owner_from_another_session_generation_cannot_commit() {
+        let old_registry = MemberRuntimeRegistry::new(51);
+        let old_owner = match old_registry.reserve_attach("worker-1", false) {
+            ReserveAttach::Start(lease) => lease,
+            _ => panic!("old session attach must start"),
+        };
+        let current_registry = MemberRuntimeRegistry::new(52);
+        let current_owner = match current_registry.reserve_attach("worker-1", false) {
+            ReserveAttach::Start(lease) => lease,
+            _ => panic!("current session attach must start"),
+        };
+
+        assert_eq!(old_owner.operation_id(), 1);
+        assert_eq!(current_owner.operation_id(), 1);
+        assert!(!current_registry.commit_ready(&old_owner));
+        assert_eq!(
+            current_registry.snapshot("worker-1"),
+            MemberRuntimeSnapshot::Attaching { operation_id: 1 }
+        );
+        assert!(current_registry.commit_ready(&current_owner));
+    }
+
+    #[test]
+    fn remove_owner_from_another_session_generation_cannot_finish_or_restore() {
+        let old_registry = MemberRuntimeRegistry::new(53);
+        assert!(old_registry.seed_ready("worker-1"));
+        let old_owner = match old_registry.begin_remove("worker-1") {
+            BeginRemove::Start(lease) => lease,
+            _ => panic!("old session remove must start"),
+        };
+        let current_registry = MemberRuntimeRegistry::new(54);
+        assert!(current_registry.seed_ready("worker-1"));
+        let current_owner = match current_registry.begin_remove("worker-1") {
+            BeginRemove::Start(lease) => lease,
+            _ => panic!("current session remove must start"),
+        };
+
+        assert_eq!(old_owner.operation_id(), 1);
+        assert_eq!(current_owner.operation_id(), 1);
+        assert!(!current_registry.finish_remove(&old_owner));
+        assert!(!current_registry.restore_attach_required_after_remove_persist_error(
+            &old_owner,
+            failure("stale_session", "Stale session remove failed")
+        ));
+        assert_eq!(
+            current_registry.snapshot("worker-1"),
+            MemberRuntimeSnapshot::Removing { operation_id: 1 }
+        );
+        assert!(current_registry.finish_remove(&current_owner));
     }
 }
