@@ -38,6 +38,14 @@ pub enum TeamError {
     #[error("Team agent runtime is not ready for conversation: {conversation_id}")]
     RuntimeNotReady { conversation_id: String },
 
+    #[error("Team member runtime failed: {slot_id}")]
+    MemberRuntimeFailed {
+        team_id: String,
+        slot_id: String,
+        conversation_id: String,
+        public_reason: String,
+    },
+
     #[error("Workspace path is unavailable: {0}")]
     WorkspacePathUnavailable(String),
 

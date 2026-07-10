@@ -30,7 +30,9 @@ use crate::events::{
     TEAM_CREATED_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT, TEAM_SESSION_STATUS_CHANGED_EVENT, TeamEventEmitter,
 };
 use crate::mcp::TeamMcpStdioConfig;
-use crate::member_runtime::{AttachLease, AttachOutcome, AttachWaiter, MemberRuntimeSnapshot, ReserveAttach};
+use crate::member_runtime::{
+    AttachLease, AttachOutcome, AttachWaiter, BeginRemove, MemberRuntimeFailure, MemberRuntimeSnapshot, ReserveAttach,
+};
 use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogPort};
 use crate::prompt_dump::TeamPromptDumpConfig;
@@ -586,41 +588,133 @@ impl TeamSessionService {
             .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
-        let _guard = lock.lock().await;
+        let (removed, session, removal_lease) = {
+            let _guard = lock.lock().await;
+            let team = self.load_owned_team(user_id, team_id).await?;
+            let removed = team
+                .agents
+                .iter()
+                .find(|agent| agent.slot_id == slot_id)
+                .cloned()
+                .ok_or_else(|| TeamError::AgentNotFound(slot_id.into()))?;
+            if removed.role == crate::types::TeammateRole::Lead {
+                return Err(TeamError::InvalidRequest("cannot remove the team lead".into()));
+            }
+            let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+            let removal = session
+                .as_ref()
+                .map(|session| session.member_runtimes().begin_remove(slot_id));
+            let removal_lease = match removal {
+                Some(BeginRemove::Start(lease)) => Some(lease),
+                Some(BeginRemove::Join(waiter)) => {
+                    drop(_guard);
+                    return match waiter.wait().await {
+                        AttachOutcome::Removed => Ok(()),
+                        AttachOutcome::Failed(failure) => Err(TeamError::MemberRuntimeFailed {
+                            team_id: team_id.to_owned(),
+                            slot_id: removed.slot_id,
+                            conversation_id: removed.conversation_id,
+                            public_reason: failure.public_reason,
+                        }),
+                        AttachOutcome::Ready | AttachOutcome::SessionStopped => {
+                            Err(TeamError::SessionNotFound(team_id.to_owned()))
+                        }
+                    };
+                }
+                Some(BeginRemove::Absent | BeginRemove::SessionStopped) | None => None,
+            };
+            (removed, session, removal_lease)
+        };
 
-        let mut team = self.load_owned_team(user_id, team_id).await?;
-
-        let idx = team
-            .agents
-            .iter()
-            .position(|a| a.slot_id == slot_id)
-            .ok_or_else(|| TeamError::AgentNotFound(slot_id.into()))?;
-
-        if team.agents[idx].role == crate::types::TeammateRole::Lead {
-            return Err(TeamError::InvalidRequest("cannot remove the team lead".into()));
+        // Cancellation and process cleanup intentionally happen without the
+        // membership lock. Concurrent ensure calls observe Removing and join
+        // the same registry operation instead of starting a replacement.
+        if let Some(session) = &session {
+            session.event_loops().remove(slot_id);
         }
-
-        let removed = team.agents.remove(idx);
-
-        let _ = self
-            .conversation_port
-            .delete_team_conversation(user_id, &removed.conversation_id)
+        self.task_manager
+            .kill_and_wait(&removed.conversation_id, Some(AgentKillReason::TeamDeleted))
             .await;
 
-        let agents_json = serde_json::to_string(&team.agents)?;
-        self.repo
-            .update_team(
-                team_id,
-                &UpdateTeamParams {
-                    agents: Some(agents_json),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let persist_result = {
+            let _guard = lock.lock().await;
+            let mut current = self.load_owned_team(user_id, team_id).await?;
+            current.agents.retain(|agent| agent.slot_id != slot_id);
+            let agents_json = serde_json::to_string(&current.agents)?;
+            self.repo
+                .update_team(
+                    team_id,
+                    &UpdateTeamParams {
+                        agents: Some(agents_json),
+                        ..Default::default()
+                    },
+                )
+                .await
+        };
 
-        if let Some(session) = self.sessions.get(team_id).map(|e| Arc::clone(&e.session)) {
-            session.remove_agent(slot_id).await?;
+        if let Err(error) = persist_result {
+            if let (Some(session), Some(lease)) = (&session, removal_lease.as_ref()) {
+                session
+                    .member_runtimes()
+                    .restore_attach_required_after_remove_persist_error(
+                        lease,
+                        MemberRuntimeFailure {
+                            classification: "membership_persist_failed",
+                            public_reason: "Agent runtime needs to restart after membership update failed".to_owned(),
+                        },
+                    );
+                self.refresh_member_runtime_status(session).await;
+            }
+            return Err(error.into());
+        }
+
+        let published_session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        let active_session = if let Some(current) = published_session {
+            let current_removal_lease = if session.as_ref().is_some_and(|captured| Arc::ptr_eq(captured, &current)) {
+                removal_lease
+            } else {
+                match current.member_runtimes().begin_remove(slot_id) {
+                    BeginRemove::Start(lease) => Some(lease),
+                    BeginRemove::Join(waiter) => {
+                        let _ = waiter.wait().await;
+                        None
+                    }
+                    BeginRemove::Absent | BeginRemove::SessionStopped => None,
+                }
+            };
+            current.event_loops().remove(slot_id);
+            self.task_manager
+                .kill_and_wait(&removed.conversation_id, Some(AgentKillReason::TeamDeleted))
+                .await;
+            match current.scheduler().remove_agent(slot_id).await {
+                Ok(_) | Err(TeamError::AgentNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+            if let Some(lease) = current_removal_lease.as_ref() {
+                current.member_runtimes().finish_remove(lease);
+            }
+            Some(current)
+        } else {
+            None
+        };
+
+        if let Err(error) = self
+            .conversation_port
+            .delete_team_conversation(user_id, &removed.conversation_id)
+            .await
+        {
+            warn!(
+                team_id,
+                slot_id,
+                conversation_id = %removed.conversation_id,
+                error = %error,
+                "removed team member conversation cleanup failed"
+            );
+        }
+
+        if let Some(session) = active_session.filter(|session| self.capture_published_session(session).is_some()) {
             session.notify_leader_membership_removed(&removed).await?;
+            self.refresh_member_runtime_status(&session).await;
             info!(
                 team_id = %team_id,
                 slot_id = %removed.slot_id,
@@ -993,6 +1087,9 @@ impl TeamSessionService {
         session: Arc<TeamSession>,
         work: Vec<MemberRuntimeReconcileWork>,
     ) -> Result<(), TeamError> {
+        if !work.is_empty() {
+            self.publish_member_runtime_starting_if_current(&session);
+        }
         let mut waiters = Vec::with_capacity(work.len());
         for item in work {
             let waiter = item.waiter;
@@ -1047,7 +1144,18 @@ impl TeamSessionService {
             match outcome {
                 AttachOutcome::Ready | AttachOutcome::Removed => {}
                 AttachOutcome::Failed(failure) => {
-                    return Err(TeamError::InvalidRequest(failure.public_reason));
+                    self.broadcast_session_status(
+                        team_id,
+                        TeamSessionStatus::Failed,
+                        Some(TeamSessionPhase::AttachingAgents),
+                        |payload| payload.error = Some(failure.public_reason.clone()),
+                    );
+                    return Err(TeamError::MemberRuntimeFailed {
+                        team_id: team_id.to_owned(),
+                        slot_id: agent.slot_id,
+                        conversation_id: agent.conversation_id,
+                        public_reason: failure.public_reason,
+                    });
                 }
                 AttachOutcome::SessionStopped => {
                     return Err(TeamError::InvalidRequest(
@@ -1461,6 +1569,72 @@ impl TeamSessionService {
             self.broadcast_agent_runtime_status(expected.team_id(), agent, TeamAgentRuntimeStatus::Ready, None);
         })
         .is_some()
+    }
+
+    pub(crate) fn publish_member_runtime_starting_if_current(&self, expected: &TeamSession) -> bool {
+        self.with_published_session(expected, |_| {
+            self.broadcast_session_status(
+                expected.team_id(),
+                TeamSessionStatus::Starting,
+                Some(TeamSessionPhase::AttachingAgents),
+                |_| {},
+            );
+        })
+        .is_some()
+    }
+
+    pub(crate) fn publish_member_runtime_failed_if_current(&self, expected: &TeamSession, reason: &str) -> bool {
+        self.with_published_session(expected, |_| {
+            self.broadcast_session_status(
+                expected.team_id(),
+                TeamSessionStatus::Failed,
+                Some(TeamSessionPhase::AttachingAgents),
+                |payload| payload.error = Some(reason.to_owned()),
+            );
+        })
+        .is_some()
+    }
+
+    pub(crate) async fn refresh_member_runtime_status(&self, expected: &TeamSession) {
+        let membership_lock = self
+            .add_agent_locks
+            .entry(expected.team_id().to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _membership_guard = membership_lock.lock().await;
+        let Ok(Some(row)) = self.repo.get_team(expected.team_id()).await else {
+            return;
+        };
+        let Ok(team) = Team::from_row(&row) else {
+            return;
+        };
+
+        let mut failed_reason = None;
+        let mut pending = false;
+        for agent in &team.agents {
+            match expected.member_runtimes().snapshot(&agent.slot_id) {
+                MemberRuntimeSnapshot::Ready => {}
+                MemberRuntimeSnapshot::Failed { failure, .. } => {
+                    failed_reason.get_or_insert(failure.public_reason);
+                }
+                MemberRuntimeSnapshot::Absent
+                | MemberRuntimeSnapshot::Attaching { .. }
+                | MemberRuntimeSnapshot::Removing { .. } => pending = true,
+                MemberRuntimeSnapshot::SessionStopped => return,
+            }
+        }
+
+        if let Some(reason) = failed_reason {
+            self.publish_member_runtime_failed_if_current(expected, &reason);
+        } else if pending {
+            self.publish_member_runtime_starting_if_current(expected);
+        } else {
+            let _ = self.with_published_session(expected, |_| {
+                self.broadcast_session_status(expected.team_id(), TeamSessionStatus::Ready, None, |payload| {
+                    payload.server_count = Some(team.agents.len());
+                });
+            });
+        }
     }
 
     pub async fn get_run_state(&self, user_id: &str, team_id: &str) -> Result<TeamRunStateResponse, TeamError> {

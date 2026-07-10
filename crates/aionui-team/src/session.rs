@@ -1783,6 +1783,7 @@ pub(crate) async fn attach_member_runtime(
     let started_at = Instant::now();
     let operation_id = lease.operation_id();
     let generation = session.generation().to_owned();
+    service.publish_member_runtime_starting_if_current(&session);
     info!(
         team_id = session.team_id(),
         slot_id = agent.slot_id,
@@ -1806,10 +1807,7 @@ pub(crate) async fn attach_member_runtime(
         service
             .cleanup_stale_member_runtime_task(&session, &agent.conversation_id)
             .await;
-        let failure = MemberRuntimeFailure {
-            classification: "attach_failed",
-            public_reason: error.to_string(),
-        };
+        let failure = sanitize_member_runtime_failure(&error);
         if session.member_runtimes.commit_failed(&lease, failure.clone()) {
             service.broadcast_agent_runtime_status(
                 session.team_id(),
@@ -1825,6 +1823,7 @@ pub(crate) async fn attach_member_runtime(
                 .team_run_manager
                 .mark_slot_runtime_health(&agent.slot_id, TeamSlotRuntimeHealth::Unhealthy)
                 .await;
+            service.refresh_member_runtime_status(&session).await;
             if let Err(notify_error) = session
                 .notify_leader_spawn_attach_failed(&agent.slot_id, &failure.public_reason)
                 .await
@@ -1885,6 +1884,7 @@ pub(crate) async fn attach_member_runtime(
                     public_reason: "Agent runtime event loop could not be registered".to_owned(),
                 };
                 session.member_runtimes.commit_failed(&lease, failure.clone());
+                service.refresh_member_runtime_status(&session).await;
                 warn!(
                     team_id = session.team_id(),
                     slot_id = agent.slot_id,
@@ -1916,6 +1916,7 @@ pub(crate) async fn attach_member_runtime(
         cleanup_stale_attach(&service, &session, &agent, operation_id, &generation, started_at).await;
         return AttachOutcome::SessionStopped;
     }
+    service.refresh_member_runtime_status(&session).await;
     info!(
         team_id = session.team_id(),
         slot_id = agent.slot_id,
@@ -1927,6 +1928,18 @@ pub(crate) async fn attach_member_runtime(
         "team member runtime attach completed"
     );
     AttachOutcome::Ready
+}
+
+fn sanitize_member_runtime_failure(error: &TeamError) -> MemberRuntimeFailure {
+    let classification = match error {
+        TeamError::Database(_) => "runtime_configuration_failed",
+        TeamError::SessionNotFound(_) => "session_stopped",
+        _ => "runtime_start_failed",
+    };
+    MemberRuntimeFailure {
+        classification,
+        public_reason: "Agent runtime failed to start".to_owned(),
+    }
 }
 
 async fn cleanup_stale_attach(

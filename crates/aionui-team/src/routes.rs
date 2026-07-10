@@ -64,6 +64,22 @@ impl From<TeamError> for ApiError {
                 format!("Team agent runtime is not ready for conversation: {conversation_id}"),
                 Some(serde_json::json!({ "conversation_id": conversation_id })),
             ),
+            TeamError::MemberRuntimeFailed {
+                team_id,
+                slot_id,
+                conversation_id,
+                public_reason,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_MEMBER_RUNTIME_FAILED",
+                "A team member runtime failed to start",
+                Some(serde_json::json!({
+                    "team_id": team_id,
+                    "slot_id": slot_id,
+                    "conversation_id": conversation_id,
+                    "reason": public_reason,
+                })),
+            ),
             TeamError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
             TeamError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
             TeamError::Database(db_err) => db_error_to_api_error(db_err),
@@ -459,6 +475,29 @@ mod tests {
         assert_eq!(err.status_code(), StatusCode::CONFLICT);
         assert_eq!(err.error_code(), "TEAM_RUNTIME_NOT_READY");
         assert_eq!(err.error_details(), Some(json!({ "conversation_id": "conv-1" })));
+    }
+
+    #[test]
+    fn member_runtime_failure_maps_to_sanitized_coded_conflict() {
+        let err: ApiError = TeamError::MemberRuntimeFailed {
+            team_id: "team-1".into(),
+            slot_id: "slot-2".into(),
+            conversation_id: "conv-2".into(),
+            public_reason: "Agent runtime failed to start".into(),
+        }
+        .into();
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "TEAM_MEMBER_RUNTIME_FAILED");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({
+                "team_id": "team-1",
+                "slot_id": "slot-2",
+                "conversation_id": "conv-2",
+                "reason": "Agent runtime failed to start",
+            }))
+        );
+        assert!(!format!("{err:?}").contains("provider-secret"));
     }
 
     #[test]

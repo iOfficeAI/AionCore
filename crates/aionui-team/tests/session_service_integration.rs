@@ -1849,13 +1849,27 @@ fn setup_with_factory_and_recording_broadcaster(
     Arc<CountingTaskManager>,
     Arc<RecordingBroadcaster>,
 ) {
+    let (service, team_repo, task_manager, recorder, _conversation_repo) =
+        setup_with_factory_recording_broadcaster_and_conversation_repo(factory);
+    (service, team_repo, task_manager, recorder)
+}
+
+fn setup_with_factory_recording_broadcaster_and_conversation_repo(
+    factory: AgentFactory,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<CountingTaskManager>,
+    Arc<RecordingBroadcaster>,
+    Arc<MockConversationRepo>,
+) {
     let team_repo = Arc::new(FullMockTeamRepo::new());
     let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
     let recorder = Arc::new(RecordingBroadcaster::new());
     let broadcaster: Arc<dyn EventBroadcaster> = recorder.clone();
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
-    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo));
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
     let task_manager = Arc::new(CountingTaskManager::new(factory));
@@ -1877,7 +1891,7 @@ fn setup_with_factory_and_recording_broadcaster(
         noop_cancellation_port(),
         backend_binary_path,
     );
-    (svc, team_repo, task_manager, recorder)
+    (svc, team_repo, task_manager, recorder, conv_repo)
 }
 
 fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadataRow {
@@ -3707,12 +3721,12 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
 async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() {
     use futures_util::FutureExt;
 
-    let build_count = Arc::new(AtomicUsize::new(0));
-    let factory_count = build_count.clone();
+    let fail_next = Arc::new(AtomicBool::new(false));
+    let factory_fail_next = Arc::clone(&fail_next);
     let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
-        let build_index = factory_count.fetch_add(1, Ordering::SeqCst);
+        let should_fail = factory_fail_next.swap(false, Ordering::SeqCst);
         async move {
-            if build_index >= 1 {
+            if should_fail {
                 return Err(AgentError::internal("simulated manual add attach failure"));
             }
             Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
@@ -3721,7 +3735,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() 
         }
         .boxed()
     });
-    let (svc, team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(factory);
+    let (svc, team_repo, task_manager, recorder) = setup_with_factory_and_recording_broadcaster(factory);
     let created = svc
         .create_team(
             "user1",
@@ -3741,6 +3755,10 @@ async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() 
         .await
         .unwrap();
     svc.ensure_session("user1", &created.id).await.unwrap();
+    let original_scheduler = svc.get_session_scheduler(&created.id).unwrap();
+    let lead_conversation_id = created.assistants[0].conversation_id.clone();
+    task_manager.reset_calls();
+    fail_next.store(true, Ordering::SeqCst);
 
     let agent = svc
         .add_agent(
@@ -3772,6 +3790,43 @@ async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() 
     .await
     .expect("manual add attach failure should mark the slot error");
 
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if recorder
+                .events_by_name("team.sessionStatusChanged")
+                .iter()
+                .any(|event| {
+                    event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
+                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+                        && event.data.get("phase").and_then(serde_json::Value::as_str) == Some("attaching_agents")
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dynamic attach failure must fail the team lifecycle");
+
+    assert!(Arc::ptr_eq(
+        &original_scheduler,
+        &svc.get_session_scheduler(&created.id)
+            .expect("published session remains")
+    ));
+    assert!(
+        task_manager.get_task(&lead_conversation_id).is_some(),
+        "healthy leader runtime must remain alive"
+    );
+    assert!(
+        task_manager
+            .snapshot()
+            .build
+            .iter()
+            .all(|conversation_id| conversation_id == &agent.conversation_id),
+        "dynamic failure must not rebuild healthy members"
+    );
+
     let lead_slot_id = created.leader_assistant_id.as_deref().expect("leader slot");
     let leader_messages = team_repo.peek_unread(&created.id, lead_slot_id).await.unwrap();
     assert!(
@@ -3779,6 +3834,228 @@ async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() 
             .iter()
             .any(|message| message.content.contains("failed to attach its runtime")),
         "leader should receive a persisted attach-failure notice"
+    );
+
+    svc.ensure_session("user1", &created.id)
+        .await
+        .expect("later ensure should retry only the failed member");
+    assert!(Arc::ptr_eq(
+        &original_scheduler,
+        &svc.get_session_scheduler(&created.id)
+            .expect("same session after retry")
+    ));
+    assert_eq!(
+        task_manager
+            .snapshot()
+            .build
+            .iter()
+            .filter(|conversation_id| *conversation_id == &agent.conversation_id)
+            .count(),
+        2,
+        "the failed member should have one failed attach and one later retry"
+    );
+    assert!(
+        recorder
+            .events_by_name("team.sessionStatusChanged")
+            .iter()
+            .any(|event| {
+                event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
+                    && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
+                    && event.data.get("server_count").and_then(serde_json::Value::as_u64) == Some(2)
+            }),
+        "single-member retry must restore team Ready"
+    );
+}
+
+#[tokio::test]
+async fn failed_member_returns_conflict_and_removal_restores_ready() {
+    use futures_util::FutureExt;
+
+    let build_count = Arc::new(AtomicUsize::new(0));
+    let factory_count = Arc::clone(&build_count);
+    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+        let build_index = factory_count.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if build_index >= 1 {
+                return Err(AgentError::internal("provider-secret: dynamic attach failed"));
+            }
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
+            )))
+        }
+        .boxed()
+    });
+    let (svc, _team_repo, task_manager, recorder) = setup_with_factory_and_recording_broadcaster(factory);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Failed member removal".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let original_scheduler = svc.get_session_scheduler(&created.id).unwrap();
+    let lead_conversation_id = created.assistants[0].conversation_id.clone();
+    task_manager.reset_calls();
+
+    let failed = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Broken".into(),
+                role: "teammate".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if recorder
+                .events_by_name("team.sessionStatusChanged")
+                .iter()
+                .any(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dynamic failure status");
+
+    let error = svc
+        .ensure_session("user1", &created.id)
+        .await
+        .expect_err("failed-member retry should report one deterministic failure");
+    assert!(matches!(
+        error,
+        TeamError::MemberRuntimeFailed {
+            ref team_id,
+            ref slot_id,
+            ref conversation_id,
+            ref public_reason,
+        } if team_id == &created.id
+            && slot_id == &failed.slot_id
+            && conversation_id == &failed.conversation_id
+            && public_reason == "Agent runtime failed to start"
+    ));
+
+    task_manager.reset_calls();
+    recorder.clear();
+    svc.remove_agent("user1", &created.id, &failed.slot_id).await.unwrap();
+
+    assert!(Arc::ptr_eq(
+        &original_scheduler,
+        &svc.get_session_scheduler(&created.id).expect("healthy session remains")
+    ));
+    assert!(task_manager.get_task(&lead_conversation_id).is_some());
+    assert!(
+        task_manager
+            .snapshot()
+            .kill
+            .iter()
+            .all(|(conversation_id, _)| conversation_id != &lead_conversation_id)
+    );
+    assert!(
+        recorder
+            .events_by_name("team.sessionStatusChanged")
+            .iter()
+            .any(|event| {
+                event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
+                    && event.data.get("server_count").and_then(serde_json::Value::as_u64) == Some(1)
+            })
+    );
+}
+
+#[tokio::test]
+async fn deleting_attaching_member_leaves_no_runtime_conversation_or_ready_event() {
+    let gate = Arc::new(GatedProvisioningFactory::default());
+    let (svc, _team_repo, task_manager, recorder, conv_repo) =
+        setup_with_factory_recording_broadcaster_and_conversation_repo(gate.factory());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Remove attaching member".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    gate.enable();
+    let added = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Attaching".into(),
+                role: "teammate".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    gate.wait_for_starts(1).await;
+
+    let remove_service = Arc::clone(&svc);
+    let team_id = created.id.clone();
+    let slot_id = added.slot_id.clone();
+    let removal = tokio::spawn(async move { remove_service.remove_agent("user1", &team_id, &slot_id).await });
+    tokio::task::yield_now().await;
+    assert!(!removal.is_finished(), "removal must join in-flight runtime cleanup");
+    gate.release(1);
+    removal.await.unwrap().unwrap();
+
+    assert!(task_manager.get_task(&added.conversation_id).is_none());
+    assert!(
+        conv_repo.get(&added.conversation_id).await.unwrap().is_none(),
+        "removed attaching member conversation must be deleted"
+    );
+    assert!(
+        svc.get_team("user1", &created.id)
+            .await
+            .unwrap()
+            .assistants
+            .iter()
+            .all(|agent| agent.slot_id != added.slot_id)
+    );
+    assert_eq!(
+        recorder
+            .events_by_name("team.agentRuntimeStatusChanged")
+            .into_iter()
+            .filter(|event| {
+                event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(added.slot_id.as_str())
+                    && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
+            })
+            .count(),
+        0,
+        "cancelled attach must not publish late Ready"
     );
 }
 
@@ -4219,6 +4496,92 @@ async fn ar1_remove_agent_from_team() {
     let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.assistants.len(), 1);
     assert!(got.assistants.iter().all(|a| a.slot_id != worker_slot));
+}
+
+#[tokio::test]
+async fn membership_persist_failure_does_not_delete_the_conversation() {
+    let (svc, team_repo, task_manager, conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Removal persistence failure".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let worker = created.assistants[1].clone();
+    team_repo.fail_agent_updates();
+
+    let error = svc
+        .remove_agent("user1", &created.id, &worker.slot_id)
+        .await
+        .expect_err("forced membership persistence failure must be returned");
+
+    assert!(error.to_string().contains("forced agent update failure"));
+    assert!(
+        conv_repo.get(&worker.conversation_id).await.unwrap().is_some(),
+        "conversation deletion must happen only after membership persistence"
+    );
+    assert!(
+        svc.get_team("user1", &created.id)
+            .await
+            .unwrap()
+            .assistants
+            .iter()
+            .any(|agent| agent.slot_id == worker.slot_id),
+        "failed persistence must leave declared membership intact"
+    );
+    assert!(
+        task_manager.get_task(&worker.conversation_id).is_none(),
+        "cancelled runtime must be cleaned before reporting persistence failure"
+    );
+}
+
+#[tokio::test]
+async fn remove_tolerates_current_session_already_missing_the_slot() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Already absent runtime slot".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let worker = created.assistants[1].clone();
+    svc.get_session_scheduler(&created.id)
+        .unwrap()
+        .remove_agent(&worker.slot_id)
+        .await
+        .unwrap();
+
+    svc.remove_agent("user1", &created.id, &worker.slot_id)
+        .await
+        .expect("post-persistence runtime cleanup must be idempotent");
+
+    assert!(conv_repo.get(&worker.conversation_id).await.unwrap().is_none());
+    assert!(
+        svc.get_team("user1", &created.id)
+            .await
+            .unwrap()
+            .assistants
+            .iter()
+            .all(|agent| agent.slot_id != worker.slot_id)
+    );
 }
 
 #[tokio::test]
