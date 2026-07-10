@@ -93,7 +93,7 @@ pub type AgentTurnStartedCallback =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTurnStarted {
-    pub team_run_id: String,
+    pub team_run_id: Option<String>,
     pub slot_id: String,
     pub role: TeamRunTargetRole,
     pub conversation_id: String,

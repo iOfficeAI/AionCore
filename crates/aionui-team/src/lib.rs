@@ -18,14 +18,14 @@ pub mod routes;
 pub mod scheduler;
 pub mod service;
 pub mod session;
-mod slot_wake_gate;
 pub mod task_board;
 pub mod team_run;
 #[cfg(test)]
 pub(crate) mod test_utils;
 pub mod types;
 pub mod visibility;
-mod wake;
+mod work_coordinator;
+mod work_source;
 mod workspace;
 
 pub use crash_detection::{CrashReason, detect_crash, is_rate_limited};
@@ -55,10 +55,7 @@ pub use scheduler::{
 pub use service::{TeamIdleCleanupCoordinator, TeamSessionService};
 pub use session::{TeamSession, WakeInput};
 pub use task_board::{TaskBoard, TaskUpdate};
-pub use team_run::{
-    ActiveChildTurn, ChildCancelTarget, ChildStartDecision, StartingChildReservation, StartingReservationState,
-    TeamRunManager, target_role_for,
-};
+pub use team_run::{TeamRunManager, target_role_for};
 pub use types::{
     MailboxMessage, MailboxMessageType, TaskStatus, Team, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
 };

@@ -8,6 +8,7 @@ pub struct MockState {
     pub messages: Vec<MailboxMessageRow>,
     pub tasks: Vec<TeamTaskRow>,
     pub fail_message_writes: bool,
+    pub fail_task_lists: bool,
 }
 
 pub struct MockTeamRepo {
@@ -19,12 +20,6 @@ impl MockTeamRepo {
         Self {
             state: Mutex::new(MockState::default()),
         }
-    }
-
-    pub fn with_message_write_failure() -> Self {
-        let repo = Self::new();
-        repo.state.lock().unwrap().fail_message_writes = true;
-        repo
     }
 }
 
@@ -163,6 +158,9 @@ impl ITeamRepository for MockTeamRepo {
 
     async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
         let state = self.state.lock().unwrap();
+        if state.fail_task_lists {
+            return Err(DbError::Init("forced task list failure".into()));
+        }
         let tasks = state.tasks.iter().filter(|t| t.team_id == team_id).cloned().collect();
         Ok(tasks)
     }
@@ -972,7 +970,7 @@ pub(crate) mod workspace_harness {
         async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
             if let Some(on_started) = request.on_started.as_ref() {
                 on_started(AgentTurnStarted {
-                    team_run_id: request.team_run_id.clone().expect("team run id"),
+                    team_run_id: request.team_run_id.clone(),
                     slot_id: request.slot_id.clone(),
                     role: request.role.clone(),
                     conversation_id: request.conversation_id.clone(),
@@ -1014,26 +1012,22 @@ pub(crate) mod workspace_harness {
         (svc, team_repo, task_manager, conv_repo)
     }
 
-    pub(crate) fn setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster() -> (
+    type ServiceHarness = (
         Arc<TeamSessionService>,
         Arc<FullMockTeamRepo>,
         Arc<dyn IWorkerTaskManager>,
         Arc<MockConversationRepo>,
         Arc<RecordingBroadcaster>,
-    ) {
+    );
+
+    pub(crate) fn setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster() -> ServiceHarness {
         let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
         setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager)
     }
 
     pub(crate) fn setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(
         task_manager: Arc<dyn IWorkerTaskManager>,
-    ) -> (
-        Arc<TeamSessionService>,
-        Arc<FullMockTeamRepo>,
-        Arc<dyn IWorkerTaskManager>,
-        Arc<MockConversationRepo>,
-        Arc<RecordingBroadcaster>,
-    ) {
+    ) -> ServiceHarness {
         let team_repo = Arc::new(FullMockTeamRepo::new());
         let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
         let conv_repo = Arc::new(MockConversationRepo::new());

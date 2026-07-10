@@ -51,7 +51,6 @@ impl From<TeamError> for ApiError {
                     ApiError::BadRequest(msg)
                 }
             }
-            TeamError::SlotBusy(msg) => ApiError::Conflict(format!("Team slot is busy: {msg}")),
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
@@ -428,12 +427,6 @@ mod tests {
                 "required_field": "assistant_id",
             }))
         );
-    }
-
-    #[test]
-    fn slot_busy_maps_to_conflict() {
-        let api_error: ApiError = TeamError::SlotBusy("lead-1".into()).into();
-        assert_eq!(api_error.status_code(), StatusCode::CONFLICT);
     }
 
     #[test]

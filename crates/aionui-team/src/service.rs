@@ -38,8 +38,10 @@ use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssist
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
+use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeammateRole};
-use crate::wake::TeamWakeSource;
+use crate::work_coordinator::RuntimeConstraint;
+use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
@@ -542,7 +544,7 @@ impl TeamSessionService {
 
         if let Some(session) = self.sessions.get(team_id).map(|e| Arc::clone(&e.session)) {
             let reservation = session.reserve_dynamic_member_attach(&agent);
-            let wake_plan = session.add_manual_agent(&agent).await?;
+            session.add_manual_agent(&agent).await?;
             let service = self
                 .self_ref
                 .upgrade()
@@ -554,7 +556,6 @@ impl TeamSessionService {
                 user_id.to_owned(),
                 agent.clone(),
                 self.task_manager.clone(),
-                wake_plan,
                 reservation,
             );
             info!(
@@ -977,6 +978,11 @@ impl TeamSessionService {
             self.cleanup_bootstrap_runtime_tasks(&agents_snapshot).await;
             return Err(error);
         }
+        for agent in &agents_snapshot {
+            session
+                .work_coordinator()
+                .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Ready);
+        }
 
         let slow_monitor_handle = Self::spawn_slow_monitor(session.clone());
         let entry = SessionEntry {
@@ -1258,7 +1264,8 @@ impl TeamSessionService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                session.team_run_manager().observe_slow_child_turns(now_ms()).await;
+                let snapshot = session.work_coordinator().snapshot();
+                session.team_run_manager().publish_snapshot_update(&snapshot);
             }
         })
     }
@@ -1640,12 +1647,28 @@ impl TeamSessionService {
     pub async fn get_run_state(&self, user_id: &str, team_id: &str) -> Result<TeamRunStateResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
-        let active_run = match session {
-            Some(session) => session.team_run_manager().current_payload().await,
-            None => None,
+        let Some(session) = session else {
+            return Ok(TeamRunStateResponse {
+                session_generation: None,
+                active_run: None,
+                slot_work: Vec::new(),
+            });
         };
-
-        Ok(TeamRunStateResponse { active_run })
+        let snapshot = session.work_coordinator().snapshot();
+        let active_run = session.team_run_manager().current_payload(&snapshot).filter(|run| {
+            matches!(
+                run.status,
+                aionui_api_types::TeamRunStatus::Accepted
+                    | aionui_api_types::TeamRunStatus::Running
+                    | aionui_api_types::TeamRunStatus::Cancelling
+            )
+        });
+        let slot_work = snapshot.slots.iter().map(TeamRunManager::slot_payload).collect();
+        Ok(TeamRunStateResponse {
+            session_generation: Some(snapshot.session_generation),
+            active_run,
+            slot_work,
+        })
     }
 
     pub fn get_session_scheduler(&self, team_id: &str) -> Option<Arc<crate::scheduler::TeammateManager>> {
@@ -1709,7 +1732,7 @@ impl TeamSessionService {
                 handled_conversations.insert(agent.conversation_id.clone());
             }
 
-            if session.team_run_manager().active_run_id().await.is_some() {
+            if session.team_run_manager().current_active_run_id().is_some() {
                 debug!(
                     team_id,
                     matched_idle_count, "team idle cleanup skipped because team run is active"
@@ -1954,7 +1977,7 @@ impl TeamSessionService {
             .sessions
             .get(team_id)
             .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-        if entry.session.team_run_manager().active_run_id().await.is_some() {
+        if entry.session.team_run_manager().current_active_run_id().is_some() {
             return Ok(());
         }
         Err(TeamError::InvalidRequest(
@@ -1966,7 +1989,7 @@ impl TeamSessionService {
         &self,
         team_id: &str,
         source_slot_id: &str,
-        source: TeamWakeSource,
+        source: WorkSource,
     ) -> Result<(), TeamError> {
         let entry = self
             .sessions
@@ -2892,13 +2915,13 @@ mod tests {
         let active_run = state.active_run.expect("active run state");
 
         assert_eq!(active_run.team_id, created.id);
-        assert_eq!(active_run.team_run_id, ack.team_run_id);
-        assert_eq!(active_run.status, ack.status);
-        assert_eq!(active_run.target_slot_id, ack.target_slot_id);
-        assert_eq!(active_run.target_role, ack.target_role);
-        assert_eq!(active_run.pending_wake_count, 1);
+        assert_eq!(active_run.team_run_id, ack.run.team_run_id);
+        assert_eq!(active_run.status, ack.run.status);
+        assert_eq!(active_run.target_slot_id, ack.run.target_slot_id);
+        assert_eq!(active_run.target_role, ack.run.target_role);
+        assert_eq!(active_run.queued_intent_count, 1);
         assert_eq!(active_run.slot_work.len(), 1);
-        assert_eq!(active_run.slot_work[0].slot_id, ack.accepted_slot_id);
+        assert_eq!(active_run.slot_work[0].slot_id, ack.run.slot_work[0].slot_id);
     }
 
     #[tokio::test]

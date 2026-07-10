@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "remove rollback lease APIs are consumed by the follow-up membership ordering task"
-)]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -77,21 +72,12 @@ impl AttachLease {
 pub(crate) struct RemoveLease {
     session_generation: String,
     agent_id: String,
-    waiter: AttachWaiter,
-    cancel_attach_operation_id: Option<u64>,
+    operation_id: u64,
 }
 
 impl RemoveLease {
     pub(crate) fn operation_id(&self) -> u64 {
-        self.waiter.operation_id()
-    }
-
-    pub(crate) fn waiter(&self) -> AttachWaiter {
-        self.waiter.clone()
-    }
-
-    pub(crate) fn cancel_attach_operation_id(&self) -> Option<u64> {
-        self.cancel_attach_operation_id
+        self.operation_id
     }
 }
 
@@ -368,19 +354,19 @@ impl MemberRuntimeRegistry {
         }
 
         let previous = entries.remove(agent_id);
-        let (cancel_attach_operation_id, cancelled_outcome_tx) = match previous {
+        let cancelled_outcome_tx = match previous {
             Some(MemberRuntimeEntry::Attaching {
-                operation_id,
+                operation_id: _,
                 outcome_tx,
-            }) => (Some(operation_id), Some(outcome_tx)),
-            Some(MemberRuntimeEntry::Failed { .. }) => (None, None),
-            Some(MemberRuntimeEntry::Ready) => (None, None),
+            }) => Some(outcome_tx),
+            Some(MemberRuntimeEntry::Failed { .. }) => None,
+            Some(MemberRuntimeEntry::Ready) => None,
             Some(MemberRuntimeEntry::Removing { .. }) => unreachable!("handled above"),
             None => return BeginRemove::Absent,
         };
 
         let operation_id = self.next_operation_id();
-        let (outcome_tx, outcome_rx) = watch::channel(AttachSignal::Pending);
+        let (outcome_tx, _outcome_rx) = watch::channel(AttachSignal::Pending);
         entries.insert(
             agent_id.to_owned(),
             MemberRuntimeEntry::Removing {
@@ -394,8 +380,7 @@ impl MemberRuntimeRegistry {
         BeginRemove::Start(RemoveLease {
             session_generation: self.session_generation.clone(),
             agent_id: agent_id.to_owned(),
-            waiter: waiter(operation_id, outcome_rx),
-            cancel_attach_operation_id,
+            operation_id,
         })
     }
 
@@ -633,7 +618,6 @@ mod tests {
             _ => panic!("remove must start"),
         };
         assert_eq!(remove.operation_id(), 2);
-        assert_eq!(remove.cancel_attach_operation_id(), Some(1));
         assert_eq!(
             registry.snapshot("worker-1"),
             MemberRuntimeSnapshot::Removing { operation_id: 2 }
@@ -657,11 +641,14 @@ mod tests {
             _ => panic!("seeded runtime removal must start"),
         };
         assert_eq!(second_remove.operation_id(), 3);
-        assert_eq!(second_remove.cancel_attach_operation_id(), None);
+        let second_remove_waiter = match registry.reserve_attach("worker-2", false) {
+            ReserveAttach::Removing(waiter) => waiter,
+            _ => panic!("attach must wait for the active removal"),
+        };
         let remove_failure = failure("remove_rejected", "Agent removal could not be completed");
         assert!(registry.restore_attach_required_after_remove_persist_error(&second_remove, remove_failure.clone()));
         assert_eq!(
-            second_remove.waiter().wait().await,
+            second_remove_waiter.wait().await,
             AttachOutcome::Failed(remove_failure.clone())
         );
         assert_eq!(
@@ -766,7 +753,6 @@ mod tests {
         };
 
         assert_eq!(remove.operation_id(), 2);
-        assert_eq!(remove.cancel_attach_operation_id(), None);
         assert_eq!(attach.waiter().wait().await, AttachOutcome::Failed(attach_failure));
     }
 
@@ -801,7 +787,6 @@ mod tests {
         assert_eq!(owner.operation_id(), 1);
         assert_eq!(joiner.operation_id(), 1);
         assert!(registry.finish_remove(&owner));
-        assert_eq!(owner.waiter().wait().await, AttachOutcome::Removed);
         assert_eq!(joiner.wait().await, AttachOutcome::Removed);
     }
 
@@ -820,7 +805,6 @@ mod tests {
 
         assert!(registry.stop());
 
-        assert_eq!(owner.waiter().wait().await, AttachOutcome::SessionStopped);
         assert_eq!(reserve_waiter.wait().await, AttachOutcome::SessionStopped);
         assert!(!registry.finish_remove(&owner));
     }

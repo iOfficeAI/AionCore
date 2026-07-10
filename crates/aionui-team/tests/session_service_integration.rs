@@ -228,7 +228,7 @@ impl AgentTurnExecutionPort for NoopTurnPort {
     async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
         if let Some(on_started) = request.on_started.as_ref() {
             on_started(AgentTurnStarted {
-                team_run_id: request.team_run_id.clone().expect("team run id"),
+                team_run_id: request.team_run_id.clone(),
                 slot_id: request.slot_id.clone(),
                 role: request.role.clone(),
                 conversation_id: request.conversation_id.clone(),
@@ -255,7 +255,7 @@ impl AgentTurnExecutionPort for RecordingTurnPort {
     async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
         if let Some(on_started) = request.on_started.as_ref() {
             on_started(AgentTurnStarted {
-                team_run_id: request.team_run_id.clone().expect("team run id"),
+                team_run_id: request.team_run_id.clone(),
                 slot_id: request.slot_id.clone(),
                 role: request.role.clone(),
                 conversation_id: request.conversation_id.clone(),
@@ -1644,7 +1644,7 @@ fn setup() -> Arc<TeamSessionService> {
 }
 
 #[tokio::test]
-async fn ensure_session_recovery_drain_runs_agent_turn_with_team_run_id() {
+async fn recovery_creates_background_intents_without_restoring_old_memory_run() {
     let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
     let created = svc
         .create_team(
@@ -1694,7 +1694,10 @@ async fn ensure_session_recovery_drain_runs_agent_turn_with_team_run_id() {
     let requests = turn_port.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].slot_id, lead_slot_id);
-    assert!(requests[0].team_run_id.is_some(), "recovery turn must be TeamRun-owned");
+    assert_eq!(
+        requests[0].team_run_id, None,
+        "recovery work must not synthesize a user-visible TeamRun"
+    );
 }
 
 #[tokio::test]
@@ -1854,15 +1857,15 @@ fn setup_with_factory_and_recording_broadcaster(
     (service, team_repo, task_manager, recorder)
 }
 
-fn setup_with_factory_recording_broadcaster_and_conversation_repo(
-    factory: AgentFactory,
-) -> (
+type RecordingServiceHarness = (
     Arc<TeamSessionService>,
     Arc<FullMockTeamRepo>,
     Arc<CountingTaskManager>,
     Arc<RecordingBroadcaster>,
     Arc<MockConversationRepo>,
-) {
+);
+
+fn setup_with_factory_recording_broadcaster_and_conversation_repo(factory: AgentFactory) -> RecordingServiceHarness {
     let team_repo = Arc::new(FullMockTeamRepo::new());
     let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
@@ -3495,7 +3498,7 @@ async fn aa1_add_agent_to_team() {
 }
 
 #[tokio::test]
-async fn manual_add_agent_projects_team_system_messages_without_active_team_run() {
+async fn manual_add_without_active_run_queues_background_welcome_without_creating_run() {
     let (svc, _, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
         success_factory(),
         Arc::new(StubAgentMetadataRepo::empty()),
@@ -3557,6 +3560,10 @@ async fn manual_add_agent_projects_team_system_messages_without_active_team_run(
     assert_eq!(added_content["sender_name"], "team_system");
     assert_eq!(added_content["teammate_message"], true);
     assert!(added_content["content"].as_str().unwrap().contains("manually added"));
+
+    let run_state = svc.get_run_state("user1", &created.id).await.unwrap();
+    assert!(run_state.active_run.is_none());
+    assert!(run_state.slot_work.iter().any(|slot| slot.slot_id == added.slot_id));
 }
 
 #[tokio::test]
@@ -3828,7 +3835,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() 
     );
 
     let lead_slot_id = created.leader_assistant_id.as_deref().expect("leader slot");
-    let leader_messages = team_repo.peek_unread(&created.id, lead_slot_id).await.unwrap();
+    let leader_messages = team_repo.get_history(&created.id, lead_slot_id, None).await.unwrap();
     assert!(
         leader_messages
             .iter()
@@ -3983,7 +3990,7 @@ async fn failed_member_returns_conflict_and_removal_restores_ready() {
 }
 
 #[tokio::test]
-async fn deleting_attaching_member_leaves_no_runtime_conversation_or_ready_event() {
+async fn remove_during_attach_cancels_work_and_rejects_late_ready() {
     let gate = Arc::new(GatedProvisioningFactory::default());
     let (svc, _team_repo, task_manager, recorder, conv_repo) =
         setup_with_factory_recording_broadcaster_and_conversation_repo(gate.factory());
@@ -5902,7 +5909,7 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
 }
 
 #[tokio::test]
-async fn d9_ensure_session_cleans_up_successful_rebuilds_when_one_agent_fails() {
+async fn cold_bootstrap_failure_stops_session_and_cleans_all_successful_runtimes() {
     use futures_util::FutureExt;
 
     let fail_conversation_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));

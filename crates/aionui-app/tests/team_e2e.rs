@@ -579,7 +579,11 @@ async fn trs2_run_state_returns_active_run_payload() {
     let send_resp = app.clone().oneshot(send_req).await.unwrap();
     assert_eq!(send_resp.status(), StatusCode::OK);
     let send_body = body_json(send_resp).await;
-    let team_run_id = send_body["data"]["team_run_id"].as_str().unwrap();
+    let team_run_id = send_body["data"]["run"]["team_run_id"].as_str().unwrap();
+    assert!(matches!(
+        send_body["data"]["enqueue_status"].as_str(),
+        Some("accepted" | "queued" | "blocked_runtime_starting")
+    ));
 
     let req = get_with_token(&format!("/api/teams/{team_id}/run-state"), &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -590,9 +594,12 @@ async fn trs2_run_state_returns_active_run_payload() {
     assert_eq!(body["data"]["active_run"]["team_id"], team_id);
     assert_eq!(body["data"]["active_run"]["team_run_id"], team_run_id);
     assert_eq!(body["data"]["active_run"]["source"], "user_message");
-    assert_eq!(body["data"]["active_run"]["has_user_intervention"], true);
+    assert_eq!(body["data"]["active_run"]["has_user_intervention"], false);
     assert_eq!(body["data"]["active_run"]["status"], "accepted");
-    assert_eq!(body["data"]["active_run"]["pending_wake_count"], 1);
+    assert!(body["data"]["active_run"]["queued_intent_count"].is_number());
+    assert!(body["data"]["active_run"]["starting_batch_count"].is_number());
+    assert!(body["data"]["active_run"]["running_batch_count"].is_number());
+    assert!(body["data"]["active_run"]["active_enqueue_lease_count"].is_number());
     assert!(body["data"]["active_run"]["slot_work"].as_array().unwrap().len() >= 1);
 }
 

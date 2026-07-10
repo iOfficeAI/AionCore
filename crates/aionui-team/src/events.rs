@@ -124,9 +124,10 @@ impl TeamEventEmitter {
             target_slot_id = %payload.target_slot_id,
             target_role = ?payload.target_role,
             status = ?payload.status,
-            active_child_count = payload.active_child_count,
-            pending_wake_count = payload.pending_wake_count,
-            starting_child_count = payload.starting_child_count,
+            queued_intent_count = payload.queued_intent_count,
+            starting_batch_count = payload.starting_batch_count,
+            running_batch_count = payload.running_batch_count,
+            active_enqueue_lease_count = payload.active_enqueue_lease_count,
             slot_work_count = payload.slot_work.len(),
             "team websocket event emitted"
         );
@@ -329,9 +330,10 @@ mod tests {
                 target_slot_id: "lead-1".into(),
                 target_role: aionui_api_types::TeamRunTargetRole::Lead,
                 status: aionui_api_types::TeamRunStatus::Accepted,
-                active_child_count: 0,
-                pending_wake_count: 1,
-                starting_child_count: 0,
+                queued_intent_count: 1,
+                starting_batch_count: 0,
+                running_batch_count: 0,
+                active_enqueue_lease_count: 0,
                 slot_work: Vec::new(),
             },
         );
@@ -345,7 +347,7 @@ mod tests {
         assert_eq!(payload.team_run_id, "run-1");
         assert_eq!(payload.target_role, aionui_api_types::TeamRunTargetRole::Lead);
         assert_eq!(payload.status, aionui_api_types::TeamRunStatus::Accepted);
-        assert_eq!(payload.starting_child_count, 0);
+        assert_eq!(payload.starting_batch_count, 0);
     }
 
     #[test]

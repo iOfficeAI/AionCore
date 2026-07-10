@@ -44,7 +44,7 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
         let team_run_id = request.team_run_id.clone();
         let slot_id = request.slot_id.clone();
         let role = request.role.clone();
-        let on_started = team_started.zip(team_run_id).map(|(callback, team_run_id)| {
+        let on_started = team_started.map(|callback| {
             Arc::new(move |started: ConversationAgentTurnStarted| {
                 let callback = callback.clone();
                 let team_run_id = team_run_id.clone();

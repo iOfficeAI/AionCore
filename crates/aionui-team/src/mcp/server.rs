@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
-use aionui_api_types::{TeamSendMessageQueuedResponse, TeamSendMessageStatus};
+use aionui_api_types::TeamSendMessageQueuedResponse;
 use aionui_realtime::EventBroadcaster;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -14,7 +14,7 @@ use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
 use crate::types::{TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
-use crate::wake::TeamWakeSource;
+use crate::work_source::WorkSource;
 
 use super::protocol::{
     INVALID_PARAMS, INVALID_REQUEST, JsonRpcResponse, METHOD_NOT_FOUND, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION,
@@ -639,13 +639,13 @@ async fn exec_send_message(
             .map_err(|e| ToolCallError::from_message(e.to_string()))?;
         if let Some(svc) = service.upgrade()
             && let Err(e) = svc
-                .wake_leader_after_recovery_message(team_id, caller_slot_id, TeamWakeSource::ShutdownRejected)
+                .wake_leader_after_recovery_message(team_id, caller_slot_id, WorkSource::ShutdownRejected)
                 .await
         {
             warn!(
                 team_id,
                 slot_id = %caller_slot_id,
-                wake_source = %TeamWakeSource::ShutdownRejected,
+                wake_source = %WorkSource::ShutdownRejected,
                 error = %e,
                 "failed to apply shutdown_rejected wake policy"
             );
@@ -703,11 +703,8 @@ fn build_send_message_queued_response(
         .first()
         .ok_or_else(|| "No message targets resolved".to_string())?;
     Ok(TeamSendMessageQueuedResponse {
-        status: TeamSendMessageStatus::Queued,
-        delivery: first.delivery.clone(),
-        reason: first.target.queue_state.clone(),
         team_run_id: first.team_run_id.clone(),
-        targets: target_results.into_iter().map(|result| result.target).collect(),
+        target: first.target.clone(),
     })
 }
 
@@ -1187,34 +1184,35 @@ fn http_bearer_token(request: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aionui_api_types::{
-        TeamRunTargetRole, TeamSendMessageDelivery, TeamSendMessageReason, TeamSendMessageTargetQueueState,
-    };
+    use aionui_api_types::{TeamRunTargetRole, TeamSlotWorkPayload, TeamSlotWorkState};
 
     #[test]
     fn build_send_message_queued_response_serializes_json_contract() {
         let response = build_send_message_queued_response(vec![AgentMessageQueueResult {
-            team_run_id: "run-1".into(),
-            delivery: TeamSendMessageDelivery::WakeRecorded,
-            target: TeamSendMessageTargetQueueState {
+            team_run_id: Some("run-1".into()),
+            target: TeamSlotWorkPayload {
                 slot_id: "worker-1".into(),
                 role: TeamRunTargetRole::Teammate,
-                queue_state: TeamSendMessageReason::QueuedForIdle,
-                pending_wake_count: 1,
-                starting_child_count: 0,
+                state: TeamSlotWorkState::Queued,
+                queued_foreground_count: 0,
+                queued_background_count: 1,
                 active_turn_id: None,
-                suppressed_wake_count: 0,
+                active_turn_started_at_ms: None,
+                active_turn_elapsed_ms: None,
+                active_turn_slow: None,
+                active_turn_slow_threshold_ms: None,
+                blocked_reason: None,
+                team_run_id: Some("run-1".into()),
             },
         }])
         .unwrap();
 
         let text = serde_json::to_string(&response).unwrap();
         let payload: serde_json::Value = serde_json::from_str(&text).expect("team_send_message result must be JSON");
-        assert_eq!(payload["status"], "queued");
-        assert_eq!(payload["delivery"], "wake_recorded");
-        assert_eq!(payload["reason"], "queued_for_idle");
-        assert_eq!(payload["targets"][0]["slot_id"], "worker-1");
-        assert_eq!(payload["targets"][0]["queue_state"], "queued_for_idle");
+        assert_eq!(payload["team_run_id"], "run-1");
+        assert_eq!(payload["target"]["slot_id"], "worker-1");
+        assert_eq!(payload["target"]["state"], "queued");
+        assert_eq!(payload["target"]["queued_background_count"], 1);
     }
 
     /// Non-Lead callers are rejected at the dispatch layer with the
