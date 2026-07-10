@@ -4583,19 +4583,15 @@ mod tests {
 
         let mut catalog = None;
         for _ in 0..40 {
-            match tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await {
-                Ok(Some(env)) => {
-                    if let SessionEvent::CatalogUpdated {
-                        models,
-                        modes,
-                        slash_commands,
-                    } = env.event
-                    {
-                        catalog = Some((models, modes, slash_commands));
-                        break;
-                    }
-                }
-                _ => {}
+            if let Ok(Some(env)) = tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await
+                && let SessionEvent::CatalogUpdated {
+                    models,
+                    modes,
+                    slash_commands,
+                } = env.event
+            {
+                catalog = Some((models, modes, slash_commands));
+                break;
             }
         }
         let (models, modes, slash_commands) = catalog.expect("a CatalogUpdated must be broadcast on initialize");

@@ -1366,7 +1366,7 @@ async fn reader_task(
                                 tracing::error!(
                                     conversation_id = %session_id,
                                     set = %label,
-                                    "codex thread/settings/update (SetMode/SetModel) rejected by agent: {message}"
+                                    "codex thread/settings/update (SetMode/SetModel/effort) rejected by agent: {message}"
                                 );
                                 emit(
                                     &event_tx,
@@ -3100,11 +3100,45 @@ impl SessionBackend for CodexSessionBackend {
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
                 })
             }
-            // #99: codex's effort is a collaborationMode reasoning_effort setting set
-            // via SetMode (thread/settings), not a generic config-option command — so
-            // the generic SetConfigOption has no codex wire and rejects (cap=false ↔
-            // reject). (If a codex effort-via-SetConfigOption path is wired later, it
-            // routes through thread/settings like SetMode.)
+            // codex's reasoning effort IS a first-class `thread/settings/update` field:
+            // `ThreadSettingsUpdateParams.effort` ("Override the reasoning effort for
+            // subsequent turns" → ReasoningEffort enum), verified in the generated
+            // schema (samples/codex-cli/0.137.0/schema-full/ClientRequest.json,
+            // ThreadSettingsUpdateParams). So the effort option routes through the exact
+            // same wire SetModel/SetMode use — just with `{effort}` in params. The value
+            // reaching here is one of the model's advertised `supportedReasoningEfforts`
+            // (parsed verbatim from the catalog), so it is passed through unvalidated
+            // exactly like `model`; codex rejects an out-of-catalog value with a JSON-RPC
+            // error, which the reader surfaces as a Notice (validation is the reader's job
+            // on the response, matching SetModel/SetMode). Any OTHER config option has no
+            // codex wire and still rejects.
+            Command::SetConfigOption { option_id, value }
+                if matches!(option_id.as_str(), "effort" | "reasoning_effort" | "thought_level") =>
+            {
+                // F-4: between-turn config write → wake a suspended session first.
+                self.suspend
+                    .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+                    .await?;
+                let tid = self.bound_thread().await?;
+                let id = self.next_rpc_id();
+                // Register the rpc id so the reader claims the response: a JSON-RPC error
+                // (codex rejected the effort) surfaces as a Notice instead of being
+                // dropped (success converges via thread/settings/updated).
+                self.pending_set
+                    .lock()
+                    .await
+                    .insert(id, format!("effort\u{2192}{value}"));
+                let frame = json!({
+                    "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
+                    "params": { "threadId": tid, "effort": value }
+                });
+                self.write_frame(frame).await?;
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                })
+            }
             Command::SetConfigOption { .. } => Err(BackendError::CommandNotSupported {
                 command: "set_config_option",
             }),
@@ -4944,6 +4978,58 @@ mod tests {
         assert!(
             written.contains(r#""threadId":"th-5""#),
             "carries threadId, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_config_option_effort_writes_thread_settings_update() {
+        // codex's reasoning effort is a first-class `thread/settings/update{threadId,
+        // effort}` field (schema: ThreadSettingsUpdateParams.effort → ReasoningEffort),
+        // so SetConfigOption{effort} routes through the same wire as SetModel/SetMode —
+        // NOT a CommandNotSupported reject. Each effort alias id maps to the `effort` key.
+        for option_id in ["effort", "reasoning_effort", "thought_level"] {
+            let fake = fake_with_binding("th-7", None);
+            let captured = fake.captured_stdin();
+            let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+            backend
+                .dispatch(Command::SetConfigOption {
+                    option_id: option_id.into(),
+                    value: "high".into(),
+                })
+                .await
+                .unwrap_or_else(|e| panic!("effort id `{option_id}` must be accepted, got: {e:?}"));
+            let written = captured_str(&captured).await;
+            assert!(
+                written.contains(r#""method":"thread/settings/update""#),
+                "id `{option_id}` wrote thread/settings/update, got: {written}"
+            );
+            assert!(
+                written.contains(r#""effort":"high""#),
+                "id `{option_id}` carries the effort value, got: {written}"
+            );
+            assert!(
+                written.contains(r#""threadId":"th-7""#),
+                "id `{option_id}` carries threadId, got: {written}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_config_option_non_effort_still_rejects() {
+        // Only the effort aliases have a codex wire; any other generic config option
+        // still has none and must reject with CommandNotSupported (not silently drop).
+        let fake = fake_with_binding("th-8", None);
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let err = backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "verbosity".into(),
+                value: "high".into(),
+            })
+            .await
+            .expect_err("a non-effort config option must reject");
+        assert!(
+            matches!(err, BackendError::CommandNotSupported { command: "set_config_option" }),
+            "got: {err:?}"
         );
     }
 
