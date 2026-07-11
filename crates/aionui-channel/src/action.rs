@@ -27,6 +27,10 @@ pub enum MessageResult {
     /// Message was a text but user already has an active agent stream
     /// (no duplicate dispatch needed).
     AlreadyProcessing,
+    /// Message was ignored — e.g. it predates the user's authorization
+    /// (a pairing-trigger message redelivered by the platform). No dispatch,
+    /// no reply.
+    Ignored,
 }
 
 /// Processes incoming IM messages: authorization → action routing → AI dispatch.
@@ -66,11 +70,13 @@ impl ActionExecutor {
         let user_id = &msg.user.id;
         let chat_id = &msg.chat_id;
 
-        // 1. Authorization check — resolve platform user → internal user ID
-        let internal_user_id = self.pairing.get_internal_user_id(user_id, &platform_type).await?;
-
-        let internal_user_id = match internal_user_id {
-            Some(id) => id,
+        // 1. Authorization check — resolve platform user → (internal ID, authorized_at)
+        let (internal_user_id, authorized_at) = match self
+            .pairing
+            .get_authorized_user(user_id, &platform_type)
+            .await?
+        {
+            Some(pair) => pair,
             None => {
                 let response = self
                     .handle_unauthorized(user_id, &platform_type, &msg.user.display_name)
@@ -85,7 +91,21 @@ impl ActionExecutor {
             return Ok(MessageResult::Action(response));
         }
 
-        // 3. Text message → session resolution → AI dispatch
+        // 3. Drop messages that predate authorization. The message that triggers
+        // pairing is only used to hand out a pairing code; if the platform later
+        // redelivers it (or it was sent before approval), it must not be replayed
+        // as a chat message. `timestamp` is unix seconds; `authorized_at` is millis.
+        if msg.timestamp > 0 && msg.timestamp.saturating_mul(1000) < authorized_at {
+            info!(
+                user_id = %user_id,
+                msg_timestamp = msg.timestamp,
+                authorized_at,
+                "ignoring message sent before authorization"
+            );
+            return Ok(MessageResult::Ignored);
+        }
+
+        // 4. Text message → session resolution → AI dispatch
         let agent_config = self.settings.get_agent_config(msg.platform).await?;
         let session = self
             .session_mgr
@@ -797,6 +817,21 @@ mod tests {
             }
             _ => panic!("Expected Dispatched result for authorized user"),
         }
+    }
+
+    #[tokio::test]
+    async fn message_before_authorization_is_ignored() {
+        let (executor, repo) = setup();
+        repo.add_authorized_user("tg_42", "telegram");
+
+        // A message timestamped long before authorization (now) — e.g. the
+        // pairing-trigger message redelivered by the platform — must not be
+        // replayed as a chat message.
+        let mut msg = make_text_message("tg_42", "chat_1", "hi", PluginType::Telegram);
+        msg.timestamp = 1000; // unix seconds, far before authorized_at (now)
+
+        let result = executor.handle_incoming_message(&msg).await.unwrap();
+        assert!(matches!(result, MessageResult::Ignored));
     }
 
     // ── Platform action tests ──────────────────────────────────────────
