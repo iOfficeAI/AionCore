@@ -381,7 +381,16 @@ async fn connect_and_listen(
                                 }
                             }
                             METHOD_DATA => {
-                                let ack = build_ack_frame(&frame);
+                                // A card.action.trigger callback must be answered with a
+                                // card-callback response body (`{}` = keep card unchanged),
+                                // not the generic event ack, or the platform reports a
+                                // callback timeout on the clicked button.
+                                let ack_payload: &[u8] = if is_card_action_trigger(&frame.payload) {
+                                    b"{}"
+                                } else {
+                                    br#"{"code":200}"#
+                                };
+                                let ack = build_ack_frame(&frame, ack_payload);
                                 let ack_bytes = encode_frame(&ack);
                                 if let Err(e) = write.send(WsMessage::Binary(ack_bytes.into())).await {
                                     warn!(error = %e, "Failed to send Lark ack frame");
@@ -471,6 +480,21 @@ fn handle_control_frame(frame: &super::frame::PbFrame) -> Option<Duration> {
             None
         }
     }
+}
+
+/// Peek a raw frame payload to detect a `card.action.trigger` callback, whose
+/// ack must carry a card-callback response body instead of the generic event ack.
+fn is_card_action_trigger(payload: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| {
+            v.get("header")
+                .and_then(|h| h.get("event_type"))
+                .and_then(|e| e.as_str())
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("card.action.trigger")
 }
 
 /// Handle a decoded and reassembled Lark event payload.
@@ -1283,5 +1307,14 @@ mod tests {
         assert!(plugin.last_error().is_none());
         assert_eq!(plugin.plugin_type(), PluginType::Lark);
         assert_eq!(plugin.active_user_count(), 0);
+    }
+
+    #[test]
+    fn detects_card_action_trigger_frame() {
+        let card = br#"{"header":{"event_type":"card.action.trigger"},"event":{}}"#;
+        let msg = br#"{"header":{"event_type":"im.message.receive_v1"},"event":{}}"#;
+        assert!(is_card_action_trigger(card));
+        assert!(!is_card_action_trigger(msg));
+        assert!(!is_card_action_trigger(b"not json"));
     }
 }
