@@ -519,6 +519,13 @@ async fn handle_ws_text(
                         handle_bot_menu_event(event_data, message_tx).await;
                     }
                 }
+                "card.action.trigger" => {
+                    // Interactive card button click delivered over the long connection
+                    // (webhook mode delivers this as a `card` frame instead).
+                    if let Some(event_data) = envelope.get("event").cloned() {
+                        handle_card_action(event_data, message_tx, confirm_tx).await;
+                    }
+                }
                 _ => {
                     debug!(event_type, "Lark unhandled event type");
                 }
@@ -631,9 +638,19 @@ async fn handle_card_action(
         }
     }
 
-    let chat_id = evt.open_chat_id.as_deref().unwrap_or("").to_string();
+    // Long-connection event nests ids under `context`; legacy webhook has them top-level.
+    let chat_id = evt
+        .context
+        .as_ref()
+        .and_then(|c| c.open_chat_id.clone())
+        .or_else(|| evt.open_chat_id.clone())
+        .unwrap_or_default();
 
-    let message_id = evt.open_message_id.clone();
+    let message_id = evt
+        .context
+        .as_ref()
+        .and_then(|c| c.open_message_id.clone())
+        .or_else(|| evt.open_message_id.clone());
 
     let user = UnifiedUser {
         id: evt.operator.open_id.clone(),
