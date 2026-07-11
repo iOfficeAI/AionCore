@@ -169,7 +169,6 @@ pub struct ListConversationsQuery {
     pub cron_job_id: Option<String>,
     pub pinned: Option<bool>,
     pub workspace: Option<String>,
-    pub custom_workspace: Option<bool>,
 }
 
 /// Query parameters for `GET /api/conversations/:id/messages`.

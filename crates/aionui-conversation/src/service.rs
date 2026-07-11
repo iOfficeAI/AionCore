@@ -1750,6 +1750,7 @@ impl ConversationService {
         let rows = self.conversation_repo.list_projects(user_id).await?;
         Ok(rows
             .into_iter()
+            .filter(|row| !std::path::Path::new(&row.workspace).starts_with(&self.workspace_root))
             .map(|row| ConversationProjectResponse {
                 workspace: row.workspace,
                 latest_conversation_at: row.latest_conversation_at,
@@ -1772,7 +1773,6 @@ impl ConversationService {
             cron_job_id: query.cron_job_id,
             pinned: query.pinned,
             workspace: query.workspace,
-            custom_workspace: query.custom_workspace,
         };
 
         let result = self.conversation_repo.list_paginated(user_id, &filters).await?;

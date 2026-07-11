@@ -256,8 +256,6 @@ pub struct ConversationFilters {
     pub pinned: Option<bool>,
     /// Filter by the exact `extra.workspace` value.
     pub workspace: Option<String>,
-    /// Filter by custom-workspace membership. Missing values count as false.
-    pub custom_workspace: Option<bool>,
 }
 
 impl ConversationFilters {
