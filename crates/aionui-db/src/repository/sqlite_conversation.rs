@@ -8,8 +8,8 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    ConversationFilters, ConversationProjectRow, ConversationRowUpdate, IConversationRepository, MessagePageCursor,
+    MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
 
 /// SQLite-backed implementation of [`IConversationRepository`].
@@ -322,6 +322,29 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     // ── Extended queries ────────────────────────────────────────────
+
+    async fn list_projects(&self, user_id: &str) -> Result<Vec<ConversationProjectRow>, DbError> {
+        let rows = sqlx::query_as::<_, ConversationProjectRow>(
+            "SELECT json_extract(extra, '$.workspace') AS workspace, \
+                    MAX(updated_at) AS latest_conversation_at, \
+                    COUNT(*) AS conversation_count \
+             FROM conversations \
+             WHERE user_id = ? \
+               AND json_extract(extra, '$.workspace') IS NOT NULL \
+               AND json_extract(extra, '$.workspace') != '' \
+               AND COALESCE(json_extract(extra, '$.custom_workspace'), 0) = 1 \
+               AND COALESCE(json_extract(extra, '$.is_health_check'), 0) != 1 \
+               AND json_extract(extra, '$.team_id') IS NULL \
+               AND json_extract(extra, '$.teamId') IS NULL \
+             GROUP BY json_extract(extra, '$.workspace') \
+             ORDER BY latest_conversation_at DESC, workspace ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
 
     async fn find_by_source_and_chat(
         &self,
@@ -996,6 +1019,14 @@ fn append_filter_conditions(filters: &ConversationFilters, where_parts: &mut Vec
         where_parts.push("c.pinned = ?".to_string());
         binds.push(BindValue::Bool(pinned));
     }
+    if let Some(ref workspace) = filters.workspace {
+        where_parts.push("json_extract(c.extra, '$.workspace') = ?".to_string());
+        binds.push(BindValue::Str(workspace.clone()));
+    }
+    if let Some(custom_workspace) = filters.custom_workspace {
+        where_parts.push("COALESCE(json_extract(c.extra, '$.custom_workspace'), 0) = ?".to_string());
+        binds.push(BindValue::Bool(custom_workspace));
+    }
 }
 
 /// Builds a count query and bind values for the total (ignoring cursor).
@@ -1071,6 +1102,66 @@ mod tests {
     const SYSTEM_USER_ID: &str = "system_default_user";
 
     // ── Conversation CRUD tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_projects_groups_custom_workspaces_and_filters_hidden_rows() {
+        let (repo, _db) = setup().await;
+        let mut first = sample_conversation(SYSTEM_USER_ID);
+        first.extra = r#"{"workspace":"/projects/alpha","custom_workspace":true}"#.to_string();
+        first.updated_at = 10;
+        let mut second = sample_conversation(SYSTEM_USER_ID);
+        second.extra = r#"{"workspace":"/projects/alpha","custom_workspace":true}"#.to_string();
+        second.updated_at = 20;
+        let mut beta = sample_conversation(SYSTEM_USER_ID);
+        beta.extra = r#"{"workspace":"/projects/beta","custom_workspace":true}"#.to_string();
+        beta.updated_at = 15;
+        let mut temporary = sample_conversation(SYSTEM_USER_ID);
+        temporary.extra = r#"{"workspace":"/projects/temp","custom_workspace":false}"#.to_string();
+        let mut health = sample_conversation(SYSTEM_USER_ID);
+        health.extra = r#"{"workspace":"/projects/health","custom_workspace":true,"is_health_check":true}"#.to_string();
+        let mut team = sample_conversation(SYSTEM_USER_ID);
+        team.extra = r#"{"workspace":"/projects/team","custom_workspace":true,"team_id":"team-1"}"#.to_string();
+
+        for row in [&first, &second, &beta, &temporary, &health, &team] {
+            repo.create(row).await.unwrap();
+        }
+
+        let projects = repo.list_projects(SYSTEM_USER_ID).await.unwrap();
+
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].workspace, "/projects/alpha");
+        assert_eq!(projects[0].conversation_count, 2);
+        assert_eq!(projects[0].latest_conversation_at, 20);
+        assert_eq!(projects[1].workspace, "/projects/beta");
+        assert_eq!(projects[1].conversation_count, 1);
+    }
+
+    #[tokio::test]
+    async fn list_paginated_filters_exact_workspace() {
+        let (repo, _db) = setup().await;
+        let mut alpha = sample_conversation(SYSTEM_USER_ID);
+        alpha.extra = r#"{"workspace":"/projects/alpha","custom_workspace":true}"#.to_string();
+        let mut beta = sample_conversation(SYSTEM_USER_ID);
+        beta.extra = r#"{"workspace":"/projects/beta","custom_workspace":true}"#.to_string();
+        repo.create(&alpha).await.unwrap();
+        repo.create(&beta).await.unwrap();
+
+        let result = repo
+            .list_paginated(
+                SYSTEM_USER_ID,
+                &ConversationFilters {
+                    workspace: Some("/projects/alpha".to_string()),
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 1);
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].id, alpha.id);
+    }
 
     #[tokio::test]
     async fn create_and_get_conversation() {

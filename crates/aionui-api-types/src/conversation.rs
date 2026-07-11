@@ -168,6 +168,8 @@ pub struct ListConversationsQuery {
     pub source: Option<String>,
     pub cron_job_id: Option<String>,
     pub pinned: Option<bool>,
+    pub workspace: Option<String>,
+    pub custom_workspace: Option<bool>,
 }
 
 /// Query parameters for `GET /api/conversations/:id/messages`.
@@ -231,6 +233,17 @@ pub struct ConversationResponse {
     pub modified_at: TimestampMs,
     pub extra: serde_json::Value,
 }
+
+/// Project summary derived from custom-workspace conversations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationProjectResponse {
+    pub workspace: String,
+    pub latest_conversation_at: TimestampMs,
+    pub conversation_count: u64,
+}
+
+/// List of conversation projects ordered by recent activity.
+pub type ConversationProjectListResponse = Vec<ConversationProjectResponse>;
 
 /// Paginated list of conversations.
 pub type ConversationListResponse = PaginatedResult<ConversationResponse>;

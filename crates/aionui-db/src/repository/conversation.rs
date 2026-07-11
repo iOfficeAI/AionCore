@@ -52,6 +52,11 @@ pub trait IConversationRepository: Send + Sync {
     /// Lists conversations whose `extra.cronJobId` matches.
     async fn list_by_cron_job(&self, user_id: &str, cron_job_id: &str) -> Result<Vec<ConversationRow>, DbError>;
 
+    /// Lists custom workspaces with conversation counts and latest activity.
+    async fn list_projects(&self, _user_id: &str) -> Result<Vec<ConversationProjectRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Lists conversations sharing the same `extra.workspace` value.
     /// The conversation identified by `conversation_id` is excluded.
     async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError>;
@@ -229,6 +234,13 @@ pub struct MessagePageResult {
     pub has_more_after: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ConversationProjectRow {
+    pub workspace: String,
+    pub latest_conversation_at: TimestampMs,
+    pub conversation_count: i64,
+}
+
 /// Filters for paginated conversation listing.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationFilters {
@@ -242,6 +254,10 @@ pub struct ConversationFilters {
     pub cron_job_id: Option<String>,
     /// Filter by pinned status.
     pub pinned: Option<bool>,
+    /// Filter by the exact `extra.workspace` value.
+    pub workspace: Option<String>,
+    /// Filter by custom-workspace membership. Missing values count as false.
+    pub custom_workspace: Option<bool>,
 }
 
 impl ConversationFilters {
