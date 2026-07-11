@@ -13,8 +13,42 @@ use super::types::{
     WsEndpointResponse,
 };
 
-const LARK_OPEN_API_BASE: &str = "https://open.feishu.cn/open-apis";
-const LARK_BASE: &str = "https://open.feishu.cn";
+/// Lark Open Platform domain — Feishu (China) vs Lark (international).
+///
+/// Feishu and Lark share the same Open Platform API surface; only the host
+/// differs. The active domain is selected from stored credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LarkDomain {
+    Feishu,
+    Lark,
+}
+
+impl LarkDomain {
+    /// Map a stored credential value to a domain.
+    /// Absent or unrecognized => Feishu (backward-compatible default).
+    pub fn from_config(value: Option<&str>) -> Self {
+        match value {
+            Some("lark") => Self::Lark,
+            _ => Self::Feishu,
+        }
+    }
+
+    /// Base host (used e.g. by the WebSocket endpoint request).
+    pub fn base(&self) -> &'static str {
+        match self {
+            Self::Feishu => "https://open.feishu.cn",
+            Self::Lark => "https://open.larksuite.com",
+        }
+    }
+
+    /// Open API base (host + `/open-apis`).
+    pub fn open_api_base(&self) -> &'static str {
+        match self {
+            Self::Feishu => "https://open.feishu.cn/open-apis",
+            Self::Lark => "https://open.larksuite.com/open-apis",
+        }
+    }
+}
 
 /// Token refresh margin — refresh 5 minutes before expiry.
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
@@ -40,16 +74,18 @@ pub(crate) struct LarkApi {
     client: Client,
     app_id: String,
     app_secret: String,
+    domain: LarkDomain,
     token_cache: Arc<RwLock<Option<TokenCache>>>,
 }
 
 impl LarkApi {
-    /// Create a new Lark API client.
-    pub fn new(client: Client, app_id: &str, app_secret: &str) -> Self {
+    /// Create a new Lark API client for the given domain (Feishu or Lark).
+    pub fn new(client: Client, app_id: &str, app_secret: &str, domain: LarkDomain) -> Self {
         Self {
             client,
             app_id: app_id.to_string(),
             app_secret: app_secret.to_string(),
+            domain,
             token_cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -72,7 +108,7 @@ impl LarkApi {
 
     /// Request a new tenant access token from Lark.
     async fn refresh_token(&self) -> Result<String, ChannelError> {
-        let url = format!("{LARK_OPEN_API_BASE}/auth/v3/tenant_access_token/internal");
+        let url = format!("{}/auth/v3/tenant_access_token/internal", self.domain.open_api_base());
         let body = TenantAccessTokenRequest {
             app_id: self.app_id.clone(),
             app_secret: self.app_secret.clone(),
@@ -117,7 +153,7 @@ impl LarkApi {
     /// Get bot identity information.
     pub async fn get_bot_info(&self) -> Result<BotInfoData, ChannelError> {
         let token = self.get_token().await?;
-        let url = format!("{LARK_OPEN_API_BASE}/bot/v3/info");
+        let url = format!("{}/bot/v3/info", self.domain.open_api_base());
 
         let resp: BotInfoResponse = self
             .client
@@ -146,7 +182,7 @@ impl LarkApi {
     /// Note: This endpoint uses AppID/AppSecret in the request body for auth,
     /// NOT the Bearer token used by other Lark APIs.
     pub async fn get_ws_endpoint(&self) -> Result<WsEndpointData, ChannelError> {
-        let url = format!("{LARK_BASE}/callback/ws/endpoint");
+        let url = format!("{}/callback/ws/endpoint", self.domain.base());
 
         let body = WsEndpointRequest {
             app_id: self.app_id.clone(),
@@ -190,7 +226,7 @@ impl LarkApi {
     /// Returns the message ID of the sent card.
     pub async fn send_card(&self, chat_id: &str, card_content: &str) -> Result<SendMessageData, ChannelError> {
         let token = self.get_token().await?;
-        let url = format!("{LARK_OPEN_API_BASE}/im/v1/messages?receive_id_type=chat_id");
+        let url = format!("{}/im/v1/messages?receive_id_type=chat_id", self.domain.open_api_base());
 
         debug!(chat_id, "Sending Lark card message");
 
@@ -226,7 +262,7 @@ impl LarkApi {
     /// Update (patch) an existing interactive card message.
     pub async fn update_card(&self, message_id: &str, card_content: &str) -> Result<(), ChannelError> {
         let token = self.get_token().await?;
-        let url = format!("{LARK_OPEN_API_BASE}/im/v1/messages/{message_id}");
+        let url = format!("{}/im/v1/messages/{message_id}", self.domain.open_api_base());
 
         debug!(message_id, "Updating Lark card message");
 
@@ -265,7 +301,7 @@ mod tests {
     #[test]
     fn api_stores_credentials() {
         let client = Client::new();
-        let api = LarkApi::new(client, "cli_123", "secret_456");
+        let api = LarkApi::new(client, "cli_123", "secret_456", LarkDomain::Feishu);
         assert_eq!(api.app_id, "cli_123");
         assert_eq!(api.app_secret, "secret_456");
     }
@@ -299,5 +335,32 @@ mod tests {
             expires_in: Duration::from_secs(7200),
         };
         assert!(cache.is_expired());
+    }
+
+    // --- Lark / Feishu domain switching (Phase 01) ---
+
+    #[test]
+    fn larkdomain_from_config_maps_values() {
+        assert_eq!(LarkDomain::from_config(Some("lark")), LarkDomain::Lark);
+        assert_eq!(LarkDomain::from_config(Some("feishu")), LarkDomain::Feishu);
+        // Absent => default Feishu (backward-compat with existing users)
+        assert_eq!(LarkDomain::from_config(None), LarkDomain::Feishu);
+        // Unknown value => safe fallback to Feishu
+        assert_eq!(LarkDomain::from_config(Some("bogus")), LarkDomain::Feishu);
+    }
+
+    #[test]
+    fn larkdomain_urls() {
+        assert_eq!(LarkDomain::Feishu.base(), "https://open.feishu.cn");
+        assert_eq!(LarkDomain::Feishu.open_api_base(), "https://open.feishu.cn/open-apis");
+        assert_eq!(LarkDomain::Lark.base(), "https://open.larksuite.com");
+        assert_eq!(LarkDomain::Lark.open_api_base(), "https://open.larksuite.com/open-apis");
+    }
+
+    #[test]
+    fn api_stores_domain() {
+        let client = Client::new();
+        let api = LarkApi::new(client, "cli_123", "secret_456", LarkDomain::Lark);
+        assert_eq!(api.domain, LarkDomain::Lark);
     }
 }

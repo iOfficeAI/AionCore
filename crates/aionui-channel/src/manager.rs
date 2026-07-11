@@ -527,6 +527,16 @@ impl ChannelManager {
     fn row_to_status_response(&self, row: &ChannelPluginRow, live_status: Option<String>) -> PluginStatusResponse {
         let is_running = self.plugins.contains_key(&row.id);
         let has_token = !row.config.is_empty();
+        // Best-effort: surface the stored Lark region so the UI can restore the
+        // selected domain after reload. Any decrypt/parse failure yields None.
+        let domain = if row.config.is_empty() {
+            None
+        } else {
+            decrypt_string(&row.config, &self.encryption_key)
+                .ok()
+                .and_then(|json| serde_json::from_str::<PluginConfig>(&json).ok())
+                .and_then(|cfg| cfg.credentials.domain)
+        };
         PluginStatusResponse {
             plugin_id: row.id.clone(),
             plugin_type: row.r#type.clone(),
@@ -540,6 +550,7 @@ impl ChannelManager {
             has_token,
             bot_username: None,
             active_users: 0,
+            domain,
         }
     }
 
@@ -887,6 +898,7 @@ mod tests {
                 app_secret: None,
                 encrypt_key: None,
                 verification_token: None,
+                domain: None,
                 client_id: None,
                 client_secret: None,
                 account_id: None,

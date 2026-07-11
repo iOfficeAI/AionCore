@@ -87,6 +87,7 @@ mod dingtalk_tests {
                 app_secret: None,
                 encrypt_key: None,
                 verification_token: None,
+                domain: None,
                 client_id: client_id.map(String::from),
                 client_secret: client_secret.map(String::from),
                 account_id: None,

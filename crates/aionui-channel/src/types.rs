@@ -176,6 +176,9 @@ pub struct PluginCredentials {
     pub encrypt_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verification_token: Option<String>,
+    /// Lark Open Platform domain: `"feishu"` (default) or `"lark"` (international).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 
     // DingTalk
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,6 +213,7 @@ impl PluginCredentials {
             && self.client_secret.is_none()
             && self.account_id.is_none()
             && self.bot_token.is_none()
+            && self.domain.is_none()
             && self.extra.is_empty()
     }
 }
@@ -599,6 +603,7 @@ mod tests {
             app_secret: None,
             encrypt_key: None,
             verification_token: None,
+            domain: None,
             client_id: None,
             client_secret: None,
             account_id: None,
@@ -619,6 +624,7 @@ mod tests {
             app_secret: Some("secret".into()),
             encrypt_key: Some("ek".into()),
             verification_token: Some("vt".into()),
+            domain: None,
             client_id: None,
             client_secret: None,
             account_id: None,
@@ -641,6 +647,23 @@ mod tests {
         let creds: PluginCredentials = serde_json::from_value(raw).unwrap();
         assert_eq!(creds.token.as_deref(), Some("xxx"));
         assert_eq!(creds.extra.get("customField").unwrap(), "hello");
+    }
+
+    #[test]
+    fn plugin_credentials_lark_domain_roundtrip() {
+        let raw = json!({ "app_id": "cli_abc", "app_secret": "secret", "domain": "lark" });
+        let creds: PluginCredentials = serde_json::from_value(raw).unwrap();
+        // domain must be a first-class field, not swallowed into `extra`
+        assert_eq!(creds.domain.as_deref(), Some("lark"));
+        let json = serde_json::to_value(&creds).unwrap();
+        assert_eq!(json["domain"], "lark");
+    }
+
+    #[test]
+    fn is_empty_considers_domain() {
+        let raw = json!({ "domain": "lark" });
+        let creds: PluginCredentials = serde_json::from_value(raw).unwrap();
+        assert!(!creds.is_empty());
     }
 
     #[test]
@@ -1022,6 +1045,7 @@ mod tests {
                 app_secret: None,
                 encrypt_key: None,
                 verification_token: None,
+                domain: None,
                 client_id: None,
                 client_secret: None,
                 account_id: None,

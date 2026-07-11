@@ -15,7 +15,7 @@ use crate::types::{
     UnifiedAttachment, UnifiedIncomingMessage, UnifiedMessageContent, UnifiedOutgoingMessage, UnifiedUser,
 };
 
-use super::api::LarkApi;
+use super::api::{LarkApi, LarkDomain};
 use super::frame::{
     METHOD_CONTROL, METHOD_DATA, build_ack_frame, build_ping_frame, decode_frame, encode_frame, get_header,
 };
@@ -98,6 +98,9 @@ impl ChannelPlugin for LarkPlugin {
                 ChannelError::InvalidConfig("Missing Lark app_secret".into())
             })?;
 
+        // Select Feishu (default) or Lark (international) domain from stored config.
+        let domain = LarkDomain::from_config(config.credentials.domain.as_deref());
+
         let http_client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -107,7 +110,7 @@ impl ChannelPlugin for LarkPlugin {
                 ChannelError::ConnectionFailed(format!("HTTP client init failed: {e}"))
             })?;
 
-        let api = Arc::new(LarkApi::new(http_client, app_id, app_secret));
+        let api = Arc::new(LarkApi::new(http_client, app_id, app_secret, domain));
 
         // Validate credentials by getting bot info
         let bot_data = api.get_bot_info().await.map_err(|e| {

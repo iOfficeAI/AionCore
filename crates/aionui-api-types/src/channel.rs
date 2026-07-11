@@ -45,6 +45,9 @@ pub struct TestPluginExtraConfig {
     pub app_id: Option<String>,
     #[serde(default)]
     pub app_secret: Option<String>,
+    /// Lark Open Platform domain: `"feishu"` (default) or `"lark"` (international).
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +163,10 @@ pub struct PluginStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_username: Option<String>,
     pub active_users: i64,
+    /// Lark region ("feishu"/"lark") from the stored config, so the UI can
+    /// restore the selected region after reload. `None` for other platforms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 /// Result of a plugin credential test.
@@ -458,6 +465,7 @@ mod tests {
             has_token: true,
             bot_username: Some("my_bot".into()),
             active_users: 5,
+            domain: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["plugin_id"], "telegram");
@@ -489,6 +497,7 @@ mod tests {
             has_token: false,
             bot_username: None,
             active_users: 0,
+            domain: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("status").is_none());
@@ -728,6 +737,7 @@ mod tests {
                 has_token: false,
                 bot_username: None,
                 active_users: 0,
+                domain: None,
             },
         };
         let json = serde_json::to_value(&payload).unwrap();
@@ -781,6 +791,7 @@ mod tests {
             has_token: false,
             bot_username: None,
             active_users: 0,
+            domain: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: PluginStatusResponse = serde_json::from_str(&json).unwrap();
