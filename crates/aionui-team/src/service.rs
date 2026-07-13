@@ -792,6 +792,63 @@ impl TeamSessionService {
         Ok(())
     }
 
+    pub async fn update_agent_model(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        model: &str,
+    ) -> Result<(), TeamError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(TeamError::InvalidRequest("model must not be empty".into()));
+        }
+
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        let mut team = self.load_owned_team(user_id, team_id).await?;
+        let conversation_id = team
+            .agents
+            .iter()
+            .find(|agent| agent.slot_id == slot_id)
+            .map(|agent| agent.conversation_id.clone())
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+
+        self.conversation_port
+            .patch_runtime_config(&conversation_id, serde_json::json!({ "current_model_id": model }))
+            .await?;
+        let agent = team
+            .agents
+            .iter_mut()
+            .find(|agent| agent.slot_id == slot_id)
+            .expect("validated team agent");
+        agent.model = model.to_owned();
+        self.repo
+            .update_team(
+                team_id,
+                &UpdateTeamParams {
+                    agents: Some(serde_json::to_string(&team.agents)?),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session))
+            && let Err(error) = session.update_agent_model(slot_id, model).await
+        {
+            warn!(team_id, slot_id, error = %error, "persisted team model but live session roster update failed");
+        }
+        info!(
+            team_id,
+            slot_id, conversation_id, model, "team agent model preference persisted"
+        );
+        Ok(())
+    }
+
     /// Start the team's MCP server and rebuild every agent process so it
     /// carries a fresh `team_mcp_stdio_config` pointing at the new server.
     ///
@@ -1938,7 +1995,6 @@ impl TeamSessionService {
         to_slot_id: &str,
         content: &str,
     ) -> Result<AgentMessageQueueResult, TeamError> {
-        self.require_active_team_run_for_team_work(team_id).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1966,23 +2022,6 @@ impl TeamSessionService {
             Arc::clone(&entry.session)
         };
         session.shutdown_agent(caller_slot_id, target_slot_id, reason).await
-    }
-
-    /// Friendly pre-check used before invoking run-scoped team tools. This is
-    /// not a concurrency guarantee; any operation
-    /// that writes mailbox, projection, scheduler, spawn, shutdown, or wake state
-    /// must still acquire a TeamRun operation lease in TeamSession/TeamRunManager.
-    pub(crate) async fn require_active_team_run_for_team_work(&self, team_id: &str) -> Result<(), TeamError> {
-        let entry = self
-            .sessions
-            .get(team_id)
-            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-        if entry.session.team_run_manager().current_active_run_id().is_some() {
-            return Ok(());
-        }
-        Err(TeamError::InvalidRequest(
-            "no active team run for run-scoped wake".into(),
-        ))
     }
 
     pub(crate) async fn wake_leader_after_recovery_message(

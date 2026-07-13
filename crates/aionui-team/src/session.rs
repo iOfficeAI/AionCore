@@ -1294,6 +1294,10 @@ impl TeamSession {
         self.scheduler.rename_agent(slot_id, new_name).await
     }
 
+    pub async fn update_agent_model(&self, slot_id: &str, model: &str) -> Result<(), TeamError> {
+        self.scheduler.update_agent_model(slot_id, model).await
+    }
+
     /// Spawn a new teammate at the Lead's request (backing of `team_spawn_agent`).
     ///
     /// Validation chain mirrors the assistant-first team contract:

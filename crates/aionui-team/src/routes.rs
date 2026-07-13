@@ -12,8 +12,8 @@ use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
-    TeamRunStateResponse,
+    SendTeamMessageRequest, SetModeRequest, SetModelRequest, TeamAgentResponse, TeamListResponse, TeamResponse,
+    TeamRunAckResponse, TeamRunStateResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -98,6 +98,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route(
             "/api/teams/{id}/agents/{slot_id}/name",
             axum::routing::patch(rename_agent),
+        )
+        .route(
+            "/api/teams/{id}/agents/{slot_id}/model",
+            axum::routing::patch(update_agent_model),
         )
         .route("/api/teams/{id}/messages", post(send_message))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
@@ -228,6 +232,20 @@ async fn rename_agent(
     state
         .service
         .rename_agent(&user.id, &params.id, &params.slot_id, &req.name)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn update_agent_model(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+    body: Result<Json<SetModelRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .service
+        .update_agent_model(&user.id, &params.id, &params.slot_id, &req.model_id)
         .await?;
     Ok(Json(ApiResponse::success()))
 }
