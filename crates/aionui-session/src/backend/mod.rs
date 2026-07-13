@@ -82,9 +82,15 @@ pub trait SessionBackend: Send + Sync {
     /// detail (transient, never persisted) was lost on the frontend reload. Reads
     /// the adapter's transient pending registry; NOT reducer/FSM/persisted.
     ///
-    /// Default empty: backends without a pending registry (codex's only pending is
-    /// auth, not a tool permission; ACP `session/request_permission` is
-    /// fire-and-forget) and every test double need no change. claude overrides it.
+    /// Default empty: only backends with no unanswered-permission registry and every
+    /// test double need no change. claude and codex both override it (claude from its
+    /// `can_use_tool` pending map; codex from its `*/requestApproval` + elicitation
+    /// registry). NOTE: the ACP `SessionBackend` (`acp_conn`) DOES keep such a
+    /// registry (`pending_perm_options`, populated on `session/request_permission`)
+    /// but does not yet override this — a latent recovery gap for the day the ACP
+    /// SessionBackend is routed into `AgentInstance::Session` (today only claude/codex
+    /// are; opencode/gemini/hermes still use the legacy `AgentInstance::Acp` path,
+    /// which recovers via its own `permission_router`).
     fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
         Vec::new()
     }

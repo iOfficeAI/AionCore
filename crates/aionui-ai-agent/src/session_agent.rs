@@ -1328,24 +1328,33 @@ fn catalog_partial_from_caps(caps: &aionui_session::Capabilities) -> Option<aion
     })
 }
 
-/// legacy `codex_sandbox::sandbox_mode_for_requested_mode`: only an explicit
-/// full-access / yolo mode escalates to `danger-full-access`; everything else
-/// (including `None`) stays at the safe default (returned here as `None` so the
-/// backend's `unwrap_or("workspace-write")` applies). Verbatim port of clean-slate
-/// `session_runtime::codex_sandbox_for_mode`.
+/// Map a conversation's requested mode → the codex `thread/start.sandbox` string
+/// (`SandboxMode`: `read-only` / `workspace-write` / `danger-full-access`, verified
+/// `codex-cli/0.137.0/schema-full/ClientRequest.json` §SandboxMode), or `None` to keep
+/// the backend's safe default (`unwrap_or("workspace-write")`).
 ///
-/// This runs at OPEN time and pre-seeds `thread/start.sandboxPolicy` — the sandbox axis
-/// the tier reaches the first turn through, since `thread/start` carries no `permissions`
-/// field and `permissions` is mutually exclusive with `sandboxPolicy` (U1). The
-/// post-open `reconcile_codex_mode` then applies the matching permission profile via
-/// SetMode. The mode value reaching this boot helper is the persisted/config selection,
-/// which under feature 012 "Plan B" is the LEGACY bare token (`full-access`); the colon
-/// profile id (`:danger-full-access`, e.g. from a readback that skipped bare-mapping) and
-/// the legacy `yoloNoSandbox` alias stay recognized for robustness. Kept in lockstep with
-/// `codex_conn::codex_perm::{normalize_to_profile_id, profile_id_to_legacy_value}`.
+/// This runs at OPEN time and pre-seeds `thread/start.sandbox` — the sandbox axis the
+/// tier reaches the FIRST turn through, since `thread/start` carries no `permissions`
+/// field and `permissions` is mutually exclusive with `sandbox` (U1). The post-open
+/// `reconcile_codex_mode` only applies the matching permission profile via SetMode, and
+/// that `thread/settings/update{permissions}` write "applies to the NEXT turn"
+/// (codex_conn `Command::SetMode`) — so WITHOUT seeding the restrictive sandbox here, a
+/// read-only conversation's first turn would run under the permissive `workspace-write`
+/// default and a write would succeed before the profile lands. We therefore seed BOTH
+/// escalation (`full-access` → `danger-full-access`) AND restriction (`read-only` →
+/// `read-only`) at the sandbox axis; the middle `workspace`/`auto` tier keeps the
+/// `workspace-write` default (returned as `None`).
+///
+/// The mode value reaching this boot helper is the persisted/config selection, which
+/// under feature 012 "Plan B" is the LEGACY bare token (`full-access` / `read-only`);
+/// the colon profile id (`:danger-full-access` / `:read-only`, e.g. from a readback that
+/// skipped bare-mapping) and the legacy `yoloNoSandbox` alias stay recognized for
+/// robustness. Kept in lockstep with `codex_conn::codex_perm::{normalize_to_profile_id,
+/// profile_id_to_legacy_value}`.
 fn codex_sandbox_for_mode(mode: Option<&str>) -> Option<&'static str> {
     match mode.map(str::trim) {
         Some(":danger-full-access" | "full-access" | "yoloNoSandbox") => Some("danger-full-access"),
+        Some(":read-only" | "read-only") => Some("read-only"),
         _ => None,
     }
 }
@@ -2269,11 +2278,37 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 },
             )]
         }
+        // Out-of-turn advisory (codex `warning`/`guardianWarning`/`configWarning`/
+        // `deprecationNotice`; claude a rejected mode/model/effort set surfaced by
+        // `sniff_set_config_reject`). Both backends emit `Notice` *specifically so a
+        // failed/advisory event is VISIBLE instead of silently dropped* — re-dropping it
+        // here would re-introduce exactly the silent-degradation the backends were coded
+        // to avoid (e.g. a rejected effort switch would look like it succeeded). Surface
+        // it as a `Tips` frame — the one advisory frame the origin frontend already
+        // renders (`MessageTips`, warning/info styling). NOTE: origin's `useAcpMessage`
+        // has no explicit `tips` case, so a `tips` frame lands in its `default:` arm,
+        // which is benign for display (it renders via `mergeLiveMessage`) but also calls
+        // `setRunning(true)`. That is acceptable here: a Notice only arrives mid/around a
+        // turn that is already running (or immediately re-settled by the turn's terminal
+        // Finish), so it does not manufacture a spurious idle timer the way a config frame
+        // would. `NoticeLevel` has only Info/Warning (no Error tier), matching TipType.
+        SessionEvent::Notice { level, message } => {
+            let tip_type = match level {
+                aionui_session::NoticeLevel::Info => TipType::Info,
+                aionui_session::NoticeLevel::Warning => TipType::Warning,
+            };
+            vec![AgentStreamEvent::Tips(TipsEventData {
+                content: message,
+                tip_type,
+                code: None,
+                params: None,
+            })]
+        }
         // Events with no origin-side counterpart (or purely internal) are dropped.
         // Cancel folds into the Finish emitted by the resulting terminal; Heartbeat,
         // PromptAccepted, Snapshot, Lagged, item lifecycle, subagent/rewound/etc. are
         // not part of origin's AgentStreamEvent vocabulary. codex ToolOutputDelta /
-        // TurnDiffUpdated / Notice / SubagentUpdate are also dropped for now — separate
+        // TurnDiffUpdated / SubagentUpdate are also dropped for now — separate
         // follow-ups (each needs its own origin frame + renderer verification).
         _ => Vec::new(),
     }
@@ -2502,10 +2537,12 @@ mod build_mapping_tests {
         );
     }
 
-    /// Only an explicit full-access / yolo mode escalates the codex sandbox; every
-    /// other mode (and None) keeps None ⇒ workspace-write. Ported verbatim.
+    /// Full-access / yolo escalates the codex sandbox to `danger-full-access`;
+    /// read-only RESTRICTS it to `read-only` (so the FIRST turn is already locked
+    /// down — the SetMode permission profile only lands on the NEXT turn); the
+    /// workspace/auto middle tier keeps None ⇒ workspace-write.
     #[test]
-    fn codex_sandbox_maps_only_full_access_modes() {
+    fn codex_sandbox_maps_full_access_and_read_only_modes() {
         // Plan B canonical value: the legacy bare token.
         assert_eq!(codex_sandbox_for_mode(Some("full-access")), Some("danger-full-access"));
         // The colon profile id (e.g. a readback that skipped bare-mapping) stays recognized.
@@ -2521,8 +2558,14 @@ mod build_mapping_tests {
             codex_sandbox_for_mode(Some("  :danger-full-access  ")),
             Some("danger-full-access")
         );
-        // read-only and workspace tiers do NOT escalate — the safe sandbox default applies.
-        assert_eq!(codex_sandbox_for_mode(Some(":read-only")), None);
+        // read-only RESTRICTS the sandbox at OPEN time (regression fix: seeding this
+        // at thread/start is what makes the first-turn write actually blocked; the
+        // SetMode permission profile alone applies too late). Both the bare token and
+        // the colon id (and surrounding whitespace) are recognized.
+        assert_eq!(codex_sandbox_for_mode(Some("read-only")), Some("read-only"));
+        assert_eq!(codex_sandbox_for_mode(Some(":read-only")), Some("read-only"));
+        assert_eq!(codex_sandbox_for_mode(Some("  read-only  ")), Some("read-only"));
+        // The workspace/auto middle tier keeps the safe workspace-write default.
         assert_eq!(codex_sandbox_for_mode(Some(":workspace")), None);
         assert_eq!(codex_sandbox_for_mode(Some("plan")), None);
         assert_eq!(codex_sandbox_for_mode(Some("default")), None);
@@ -2789,6 +2832,34 @@ mod translate_tests {
             v.get("cost").and_then(|c| c.get("currency")).and_then(|x| x.as_str()),
             Some("USD")
         );
+    }
+
+    // A backend Notice (a rejected mode/model/effort set, or a codex out-of-turn
+    // warning/deprecation) must NOT be silently dropped at the seam — the backends emit
+    // it precisely so the failure is visible. It surfaces as a `Tips` frame the frontend
+    // already renders, carrying the notice level → TipType and the message verbatim.
+    #[test]
+    fn notice_surfaces_as_tips() {
+        for (level, expected) in [
+            (aionui_session::NoticeLevel::Warning, TipType::Warning),
+            (aionui_session::NoticeLevel::Info, TipType::Info),
+        ] {
+            let events = translate_event(
+                SessionEvent::Notice {
+                    level,
+                    message: "set effort: rejected by agent".into(),
+                },
+                "conv-1",
+                false,
+            );
+            assert_eq!(events.len(), 1, "a Notice must produce exactly one Tips frame");
+            let crate::protocol::events::AgentStreamEvent::Tips(tip) = &events[0] else {
+                panic!("expected Tips, got {:?}", events[0]);
+            };
+            assert_eq!(tip.content, "set effort: rejected by agent");
+            assert_eq!(tip.tip_type, expected, "notice level maps to tip severity");
+            assert!(tip.code.is_none(), "ad-hoc notice carries no i18n code");
+        }
     }
 
     // A ConfigChanged must NOT produce any stream frame: the origin frontend's mode/

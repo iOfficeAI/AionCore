@@ -32,7 +32,8 @@ use tokio::sync::{Mutex, broadcast};
 
 use super::suspend::{ProcHandle, SuspendController, spawn_idle_timer};
 use super::types::{
-    Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, SessionEnvelope, SessionSpec,
+    Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
+    SessionEnvelope, SessionSpec,
 };
 use super::{BackendConnection, SessionBackend, SessionConfig};
 use crate::adapter::AgentIo;
@@ -582,6 +583,18 @@ pub struct CodexSessionBackend {
     /// updated by `dispatch(SetModel)` + the `thread/settings/updated` notif. None
     /// until known → SetMode rejects (can't build a valid collaborationMode).
     current_model: Arc<Mutex<Option<String>>>,
+    /// REST-recovery (`GET /confirmations`) source: the currently-open (unanswered)
+    /// tool/file/elicitation approval requests, keyed by the SAME request_id the
+    /// backend surfaced on `SessionEvent::Permission` (so the recovered card's
+    /// id==call_id matches the live frame and de-dups). The value is a safe title
+    /// label derived from the reverse-RPC method (NOT the command body — TIO-13).
+    /// Lifecycle: the reader inserts on each `*/requestApproval` (+ elicitation)
+    /// reverse-RPC, removes on `serverRequest/resolved` (codex retracted/answered it)
+    /// and `dispatch(AnswerPermission)` (we answered it). `std::sync::Mutex` because
+    /// the sync `pending_permission_requests()` trait method reads it without await —
+    /// mirrors claude's `pending_perms`. Behind an Arc so the reader (cloned into
+    /// every post-wake reader via `reader_state`) shares the one registry.
+    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// GAP-A: rpc-id → client_msg_id correlation for in-flight `turn/start`
     /// requests. codex IS a bidirectional JSON-RPC client: `turn/start` gets a
     /// synchronous response `{turn:{id,status:inProgress}}` keyed by the request
@@ -669,6 +682,7 @@ struct CodexReaderState {
     thread_binding: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
+    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pending_sends: Arc<Mutex<HashMap<u64, String>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
@@ -698,6 +712,7 @@ fn start_codex_reader(
             state.thread_binding,
             state.active_turn_id,
             state.pending_auth_id,
+            state.pending_tool_approvals,
             state.pending_sends,
             state.pending_discovery,
             state.pending_set,
@@ -813,6 +828,7 @@ impl CodexSessionBackend {
         let thread_binding = Arc::new(Mutex::new(None));
         let active_turn_id = Arc::new(Mutex::new(None));
         let pending_auth_id = Arc::new(Mutex::new(None));
+        let pending_tool_approvals = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let current_model = Arc::new(Mutex::new(None));
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
@@ -834,6 +850,7 @@ impl CodexSessionBackend {
             thread_binding: thread_binding.clone(),
             active_turn_id: active_turn_id.clone(),
             pending_auth_id: pending_auth_id.clone(),
+            pending_tool_approvals: pending_tool_approvals.clone(),
             pending_sends: pending_sends.clone(),
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
@@ -886,6 +903,7 @@ impl CodexSessionBackend {
             thread_binding,
             active_turn_id,
             pending_auth_id,
+            pending_tool_approvals,
             current_model,
             pending_sends,
             pending_discovery,
@@ -1067,6 +1085,7 @@ async fn reader_task(
     thread_binding: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
+    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pending_sends: Arc<Mutex<HashMap<u64, String>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
@@ -1139,8 +1158,17 @@ async fn reader_task(
                         // reverse-RPC (ServerRequest): infra → auto-reject to prevent
                         // deadlock (A2/A3); auth-refresh + approvals → surface as
                         // Permission (NOT auto-answered — a human/credential answers).
-                        handle_reverse_rpc(m, &frame, &session_id, &turn_gen, &event_tx, &pending_auth_id, &stdin)
-                            .await;
+                        handle_reverse_rpc(
+                            m,
+                            &frame,
+                            &session_id,
+                            &turn_gen,
+                            &event_tx,
+                            &pending_auth_id,
+                            &pending_tool_approvals,
+                            &stdin,
+                        )
+                        .await;
                     }
                     (Some(m), false) => {
                         // server notification → SessionEvent(s)
@@ -1206,12 +1234,20 @@ async fn reader_task(
                             if matches!(kind, crate::event::PermissionKind::Auth) {
                                 *pending_auth_id.lock().await = None;
                             }
+                            let resolved_id = req_id.map(|v| v.to_string()).unwrap_or_default();
+                            // Drop the recovered-card entry: codex resolved this approval
+                            // (answered elsewhere or retracted), so it is no longer a
+                            // pending confirmation for REST recovery. The registry keys
+                            // by the surfaced request_id (raw for tool/file approvals,
+                            // ELICIT_PREFIX-tagged for elicitation), matching the id shape
+                            // stored on the requestApproval emit below.
+                            remove_pending_tool_approval(&pending_tool_approvals, &resolved_id);
                             emit(
                                 &event_tx,
                                 &session_id,
                                 cur,
                                 SessionEvent::PermissionResolved {
-                                    request_id: req_id.map(|v| v.to_string()).unwrap_or_default(),
+                                    request_id: resolved_id,
                                     kind,
                                 },
                             );
@@ -1763,6 +1799,18 @@ fn rollback_to_turn(result: &Value) -> u64 {
         .unwrap_or(0)
 }
 
+/// Remove a resolved/answered approval from the recovery registry. `serverRequest/
+/// resolved` carries the RAW wire id, but an elicitation was stored under the
+/// `ELICIT_PREFIX`-tagged key — so try the raw id first, then the prefixed form, so
+/// a resolved notification clears either entry shape. `dispatch(AnswerPermission)`
+/// passes the exact stored key (raw or prefixed), which the first lookup catches.
+fn remove_pending_tool_approval(pending: &Arc<std::sync::Mutex<HashMap<String, String>>>, request_id: &str) {
+    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
+    if map.remove(request_id).is_none() {
+        map.remove(&format!("{ELICIT_PREFIX}{request_id}"));
+    }
+}
+
 /// Reverse-RPC handler (A2/A3). The blocking ServerRequest MUST eventually get a
 /// JSON-RPC RESPONSE (same `id`) or the channel deadlocks and the turn hangs.
 /// THREE classes:
@@ -1774,6 +1822,7 @@ fn rollback_to_turn(result: &Value) -> u64 {
 ///    keyed response with the supplied tokens. NOT auto-answered.
 ///  - Tool/file approvals (`*/requestApproval`): a human decides → `Permission`
 ///    (Tool); `dispatch(AnswerPermission)` writes the keyed accept/decline.
+#[allow(clippy::too_many_arguments)]
 async fn handle_reverse_rpc(
     method: &str,
     frame: &Value,
@@ -1781,6 +1830,7 @@ async fn handle_reverse_rpc(
     turn_gen: &Arc<AtomicU64>,
     event_tx: &broadcast::Sender<SessionEnvelope>,
     pending_auth_id: &Arc<Mutex<Option<Value>>>,
+    pending_tool_approvals: &Arc<std::sync::Mutex<HashMap<String, String>>>,
     stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
 ) {
     let cur = turn_gen.load(Ordering::SeqCst);
@@ -1839,6 +1889,22 @@ async fn handle_reverse_rpc(
         // can't be granted — strictly better than a malformed answer or a deadlock).
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
             let request_id = id.to_string();
+            // Register for REST recovery (`GET /confirmations`): a tool/file approval
+            // raised before the client subscribed (or after a page reload) must be
+            // rebuildable, else the turn hangs waiting for an answer that can never be
+            // given. Keyed by the SAME request_id we surface, so a duplicate live+
+            // recovered pair de-dups; the value is a safe title (the approval class,
+            // NOT the command body — TIO-13). Cleared on serverRequest/resolved or
+            // dispatch(AnswerPermission).
+            let title = if method == "item/fileChange/requestApproval" {
+                "FileChange"
+            } else {
+                "CommandExecution"
+            };
+            pending_tool_approvals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(request_id.clone(), title.to_string());
             emit(
                 event_tx,
                 session_id,
@@ -1876,6 +1942,13 @@ async fn handle_reverse_rpc(
                 "mode": frame.get("params").and_then(|p| p.get("mode")),
                 "serverName": frame.get("params").and_then(|p| p.get("serverName")),
             });
+            // Register for REST recovery, keyed by the ELICIT_PREFIX-tagged request_id
+            // (the same id we surface + dispatch(AnswerPermission) answers). Title is
+            // the safe approval class, not the elicitation message body (TIO-13).
+            pending_tool_approvals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(request_id.clone(), "Elicitation".to_string());
             emit(
                 event_tx,
                 session_id,
@@ -3091,6 +3164,11 @@ impl SessionBackend for CodexSessionBackend {
                     })
                 };
                 self.write_frame(frame).await?;
+                // We answered it → drop from the REST-recovery registry so a
+                // subsequent GET /confirmations no longer resurfaces a card the user
+                // already resolved. `request_id` is the exact stored key (raw for
+                // tool/file, ELICIT_PREFIX-tagged for elicitation).
+                remove_pending_tool_approval(&self.pending_tool_approvals, &request_id);
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -3186,6 +3264,31 @@ impl SessionBackend for CodexSessionBackend {
             caps.available_modes = disc.modes.clone();
         }
         caps
+    }
+
+    /// REST-recovery (`GET /confirmations`) source: the transient registry of
+    /// currently-open (unanswered) codex approval requests — command/file
+    /// approvals (`*/requestApproval`) and MCP elicitations. The reader inserts on
+    /// each such reverse-RPC, and removes on `serverRequest/resolved` (codex
+    /// retracted/answered) and `dispatch(AnswerPermission)` (we answered). Without
+    /// this override (the default empty `Vec`), a codex tool/file approval raised
+    /// before the client subscribed — or lost on a page reload — could never be
+    /// rebuilt, and the turn hung forever waiting for an answer. The recovered
+    /// card's id==call_id==request_id, matching the live `Permission` frame so a
+    /// duplicate live+recovered pair de-dups. codex approvals carry no question
+    /// payload (AskUserQuestion is claude-only), so `questions` is always `None`;
+    /// the raw command body is NOT exposed (TIO-13) — only the approval-class title.
+    fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
+        self.pending_tool_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(request_id, title)| PendingPermissionView {
+                request_id: request_id.clone(),
+                tool_name: title.clone(),
+                questions: None,
+            })
+            .collect()
     }
 }
 
@@ -3535,6 +3638,69 @@ mod tests {
                 "{m} surfaces as Permission(Tool), got {events:?}"
             );
         }
+    }
+
+    /// REST-recovery parity with claude: a codex tool approval is LISTED by
+    /// `pending_permission_requests()` while open, and the list is EMPTY after
+    /// `dispatch(AnswerPermission)` consumes it. Without the registry the recovery
+    /// read returned empty and a reloaded `waiting_confirmation` codex turn hung
+    /// forever (the id needed to answer lived only in the missed live frame).
+    #[tokio::test]
+    async fn codex_pending_tool_approval_lists_open_then_clears_on_answer() {
+        // Gate the reverse-RPC so it arrives AFTER we subscribe; keep the process
+        // alive (never_exits) so the registry is not torn down by an EOF.
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":7,"method":"item/commandExecution/requestApproval","params":{"command":"rm -rf /"}}"#,
+                "\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+        let releaser = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut events = backend.events();
+        releaser();
+
+        // Wait for the live Permission frame so the reader has processed the insert.
+        let request_id = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::Permission {
+                    request_id,
+                    kind: PermissionKind::Tool,
+                    ..
+                } = env.event
+                {
+                    return Some(request_id);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for Permission")
+        .expect("a Tool Permission frame");
+
+        // OPEN: recovery lists exactly this pending approval, keyed by request_id.
+        let open = backend.pending_permission_requests();
+        assert_eq!(open.len(), 1, "one open approval recovered, got {open:?}");
+        assert_eq!(open[0].request_id, request_id, "recovered id == live request_id");
+        assert_eq!(open[0].tool_name, "CommandExecution");
+        assert!(open[0].questions.is_none(), "codex approvals carry no question payload");
+
+        // ANSWER: dispatch(AnswerPermission) → the registry entry is dropped.
+        backend
+            .dispatch(Command::AnswerPermission {
+                request_id: request_id.clone(),
+                decision: crate::PermissionDecision::Approved,
+                selected: None,
+                answers: Vec::new(),
+            })
+            .await
+            .expect("AnswerPermission accepted");
+        assert!(
+            backend.pending_permission_requests().is_empty(),
+            "recovery list EMPTY after the approval is answered"
+        );
     }
 
     #[tokio::test]
@@ -5519,6 +5685,19 @@ mod tests {
         );
         // approvalPolicy keeps its default when only sandbox_mode is set.
         assert_eq!(frame["params"]["approvalPolicy"], "on-request");
+        // Restriction rides the SAME axis: a read-only conversation seeds
+        // sandbox:"read-only" at thread/start so the FIRST turn is already locked
+        // down (the SetMode permission profile applies only on the NEXT turn). This
+        // is the wire half of the read-only first-turn-write regression fix.
+        let ro = thread_start_params(&SessionConfig {
+            sandbox_mode: Some("read-only".into()),
+            ..Default::default()
+        })
+        .into_frame(3, "thread/start");
+        assert_eq!(
+            ro["params"]["sandbox"], "read-only",
+            "a read-only conversation must launch its thread under the read-only sandbox"
+        );
     }
 
     /// thread/start serializes SessionConfig.approval_policy data-driven (sibling of
