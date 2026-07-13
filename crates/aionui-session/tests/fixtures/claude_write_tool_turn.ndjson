@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","cwd":"/tmp","session_id":"00000000-0000-0000-0000-000000000001","tools":["Write"],"mcp_servers":[],"model":"claude-opus-4-5","permissionMode":"bypassPermissions","apiKeySource":"none","claude_code_version":"2.1.0"}
+{"type":"assistant","message":{"id":"msg_w_001","model":"claude-opus-4-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_write_1","name":"Write","input":{"file_path":"/tmp/hello.txt","content":"hello world"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":8}}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_write_1","content":"File created successfully at /tmp/hello.txt","is_error":false}]}}
+{"type":"assistant","message":{"id":"msg_w_002","model":"claude-opus-4-5","role":"assistant","content":[{"type":"text","text":"Done — wrote hello.txt."}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":20,"output_tokens":6}}}
+{"type":"result","subtype":"success","is_error":false,"result":"Done — wrote hello.txt.","stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000001","total_cost_usd":0.0}

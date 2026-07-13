@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","cwd":"/tmp","session_id":"00000000-0000-0000-0000-000000000001","tools":[],"mcp_servers":[],"model":"claude-opus-4-5","permissionMode":"bypassPermissions","apiKeySource":"none","claude_code_version":"2.1.0"}
+{"type":"assistant","message":{"id":"msg_test_001","model":"claude-opus-4-5","role":"assistant","content":[{"type":"text","text":"Hello from fake backend"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":5}}}
+{"type":"result","subtype":"success","is_error":false,"result":"Hello from fake backend","stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000001","total_cost_usd":0.0}
