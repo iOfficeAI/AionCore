@@ -669,6 +669,11 @@ mod tests {
             .find(|r| r.name == "Hermes" && r.agent_source == "builtin")
             .expect("seeded hermes row");
         assert_eq!(hermes.yolo_id, None);
+        let codex = rows
+            .iter()
+            .find(|r| r.name == "Codex CLI" && r.backend.as_deref() == Some("codex") && r.agent_source == "builtin")
+            .expect("seeded codex row");
+        assert_eq!(codex.yolo_id.as_deref(), Some("agent-full-access"));
     }
 
     #[tokio::test]

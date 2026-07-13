@@ -121,6 +121,20 @@ impl ConfigSnapshot {
             .and_then(|option| option.current_value.clone())
     }
 
+    pub(crate) fn selectable_values(&self, option_id: &str) -> Vec<&str> {
+        self.options
+            .iter()
+            .find(|option| option.id == option_id)
+            .map(|option| {
+                option
+                    .options
+                    .iter()
+                    .map(|select_option| select_option.value.as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn observed_matches(&self, option_id: &str, requested: &str) -> bool {
         self.option_current(option_id).as_deref() == Some(requested)
     }
@@ -346,5 +360,24 @@ mod tests {
             resolve_set_path(&snapshot, "reasoning_effort", "high"),
             Err(ConfigSetPathError::OptionNotFound)
         );
+    }
+
+    #[test]
+    fn config_snapshot_selectable_values_returns_mode_option_values() {
+        let snapshot = ConfigSnapshot::from_real_options(vec![
+            SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "auto",
+                vec![
+                    SessionConfigSelectOption::new("auto", "Auto"),
+                    SessionConfigSelectOption::new("agent-full-access", "Agent Full Access"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Mode),
+        ]);
+
+        assert_eq!(snapshot.selectable_values("mode"), vec!["auto", "agent-full-access"]);
+        assert!(snapshot.selectable_values("model").is_empty());
     }
 }

@@ -1263,12 +1263,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_yolo_id_maps_to_full_access() {
+    async fn codex_yolo_id_maps_to_agent_full_access() {
         let reg = registry().await;
         let codex = reg.find_builtin_by_backend("codex").await.unwrap();
         // Legacy AionUi yolo aliases resolve to Codex's native
-        // `full-access` mode via the catalog row.
-        assert_eq!(codex.yolo_id.as_deref(), Some("full-access"));
+        // `agent-full-access` mode via the catalog row.
+        assert_eq!(codex.yolo_id.as_deref(), Some("agent-full-access"));
     }
 
     #[tokio::test]
