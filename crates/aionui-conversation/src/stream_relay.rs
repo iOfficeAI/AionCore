@@ -203,10 +203,12 @@ impl StreamRelay {
     ) -> RelayOutcome {
         let started_at = now_ms();
         info!(
+            target: "aionui_feedback_diagnostics",
+            diagnostic_event = "feedback.runtime.turn_start",
             conversation_id = %self.conversation_id,
             turn_id = %self.turn_id,
             msg_id = %self.msg_id,
-            "StreamRelay started"
+            "feedback.runtime.turn_start"
         );
 
         let mut full_text_buffer = String::new();
@@ -275,9 +277,14 @@ impl StreamRelay {
                     if !first_agent_event_logged {
                         first_agent_event_logged = true;
                         info!(
-                            event_type = Self::event_kind(&event),
+                            target: "aionui_feedback_diagnostics",
+                            diagnostic_event = "feedback.runtime.turn_first_agent_event",
+                            conversation_id = %self.conversation_id,
+                            turn_id = %self.turn_id,
+                            msg_id = %self.msg_id,
+                            event_type = %Self::event_kind(&event),
                             elapsed_ms = now_ms().saturating_sub(started_at),
-                            "StreamRelay received first agent event"
+                            "feedback.runtime.turn_first_agent_event"
                         );
                     }
 
@@ -293,9 +300,14 @@ impl StreamRelay {
                             if !first_visible_output_logged && !data.content.is_empty() {
                                 first_visible_output_logged = true;
                                 info!(
+                                    target: "aionui_feedback_diagnostics",
+                                    diagnostic_event = "feedback.runtime.turn_first_visible_output",
+                                    conversation_id = %self.conversation_id,
+                                    turn_id = %self.turn_id,
+                                    msg_id = %self.msg_id,
                                     event_type = "Thinking",
                                     elapsed_ms = now_ms().saturating_sub(started_at),
-                                    "StreamRelay received first visible output"
+                                    "feedback.runtime.turn_first_visible_output"
                                 );
                             }
                             if !data.content.is_empty() {
@@ -315,9 +327,14 @@ impl StreamRelay {
                             if !first_visible_output_logged && !data.content.is_empty() {
                                 first_visible_output_logged = true;
                                 info!(
+                                    target: "aionui_feedback_diagnostics",
+                                    diagnostic_event = "feedback.runtime.turn_first_visible_output",
+                                    conversation_id = %self.conversation_id,
+                                    turn_id = %self.turn_id,
+                                    msg_id = %self.msg_id,
                                     event_type = "Text",
                                     elapsed_ms = now_ms().saturating_sub(started_at),
-                                    "StreamRelay received first visible output"
+                                    "feedback.runtime.turn_first_visible_output"
                                 );
                             }
                             if !data.content.is_empty() {
@@ -348,26 +365,22 @@ impl StreamRelay {
                                 "Error"
                             };
                             let terminal = Self::terminal_from_event(&event);
-                            match &terminal {
-                                RelayTerminal::Error { code, retryable } => {
-                                    info!(
-                                        event_type,
-                                        elapsed_ms,
-                                        text_len = full_text_buffer.len(),
-                                        error_code = ?code,
-                                        retryable = ?retryable,
-                                        "StreamRelay received terminal event"
-                                    );
-                                }
-                                RelayTerminal::Finish | RelayTerminal::ChannelClosed => {
-                                    info!(
-                                        event_type,
-                                        elapsed_ms,
-                                        text_len = full_text_buffer.len(),
-                                        "StreamRelay received terminal event"
-                                    );
-                                }
-                            }
+                            info!(
+                                target: "aionui_feedback_diagnostics",
+                                diagnostic_event = "feedback.runtime.turn_terminal",
+                                conversation_id = %self.conversation_id,
+                                turn_id = %self.turn_id,
+                                msg_id = %self.msg_id,
+                                event_type = %event_type,
+                                elapsed_ms,
+                                text_len = full_text_buffer.len(),
+                                error_code = ?terminal.code(),
+                                retryable = ?terminal.retryable(),
+                                saw_visible_output = attempt.saw_visible_output,
+                                saw_tool_or_side_effect = attempt.saw_tool_or_side_effect,
+                                persisted_assistant_output = !full_text_buffer.is_empty(),
+                                "feedback.runtime.turn_terminal"
+                            );
 
                             let defer_clean_error = self.defer_clean_terminal_errors
                                 && matches!(
@@ -482,9 +495,20 @@ impl StreamRelay {
                 Err(broadcast::error::RecvError::Closed) => {
                     let elapsed_ms = now_ms() - started_at;
                     warn!(
+                        target: "aionui_feedback_diagnostics",
+                        diagnostic_event = "feedback.runtime.turn_terminal",
+                        conversation_id = %self.conversation_id,
+                        turn_id = %self.turn_id,
+                        msg_id = %self.msg_id,
+                        event_type = "ChannelClosed",
                         elapsed_ms,
                         text_len = full_text_buffer.len(),
-                        "StreamRelay channel closed without terminal event"
+                        error_code = ?RelayTerminal::ChannelClosed.code(),
+                        retryable = ?RelayTerminal::ChannelClosed.retryable(),
+                        saw_visible_output = attempt.saw_visible_output,
+                        saw_tool_or_side_effect = attempt.saw_tool_or_side_effect,
+                        persisted_assistant_output = !full_text_buffer.is_empty(),
+                        "feedback.runtime.turn_terminal"
                     );
 
                     let deleting = self.is_deleting();
@@ -770,10 +794,43 @@ mod tests {
     use aionui_ai_agent::protocol::events::{ErrorEventData, FinishEventData, TextEventData, ThinkingEventData};
     use aionui_db::DbError;
     use aionui_db::models::MessageRow;
+    use std::io::Write;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tracing::Level;
+    use tracing_subscriber::fmt;
 
     // ── run() async tests ─────────────────────────────────────────
+
+    #[derive(Clone)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedLogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(level: Level, f: impl FnOnce()) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedLogBuffer(Arc::clone(&buffer))
+        };
+        let subscriber = fmt::Subscriber::builder()
+            .with_max_level(level)
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buffer.lock().expect("log buffer lock").clone()).expect("utf8 logs")
+    }
 
     #[derive(Default)]
     struct RecordingSkillResolverForRelay {
@@ -971,6 +1028,47 @@ mod tests {
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Something went wrong");
         assert_eq!(content["type"], "error");
+    }
+
+    #[test]
+    fn stream_relay_emits_feedback_runtime_terminal_log() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let captured = capture_logs(Level::INFO, || {
+            runtime.block_on(async {
+                let repo = Arc::new(RecordingRepo::new());
+                let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+                let (tx, rx) = broadcast::channel(64);
+
+                let relay = StreamRelay::new(
+                    "conv-1".into(),
+                    "asst-1".into(),
+                    "turn-1".into(),
+                    "user-1".into(),
+                    repo,
+                    bus,
+                );
+
+                tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
+                    "Something went wrong",
+                    None,
+                )))
+                .unwrap();
+                drop(tx);
+
+                relay.consume(rx).await;
+            });
+        });
+
+        assert!(captured.contains("aionui_feedback_diagnostics"), "{captured}");
+        assert!(captured.contains("feedback.runtime.turn_terminal"), "{captured}");
+        assert!(captured.contains("conversation_id=conv-1"), "{captured}");
+        assert!(captured.contains("turn_id=turn-1"), "{captured}");
+        assert!(captured.contains("msg_id=asst-1"), "{captured}");
+        assert!(captured.contains("event_type=Error"), "{captured}");
+        assert!(captured.contains("text_len=0"), "{captured}");
     }
 
     #[tokio::test]

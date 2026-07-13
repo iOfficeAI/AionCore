@@ -32,6 +32,68 @@ pub(super) fn aionrs_engine_error_to_send_error(error: &AionrsAgentError) -> Age
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AionrsRuntimeErrorSummary {
+    pub(super) kind: &'static str,
+    pub(super) provider_error_class: Option<&'static str>,
+    pub(super) http_status: Option<u16>,
+    pub(super) failure_count: Option<usize>,
+    pub(super) failure_limit: Option<usize>,
+}
+
+impl AionrsRuntimeErrorSummary {
+    fn new(kind: &'static str, provider_error_class: Option<&'static str>) -> Self {
+        Self {
+            kind,
+            provider_error_class,
+            http_status: None,
+            failure_count: None,
+            failure_limit: None,
+        }
+    }
+}
+
+pub(super) fn aionrs_runtime_error_summary(error: &AionrsAgentError) -> AionrsRuntimeErrorSummary {
+    match error {
+        AionrsAgentError::Provider(ProviderError::Api { status, .. }) => AionrsRuntimeErrorSummary {
+            http_status: Some(*status),
+            ..AionrsRuntimeErrorSummary::new("provider", Some("http_status"))
+        },
+        AionrsAgentError::Provider(ProviderError::Connection(_) | ProviderError::Http(_)) => {
+            AionrsRuntimeErrorSummary::new("provider", Some("network"))
+        }
+        AionrsAgentError::Provider(ProviderError::RateLimited { .. }) => AionrsRuntimeErrorSummary {
+            http_status: Some(429),
+            ..AionrsRuntimeErrorSummary::new("provider", Some("rate_limited"))
+        },
+        AionrsAgentError::Provider(ProviderError::PromptTooLong(_)) => {
+            AionrsRuntimeErrorSummary::new("provider", Some("context_too_large"))
+        }
+        AionrsAgentError::Provider(ProviderError::Parse(_)) => {
+            AionrsRuntimeErrorSummary::new("provider", Some("parse"))
+        }
+        AionrsAgentError::ToolCallFailures { count, limit } => AionrsRuntimeErrorSummary {
+            kind: "tool_call_failures",
+            provider_error_class: None,
+            http_status: None,
+            failure_count: Some(*count),
+            failure_limit: Some(*limit),
+        },
+        AionrsAgentError::ToolCallMalformed { count, limit } => AionrsRuntimeErrorSummary {
+            kind: "tool_call_malformed",
+            provider_error_class: None,
+            http_status: None,
+            failure_count: Some(*count),
+            failure_limit: Some(*limit),
+        },
+        AionrsAgentError::ContextTooLong { .. } => {
+            AionrsRuntimeErrorSummary::new("context_too_large", Some("context_too_large"))
+        }
+        AionrsAgentError::ApiError(_) => AionrsRuntimeErrorSummary::new("api_error", None),
+        AionrsAgentError::UserAborted => AionrsRuntimeErrorSummary::new("user_aborted", None),
+    }
+}
+
 fn aionrs_provider_error_to_send_error(error: &ProviderError, detail: String) -> AgentSendError {
     match error {
         ProviderError::Api { status, .. } => aionrs_provider_status_to_send_error(*status, detail),
@@ -313,6 +375,26 @@ mod tests {
             Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
         );
         assert_eq!(send_error.stream_error().retryable, Some(true));
+    }
+
+    #[test]
+    fn provider_error_summary_classifies_network_without_body() {
+        let error = AionrsAgentError::Provider(ProviderError::Connection("connect failed".into()));
+        let summary = aionrs_runtime_error_summary(&error);
+
+        assert_eq!(summary.kind, "provider");
+        assert_eq!(summary.provider_error_class, Some("network"));
+        assert_eq!(summary.http_status, None);
+    }
+
+    #[test]
+    fn tool_call_failure_summary_classifies_loop() {
+        let error = AionrsAgentError::ToolCallFailures { count: 3, limit: 3 };
+        let summary = aionrs_runtime_error_summary(&error);
+
+        assert_eq!(summary.kind, "tool_call_failures");
+        assert_eq!(summary.failure_count, Some(3));
+        assert_eq!(summary.failure_limit, Some(3));
     }
 
     #[test]

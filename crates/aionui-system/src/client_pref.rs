@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aionui_api_types::{ClientPreferencesResponse, UpdateClientPreferencesRequest};
 use aionui_db::IClientPreferenceRepository;
+use tracing::{debug, info};
 
 use crate::error::SystemError;
 
@@ -27,11 +29,31 @@ impl ClientPrefService {
         }
         .map_err(|e| SystemError::Internal(format!("Failed to get preferences: {e}")))?;
 
+        let mut found_keys = BTreeSet::new();
         let mut map = ClientPreferencesResponse::new();
         for row in rows {
             let value: serde_json::Value =
                 serde_json::from_str(&row.value).unwrap_or(serde_json::Value::String(row.value));
+            found_keys.insert(row.key.clone());
+            debug!(
+                target: "aionui_feedback_diagnostics",
+                diagnostic_event = "feedback.runtime.client_preference_read",
+                key = %row.key,
+                found = true,
+                "feedback.runtime.client_preference_read"
+            );
             map.insert(row.key, value);
+        }
+        if let Some(keys) = keys {
+            for key in keys.iter().filter(|key| !found_keys.contains(**key)) {
+                debug!(
+                    target: "aionui_feedback_diagnostics",
+                    diagnostic_event = "feedback.runtime.client_preference_read",
+                    key = %key,
+                    found = false,
+                    "feedback.runtime.client_preference_read"
+                );
+            }
         }
         Ok(map)
     }
@@ -45,13 +67,27 @@ impl ClientPrefService {
             validate_key(&key)?;
 
             if value.is_null() {
+                info!(
+                    target: "aionui_feedback_diagnostics",
+                    diagnostic_event = "feedback.runtime.client_preference_write",
+                    key = %key,
+                    value_type = %"null",
+                    value_bytes = 0,
+                    "feedback.runtime.client_preference_write"
+                );
                 deletes.push(key);
             } else {
-                upserts.push((
-                    key,
-                    serde_json::to_string(&value)
-                        .map_err(|e| SystemError::Internal(format!("Failed to serialize value: {e}")))?,
-                ));
+                let serialized = serde_json::to_string(&value)
+                    .map_err(|e| SystemError::Internal(format!("Failed to serialize value: {e}")))?;
+                info!(
+                    target: "aionui_feedback_diagnostics",
+                    diagnostic_event = "feedback.runtime.client_preference_write",
+                    key = %key,
+                    value_type = %json_value_type(&value),
+                    value_bytes = serialized.len(),
+                    "feedback.runtime.client_preference_write"
+                );
+                upserts.push((key, serialized));
             }
         }
 
@@ -75,6 +111,17 @@ impl ClientPrefService {
     }
 }
 
+fn json_value_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 fn validate_key(key: &str) -> Result<(), SystemError> {
     if key.is_empty() {
         return Err(SystemError::BadRequest("Preference key must not be empty".into()));
@@ -92,6 +139,49 @@ mod tests {
     use super::*;
     use aionui_db::{SqliteClientPreferenceRepository, init_database_memory};
     use serde_json::json;
+    use std::io::Write;
+    use std::sync::{Mutex, Once, OnceLock};
+    use tracing::Level;
+    use tracing_subscriber::fmt;
+
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    static LOG_CAPTURE_INIT: Once = Once::new();
+    static LOG_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+    static LOG_CAPTURE_BUFFER: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+
+    fn capture_logs(max_level: Level, f: impl FnOnce()) -> String {
+        let _capture_guard = LOG_CAPTURE_LOCK.lock().unwrap();
+        let buffer = Arc::clone(LOG_CAPTURE_BUFFER.get_or_init(|| Arc::new(Mutex::new(Vec::<u8>::new()))));
+        buffer.lock().unwrap().clear();
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedBuf(Arc::clone(&buffer))
+        };
+        LOG_CAPTURE_INIT.call_once(|| {
+            let subscriber = fmt::Subscriber::builder()
+                .with_max_level(max_level)
+                .with_writer(make_writer)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).expect("set global test subscriber");
+        });
+
+        f();
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
 
     async fn setup() -> ClientPrefService {
         let db = init_database_memory().await.unwrap();
@@ -188,6 +278,45 @@ mod tests {
         assert_eq!(prefs.len(), 2);
         assert_eq!(prefs["a"], json!(1));
         assert_eq!(prefs["c"], json!(3));
+    }
+
+    #[test]
+    fn client_preference_diagnostic_logs_do_not_include_values() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let captured = capture_logs(Level::DEBUG, || {
+            runtime.block_on(async {
+                let svc = setup().await;
+                let mut req = UpdateClientPreferencesRequest::new();
+                req.insert("appearance.secretTheme".into(), json!("super-secret-value"));
+                req.insert("appearance.deleted".into(), json!(null));
+                svc.update_preferences(req).await.unwrap();
+
+                let _ = svc
+                    .get_preferences(Some(&["appearance.secretTheme", "appearance.missing"]))
+                    .await
+                    .unwrap();
+            });
+        });
+
+        assert!(captured.contains("aionui_feedback_diagnostics"), "{captured}");
+        assert!(
+            captured.contains("feedback.runtime.client_preference_write"),
+            "{captured}"
+        );
+        assert!(
+            captured.contains("feedback.runtime.client_preference_read"),
+            "{captured}"
+        );
+        assert!(captured.contains("key=appearance.secretTheme"), "{captured}");
+        assert!(captured.contains("key=appearance.missing"), "{captured}");
+        assert!(captured.contains("value_type=string"), "{captured}");
+        assert!(captured.contains("value_type=null"), "{captured}");
+        assert!(captured.contains("found=true"), "{captured}");
+        assert!(captured.contains("found=false"), "{captured}");
+        assert!(!captured.contains("super-secret-value"), "{captured}");
     }
 
     #[tokio::test]

@@ -11,6 +11,8 @@ pub enum FeedbackDiagnosticsProfile {
     ModelAuth,
     AgentTeam,
     McpTools,
+    ClientUiSettings,
+    WorkspaceSummary,
     GlobalSummary,
 }
 
@@ -21,6 +23,8 @@ impl FeedbackDiagnosticsProfile {
             Self::ModelAuth => "model-auth",
             Self::AgentTeam => "agent-team",
             Self::McpTools => "mcp-tools",
+            Self::ClientUiSettings => "client-ui-settings",
+            Self::WorkspaceSummary => "workspace-summary",
             Self::GlobalSummary => "global-summary",
         }
     }

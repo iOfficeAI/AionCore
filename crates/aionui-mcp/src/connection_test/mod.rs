@@ -17,7 +17,7 @@ use aionui_runtime::{
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::types::McpServerTransport;
 use protocol::{
@@ -78,13 +78,18 @@ impl McpConnectionTestService {
         runtime_scope_id: Option<&str>,
     ) -> McpConnectionTestResult {
         debug!(name, ?transport, "starting MCP connection test");
-        match transport {
+        let transport_type = mcp_transport_type(transport);
+        let mcp_server_id = runtime_scope_id.unwrap_or(name);
+        log_mcp_transport_start(mcp_server_id, transport_type);
+        let result = match transport {
             McpServerTransport::Stdio { command, args, env } => {
                 self.test_stdio(command, args, env, runtime_scope_id).await
             }
             McpServerTransport::Http { url, headers } => self.test_http(url, headers).await,
             McpServerTransport::Sse { url, headers } => self.test_sse(url, headers).await,
-        }
+        };
+        log_mcp_transport_result(mcp_server_id, transport_type, &result);
+        result
     }
 
     // -- Stdio transport --------------------------------------------------
@@ -473,6 +478,51 @@ fn runtime_resolution_error(message: &str) -> std::io::Error {
     }
 }
 
+fn mcp_transport_type(transport: &McpServerTransport) -> &'static str {
+    match transport {
+        McpServerTransport::Stdio { .. } => "stdio",
+        McpServerTransport::Http { .. } => "http",
+        McpServerTransport::Sse { .. } => "sse",
+    }
+}
+
+fn log_mcp_transport_start(mcp_server_id: &str, transport_type: &str) {
+    info!(
+        target: "aionui_feedback_diagnostics",
+        diagnostic_event = "feedback.runtime.mcp_transport_start",
+        mcp_server_id = %mcp_server_id,
+        transport_type = %transport_type,
+        "feedback.runtime.mcp_transport_start"
+    );
+}
+
+fn log_mcp_transport_result(mcp_server_id: &str, transport_type: &str, result: &McpConnectionTestResult) {
+    let status = if result.success { "success" } else { "error" };
+    let tool_count = result.tools.as_ref().map_or(0, Vec::len);
+    let error_class = result.code.map(classify_mcp_error_code).unwrap_or("none");
+    warn!(
+        target: "aionui_feedback_diagnostics",
+        diagnostic_event = "feedback.runtime.mcp_transport_result",
+        mcp_server_id = %mcp_server_id,
+        transport_type = %transport_type,
+        status = %status,
+        error_class = %error_class,
+        tool_count,
+        "feedback.runtime.mcp_transport_result"
+    );
+}
+
+fn classify_mcp_error_code(code: McpConnectionTestErrorCode) -> &'static str {
+    match code {
+        McpConnectionTestErrorCode::CommandNotFound => "command_not_found",
+        McpConnectionTestErrorCode::CommandPermissionDenied => "permission_denied",
+        McpConnectionTestErrorCode::Timeout => "timeout",
+        McpConnectionTestErrorCode::ProtocolError | McpConnectionTestErrorCode::RpcError => "schema_error",
+        McpConnectionTestErrorCode::ConnectionFailed | McpConnectionTestErrorCode::HttpError => "network",
+        McpConnectionTestErrorCode::CommandStartFailed => "unknown",
+    }
+}
+
 /// Intermediate struct for HTTP transport response parsing.
 struct HttpMcpResponse {
     rpc: JsonRpcResponse,
@@ -483,6 +533,40 @@ struct HttpMcpResponse {
 mod tests {
     use super::*;
     use aionui_realtime::BroadcastEventBus;
+    use std::io::Write;
+    use std::sync::Mutex;
+    use tracing::Level;
+    use tracing_subscriber::fmt;
+
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(max_level: Level, f: impl FnOnce()) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedBuf(Arc::clone(&buffer))
+        };
+        let subscriber = fmt::Subscriber::builder()
+            .with_max_level(max_level)
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
 
     #[test]
     fn service_clone() {
@@ -495,6 +579,36 @@ mod tests {
         let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)))
             .with_timeout(Duration::from_secs(5));
         assert_eq!(svc.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn mcp_transport_diagnostic_logs_use_redacted_contract() {
+        let result = McpConnectionTestResult {
+            success: false,
+            tools: None,
+            error: Some("raw command should not be logged".to_owned()),
+            code: Some(McpConnectionTestErrorCode::CommandNotFound),
+            details: Some(serde_json::json!({"command": "secret-command --token abc"})),
+            needs_auth: None,
+            auth_method: None,
+            www_authenticate: None,
+        };
+
+        let captured = capture_logs(Level::INFO, || {
+            log_mcp_transport_start("server-1", "stdio");
+            log_mcp_transport_result("server-1", "stdio", &result);
+        });
+
+        assert!(captured.contains("aionui_feedback_diagnostics"), "{captured}");
+        assert!(captured.contains("feedback.runtime.mcp_transport_start"), "{captured}");
+        assert!(captured.contains("feedback.runtime.mcp_transport_result"), "{captured}");
+        assert!(captured.contains("mcp_server_id=server-1"), "{captured}");
+        assert!(captured.contains("transport_type=stdio"), "{captured}");
+        assert!(captured.contains("status=error"), "{captured}");
+        assert!(captured.contains("error_class=command_not_found"), "{captured}");
+        assert!(captured.contains("tool_count=0"), "{captured}");
+        assert!(!captured.contains("secret-command"), "{captured}");
+        assert!(!captured.contains("token abc"), "{captured}");
     }
 
     #[cfg(unix)]
