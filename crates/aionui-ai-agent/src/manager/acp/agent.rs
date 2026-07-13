@@ -1318,9 +1318,7 @@ impl AcpAgentManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_acp_final_input_dump_value, exit_status_parts, normalize_config_option_request_value, user_facing_message,
-    };
+    use super::{exit_status_parts, normalize_config_option_request_value, user_facing_message};
     use crate::agent_runtime::AgentRuntime;
     use crate::error::AgentError;
     use crate::manager::acp::config_options::ConfigSnapshot;
