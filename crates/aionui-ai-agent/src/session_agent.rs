@@ -3643,15 +3643,70 @@ mod pump_tests {
         }
     }
 
-    // Collect every frame the task forwards until its event stream drains.
-    async fn drain(task: &Arc<SessionAgentTask>) -> Vec<AgentStreamEvent> {
+    /// Like `ScriptBackend`, but holds every scripted frame until its `gate` is
+    /// released — so a test can `subscribe()` to the task BEFORE any frame is
+    /// pumped. This deterministically closes a subscribe-vs-pump race: the pump is
+    /// spawned inside `build()` (it calls `events()` and starts polling at once), and
+    /// on a `multi_thread` runtime it can otherwise emit — and DROP — frames before the
+    /// test's `subscribe()` runs, because the broadcast channel keeps no pre-subscribe
+    /// buffer. `drain_script` subscribes first, THEN releases the gate. This mirrors
+    /// production, where the backend's event stream is subscribed at open but stays
+    /// silent until the CLI emits (well after the frontend's WS subscribe).
+    struct GatedScriptBackend {
+        script: Vec<SessionEnvelope>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for GatedScriptBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            let admission = match c {
+                Command::Send { .. } => Admission::Started,
+                _ => Admission::NoTurn,
+            };
+            Ok(CommandReceipt {
+                accepted: true,
+                admission,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            let gate = self.gate.clone();
+            let script = self.script.clone();
+            // First poll parks on the gate; only once released does the scripted
+            // sequence flow — so no frame can predate the test's subscribe().
+            futures_util::stream::once(async move { gate.notified().await })
+                .flat_map(move |_| futures_util::stream::iter(script.clone()))
+                .boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    // Build a task over a gated script, subscribe, THEN release the gate, and collect
+    // every frame the task forwards until its (finite) event stream drains. Subscribing
+    // before releasing is what makes the collection deterministic — see
+    // `GatedScriptBackend`.
+    async fn drain_script(script: Vec<SessionEnvelope>) -> Vec<AgentStreamEvent> {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
+            script,
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
         let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        // Release only AFTER subscribing: the pump cannot emit before we listen.
+        gate.notify_one();
         let mut out = Vec::new();
         // The scripted stream is finite; once the pump drains it, no more frames
         // arrive, so a short bounded poll settles the collection (no live agent).
         while let Ok(Ok(ev)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
             out.push(ev);
         }
+        // Keep the task (hence the backend + pump) alive through the whole drain.
+        drop(task);
         out
     }
 
@@ -3693,9 +3748,7 @@ mod pump_tests {
                 outcome: aionui_session::TurnOutcome::EndTurn,
             }),
         ];
-        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(script));
-        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
-        let frames = drain(&task).await;
+        let frames = drain_script(script).await;
         let seq: Vec<&str> = frames.iter().map(frame_name).collect();
         // No leading "config"; the turn body + terminal come through.
         assert!(
@@ -3747,9 +3800,7 @@ mod pump_tests {
             }],
             slash_commands: Vec::new(),
         })];
-        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(script));
-        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
-        let frames = drain(&task).await;
+        let frames = drain_script(script).await;
         let config = frames
             .iter()
             .find_map(|f| match f {
@@ -3812,9 +3863,7 @@ mod pump_tests {
                 },
             ],
         })];
-        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(script));
-        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
-        let frames = drain(&task).await;
+        let frames = drain_script(script).await;
         let commands = frames
             .iter()
             .find_map(|f| match f {
@@ -3846,9 +3895,7 @@ mod pump_tests {
             modes: Vec::new(),
             slash_commands: Vec::new(),
         })];
-        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(script));
-        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
-        let frames = drain(&task).await;
+        let frames = drain_script(script).await;
         assert!(
             !frames
                 .iter()
@@ -3949,9 +3996,7 @@ mod pump_tests {
                 outcome: aionui_session::TurnOutcome::EndTurn,
             }),
         ];
-        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(script));
-        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
-        let frames = drain(&task).await;
+        let frames = drain_script(script).await;
         let seq: Vec<&str> = frames.iter().map(frame_name).collect();
         // Exactly ONE finish, and BOTH text segments (launch reply + completion
         // message) reach the frontend before it.
@@ -4016,9 +4061,7 @@ mod pump_tests {
                 outcome: aionui_session::TurnOutcome::EndTurn,
             }),
         ];
-        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(script));
-        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
-        let frames = drain(&task).await;
+        let frames = drain_script(script).await;
         assert!(
             frames.iter().any(|f| matches!(f, AgentStreamEvent::Error(_))),
             "an error result terminates the turn even while a workflow is in flight, got {:?}",
@@ -4246,9 +4289,7 @@ mod pump_tests {
                 text: "line-2\n".into(),
             }),
         ];
-        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(script));
-        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
-        let frames = drain(&task).await;
+        let frames = drain_script(script).await;
         let outputs: Vec<String> = frames
             .iter()
             .filter_map(|f| match f {
