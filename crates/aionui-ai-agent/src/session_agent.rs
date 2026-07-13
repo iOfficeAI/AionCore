@@ -1353,7 +1353,14 @@ fn catalog_partial_from_caps(caps: &aionui_session::Capabilities) -> Option<aion
 /// profile_id_to_legacy_value}`.
 fn codex_sandbox_for_mode(mode: Option<&str>) -> Option<&'static str> {
     match mode.map(str::trim) {
-        Some(":danger-full-access" | "full-access" | "yoloNoSandbox") => Some("danger-full-access"),
+        // `agent-full-access` is the canonical codex full-access mode id since #608
+        // (migration 021 rewrote builtin `yolo_id` `full-access`→`agent-full-access`, and
+        // `normalize_requested_mode` now resolves yolo aliases to it). The legacy
+        // `full-access` / `:danger-full-access` / `yoloNoSandbox` stay recognized for
+        // pre-021 persisted data — all four are the same danger-full-access tier.
+        Some(":danger-full-access" | "agent-full-access" | "full-access" | "yoloNoSandbox") => {
+            Some("danger-full-access")
+        }
         Some(":read-only" | "read-only") => Some("read-only"),
         _ => None,
     }
@@ -1367,7 +1374,9 @@ fn codex_sandbox_for_mode(mode: Option<&str>) -> Option<&'static str> {
 /// `session_runtime::codex_approval_for_mode`.
 fn codex_approval_for_mode(mode: Option<&str>) -> Option<&'static str> {
     match mode.map(str::trim) {
-        Some(":danger-full-access" | "full-access" | "yoloNoSandbox") => Some("never"),
+        // Recognizes the #608 canonical `agent-full-access` alongside the legacy
+        // `full-access` / `:danger-full-access` / `yoloNoSandbox` (see codex_sandbox_for_mode).
+        Some(":danger-full-access" | "agent-full-access" | "full-access" | "yoloNoSandbox") => Some("never"),
         _ => None,
     }
 }
@@ -2543,7 +2552,12 @@ mod build_mapping_tests {
     /// workspace/auto middle tier keeps None ⇒ workspace-write.
     #[test]
     fn codex_sandbox_maps_full_access_and_read_only_modes() {
-        // Plan B canonical value: the legacy bare token.
+        // #608 canonical full-access id (migration 021 + normalize_requested_mode).
+        assert_eq!(
+            codex_sandbox_for_mode(Some("agent-full-access")),
+            Some("danger-full-access")
+        );
+        // Plan B legacy bare token (pre-021 persisted data).
         assert_eq!(codex_sandbox_for_mode(Some("full-access")), Some("danger-full-access"));
         // The colon profile id (e.g. a readback that skipped bare-mapping) stays recognized.
         assert_eq!(
@@ -2577,6 +2591,7 @@ mod build_mapping_tests {
     #[test]
     fn codex_approval_maps_only_full_access_modes() {
         assert_eq!(codex_approval_for_mode(Some(":danger-full-access")), Some("never"));
+        assert_eq!(codex_approval_for_mode(Some("agent-full-access")), Some("never"));
         assert_eq!(codex_approval_for_mode(Some("full-access")), Some("never"));
         assert_eq!(codex_approval_for_mode(Some("yoloNoSandbox")), Some("never"));
         assert_eq!(codex_approval_for_mode(Some("  :danger-full-access  ")), Some("never"));

@@ -1519,7 +1519,7 @@ mod codex_perm {
     /// bucketing):
     ///   - already colon-prefixed (`:workspace`, a discovered/custom id) → passed through
     ///     verbatim (the discovery path already speaks colon ids)
-    ///   - `full-access` / `yolo` / `yoloNoSandbox`  → `:danger-full-access`
+    ///   - `agent-full-access` (canonical) / `full-access` / `yolo` / `yoloNoSandbox` → `:danger-full-access`
     ///   - `read-only`                               → `:read-only`
     ///   - `default` / `auto` / `autoEdit` / else    → `:workspace`
     ///
@@ -1536,7 +1536,10 @@ mod codex_perm {
             }
         }
         match trimmed {
-            "full-access" | "yolo" | "yoloNoSandbox" => ":danger-full-access".to_owned(),
+            // `agent-full-access` is the #608 canonical codex full-access id (migration 021 +
+            // `normalize_requested_mode`); legacy `full-access` / `yolo` / `yoloNoSandbox` stay
+            // recognized for pre-021 persisted data. All map onto the danger-full-access profile.
+            "agent-full-access" | "full-access" | "yolo" | "yoloNoSandbox" => ":danger-full-access".to_owned(),
             "read-only" => ":read-only".to_owned(),
             _ => ":workspace".to_owned(),
         }
@@ -6043,7 +6046,8 @@ mod tests {
     fn codex_perm_normalize_to_profile_id_maps_legacy_and_passes_colon_ids() {
         // Legacy bare values rewrite onto the danger-full-access colon id (parity with
         // legacy `codex_sandbox`: full-access/yolo/yoloNoSandbox → danger-full-access).
-        for legacy in ["full-access", "yolo", "yoloNoSandbox"] {
+        // `agent-full-access` is the #608 canonical id; the rest are pre-021 legacy aliases.
+        for legacy in ["agent-full-access", "full-access", "yolo", "yoloNoSandbox"] {
             assert_eq!(codex_perm::normalize_to_profile_id(legacy), ":danger-full-access");
         }
         // read-only bare → its colon id.

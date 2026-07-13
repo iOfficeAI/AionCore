@@ -225,6 +225,48 @@ mod tests {
     };
     use std::sync::Arc;
 
+    fn agent_metadata_row(backend: &str, yolo_id: Option<&str>) -> AgentMetadataRow {
+        AgentMetadataRow {
+            id: format!("agent-{backend}"),
+            icon: None,
+            name: format!("{backend} agent"),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some(backend.to_owned()),
+            agent_type: AgentType::Acp.serde_name().to_owned(),
+            agent_source: "builtin".to_owned(),
+            agent_source_info: None,
+            enabled: true,
+            command: None,
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: yolo_id.map(ToOwned::to_owned),
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            command_override: None,
+            env_override: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
     #[derive(Clone)]
     struct SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow,
@@ -584,6 +626,24 @@ mod tests {
     fn parse_agent_type_unknown_backend_returns_error() {
         let err = parse_agent_type("unknown").unwrap_err();
         assert!(matches!(err, TeamError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn session_mode_for_backend_uses_codex_metadata_agent_full_access() {
+        let row = agent_metadata_row("codex", Some("agent-full-access"));
+
+        assert_eq!(
+            session_mode_for_backend("codex", AgentType::Acp, Some(&row)),
+            "agent-full-access"
+        );
+    }
+
+    #[test]
+    fn session_mode_for_backend_falls_back_to_codex_agent_full_access() {
+        assert_eq!(
+            session_mode_for_backend("codex", AgentType::Acp, None),
+            "agent-full-access"
+        );
     }
 
     #[tokio::test]

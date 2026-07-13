@@ -27,8 +27,8 @@ use aionui_db::{
     IConversationRepository, ICronRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
     SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteCronRepository,
-    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertConversationAssistantSnapshotParams,
-    init_database_memory,
+    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertConversationAssistantSnapshotParams, init_database_memory,
     models::{ConversationAssistantSnapshotRow, CronJobRow, MessageRow},
 };
 use aionui_realtime::EventBroadcaster;
@@ -740,6 +740,18 @@ async fn setup_with_conv_runtime() -> (
     Arc<StubConvRepo>,
     Arc<ConversationService>,
 ) {
+    let (svc, cron_repo, bc, stub_conv_repo, conv_service, _) = setup_with_conv_runtime_and_agent_metadata().await;
+    (svc, cron_repo, bc, stub_conv_repo, conv_service)
+}
+
+async fn setup_with_conv_runtime_and_agent_metadata() -> (
+    CronService,
+    Arc<dyn ICronRepository>,
+    Arc<MockBroadcaster>,
+    Arc<StubConvRepo>,
+    Arc<ConversationService>,
+    Arc<dyn IAgentMetadataRepository>,
+) {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
     let cron_repo: Arc<dyn ICronRepository> = Arc::new(SqliteCronRepository::new(pool.clone()));
@@ -812,7 +824,7 @@ async fn setup_with_conv_runtime() -> (
     let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn EventBroadcaster>);
     let svc = CronService::new(CronServiceDeps {
         repo: cron_repo.clone(),
-        agent_metadata_repo,
+        agent_metadata_repo: agent_metadata_repo.clone(),
         assistant_definition_repo: assistant_definition_repo.clone(),
         assistant_overlay_repo: assistant_overlay_repo.clone(),
         scheduler,
@@ -831,7 +843,7 @@ async fn setup_with_conv_runtime() -> (
     seed_bare_assistant_definitions(&assistant_definition_repo).await;
 
     std::mem::forget(db);
-    (svc, cron_repo, bc, stub_conv_repo, conv_service)
+    (svc, cron_repo, bc, stub_conv_repo, conv_service, agent_metadata_repo)
 }
 
 async fn setup_with_assistant_repos() -> (
@@ -2364,7 +2376,64 @@ async fn create_for_conversation_helper_uses_assistant_metadata_full_auto_mode()
 
     let row = cron_repo.get_by_id(&response.job_id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
-    assert_eq!(config.mode.as_deref(), Some("full-access"));
+    assert_eq!(config.mode.as_deref(), Some("agent-full-access"));
+}
+
+#[tokio::test]
+async fn create_for_conversation_helper_uses_codex_canonical_full_auto_mode_from_fallback() {
+    let (svc, cron_repo, _, _, conv_service, agent_metadata_repo) = setup_with_conv_runtime_and_agent_metadata().await;
+    let codex = agent_metadata_repo
+        .find_builtin_by_backend("codex")
+        .await
+        .unwrap()
+        .expect("seeded codex metadata");
+    agent_metadata_repo
+        .upsert(&UpsertAgentMetadataParams {
+            id: &codex.id,
+            icon: codex.icon.as_deref(),
+            name: &codex.name,
+            name_i18n: codex.name_i18n.as_deref(),
+            description: codex.description.as_deref(),
+            description_i18n: codex.description_i18n.as_deref(),
+            backend: codex.backend.as_deref(),
+            agent_type: &codex.agent_type,
+            agent_source: &codex.agent_source,
+            agent_source_info: codex.agent_source_info.as_deref(),
+            enabled: codex.enabled,
+            command: codex.command.as_deref(),
+            args: codex.args.as_deref(),
+            env: codex.env.as_deref(),
+            native_skills_dirs: codex.native_skills_dirs.as_deref(),
+            behavior_policy: codex.behavior_policy.as_deref(),
+            yolo_id: None,
+            agent_capabilities: codex.agent_capabilities.as_deref(),
+            auth_methods: codex.auth_methods.as_deref(),
+            config_options: codex.config_options.as_deref(),
+            available_modes: codex.available_modes.as_deref(),
+            available_models: codex.available_models.as_deref(),
+            available_commands: codex.available_commands.as_deref(),
+            sort_order: codex.sort_order,
+        })
+        .await
+        .unwrap();
+
+    let runtime_state = conv_service.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn("conv_mode_codex", "turn_helper_create_codex_fallback_full_auto")
+        .expect("claim conversation");
+
+    let response = svc
+        .create_for_conversation_helper(
+            "u1",
+            "conv_mode_codex",
+            conversation_cron_request("run codex fallback without prompting"),
+        )
+        .await
+        .unwrap();
+
+    let row = cron_repo.get_by_id(&response.job_id).await.unwrap().unwrap();
+    let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
+    assert_eq!(config.mode.as_deref(), Some("agent-full-access"));
 }
 
 #[tokio::test]
