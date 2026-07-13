@@ -11,8 +11,9 @@ use axum::routing::{get, post};
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
-    PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest,
-    SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
+    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
+    TeamRunStateResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -50,13 +51,34 @@ impl From<TeamError> for ApiError {
                     ApiError::BadRequest(msg)
                 }
             }
-            TeamError::SlotBusy(msg) => ApiError::Conflict(format!("Team slot is busy: {msg}")),
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
             TeamError::DuplicateAgentName(msg) => ApiError::BadRequest(format!("Agent name already taken: {msg}")),
+            TeamError::RuntimeNotReady { conversation_id } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_RUNTIME_NOT_READY",
+                format!("Team agent runtime is not ready for conversation: {conversation_id}"),
+                Some(serde_json::json!({ "conversation_id": conversation_id })),
+            ),
+            TeamError::MemberRuntimeFailed {
+                team_id,
+                slot_id,
+                conversation_id,
+                public_reason,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_MEMBER_RUNTIME_FAILED",
+                "A team member runtime failed to start",
+                Some(serde_json::json!({
+                    "team_id": team_id,
+                    "slot_id": slot_id,
+                    "conversation_id": conversation_id,
+                    "reason": public_reason,
+                })),
+            ),
             TeamError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
             TeamError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
             TeamError::Database(db_err) => db_error_to_api_error(db_err),
@@ -79,6 +101,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         )
         .route("/api/teams/{id}/messages", post(send_message))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/config-options",
+            get(get_conversation_config_options),
+        )
         .route("/api/teams/{id}/runs/{team_run_id}/cancel", post(cancel_run))
         .route(
             "/api/teams/{id}/runs/{team_run_id}/agents/{slot_id}/cancel",
@@ -314,6 +340,19 @@ async fn ensure_session(
     Ok(Json(ApiResponse::success()))
 }
 
+async fn get_conversation_config_options(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<GetConfigOptionsResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_conversation_config_options(&user.id, &id, &conversation_id)
+            .await?,
+    )))
+}
+
 async fn stop_session(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -391,12 +430,6 @@ mod tests {
     }
 
     #[test]
-    fn slot_busy_maps_to_conflict() {
-        let api_error: ApiError = TeamError::SlotBusy("lead-1".into()).into();
-        assert_eq!(api_error.status_code(), StatusCode::CONFLICT);
-    }
-
-    #[test]
     fn leader_only_maps_to_forbidden() {
         let err: ApiError = TeamError::LeaderOnly("spawn_agent".into()).into();
         assert!(matches!(err, ApiError::Forbidden(msg) if msg == "spawn_agent"));
@@ -424,6 +457,40 @@ mod tests {
     fn duplicate_agent_name_maps_to_bad_request() {
         let err: ApiError = TeamError::DuplicateAgentName("alice".into()).into();
         assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("alice")));
+    }
+
+    #[test]
+    fn runtime_not_ready_maps_to_coded_conflict() {
+        let err: ApiError = TeamError::RuntimeNotReady {
+            conversation_id: "conv-1".into(),
+        }
+        .into();
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "TEAM_RUNTIME_NOT_READY");
+        assert_eq!(err.error_details(), Some(json!({ "conversation_id": "conv-1" })));
+    }
+
+    #[test]
+    fn member_runtime_failure_maps_to_sanitized_coded_conflict() {
+        let err: ApiError = TeamError::MemberRuntimeFailed {
+            team_id: "team-1".into(),
+            slot_id: "slot-2".into(),
+            conversation_id: "conv-2".into(),
+            public_reason: "Agent runtime failed to start".into(),
+        }
+        .into();
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "TEAM_MEMBER_RUNTIME_FAILED");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({
+                "team_id": "team-1",
+                "slot_id": "slot-2",
+                "conversation_id": "conv-2",
+                "reason": "Agent runtime failed to start",
+            }))
+        );
+        assert!(!format!("{err:?}").contains("provider-secret"));
     }
 
     #[test]

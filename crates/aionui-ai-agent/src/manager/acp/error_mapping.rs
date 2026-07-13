@@ -66,6 +66,17 @@ pub(super) fn is_acp_session_not_found(err: &AcpError) -> bool {
     matches!(err, AcpError::SessionNotFound { .. })
 }
 
+pub(super) fn is_missing_resumed_session(err: &AcpError, resumed_session_id: &str) -> bool {
+    is_acp_session_not_found(err)
+        || matches!(
+            err,
+            AcpError::ResourceNotFound {
+                resource: Some(resource),
+                ..
+            } if resource == resumed_session_id
+        )
+}
+
 fn acp_error_public_message(err: &AcpError) -> String {
     match err {
         AcpError::AgentInternal { code, .. } => format!("Agent internal error (code {code})"),

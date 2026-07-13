@@ -14,9 +14,6 @@ pub enum TeamError {
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
-    #[error("Team slot is busy: {0}")]
-    SlotBusy(String),
-
     #[error("Leader-only action: {0}")]
     LeaderOnly(String),
 
@@ -34,6 +31,17 @@ pub enum TeamError {
 
     #[error("Agent name already taken: {0}")]
     DuplicateAgentName(String),
+
+    #[error("Team agent runtime is not ready for conversation: {conversation_id}")]
+    RuntimeNotReady { conversation_id: String },
+
+    #[error("Team member runtime failed: {slot_id}")]
+    MemberRuntimeFailed {
+        team_id: String,
+        slot_id: String,
+        conversation_id: String,
+        public_reason: String,
+    },
 
     #[error("Workspace path is unavailable: {0}")]
     WorkspacePathUnavailable(String),
@@ -92,6 +100,16 @@ pub fn classify_public_error(message: &str) -> Option<TeamPublicError> {
         }
     }
 
+    if message == "model is no longer accepted; use the assistant configuration or UI model selector" {
+        return Some(TeamPublicError::new(
+            "TEAM_ASSISTANT_FIELD_UNSUPPORTED",
+            Some(json!({
+                "field": "model",
+                "required_field": "assistant_id",
+            })),
+        ));
+    }
+
     if message == "team_list_assistants does not accept arguments" {
         return Some(TeamPublicError::new(
             "TEAM_TOOL_ARGUMENTS_NOT_ALLOWED",
@@ -117,10 +135,6 @@ mod tests {
         assert_eq!(TeamError::TeamNotFound("t1".into()).to_string(), "Team not found: t1");
         assert_eq!(TeamError::AgentNotFound("s1".into()).to_string(), "Agent not found: s1");
         assert_eq!(TeamError::TaskNotFound("tk1".into()).to_string(), "Task not found: tk1");
-        assert_eq!(
-            TeamError::SlotBusy("lead-1".into()).to_string(),
-            "Team slot is busy: lead-1"
-        );
     }
 
     #[test]
@@ -139,6 +153,18 @@ mod tests {
             legacy.details,
             Some(json!({
                 "field": "backend",
+                "required_field": "assistant_id",
+            }))
+        );
+
+        let model =
+            classify_public_error("model is no longer accepted; use the assistant configuration or UI model selector")
+                .expect("model field");
+        assert_eq!(model.code, "TEAM_ASSISTANT_FIELD_UNSUPPORTED");
+        assert_eq!(
+            model.details,
+            Some(json!({
+                "field": "model",
                 "required_field": "assistant_id",
             }))
         );

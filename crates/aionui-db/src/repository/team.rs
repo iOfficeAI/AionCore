@@ -8,6 +8,7 @@ pub struct UpdateTeamParams {
     pub workspace: Option<String>,
     pub agents: Option<String>,
     pub lead_agent_id: Option<String>,
+    pub session_mode: Option<String>,
 }
 
 /// Parameters for updating a task record.

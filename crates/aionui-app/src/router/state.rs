@@ -631,7 +631,7 @@ pub fn build_team_state(
     let projection_store: Arc<dyn TeamProjectionMessageStore> = adapters.clone();
     let turn_port: Arc<dyn AgentTurnExecutionPort> = adapters.clone();
     let cancellation_port: Arc<dyn AgentTurnCancellationPort> = adapters;
-    let service = TeamSessionService::new(
+    let service = TeamSessionService::new_with_prompt_dump(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
         Arc::new(AssistantServiceTeamCatalog { assistant_service }),
@@ -647,6 +647,7 @@ pub fn build_team_state(
         turn_port,
         cancellation_port,
         backend_binary_path,
+        aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
     TeamRouterState {
         service,

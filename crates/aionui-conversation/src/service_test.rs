@@ -3556,6 +3556,39 @@ async fn ensure_runtime_recovers_missing_agent_and_returns_snapshot() {
 }
 
 #[tokio::test]
+async fn ensure_runtime_rejects_team_owned_conversation() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let mut req = make_create_req();
+    req.extra = serde_json::json!({
+        "teamId": "team-1",
+        "slot_id": "slot-1",
+        "role": "lead"
+    });
+    let conv = svc.create("user_1", req).await.unwrap();
+
+    let err = svc
+        .ensure_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &err,
+            ConversationError::TeamRuntimeRequired {
+                conversation_id,
+                team_id,
+            } if conversation_id == &conv.id && team_id == "team-1"
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        task_mgr.get_task(&conv.id).is_none(),
+        "standalone ensure must not build team-owned conversation runtime"
+    );
+}
+
+#[tokio::test]
 async fn ensure_runtime_uses_existing_agent_snapshot_without_recovery() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());

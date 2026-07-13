@@ -16,7 +16,7 @@ use tokio::sync::broadcast::error::TryRecvError;
 
 use super::agent::sdk_to_snake_value;
 use super::agent_close::STDERR_PEEK_LINES;
-use super::error_mapping::{AcpSendFailure, is_acp_session_not_found};
+use super::error_mapping::{AcpSendFailure, is_acp_session_not_found, is_missing_resumed_session};
 use tracing::warn;
 
 #[derive(Debug)]
@@ -81,8 +81,9 @@ impl AcpAgentManager {
         warn!(
             conversation_id = %self.params.conversation_id,
             stale_session_id = %stale_sid,
+            recovery_action = "clear_persisted_session_id_and_session_new",
             error = %err,
-            "open_session_resume: stale session id rejected by CLI; rebuilding via session/new"
+            "open_session_resume: stale session id rejected by CLI; clearing persisted session id and rebuilding via session/new"
         );
         {
             let mut session = self.session.write().await;
@@ -125,7 +126,7 @@ impl AcpAgentManager {
             let req = self.params.new_session_request().meta(meta);
             let new_response = match self.protocol.new_session(req).await {
                 Ok(r) => r,
-                Err(e) if is_acp_session_not_found(&e) => {
+                Err(e) if is_missing_resumed_session(&e, session_id) => {
                     return self.rebuild_after_acp_session_not_found(session_id, e).await;
                 }
                 Err(e) => return Err(e.into()),
@@ -621,6 +622,32 @@ mod tests {
 
         let auth_required = AcpError::AuthRequired;
         assert!(!super::is_acp_session_not_found(&auth_required));
+    }
+
+    #[test]
+    fn resumed_session_resource_not_found_matches_only_the_exact_session_id() {
+        let exact = AcpError::ResourceNotFound {
+            resource: Some("ses-resume".into()),
+            message: "missing".into(),
+        };
+        assert!(super::is_missing_resumed_session(&exact, "ses-resume"));
+
+        let unrelated = AcpError::ResourceNotFound {
+            resource: Some("/workspace/file.txt".into()),
+            message: "missing".into(),
+        };
+        assert!(!super::is_missing_resumed_session(&unrelated, "ses-resume"));
+
+        let unspecified = AcpError::ResourceNotFound {
+            resource: None,
+            message: "missing".into(),
+        };
+        assert!(!super::is_missing_resumed_session(&unspecified, "ses-resume"));
+
+        let structured = AcpError::SessionNotFound {
+            session_id: "different-wire-id".into(),
+        };
+        assert!(super::is_missing_resumed_session(&structured, "ses-resume"));
     }
 
     // -- empty-finish diagnostic (ELECTRON-1JG) -------------------------------

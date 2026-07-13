@@ -1,5 +1,6 @@
 mod common;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use aionui_api_types::{
@@ -45,6 +46,10 @@ impl EventBroadcaster for RecordingBroadcaster {
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
         self.events.lock().unwrap().push(event);
     }
+}
+
+fn roster(ids: &[&str]) -> HashSet<String> {
+    ids.iter().map(|id| (*id).to_owned()).collect()
 }
 
 #[derive(Default)]
@@ -139,6 +144,24 @@ fn projection_request_for_teammate_mirror_uses_stable_mailbox_dedupe_key() {
     assert!(!req.visibility.allow_hidden_conversation_message);
 }
 
+#[test]
+fn projection_request_for_team_system_message_uses_stable_mailbox_dedupe_key() {
+    let req = TeamProjectionRequest::team_system_visible(
+        "team-1",
+        "lead-1",
+        "conv-lead",
+        "Roster changed",
+        "mailbox-system-123",
+    );
+
+    assert_eq!(
+        req.dedupe_key.as_deref(),
+        Some("team:team-1:mailbox:mailbox-system-123:conversation:conv-lead")
+    );
+    assert!(req.visibility.insert_teammate_visible_bubble);
+    assert!(!req.visibility.allow_hidden_conversation_message);
+}
+
 #[tokio::test]
 async fn projection_inserts_user_visible_bubble_with_stripped_system_notes() {
     let store = Arc::new(RecordingProjectionStore::default());
@@ -209,6 +232,43 @@ async fn projection_dedupes_teammate_mirror_and_broadcasts_persisted_msg_id() {
     assert_eq!(events[0].data["from_name"], "Worker");
 }
 
+#[tokio::test]
+async fn projection_inserts_team_system_bubble_and_broadcasts_it_like_existing_mirror() {
+    let store = Arc::new(RecordingProjectionStore::default());
+    let bc = Arc::new(RecordingBroadcaster::new());
+    let projection = TeamMessageProjection::new(store.clone(), bc.clone());
+    let req = TeamProjectionRequest::team_system_visible(
+        "team-1",
+        "lead-1",
+        "conv-lead",
+        "Roster changed",
+        "mailbox-system-123",
+    );
+
+    let projected = projection.project(req).await.unwrap();
+
+    let msg_id = match projected {
+        ProjectedTeamMessage::Inserted { msg_id } => msg_id,
+        other => panic!("expected insert, got {other:?}"),
+    };
+    let rows = store.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].position.as_deref(), Some("left"));
+    assert_eq!(rows[0].msg_id.as_deref(), Some(msg_id.as_str()));
+    let content: serde_json::Value = serde_json::from_str(&rows[0].content).unwrap();
+    assert_eq!(content["content"], "Roster changed");
+    assert_eq!(content["teammate_message"], true);
+    assert_eq!(content["sender_name"], "team_system");
+
+    let events = bc.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "team.teammateMessage");
+    assert_eq!(events[0].data["conversation_id"], "conv-lead");
+    assert_eq!(events[0].data["msg_id"], msg_id);
+    assert_eq!(events[0].data["from_slot_id"], "team_system");
+    assert_eq!(events[0].data["from_name"], "team_system");
+}
+
 // ===========================================================================
 // Test-plan §9: Prompt Templates
 // ===========================================================================
@@ -239,29 +299,33 @@ fn default_assistants() -> Vec<AvailableAssistant> {
     ]
 }
 
-// -- LP-1: Lead prompt contains member list ----------------------------------
+// -- LP-1: Lead prompt relies on team_members for roster ----------------------
 
 #[test]
-fn lp1_lead_prompt_contains_member_list() {
+fn lp1_lead_prompt_does_not_contain_member_snapshot() {
     let members = vec![
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Alice", TeammateRole::Teammate),
         make_agent("w2", "Bob", TeammateRole::Teammate),
     ];
     let assistants = default_assistants();
-    let prompt = build_lead_prompt("Alpha", &members, &assistants);
+    let lead = make_agent("lead-1", "Lead", TeammateRole::Lead);
+    let prompt = build_lead_prompt(&lead, "Alpha", &members, &assistants);
 
-    // AionUi bullet format: `- {name} ({backend}, status: {status})`
-    assert!(prompt.contains("- Lead ("), "lead name missing");
-    assert!(prompt.contains("- Alice ("), "teammate Alice missing");
-    assert!(prompt.contains("- Bob ("), "teammate Bob missing");
+    assert!(!prompt.contains("## Your Teammates"));
+    assert!(!prompt.contains("- Lead ("), "lead snapshot leaked");
+    assert!(!prompt.contains("- Alice ("), "teammate Alice snapshot leaked");
+    assert!(!prompt.contains("- Bob ("), "teammate Bob snapshot leaked");
+    assert!(prompt.to_lowercase().contains("first team turn"));
+    assert!(prompt.contains("team_members"));
 }
 
 // -- LP-2: Lead prompt contains tool descriptions ----------------------------
 
 #[test]
 fn lp2_lead_prompt_contains_tool_descriptions() {
-    let prompt = build_lead_prompt("Beta", &[], &default_assistants());
+    let lead = make_agent("lead-1", "Lead", TeammateRole::Lead);
+    let prompt = build_lead_prompt(&lead, "Beta", &[], &default_assistants());
 
     // AionUi lead prompt references the `team_*` coordination tools that the
     // leader must use; the MCP layer enumerates them with arguments, so the
@@ -274,18 +338,20 @@ fn lp2_lead_prompt_contains_tool_descriptions() {
         "team_members",
         "team_rename_agent",
         "team_shutdown_agent",
-        "team_list_models",
     ];
     for tool in expected_tools {
         assert!(prompt.contains(tool), "missing tool: {tool}");
     }
+    assert!(prompt.contains("team_list_assistants"));
+    assert!(!prompt.contains("## Available Assistants for Spawning"));
 }
 
 // -- LP-3: Lead prompt contains task management guidance ---------------------
 
 #[test]
 fn lp3_lead_prompt_contains_task_management_guidance() {
-    let prompt = build_lead_prompt("Gamma", &[], &default_assistants());
+    let lead = make_agent("lead-1", "Lead", TeammateRole::Lead);
+    let prompt = build_lead_prompt(&lead, "Gamma", &[], &default_assistants());
 
     assert!(
         prompt.contains("Break the work into tasks"),
@@ -318,6 +384,11 @@ fn tp1_teammate_prompt_contains_execution_guidance() {
     assert!(prompt.contains("shutdown_request"), "missing shutdown protocol");
     assert!(prompt.contains("shutdown_approved"), "missing shutdown_approved");
     assert!(prompt.contains("STOP GENERATING"), "missing stop protocol");
+    assert!(prompt.contains("Slot ID: w1"), "missing teammate slot id");
+    assert!(
+        !prompt.contains("Teammates:"),
+        "static teammate list must not be injected"
+    );
 }
 
 // -- TP-2: Teammate prompt contains team name --------------------------------
@@ -362,7 +433,7 @@ fn wp1_wake_payload_includes_unread_messages() {
             created_at: 0,
         },
     ];
-    let payload = build_wake_payload(&agent, &[], &messages);
+    let payload = build_wake_payload(&agent, &[], &messages, &roster(&["lead-1", "w1", "w2"]));
 
     assert!(payload.contains("Feature X is done"));
     assert!(payload.contains("`w1`"));
@@ -405,18 +476,20 @@ fn wp2_wake_payload_includes_task_list() {
             updated_at: 0,
         },
     ];
-    let payload = build_wake_payload(&agent, &tasks, &[]);
+    let payload = build_wake_payload(&agent, &tasks, &[], &roster(&["lead-1", "w1", "w2"]));
 
-    assert!(payload.contains("Current Task Board"));
+    assert!(payload.contains("Current Task Board Summary"));
+    assert!(payload.contains("Showing 2 of 2 tasks."));
     assert!(payload.contains("Implement auth"));
     assert!(payload.contains("in_progress"));
     assert!(payload.contains("Write tests"));
     assert!(payload.contains("pending"));
     assert!(payload.contains("w1"));
     assert!(payload.contains("w2"));
+    assert!(payload.contains("aaaaaaaa…"));
     assert!(
-        payload.contains("aaaaaaaa-1111-2222-3333-444444444444"),
-        "blocker task ID should appear in blocked_by column"
+        !payload.contains("aaaaaaaa-1111-2222-3333-444444444444"),
+        "summary blocked_by column should use short task IDs"
     );
 }
 
@@ -425,7 +498,7 @@ fn wp2_wake_payload_includes_task_list() {
 #[test]
 fn wp3_wake_payload_empty_builds_normally() {
     let agent = make_agent("w1", "Worker1", TeammateRole::Teammate);
-    let payload = build_wake_payload(&agent, &[], &[]);
+    let payload = build_wake_payload(&agent, &[], &[], &roster(&["w1"]));
 
     assert!(payload.contains("No new messages"));
     assert!(payload.contains("No tasks on the board"));

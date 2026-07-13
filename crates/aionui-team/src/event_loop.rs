@@ -1,8 +1,5 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -10,25 +7,33 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use aionui_api_types::{TeamChildTurnPayload, TeamRunStatus};
+
+use crate::events::{TEAM_CHILD_TURN_CANCELLED_EVENT, TEAM_CHILD_TURN_COMPLETED_EVENT, TEAM_CHILD_TURN_STARTED_EVENT};
 use crate::mailbox::Mailbox;
 use crate::ports::{
     AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnRequest, AgentTurnSource, AgentTurnStarted,
     AgentTurnStartedCallback,
 };
 use crate::scheduler::TeammateManager;
-use crate::session::TeamSession;
-use crate::team_run::{ActiveChildTurn, ChildStartDecision, target_role_for};
+use crate::session::{PrepareBatchResult, TeamSession, WakeInput};
+use crate::team_run::target_role_for;
 use crate::types::TeammateStatus;
-use crate::wake::TeamWakeSource;
-use aionui_api_types::TeamRunStatus;
+use crate::work_coordinator::{CommitResult, StartCommitResult, WorkBatch};
+use crate::work_source::WorkSource;
 
-/// Registry of per-agent Notify handles. Used by any trigger source to poke
-/// an agent's event loop without needing to know its internals.
 pub struct EventLoopRegistry {
     notifiers: DashMap<String, Arc<Notify>>,
     handles: DashMap<String, JoinHandle<()>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    lifecycle: Mutex<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventLoopRegistrationError {
+    Duplicate,
+    Stopped,
 }
 
 impl Default for EventLoopRegistry {
@@ -45,23 +50,30 @@ impl EventLoopRegistry {
             handles: DashMap::new(),
             shutdown_tx,
             shutdown_rx,
+            lifecycle: Mutex::new(false),
         }
     }
 
-    /// Check if an event loop is registered for this slot.
     pub fn has(&self, slot_id: &str) -> bool {
         self.notifiers.contains_key(slot_id)
     }
 
-    /// Poke the named agent's event loop so it drains its mailbox.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.notifiers.len()
+    }
+
     pub fn notify(&self, slot_id: &str) {
-        if let Some(n) = self.notifiers.get(slot_id) {
-            n.notify_one();
+        if let Some(notify) = self.notifiers.get(slot_id) {
+            notify.notify_one();
         }
     }
 
-    /// Register and spawn an event loop for one agent.
-    pub fn spawn(&self, slot_id: &str, ctx: AgentLoopContext) -> bool {
+    pub fn spawn(&self, slot_id: &str, ctx: AgentLoopContext) -> Result<(), EventLoopRegistrationError> {
+        let stopped = self.lock_lifecycle();
+        if *stopped {
+            return Err(EventLoopRegistrationError::Stopped);
+        }
         let notify = Arc::new(Notify::new());
         match self.notifiers.entry(slot_id.to_owned()) {
             Entry::Occupied(_) => {
@@ -70,7 +82,7 @@ impl EventLoopRegistry {
                     slot_id,
                     "agent event loop registration ignored because slot is already registered"
                 );
-                return false;
+                return Err(EventLoopRegistrationError::Duplicate);
             }
             Entry::Vacant(entry) => {
                 entry.insert(notify.clone());
@@ -78,19 +90,23 @@ impl EventLoopRegistry {
         }
         let handle = tokio::spawn(run_event_loop(notify, self.shutdown_rx.clone(), ctx));
         self.handles.insert(slot_id.to_owned(), handle);
-        true
+        Ok(())
     }
 
-    /// Remove an agent's event loop (agent removed from team).
     pub fn remove(&self, slot_id: &str) {
+        let _lifecycle = self.lock_lifecycle();
         self.notifiers.remove(slot_id);
         if let Some((_, handle)) = self.handles.remove(slot_id) {
             handle.abort();
         }
     }
 
-    /// Shut down all event loops.
     pub fn shutdown(&self) {
+        let mut stopped = self.lock_lifecycle();
+        if *stopped {
+            return;
+        }
+        *stopped = true;
         let _ = self.shutdown_tx.send(true);
         for entry in self.handles.iter() {
             entry.value().abort();
@@ -98,9 +114,12 @@ impl EventLoopRegistry {
         self.handles.clear();
         self.notifiers.clear();
     }
+
+    fn lock_lifecycle(&self) -> MutexGuard<'_, bool> {
+        self.lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
-/// Context shared across all iterations of one agent's event loop.
 pub struct AgentLoopContext {
     pub team_id: String,
     pub slot_id: String,
@@ -109,26 +128,13 @@ pub struct AgentLoopContext {
     pub scheduler: Arc<TeammateManager>,
     pub mailbox: Arc<Mailbox>,
     pub turn_port: Arc<dyn AgentTurnExecutionPort>,
-    /// Used to notify other agents' event loops (e.g. leader after all-settled).
     pub registry: Arc<EventLoopRegistry>,
-}
-
-struct TurnExecution {
-    finish_ok: bool,
-    team_run_id: Option<String>,
-    turn_id: Option<String>,
 }
 
 fn is_retryable_start_skip(error: &AgentTurnExecutionError) -> bool {
     matches!(error, AgentTurnExecutionError::Skipped { reason } if reason.contains("already running"))
 }
 
-/// The event loop for one agent slot. Spawned as a tokio task.
-///
-/// Flow:
-/// 1. Wait for signal (notify) or shutdown.
-/// 2. Drain loop: compute_wake_input → has messages → send_message (blocking) → finalize → repeat.
-/// 3. When mailbox empty → back to step 1.
 async fn run_event_loop(
     notify: Arc<Notify>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -139,316 +145,265 @@ async fn run_event_loop(
         slot_id = %ctx.slot_id,
         "agent event loop started"
     );
-
     loop {
-        // Step 1: wait for signal or shutdown
         tokio::select! {
             biased;
-            _ = shutdown_rx.wait_for(|v| *v) => {
-                info!(
-                    team_id = %ctx.team_id,
-                    slot_id = %ctx.slot_id,
-                    "agent event loop shutting down"
-                );
-                return;
-            }
+            _ = shutdown_rx.wait_for(|stopped| *stopped) => return,
             _ = notify.notified() => {}
         }
 
-        // Drain loop: keep processing until mailbox is empty
         loop {
             if *shutdown_rx.borrow() {
                 return;
             }
-
-            let input = match ctx.session.compute_wake_input(&ctx.slot_id).await {
-                Ok(Some(input)) => input,
-                Ok(None) => break,
-                Err(e) => {
+            match ctx.session.prepare_next_batch(&ctx.slot_id).await {
+                Ok(PrepareBatchResult::Execute { batch, input }) => {
+                    if execute_and_finalize(&ctx, *batch, input).await == ExecuteResult::WaitForSignal {
+                        break;
+                    }
+                }
+                Ok(PrepareBatchResult::SettleSignals { intent_ids }) => {
+                    ctx.session.handle_signal_intents(&ctx.slot_id, &intent_ids).await;
+                }
+                Ok(
+                    PrepareBatchResult::WaitingForCompletion
+                    | PrepareBatchResult::Blocked
+                    | PrepareBatchResult::Quiescent,
+                ) => break,
+                Err(error) => {
                     warn!(
                         team_id = %ctx.team_id,
                         slot_id = %ctx.slot_id,
-                        error = %e,
-                        "event loop: compute_wake_input failed"
+                        error = %error,
+                        "event loop reconcile failed"
                     );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
                     break;
                 }
-            };
-
-            if !input.should_send {
-                ctx.session
-                    .team_run_manager()
-                    .record_empty_wake_observed(&ctx.slot_id)
-                    .await;
-                break;
-            }
-
-            match execute_turn(&ctx, &input).await {
-                Some(turn) => finalize_turn(&ctx, turn, &input).await,
-                None => break, // Turn not started (guard/runtime preparation); retry on next signal
             }
         }
     }
 }
 
-/// Execute one agent turn through the Team-defined port. Conversation/runtime
-/// lifecycle remains behind the port; Team keeps projection, mark-read, and
-/// scheduler finalization here.
-async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput) -> Option<TurnExecution> {
-    let role = target_role_for(input.agent_role);
-    let reservation = if input.team_run_id.is_some() {
-        match ctx
-            .session
-            .team_run_manager()
-            .claim_wake_for_turn(&ctx.slot_id, role.clone(), &input.conversation_id)
-            .await
-        {
-            Some(reservation) => {
-                if let Some(source) = input.wake_source {
-                    info!(
-                        team_id = %ctx.team_id,
-                        team_run_id = ?input.team_run_id,
-                        slot_id = %ctx.slot_id,
-                        wake_source = %source,
-                        trigger_message_id = ?input.trigger_message_id.as_deref(),
-                        "team priority wake claimed"
-                    );
-                }
-                Some(reservation)
-            }
-            None => {
-                warn!(
-                    team_id = %ctx.team_id,
-                    team_run_id = ?input.team_run_id,
-                    slot_id = %ctx.slot_id,
-                    conversation_id = %input.conversation_id,
-                    "event loop: team run wake skipped because reservation could not be claimed"
-                );
-                if let Err(e) = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await {
-                    warn!(
-                        team_id = %ctx.team_id,
-                        slot_id = %ctx.slot_id,
-                        error = %e,
-                        "event loop: failed to roll back status after reservation claim failure"
-                    );
-                }
-                return None;
-            }
-        }
-    } else {
-        None
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecuteResult {
+    ContinueDraining,
+    WaitForSignal,
+}
 
-    ctx.session.mirror_unread_to_conversation(input).await;
-
+async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: WakeInput) -> ExecuteResult {
+    ctx.session.mirror_unread_to_conversation(&input).await;
     let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Working).await;
 
-    let files: Vec<String> = input
+    let files = input
         .unread
         .iter()
-        .filter_map(|m| m.files.as_ref())
+        .filter_map(|message| message.files.as_ref())
         .flatten()
         .cloned()
         .collect();
-
-    let unread_message_ids = input.unread.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+    let unread_message_ids = input
+        .unread
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
     let started_seen = Arc::new(AtomicBool::new(false));
-    let on_started: Option<AgentTurnStartedCallback> = reservation.clone().map(|reservation| {
-        let team_run_manager = ctx.session.team_run_manager().clone();
-        let cancellation_port = ctx.session.cancellation_port().clone();
-        let user_id = ctx.user_id.clone();
-        let started_seen = started_seen.clone();
-        Arc::new(move |started: AgentTurnStarted| {
-            let team_run_manager = team_run_manager.clone();
-            let cancellation_port = cancellation_port.clone();
-            let user_id = user_id.clone();
-            let reservation_id = reservation.reservation_id.clone();
-            started_seen.store(true, Ordering::SeqCst);
-            Box::pin(async move {
-                let child = ActiveChildTurn {
-                    team_run_id: started.team_run_id,
-                    slot_id: started.slot_id,
-                    role: started.role,
-                    conversation_id: started.conversation_id,
-                    turn_id: started.turn_id,
-                    started_at_ms: aionui_common::now_ms(),
-                    last_slow_notified_at_ms: None,
-                };
-                match team_run_manager
-                    .record_child_started(&reservation_id, child.clone())
-                    .await
-                {
-                    ChildStartDecision::Accepted => {}
-                    ChildStartDecision::CancelImmediately(child) => {
-                        if let Err(err) = cancellation_port
-                            .cancel_agent_turn(&user_id, &child.conversation_id, &child.turn_id)
-                            .await
-                        {
-                            warn!(
-                                team_run_id = %child.team_run_id,
-                                slot_id = %child.slot_id,
-                                conversation_id = %child.conversation_id,
-                                turn_id = %child.turn_id,
-                                error = %err,
-                                "event loop: late-start child cancellation failed"
-                            );
-                        }
-                        team_run_manager.record_child_cancelled(&child).await;
-                        team_run_manager.try_complete_cancelled().await;
+    let coordinator = ctx.session.work_coordinator().clone();
+    let cancellation_port = ctx.session.cancellation_port().clone();
+    let user_id = ctx.user_id.clone();
+    let conversation_id = input.conversation_id.clone();
+    let callback_batch = batch.clone();
+    let callback_started = started_seen.clone();
+    let callback_emitter = ctx.session.team_event_emitter();
+    let on_started: AgentTurnStartedCallback = Arc::new(move |started: AgentTurnStarted| {
+        let coordinator = coordinator.clone();
+        let cancellation_port = cancellation_port.clone();
+        let user_id = user_id.clone();
+        let conversation_id = conversation_id.clone();
+        let batch = callback_batch.clone();
+        let callback_started = callback_started.clone();
+        let emitter = callback_emitter.clone();
+        Box::pin(async move {
+            callback_started.store(true, Ordering::SeqCst);
+            match coordinator.mark_started(&batch, &started.turn_id) {
+                StartCommitResult::Accepted => {
+                    if let Some(team_run_id) = started.team_run_id {
+                        emitter.broadcast_child_turn(
+                            TEAM_CHILD_TURN_STARTED_EVENT,
+                            TeamChildTurnPayload {
+                                team_id: emitter.team_id().to_owned(),
+                                team_run_id,
+                                slot_id: started.slot_id,
+                                role: started.role,
+                                conversation_id: started.conversation_id,
+                                turn_id: started.turn_id,
+                                status: TeamRunStatus::Running,
+                            },
+                        );
                     }
-                    ChildStartDecision::Ignored => {}
                 }
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-        }) as AgentTurnStartedCallback
+                StartCommitResult::CancelImmediately => {
+                    if let Err(error) = cancellation_port
+                        .cancel_agent_turn(&user_id, &conversation_id, &started.turn_id)
+                        .await
+                    {
+                        warn!(
+                            slot_id = %batch.slot_id,
+                            batch_id = %batch.batch_id,
+                            turn_id = %started.turn_id,
+                            error = %error,
+                            "late-start team batch cancellation failed"
+                        );
+                    }
+                    coordinator.cancel_batch(&batch, "late_start_cancelled");
+                    if let Some(team_run_id) = started.team_run_id {
+                        emitter.broadcast_child_turn(
+                            TEAM_CHILD_TURN_CANCELLED_EVENT,
+                            TeamChildTurnPayload {
+                                team_id: emitter.team_id().to_owned(),
+                                team_run_id,
+                                slot_id: started.slot_id,
+                                role: started.role,
+                                conversation_id: started.conversation_id,
+                                turn_id: started.turn_id,
+                                status: TeamRunStatus::Cancelled,
+                            },
+                        );
+                    }
+                }
+                StartCommitResult::StaleOwner => {}
+            }
+        })
     });
     let request = AgentTurnRequest {
-        team_run_id: input.team_run_id.clone(),
+        team_run_id: batch.team_run_ids.first().cloned(),
         team_id: ctx.team_id.clone(),
         slot_id: ctx.slot_id.clone(),
-        role,
+        role: target_role_for(input.agent_role),
         conversation_id: input.conversation_id.clone(),
         user_id: ctx.user_id.clone(),
-        content: input.first_message.clone(),
+        content: input.first_message,
         files,
         source: AgentTurnSource::Mailbox {
-            unread_count: input.unread.len(),
+            unread_count: unread_message_ids.len(),
             unread_message_ids,
         },
-        on_started,
+        on_started: Some(on_started),
     };
 
-    info!(
-        team_id = %ctx.team_id,
-        team_run_id = ?input.team_run_id,
-        slot_id = %ctx.slot_id,
-        conversation_id = %input.conversation_id,
-        "event loop: agent turn port call started"
-    );
     let outcome = match ctx.turn_port.run_agent_turn(request).await {
         Ok(outcome) => outcome,
-        Err(e) => {
+        Err(error) if !started_seen.load(Ordering::SeqCst) && is_retryable_start_skip(&error) => {
+            ctx.session.work_coordinator().retry_start(&batch, "already_running");
+            let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
+            return ExecuteResult::WaitForSignal;
+        }
+        Err(error) => {
             warn!(
                 team_id = %ctx.team_id,
-                team_run_id = ?input.team_run_id,
                 slot_id = %ctx.slot_id,
-                conversation_id = %input.conversation_id,
-                error = %e,
-                outcome = "failed",
-                "event loop: agent turn port call failed"
+                batch_id = %batch.batch_id,
+                error = %error,
+                "agent turn start failed"
             );
-            if input.team_run_id.is_some()
-                && let Some(reservation) = reservation.as_ref()
-            {
-                if started_seen.load(Ordering::SeqCst) {
-                    ctx.session.team_run_manager().complete_failed().await;
-                } else if is_retryable_start_skip(&e) {
-                    ctx.session
-                        .team_run_manager()
-                        .retry_child_start_later(&reservation.reservation_id, &e.to_string())
-                        .await;
-                    let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
-                    return None;
-                } else {
-                    ctx.session
-                        .team_run_manager()
-                        .record_child_start_failed(&reservation.reservation_id, &e.to_string())
-                        .await;
-                }
-            }
-            return Some(TurnExecution {
-                finish_ok: false,
-                team_run_id: input.team_run_id.clone(),
-                turn_id: None,
-            });
+            mark_batch_messages_read(ctx, &batch).await;
+            ctx.session.work_coordinator().fail_batch(&batch, "turn_start_failed");
+            let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
+            return ExecuteResult::ContinueDraining;
         }
     };
 
-    let turn_ok = outcome.status.is_success();
-    info!(
-        team_id = %ctx.team_id,
-        team_run_id = ?input.team_run_id,
-        slot_id = %ctx.slot_id,
-        conversation_id = %outcome.conversation_id,
-        turn_id = %outcome.turn_id,
-        outcome = ?outcome.status,
-        "event loop: agent turn port call completed"
-    );
-
-    let msg_ids: Vec<String> = input.unread.iter().map(|m| m.id.clone()).collect();
-    if !msg_ids.is_empty()
-        && let Err(e) = ctx.mailbox.mark_read_batch(&msg_ids).await
-    {
-        warn!(
-            team_id = %ctx.team_id,
-            slot_id = %ctx.slot_id,
-            error = %e,
-            "event loop: mark_read_batch failed (non-fatal)"
-        );
-    }
-
-    Some(TurnExecution {
-        finish_ok: turn_ok,
-        team_run_id: input.team_run_id.clone(),
-        turn_id: Some(outcome.turn_id),
-    })
-}
-
-/// Finalize a completed turn: mark idle (or error), cascade to leader.
-async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, input: &crate::session::WakeInput) {
-    if !turn.finish_ok {
+    mark_batch_messages_read(ctx, &batch).await;
+    let terminal_status = if outcome.status.is_success() {
+        (ctx.session.work_coordinator().complete_batch(&batch) == CommitResult::Committed)
+            .then_some(TeamRunStatus::Completed)
+    } else {
+        let committed = ctx.session.work_coordinator().fail_batch(&batch, "turn_failed");
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
+        (committed == CommitResult::Committed).then_some(TeamRunStatus::Failed)
+    };
+    if let Some(status) = terminal_status {
+        let emitter = ctx.session.team_event_emitter();
+        for team_run_id in &batch.team_run_ids {
+            emitter.broadcast_child_turn(
+                TEAM_CHILD_TURN_COMPLETED_EVENT,
+                TeamChildTurnPayload {
+                    team_id: ctx.team_id.clone(),
+                    team_run_id: team_run_id.clone(),
+                    slot_id: ctx.slot_id.clone(),
+                    role: target_role_for(input.agent_role),
+                    conversation_id: outcome.conversation_id.clone(),
+                    turn_id: outcome.turn_id.clone(),
+                    status: status.clone(),
+                },
+            );
+        }
     }
+
     match ctx.scheduler.finalize_turn(&ctx.slot_id, &[]).await {
-        Ok(Some(wake_target)) => {
-            if wake_target != ctx.slot_id
-                && let Err(e) = ctx
-                    .session
-                    .scheduler_wake_agent_for_team_work(&wake_target, TeamWakeSource::IdleNotification)
-                    .await
+        Ok(Some(wake_target)) if wake_target != ctx.slot_id => {
+            if let Err(error) = ctx
+                .session
+                .enqueue_leader_settle_signal(&wake_target, WorkSource::IdleNotification)
+                .await
             {
                 warn!(
                     team_id = %ctx.team_id,
                     slot_id = %ctx.slot_id,
-                    wake_target = %wake_target,
-                    error = %e,
-                    "event loop: failed to wake leader after teammate finalize"
+                    wake_target,
+                    error = %error,
+                    "leader settle signal enqueue failed"
                 );
             }
         }
-        Ok(None) => {}
-        Err(e) => {
-            warn!(
-                team_id = %ctx.team_id,
-                slot_id = %ctx.slot_id,
-                error = %e,
-                "event loop: finalize_turn failed"
-            );
-        }
+        Ok(_) => {}
+        Err(error) => warn!(
+            team_id = %ctx.team_id,
+            slot_id = %ctx.slot_id,
+            error = %error,
+            "scheduler turn finalization failed"
+        ),
     }
-    if let (Some(_team_run_id), Some(turn_id)) = (turn.team_run_id, turn.turn_id) {
-        let status = if turn.finish_ok {
-            TeamRunStatus::Completed
-        } else {
-            TeamRunStatus::Failed
-        };
-        ctx.session
-            .team_run_manager()
-            .record_child_completed(&ctx.slot_id, &turn_id, status)
-            .await;
-        ctx.session.team_run_manager().maybe_complete().await;
+    ExecuteResult::ContinueDraining
+}
+
+async fn mark_batch_messages_read(ctx: &AgentLoopContext, batch: &WorkBatch) {
+    if batch.mailbox_message_ids.is_empty() {
+        return;
     }
-    let should_release_suppressed_wake = input.wake_source.is_some_and(TeamWakeSource::resumes_paused_slot);
-    if should_release_suppressed_wake {
-        let role = target_role_for(input.agent_role);
-        if ctx
-            .session
-            .team_run_manager()
-            .release_suppressed_wake_if_resumed(&ctx.slot_id, role)
-            .await
-            .is_some()
-        {
-            ctx.registry.notify(&ctx.slot_id);
-        }
+    if let Err(error) = ctx.mailbox.mark_read_batch(&batch.mailbox_message_ids).await {
+        warn!(
+            team_id = %ctx.team_id,
+            slot_id = %ctx.slot_id,
+            batch_id = %batch.batch_id,
+            error = %error,
+            "team batch mailbox terminal mark-read failed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod registry_lifecycle_tests {
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    use super::EventLoopRegistry;
+
+    #[test]
+    fn remove_waits_for_in_progress_registration_lifecycle() {
+        let registry = Arc::new(EventLoopRegistry::new());
+        let lifecycle = registry.lock_lifecycle();
+        let (calling_tx, calling_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = Arc::clone(&registry);
+        let thread = std::thread::spawn(move || {
+            calling_tx.send(()).unwrap();
+            worker.remove("worker-1");
+            done_tx.send(()).unwrap();
+        });
+        calling_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(lifecycle);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread.join().unwrap();
     }
 }

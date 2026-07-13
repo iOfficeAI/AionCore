@@ -131,12 +131,16 @@ pub struct AionrsResolvedConfig {
     pub session_directory: PathBuf,
     /// Session mode (default, auto_edit, yolo).
     pub session_mode: Option<String>,
+    /// Resolved skill names from the conversation snapshot.
+    pub skills: Vec<String>,
     /// Extra MCP servers to inject (team coordination or guide).
     pub extra_mcp_servers: HashMap<String, aion_config::config::McpServerConfig>,
     /// AWS Bedrock credentials (region + access key or profile).
     pub bedrock_config: Option<aion_config::config::BedrockConfig>,
     /// Per-turn environment values exposed to runtime tool execution.
     pub runtime_env: Vec<(String, String)>,
+    /// Prompt dump directory when development prompt dumps are enabled.
+    pub prompt_dump_dir: Option<PathBuf>,
 }
 
 #[cfg(test)]

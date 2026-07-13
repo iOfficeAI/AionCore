@@ -43,6 +43,7 @@ pub struct AppServices {
     /// Raw JWT secret string, used to derive encryption keys.
     pub jwt_secret_raw: String,
     pub data_dir: PathBuf,
+    pub dump_prompts: bool,
     pub work_dir: PathBuf,
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
@@ -219,6 +220,7 @@ impl AppServices {
             acp_session_sync: acp_agent_service,
             jwt_secret_raw: secret,
             data_dir,
+            dump_prompts,
             work_dir,
             local,
             app_version,
