@@ -2,8 +2,8 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/.." && pwd)"
-script="$repo_root/scripts/check-migration-immutability.sh"
+repo_root="$(cd "$script_dir/../.." && pwd)"
+script="$repo_root/scripts/migration/check-immutability.sh"
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -56,26 +56,26 @@ init_case_repo() {
 modified_repo="$(init_case_repo modified)"
 printf '%s\n' '-- modified' >> "$modified_repo/crates/aionui-db/migrations/001_initial_schema.sql"
 run_in_repo "$modified_repo" 1 "Existing migration files from main must not be modified or deleted" \
-    env AIONCORE_MIGRATION_BASE_REF=main "$script"
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 deleted_repo="$(init_case_repo deleted)"
 rm "$deleted_repo/crates/aionui-db/migrations/002_data_fix.sql"
 run_in_repo "$deleted_repo" 1 "Existing migration files from main must not be modified or deleted" \
-    env AIONCORE_MIGRATION_BASE_REF=main "$script"
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 auxiliary_repo="$(init_case_repo auxiliary)"
 printf '%s\n' '-- modified auxiliary sql' >> "$auxiliary_repo/crates/aionui-db/migrations/manual_fixture.sql"
 run_in_repo "$auxiliary_repo" 1 "Existing migration files from main must not be modified or deleted" \
-    env AIONCORE_MIGRATION_BASE_REF=main "$script"
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 added_repo="$(init_case_repo added)"
 printf '%s\n' '-- 003 new migration' > "$added_repo/crates/aionui-db/migrations/003_new_change.sql"
 run_in_repo "$added_repo" 0 "Migration immutability check passed" \
-    env AIONCORE_MIGRATION_BASE_REF=main "$script"
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 override_repo="$(init_case_repo override)"
 printf '%s\n' '-- modified with explicit override' >> "$override_repo/crates/aionui-db/migrations/001_initial_schema.sql"
 run_in_repo "$override_repo" 0 "skipping migration immutability check" \
-    env AIONCORE_MIGRATION_BASE_REF=main AIONCORE_ALLOW_MAIN_MIGRATION_EDIT=1 "$script"
+    env AIONCORE_MIGRATION_BASE_REF=main AIONCORE_ALLOW_MAIN_MIGRATION_EDIT=1 bash "$script"
 
 echo "Migration immutability script tests passed"

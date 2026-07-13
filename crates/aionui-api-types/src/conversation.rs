@@ -4,6 +4,8 @@ use aionui_common::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::acp::AcpConfigOptionDto;
+
 /// Per-MCP snapshot status stored in `conversation.extra`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +33,8 @@ pub struct AssistantConversationOverridesRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub permission: Option<String>,
+    #[serde(default)]
+    pub thought_level: Option<String>,
     #[serde(default)]
     pub skill_ids: Option<Vec<String>>,
     #[serde(default)]
@@ -136,6 +140,13 @@ pub struct ConversationRuntimeSummary {
     pub is_processing: bool,
     pub pending_confirmations: usize,
     pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureConversationRuntimeResponse {
+    pub recovered: bool,
+    pub config_options: Vec<AcpConfigOptionDto>,
+    pub runtime: ConversationRuntimeSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -320,6 +331,7 @@ mod tests {
                 "conversation_overrides": {
                     "model": "opus-4.1",
                     "permission": "yolo",
+                    "thought_level": "high",
                     "skill_ids": ["skill-a"],
                     "disabled_builtin_skill_ids": ["builtin-a"],
                     "mcp_ids": ["mcp-a"]
@@ -341,6 +353,7 @@ mod tests {
                 conversation_overrides: Some(AssistantConversationOverridesRequest {
                     model: Some("opus-4.1".into()),
                     permission: Some("yolo".into()),
+                    thought_level: Some("high".into()),
                     skill_ids: Some(vec!["skill-a".into()]),
                     disabled_builtin_skill_ids: Some(vec!["builtin-a".into()]),
                     mcp_ids: Some(vec!["mcp-a".into()]),

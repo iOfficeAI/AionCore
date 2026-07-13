@@ -878,16 +878,16 @@ async fn t2_2_stop_stream_requires_auth() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
-// ── T2.3: Warmup ────────────────────────────────────────────────────
+// ── T2.3: Runtime ensure ────────────────────────────────────────────
 
 #[tokio::test]
-async fn t2_3_warmup_conversation_not_found() {
+async fn t2_3_runtime_ensure_conversation_not_found() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = common::json_with_token(
         "POST",
-        "/api/conversations/non-existent/warmup",
+        "/api/conversations/non-existent/runtime/ensure",
         json!({}),
         &token,
         &csrf,
@@ -897,10 +897,10 @@ async fn t2_3_warmup_conversation_not_found() {
 }
 
 #[tokio::test]
-async fn t2_3b_warmup_legacy_workspace_with_whitespace_succeeds() {
+async fn t2_3b_runtime_ensure_legacy_workspace_with_whitespace_succeeds() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let conv_id = create_conversation(&mut app, &token, &csrf, "Legacy Warmup").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Runtime Ensure").await;
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("my project");
     std::fs::create_dir(&workspace).unwrap();
@@ -908,25 +908,11 @@ async fn t2_3b_warmup_legacy_workspace_with_whitespace_succeeds() {
 
     let req = common::json_with_token(
         "POST",
-        &format!("/api/conversations/{conv_id}/warmup"),
+        &format!("/api/conversations/{conv_id}/runtime/ensure"),
         json!({}),
         &token,
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn t2_3_warmup_requires_auth() {
-    let (app, _services) = build_app().await;
-
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri("/api/conversations/some-id/warmup")
-        .header("content-type", "application/json")
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

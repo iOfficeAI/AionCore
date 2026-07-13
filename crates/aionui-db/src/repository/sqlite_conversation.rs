@@ -426,15 +426,14 @@ impl IConversationRepository for SqliteConversationRepository {
                 assistant_definition_id,
                 assistant_id,
                 assistant_source,
-                assistant_name,
-                assistant_avatar_type,
-                assistant_avatar_value,
                 agent_id,
                 rules_content,
                 default_model_mode,
                 resolved_model_id,
                 default_permission_mode,
                 resolved_permission_value,
+                default_thought_level_mode,
+                resolved_thought_level_value,
                 default_skills_mode,
                 resolved_skill_ids,
                 resolved_disabled_builtin_skill_ids,
@@ -442,20 +441,19 @@ impl IConversationRepository for SqliteConversationRepository {
                 resolved_mcp_ids,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 assistant_definition_id = excluded.assistant_definition_id,
                 assistant_id = excluded.assistant_id,
                 assistant_source = excluded.assistant_source,
-                assistant_name = excluded.assistant_name,
-                assistant_avatar_type = excluded.assistant_avatar_type,
-                assistant_avatar_value = excluded.assistant_avatar_value,
                 agent_id = excluded.agent_id,
                 rules_content = excluded.rules_content,
                 default_model_mode = excluded.default_model_mode,
                 resolved_model_id = excluded.resolved_model_id,
                 default_permission_mode = excluded.default_permission_mode,
                 resolved_permission_value = excluded.resolved_permission_value,
+                default_thought_level_mode = excluded.default_thought_level_mode,
+                resolved_thought_level_value = excluded.resolved_thought_level_value,
                 default_skills_mode = excluded.default_skills_mode,
                 resolved_skill_ids = excluded.resolved_skill_ids,
                 resolved_disabled_builtin_skill_ids = excluded.resolved_disabled_builtin_skill_ids,
@@ -467,15 +465,14 @@ impl IConversationRepository for SqliteConversationRepository {
         .bind(params.assistant_definition_id)
         .bind(params.assistant_id)
         .bind(params.assistant_source)
-        .bind(params.assistant_name)
-        .bind(params.assistant_avatar_type)
-        .bind(params.assistant_avatar_value)
         .bind(params.agent_id)
         .bind(params.rules_content)
         .bind(params.default_model_mode)
         .bind(params.resolved_model_id)
         .bind(params.default_permission_mode)
         .bind(params.resolved_permission_value)
+        .bind(params.default_thought_level_mode)
+        .bind(params.resolved_thought_level_value)
         .bind(params.default_skills_mode)
         .bind(params.resolved_skill_ids)
         .bind(params.resolved_disabled_builtin_skill_ids)

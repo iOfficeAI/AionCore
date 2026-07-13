@@ -99,6 +99,7 @@ fn test_agent_row(id: &str, backend: Option<&str>, agent_type: AgentType, name: 
         config_options: None,
         available_modes: None,
         available_models: None,
+        available_commands: None,
         sort_order: 0,
         team_capable: true,
         status: AgentManagementStatus::Online,
@@ -117,61 +118,22 @@ fn test_agent_row(id: &str, backend: Option<&str>, agent_type: AgentType, name: 
     }
 }
 
-async fn insert_generated_bare_assistant(
-    fx: &Fixture,
-    assistant_id: &str,
-    source_ref: &str,
-    _backend: &str,
-    name: &str,
-) {
-    let pool = fx.services.database.pool().clone();
-    let definition_repo = SqliteAssistantDefinitionRepository::new(pool.clone());
-    let overlay_repo = SqliteAssistantOverlayRepository::new(pool);
+fn assert_versioned_avatar_route(body: &Value, expected_path: &str) {
+    assert_versioned_avatar_value(body["data"]["avatar"].as_str(), expected_path);
+}
 
-    definition_repo
-        .upsert(&UpsertAssistantDefinitionParams {
-            id: &format!("asstdef-{assistant_id}"),
-            assistant_id,
-            source: "generated",
-            owner_type: "system",
-            source_ref: Some(source_ref),
-            source_version: None,
-            source_hash: None,
-            name,
-            name_i18n: "{}",
-            description: None,
-            description_i18n: "{}",
-            avatar_type: "none",
-            avatar_value: None,
-            agent_id: source_ref,
-            rule_resource_type: "none",
-            rule_resource_ref: None,
-            rule_inline_content: None,
-            recommended_prompts: "[]",
-            recommended_prompts_i18n: "{}",
-            default_model_mode: "auto",
-            default_model_value: None,
-            default_permission_mode: "auto",
-            default_permission_value: None,
-            default_skills_mode: "auto",
-            default_skill_ids: "[]",
-            custom_skill_names: "[]",
-            default_disabled_builtin_skill_ids: "[]",
-            default_mcps_mode: "auto",
-            default_mcp_ids: "[]",
-        })
-        .await
-        .unwrap();
-    overlay_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: &format!("asstdef-{assistant_id}"),
-            enabled: true,
-            sort_order: 5,
-            agent_id_override: None,
-            last_used_at: None,
-        })
-        .await
-        .unwrap();
+fn assert_versioned_avatar_value(value: Option<&str>, expected_path: &str) {
+    let avatar = value.expect("avatar must be a string");
+    let (path, version) = avatar
+        .split_once("?v=")
+        .expect("assistant avatar route must include cache-busting version");
+
+    assert_eq!(path, expected_path);
+    assert!(!version.is_empty(), "avatar route version must not be empty");
+    assert!(
+        version.chars().all(|ch| ch.is_ascii_digit()),
+        "avatar route version must be numeric: {version}"
+    );
 }
 
 /// Build the whole app with:
@@ -449,16 +411,15 @@ async fn list_builtin_file_avatar_is_served_via_assistant_avatar_route() {
         .find(|assistant| assistant["id"] == "builtin-office")
         .expect("builtin-office missing from assistant list");
 
-    assert_eq!(
+    assert_versioned_avatar_value(
         builtin_office["avatar"].as_str(),
-        Some("/api/assistants/builtin-office/avatar")
+        "/api/assistants/builtin-office/avatar",
     );
 }
 
 #[tokio::test]
 async fn list_generated_assistant_exposes_generated_runtime_fields() {
     let fx = fixture().await;
-    insert_generated_bare_assistant(&fx, "bare:agent-droid", "agent-droid", "droid", "Droid").await;
 
     let resp = fx
         .app
@@ -471,18 +432,15 @@ async fn list_generated_assistant_exposes_generated_runtime_fields() {
     let list = json["data"].as_array().unwrap();
     let generated = list
         .iter()
-        .find(|assistant| assistant["id"] == "bare:agent-droid")
+        .find(|assistant| assistant["id"] == "bare:8e1acf31")
         .expect("generated assistant missing from assistant list");
 
     assert_eq!(generated["source"], "generated");
     assert_eq!(generated["deletable"], false);
-    assert_eq!(generated["agent_status"], "missing");
+    assert_eq!(generated["agent_status"], "online");
     assert_eq!(generated["agent_status_message"], Value::Null);
-    assert_eq!(generated["team_selectable"], false);
-    assert_eq!(
-        generated["team_block_reason"],
-        "This assistant's agent could not be resolved."
-    );
+    assert_eq!(generated["team_selectable"], true);
+    assert_eq!(generated["team_block_reason"], Value::Null);
 }
 
 #[tokio::test]
@@ -563,6 +521,8 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
             default_model_value: Some("gpt-4.1"),
             default_permission_mode: "auto",
             default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
             default_skills_mode: "fixed",
             default_skill_ids: r#"["preset-pdf"]"#,
             custom_skill_names: &definition.custom_skill_names,
@@ -587,6 +547,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
             assistant_definition_id: &definition.id,
             last_model_id: Some("gpt-5-mini"),
             last_permission_value: Some("workspace-write"),
+            last_thought_level_value: None,
             last_skill_ids: r#"["pref-skill"]"#,
             last_disabled_builtin_skill_ids: r#"["planner"]"#,
             last_mcp_ids: r#"["mcp-pref"]"#,
@@ -627,33 +588,29 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
 #[tokio::test]
 async fn get_detail_generated_assistant_exposes_generated_runtime_fields() {
     let fx = fixture().await;
-    insert_generated_bare_assistant(&fx, "bare:agent-droid", "agent-droid", "droid", "Droid").await;
 
     let resp = fx
         .app
         .clone()
-        .oneshot(get_with_token(
-            "/api/assistants/bare:agent-droid?locale=en-US",
-            &fx.token,
-        ))
+        .oneshot(get_with_token("/api/assistants/bare:8e1acf31?locale=en-US", &fx.token))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
     let data = &json["data"];
-    assert_eq!(data["id"], "bare:agent-droid");
+    assert_eq!(data["id"], "bare:8e1acf31");
     assert_eq!(data["source"], "generated");
     assert_eq!(data["deletable"], false);
-    assert_eq!(data["agent_status"], "missing");
+    assert_eq!(data["agent_status"], "online");
     assert_eq!(data["agent_status_message"], Value::Null);
-    assert_eq!(data["team_selectable"], false);
-    assert_eq!(
-        data["team_block_reason"],
-        "This assistant's agent could not be resolved."
-    );
-    assert_eq!(data["engine"]["agent_id"], "agent-droid");
-    assert_eq!(data["engine"]["agent"], Value::Null);
+    assert_eq!(data["team_selectable"], true);
+    assert_eq!(data["team_block_reason"], Value::Null);
+    assert_eq!(data["engine"]["agent_id"], "8e1acf31");
+    assert_eq!(data["engine"]["agent"]["acp_backend"], "codex");
+    assert!(data["engine"]["agent"].get("backend").is_none());
+    assert!(data["engine"]["agent"].get("id").is_none());
+    assert_eq!(data["engine"]["agent"]["type"], "acp");
 }
 
 // ===========================================================================
@@ -736,7 +693,7 @@ async fn create_user_avatar_from_local_file_is_served_via_assistant_avatar_route
     let resp = fx.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = body_json(resp).await;
-    assert_eq!(body["data"]["avatar"], "/api/assistants/u-avatar/avatar");
+    assert_versioned_avatar_route(&body, "/api/assistants/u-avatar/avatar");
 
     let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar.png");
     assert!(
@@ -783,7 +740,7 @@ async fn create_user_avatar_from_builtin_avatar_route_copies_builtin_asset() {
     let resp = fx.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = body_json(resp).await;
-    assert_eq!(body["data"]["avatar"], "/api/assistants/u-avatar-from-builtin/avatar");
+    assert_versioned_avatar_route(&body, "/api/assistants/u-avatar-from-builtin/avatar");
 
     let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar-from-builtin.png");
     assert!(
@@ -833,10 +790,7 @@ async fn create_user_avatar_from_absolute_builtin_avatar_route_copies_builtin_as
     let resp = fx.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = body_json(resp).await;
-    assert_eq!(
-        body["data"]["avatar"],
-        "/api/assistants/u-avatar-from-builtin-absolute/avatar"
-    );
+    assert_versioned_avatar_route(&body, "/api/assistants/u-avatar-from-builtin-absolute/avatar");
 
     let persisted_avatar = fx
         .user_data_dir
@@ -1067,6 +1021,10 @@ async fn delete_extension_registry_id_without_user_row_returns_404() {
 
 #[tokio::test]
 async fn set_state_inserts_override_for_builtin() {
+    // Builtin sort_order is manifest-owned (users can't reorder official
+    // assistants), so a set_state sort_order is ignored for builtins and the
+    // response keeps the manifest value (0 for this fixture). Only `enabled`
+    // is honoured.
     let fx = fixture().await;
     let req = json_with_token(
         "PATCH",
@@ -1079,7 +1037,7 @@ async fn set_state_inserts_override_for_builtin() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["data"]["enabled"], false);
-    assert_eq!(json["data"]["sort_order"], 9);
+    assert_eq!(json["data"]["sort_order"], 0);
     assert_eq!(json["data"]["source"], "builtin");
 }
 
@@ -1270,7 +1228,7 @@ async fn avatar_builtin_returns_bytes_with_content_type() {
 }
 
 #[tokio::test]
-async fn avatar_user_returns_bytes_after_file_planted() {
+async fn avatar_user_ignores_planted_file_without_managed_value() {
     let fx = fixture().await;
     create_user(&fx, "u1", "A").await;
     let avatars_dir = fx.user_data_dir.join("assistant-avatars");
@@ -1283,11 +1241,7 @@ async fn avatar_user_returns_bytes_after_file_planted() {
         .oneshot(get_with_token("/api/assistants/u1/avatar", &fx.token))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
-        Some("image/svg+xml")
-    );
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

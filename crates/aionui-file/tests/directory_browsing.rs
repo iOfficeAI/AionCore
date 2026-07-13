@@ -80,15 +80,33 @@ async fn get_files_by_dir_subdirectory() {
 }
 
 #[tokio::test]
-async fn get_files_by_dir_rejects_path_outside_sandbox() {
+async fn get_files_by_dir_accepts_requested_root_outside_sandbox() {
     let sandbox = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("workspace.txt"), "workspace").unwrap();
+
+    let svc = make_service(sandbox.path());
+
+    let items = svc
+        .get_files_by_dir(outside.path().to_str().unwrap(), outside.path().to_str().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].name, "workspace.txt");
+}
+
+#[tokio::test]
+async fn get_files_by_dir_rejects_dir_outside_requested_root() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     fs::write(outside.path().join("secret.txt"), "secret").unwrap();
 
     let svc = make_service(sandbox.path());
 
     let result = svc
-        .get_files_by_dir(outside.path().to_str().unwrap(), outside.path().to_str().unwrap())
+        .get_files_by_dir(outside.path().to_str().unwrap(), root.path().to_str().unwrap())
         .await;
 
     assert!(result.is_err());

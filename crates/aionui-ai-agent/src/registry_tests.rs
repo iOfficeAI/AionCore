@@ -197,6 +197,7 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
 
     let registry = AgentRegistry::new(repo);
     registry.hydrate().await.unwrap();
+    registry.refresh_availability().await;
 
     let row = registry
         .list_management_rows()
@@ -222,6 +223,62 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
         row_json["last_check_error_details"]["command"].as_str(),
         Some("definitely-missing-cli")
     );
+}
+
+#[tokio::test]
+async fn management_rows_mark_installed_agents_without_health_check_unchecked() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let command_path = temp.path().join("unchecked-cli");
+    std::fs::write(&command_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let command = command_path.to_string_lossy().to_string();
+    let source_info = serde_json::json!({ "binary_name": command }).to_string();
+
+    repo.upsert(&UpsertAgentMetadataParams {
+        id: "agent-unchecked-cli",
+        icon: None,
+        name: "Unchecked CLI Agent",
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: Some("custom"),
+        agent_type: "acp",
+        agent_source: "custom",
+        agent_source_info: Some(&source_info),
+        enabled: true,
+        command: Some(&command),
+        args: Some("[]"),
+        env: Some("[]"),
+        native_skills_dirs: None,
+        behavior_policy: None,
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 100,
+    })
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    let row = registry
+        .list_management_rows()
+        .await
+        .into_iter()
+        .find(|item| item.id == "agent-unchecked-cli")
+        .unwrap();
+
+    let row_json = serde_json::to_value(&row).unwrap();
+    assert_eq!(row_json["status"].as_str(), Some("unchecked"));
+    assert!(row.installed);
+    assert!(row.last_check_status.is_none());
+    assert!(row.last_check_error_code.is_none());
 }
 
 #[tokio::test]
@@ -278,7 +335,7 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
         name_i18n: None,
         description: None,
         description_i18n: None,
-        backend: Some("claude".into()),
+        backend: Some("claude"),
         agent_type: "acp",
         agent_source: "builtin",
         agent_source_info: None,
@@ -300,7 +357,9 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
         available_models: Some(
             r#"{"current_model_id":"claude-opus","current_model_label":"Claude Opus","available_models":[{"id":"claude-opus","label":"Claude Opus"}]}"#,
         ),
-        available_commands: None,
+        available_commands: Some(
+            r#"{"available_commands":[{"name":"review","description":"Review the current diff"}]}"#,
+        ),
         sort_order: 100,
     })
     .await
@@ -325,6 +384,10 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
     assert_eq!(
         row_json["config_options"]["config_options"][0]["current_value"].as_str(),
         Some("claude-opus")
+    );
+    assert_eq!(
+        row_json["available_commands"]["available_commands"][0]["name"].as_str(),
+        Some("review")
     );
 }
 

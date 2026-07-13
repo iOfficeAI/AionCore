@@ -210,6 +210,8 @@ fn bare_assistant_definition_params<'a>(
         default_model_value: None,
         default_permission_mode: "auto",
         default_permission_value: None,
+        default_thought_level_mode: "auto",
+        default_thought_level_value: None,
         default_skills_mode: "auto",
         default_skill_ids: "[]",
         custom_skill_names: "[]",

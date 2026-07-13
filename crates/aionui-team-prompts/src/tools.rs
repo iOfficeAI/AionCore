@@ -31,26 +31,16 @@ Use this only when one of the following is true:
 Before calling this tool in the normal planning flow:
 - Start with one short sentence explaining why additional teammates would help
 - Tell the user which teammate(s) you recommend
-- Present the proposal as a table with: name, responsibility, recommended assistant, and recommended model
-- Include each teammate's responsibility, recommended assistant, and model
+- Present the proposal as a table with: name, responsibility, and recommended assistant
+- Include each teammate's responsibility and recommended assistant
 - Ask whether to create them as proposed or change any names, responsibilities, or assistant choices
 - In that approval question, remind the user that they can later ask you to replace or adjust any teammate if the lineup is not working well
 - Do NOT call this tool in that same turn; wait for explicit approval in a later user message
 
 When calling this tool, always provide assistant_id from the available assistants catalog.
-When calling this tool, provide the model parameter if a specific model was recommended and approved.
+Do not provide a model. The new teammate uses the selected assistant's configured/default model; users can adjust models from the UI model selector.
 
 The new agent will be created and added to the team. You can then assign tasks and send messages to it."#;
-
-pub const TEAM_LIST_MODELS_DESCRIPTION: &str =
-    "Query available models for assistant backends. Returns the real-time model list that matches the frontend model selector.
-
-Use this to:
-- Check what models are available before spawning an assistant-backed teammate with a specific model
-- See all available backends and their models at once
-- Verify a model ID is valid for the backend behind a chosen assistant or fallback backend
-
-Pass assistant_id to query models for a specific assistant, or omit it to see all backends.";
 
 pub const TEAM_DESCRIBE_ASSISTANT_DESCRIPTION: &str =
     "Get detailed information about an assistant before spawning it as a teammate.
@@ -59,7 +49,7 @@ Returns the assistant's full description, enabled skills, and example tasks so y
 judge whether it fits the user's request. Use this when two or more assistants look
 relevant from the one-line catalog in your system prompt.
 
-Only works on assistants listed in \"Available Assistants for Spawning\".
+Use team_list_assistants to find candidate assistant_id values.
 After confirming a match, call team_spawn_agent with the same assistant_id.";
 
 pub const TEAM_LIST_ASSISTANTS_DESCRIPTION: &str = "List the assistants available for team spawning. Returns the real assistant catalog with \
@@ -90,9 +80,7 @@ pub fn team_tool_specs() -> Vec<TeamToolSpec> {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Agent display name" },
-                    "model": { "type": "string", "description": "Specific model ID to use (e.g. \"claude-sonnet-4\"). Must be valid for the chosen assistant backend. Query team_list_models to see available models." },
-                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn (from the Available Assistants catalog). The runtime backend is derived from this assistant." },
-                    "role": { "type": "string", "description": "Agent role (default: 'teammate')" }
+                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn. Call team_list_assistants when you need candidates; the runtime backend is derived from this assistant." }
                 },
                 "required": ["name", "assistant_id"]
             }),
@@ -131,10 +119,42 @@ pub fn team_tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: "team_task_list",
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "List all tasks on the team task board.",
+            description: "List tasks on the team task board. Pass {} for the full board, or use owner/status/include_deleted/limit for filtered views.",
             input_schema: json!({
                 "type": "object",
-                "properties": {}
+                "additionalProperties": false,
+                "properties": {
+                    "owner": {
+                        "type": "string",
+                        "description": "Return only tasks owned by this exact agent slot_id"
+                    },
+                    "status": {
+                        "description": "Return only tasks with these statuses. Accepts one status string or an array of status strings.",
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed", "deleted"]
+                            },
+                            {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed", "deleted"]
+                                }
+                            }
+                        ]
+                    },
+                    "include_deleted": {
+                        "type": "boolean",
+                        "description": "When status is omitted, include deleted tasks. Defaults to true so {} returns the full board."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum number of returned tasks. Values above 200 are clamped to 200."
+                    }
+                }
             }),
         },
         TeamToolSpec {
@@ -192,17 +212,6 @@ pub fn team_tool_specs() -> Vec<TeamToolSpec> {
                     "locale": { "type": "string", "description": "Locale like \"zh-CN\" or \"en-US\". Defaults to the user's current UI language when omitted." }
                 },
                 "required": ["assistant_id"]
-            }),
-        },
-        TeamToolSpec {
-            name: "team_list_models",
-            permission: TeamToolPermission::AnyTeamAgent,
-            description: TEAM_LIST_MODELS_DESCRIPTION,
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "assistant_id": { "type": "string", "description": "Assistant ID to query. When provided, returns models for the backend behind that assistant. Shows all backends when omitted." }
-                }
             }),
         },
     ]
@@ -271,7 +280,6 @@ mod tests {
                 ("team_shutdown_agent", TeamToolPermission::LeadOnly),
                 ("team_list_assistants", TeamToolPermission::AnyTeamAgent),
                 ("team_describe_assistant", TeamToolPermission::AnyTeamAgent),
-                ("team_list_models", TeamToolPermission::AnyTeamAgent),
             ]
         );
     }
@@ -289,5 +297,22 @@ mod tests {
         assert!(!props.contains_key("agent_type"));
         assert!(!props.contains_key("backend"));
         assert!(required_names.contains(&"assistant_id"));
+    }
+
+    #[test]
+    fn task_list_schema_exposes_bounded_filter_arguments() {
+        let descriptor = visible_team_tool_descriptors(false)
+            .into_iter()
+            .find(|tool| tool.name == "team_task_list")
+            .expect("team_task_list descriptor");
+        let props = descriptor.input_schema["properties"].as_object().unwrap();
+
+        assert!(props.contains_key("owner"));
+        assert!(props.contains_key("status"));
+        assert!(props.contains_key("include_deleted"));
+        assert!(props.contains_key("limit"));
+        assert_eq!(descriptor.input_schema["additionalProperties"], false);
+        assert!(props["limit"].get("maximum").is_none());
+        assert_eq!(props["limit"]["minimum"], 1);
     }
 }

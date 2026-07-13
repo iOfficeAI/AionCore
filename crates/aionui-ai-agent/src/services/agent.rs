@@ -15,9 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_api_types::{
-    AgentLogoEntry, AgentManagementRow, AgentMetadata, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
-};
+use aionui_api_types::{AgentLogoEntry, AgentManagementRow, ProviderHealthCheckRequest, ProviderHealthCheckResponse};
 use aionui_db::IProviderRepository;
 use aionui_realtime::EventBroadcaster;
 
@@ -76,17 +74,6 @@ impl AgentService {
 
 // Agent operations
 impl AgentService {
-    pub async fn refresh_agents(&self) -> Result<Vec<AgentMetadata>, AgentError> {
-        self.registry.refresh_availability().await;
-        Ok(self
-            .registry
-            .list_all()
-            .await
-            .into_iter()
-            .filter(|agent| agent.agent_type.supports_new_conversation())
-            .collect())
-    }
-
     pub async fn list_management_agents(&self) -> Result<Vec<AgentManagementRow>, AgentError> {
         Ok(self.availability.list_management_rows().await)
     }
@@ -140,7 +127,8 @@ impl AgentService {
         req: aionui_api_types::SetAgentOverridesRequest,
     ) -> Result<AgentManagementRow, AgentError> {
         let repo = self.registry.repo_handle();
-        repo.get(id)
+        let row = repo
+            .get(id)
             .await
             .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
@@ -151,6 +139,14 @@ impl AgentService {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
+        let has_env_override = req
+            .env_override
+            .as_ref()
+            .is_some_and(|entries| entries.iter().any(|entry| !entry.name.trim().is_empty()));
+
+        if (command_override.is_some() || has_env_override) && is_internal_aion_cli_row(&row) {
+            return Err(AgentError::bad_request("Internal Aion CLI does not support overrides"));
+        }
 
         let env_json = match req.env_override {
             Some(entries) if !entries.is_empty() => Some(
@@ -163,12 +159,8 @@ impl AgentService {
         repo.update_agent_overrides(id, command_override.as_deref(), env_json.as_deref())
             .await
             .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides: {e}")))?;
-        self.registry.invalidate_and_rehydrate().await?;
 
-        self.availability
-            .management_row_by_id(id)
-            .await
-            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))
+        self.availability.run_manual_health_check(id).await
     }
 
     pub async fn get_agent_overrides(&self, id: &str) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {
@@ -187,8 +179,16 @@ impl AgentService {
             .unwrap_or_default();
 
         Ok(aionui_api_types::AgentOverridesResponse {
-            command_override: row.command_override,
+            command_override: if is_internal_aion_cli_row(&row) {
+                None
+            } else {
+                row.command_override
+            },
             env_override,
         })
     }
+}
+
+fn is_internal_aion_cli_row(row: &aionui_db::AgentMetadataRow) -> bool {
+    row.agent_type.eq_ignore_ascii_case("aionrs") && row.agent_source.eq_ignore_ascii_case("internal")
 }

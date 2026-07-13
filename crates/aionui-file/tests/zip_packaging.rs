@@ -259,8 +259,35 @@ async fn create_zip_rejects_output_outside_sandbox() {
 }
 
 #[tokio::test]
-async fn create_zip_rejects_disk_entry_outside_sandbox() {
+async fn create_zip_accepts_disk_entry_outside_sandbox_without_source_root() {
     let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let outside_file = other.path().join("picked.txt");
+    fs::write(&outside_file, "picked data").unwrap();
+
+    let svc = make_service(dir.path());
+    let zip_path = dir.path().join("picked.zip");
+    let entries = vec![ZipEntry::Disk {
+        name: "picked.txt".into(),
+        file_path: outside_file.to_string_lossy().into_owned(),
+    }];
+
+    let result = svc.create_zip(zip_path.to_str().unwrap(), entries, None).await.unwrap();
+    assert!(result);
+    assert!(zip_path.exists());
+
+    let file = fs::File::open(&zip_path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let mut entry = archive.by_name("picked.txt").unwrap();
+    let mut buf = String::new();
+    entry.read_to_string(&mut buf).unwrap();
+    assert_eq!(buf, "picked data");
+}
+
+#[tokio::test]
+async fn create_zip_rejects_disk_entry_outside_explicit_source_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_root = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     let outside_file = other.path().join("secret.txt");
     fs::write(&outside_file, "sensitive data").unwrap();
@@ -272,7 +299,15 @@ async fn create_zip_rejects_disk_entry_outside_sandbox() {
         file_path: outside_file.to_string_lossy().into_owned(),
     }];
 
-    let result = svc.create_zip(zip_path.to_str().unwrap(), entries, None).await;
+    let result = svc
+        .create_zip_with_extra_roots(
+            zip_path.to_str().unwrap(),
+            entries,
+            None,
+            None,
+            Some(source_root.path()),
+        )
+        .await;
     assert!(result.is_err());
     assert!(!zip_path.exists());
 }

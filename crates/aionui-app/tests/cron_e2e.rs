@@ -119,6 +119,9 @@ async fn au2_unauthenticated_all_endpoints() {
         ("GET", "/api/cron/jobs/cron_test"),
         ("GET", "/api/cron/jobs/cron_test/skill"),
         ("DELETE", "/api/cron/jobs/cron_test/skill"),
+        ("GET", "/api/internal/conversation-cron/list"),
+        ("POST", "/api/internal/conversation-cron/create"),
+        ("PUT", "/api/internal/conversation-cron/jobs/cron_test"),
     ];
 
     for (method, uri) in endpoints {
@@ -134,6 +137,29 @@ async fn au2_unauthenticated_all_endpoints() {
             resp.status()
         );
     }
+}
+
+#[test]
+fn cron_skill_does_not_instruct_agents_to_write_payload_files() {
+    let skill = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/builtin-skills/auto-inject/cron/SKILL.md"),
+    )
+    .unwrap();
+
+    assert!(!skill.contains("--input"));
+    assert!(!skill.contains("cat >"));
+    assert!(!skill.contains("/tmp/aionui-cron"));
+    assert!(!skill.contains("python3"));
+    assert!(!skill.contains("aionui_cron.py"));
+    assert!(skill.contains("$AIONUI_HELPER_BIN"));
+    assert!(!skill.contains("cron-helper"));
+    assert!(skill.contains("config cron current list"));
+    assert!(skill.contains("config cron current create"));
+    assert!(skill.contains("config cron current update"));
+    assert!(skill.contains("\"job_id\""));
+    assert!(skill.contains("After a successful create or update"));
+    assert!(skill.contains("Do not show internal ids"));
+    assert!(skill.contains("cron_..."));
 }
 
 // ── CJ-1: Create cron job ───────────────────────────────────────────
@@ -155,6 +181,17 @@ async fn cj1_create_cron_job() {
     assert_eq!(data["metadata"]["conversation_id"], "conv_1");
     assert_eq!(data["metadata"]["agent_type"], "acp");
     assert_eq!(data["metadata"]["created_by"], "user");
+}
+
+#[tokio::test]
+async fn cj1b_create_job_allows_missing_task_description() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_job(&mut app, &token, &csrf, create_job_body("No Description")).await;
+
+    assert!(data.get("description").is_none());
+    assert_eq!(data["schedule"]["description"], "every minute");
 }
 
 // ── CJ-2: Create three schedule types ────────────────────────────────
@@ -594,7 +631,7 @@ async fn rn1_run_now_returns_conversation_id_for_new_conversation_job() {
 }
 
 #[tokio::test]
-async fn rn1b_run_now_returns_conflict_when_conversation_is_busy() {
+async fn rn1b_run_now_returns_active_conversation_when_conversation_is_busy() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
@@ -632,14 +669,10 @@ async fn rn1b_run_now_returns_conflict_when_conversation_is_busy() {
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let body = body_json(resp).await;
-    assert_eq!(body["code"], "CONFLICT");
-    assert!(
-        body["error"].as_str().unwrap_or_default().contains("already running"),
-        "busy run-now should surface conversation busy semantics"
-    );
+    assert_eq!(body["data"]["conversation_id"], json!(conversation_id));
 
     drop(claim);
 }

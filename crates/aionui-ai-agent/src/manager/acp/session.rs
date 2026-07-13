@@ -43,6 +43,20 @@ struct Advertised {
     available_commands: Option<Vec<AvailableCommand>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CatalogPreloadSummary {
+    pub(crate) mode_preloaded: bool,
+    pub(crate) model_preloaded: bool,
+    pub(crate) mode_catalog_count: usize,
+    pub(crate) model_catalog_count: usize,
+}
+
+impl CatalogPreloadSummary {
+    pub(crate) fn any_preloaded(self) -> bool {
+        self.mode_preloaded || self.model_preloaded
+    }
+}
+
 /// Aggregate root for a single ACP session's lifecycle and state.
 ///
 /// Encapsulates the three-layer state model (desired / observed / advertised)
@@ -473,7 +487,11 @@ impl AcpSession {
 
     pub(crate) fn config_snapshot(&self) -> ConfigSnapshot {
         if let Some(options) = self.advertised.config_options.clone() {
-            return ConfigSnapshot::from_real_options(options);
+            return ConfigSnapshot::from_real_options_with_runtime_supplements(
+                options,
+                self.advertised.modes.as_ref(),
+                self.advertised.models.as_ref(),
+            );
         }
         ConfigSnapshot::from_legacy_catalogs(self.advertised.modes.as_ref(), self.advertised.models.as_ref())
     }
@@ -577,8 +595,26 @@ impl AcpSession {
     }
 
     pub fn apply_advertised_modes(&mut self, modes: SessionModeState) {
+        let incoming_mode_catalog_count = modes.available_modes.len();
+        let existing_mode_catalog_count = self
+            .advertised
+            .modes
+            .as_ref()
+            .map_or(0, |modes| modes.available_modes.len());
+        let modes = self.preserve_existing_mode_catalog_if_empty(modes);
+        let final_mode_catalog_count = modes.available_modes.len();
         let new_id = ModeId::new(modes.current_mode_id.to_string());
         let changed = self.observed.mode_id.as_ref() != Some(&new_id);
+        if incoming_mode_catalog_count == 0
+            && existing_mode_catalog_count > 0
+            && final_mode_catalog_count == existing_mode_catalog_count
+        {
+            tracing::debug!(
+                current_mode = %new_id,
+                preserved_mode_catalog_count = final_mode_catalog_count,
+                "ACP advertised modes kept existing catalog for empty runtime update"
+            );
+        }
         self.observed.mode_id = Some(new_id.clone());
         self.advertised.modes = Some(modes);
         if changed {
@@ -588,14 +624,52 @@ impl AcpSession {
     }
 
     pub fn apply_advertised_models(&mut self, models: SessionModelState) {
+        let incoming_model_catalog_count = models.available_models.len();
+        let existing_model_catalog_count = self
+            .advertised
+            .models
+            .as_ref()
+            .map_or(0, |models| models.available_models.len());
+        let models = self.preserve_existing_model_catalog_if_empty(models);
+        let final_model_catalog_count = models.available_models.len();
         let new_id = ModelId::new(models.current_model_id.to_string());
         let changed = self.observed.model_id.as_ref() != Some(&new_id);
+        if incoming_model_catalog_count == 0
+            && existing_model_catalog_count > 0
+            && final_model_catalog_count == existing_model_catalog_count
+        {
+            tracing::debug!(
+                current_model = %new_id,
+                preserved_model_catalog_count = final_model_catalog_count,
+                "ACP advertised models kept existing catalog for empty runtime update"
+            );
+        }
         self.observed.model_id = Some(new_id.clone());
         self.advertised.models = Some(models);
         if changed {
             self.pending_events
                 .push(AcpSessionEvent::ObservedModelSynced { model: new_id });
         }
+    }
+
+    fn preserve_existing_mode_catalog_if_empty(&self, mut modes: SessionModeState) -> SessionModeState {
+        if modes.available_modes.is_empty()
+            && let Some(existing) = self.advertised.modes.as_ref()
+            && !existing.available_modes.is_empty()
+        {
+            modes.available_modes.clone_from(&existing.available_modes);
+        }
+        modes
+    }
+
+    fn preserve_existing_model_catalog_if_empty(&self, mut models: SessionModelState) -> SessionModelState {
+        if models.available_models.is_empty()
+            && let Some(existing) = self.advertised.models.as_ref()
+            && !existing.available_models.is_empty()
+        {
+            models.available_models.clone_from(&existing.available_models);
+        }
+        models
     }
 
     fn preserve_desired_model_in_catalog(&self, models: SessionModelState) -> SessionModelState {
@@ -618,6 +692,28 @@ impl AcpSession {
 
     pub fn apply_advertised_config_options(&mut self, options: Vec<SessionConfigOption>) {
         let options = merge_config_options(self.advertised.config_options.as_deref(), options);
+        let supplement_summary = ConfigSnapshot::supplement_summary_for_real_options(
+            &options,
+            self.advertised.modes.as_ref(),
+            self.advertised.models.as_ref(),
+        );
+        if let Some(supplemented_categories) = supplement_summary.categories_csv() {
+            tracing::info!(
+                supplemented_categories,
+                real_option_count = options.len(),
+                mode_catalog_count = self
+                    .advertised
+                    .modes
+                    .as_ref()
+                    .map_or(0, |modes| modes.available_modes.len()),
+                model_catalog_count = self
+                    .advertised
+                    .models
+                    .as_ref()
+                    .map_or(0, |models| models.available_models.len()),
+                "ACP config options supplemented from advertised catalog"
+            );
+        }
 
         if let Some(modes) = derive_modes_from_config_options(&options) {
             self.apply_advertised_modes(modes);
@@ -677,11 +773,23 @@ impl AcpSession {
     /// Called on resume paths before the CLI session/load response arrives.
     pub fn preload_persisted(&mut self, state: &PersistedSessionState) {
         if let Some(mode) = &state.current_mode_id {
-            self.advertised.modes = Some(SessionModeState::new(mode.as_str().to_owned(), Vec::new()));
+            let available_modes = self
+                .advertised
+                .modes
+                .as_ref()
+                .map(|modes| modes.available_modes.clone())
+                .unwrap_or_default();
+            self.advertised.modes = Some(SessionModeState::new(mode.as_str().to_owned(), available_modes));
             self.observed.mode_id = Some(mode.clone());
         }
         if let Some(model) = &state.current_model_id {
-            self.advertised.models = Some(SessionModelState::new(model.as_str().to_owned(), Vec::new()));
+            let available_models = self
+                .advertised
+                .models
+                .as_ref()
+                .map(|models| models.available_models.clone())
+                .unwrap_or_default();
+            self.advertised.models = Some(SessionModelState::new(model.as_str().to_owned(), available_models));
             self.observed.model_id = Some(model.clone());
         }
         if !state.config_selections.is_empty() {
@@ -690,6 +798,76 @@ impl AcpSession {
         if let Some(usage) = &state.context_usage {
             self.advertised.context_usage = Some(usage.clone());
         }
+    }
+
+    pub(crate) fn preload_advertised_catalogs(
+        &mut self,
+        modes: Option<SessionModeState>,
+        models: Option<SessionModelState>,
+    ) -> CatalogPreloadSummary {
+        let mut summary = CatalogPreloadSummary::default();
+
+        if let Some(modes) = modes.filter(|modes| !modes.available_modes.is_empty())
+            && self
+                .advertised
+                .modes
+                .as_ref()
+                .is_none_or(|existing| existing.available_modes.is_empty())
+        {
+            summary.mode_preloaded = true;
+            summary.mode_catalog_count = modes.available_modes.len();
+            self.advertised.modes = Some(self.mode_catalog_with_session_current(modes));
+        }
+
+        if let Some(models) = models.filter(|models| !models.available_models.is_empty())
+            && self
+                .advertised
+                .models
+                .as_ref()
+                .is_none_or(|existing| existing.available_models.is_empty())
+        {
+            summary.model_preloaded = true;
+            summary.model_catalog_count = models.available_models.len();
+            self.advertised.models = Some(self.model_catalog_with_session_current(models));
+        }
+
+        summary
+    }
+
+    fn mode_catalog_with_session_current(&self, mut modes: SessionModeState) -> SessionModeState {
+        let current = self
+            .observed
+            .mode_id
+            .as_ref()
+            .or(self.desired.mode_id.as_ref())
+            .filter(|mode| {
+                modes
+                    .available_modes
+                    .iter()
+                    .any(|available| available.id.0.as_ref() == mode.as_str())
+            });
+        if let Some(current) = current {
+            modes.current_mode_id = current.as_str().to_owned().into();
+        }
+        modes
+    }
+
+    fn model_catalog_with_session_current(&self, mut models: SessionModelState) -> SessionModelState {
+        let current = self
+            .observed
+            .model_id
+            .as_ref()
+            .or(self.desired.model_id.as_ref())
+            .filter(|model| {
+                models
+                    .available_models
+                    .iter()
+                    .any(|available| available.model_id.0.as_ref() == model.as_str())
+            });
+        if let Some(current) = current {
+            models.current_model_id = current.as_str().to_owned().into();
+        }
+        models
     }
 }
 
@@ -811,9 +989,13 @@ fn select_option_contains_value(kind: &SessionConfigKind, value: &str) -> bool {
     }
 }
 
-// Tests live in `session_tests.rs` (linked via `#[path]`) so this file
-// stays under the 1000-line per-file budget. Inside that file `super::*`
-// resolves to this module's private items.
+// Tests live in sibling files linked via `#[path]` so this file stays under
+// the 1000-line per-file budget. Inside those files `super::*` resolves to
+// this module's private items.
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_config_snapshot_tests.rs"]
+mod config_snapshot_tests;

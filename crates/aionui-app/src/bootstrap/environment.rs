@@ -50,6 +50,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         app_version: cli.app_version.clone(),
         local: cli.local,
         dump_prompts: cli.dump_prompts,
+        recover_corrupted_database: cli.recover_corrupted_database,
     };
     info!(
         "Running in {} mode — authentication is {}",
@@ -95,7 +96,14 @@ pub async fn init_data_layer(config: &AppConfig) -> Result<Database, BootstrapEr
         .with_field("databasePath", db_path.display().to_string())
     })?;
     info!("Initializing database at {}", db_path.display());
-    let database = aionui_db::init_database_staged(&db_path).await.map_err(|e| {
+    let database = aionui_db::init_database_staged_with_options(
+        &db_path,
+        aionui_db::DatabaseInitOptions {
+            recover_corrupted_database: config.recover_corrupted_database,
+        },
+    )
+    .await
+    .map_err(|e| {
         let stage = e.stage();
         BootstrapError::new(
             BootstrapErrorCode::DataInitFailed,
@@ -130,5 +138,18 @@ mod tests {
         );
 
         assert_eq!(err.stage(), "database.schema_repair");
+    }
+
+    #[test]
+    fn database_recoverable_corruption_stage_comes_from_db_boundary_error() {
+        let err = aionui_db::DatabaseInitError::new(
+            "database.recoverable_corruption",
+            aionui_db::DbError::Migration(sqlx::migrate::MigrateError::ExecuteMigration(
+                sqlx::Error::Protocol("database disk image is malformed".into()),
+                13,
+            )),
+        );
+
+        assert_eq!(err.stage(), "database.recoverable_corruption");
     }
 }

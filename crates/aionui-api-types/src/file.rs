@@ -79,6 +79,8 @@ pub struct RemoveEntryRequest {
 pub struct RenameRequest {
     pub path: String,
     pub new_name: String,
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 /// Request body for `POST /api/fs/temp` — create temp file.
@@ -115,6 +117,10 @@ pub struct ZipFileEntry {
 #[derive(Debug, Deserialize)]
 pub struct ZipRequest {
     pub path: String,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub source_root: Option<String>,
     #[serde(default)]
     pub request_id: Option<String>,
     pub files: Vec<ZipFileEntry>,
@@ -334,6 +340,15 @@ mod tests {
     }
 
     #[test]
+    fn list_workspace_files_request_requires_root() {
+        let req: ListWorkspaceFilesRequest = serde_json::from_str(r#"{"root":"/workspace"}"#).unwrap();
+        assert_eq!(req.root, "/workspace");
+
+        let missing_root = serde_json::from_str::<ListWorkspaceFilesRequest>(r#"{}"#);
+        assert!(missing_root.is_err());
+    }
+
+    #[test]
     fn copy_files_request_snake_case() {
         let raw = json!({
             "file_paths": ["/a.txt", "/b.txt"],
@@ -358,16 +373,19 @@ mod tests {
 
     #[test]
     fn rename_request_snake_case() {
-        let raw = r#"{"path":"/ws/old.txt","new_name":"new.txt"}"#;
+        let raw = r#"{"path":"/ws/old.txt","new_name":"new.txt","workspace":"/ws"}"#;
         let req: RenameRequest = serde_json::from_str(raw).unwrap();
         assert_eq!(req.path, "/ws/old.txt");
         assert_eq!(req.new_name, "new.txt");
+        assert_eq!(req.workspace.as_deref(), Some("/ws"));
     }
 
     #[test]
     fn zip_request_snake_case() {
         let raw = json!({
             "path": "/out.zip",
+            "workspace": "/out",
+            "source_root": "/src",
             "request_id": "req-1",
             "files": [
                 { "name": "a.txt", "content": "hello" },
@@ -376,6 +394,8 @@ mod tests {
         });
         let req: ZipRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.path, "/out.zip");
+        assert_eq!(req.workspace.as_deref(), Some("/out"));
+        assert_eq!(req.source_root.as_deref(), Some("/src"));
         assert_eq!(req.request_id.as_deref(), Some("req-1"));
         assert_eq!(req.files.len(), 2);
         assert_eq!(req.files[0].content.as_deref(), Some("hello"));

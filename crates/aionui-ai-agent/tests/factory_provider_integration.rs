@@ -101,6 +101,7 @@ fn make_aionrs_options(
         },
         model,
         skills: vec![],
+        runtime_env: vec![],
         team: None,
         kind: AgentSessionKind::Aionrs(Box::new(AionrsSessionBuildContext {
             config,
@@ -154,7 +155,7 @@ async fn aionrs_factory_resolves_provider_from_db() {
             use_model: None,
         },
         AionrsBuildExtra {
-            max_tokens: 2048,
+            max_tokens: Some(2048),
             ..Default::default()
         },
     );

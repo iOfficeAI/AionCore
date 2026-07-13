@@ -263,12 +263,32 @@ async fn command_version(command: ResolvedCommand, label: &str) -> Result<semver
 }
 
 fn parse_version_output(output: &str, label: &str) -> Result<semver::Version, NodeRuntimeError> {
-    let version = output.trim().trim_start_matches('v');
-    semver::Version::parse(version).map_err(|error| {
-        NodeRuntimeError::managed_invalid(format!(
-            "{label} returned non-semver version output '{version}': {error}"
-        ))
-    })
+    let mut versions = output
+        .lines()
+        .filter_map(parse_independent_semver_line)
+        .collect::<Vec<_>>();
+
+    match versions.len() {
+        1 => Ok(versions.remove(0)),
+        0 => {
+            let normalized = output.trim();
+            Err(NodeRuntimeError::managed_invalid(format!(
+                "{label} returned non-semver version output '{normalized}'"
+            )))
+        }
+        _ => {
+            let normalized = output.trim();
+            Err(NodeRuntimeError::managed_invalid(format!(
+                "{label} returned ambiguous semver version output '{normalized}'"
+            )))
+        }
+    }
+}
+
+fn parse_independent_semver_line(line: &str) -> Option<semver::Version> {
+    let trimmed = line.trim();
+    let version_text = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    semver::Version::parse(version_text).ok()
 }
 
 pub fn doctor_snapshot_for_test(rows: Vec<(&str, &str, &str)>) -> Vec<DoctorRow> {
@@ -382,6 +402,56 @@ mod tests {
     fn probe_explicit_path_is_passthrough() {
         let probe = probe_runtime_command("/tmp/custom-node");
         assert!(matches!(probe, RuntimeCommandProbe::ExplicitPath { .. }));
+    }
+
+    #[test]
+    fn parse_version_output_accepts_banner_crlf_single_semver_line() {
+        let version = parse_version_output(
+            "Bienvenido a FenixFat\r\nFenixFat 2026-07-02 10:00:00\r\n11.6.1\r\n",
+            "npm",
+        )
+        .expect("single independent semver line should parse");
+
+        assert_eq!(version, semver::Version::new(11, 6, 1));
+    }
+
+    #[test]
+    fn parse_version_output_accepts_v_prefixed_single_semver_line() {
+        let version = parse_version_output("v24.11.0\r\n", "node").expect("v prefix should parse");
+
+        assert_eq!(version, semver::Version::new(24, 11, 0));
+    }
+
+    #[test]
+    fn parse_version_output_rejects_output_without_independent_semver_line() {
+        let error = parse_version_output("Bienvenido\r\nFenixFat\r\n", "npm").expect_err("missing semver should fail");
+
+        assert!(
+            error.to_string().contains("npm returned non-semver version output"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_version_output_rejects_embedded_semver_text() {
+        let error = parse_version_output("npm version 11.6.1\r\n", "npm").expect_err("embedded semver should fail");
+
+        assert!(
+            error.to_string().contains("npm returned non-semver version output"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_version_output_rejects_multiple_independent_semver_lines() {
+        let error = parse_version_output("11.6.1\r\n10.9.0\r\n", "npm").expect_err("ambiguous versions should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("npm returned ambiguous semver version output"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

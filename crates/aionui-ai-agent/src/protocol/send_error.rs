@@ -429,7 +429,12 @@ fn acp_agent_internal_detail_for_classification(code: i32, classification: Class
         return AWS_SSO_EXPIRED_DETAIL.to_owned();
     }
 
-    acp_agent_internal_public_detail(code)
+    let sanitized = sanitize_error_detail(text);
+    if sanitized.is_empty() {
+        acp_agent_internal_public_detail(code)
+    } else {
+        format!("{}: {}", acp_agent_internal_public_detail(code), sanitized)
+    }
 }
 
 fn acp_agent_internal_texts<'a>(message: &'a str, data: Option<&'a serde_json::Value>) -> Vec<&'a str> {
@@ -1448,8 +1453,10 @@ mod tests {
         );
 
         let detail = err.stream_error().detail.as_deref().expect("detail present");
-        assert_eq!(detail, "Agent internal error (code -32603)");
-        assert!(!detail.contains("Failed to connect MCP servers"));
+        assert_eq!(
+            detail,
+            "Agent internal error (code -32603): Failed to connect MCP servers"
+        );
     }
 
     #[test]
@@ -1575,8 +1582,10 @@ mod tests {
         });
 
         let detail = err.stream_error().detail.as_deref().expect("detail present");
-        assert_eq!(detail, "Agent internal error (code -32603)");
-        assert!(!detail.contains("Failed to connect MCP servers"));
+        assert_eq!(
+            detail,
+            "Agent internal error (code -32603): Failed to connect MCP servers"
+        );
         assert!(!detail.contains("sk-secret"));
         assert!(!detail.contains("api_key"));
     }
@@ -1649,8 +1658,8 @@ mod tests {
         );
 
         for managed_binary_missing in [
-            "expected managed Claude ACP platform binary missing: C:\\Users\\user\\AppData\\Roaming\\AionUi\\aionui\\runtime\\acp\\claude-agent-acp\\0.39.0\\win32-x64\\node_modules\\@anthropic-ai\\claude-agent-sdk-win32-x64\\claude.exe",
-            "expected managed Codex ACP platform binary missing: C:\\Users\\user\\AppData\\Roaming\\AionUi\\aionui\\runtime\\acp\\codex-acp\\0.14.0\\win32-x64\\node_modules\\@zed-industries\\codex-acp-win32-x64\\bin\\codex-acp.exe",
+            "expected managed Claude ACP platform binary missing: C:\\Users\\user\\AppData\\Roaming\\AionUi\\aionui\\runtime\\acp\\claude-agent-acp\\0.58.1\\win32-x64\\node_modules\\@anthropic-ai\\claude-agent-sdk-win32-x64\\claude.exe",
+            "expected managed Codex ACP platform binary missing: C:\\Users\\user\\AppData\\Roaming\\AionUi\\aionui\\runtime\\acp\\codex-acp\\1.1.2\\win32-x64\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe",
         ] {
             assert_classification(
                 managed_binary_missing,

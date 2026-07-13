@@ -154,6 +154,12 @@ curl -s -X POST http://127.0.0.1:25808/api/webui/change-username -H "Content-Typ
 
 (Confirm exact field names from the response if it errors; reset-password / generate-qr-token endpoints also exist.)
 
+> These `/api/webui/*` credential endpoints only work when aioncore runs in
+> **local mode** (the normal desktop/Electron case, which is exactly the scenario
+> this skill targets). If aioncore is deployed as a standalone server, they
+> return **403 Forbidden** — change the password through that deployment's own
+> mechanism instead.
+
 ### Optional - a permanent / fixed address (mention only, do not push)
 
 Only bring this up after the user has experienced the free public access and asks for a URL that does not change. A fixed address requires a Cloudflare account + your own domain wired to a cloudflared named tunnel (more setup, and a custom domain is paid). The free *.trycloudflare.com URL is always random/ephemeral. Recommend the named-tunnel path as an option, but do not set it up unless they explicitly want it.

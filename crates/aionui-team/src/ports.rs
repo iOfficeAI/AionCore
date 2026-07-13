@@ -25,6 +25,31 @@ pub trait TeamConversationLookupPort: Send + Sync {
     ) -> Result<Option<TeamConversationBindingLookup>, TeamError>;
 }
 
+#[async_trait]
+pub trait TeamAssistantCatalogPort: Send + Sync {
+    async fn list_team_selectable_assistants(&self) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError>;
+
+    async fn resolve_team_selectable_assistant(
+        &self,
+        assistant_id: &str,
+    ) -> Result<Option<TeamAssistantCatalogEntry>, TeamError> {
+        Ok(self
+            .list_team_selectable_assistants()
+            .await?
+            .into_iter()
+            .find(|assistant| assistant.assistant_id == assistant_id))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamAssistantCatalogEntry {
+    pub assistant_id: String,
+    pub name: String,
+    pub backend: String,
+    pub description: String,
+    pub skills: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTurnSource {
     Mailbox {
@@ -68,7 +93,7 @@ pub type AgentTurnStartedCallback =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTurnStarted {
-    pub team_run_id: String,
+    pub team_run_id: Option<String>,
     pub slot_id: String,
     pub role: TeamRunTargetRole,
     pub conversation_id: String,

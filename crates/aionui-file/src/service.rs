@@ -13,7 +13,7 @@ use crate::error::FileError;
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::EventBroadcaster;
 
-use crate::path_safety::{has_traversal, validate_path, validate_path_for_write, validate_path_with_extra_root};
+use crate::path_safety::{has_traversal, validate_path_for_write, validate_path_with_extra_root};
 use crate::types::{
     ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileMetadata, WorkspaceFlatFile, ZipEntry,
 };
@@ -583,15 +583,24 @@ fn write_zip_entries(
 impl crate::traits::IFileService for FileService {
     async fn get_files_by_dir(&self, dir: &str, root: &str) -> Result<Vec<DirOrFile>, FileError> {
         let roots = self.allowed_roots_refs();
-        let canonical_dir = validate_path(dir, &roots)?;
-        let canonical_root = validate_path(root, &roots)?;
+        let extra_root = Path::new(root);
+        let canonical_dir = validate_path_with_extra_root(dir, &roots, Some(extra_root))?;
+        let canonical_root = validate_path_with_extra_root(root, &roots, Some(extra_root))?;
 
         self.build_dir_tree(&canonical_dir, &canonical_root).await
     }
 
     async fn list_workspace_files(&self, root: &str) -> Result<Vec<WorkspaceFlatFile>, FileError> {
+        self.list_workspace_files_with_extra_root(root, None).await
+    }
+
+    async fn list_workspace_files_with_extra_root(
+        &self,
+        root: &str,
+        extra_root: Option<&Path>,
+    ) -> Result<Vec<WorkspaceFlatFile>, FileError> {
         let roots = self.allowed_roots_refs();
-        let canonical_root = validate_path(root, &roots)?;
+        let canonical_root = validate_path_with_extra_root(root, &roots, extra_root)?;
         let cache_key = canonical_root.to_string_lossy().into_owned();
 
         // Check cache first
@@ -689,7 +698,7 @@ impl crate::traits::IFileService for FileService {
             )));
         }
 
-        let roots = self.allowed_roots_refs();
+        let roots = self.allowed_roots_with_extra(Some(Path::new(workspace)));
         let canonical = validate_path_for_write(path, &roots)?;
 
         let path_owned = canonical.clone();
@@ -735,23 +744,30 @@ impl crate::traits::IFileService for FileService {
         source_root: Option<&str>,
     ) -> Result<CopyResult, FileError> {
         let roots = self.allowed_roots_refs();
-        let ws_canonical = validate_path(workspace, &roots)?;
+        let ws_canonical = validate_path_with_extra_root(workspace, &roots, Some(Path::new(workspace)))?;
 
         let sr_canonical = match source_root {
-            Some(sr) => Some(validate_path(sr, &roots)?),
+            Some(sr) => Some(validate_path_with_extra_root(sr, &roots, Some(Path::new(sr)))?),
             None => None,
         };
 
         let file_paths_owned: Vec<String> = file_paths.to_vec();
         let roots_owned: Vec<std::path::PathBuf> = self.allowed_roots.clone();
+        let workspace_root_owned = ws_canonical.clone();
+        let source_root_owned = sr_canonical.clone();
 
         tokio::task::spawn_blocking(move || {
-            let roots_refs: Vec<&Path> = roots_owned.iter().map(|p| p.as_path()).collect();
+            let mut roots_refs: Vec<&Path> = roots_owned.iter().map(|p| p.as_path()).collect();
+            roots_refs.push(workspace_root_owned.as_path());
+            if let Some(source_root) = source_root_owned.as_deref() {
+                roots_refs.push(source_root);
+            }
             let mut copied = Vec::new();
             let mut failed = Vec::new();
 
             for fp in &file_paths_owned {
-                let src = match validate_path(fp, &roots_refs) {
+                let source_extra = source_root_owned.as_deref().or_else(|| Path::new(fp).parent());
+                let src = match validate_path_with_extra_root(fp, &roots_refs, source_extra) {
                     Ok(p) if p.is_file() => p,
                     _ => {
                         failed.push(fp.clone());
@@ -792,7 +808,7 @@ impl crate::traits::IFileService for FileService {
         }
 
         let roots = self.allowed_roots_refs();
-        let canonical = validate_path(path, &roots)?;
+        let canonical = validate_path_with_extra_root(path, &roots, Some(Path::new(workspace)))?;
 
         let path_owned = canonical.clone();
         tokio::task::spawn_blocking(move || remove_entry_sync(&path_owned))
@@ -828,6 +844,15 @@ impl crate::traits::IFileService for FileService {
     }
 
     async fn rename_entry(&self, path: &str, new_name: &str) -> Result<String, FileError> {
+        self.rename_entry_with_extra_root(path, new_name, None).await
+    }
+
+    async fn rename_entry_with_extra_root(
+        &self,
+        path: &str,
+        new_name: &str,
+        extra_root: Option<&Path>,
+    ) -> Result<String, FileError> {
         if has_traversal(path) {
             return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
@@ -843,7 +868,7 @@ impl crate::traits::IFileService for FileService {
         }
 
         let roots = self.allowed_roots_refs();
-        let canonical = validate_path(path, &roots)?;
+        let canonical = validate_path_with_extra_root(path, &roots, extra_root)?;
 
         let new_name_owned = new_name.to_owned();
         let path_owned = canonical;
@@ -1070,14 +1095,32 @@ impl crate::traits::IFileService for FileService {
         entries: Vec<ZipEntry>,
         request_id: Option<String>,
     ) -> Result<bool, FileError> {
+        self.create_zip_with_extra_roots(path, entries, request_id, None, None)
+            .await
+    }
+
+    async fn create_zip_with_extra_roots(
+        &self,
+        path: &str,
+        entries: Vec<ZipEntry>,
+        request_id: Option<String>,
+        output_root: Option<&Path>,
+        source_root: Option<&Path>,
+    ) -> Result<bool, FileError> {
         // Validate output path is within the sandbox
         let roots = self.allowed_roots_refs();
-        let output = validate_path_for_write(path, &roots)?;
+        let output_roots = self.allowed_roots_with_extra(output_root);
+        let output = validate_path_for_write(path, &output_roots)?;
 
         // Validate all Disk entry source paths are within the sandbox
+        let mut source_roots = roots;
+        if let Some(source_root) = source_root {
+            source_roots.push(source_root);
+        }
         for entry in &entries {
             if let ZipEntry::Disk { file_path, .. } = entry {
-                validate_path(file_path, &roots)?;
+                let source_extra = source_root.or_else(|| Path::new(file_path).parent());
+                validate_path_with_extra_root(file_path, &source_roots, source_extra)?;
             }
         }
 

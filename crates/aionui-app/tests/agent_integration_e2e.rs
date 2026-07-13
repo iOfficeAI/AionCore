@@ -264,7 +264,8 @@ async fn management_endpoint_keeps_deprecated_runtime_rows_for_diagnostics() {
     ] {
         upsert_visible_agent_metadata(&services, id, agent_type).await;
     }
-    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
 
     let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -402,7 +403,8 @@ async fn agent_logos_endpoint_includes_disabled_and_missing_rows() {
         })
         .await
         .unwrap();
-    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
 
     let req = get_with_token("/api/agents/logos", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -478,14 +480,14 @@ async fn stop_stream_with_mock_agent() {
 }
 
 #[tokio::test]
-async fn warmup_with_mock_agent() {
+async fn runtime_ensure_with_mock_agent() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
-    let conv_id = create_conversation(&mut app, &token, &csrf, "Warmup Test").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Runtime Ensure Test").await;
 
     let req = json_with_token(
         "POST",
-        &format!("/api/conversations/{conv_id}/warmup"),
+        &format!("/api/conversations/{conv_id}/runtime/ensure"),
         json!({}),
         &token,
         &csrf,
@@ -624,16 +626,20 @@ async fn agent_overrides_roundtrip_and_management_summary() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
     upsert_visible_agent_metadata(&services, "ovr-agent", "acp").await;
-    services.agent_registry.invalidate_and_rehydrate().await.unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
 
     // PUT overrides
     let body = json!({
-        "command_override": "/real/bin/ovr",
+        "command_override": "true",
         "env_override": [{"name": "ANTHROPIC_API_KEY", "value": "sk-x"}, {"name": "PATH", "value": "/evil"}]
     });
     let req = json_with_token("PUT", "/api/agents/ovr-agent/overrides", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let put_body = body_json(resp).await;
+    assert_eq!(put_body["data"]["last_check_kind"], "manual");
+    assert_eq!(put_body["data"]["last_check_status"], "offline");
 
     // management row: safe fields, blocked PATH not counted
     let mreq = get_with_token("/api/agents/management", &token);
@@ -648,7 +654,7 @@ async fn agent_overrides_roundtrip_and_management_summary() {
     assert_eq!(row["has_command_override"], true);
     assert_eq!(row["env_override_key_count"], 1); // PATH excluded
     assert!(
-        row["env"].as_array().map_or(true, |arr| arr.is_empty()),
+        row["env"].as_array().is_none_or(|arr| arr.is_empty()),
         "management row env must be empty or absent"
     );
     assert!(
@@ -659,7 +665,36 @@ async fn agent_overrides_roundtrip_and_management_summary() {
     // GET overrides: plaintext echo
     let greq = get_with_token("/api/agents/ovr-agent/overrides", &token);
     let gbody = body_json(app.clone().oneshot(greq).await.unwrap()).await;
-    assert_eq!(gbody["data"]["command_override"], "/real/bin/ovr");
+    assert_eq!(gbody["data"]["command_override"], "true");
     let envs = gbody["data"]["env_override"].as_array().unwrap();
     assert!(envs.iter().any(|e| e["name"] == "ANTHROPIC_API_KEY"));
+}
+
+#[tokio::test]
+async fn internal_aion_cli_rejects_overrides() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    upsert_visible_agent_metadata(&services, "632f31d2", "aionrs").await;
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
+
+    let command_body = json!({
+        "command_override": "irm https://claude.ai/install.ps1 | iex",
+        "env_override": [{"name": "ANTHROPIC_API_KEY", "value": "sk-x"}]
+    });
+    let req = json_with_token("PUT", "/api/agents/632f31d2/overrides", command_body, &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let env_body = json!({
+        "env_override": [{"name": "ANTHROPIC_API_KEY", "value": "sk-x"}]
+    });
+    let req = json_with_token("PUT", "/api/agents/632f31d2/overrides", env_body, &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let greq = get_with_token("/api/agents/632f31d2/overrides", &token);
+    let gbody = body_json(app.clone().oneshot(greq).await.unwrap()).await;
+    assert!(gbody["data"]["command_override"].is_null());
+    assert!(gbody["data"]["env_override"].as_array().unwrap().is_empty());
 }

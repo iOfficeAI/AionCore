@@ -131,6 +131,10 @@ async fn unified_skill_list_includes_auto_inject_entries_from_embedded_corpus() 
     );
     let names: Vec<&str> = auto_items.iter().filter_map(|item| item["name"].as_str()).collect();
     assert!(
+        names.contains(&"aionui-config"),
+        "aionui-config should be shipped as an auto-inject builtin skill: {names:?}",
+    );
+    assert!(
         !names.contains(&"aionui-skills"),
         "aionui-skills should not be shipped as an auto-inject builtin skill: {names:?}",
     );
@@ -287,7 +291,8 @@ async fn list_skills_builtin_entries_carry_relative_location() {
             "builtin" => {
                 saw_builtin = true;
                 let rel = item["relative_location"].as_str().unwrap();
-                assert!(rel.ends_with("/SKILL.md"));
+                let normalized_rel = rel.replace('\\', "/");
+                assert!(normalized_rel.ends_with("/SKILL.md"));
                 let loc = item["location"].as_str().unwrap();
                 assert!(
                     loc.contains("builtin-skills"),
@@ -308,8 +313,9 @@ async fn list_skills_builtin_entries_carry_relative_location() {
             "cron" => {
                 assert!(item.get("relative_location").is_none());
                 let loc = item["location"].as_str().unwrap();
+                let normalized_loc = loc.replace('\\', "/");
                 assert!(
-                    loc.ends_with("/SKILL.md"),
+                    normalized_loc.ends_with("/SKILL.md"),
                     "cron skill location should point at SKILL.md: {loc}"
                 );
             }

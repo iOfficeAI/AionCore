@@ -200,7 +200,15 @@ async fn list_workspace_files(
     body: Result<Json<ListWorkspaceFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<WorkspaceFlatFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let items = state.file_service.list_workspace_files(&req.root).await?;
+    let root = req.root.trim();
+    if root.is_empty() {
+        return Err(ApiError::BadRequest("root is required".to_owned()));
+    }
+    let items = state
+        .file_service
+        .list_workspace_files_with_extra_root(root, Some(Path::new(root)))
+        .await?;
+
     let response: Vec<WorkspaceFlatFileResponse> = items.into_iter().map(to_flat_file_response).collect();
     Ok(Json(ApiResponse::ok(response)))
 }
@@ -296,7 +304,16 @@ async fn rename_entry(
     body: Result<Json<RenameRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RenameResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let new_path = state.file_service.rename_entry(&req.path, &req.new_name).await?;
+    let workspace = req.workspace.unwrap_or_else(|| {
+        std::path::Path::new(&req.path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let new_path = state
+        .file_service
+        .rename_entry_with_extra_root(&req.path, &req.new_name, Some(Path::new(&workspace)))
+        .await?;
     Ok(Json(ApiResponse::ok(RenameResponse { new_path })))
 }
 
@@ -435,7 +452,13 @@ async fn create_zip(
     let entries: Vec<ZipEntry> = req.files.into_iter().map(to_zip_entry).collect();
     let ok = state
         .file_service
-        .create_zip(&req.path, entries, req.request_id)
+        .create_zip_with_extra_roots(
+            &req.path,
+            entries,
+            req.request_id,
+            req.workspace.as_deref().map(Path::new),
+            req.source_root.as_deref().map(Path::new),
+        )
         .await?;
     Ok(Json(ApiResponse::ok(ok)))
 }

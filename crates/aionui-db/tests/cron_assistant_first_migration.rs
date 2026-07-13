@@ -194,6 +194,175 @@ async fn migration_015_populates_aionrs_catalog_by_agent_type() {
     assert!(config_options.contains("\"yolo\""));
 }
 
+#[tokio::test]
+async fn migration_016_clears_internal_aion_cli_overrides_only() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    run_migrations_through(&pool, 15).await;
+    sqlx::query(
+        "UPDATE agent_metadata
+         SET command = 'bad-command',
+             command_override = 'bad-override',
+             env_override = '[{\"name\":\"ANTHROPIC_API_KEY\",\"value\":\"sk-x\"}]'
+         WHERE agent_type = 'aionrs'
+           AND agent_source = 'internal'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO agent_metadata (
+            id, name, backend, command, command_override, env_override, agent_type,
+            enabled, agent_source, sort_order, created_at, updated_at
+         ) VALUES (
+            'external-override-agent', 'External Override', 'external', 'external-cli',
+            '/opt/bin/external-cli', '[{\"name\":\"ANTHROPIC_API_KEY\",\"value\":\"sk-y\"}]',
+            'acp', 1, 'builtin', 999, 1, 1
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    run_migration(&pool, 16).await;
+
+    let internal_row = sqlx::query(
+        "SELECT command, command_override, env_override
+         FROM agent_metadata
+         WHERE agent_type = 'aionrs'
+           AND agent_source = 'internal'
+         LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let internal_command: Option<String> = internal_row.get("command");
+    let internal_command_override: Option<String> = internal_row.get("command_override");
+    let internal_env_override: Option<String> = internal_row.get("env_override");
+    assert_eq!(internal_command, None);
+    assert_eq!(internal_command_override, None);
+    assert_eq!(internal_env_override, None);
+
+    let external_row = sqlx::query(
+        "SELECT command, command_override, env_override
+         FROM agent_metadata
+         WHERE id = 'external-override-agent'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let external_command: String = external_row.get("command");
+    let external_command_override: String = external_row.get("command_override");
+    let external_env_override: String = external_row.get("env_override");
+    assert_eq!(external_command, "external-cli");
+    assert_eq!(external_command_override, "/opt/bin/external-cli");
+    assert_eq!(
+        external_env_override,
+        r#"[{"name":"ANTHROPIC_API_KEY","value":"sk-y"}]"#
+    );
+}
+
+#[tokio::test]
+async fn migration_019_deletes_retired_runtime_client_preferences_only() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    run_migrations_through(&pool, 18).await;
+
+    for key in [
+        "acp.config",
+        "aionrs.config",
+        "codex.config",
+        "acp.cachedModes",
+        "acp.cachedInitializeResult",
+        "acp.cached_config_options",
+        "acp.promptTimeout",
+        "tools.imageGenerationModel",
+    ] {
+        sqlx::query("INSERT INTO client_preferences (key, value, updated_at) VALUES (?, '{}', 1)")
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    run_migration(&pool, 19).await;
+
+    let removed_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM client_preferences
+         WHERE key IN (
+             'acp.config',
+             'aionrs.config',
+             'codex.config',
+             'acp.cachedModes',
+             'acp.cachedInitializeResult',
+             'acp.cached_config_options'
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(removed_count, 0);
+
+    let preserved_keys: Vec<String> = sqlx::query_scalar("SELECT key FROM client_preferences ORDER BY key")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        preserved_keys,
+        vec!["acp.promptTimeout".to_owned(), "tools.imageGenerationModel".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn migration_020_clears_legacy_codex_acp_bridge_without_fixed_id() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    run_migrations_through(&pool, 19).await;
+
+    sqlx::query(
+        "INSERT INTO agent_metadata (
+             id, name, backend, command, args, agent_type, enabled, agent_source,
+             agent_source_info, sort_order, created_at, updated_at
+         ) VALUES (
+             'custom-codex-id', 'Codex CLI', 'codex', 'npx',
+             '[\"-y\",\"@zed-industries/codex-acp@0.14.0\"]',
+             'acp', 1, 'builtin', '{\"binary_name\":\"codex\",\"bridge_binary\":\"npx\"}',
+             3110, 1, 1
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    run_migration(&pool, 20).await;
+
+    let row = sqlx::query(
+        "SELECT command, args, json_extract(agent_source_info, '$.bridge_binary') AS bridge_binary
+         FROM agent_metadata
+         WHERE id = 'custom-codex-id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.get::<Option<String>, _>("command").is_none());
+    assert_eq!(row.get::<String, _>("args"), "[]");
+    assert!(row.get::<Option<String>, _>("bridge_binary").is_none());
+}
+
 async fn insert_legacy_cron(
     pool: &sqlx::SqlitePool,
     id: &str,

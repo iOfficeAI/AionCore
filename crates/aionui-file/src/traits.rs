@@ -24,6 +24,17 @@ pub trait IFileService: Send + Sync {
     /// Returns at most 20,000 entries.
     async fn list_workspace_files(&self, root: &str) -> Result<Vec<WorkspaceFlatFile>, FileError>;
 
+    /// Recursively list all files under `root`, allowing one trusted
+    /// request-scoped workspace root in addition to the service sandbox.
+    async fn list_workspace_files_with_extra_root(
+        &self,
+        root: &str,
+        extra_root: Option<&Path>,
+    ) -> Result<Vec<WorkspaceFlatFile>, FileError> {
+        let _ = extra_root;
+        self.list_workspace_files(root).await
+    }
+
     /// Get metadata for a single file or directory.
     async fn get_file_metadata(&self, path: &str, extra_root: Option<&Path>) -> Result<FileMetadata, FileError>;
 
@@ -58,6 +69,18 @@ pub trait IFileService: Send + Sync {
 
     /// Rename a file or directory. Returns the new absolute path.
     async fn rename_entry(&self, path: &str, new_name: &str) -> Result<String, FileError>;
+
+    /// Rename a file or directory, allowing one request-scoped root in
+    /// addition to the service sandbox.
+    async fn rename_entry_with_extra_root(
+        &self,
+        path: &str,
+        new_name: &str,
+        extra_root: Option<&Path>,
+    ) -> Result<String, FileError> {
+        let _ = extra_root;
+        self.rename_entry(path, new_name).await
+    }
 
     /// Create an empty temporary file and return its absolute path.
     async fn create_temp_file(&self, file_name: &str) -> Result<String, FileError>;
@@ -98,6 +121,20 @@ pub trait IFileService: Send + Sync {
         entries: Vec<ZipEntry>,
         request_id: Option<String>,
     ) -> Result<bool, FileError>;
+
+    /// Create a ZIP archive, allowing request-scoped roots for the output path
+    /// and disk source entries in addition to the service sandbox.
+    async fn create_zip_with_extra_roots(
+        &self,
+        path: &str,
+        entries: Vec<ZipEntry>,
+        request_id: Option<String>,
+        output_root: Option<&Path>,
+        source_root: Option<&Path>,
+    ) -> Result<bool, FileError> {
+        let _ = (output_root, source_root);
+        self.create_zip(path, entries, request_id).await
+    }
 
     /// Cancel an in-progress ZIP operation by its `request_id`.
     /// Returns `true` if a matching operation was found and cancelled.

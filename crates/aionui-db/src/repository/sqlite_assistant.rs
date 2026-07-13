@@ -352,6 +352,14 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         Ok(rows)
     }
 
+    async fn list_including_deleted(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        let rows =
+            sqlx::query_as::<_, AssistantDefinitionRow>("SELECT * FROM assistant_definitions ORDER BY updated_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
     async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantDefinitionRow>(
             "SELECT * FROM assistant_definitions WHERE assistant_id = ? AND deleted_at IS NULL",
@@ -359,6 +367,18 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         .bind(assistant_id)
         .fetch_optional(&self.pool)
         .await?;
+        Ok(row)
+    }
+
+    async fn get_by_assistant_id_including_deleted(
+        &self,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        let row =
+            sqlx::query_as::<_, AssistantDefinitionRow>("SELECT * FROM assistant_definitions WHERE assistant_id = ?")
+                .bind(assistant_id)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row)
     }
 
@@ -387,6 +407,21 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         Ok(row)
     }
 
+    async fn get_by_source_ref_including_deleted(
+        &self,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        let row = sqlx::query_as::<_, AssistantDefinitionRow>(
+            "SELECT * FROM assistant_definitions WHERE source = ? AND source_ref = ?",
+        )
+        .bind(source)
+        .bind(source_ref)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     async fn upsert(&self, params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
         let now = now_ms();
 
@@ -398,10 +433,11 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
                 recommended_prompts, recommended_prompts_i18n,
                 default_model_mode, default_model_value,
                 default_permission_mode, default_permission_value,
+                default_thought_level_mode, default_thought_level_value,
                 default_skills_mode, default_skill_ids, custom_skill_names, default_disabled_builtin_skill_ids,
                 default_mcps_mode, default_mcp_ids,
                 created_at, updated_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             ON CONFLICT(id) DO UPDATE SET
                 assistant_id = excluded.assistant_id,
                 source = excluded.source,
@@ -425,6 +461,8 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
                 default_model_value = excluded.default_model_value,
                 default_permission_mode = excluded.default_permission_mode,
                 default_permission_value = excluded.default_permission_value,
+                default_thought_level_mode = excluded.default_thought_level_mode,
+                default_thought_level_value = excluded.default_thought_level_value,
                 default_skills_mode = excluded.default_skills_mode,
                 default_skill_ids = excluded.default_skill_ids,
                 custom_skill_names = excluded.custom_skill_names,
@@ -457,6 +495,8 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         .bind(params.default_model_value)
         .bind(params.default_permission_mode)
         .bind(params.default_permission_value)
+        .bind(params.default_thought_level_mode)
+        .bind(params.default_thought_level_value)
         .bind(params.default_skills_mode)
         .bind(params.default_skill_ids)
         .bind(params.custom_skill_names)
@@ -474,6 +514,27 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
                 params.id
             ))
         })
+    }
+
+    async fn update_avatar_fields_preserving_deleted(
+        &self,
+        id: &str,
+        avatar_type: &str,
+        avatar_value: Option<&str>,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        let row = sqlx::query_as::<_, AssistantDefinitionRow>(
+            "UPDATE assistant_definitions
+             SET avatar_type = ?, avatar_value = ?, updated_at = ?
+             WHERE id = ?
+             RETURNING *",
+        )
+        .bind(avatar_type)
+        .bind(avatar_value)
+        .bind(now_ms())
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     async fn soft_delete(&self, id: &str, deleted_at: i64) -> Result<bool, DbError> {
@@ -568,12 +629,13 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
         let now = now_ms();
         sqlx::query(
             "INSERT INTO assistant_preferences (
-                assistant_definition_id, last_model_id, last_permission_value, last_skill_ids,
+                assistant_definition_id, last_model_id, last_permission_value, last_thought_level_value, last_skill_ids,
                 last_disabled_builtin_skill_ids, last_mcp_ids, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(assistant_definition_id) DO UPDATE SET
                 last_model_id = excluded.last_model_id,
                 last_permission_value = excluded.last_permission_value,
+                last_thought_level_value = excluded.last_thought_level_value,
                 last_skill_ids = excluded.last_skill_ids,
                 last_disabled_builtin_skill_ids = excluded.last_disabled_builtin_skill_ids,
                 last_mcp_ids = excluded.last_mcp_ids,
@@ -582,6 +644,7 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
         .bind(params.assistant_definition_id)
         .bind(params.last_model_id)
         .bind(params.last_permission_value)
+        .bind(params.last_thought_level_value)
         .bind(params.last_skill_ids)
         .bind(params.last_disabled_builtin_skill_ids)
         .bind(params.last_mcp_ids)
@@ -604,97 +667,6 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
-    }
-}
-
-pub async fn rebuild_legacy_assistant_mirror(
-    pool: &SqlitePool,
-    definition: &AssistantDefinitionRow,
-    state: Option<&AssistantOverlayRow>,
-) -> Result<(), DbError> {
-    let prompts = normalize_json_array(Some(definition.recommended_prompts.as_str()));
-    let default_skills = normalize_json_array(Some(definition.default_skill_ids.as_str()));
-    let custom_skill_names = normalize_json_array(Some(definition.custom_skill_names.as_str()));
-    let disabled_builtin = normalize_json_array(Some(definition.default_disabled_builtin_skill_ids.as_str()));
-    let models = match (
-        definition.default_model_mode.as_str(),
-        definition.default_model_value.as_deref(),
-    ) {
-        ("fixed", Some(model)) => serde_json::to_string(&vec![model]).unwrap_or_else(|_| "[]".to_string()),
-        _ => "[]".to_string(),
-    };
-    if definition.source == "user" {
-        sqlx::query(
-            "INSERT INTO assistants (
-                id, name, description, avatar, enabled_skills,
-                custom_skill_names, disabled_builtin_skills, prompts, models,
-                name_i18n, description_i18n, prompts_i18n, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                description = excluded.description,
-                avatar = excluded.avatar,
-                enabled_skills = excluded.enabled_skills,
-                custom_skill_names = excluded.custom_skill_names,
-                disabled_builtin_skills = excluded.disabled_builtin_skills,
-                prompts = excluded.prompts,
-                models = excluded.models,
-                name_i18n = excluded.name_i18n,
-                description_i18n = excluded.description_i18n,
-                prompts_i18n = excluded.prompts_i18n,
-                updated_at = excluded.updated_at",
-        )
-        .bind(&definition.assistant_id)
-        .bind(&definition.name)
-        .bind(&definition.description)
-        .bind(&definition.avatar_value)
-        .bind(&default_skills)
-        .bind(&custom_skill_names)
-        .bind(&disabled_builtin)
-        .bind(&prompts)
-        .bind(&models)
-        .bind(&definition.name_i18n)
-        .bind(&definition.description_i18n)
-        .bind(&definition.recommended_prompts_i18n)
-        .bind(definition.created_at)
-        .bind(definition.updated_at)
-        .execute(pool)
-        .await?;
-    } else {
-        sqlx::query("DELETE FROM assistants WHERE id = ?")
-            .bind(&definition.assistant_id)
-            .execute(pool)
-            .await?;
-    }
-
-    let enabled = state.map(|row| row.enabled).unwrap_or(true);
-    let sort_order = state.map(|row| row.sort_order).unwrap_or_default();
-    let last_used_at = state.and_then(|row| row.last_used_at);
-
-    sqlx::query(
-        "INSERT INTO assistant_overrides (assistant_id, enabled, sort_order, last_used_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(assistant_id) DO UPDATE SET
-            enabled = excluded.enabled,
-            sort_order = excluded.sort_order,
-            last_used_at = excluded.last_used_at,
-            updated_at = excluded.updated_at",
-    )
-    .bind(&definition.assistant_id)
-    .bind(enabled)
-    .bind(sort_order)
-    .bind(last_used_at)
-    .bind(state.map(|row| row.updated_at).unwrap_or(definition.updated_at))
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
-fn normalize_json_array(raw: Option<&str>) -> String {
-    match raw {
-        Some(value) if !value.trim().is_empty() => value.to_string(),
-        _ => "[]".to_string(),
     }
 }
 
@@ -773,6 +745,8 @@ mod tests {
             default_model_value: None,
             default_permission_mode: "fixed",
             default_permission_value: Some("workspace-write"),
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
             default_skills_mode: "fixed",
             default_skill_ids: r#"["pdf","cron"]"#,
             custom_skill_names: r#"["my-custom-skill"]"#,
@@ -1079,6 +1053,7 @@ mod tests {
                 assistant_definition_id: &definition.id,
                 last_model_id: Some("gpt-4.1"),
                 last_permission_value: Some("workspace-write"),
+                last_thought_level_value: Some("high"),
                 last_skill_ids: r#"["pdf"]"#,
                 last_disabled_builtin_skill_ids: r#"["todo-tracker"]"#,
                 last_mcp_ids: r#"["mcp-1"]"#,
@@ -1086,149 +1061,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row.last_model_id.as_deref(), Some("gpt-4.1"));
+        assert_eq!(row.last_thought_level_value.as_deref(), Some("high"));
 
         let fetched = p.get(&definition.id).await.unwrap().unwrap();
         assert_eq!(fetched.last_skill_ids, r#"["pdf"]"#);
-    }
-
-    #[tokio::test]
-    async fn rebuild_legacy_mirror_creates_legacy_rows() {
-        let (d, s, _p, db) = setup_v2().await;
-        let definition = d.upsert(&definition_params("u1", "User One")).await.unwrap();
-        let state = s
-            .upsert(&UpsertAssistantOverlayParams {
-                assistant_definition_id: &definition.id,
-                enabled: false,
-                sort_order: 7,
-                agent_id_override: Some("claude"),
-                last_used_at: Some(999),
-            })
-            .await
-            .unwrap();
-
-        rebuild_legacy_assistant_mirror(db.pool(), &definition, Some(&state))
-            .await
-            .unwrap();
-
-        let legacy_assistant = sqlx::query_as::<_, AssistantRow>("SELECT * FROM assistants WHERE id = 'u1'")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(legacy_assistant.avatar.as_deref(), Some("🤖"));
-        assert_eq!(legacy_assistant.enabled_skills.as_deref(), Some(r#"["pdf","cron"]"#));
-
-        let legacy_override =
-            sqlx::query_as::<_, AssistantOverrideRow>("SELECT * FROM assistant_overrides WHERE assistant_id = 'u1'")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert!(!legacy_override.enabled);
-        assert_eq!(legacy_override.sort_order, 7);
-        assert_eq!(legacy_override.last_used_at, Some(999));
-    }
-
-    #[tokio::test]
-    async fn rebuild_legacy_mirror_omits_runtime_backend_columns() {
-        let (d, s, _p, db) = setup_v2().await;
-        let mut params = definition_params("u2", "User Two");
-        params.id = "asstdef_u2";
-        params.agent_id = "cc126dd5";
-        let definition = d.upsert(&params).await.unwrap();
-        let state = s
-            .upsert(&UpsertAssistantOverlayParams {
-                assistant_definition_id: &definition.id,
-                enabled: true,
-                sort_order: 0,
-                agent_id_override: Some("2d23ff1c"),
-                last_used_at: None,
-            })
-            .await
-            .unwrap();
-
-        rebuild_legacy_assistant_mirror(db.pool(), &definition, Some(&state))
-            .await
-            .unwrap();
-
-        let legacy_assistant = sqlx::query_as::<_, AssistantRow>("SELECT * FROM assistants WHERE id = 'u2'")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(legacy_assistant.name, "User Two");
-
-        let legacy_override =
-            sqlx::query_as::<_, AssistantOverrideRow>("SELECT * FROM assistant_overrides WHERE assistant_id = 'u2'")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert!(legacy_override.enabled);
-    }
-
-    #[tokio::test]
-    async fn rebuild_legacy_mirror_skips_builtin_assistant_rows() {
-        let (d, s, _p, db) = setup_v2().await;
-        let definition = d
-            .upsert(&UpsertAssistantDefinitionParams {
-                id: "asstdef_builtin_office",
-                assistant_id: "builtin-office",
-                source: "builtin",
-                owner_type: "system",
-                source_ref: Some("builtin-office"),
-                source_version: None,
-                source_hash: None,
-                name: "Office",
-                name_i18n: r#"{"zh-CN":"Office"}"#,
-                description: Some("builtin"),
-                description_i18n: "{}",
-                avatar_type: "builtin_asset",
-                avatar_value: Some("office.svg"),
-                agent_id: "aionrs",
-                rule_resource_type: "builtin_asset",
-                rule_resource_ref: Some("builtin-office"),
-                rule_inline_content: None,
-                recommended_prompts: r#"["hello"]"#,
-                recommended_prompts_i18n: "{}",
-                default_model_mode: "auto",
-                default_model_value: None,
-                default_permission_mode: "auto",
-                default_permission_value: None,
-                default_skills_mode: "fixed",
-                default_skill_ids: "[]",
-                custom_skill_names: "[]",
-                default_disabled_builtin_skill_ids: "[]",
-                default_mcps_mode: "auto",
-                default_mcp_ids: "[]",
-            })
-            .await
-            .unwrap();
-        let state = s
-            .upsert(&UpsertAssistantOverlayParams {
-                assistant_definition_id: &definition.id,
-                enabled: false,
-                sort_order: 3,
-                agent_id_override: Some("claude"),
-                last_used_at: Some(42),
-            })
-            .await
-            .unwrap();
-
-        rebuild_legacy_assistant_mirror(db.pool(), &definition, Some(&state))
-            .await
-            .unwrap();
-
-        let legacy_assistant_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM assistants WHERE id = 'builtin-office'")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert_eq!(legacy_assistant_count, 0);
-
-        let legacy_override = sqlx::query_as::<_, AssistantOverrideRow>(
-            "SELECT * FROM assistant_overrides WHERE assistant_id = 'builtin-office'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert!(!legacy_override.enabled);
-        assert_eq!(legacy_override.sort_order, 3);
+        assert_eq!(fetched.last_thought_level_value.as_deref(), Some("high"));
     }
 }

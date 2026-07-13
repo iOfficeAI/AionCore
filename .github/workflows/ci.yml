@@ -18,8 +18,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - run: scripts/check-migration-immutability.test.sh
-      - run: scripts/check-migration-immutability.sh
+      - run: bash scripts/migration/check-immutability.test.sh
+      - run: bash scripts/migration/check-immutability.sh
 
   fmt:
     name: Format

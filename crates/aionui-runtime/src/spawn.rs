@@ -268,7 +268,7 @@ fn shell_wrap_windows_script(program: &OsStr) -> Option<ProgramPlan> {
     if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
         return Some(ProgramPlan {
             program: "cmd".into(),
-            args_prefix: vec!["/c".into(), program.into()],
+            args_prefix: vec!["/d".into(), "/c".into(), program.into()],
         });
     }
 
@@ -340,14 +340,11 @@ async fn kill_windows_process_tree(pid: u32) -> io::Result<()> {
         return Ok(());
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "taskkill failed for pid {pid} (exit {:?}): {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-    ))
+    Err(io::Error::other(format!(
+        "taskkill failed for pid {pid} (exit {:?}): {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
 
 /// Resolve `program` through `resolve_command_path` so callers don't have
@@ -527,6 +524,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                OsString::from("/d"),
                 OsString::from("/c"),
                 OsString::from(r"C:\Users\me\AppData\Roaming\npm\opencode.cmd"),
                 OsString::from("run"),
@@ -543,6 +541,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                OsString::from("/d"),
                 OsString::from("/c"),
                 OsString::from(r"C:\Users\me\AppData\Roaming\npm\opencode.bat"),
                 OsString::from("--version"),

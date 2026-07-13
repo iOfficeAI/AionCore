@@ -112,6 +112,7 @@ pub enum AgentManagementStatus {
     Missing,
     Online,
     Offline,
+    Unchecked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +284,8 @@ pub struct AgentManagementRow {
     pub available_modes: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_models: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_commands: Option<serde_json::Value>,
     pub sort_order: i64,
     #[serde(default)]
     pub team_capable: bool,
@@ -406,6 +409,8 @@ mod tests {
     fn agent_management_status_serializes_snake_case() {
         let value = serde_json::to_value(AgentManagementStatus::Offline).unwrap();
         assert_eq!(value, json!("offline"));
+        let value = serde_json::to_value(AgentManagementStatus::Unchecked).unwrap();
+        assert_eq!(value, json!("unchecked"));
     }
 }
 

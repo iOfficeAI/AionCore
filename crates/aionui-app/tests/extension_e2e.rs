@@ -1221,7 +1221,9 @@ async fn skill_import_returns_specific_code_for_oversized_file() {
         "---\nname: huge-skill\ndescription: Huge skill\n---\nBody",
     )
     .unwrap();
-    std::fs::write(skill_dir.join("movie.bin"), vec![0u8; 10 * 1024 * 1024 + 1]).unwrap();
+    let oversized_file_bytes = 50 * 1024 * 1024 + 1;
+    let oversized_file = std::fs::File::create(skill_dir.join("movie.bin")).unwrap();
+    oversized_file.set_len(oversized_file_bytes).unwrap();
 
     let resp = app
         .oneshot(json_with_token(
@@ -1244,8 +1246,8 @@ async fn skill_import_returns_specific_code_for_oversized_file() {
             "source_name": "huge-skill",
             "code": "SKILL_IMPORT_FILE_TOO_LARGE",
             "error_path": "movie.bin",
-            "actual_bytes": 10 * 1024 * 1024 + 1,
-            "limit_bytes": 10 * 1024 * 1024
+            "actual_bytes": oversized_file_bytes,
+            "limit_bytes": 50 * 1024 * 1024
         }])
     );
 }
@@ -1271,7 +1273,9 @@ async fn skill_batch_import_reports_partial_failures_without_rolling_back_succes
         "---\nname: sample-beta\ndescription: Beta skill\n---\nBody",
     )
     .unwrap();
-    std::fs::write(beta_dir.join("movie.bin"), vec![0u8; 10 * 1024 * 1024 + 1]).unwrap();
+    let oversized_file_bytes = 50 * 1024 * 1024 + 1;
+    let oversized_file = std::fs::File::create(beta_dir.join("movie.bin")).unwrap();
+    oversized_file.set_len(oversized_file_bytes).unwrap();
 
     let resp = app
         .clone()
@@ -1295,8 +1299,8 @@ async fn skill_batch_import_reports_partial_failures_without_rolling_back_succes
             "source_name": "beta-skill",
             "code": "SKILL_IMPORT_FILE_TOO_LARGE",
             "error_path": "movie.bin",
-            "actual_bytes": 10 * 1024 * 1024 + 1,
-            "limit_bytes": 10 * 1024 * 1024
+            "actual_bytes": oversized_file_bytes,
+            "limit_bytes": 50 * 1024 * 1024
         }])
     );
     assert!(paths.user_skills_dir.join("sample-alpha").join("SKILL.md").exists());
@@ -1315,8 +1319,8 @@ async fn skill_batch_import_reports_partial_failures_without_rolling_back_succes
                 && record["status"] == "failed"
                 && record["error_code"] == "SKILL_IMPORT_FILE_TOO_LARGE"
                 && record["error_path"] == "movie.bin"
-                && record["actual_bytes"] == 10 * 1024 * 1024 + 1
-                && record["limit_bytes"] == 10 * 1024 * 1024
+                && record["actual_bytes"] == oversized_file_bytes
+                && record["limit_bytes"] == 50 * 1024 * 1024
         }),
         "history records = {records:?}"
     );

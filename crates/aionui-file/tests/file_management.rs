@@ -170,23 +170,50 @@ async fn copy_files_directory_in_list_is_failed() {
 }
 
 #[tokio::test]
-async fn copy_files_outside_sandbox_fails() {
+async fn copy_files_accepts_source_and_workspace_outside_sandbox() {
     let sandbox = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    let ws = sandbox.path().join("ws");
+    let source = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let ws = workspace.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+    fs::write(source.path().join("picked.txt"), "picked").unwrap();
 
     let svc = make_service(sandbox.path());
-    let paths = vec![outside.path().join("secret.txt").to_string_lossy().into_owned()];
+    let paths = vec![source.path().join("picked.txt").to_string_lossy().into_owned()];
 
     let result = svc
         .copy_files_to_workspace(&paths, ws.to_str().unwrap(), None)
         .await
         .unwrap();
 
+    assert_eq!(result.copied_files.len(), 1);
+    assert!(result.failed_files.is_empty());
+    assert_eq!(fs::read_to_string(ws.join("picked.txt")).unwrap(), "picked");
+}
+
+#[tokio::test]
+async fn copy_files_rejects_source_outside_explicit_source_root() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let source_root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+
+    let svc = make_service(sandbox.path());
+    let paths = vec![outside.path().join("secret.txt").to_string_lossy().into_owned()];
+
+    let result = svc
+        .copy_files_to_workspace(
+            &paths,
+            workspace.path().to_str().unwrap(),
+            Some(source_root.path().to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+
     assert!(result.copied_files.is_empty());
     assert_eq!(result.failed_files.len(), 1);
+    assert!(!workspace.path().join("secret.txt").exists());
 }
 
 // -----------------------------------------------------------------------

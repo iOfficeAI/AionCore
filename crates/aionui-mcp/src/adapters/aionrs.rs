@@ -6,7 +6,7 @@ use crate::adapter::{DetectedServer, McpAgentAdapter};
 use crate::error::McpError;
 use crate::types::McpServerTransport;
 
-use super::cli_helpers::{DETECT_TIMEOUT, is_cli_installed, run_cli_strict};
+use super::cli_helpers::{DETECT_TIMEOUT, is_cli_installed, run_cli, run_cli_strict};
 
 const CLI_NAME: &str = "aionrs";
 
@@ -171,13 +171,27 @@ impl McpAgentAdapter for AionrsAdapter {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Run `aionrs --config-path` to get the TOML config file path.
+/// Resolve the TOML config file path from the `aionrs` CLI.
+///
+/// Newer `aionrs` exposes this via the `config path` subcommand; older
+/// versions used the `--config-path` flag. We try the subcommand first and
+/// fall back to the legacy flag so both CLI versions keep working. The
+/// subcommand attempt uses `run_cli` (tolerating a non-zero exit) so an old
+/// CLI rejecting `config path` falls through to the flag instead of erroring.
 async fn get_config_path() -> Result<String, McpError> {
+    if let Ok((stdout, _stderr)) = run_cli(CLI_NAME, &["config", "path"], DETECT_TIMEOUT).await {
+        let path = stdout.trim();
+        if !path.is_empty() {
+            return Ok(path.to_owned());
+        }
+    }
+
+    // Legacy fallback for `aionrs` versions predating the `config` subcommand.
     let stdout = run_cli_strict(CLI_NAME, &["--config-path"], DETECT_TIMEOUT).await?;
     let path = stdout.trim().to_owned();
     if path.is_empty() {
         return Err(McpError::AgentOperationFailed(
-            "aionrs --config-path returned empty output".into(),
+            "aionrs config path returned empty output".into(),
         ));
     }
     Ok(path)

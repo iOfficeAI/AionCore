@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,51 @@ use crate::types::{AionrsResolvedConfig, SendMessageData};
 
 use super::error::aionrs_engine_error_to_send_error;
 
+#[derive(Clone, Debug)]
+struct AionrsFinalInputDumpContext {
+    dump_dir: PathBuf,
+    provider: String,
+    model: String,
+    base_url: Option<String>,
+    system_prompt: Option<String>,
+    session_mode: Option<String>,
+    skills: Vec<String>,
+    mcp_servers: HashMap<String, aion_config::config::McpServerConfig>,
+    runtime_env: Vec<(String, String)>,
+}
+
+fn build_aionrs_final_input_dump_value(
+    conversation_id: &str,
+    workspace: &str,
+    context: &AionrsFinalInputDumpContext,
+    data: &SendMessageData,
+) -> Value {
+    serde_json::json!({
+        "kind": "aionrs-final-input",
+        "backend": "aionrs",
+        "conversation_id": conversation_id,
+        "session_id": "none",
+        "msg_id": data.msg_id,
+        "turn_id": data.turn_id.as_deref().unwrap_or("none"),
+        "input": {
+            "system_prompt": context.system_prompt.as_deref(),
+            "user_content": &data.content,
+        },
+        "resolved_context": {
+            "provider": &context.provider,
+            "model": &context.model,
+            "base_url": context.base_url.as_deref(),
+            "workspace": {
+                "path": workspace,
+            },
+            "session_mode": context.session_mode.as_deref(),
+            "skills": &context.skills,
+            "mcp_servers": serde_json::to_value(&context.mcp_servers).unwrap_or(Value::Null),
+            "runtime_env": &context.runtime_env,
+        },
+    })
+}
+
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
@@ -44,6 +90,7 @@ pub struct AionrsAgentManager {
     mcp_managers: Vec<Arc<McpManager>>,
     approval_manager: Arc<ToolApprovalManager>,
     confirmations: Arc<std::sync::RwLock<Vec<Confirmation>>>,
+    final_input_dump: Option<AionrsFinalInputDumpContext>,
     /// Signalled by `cancel()` to abort an in-flight `engine.run()` via
     /// `tokio::select!` in `send_message()`.
     cancel_notify: Arc<Notify>,
@@ -70,19 +117,36 @@ impl AionrsAgentManager {
     ) -> Result<Self, AgentError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
+        let runtime_env = config_extra.runtime_env.clone();
+        let final_input_dump = config_extra
+            .prompt_dump_dir
+            .clone()
+            .map(|dump_dir| AionrsFinalInputDumpContext {
+                dump_dir,
+                provider: config_extra.provider.clone(),
+                model: config_extra.model.clone(),
+                base_url: config_extra.base_url.clone(),
+                system_prompt: config_extra.system_prompt.clone(),
+                session_mode: config_extra.session_mode.clone(),
+                skills: config_extra.skills.clone(),
+                mcp_servers: config_extra.extra_mcp_servers.clone(),
+                runtime_env: config_extra.runtime_env.clone(),
+            });
 
         let cli_args = CliArgs {
             provider: Some(config_extra.provider.clone()),
             api_key: Some(config_extra.api_key.clone()),
             base_url: config_extra.base_url.clone(),
             model: Some(config_extra.model.clone()),
-            max_tokens: Some(config_extra.max_tokens),
+            max_tokens: config_extra.max_tokens,
             max_turns: config_extra.max_turns,
             max_tool_call_malformed_turns: config_extra.max_tool_call_malformed_turns,
             max_tool_call_failure_turns: config_extra.max_tool_call_failure_turns,
             system_prompt: config_extra.system_prompt.clone(),
             profile: None,
             auto_approve: config_extra.session_mode.as_deref() == Some("yolo"),
+            thinking: None,
+            thinking_budget: None,
             project_dir: Some(PathBuf::from(&workspace)),
         };
 
@@ -95,10 +159,10 @@ impl AionrsAgentManager {
         config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
 
         if let Some(field) = config_extra.compat_overrides.max_tokens_field {
-            config.compat.max_tokens_field = Some(field);
+            config.compat.transport.max_tokens_field = Some(field);
         }
         if let Some(path) = config_extra.compat_overrides.api_path {
-            config.compat.api_path = Some(path);
+            config.compat.transport.api_path = Some(path);
         }
 
         if !config_extra.extra_mcp_servers.is_empty() {
@@ -108,7 +172,7 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink);
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,
@@ -170,6 +234,7 @@ impl AionrsAgentManager {
             mcp_managers: result.mcp_managers,
             approval_manager,
             confirmations,
+            final_input_dump,
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
         })
@@ -195,6 +260,52 @@ impl AionrsAgentManager {
         );
 
         was_running
+    }
+
+    fn dump_aionrs_final_input(&self, data: &SendMessageData) {
+        let Some(context) = self.final_input_dump.as_ref() else {
+            return;
+        };
+
+        let value = build_aionrs_final_input_dump_value(
+            self.runtime.conversation_id(),
+            self.runtime.workspace(),
+            context,
+            data,
+        );
+        let input = value.get("input").cloned().unwrap_or(Value::Null);
+        let resolved_context = value.get("resolved_context").cloned().unwrap_or(Value::Null);
+
+        match crate::dev_prompt_dump::dump_agent_final_input(
+            &context.dump_dir,
+            crate::dev_prompt_dump::AgentFinalInputDump {
+                kind: "aionrs-final-input",
+                backend: "aionrs",
+                conversation_id: self.runtime.conversation_id(),
+                session_id: None,
+                msg_id: Some(data.msg_id.as_str()),
+                turn_id: data.turn_id.as_deref(),
+                input,
+                resolved_context,
+            },
+        ) {
+            Ok(path) => {
+                debug!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    msg_id = %data.msg_id,
+                    path = %path.display(),
+                    "DEV agent final input dump written"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    msg_id = %data.msg_id,
+                    error = %error,
+                    "DEV agent final input dump failed"
+                );
+            }
+        }
     }
 }
 
@@ -234,6 +345,7 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         );
         self.runtime.bump_activity();
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
+        self.dump_aionrs_final_input(&data);
 
         let mut engine = self.engine.lock().await;
 
@@ -484,16 +596,78 @@ mod tests {
             model: "claude-sonnet-4-20250514".into(),
             base_url: None,
             system_prompt: None,
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             max_turns: None,
             max_tool_call_malformed_turns: None,
             max_tool_call_failure_turns: None,
             compat_overrides: Default::default(),
             session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
             session_mode: None,
+            skills: Vec::new(),
             extra_mcp_servers: std::collections::HashMap::new(),
             bedrock_config: None,
+            runtime_env: Vec::new(),
+            prompt_dump_dir: None,
         }
+    }
+
+    #[test]
+    fn aionrs_final_input_dump_value_contains_raw_split_input_and_context() {
+        let mut mcp_env = std::collections::HashMap::new();
+        mcp_env.insert("TOKEN".to_owned(), "raw-token-value".to_owned());
+
+        let mut mcp_servers = std::collections::HashMap::new();
+        mcp_servers.insert(
+            "raw-mcp".to_owned(),
+            aion_config::config::McpServerConfig {
+                transport: aion_config::config::TransportType::Stdio,
+                command: Some("/bin/raw-mcp".to_owned()),
+                args: Some(vec!["--serve".to_owned()]),
+                env: Some(mcp_env),
+                url: None,
+                headers: None,
+                deferred: Some(false),
+                startup_timeout_ms: None,
+            },
+        );
+
+        let context = AionrsFinalInputDumpContext {
+            dump_dir: std::path::PathBuf::from("/tmp/prompt-dumps"),
+            provider: "openai".to_owned(),
+            model: "gpt-test".to_owned(),
+            base_url: Some("https://example.test/v1".to_owned()),
+            system_prompt: Some("assistant rule raw".to_owned()),
+            session_mode: Some("yolo".to_owned()),
+            skills: vec!["aionui-config".to_owned()],
+            mcp_servers,
+            runtime_env: vec![("AIONUI_RAW".to_owned(), "raw-env-value".to_owned())],
+        };
+        let data = SendMessageData {
+            content: "team wake raw content".to_owned(),
+            msg_id: "msg-aionrs-final".to_owned(),
+            turn_id: Some("turn-aionrs-final".to_owned()),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+        };
+
+        let value = build_aionrs_final_input_dump_value("conv-aionrs", "/workspace", &context, &data);
+
+        assert_eq!(value["kind"], "aionrs-final-input");
+        assert_eq!(value["backend"], "aionrs");
+        assert_eq!(value["conversation_id"], "conv-aionrs");
+        assert_eq!(value["msg_id"], "msg-aionrs-final");
+        assert_eq!(value["turn_id"], "turn-aionrs-final");
+        assert_eq!(value["input"]["system_prompt"], "assistant rule raw");
+        assert_eq!(value["input"]["user_content"], "team wake raw content");
+        assert_eq!(value["resolved_context"]["provider"], "openai");
+        assert_eq!(value["resolved_context"]["model"], "gpt-test");
+        assert_eq!(value["resolved_context"]["workspace"]["path"], "/workspace");
+        assert_eq!(value["resolved_context"]["skills"][0], "aionui-config");
+        assert_eq!(
+            value["resolved_context"]["mcp_servers"]["raw-mcp"]["env"]["TOKEN"],
+            "raw-token-value"
+        );
+        assert_eq!(value["resolved_context"]["runtime_env"][0][1], "raw-env-value");
     }
 
     #[tokio::test]

@@ -27,6 +27,10 @@ env:
   CARGO_NET_RETRY: "10"
   AIONUI_EMBED_BUN: "1"
   BUN_VARIANT: default
+  # cross commit used by the v0.1.39/v0.1.40 Linux ARM64 release builds.
+  CROSS_GIT_REV: "29d00c7803f221f1b3f35e561b03792368fb8339"
+  LINUX_X64_GLIBC_MAX: "GLIBC_2.34"
+  LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
   RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
 
 jobs:
@@ -104,17 +108,21 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          # Include runner OS image and use_cross flag in the cache key.
+          # Include runner OS image and cross baseline in the cache key.
           # Proc-macro .so files link against the host GLIBC, so switching
           # the runner (ubuntu-24.04 ↔ 22.04) or flipping native ↔ cross
           # must fall into a different cache bucket — otherwise the cached
           # .so is loaded against an incompatible GLIBC and cargo panics
           # with "can't find crate" / "GLIBC_* not found" errors.
-          shared-key: release-${{ matrix.target }}-${{ matrix.os }}${{ matrix.use_cross == true && '-cross' || '' }}
+          shared-key: release-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
+
+      - name: Verify pinned Linux ARM64 cross image is available
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: docker pull ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:99e041b94e7d4f31477c6ddede176688562c3762ba3833b75de3316100afc39d
 
       - name: Install cross (Linux targets)
         if: matrix.use_cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev "${CROSS_GIT_REV}" --locked
 
       - name: Build release binary
         shell: bash
@@ -129,6 +137,16 @@ jobs:
           else
             cargo build --release --target ${{ matrix.target }} -p aionui-app
           fi
+
+      - name: Verify Linux ARM64 GLIBC baseline
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_ARM64_GLIBC_MAX}"
+
+      - name: Verify Linux x64 GLIBC baseline
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_X64_GLIBC_MAX}"
 
       - name: Package binary (Unix)
         if: runner.os != 'Windows'
