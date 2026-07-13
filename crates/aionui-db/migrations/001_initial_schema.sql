@@ -202,7 +202,7 @@ VALUES
      1, 'bun', '["x","--bun","@zed-industries/codex-acp@0.9.5"]', '[]',
      '[".codex/skills"]',
      '{"supports_side_question":false,"supports_team":true}',
-     'agent-full-access', 3110,
+     'full-access', 3110,
      unixepoch('now','subsec')*1000, unixepoch('now','subsec')*1000),
 
     ('cc126dd5', '/api/assets/logos/ai-major/gemini.svg', 'Gemini CLI',
