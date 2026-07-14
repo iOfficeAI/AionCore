@@ -115,6 +115,8 @@ fn managed_runtime_official_source_uses_nodejs_org() {
     let source = ManagedNodeDownloadSource::official(PlatformSpec {
         folder_suffix: "darwin-arm64",
         archive_ext: "tar.gz",
+        runtime_key: "darwin-arm64",
+        executable: "bin/node",
     });
 
     assert_eq!(source.source, "nodejs.org");
@@ -123,6 +125,28 @@ fn managed_runtime_official_source_uses_nodejs_org() {
         "https://nodejs.org/dist/v24.11.0/node-v24.11.0-darwin-arm64.tar.gz"
     );
     assert_eq!(source.sha256, None);
+}
+
+#[test]
+fn managed_node_contract_uses_runtime_key_and_exported_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle_root = tmp.path().join("managed-resources");
+    let exported = bundle_root.join("node").join("node-v24.11.0-darwin-arm64");
+    std::fs::create_dir_all(exported.join("bin")).unwrap();
+    write_file(&exported.join("bin").join("node"));
+
+    let spec = PlatformSpec {
+        folder_suffix: "darwin-arm64",
+        archive_ext: "tar.gz",
+        runtime_key: "darwin-arm64",
+        executable: "bin/node",
+    };
+
+    let contract = managed_node_contract_for_export_with_spec(&bundle_root, &exported, spec).expect("contract");
+
+    assert_eq!(contract.version, "24.11.0");
+    assert_eq!(contract.root, "node/node-v24.11.0-darwin-arm64");
+    assert_eq!(contract.executable, "bin/node");
 }
 
 #[test]
@@ -213,6 +237,8 @@ async fn bundled_runtime_validation_failure_does_not_fallback_to_remote_download
         PlatformSpec {
             folder_suffix: "darwin-arm64",
             archive_ext: "tar.gz",
+            runtime_key: "darwin-arm64",
+            executable: "bin/node",
         },
         None,
     )
