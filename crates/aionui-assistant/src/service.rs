@@ -251,26 +251,37 @@ impl AssistantService {
 
     async fn sync_legacy_user_assistants_to_new_tables(&self) -> Result<(), AssistantError> {
         for row in self.repo.list().await? {
-            if self.builtin.has(&row.id) {
-                continue;
+            if let Err(error) = self.sync_legacy_user_assistant_to_new_tables(&row).await {
+                warn!(
+                    assistant_id = %row.id,
+                    error = %error,
+                    "skip dirty legacy assistant during startup bootstrap"
+                );
             }
-            if self
-                .definition_repo
-                .get_by_source_ref_including_deleted("user", &row.id)
-                .await
-                .map_err(|e| AssistantError::Internal(format!("get user definition by source_ref: {e}")))?
-                .is_some()
-                || self
-                    .definition_repo
-                    .get_by_assistant_id_including_deleted(&row.id)
-                    .await
-                    .map_err(|e| AssistantError::Internal(format!("get user definition by assistant_id: {e}")))?
-                    .is_some()
-            {
-                continue;
-            }
-            self.upsert_definition_from_legacy_user_row(&row, None).await?;
         }
+        Ok(())
+    }
+
+    async fn sync_legacy_user_assistant_to_new_tables(&self, row: &AssistantRow) -> Result<(), AssistantError> {
+        if self.builtin.has(&row.id) {
+            return Ok(());
+        }
+        if self
+            .definition_repo
+            .get_by_source_ref_including_deleted("user", &row.id)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("get user definition by source_ref: {e}")))?
+            .is_some()
+            || self
+                .definition_repo
+                .get_by_assistant_id_including_deleted(&row.id)
+                .await
+                .map_err(|e| AssistantError::Internal(format!("get user definition by assistant_id: {e}")))?
+                .is_some()
+        {
+            return Ok(());
+        }
+        self.upsert_definition_from_legacy_user_row(row, None).await?;
         Ok(())
     }
 
@@ -389,123 +400,153 @@ impl AssistantService {
 
         let mut missing_index = 0usize;
         for row in generated_rows {
-            let existing_definition = definitions
-                .iter()
-                .find(|definition| {
-                    definition.source == "generated" && definition.source_ref.as_deref() == Some(row.id.as_str())
-                })
-                .cloned();
-            let is_missing = existing_definition.is_none();
-            let assistant_id = format!("bare:{}", row.id);
-            let (definition_id, assistant_id) = self
-                .resolve_definition_identity("generated", Some(&row.id), &assistant_id)
-                .await?;
-            let avatar_value = row.icon.as_deref().filter(|value| !value.trim().is_empty());
-            let (definition, should_upsert) = if let Some(mut definition) = existing_definition {
-                let avatar_type = if avatar_value.is_some() { "emoji" } else { "none" };
-                let should_upgrade_skill_defaults = definition.default_skills_mode == "auto"
-                    && decode_str_list(Some(definition.default_skill_ids.as_str()))?.is_empty()
-                    && decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?.is_empty();
-                let identity_changed = definition.name != row.name
-                    || definition.avatar_type != avatar_type
-                    || definition.avatar_value.as_deref() != avatar_value
-                    || definition.agent_id != row.id
-                    || definition.source_ref.as_deref() != Some(row.id.as_str());
-
-                definition.name = row.name.clone();
-                definition.avatar_type = avatar_type.to_string();
-                definition.avatar_value = avatar_value.map(ToOwned::to_owned);
-                definition.agent_id = row.id.clone();
-                definition.source_ref = Some(row.id.clone());
-                if should_upgrade_skill_defaults {
-                    definition.default_skills_mode = "fixed".into();
-                }
-                (definition, identity_changed || should_upgrade_skill_defaults)
-            } else {
-                (
-                    AssistantDefinitionRow {
-                        id: definition_id.clone(),
-                        assistant_id: assistant_id.clone(),
-                        source: "generated".into(),
-                        owner_type: "system".into(),
-                        source_ref: Some(row.id.clone()),
-                        source_version: None,
-                        source_hash: None,
-                        name: row.name.clone(),
-                        name_i18n: "{}".into(),
-                        description: row.description.clone(),
-                        description_i18n: "{}".into(),
-                        avatar_type: if avatar_value.is_some() {
-                            "emoji".into()
-                        } else {
-                            "none".into()
-                        },
-                        avatar_value: avatar_value.map(ToOwned::to_owned),
-                        agent_id: row.id.clone(),
-                        rule_resource_type: "none".into(),
-                        rule_resource_ref: None,
-                        rule_inline_content: None,
-                        recommended_prompts: "[]".into(),
-                        recommended_prompts_i18n: "{}".into(),
-                        default_model_mode: "auto".into(),
-                        default_model_value: None,
-                        default_permission_mode: "auto".into(),
-                        default_permission_value: None,
-                        default_thought_level_mode: "auto".into(),
-                        default_thought_level_value: None,
-                        default_skills_mode: "fixed".into(),
-                        default_skill_ids: "[]".into(),
-                        custom_skill_names: "[]".into(),
-                        default_disabled_builtin_skill_ids: "[]".into(),
-                        default_mcps_mode: "auto".into(),
-                        default_mcp_ids: "[]".into(),
-                        created_at: 0,
-                        updated_at: 0,
-                        deleted_at: None,
-                    },
-                    true,
+            if let Err(error) = self
+                .reconcile_generated_assistant(
+                    row,
+                    &definitions,
+                    has_existing_generated,
+                    existing_min_sort_order,
+                    missing_generated_count,
+                    &mut missing_index,
                 )
-            };
-
-            if should_upsert {
-                self.definition_repo
-                    .upsert(&upsert_params_from_definition(&definition))
-                    .await
-                    .map_err(|e| AssistantError::Internal(format!("upsert generated assistant definition: {e}")))?;
-            }
-
-            if !is_missing {
-                continue;
-            }
-
-            if self
-                .state_repo
-                .get(&definition_id)
                 .await
-                .map_err(|e| AssistantError::Internal(format!("get generated assistant overlay: {e}")))?
-                .is_none()
             {
-                let current_missing_index = missing_index;
-                missing_index += 1;
-                let initial_generated_sort_order = if !has_existing_generated && missing_generated_count > 0 {
-                    existing_min_sort_order as i64 - missing_generated_count as i64 + current_missing_index as i64
-                } else {
-                    row.sort_order
-                };
-                self.state_repo
-                    .upsert(&UpsertAssistantOverlayParams {
-                        assistant_definition_id: &definition_id,
-                        enabled: true,
-                        sort_order: initial_generated_sort_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                        agent_id_override: None,
-                        last_used_at: None,
-                    })
-                    .await
-                    .map_err(|e| AssistantError::Internal(format!("upsert generated assistant overlay: {e}")))?;
+                warn!(
+                    agent_id = %row.id,
+                    error = %error,
+                    "skip dirty generated assistant during startup bootstrap"
+                );
             }
         }
 
         Ok(rows)
+    }
+
+    async fn reconcile_generated_assistant(
+        &self,
+        row: &AgentManagementRow,
+        definitions: &[AssistantDefinitionRow],
+        has_existing_generated: bool,
+        existing_min_sort_order: i32,
+        missing_generated_count: usize,
+        missing_index: &mut usize,
+    ) -> Result<(), AssistantError> {
+        let existing_definition = definitions
+            .iter()
+            .find(|definition| {
+                definition.source == "generated" && definition.source_ref.as_deref() == Some(row.id.as_str())
+            })
+            .cloned();
+        let is_missing = existing_definition.is_none();
+        let assistant_id = format!("bare:{}", row.id);
+        let (definition_id, assistant_id) = self
+            .resolve_definition_identity("generated", Some(&row.id), &assistant_id)
+            .await?;
+        let avatar_value = row.icon.as_deref().filter(|value| !value.trim().is_empty());
+        let (definition, should_upsert) = if let Some(mut definition) = existing_definition {
+            let avatar_type = if avatar_value.is_some() { "emoji" } else { "none" };
+            let should_upgrade_skill_defaults = definition.default_skills_mode == "auto"
+                && decode_str_list(Some(definition.default_skill_ids.as_str()))?.is_empty()
+                && decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?.is_empty();
+            let identity_changed = definition.name != row.name
+                || definition.avatar_type != avatar_type
+                || definition.avatar_value.as_deref() != avatar_value
+                || definition.agent_id != row.id
+                || definition.source_ref.as_deref() != Some(row.id.as_str());
+
+            definition.name = row.name.clone();
+            definition.avatar_type = avatar_type.to_string();
+            definition.avatar_value = avatar_value.map(ToOwned::to_owned);
+            definition.agent_id = row.id.clone();
+            definition.source_ref = Some(row.id.clone());
+            if should_upgrade_skill_defaults {
+                definition.default_skills_mode = "fixed".into();
+            }
+            (definition, identity_changed || should_upgrade_skill_defaults)
+        } else {
+            (
+                AssistantDefinitionRow {
+                    id: definition_id.clone(),
+                    assistant_id: assistant_id.clone(),
+                    source: "generated".into(),
+                    owner_type: "system".into(),
+                    source_ref: Some(row.id.clone()),
+                    source_version: None,
+                    source_hash: None,
+                    name: row.name.clone(),
+                    name_i18n: "{}".into(),
+                    description: row.description.clone(),
+                    description_i18n: "{}".into(),
+                    avatar_type: if avatar_value.is_some() {
+                        "emoji".into()
+                    } else {
+                        "none".into()
+                    },
+                    avatar_value: avatar_value.map(ToOwned::to_owned),
+                    agent_id: row.id.clone(),
+                    rule_resource_type: "none".into(),
+                    rule_resource_ref: None,
+                    rule_inline_content: None,
+                    recommended_prompts: "[]".into(),
+                    recommended_prompts_i18n: "{}".into(),
+                    default_model_mode: "auto".into(),
+                    default_model_value: None,
+                    default_permission_mode: "auto".into(),
+                    default_permission_value: None,
+                    default_thought_level_mode: "auto".into(),
+                    default_thought_level_value: None,
+                    default_skills_mode: "fixed".into(),
+                    default_skill_ids: "[]".into(),
+                    custom_skill_names: "[]".into(),
+                    default_disabled_builtin_skill_ids: "[]".into(),
+                    default_mcps_mode: "auto".into(),
+                    default_mcp_ids: "[]".into(),
+                    created_at: 0,
+                    updated_at: 0,
+                    deleted_at: None,
+                },
+                true,
+            )
+        };
+
+        if should_upsert {
+            self.definition_repo
+                .upsert(&upsert_params_from_definition(&definition))
+                .await
+                .map_err(|e| AssistantError::Internal(format!("upsert generated assistant definition: {e}")))?;
+        }
+
+        if !is_missing {
+            return Ok(());
+        }
+
+        if self
+            .state_repo
+            .get(&definition_id)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("get generated assistant overlay: {e}")))?
+            .is_none()
+        {
+            let current_missing_index = *missing_index;
+            *missing_index += 1;
+            let initial_generated_sort_order = if !has_existing_generated && missing_generated_count > 0 {
+                existing_min_sort_order as i64 - missing_generated_count as i64 + current_missing_index as i64
+            } else {
+                row.sort_order
+            };
+            self.state_repo
+                .upsert(&UpsertAssistantOverlayParams {
+                    assistant_definition_id: &definition_id,
+                    enabled: true,
+                    sort_order: initial_generated_sort_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                    agent_id_override: None,
+                    last_used_at: None,
+                })
+                .await
+                .map_err(|e| AssistantError::Internal(format!("upsert generated assistant overlay: {e}")))?;
+        }
+
+        Ok(())
     }
 
     async fn upsert_definition_from_legacy_user_row(
@@ -3162,6 +3203,122 @@ mod tests {
         fx.service.bootstrap_assistant_storage().await.unwrap();
 
         assert!(fx.repo.get("custom-canonical-only").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_skips_dirty_legacy_user_assistant_rows() {
+        let fx = fixture().await;
+
+        fx.repo
+            .create(&CreateAssistantParams {
+                id: "custom-dirty-json",
+                name: "Dirty JSON",
+                description: None,
+                avatar: None,
+                enabled_skills: Some("not json"),
+                custom_skill_names: None,
+                disabled_builtin_skills: None,
+                prompts: None,
+                models: None,
+                name_i18n: None,
+                description_i18n: None,
+                prompts_i18n: None,
+            })
+            .await
+            .unwrap();
+        fx.repo
+            .create(&CreateAssistantParams {
+                id: "custom-valid",
+                name: "Valid",
+                description: None,
+                avatar: None,
+                enabled_skills: Some(r#"["skill-a"]"#),
+                custom_skill_names: None,
+                disabled_builtin_skills: None,
+                prompts: None,
+                models: None,
+                name_i18n: None,
+                description_i18n: None,
+                prompts_i18n: None,
+            })
+            .await
+            .unwrap();
+
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+
+        assert!(
+            fx.definition_repo
+                .get_by_assistant_id("custom-dirty-json")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fx.definition_repo
+                .get_by_assistant_id("custom-valid")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_skips_dirty_generated_assistant_definitions() {
+        let fx = fixture().await;
+        {
+            let mut rows = fx.agent_rows.lock().expect("agent rows lock poisoned");
+            *rows = vec![
+                mk_agent_row("agent-dirty", "dirty", aionui_api_types::AgentManagementStatus::Online),
+                mk_agent_row("agent-valid", "valid", aionui_api_types::AgentManagementStatus::Online),
+            ];
+        }
+
+        fx.definition_repo
+            .upsert(&UpsertAssistantDefinitionParams {
+                id: "asstdef_dirty_generated",
+                assistant_id: "bare:agent-dirty",
+                source: "generated",
+                owner_type: "system",
+                source_ref: Some("agent-dirty"),
+                source_version: None,
+                source_hash: None,
+                name: "Dirty",
+                name_i18n: "{}",
+                description: None,
+                description_i18n: "{}",
+                avatar_type: "none",
+                avatar_value: None,
+                agent_id: "agent-dirty",
+                rule_resource_type: "none",
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: "[]",
+                recommended_prompts_i18n: "{}",
+                default_model_mode: "auto",
+                default_model_value: None,
+                default_permission_mode: "auto",
+                default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
+                default_skills_mode: "auto",
+                default_skill_ids: "not json",
+                custom_skill_names: "[]",
+                default_disabled_builtin_skill_ids: "[]",
+                default_mcps_mode: "auto",
+                default_mcp_ids: "[]",
+            })
+            .await
+            .unwrap();
+
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+
+        assert!(
+            fx.definition_repo
+                .get_by_assistant_id("bare:agent-valid")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
