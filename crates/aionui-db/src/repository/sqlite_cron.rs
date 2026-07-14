@@ -1,4 +1,4 @@
-use aionui_common::{TimestampMs, now_ms};
+use aionui_common::{TimestampMs, generate_prefixed_id, now_ms};
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
@@ -256,9 +256,10 @@ impl ICronRepository for SqliteCronRepository {
 
                 if has_active_run {
                     sqlx::query(
-                        "INSERT INTO cron_job_runs (job_id, scheduled_at, status, created_at, updated_at, finished_at) \
-                         VALUES (?, ?, 'skipped', ?, ?, ?)",
+                        "INSERT INTO cron_job_runs (id, job_id, scheduled_at, status, created_at, updated_at, finished_at) \
+                         VALUES (?, ?, ?, 'skipped', ?, ?, ?)",
                     )
+                    .bind(generate_prefixed_id("cron_run"))
                     .bind(params.job_id)
                     .bind(params.scheduled_at)
                     .bind(params.now)
@@ -271,9 +272,10 @@ impl ICronRepository for SqliteCronRepository {
             }
 
             sqlx::query(
-                "INSERT INTO cron_job_runs (job_id, scheduled_at, status, owner_id, lease_until, started_at, created_at, updated_at) \
-                 VALUES (?, ?, 'running', ?, ?, ?, ?, ?)",
+                "INSERT INTO cron_job_runs (id, job_id, scheduled_at, status, owner_id, lease_until, started_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)",
             )
+            .bind(generate_prefixed_id("cron_run"))
             .bind(params.job_id)
             .bind(params.scheduled_at)
             .bind(params.owner_id)
