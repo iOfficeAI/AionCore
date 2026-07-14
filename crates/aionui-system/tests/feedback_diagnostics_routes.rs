@@ -245,3 +245,47 @@ async fn diagnostics_home_route_uses_module_and_global_summary_context() {
     assert!(!serialized.contains("sk-route-secret"));
     assert!(!serialized.contains("encrypted-sk-route-secret"));
 }
+
+#[tokio::test]
+async fn diagnostics_selects_existing_db_profiles_for_ui_and_workspace_modules() {
+    let (app, _db) = setup().await;
+    let resp = app
+        .clone()
+        .oneshot(diagnostics_request(
+            "/api/system/diagnostics/feedback-report?route_at_submit=%23%2Fsettings%2Fappearance&selected_module=display-desktop",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let profile_names = json["data"]["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|profile| profile["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert!(profile_names.contains(&"client-ui-settings"));
+    assert!(profile_names.contains(&"global-summary"));
+
+    let resp = app
+        .oneshot(diagnostics_request(
+            "/api/system/diagnostics/feedback-report?route_at_submit=%23%2Fconversation%2Fconv-route&selected_module=workspace-preview",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let profile_names = json["data"]["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|profile| profile["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert!(profile_names.contains(&"conversation-session"));
+    assert!(profile_names.contains(&"workspace-summary"));
+    assert!(profile_names.contains(&"global-summary"));
+}

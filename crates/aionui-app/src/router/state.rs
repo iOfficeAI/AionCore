@@ -706,11 +706,11 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     let tick_service_ref: Arc<CronServiceTickRef> = Arc::new(CronServiceTickRef::default());
     let tick_ref = tick_service_ref.clone();
     let scheduler = Arc::new(aionui_cron::scheduler::CronScheduler::new(Arc::new(
-        move |job_id: String| {
+        move |tick: aionui_cron::scheduler::ScheduledTick| {
             let svc = tick_ref.0.lock().unwrap().clone();
             tokio::spawn(async move {
                 if let Some(svc) = svc {
-                    svc.tick(&job_id).await;
+                    svc.tick(&tick.job_id, tick.scheduled_at).await;
                 }
             });
         },

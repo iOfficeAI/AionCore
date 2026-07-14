@@ -1,9 +1,12 @@
-use aionui_common::now_ms;
+use aionui_common::{TimestampMs, generate_prefixed_id, now_ms};
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::CronJobRow;
-use crate::repository::cron::{ICronRepository, UpdateCronJobParams};
+use crate::repository::cron::{
+    ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, ICronRepository, RecoverableCronRun,
+    UpdateCronJobParams,
+};
 
 #[derive(Clone, Debug)]
 pub struct SqliteCronRepository {
@@ -25,9 +28,9 @@ impl ICronRepository for SqliteCronRepository {
                 schedule_description, payload_message, execution_mode, agent_config, \
                 conversation_id, conversation_title, created_by, \
                 skill_content, description, created_at, updated_at, next_run_at, last_run_at, \
-                last_status, last_error, run_count, retry_count, max_retries\
+                last_status, last_error, run_count, retry_count, max_retries, queue_enabled\
             ) VALUES (\
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
             )",
         )
         .bind(&row.id)
@@ -54,6 +57,7 @@ impl ICronRepository for SqliteCronRepository {
         .bind(row.run_count)
         .bind(row.retry_count)
         .bind(row.max_retries)
+        .bind(row.queue_enabled)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -101,6 +105,10 @@ impl ICronRepository for SqliteCronRepository {
 
         if let Some(v) = params.enabled {
             set_parts.push("enabled = ?".to_string());
+            binds.push(BindValue::Bool(v));
+        }
+        if let Some(v) = params.queue_enabled {
+            set_parts.push("queue_enabled = ?".to_string());
             binds.push(BindValue::Bool(v));
         }
 
@@ -195,6 +203,190 @@ impl ICronRepository for SqliteCronRepository {
             .await?;
         Ok(result.rows_affected())
     }
+
+    async fn claim_run(&self, params: &ClaimCronRunParams<'_>) -> Result<CronRunClaimResult, DbError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+
+        let result = async {
+            let existing = sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(
+                "SELECT status, owner_id, lease_until FROM cron_job_runs WHERE job_id = ? AND scheduled_at = ?",
+            )
+            .bind(params.job_id)
+            .bind(params.scheduled_at)
+            .fetch_optional(&mut *connection)
+            .await?;
+
+            if let Some((status, _owner_id, lease_until)) = existing {
+                if matches!(status.as_str(), "running" | "retrying")
+                    && lease_until.is_some_and(|lease| lease <= params.now)
+                {
+                    let updated = sqlx::query(
+                        "UPDATE cron_job_runs SET status = 'running', owner_id = ?, lease_until = ?, \
+                         started_at = COALESCE(started_at, ?), finished_at = NULL, error = NULL, updated_at = ? \
+                         WHERE job_id = ? AND scheduled_at = ? AND status IN ('running', 'retrying') AND lease_until <= ?",
+                    )
+                    .bind(params.owner_id)
+                    .bind(params.lease_until)
+                    .bind(params.now)
+                    .bind(params.now)
+                    .bind(params.job_id)
+                    .bind(params.scheduled_at)
+                    .bind(params.now)
+                    .execute(&mut *connection)
+                    .await?;
+                    return Ok(if updated.rows_affected() == 1 {
+                        CronRunClaimResult::Claimed
+                    } else {
+                        CronRunClaimResult::Duplicate
+                    });
+                }
+                return Ok(CronRunClaimResult::Duplicate);
+            }
+
+            if params.queue_enabled {
+                let has_active_run: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM cron_job_runs \
+                     WHERE job_id = ? AND status IN ('running', 'retrying') AND lease_until > ?)",
+                )
+                .bind(params.job_id)
+                .bind(params.now)
+                .fetch_one(&mut *connection)
+                .await?;
+
+                if has_active_run {
+                    sqlx::query(
+                        "INSERT INTO cron_job_runs (id, job_id, scheduled_at, status, created_at, updated_at, finished_at) \
+                         VALUES (?, ?, ?, 'skipped', ?, ?, ?)",
+                    )
+                    .bind(generate_prefixed_id("cron_run"))
+                    .bind(params.job_id)
+                    .bind(params.scheduled_at)
+                    .bind(params.now)
+                    .bind(params.now)
+                    .bind(params.now)
+                    .execute(&mut *connection)
+                    .await?;
+                    return Ok(CronRunClaimResult::QueueBusy);
+                }
+            }
+
+            sqlx::query(
+                "INSERT INTO cron_job_runs (id, job_id, scheduled_at, status, owner_id, lease_until, started_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)",
+            )
+            .bind(generate_prefixed_id("cron_run"))
+            .bind(params.job_id)
+            .bind(params.scheduled_at)
+            .bind(params.owner_id)
+            .bind(params.lease_until)
+            .bind(params.now)
+            .bind(params.now)
+            .bind(params.now)
+            .execute(&mut *connection)
+            .await?;
+
+            Ok(CronRunClaimResult::Claimed)
+        }
+        .await;
+
+        match result {
+            Ok(result) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn renew_run_lease(
+        &self,
+        job_id: &str,
+        scheduled_at: TimestampMs,
+        owner_id: &str,
+        lease_until: TimestampMs,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE cron_job_runs SET lease_until = ?, updated_at = ? \
+             WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ?",
+        )
+        .bind(lease_until)
+        .bind(updated_at)
+        .bind(job_id)
+        .bind(scheduled_at)
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn defer_run(
+        &self,
+        job_id: &str,
+        scheduled_at: TimestampMs,
+        owner_id: &str,
+        retry_at: TimestampMs,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE cron_job_runs SET status = 'retrying', owner_id = NULL, lease_until = ?, updated_at = ? \
+             WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ?",
+        )
+        .bind(retry_at)
+        .bind(updated_at)
+        .bind(job_id)
+        .bind(scheduled_at)
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn finish_run(&self, params: &FinishCronRunParams<'_>) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE cron_job_runs SET status = ?, conversation_id = ?, error = ?, lease_until = NULL, \
+             finished_at = ?, updated_at = ? \
+             WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ?",
+        )
+        .bind(params.status)
+        .bind(params.conversation_id)
+        .bind(params.error)
+        .bind(params.finished_at)
+        .bind(params.finished_at)
+        .bind(params.job_id)
+        .bind(params.scheduled_at)
+        .bind(params.owner_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn cleanup_runs_before(&self, cutoff: TimestampMs) -> Result<u64, DbError> {
+        let result =
+            sqlx::query("DELETE FROM cron_job_runs WHERE status IN ('ok', 'error', 'skipped') AND finished_at < ?")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn get_recoverable_run(&self, job_id: &str, now: TimestampMs) -> Result<Option<RecoverableCronRun>, DbError> {
+        let row = sqlx::query_as::<_, (TimestampMs, TimestampMs)>(
+            "SELECT scheduled_at, MAX(lease_until, ?) AS wake_at FROM cron_job_runs \
+             WHERE job_id = ? AND status IN ('running', 'retrying') AND lease_until IS NOT NULL \
+             ORDER BY lease_until ASC LIMIT 1",
+        )
+        .bind(now)
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(scheduled_at, wake_at)| RecoverableCronRun { scheduled_at, wake_at }))
+    }
 }
 
 // ── Dynamic bind helpers ────────────────────────────────────────────
@@ -276,6 +468,7 @@ mod tests {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         }
     }
 
@@ -367,6 +560,275 @@ mod tests {
         assert!(!updated.enabled);
         assert_eq!(updated.run_count, 42);
         assert!(updated.updated_at >= updated.created_at);
+    }
+
+    #[tokio::test]
+    async fn update_queue_enabled() {
+        let (repo, _db) = setup().await;
+        repo.insert(&make_row("cron_queue")).await.unwrap();
+
+        repo.update(
+            "cron_queue",
+            &UpdateCronJobParams {
+                queue_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(repo.get_by_id("cron_queue").await.unwrap().unwrap().queue_enabled);
+    }
+
+    #[tokio::test]
+    async fn claim_run_deduplicates_same_occurrence_across_repository_instances() {
+        let (repo, db) = setup().await;
+        repo.insert(&make_row("cron_claim")).await.unwrap();
+        let other_repo = SqliteCronRepository::new(db.pool().clone());
+
+        let first = ClaimCronRunParams {
+            job_id: "cron_claim",
+            scheduled_at: 10_000,
+            owner_id: "owner-a",
+            now: 10_000,
+            lease_until: 70_000,
+            queue_enabled: false,
+        };
+        let second = ClaimCronRunParams {
+            owner_id: "owner-b",
+            ..first.clone()
+        };
+        let (first, second) = tokio::join!(repo.claim_run(&first), other_repo.claim_run(&second));
+        let results = [first.unwrap(), second.unwrap()];
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == CronRunClaimResult::Claimed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == CronRunClaimResult::Duplicate)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_run_queue_busy_records_skipped_occurrence() {
+        let (repo, db) = setup().await;
+        repo.insert(&make_row("cron_queue_claim")).await.unwrap();
+
+        assert_eq!(
+            repo.claim_run(&ClaimCronRunParams {
+                job_id: "cron_queue_claim",
+                scheduled_at: 10_000,
+                owner_id: "owner-a",
+                now: 10_000,
+                lease_until: 70_000,
+                queue_enabled: true,
+            })
+            .await
+            .unwrap(),
+            CronRunClaimResult::Claimed
+        );
+        assert_eq!(
+            repo.claim_run(&ClaimCronRunParams {
+                job_id: "cron_queue_claim",
+                scheduled_at: 20_000,
+                owner_id: "owner-b",
+                now: 20_000,
+                lease_until: 80_000,
+                queue_enabled: true,
+            })
+            .await
+            .unwrap(),
+            CronRunClaimResult::QueueBusy
+        );
+
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM cron_job_runs WHERE job_id = 'cron_queue_claim' AND scheduled_at = 20000",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "skipped");
+    }
+
+    #[tokio::test]
+    async fn expired_run_lease_can_be_reclaimed() {
+        let (repo, _db) = setup().await;
+        repo.insert(&make_row("cron_expired")).await.unwrap();
+        repo.claim_run(&ClaimCronRunParams {
+            job_id: "cron_expired",
+            scheduled_at: 10_000,
+            owner_id: "owner-a",
+            now: 10_000,
+            lease_until: 20_000,
+            queue_enabled: false,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.claim_run(&ClaimCronRunParams {
+                job_id: "cron_expired",
+                scheduled_at: 10_000,
+                owner_id: "owner-b",
+                now: 20_001,
+                lease_until: 80_001,
+                queue_enabled: false,
+            })
+            .await
+            .unwrap(),
+            CronRunClaimResult::Claimed
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_run_reuses_original_occurrence_key() {
+        let (repo, _db) = setup().await;
+        repo.insert(&make_row("cron_retry_claim")).await.unwrap();
+        repo.claim_run(&ClaimCronRunParams {
+            job_id: "cron_retry_claim",
+            scheduled_at: 10_000,
+            owner_id: "owner-a",
+            now: 10_000,
+            lease_until: 70_000,
+            queue_enabled: false,
+        })
+        .await
+        .unwrap();
+        assert!(
+            repo.defer_run("cron_retry_claim", 10_000, "owner-a", 20_000, 11_000)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            repo.claim_run(&ClaimCronRunParams {
+                job_id: "cron_retry_claim",
+                scheduled_at: 10_000,
+                owner_id: "owner-b",
+                now: 20_000,
+                lease_until: 80_000,
+                queue_enabled: false,
+            })
+            .await
+            .unwrap(),
+            CronRunClaimResult::Claimed
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_enabled_treats_deferred_run_as_active() {
+        let (repo, _db) = setup().await;
+        repo.insert(&make_row("cron_retry_queue")).await.unwrap();
+        repo.claim_run(&ClaimCronRunParams {
+            job_id: "cron_retry_queue",
+            scheduled_at: 10_000,
+            owner_id: "owner-a",
+            now: 10_000,
+            lease_until: 70_000,
+            queue_enabled: true,
+        })
+        .await
+        .unwrap();
+        repo.defer_run("cron_retry_queue", 10_000, "owner-a", 40_000, 11_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.claim_run(&ClaimCronRunParams {
+                job_id: "cron_retry_queue",
+                scheduled_at: 20_000,
+                owner_id: "owner-b",
+                now: 20_000,
+                lease_until: 80_000,
+                queue_enabled: true,
+            })
+            .await
+            .unwrap(),
+            CronRunClaimResult::QueueBusy
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_running_run_waits_for_unexpired_lease() {
+        let (repo, _db) = setup().await;
+        repo.insert(&make_row("cron_recover_running")).await.unwrap();
+        repo.claim_run(&ClaimCronRunParams {
+            job_id: "cron_recover_running",
+            scheduled_at: 10_000,
+            owner_id: "owner-a",
+            now: 10_000,
+            lease_until: 70_000,
+            queue_enabled: false,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.get_recoverable_run("cron_recover_running", 20_000).await.unwrap(),
+            Some(RecoverableCronRun {
+                scheduled_at: 10_000,
+                wake_at: 70_000,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_running_run_wakes_immediately_after_expiry() {
+        let (repo, _db) = setup().await;
+        repo.insert(&make_row("cron_recover_expired")).await.unwrap();
+        repo.claim_run(&ClaimCronRunParams {
+            job_id: "cron_recover_expired",
+            scheduled_at: 10_000,
+            owner_id: "owner-a",
+            now: 10_000,
+            lease_until: 20_000,
+            queue_enabled: false,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.get_recoverable_run("cron_recover_expired", 30_000).await.unwrap(),
+            Some(RecoverableCronRun {
+                scheduled_at: 10_000,
+                wake_at: 30_000,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_retry_preserves_original_occurrence() {
+        let (repo, _db) = setup().await;
+        repo.insert(&make_row("cron_recover_retry")).await.unwrap();
+        repo.claim_run(&ClaimCronRunParams {
+            job_id: "cron_recover_retry",
+            scheduled_at: 10_000,
+            owner_id: "owner-a",
+            now: 10_000,
+            lease_until: 70_000,
+            queue_enabled: false,
+        })
+        .await
+        .unwrap();
+        repo.defer_run("cron_recover_retry", 10_000, "owner-a", 40_000, 11_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.get_recoverable_run("cron_recover_retry", 20_000).await.unwrap(),
+            Some(RecoverableCronRun {
+                scheduled_at: 10_000,
+                wake_at: 40_000,
+            })
+        );
     }
 
     #[tokio::test]

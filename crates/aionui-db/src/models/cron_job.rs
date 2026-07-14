@@ -28,6 +28,7 @@ pub struct CronJobRow {
     pub run_count: i64,
     pub retry_count: i64,
     pub max_retries: i64,
+    pub queue_enabled: bool,
 }
 
 #[cfg(test)]
@@ -61,6 +62,7 @@ mod tests {
             run_count: 5,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: true,
         };
         let json = serde_json::to_string(&row).expect("serialize");
         let restored: CronJobRow = serde_json::from_str(&json).expect("deserialize");
@@ -98,6 +100,7 @@ mod tests {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         };
         assert!(row.schedule_tz.is_none());
         assert!(row.agent_config.is_none());

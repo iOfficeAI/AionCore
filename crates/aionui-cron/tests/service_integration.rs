@@ -965,6 +965,7 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
         conversation_title: Some("Test Conv".into()),
         created_by: "user".into(),
         execution_mode: None,
+        queue_enabled: false,
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
             name: "Default Assistant".into(),
             cli_path: None,
@@ -1386,6 +1387,7 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         })
         .await
         .unwrap();
@@ -1461,6 +1463,7 @@ async fn cj8_update_job() {
         agent_config: None,
         conversation_title: None,
         max_retries: None,
+        queue_enabled: None,
     };
 
     let updated = svc.update_job(&created.id, req).await.unwrap();
@@ -1501,6 +1504,7 @@ async fn update_existing_conversation_job_rejects_agent_config_changes() {
         }),
         conversation_title: None,
         max_retries: None,
+        queue_enabled: None,
     };
 
     let err = svc.update_job(&created.id, req).await.unwrap_err();
@@ -1539,6 +1543,7 @@ async fn update_existing_conversation_job_rejects_agent_config_even_when_switchi
         }),
         conversation_title: None,
         max_retries: None,
+        queue_enabled: None,
     };
 
     let err = svc.update_job(&created.id, req).await.unwrap_err();
@@ -1575,6 +1580,7 @@ async fn update_existing_job_to_new_conversation_removes_previous_conversation_b
                 agent_config: None,
                 conversation_title: None,
                 max_retries: None,
+                queue_enabled: None,
             },
         )
         .await
@@ -1640,6 +1646,7 @@ async fn update_existing_job_to_new_conversation_clears_previous_auto_workspace(
             agent_config: None,
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         },
     )
     .await
@@ -1683,6 +1690,7 @@ async fn update_existing_job_to_new_conversation_preserves_custom_workspace() {
             agent_config: None,
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         },
     )
     .await
@@ -1717,6 +1725,7 @@ async fn update_team_conversation_job_rejects_execution_mode_change() {
         agent_config: None,
         conversation_title: None,
         max_retries: None,
+        queue_enabled: None,
     };
 
     let err = svc.update_job(&created.id, req).await.unwrap_err();
@@ -1750,6 +1759,7 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
         }),
         conversation_title: None,
         max_retries: None,
+        queue_enabled: None,
     };
 
     let updated = svc.update_job(&created.id, req).await.unwrap();
@@ -1786,6 +1796,7 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
         }),
         conversation_title: None,
         max_retries: None,
+        queue_enabled: None,
     };
 
     let err = svc
@@ -1820,6 +1831,7 @@ async fn cj9_update_schedule_type() {
         agent_config: None,
         conversation_title: None,
         max_retries: None,
+        queue_enabled: None,
     };
 
     let updated = svc.update_job(&created.id, req).await.unwrap();
@@ -1845,6 +1857,7 @@ async fn cj10_update_nonexistent() {
         agent_config: None,
         conversation_title: None,
         max_retries: None,
+        queue_enabled: None,
     };
     let err = svc.update_job("cron_nonexistent", req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::JobNotFound(_)));
@@ -2831,9 +2844,43 @@ async fn update_max_retries() {
         agent_config: None,
         conversation_title: None,
         max_retries: Some(5),
+        queue_enabled: None,
     };
     let updated = svc.update_job(&job.id, req).await.unwrap();
     assert_eq!(updated.max_retries, 5);
+}
+
+#[tokio::test]
+async fn create_and_update_queue_enabled() {
+    let (svc, _, _) = setup().await;
+    let mut create = make_create_req("Queued", every_60s());
+    create.queue_enabled = true;
+    let job = svc.add_job(create).await.unwrap();
+    assert!(job.queue_enabled);
+    assert!(CronService::to_response(&job).state.queue_enabled);
+
+    let updated = svc
+        .update_job(
+            &job.id,
+            UpdateCronJobRequest {
+                queue_enabled: Some(false),
+                ..UpdateCronJobRequest {
+                    name: None,
+                    description: None,
+                    enabled: None,
+                    schedule: None,
+                    message: None,
+                    execution_mode: None,
+                    agent_config: None,
+                    conversation_title: None,
+                    max_retries: None,
+                    queue_enabled: None,
+                }
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!updated.queue_enabled);
 }
 
 // ── SC-1: At type — future timestamp, nextRunAtMs == atMs ────────

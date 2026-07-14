@@ -55,6 +55,25 @@ pub fn compute_next_run(schedule: &CronSchedule, now: TimestampMs) -> Option<Tim
     }
 }
 
+pub fn compute_next_run_after_occurrence(
+    schedule: &CronSchedule,
+    scheduled_at: TimestampMs,
+    now: TimestampMs,
+) -> Option<TimestampMs> {
+    match schedule {
+        CronSchedule::At { .. } => None,
+        CronSchedule::Every { every_ms, .. } => {
+            if *every_ms <= 0 {
+                return None;
+            }
+            let elapsed = now.saturating_sub(scheduled_at);
+            let steps = elapsed.div_euclid(*every_ms) + 1;
+            scheduled_at.checked_add(steps.checked_mul(*every_ms)?)
+        }
+        CronSchedule::Cron { expr, tz, .. } => compute_cron_next_run(expr, tz.as_deref(), now.max(scheduled_at)),
+    }
+}
+
 fn compute_cron_next_run(expr: &str, tz: Option<&str>, now: TimestampMs) -> Option<TimestampMs> {
     let normalized = normalize_cron_expr(expr);
     let schedule = Schedule::from_str(&normalized).ok()?;
@@ -101,7 +120,13 @@ pub fn validate_schedule(schedule: &CronSchedule) -> Result<(), CronError> {
 // CronScheduler — manages tokio timers for scheduled jobs
 // ---------------------------------------------------------------------------
 
-pub type TickCallback = Arc<dyn Fn(String) + Send + Sync>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledTick {
+    pub job_id: String,
+    pub scheduled_at: TimestampMs,
+}
+
+pub type TickCallback = Arc<dyn Fn(ScheduledTick) + Send + Sync>;
 
 pub struct CronScheduler {
     handles: DashMap<String, JoinHandle<()>>,
@@ -152,6 +177,17 @@ impl CronScheduler {
         self.schedule_job(job);
     }
 
+    pub fn schedule_retry(&self, job_id: &str, scheduled_at: TimestampMs, retry_at: TimestampMs) {
+        self.cancel_job(job_id);
+        let handle = spawn_occurrence_timer(
+            job_id.to_owned(),
+            scheduled_at,
+            retry_at,
+            Arc::clone(&self.tick_callback),
+        );
+        self.handles.insert(job_id.to_owned(), handle);
+    }
+
     pub fn cancel_all(&self) {
         for entry in self.handles.iter() {
             entry.value().abort();
@@ -179,12 +215,21 @@ impl Drop for CronScheduler {
 // ---------------------------------------------------------------------------
 
 fn spawn_at_timer(job_id: String, run_at: TimestampMs, callback: TickCallback) -> JoinHandle<()> {
+    spawn_occurrence_timer(job_id, run_at, run_at, callback)
+}
+
+fn spawn_occurrence_timer(
+    job_id: String,
+    scheduled_at: TimestampMs,
+    run_at: TimestampMs,
+    callback: TickCallback,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let delay = delay_until(run_at);
         if delay > 0 {
             tokio::time::sleep(tokio::time::Duration::from_millis(delay as u64)).await;
         }
-        callback(job_id);
+        callback(ScheduledTick { job_id, scheduled_at });
     })
 }
 
@@ -199,14 +244,22 @@ fn spawn_every_timer(
         if initial_delay > 0 {
             tokio::time::sleep(tokio::time::Duration::from_millis(initial_delay as u64)).await;
         }
-        callback(job_id.clone());
+        let mut scheduled_at = first_run_at;
+        callback(ScheduledTick {
+            job_id: job_id.clone(),
+            scheduled_at,
+        });
 
         let interval_duration = tokio::time::Duration::from_millis(every_ms as u64);
         let mut interval = tokio::time::interval(interval_duration);
         interval.tick().await; // first tick fires immediately, skip it
         loop {
             interval.tick().await;
-            callback(job_id.clone());
+            scheduled_at += every_ms;
+            callback(ScheduledTick {
+                job_id: job_id.clone(),
+                scheduled_at,
+            });
         }
     })
 }
@@ -223,7 +276,10 @@ fn spawn_cron_timer(
         if initial_delay > 0 {
             tokio::time::sleep(tokio::time::Duration::from_millis(initial_delay as u64)).await;
         }
-        callback(job_id.clone());
+        callback(ScheduledTick {
+            job_id: job_id.clone(),
+            scheduled_at: first_run_at,
+        });
 
         loop {
             let now = now_ms();
@@ -235,7 +291,10 @@ fn spawn_cron_timer(
             if delay > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(delay as u64)).await;
             }
-            callback(job_id.clone());
+            callback(ScheduledTick {
+                job_id: job_id.clone(),
+                scheduled_at: next_at,
+            });
         }
     })
 }
@@ -298,6 +357,23 @@ mod tests {
             description: None,
         };
         assert_eq!(compute_next_run(&schedule, 1000), None);
+    }
+
+    #[test]
+    fn next_run_after_occurrence_keeps_every_schedule_grid() {
+        let schedule = CronSchedule::Every {
+            every_ms: 1_000,
+            description: None,
+        };
+
+        assert_eq!(
+            compute_next_run_after_occurrence(&schedule, 10_000, 10_100),
+            Some(11_000)
+        );
+        assert_eq!(
+            compute_next_run_after_occurrence(&schedule, 10_000, 12_500),
+            Some(13_000)
+        );
     }
 
     #[test]
@@ -559,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_at_timer_fires_callback() {
-        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ScheduledTick>();
         let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
         let scheduler = CronScheduler::new(Arc::new(move |id| {
             if let Some(sender) = tx.lock().unwrap().take() {
@@ -579,7 +655,9 @@ mod tests {
 
         let result = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().unwrap(), "cron_at");
+        let tick = result.unwrap().unwrap();
+        assert_eq!(tick.job_id, "cron_at");
+        assert_eq!(tick.scheduled_at, job.next_run_at.unwrap());
     }
 
     #[tokio::test]
@@ -637,6 +715,7 @@ mod tests {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         }
     }
 }

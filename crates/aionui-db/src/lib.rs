@@ -29,7 +29,9 @@ pub use repository::conversation::{
     ConversationFilters, ConversationRowUpdate, MessagePageCursor, MessagePageDirection, MessagePageParams,
     MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
-pub use repository::cron::UpdateCronJobParams;
+pub use repository::cron::{
+    ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
+};
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};

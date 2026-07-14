@@ -12,8 +12,9 @@ use aionui_common::{
     validate_workspace_path_availability,
 };
 use aionui_db::{
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository,
-    UpdateCronJobParams, models::AgentMetadataRow, resolve_agent_binding_from_rows, runtime_backend_for_agent,
+    ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, IAgentMetadataRepository,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository, UpdateCronJobParams,
+    models::AgentMetadataRow, resolve_agent_binding_from_rows, runtime_backend_for_agent,
 };
 use tracing::{debug, error, info, warn};
 
@@ -21,7 +22,7 @@ use crate::events::CronEventEmitter;
 
 use crate::error::CronError;
 use crate::executor::{ExecutionResult, JobExecutor, PreparedRunNow, RETRY_INTERVAL_MS};
-use crate::scheduler::{CronScheduler, compute_next_run, validate_schedule};
+use crate::scheduler::{CronScheduler, compute_next_run, compute_next_run_after_occurrence, validate_schedule};
 use crate::skill_file::{delete_skill_file, has_skill_file, write_raw_skill_file, write_skill_file};
 use crate::types::{
     CreatedBy, CronAgentConfig, CronJob, CronSchedule, ExecutionMode, cron_job_from_row, cron_job_to_response,
@@ -40,6 +41,9 @@ const PLACEHOLDER_PATTERNS: &[&str] = &[
     "write your",
     "put your",
 ];
+const RUN_LEASE_MS: i64 = 60_000;
+const RUN_LEASE_HEARTBEAT_MS: u64 = 20_000;
+const RUN_HISTORY_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 #[derive(Clone)]
 pub struct CronService {
     repo: Arc<dyn ICronRepository>,
@@ -50,6 +54,7 @@ pub struct CronService {
     executor: Arc<JobExecutor>,
     emitter: CronEventEmitter,
     data_dir: PathBuf,
+    instance_id: String,
 }
 
 pub struct CronServiceDeps {
@@ -74,6 +79,7 @@ impl CronService {
             executor: deps.executor,
             emitter: deps.emitter,
             data_dir: deps.data_dir,
+            instance_id: generate_prefixed_id("cron-owner"),
         }
     }
 
@@ -114,6 +120,7 @@ impl CronService {
             conversation_title,
             created_by: "agent".to_owned(),
             execution_mode: Some("existing".to_owned()),
+            queue_enabled: false,
             agent_config,
         };
 
@@ -197,6 +204,7 @@ impl CronService {
                     agent_config: None,
                     conversation_title: None,
                     max_retries: None,
+                    queue_enabled: None,
                 },
             )
             .await?;
@@ -290,6 +298,7 @@ impl CronService {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: req.queue_enabled,
         };
 
         self.validate_job_workspace(&job).await?;
@@ -369,6 +378,9 @@ impl CronService {
         }
         if let Some(max_retries) = req.max_retries {
             job.max_retries = max_retries;
+        }
+        if let Some(queue_enabled) = req.queue_enabled {
+            job.queue_enabled = queue_enabled;
         }
 
         if req.schedule.is_some() || req.enabled.is_some() {
@@ -460,6 +472,11 @@ impl CronService {
     // -----------------------------------------------------------------------
 
     pub async fn init(&self) {
+        let now = now_ms();
+        if let Err(error) = self.repo.cleanup_runs_before(now - RUN_HISTORY_RETENTION_MS).await {
+            warn!(error = %error, "Failed to clean up old cron run records");
+        }
+
         let rows = match self.repo.list_enabled().await {
             Ok(rows) => rows,
             Err(e) => {
@@ -479,14 +496,29 @@ impl CronService {
                 }
             };
 
-            self.scheduler.schedule_job(&job);
+            match self.repo.get_recoverable_run(&job.id, now).await {
+                Ok(Some(run)) => {
+                    info!(
+                        job_id = %job.id,
+                        scheduled_at = run.scheduled_at,
+                        wake_at = run.wake_at,
+                        "Recovering unfinished cron occurrence"
+                    );
+                    self.scheduler.schedule_retry(&job.id, run.scheduled_at, run.wake_at);
+                }
+                Ok(None) => self.scheduler.schedule_job(&job),
+                Err(error) => {
+                    warn!(job_id = %job.id, error = %error, "Failed to inspect recoverable cron run");
+                    self.scheduler.schedule_job(&job);
+                }
+            }
             scheduled += 1;
         }
 
         info!(scheduled, "Cron service initialized");
     }
 
-    pub async fn tick(&self, job_id: &str) {
+    pub async fn tick(&self, job_id: &str, scheduled_at: i64) {
         let row = match self.repo.get_by_id(job_id).await {
             Ok(Some(r)) => r,
             Ok(None) => {
@@ -520,10 +552,53 @@ impl CronService {
             return;
         }
 
+        let claim_now = now_ms();
+        match self
+            .repo
+            .claim_run(&ClaimCronRunParams {
+                job_id,
+                scheduled_at,
+                owner_id: &self.instance_id,
+                now: claim_now,
+                lease_until: claim_now + RUN_LEASE_MS,
+                queue_enabled: job.queue_enabled,
+            })
+            .await
+        {
+            Ok(CronRunClaimResult::Claimed) => {}
+            Ok(CronRunClaimResult::Duplicate) => {
+                info!(job_id, scheduled_at, "Duplicate cron occurrence ignored");
+                match self.repo.get_recoverable_run(job_id, claim_now).await {
+                    Ok(Some(run)) => {
+                        self.scheduler.schedule_retry(job_id, run.scheduled_at, run.wake_at);
+                    }
+                    Ok(None) => self.reschedule_after_execution(&job, scheduled_at).await,
+                    Err(error) => {
+                        warn!(job_id, scheduled_at, error = %error, "Failed to track duplicate cron occurrence");
+                        self.reschedule_after_execution(&job, scheduled_at).await;
+                    }
+                }
+                return;
+            }
+            Ok(CronRunClaimResult::QueueBusy) => {
+                self.record_queue_busy_skip(&job).await;
+                self.reschedule_after_execution(&job, scheduled_at).await;
+                self.emitter.emit_job_executed(job_id, "skipped", None);
+                return;
+            }
+            Err(error) => {
+                error!(job_id, scheduled_at, error = %error, "Failed to claim cron occurrence");
+                return;
+            }
+        }
+
+        let heartbeat = self.spawn_run_lease_heartbeat(job_id.to_owned(), scheduled_at);
+
         let prepared = match self.executor.prepare_scheduled(&job).await {
             Ok(prepared) => prepared,
             Err(result) => {
-                self.handle_execution_result(job, result).await;
+                heartbeat.abort();
+                self.handle_execution_result(job, scheduled_at, result).await;
                 return;
             }
         };
@@ -538,8 +613,10 @@ impl CronService {
                 error = %err,
                 "Failed to bind materialized cron replacement conversation before execution"
             );
+            heartbeat.abort();
             self.handle_execution_result(
                 execution_job,
+                scheduled_at,
                 ExecutionResult::Error {
                     message: err.to_string(),
                 },
@@ -549,7 +626,8 @@ impl CronService {
         }
 
         let result = self.executor.execute_prepared_scheduled(&execution_job, prepared).await;
-        self.handle_execution_result(execution_job, result).await;
+        heartbeat.abort();
+        self.handle_execution_result(execution_job, scheduled_at, result).await;
     }
 
     pub async fn handle_system_resume(&self) {
@@ -571,6 +649,21 @@ impl CronService {
                     continue;
                 }
             };
+
+            match self.repo.get_recoverable_run(&job.id, now).await {
+                Ok(Some(run)) => {
+                    self.scheduler.schedule_retry(&job.id, run.scheduled_at, run.wake_at);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        job_id = %job.id,
+                        error = %error,
+                        "Resume: failed to inspect recoverable cron run"
+                    );
+                }
+            }
 
             if let Some(next_run) = job.next_run_at
                 && next_run < now
@@ -850,16 +943,25 @@ impl CronService {
         true
     }
 
-    async fn handle_execution_result(&self, job: CronJob, result: ExecutionResult) {
+    async fn handle_execution_result(&self, job: CronJob, scheduled_at: i64, result: ExecutionResult) {
         let job_id = &job.id;
 
         match result {
             ExecutionResult::Success { conversation_id } => {
+                if !self
+                    .finish_scheduled_run(job_id, scheduled_at, "ok", Some(&conversation_id), None)
+                    .await
+                {
+                    return;
+                }
                 self.update_job_after_success(job_id, &conversation_id).await;
-                self.reschedule_after_execution(&job).await;
+                self.reschedule_after_execution(&job, scheduled_at).await;
                 self.emitter.emit_job_executed(job_id, "ok", None);
             }
             ExecutionResult::Retrying { attempt } => {
+                if !self.schedule_retry(job_id, scheduled_at, attempt).await {
+                    return;
+                }
                 let params = UpdateCronJobParams {
                     retry_count: Some(attempt),
                     ..Default::default()
@@ -867,9 +969,14 @@ impl CronService {
                 if let Err(e) = self.repo.update(job_id, &params).await {
                     error!(job_id, error = %e, "Failed to update retry count");
                 }
-                self.schedule_retry(job_id, attempt);
             }
             ExecutionResult::Skipped => {
+                if !self
+                    .finish_scheduled_run(job_id, scheduled_at, "skipped", None, None)
+                    .await
+                {
+                    return;
+                }
                 let params = UpdateCronJobParams {
                     last_status: Some(Some("skipped".into())),
                     retry_count: Some(0),
@@ -878,12 +985,18 @@ impl CronService {
                 if let Err(e) = self.repo.update(job_id, &params).await {
                     error!(job_id, error = %e, "Failed to update skipped status");
                 }
-                self.reschedule_after_execution(&job).await;
+                self.reschedule_after_execution(&job, scheduled_at).await;
                 self.emitter.emit_job_executed(job_id, "skipped", None);
             }
             ExecutionResult::Error { message } => {
+                if !self
+                    .finish_scheduled_run(job_id, scheduled_at, "error", None, Some(&message))
+                    .await
+                {
+                    return;
+                }
                 self.update_job_after_error(job_id, &message).await;
-                self.reschedule_after_execution(&job).await;
+                self.reschedule_after_execution(&job, scheduled_at).await;
                 self.emitter.emit_job_executed(job_id, "error", Some(&message));
             }
         }
@@ -1000,7 +1113,18 @@ impl CronService {
         }
     }
 
-    async fn reschedule_after_execution(&self, job: &CronJob) {
+    async fn reschedule_after_execution(&self, job: &CronJob, scheduled_at: i64) {
+        match self.repo.get_recoverable_run(&job.id, now_ms()).await {
+            Ok(Some(run)) => {
+                self.scheduler.schedule_retry(&job.id, run.scheduled_at, run.wake_at);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(job_id = %job.id, error = %error, "Failed to inspect remaining cron occurrences");
+            }
+        }
+
         let is_at = matches!(job.schedule, CronSchedule::At { .. });
         if is_at {
             let params = UpdateCronJobParams {
@@ -1024,8 +1148,7 @@ impl CronService {
             return;
         }
 
-        let now = now_ms();
-        let next = compute_next_run(&job.schedule, now);
+        let next = compute_next_run_after_occurrence(&job.schedule, scheduled_at, now_ms());
         let updated = CronJob {
             next_run_at: next,
             ..job.clone()
@@ -1125,36 +1248,95 @@ impl CronService {
         self.scheduler.reschedule_job(&updated);
     }
 
-    fn schedule_retry(&self, job_id: &str, _attempt: i64) {
+    async fn schedule_retry(&self, job_id: &str, scheduled_at: i64, _attempt: i64) -> bool {
         let next_run = now_ms() + RETRY_INTERVAL_MS as i64;
-        let retry_job = CronJob {
-            id: job_id.to_owned(),
-            name: String::new(),
-            enabled: true,
-            schedule: CronSchedule::At {
-                at_ms: next_run,
-                description: None,
-            },
-            message: String::new(),
-            execution_mode: ExecutionMode::Existing,
-            agent_config: None,
-            conversation_id: String::new(),
-            conversation_title: None,
-            agent_type: String::new(),
-            created_by: CreatedBy::User,
-            skill_content: None,
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            next_run_at: Some(next_run),
-            last_run_at: None,
-            last_status: None,
-            last_error: None,
-            run_count: 0,
-            retry_count: 0,
-            max_retries: 0,
+        match self
+            .repo
+            .defer_run(job_id, scheduled_at, &self.instance_id, next_run, now_ms())
+            .await
+        {
+            Ok(true) => {
+                self.scheduler.schedule_retry(job_id, scheduled_at, next_run);
+                true
+            }
+            Ok(false) => {
+                warn!(job_id, scheduled_at, "Cron retry lease was no longer owned");
+                false
+            }
+            Err(error) => {
+                error!(job_id, scheduled_at, error = %error, "Failed to defer cron run");
+                false
+            }
+        }
+    }
+
+    fn spawn_run_lease_heartbeat(&self, job_id: String, scheduled_at: i64) -> tokio::task::JoinHandle<()> {
+        let repo = Arc::clone(&self.repo);
+        let owner_id = self.instance_id.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(RUN_LEASE_HEARTBEAT_MS));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now = now_ms();
+                match repo
+                    .renew_run_lease(&job_id, scheduled_at, &owner_id, now + RUN_LEASE_MS, now)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => warn!(job_id, scheduled_at, error = %error, "Failed to renew cron run lease"),
+                }
+            }
+        })
+    }
+
+    async fn finish_scheduled_run(
+        &self,
+        job_id: &str,
+        scheduled_at: i64,
+        status: &str,
+        conversation_id: Option<&str>,
+        error: Option<&str>,
+    ) -> bool {
+        let finished_at = now_ms();
+        match self
+            .repo
+            .finish_run(&FinishCronRunParams {
+                job_id,
+                scheduled_at,
+                owner_id: &self.instance_id,
+                status,
+                conversation_id,
+                error,
+                finished_at,
+            })
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!(
+                    job_id,
+                    scheduled_at, status, "Cron run lease was no longer owned at completion"
+                );
+                false
+            }
+            Err(error) => {
+                error!(job_id, scheduled_at, status, error = %error, "Failed to finish cron run");
+                false
+            }
+        }
+    }
+
+    async fn record_queue_busy_skip(&self, job: &CronJob) {
+        let params = UpdateCronJobParams {
+            last_status: Some(Some("skipped".into())),
+            retry_count: Some(0),
+            ..Default::default()
         };
-        self.scheduler.schedule_job(&retry_job);
+        if let Err(error) = self.repo.update(&job.id, &params).await {
+            error!(job_id = %job.id, error = %error, "Failed to record queue-busy cron skip");
+        }
     }
 
     pub async fn delete_jobs_by_conversation(&self, conversation_id: &str) {
@@ -1835,6 +2017,7 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
         last_error: None,
         run_count: None,
         retry_count: None,
+        queue_enabled: req.queue_enabled,
     }
 }
 
@@ -2076,6 +2259,7 @@ mod tests {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         }
     }
 
@@ -2092,6 +2276,7 @@ mod tests {
             agent_config: None,
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.name.as_deref(), Some("New Name"));
@@ -2125,6 +2310,7 @@ mod tests {
             agent_config: None,
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.schedule_kind.as_deref(), Some("cron"));
@@ -2166,6 +2352,7 @@ mod tests {
             }),
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         };
 
         let params = build_update_params(&job, &req);
@@ -2228,6 +2415,7 @@ mod tests {
             agent_config: None,
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.enabled, Some(false));
@@ -2247,6 +2435,7 @@ mod tests {
             agent_config: None,
             conversation_title: None,
             max_retries: None,
+            queue_enabled: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(

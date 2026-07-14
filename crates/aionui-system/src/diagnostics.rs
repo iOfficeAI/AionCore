@@ -154,6 +154,12 @@ fn push_route_profiles(
     if route.contains("provider") || route.contains("model") || route.contains("settings") || route.contains("agent") {
         push_profile(selected, seen, FeedbackDiagnosticsProfile::ModelAuth);
     }
+    if route.contains("appearance") || route.contains("display") || route.contains("settings") {
+        push_profile(selected, seen, FeedbackDiagnosticsProfile::ClientUiSettings);
+    }
+    if route.contains("workspace") || route.contains("project") || route.contains("preview") {
+        push_profile(selected, seen, FeedbackDiagnosticsProfile::WorkspaceSummary);
+    }
 }
 
 fn push_module_profiles(
@@ -167,10 +173,17 @@ fn push_module_profiles(
         | "assistant-preset"
         | "channel"
         | "search-history"
-        | "workspace-preview"
-        | "display-desktop"
         | "对话与会话" => {
             push_profile(selected, seen, FeedbackDiagnosticsProfile::ConversationSession);
+            push_profile(selected, seen, FeedbackDiagnosticsProfile::ModelAuth);
+            push_profile(selected, seen, FeedbackDiagnosticsProfile::McpTools);
+        }
+        "display-desktop" => {
+            push_profile(selected, seen, FeedbackDiagnosticsProfile::ClientUiSettings);
+        }
+        "workspace-preview" => {
+            push_profile(selected, seen, FeedbackDiagnosticsProfile::ConversationSession);
+            push_profile(selected, seen, FeedbackDiagnosticsProfile::WorkspaceSummary);
             push_profile(selected, seen, FeedbackDiagnosticsProfile::ModelAuth);
             push_profile(selected, seen, FeedbackDiagnosticsProfile::McpTools);
         }
@@ -202,6 +215,8 @@ fn push_module_profiles(
             push_profile(selected, seen, FeedbackDiagnosticsProfile::AgentTeam);
         }
         "system-settings" | "settings" | "系统设置" => {
+            push_profile(selected, seen, FeedbackDiagnosticsProfile::ClientUiSettings);
+            push_profile(selected, seen, FeedbackDiagnosticsProfile::WorkspaceSummary);
             push_profile(selected, seen, FeedbackDiagnosticsProfile::ModelAuth);
             push_profile(selected, seen, FeedbackDiagnosticsProfile::McpTools);
         }
@@ -225,6 +240,8 @@ fn parse_profile(value: &str) -> Option<FeedbackDiagnosticsProfile> {
         "model-auth" => Some(FeedbackDiagnosticsProfile::ModelAuth),
         "agent-team" => Some(FeedbackDiagnosticsProfile::AgentTeam),
         "mcp-tools" => Some(FeedbackDiagnosticsProfile::McpTools),
+        "client-ui-settings" => Some(FeedbackDiagnosticsProfile::ClientUiSettings),
+        "workspace-summary" => Some(FeedbackDiagnosticsProfile::WorkspaceSummary),
         "global-summary" => Some(FeedbackDiagnosticsProfile::GlobalSummary),
         _ => None,
     }
@@ -349,7 +366,12 @@ mod tests {
             ("search-history", vec![FeedbackDiagnosticsProfile::ConversationSession]),
             (
                 "workspace-preview",
-                vec![FeedbackDiagnosticsProfile::ConversationSession],
+                vec![
+                    FeedbackDiagnosticsProfile::ConversationSession,
+                    FeedbackDiagnosticsProfile::WorkspaceSummary,
+                    FeedbackDiagnosticsProfile::ModelAuth,
+                    FeedbackDiagnosticsProfile::McpTools,
+                ],
             ),
             (
                 "webui-remote",
@@ -372,10 +394,12 @@ mod tests {
                     FeedbackDiagnosticsProfile::ConversationSession,
                 ],
             ),
-            ("display-desktop", vec![FeedbackDiagnosticsProfile::ConversationSession]),
+            ("display-desktop", vec![FeedbackDiagnosticsProfile::ClientUiSettings]),
             (
                 "system-settings",
                 vec![
+                    FeedbackDiagnosticsProfile::ClientUiSettings,
+                    FeedbackDiagnosticsProfile::WorkspaceSummary,
                     FeedbackDiagnosticsProfile::ModelAuth,
                     FeedbackDiagnosticsProfile::McpTools,
                 ],

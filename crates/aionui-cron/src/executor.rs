@@ -112,6 +112,24 @@ impl JobExecutor {
             return Err(ExecutionResult::Error { message: e.to_string() });
         }
 
+        if job.queue_enabled && job.execution_mode == ExecutionMode::NewConversation {
+            match self.find_active_cron_conversation(job).await {
+                Ok(Some(conversation_id)) => {
+                    info!(
+                        job_id = %job.id,
+                        conversation_id,
+                        "Cron queue is enabled and a previous execution is still active; skipping trigger"
+                    );
+                    return Err(ExecutionResult::Skipped);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!(job_id = %job.id, error = %e, "Failed to inspect previous cron executions");
+                    return Err(ExecutionResult::Error { message: e.to_string() });
+                }
+            }
+        }
+
         let conversation_id = match self.resolve_conversation(job, saved_skill.as_ref()).await {
             Ok(id) => id,
             Err(e) => {
@@ -444,6 +462,11 @@ impl JobExecutor {
 
 impl JobExecutor {
     fn handle_busy(&self, job: &CronJob) -> ExecutionResult {
+        if job.queue_enabled {
+            info!(job_id = %job.id, "Cron queue is enabled; skipping overlapping execution");
+            return ExecutionResult::Skipped;
+        }
+
         let max_retries = job.max_retries;
         let current_retry = job.retry_count;
 
@@ -502,6 +525,15 @@ impl JobExecutor {
                     .await
             }
         }
+    }
+
+    async fn find_active_cron_conversation(&self, job: &CronJob) -> Result<Option<String>, CronError> {
+        let user_id = self.resolve_conversation_owner_user_id(job).await?;
+        let conversations = self.conversation_repo.list_by_cron_job(&user_id, &job.id).await?;
+        Ok(conversations
+            .into_iter()
+            .find(|conversation| self.is_conversation_claimed(&conversation.id))
+            .map(|conversation| conversation.id))
     }
 
     async fn create_new_conversation(
@@ -1243,6 +1275,7 @@ mod tests {
             run_count: 0,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         }
     }
 
@@ -1268,6 +1301,7 @@ mod tests {
         let job = CronJob {
             retry_count: 1,
             max_retries: 3,
+            queue_enabled: false,
             ..sample_job()
         };
         let result = executor.handle_busy(&job);
@@ -1281,6 +1315,7 @@ mod tests {
         let job = CronJob {
             retry_count: 3,
             max_retries: 3,
+            queue_enabled: false,
             ..sample_job()
         };
         let result = executor.handle_busy(&job);
@@ -1294,6 +1329,7 @@ mod tests {
         let job = CronJob {
             retry_count: 5,
             max_retries: 3,
+            queue_enabled: false,
             ..sample_job()
         };
         let result = executor.handle_busy(&job);
@@ -1307,10 +1343,24 @@ mod tests {
         let job = CronJob {
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
             ..sample_job()
         };
         let result = executor.handle_busy(&job);
         assert_eq!(result, ExecutionResult::Retrying { attempt: 1 });
+    }
+
+    #[tokio::test]
+    async fn handle_busy_returns_skipped_when_queue_is_enabled() {
+        let executor = make_executor_for_busy_tests();
+        let job = CronJob {
+            retry_count: 0,
+            max_retries: 3,
+            queue_enabled: true,
+            ..sample_job()
+        };
+
+        assert_eq!(executor.handle_busy(&job), ExecutionResult::Skipped);
     }
 
     #[tokio::test]
@@ -1329,6 +1379,27 @@ mod tests {
         assert_eq!(result, ExecutionResult::Retrying { attempt: 1 });
         assert_eq!(agent.send_calls(), 0, "busy precheck should avoid send attempts");
 
+        drop(claim);
+    }
+
+    #[tokio::test]
+    async fn execute_returns_skipped_when_queue_is_enabled_and_conversation_is_claimed() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
+        let job = CronJob {
+            queue_enabled: true,
+            ..sample_job()
+        };
+        let claim = executor
+            .conversation_service
+            .runtime_state()
+            .try_claim_turn(&job.conversation_id, "turn-existing")
+            .expect("runtime claim should succeed");
+
+        let result = executor.execute(&job).await;
+
+        assert_eq!(result, ExecutionResult::Skipped);
+        assert_eq!(agent.send_calls(), 0, "queue protection should avoid send attempts");
         drop(claim);
     }
 

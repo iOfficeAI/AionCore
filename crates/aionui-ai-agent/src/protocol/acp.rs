@@ -140,6 +140,8 @@ impl AcpProtocol {
     ) -> Result<Self, AcpError> {
         let alive = Arc::new(AtomicBool::new(true));
         let replay_suppression = Arc::new(AtomicBool::new(false));
+        let started_at = std::time::Instant::now();
+        log_acp_initialize_start();
 
         // Signals from the background task:
         // - `init_tx`: initialize handshake result (with possible SDK error)
@@ -166,16 +168,31 @@ impl AcpProtocol {
         ));
 
         // Wait for init to complete with timeout.
-        let init_response = tokio::time::timeout(std::time::Duration::from_secs(INIT_TIMEOUT_SECS), init_rx)
-            .await
-            .map_err(|_| AcpError::InitTimeout {
-                timeout_secs: INIT_TIMEOUT_SECS,
-            })?
-            .map_err(|_| AcpError::Disconnected {
-                exit_code: None,
-                signal: None,
-                stderr: "Init channel dropped".into(),
-            })??;
+        let init_response = match tokio::time::timeout(std::time::Duration::from_secs(INIT_TIMEOUT_SECS), init_rx).await
+        {
+            Ok(Ok(Ok(response))) => {
+                log_acp_initialize_success(started_at.elapsed().as_millis() as u64);
+                response
+            }
+            Ok(Ok(Err(err))) => {
+                log_acp_initialize_failed("agent_error", started_at.elapsed().as_millis() as u64);
+                return Err(err);
+            }
+            Ok(Err(_)) => {
+                log_acp_initialize_failed("channel_dropped", started_at.elapsed().as_millis() as u64);
+                return Err(AcpError::Disconnected {
+                    exit_code: None,
+                    signal: None,
+                    stderr: "Init channel dropped".into(),
+                });
+            }
+            Err(_) => {
+                log_acp_initialize_failed("timeout", started_at.elapsed().as_millis() as u64);
+                return Err(AcpError::InitTimeout {
+                    timeout_secs: INIT_TIMEOUT_SECS,
+                });
+            }
+        };
 
         // `ready_rx` should resolve almost immediately after init_tx fires.
         let connection = ready_rx.await.map_err(|_| AcpError::NotConnected)?;
@@ -620,6 +637,34 @@ fn string_pointer(value: &serde_json::Value, pointers: &[&str]) -> Option<String
         .map(str::to_owned)
 }
 
+fn log_acp_initialize_start() {
+    info!(
+        target: "aionui_feedback_diagnostics",
+        diagnostic_event = "feedback.runtime.acp_initialize_start",
+        timeout_secs = INIT_TIMEOUT_SECS,
+        "feedback.runtime.acp_initialize_start"
+    );
+}
+
+fn log_acp_initialize_success(elapsed_ms: u64) {
+    info!(
+        target: "aionui_feedback_diagnostics",
+        diagnostic_event = "feedback.runtime.acp_initialize_success",
+        elapsed_ms,
+        "feedback.runtime.acp_initialize_success"
+    );
+}
+
+fn log_acp_initialize_failed(failure_class: &'static str, elapsed_ms: u64) {
+    warn!(
+        target: "aionui_feedback_diagnostics",
+        diagnostic_event = "feedback.runtime.acp_initialize_failed",
+        failure_class = %failure_class,
+        elapsed_ms,
+        "feedback.runtime.acp_initialize_failed"
+    );
+}
+
 /// Log a JSON-RPC request from AionUi to the ACP agent.
 /// `session/prompt` carries large user input and stays at debug.
 fn log_client_request(method: &str, body: &str) {
@@ -904,6 +949,31 @@ mod tests {
             !captured.contains("secret prompt text") && !captured.contains("\"prompt\""),
             "raw prompt body should not be logged: {captured}"
         );
+    }
+
+    #[test]
+    fn acp_initialize_diagnostic_log_helpers_use_stable_contract() {
+        use tracing::Level;
+
+        let captured = capture_logs(Level::INFO, || {
+            super::log_acp_initialize_start();
+            super::log_acp_initialize_success(123);
+            super::log_acp_initialize_failed("timeout", 456);
+        });
+
+        assert!(captured.contains("aionui_feedback_diagnostics"), "{captured}");
+        assert!(captured.contains("feedback.runtime.acp_initialize_start"), "{captured}");
+        assert!(
+            captured.contains("feedback.runtime.acp_initialize_success"),
+            "{captured}"
+        );
+        assert!(
+            captured.contains("feedback.runtime.acp_initialize_failed"),
+            "{captured}"
+        );
+        assert!(captured.contains("timeout_secs=30"), "{captured}");
+        assert!(captured.contains("failure_class=timeout"), "{captured}");
+        assert!(captured.contains("elapsed_ms=456"), "{captured}");
     }
 
     #[test]

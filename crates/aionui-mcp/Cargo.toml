@@ -29,3 +29,4 @@ axum.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
+tracing-subscriber.workspace = true

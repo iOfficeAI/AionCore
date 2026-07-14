@@ -123,6 +123,7 @@ pub struct CronJobStateDto {
     pub run_count: i64,
     pub retry_count: i64,
     pub max_retries: i64,
+    pub queue_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -159,6 +160,8 @@ pub struct CreateCronJobRequest {
     pub created_by: String,
     #[serde(default)]
     pub execution_mode: Option<String>,
+    #[serde(default)]
+    pub queue_enabled: bool,
     #[serde(default)]
     pub agent_config: Option<CronAgentConfigWriteDto>,
 }
@@ -209,6 +212,8 @@ pub struct UpdateCronJobRequest {
     pub conversation_title: Option<String>,
     #[serde(default)]
     pub max_retries: Option<i64>,
+    #[serde(default)]
+    pub queue_enabled: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +614,7 @@ mod tests {
                 run_count: 5,
                 retry_count: 0,
                 max_retries: 3,
+                queue_enabled: false,
             },
         }
     }
@@ -677,6 +683,7 @@ mod tests {
                 run_count: 0,
                 retry_count: 0,
                 max_retries: 3,
+                queue_enabled: true,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();
