@@ -68,6 +68,18 @@ impl From<ConversationError> for ApiError {
                     "requested": requested,
                 })),
             ),
+            ConversationError::TeamRuntimeRequired {
+                conversation_id,
+                team_id,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_RUNTIME_REQUIRED",
+                "This conversation belongs to a team; use the team runtime session",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "team_id": team_id,
+                })),
+            ),
             ConversationError::Unprocessable { reason } => ApiError::UnprocessableEntity(reason),
             ConversationError::Internal { reason } => ApiError::Internal(reason),
             ConversationError::WorkspacePathUnavailable { path } => ApiError::WorkspacePathUnavailable(path),

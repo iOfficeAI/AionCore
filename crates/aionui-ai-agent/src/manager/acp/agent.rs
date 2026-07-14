@@ -53,9 +53,31 @@ pub(super) fn user_facing_message(err: &AgentError) -> String {
     full.split_once(": ").map(|(_, rest)| rest.to_owned()).unwrap_or(full)
 }
 
+fn build_acp_final_input_dump_value(
+    conversation_id: &str,
+    session_id: &str,
+    data: &SendMessageData,
+    final_content: &str,
+    resolved_context: Value,
+) -> Value {
+    serde_json::json!({
+        "kind": "acp-final-input",
+        "backend": "acp",
+        "conversation_id": conversation_id,
+        "session_id": session_id,
+        "msg_id": data.msg_id,
+        "turn_id": data.turn_id.as_deref().unwrap_or("none"),
+        "input": {
+            "content": final_content,
+        },
+        "resolved_context": resolved_context,
+    })
+}
+
 use super::config_option_catalog::{extract_models_from_value, extract_modes_from_value};
 use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
 use super::mode_normalize::normalize_requested_mode;
+use super::mode_normalize::normalize_requested_mode_for_available_values;
 
 /// Grace period before force-killing an ACP process (ms).
 const ACP_KILL_GRACE_MS: u64 = 500;
@@ -105,6 +127,19 @@ fn initial_mode_from_params(params: &AcpSessionParams) -> Option<ModeId> {
         })
         .filter(|m| !m.is_empty())
         .map(ModeId::new)
+}
+
+fn normalize_config_option_request_value(
+    metadata: &aionui_api_types::AgentMetadata,
+    snapshot: &ConfigSnapshot,
+    option_id: &str,
+    value: &str,
+) -> String {
+    let trimmed = value.trim();
+    if option_id == "mode" {
+        return normalize_requested_mode_for_available_values(metadata, trimmed, snapshot.selectable_values("mode"));
+    }
+    trimmed.to_owned()
 }
 
 fn has_persisted_config_for_category(
@@ -612,15 +647,17 @@ impl AcpAgentManager {
     ) -> Result<SetConfigOptionResponse, AgentError> {
         self.ensure_protocol_connected_for_operation("set_config_option")?;
 
-        let (session_id, set_path) = {
+        let (session_id, set_path, resolved_value) = {
             let session = self.session.read().await;
             let snapshot = session.config_snapshot();
-            let set_path = resolve_set_path(&snapshot, option_id, value).map_err(|err| match err {
+            let resolved_value =
+                normalize_config_option_request_value(&self.params.metadata, &snapshot, option_id, value);
+            let set_path = resolve_set_path(&snapshot, option_id, &resolved_value).map_err(|err| match err {
                 ConfigSetPathError::OptionNotFound => {
                     AgentError::bad_request(format!("Config option '{option_id}' is not available"))
                 }
                 ConfigSetPathError::ValueNotSelectable => AgentError::bad_request(format!(
-                    "Value '{value}' is not selectable for config option '{option_id}'"
+                    "Value '{resolved_value}' is not selectable for config option '{option_id}'"
                 )),
             })?;
             let session_id = session.session_id().map(ToOwned::to_owned).ok_or_else(|| {
@@ -632,14 +669,24 @@ impl AcpAgentManager {
                 );
                 AgentError::bad_request("No active session")
             })?;
-            (session_id, set_path)
+            (session_id, set_path, resolved_value)
         };
+
+        if option_id == "mode" && value.trim() != resolved_value {
+            tracing::info!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                requested = %value.trim(),
+                resolved = %resolved_value,
+                "acp_mode_request_remapped"
+            );
+        }
 
         tracing::info!(
             conversation_id = %self.params.conversation_id,
             agent_backend = ?self.params.metadata.backend,
             config_id = %option_id,
-            requested = %value,
+            requested = %resolved_value,
             "acp_config_option_set_requested"
         );
 
@@ -650,7 +697,7 @@ impl AcpAgentManager {
                     .set_config_option(SetSessionConfigOptionRequest::new(
                         SessionId::new(session_id.clone()),
                         config_id.clone(),
-                        value.to_owned(),
+                        resolved_value.clone(),
                     ))
                     .await
                     .map_err(|err| {
@@ -658,7 +705,7 @@ impl AcpAgentManager {
                             conversation_id = %self.params.conversation_id,
                             agent_backend = ?self.params.metadata.backend,
                             config_id = %config_id,
-                            requested = %value,
+                            requested = %resolved_value,
                             error = %err,
                             "acp_config_option_command_failed"
                         );
@@ -669,7 +716,7 @@ impl AcpAgentManager {
                     conversation_id = %self.params.conversation_id,
                     agent_backend = ?self.params.metadata.backend,
                     config_id = %config_id,
-                    requested = %value,
+                    requested = %resolved_value,
                     method = "session/set_config_option",
                     "acp_config_option_command_ack"
                 );
@@ -684,14 +731,14 @@ impl AcpAgentManager {
                     session.apply_advertised_config_options(response.config_options);
                     self.commit_session_changes(&mut session).await;
                 }
-                self.wait_for_observed_config_option(&config_id, value, OBSERVED_CONFIRMATION_TIMEOUT)
+                self.wait_for_observed_config_option(&config_id, &resolved_value, OBSERVED_CONFIRMATION_TIMEOUT)
                     .await
             }
             ConfigSetPath::LegacyMode => {
                 self.protocol
                     .set_mode(SetSessionModeRequest::new(
                         SessionId::new(session_id.clone()),
-                        value.to_owned(),
+                        resolved_value.clone(),
                     ))
                     .await
                     .map_err(|err| {
@@ -699,7 +746,7 @@ impl AcpAgentManager {
                             conversation_id = %self.params.conversation_id,
                             agent_backend = ?self.params.metadata.backend,
                             config_id = %option_id,
-                            requested = %value,
+                            requested = %resolved_value,
                             error = %err,
                             "acp_config_option_command_failed"
                         );
@@ -709,19 +756,19 @@ impl AcpAgentManager {
                     conversation_id = %self.params.conversation_id,
                     agent_backend = ?self.params.metadata.backend,
                     config_id = %option_id,
-                    requested = %value,
+                    requested = %resolved_value,
                     method = "session/set_mode",
                     "acp_config_option_command_ack"
                 );
                 self.ensure_session_unchanged(&session_id, "mode").await?;
-                self.wait_for_observed_config_option("mode", value, OBSERVED_CONFIRMATION_TIMEOUT)
+                self.wait_for_observed_config_option("mode", &resolved_value, OBSERVED_CONFIRMATION_TIMEOUT)
                     .await
             }
             ConfigSetPath::LegacyModel => {
                 self.protocol
                     .set_model(SetSessionModelRequest::new(
                         SessionId::new(session_id.clone()),
-                        value.to_owned(),
+                        resolved_value.clone(),
                     ))
                     .await
                     .map_err(|err| {
@@ -729,7 +776,7 @@ impl AcpAgentManager {
                             conversation_id = %self.params.conversation_id,
                             agent_backend = ?self.params.metadata.backend,
                             config_id = %option_id,
-                            requested = %value,
+                            requested = %resolved_value,
                             error = %err,
                             "acp_config_option_command_failed"
                         );
@@ -739,12 +786,12 @@ impl AcpAgentManager {
                     conversation_id = %self.params.conversation_id,
                     agent_backend = ?self.params.metadata.backend,
                     config_id = %option_id,
-                    requested = %value,
+                    requested = %resolved_value,
                     method = "session/set_model",
                     "acp_config_option_command_ack"
                 );
                 self.ensure_session_unchanged(&session_id, "model").await?;
-                self.wait_for_observed_config_option("model", value, OBSERVED_CONFIRMATION_TIMEOUT)
+                self.wait_for_observed_config_option("model", &resolved_value, OBSERVED_CONFIRMATION_TIMEOUT)
                     .await
             }
         }
@@ -914,9 +961,8 @@ impl AcpAgentManager {
                 .and_then(|commands| matched_slash_command(&raw_user_input, commands))
         };
 
-        let (content, dump_first_prompt) = {
+        let content = {
             let mut s = self.session.write().await;
-            let dump_first_prompt = s.has_pending_session_new_prelude();
             let mut ctx = PromptCtx {
                 session: &mut s,
                 params: &self.params,
@@ -925,41 +971,10 @@ impl AcpAgentManager {
             };
             let transformed = self.pipeline.pre_send(&mut ctx, data.content.clone()).await;
             self.commit_session_changes(&mut s).await;
-            (transformed, dump_first_prompt)
+            transformed
         };
 
-        if dump_first_prompt
-            && let Some(dump_dir) =
-                crate::dev_prompt_dump::dump_dir_for_data_dir(&self.params.data_dir, self.params.dump_prompts)
-        {
-            match crate::dev_prompt_dump::dump_prompt(
-                &dump_dir,
-                crate::dev_prompt_dump::PromptDump {
-                    kind: "acp-first-prompt",
-                    backend: self.backend(),
-                    conversation_id: &self.params.conversation_id,
-                    session_id: Some(&sid),
-                    msg_id: Some(&data.msg_id),
-                    turn_id: data.turn_id.as_deref(),
-                    prompt: &content,
-                },
-            ) {
-                Ok(path) => {
-                    debug!(
-                        conversation_id = %self.params.conversation_id,
-                        path = %path.display(),
-                        "DEV prompt dump written"
-                    );
-                }
-                Err(error) => {
-                    warn!(
-                        conversation_id = %self.params.conversation_id,
-                        error = %error,
-                        "DEV prompt dump failed"
-                    );
-                }
-            }
-        }
+        self.dump_acp_final_input(&sid, data, &content);
 
         let data = SendMessageData {
             content,
@@ -967,6 +982,67 @@ impl AcpAgentManager {
         };
         self.prompt_existing_session(&data, Some(&sid), matched_command.as_ref())
             .await
+    }
+
+    fn dump_acp_final_input(&self, session_id: &str, data: &SendMessageData, final_content: &str) {
+        let Some(dump_dir) =
+            crate::dev_prompt_dump::dump_dir_for_data_dir(&self.params.data_dir, self.params.dump_prompts)
+        else {
+            return;
+        };
+
+        let resolved_context = serde_json::json!({
+            "agent_id": &self.params.metadata.id,
+            "agent_backend": self.params.metadata.backend.as_deref(),
+            "workspace": {
+                "path": &self.params.workspace.path,
+                "is_custom": self.params.workspace.is_custom,
+            },
+            "preset_context": self.params.preset_context.as_deref(),
+            "skills": &self.params.config.skills,
+            "mcp_servers": serde_json::to_value(&self.params.mcp_servers).unwrap_or(Value::Null),
+            "config": serde_json::to_value(&self.params.config).unwrap_or(Value::Null),
+        });
+        let value = build_acp_final_input_dump_value(
+            &self.params.conversation_id,
+            session_id,
+            data,
+            final_content,
+            resolved_context,
+        );
+        let input = value.get("input").cloned().unwrap_or(Value::Null);
+        let resolved_context = value.get("resolved_context").cloned().unwrap_or(Value::Null);
+
+        match crate::dev_prompt_dump::dump_agent_final_input(
+            &dump_dir,
+            crate::dev_prompt_dump::AgentFinalInputDump {
+                kind: "acp-final-input",
+                backend: "acp",
+                conversation_id: &self.params.conversation_id,
+                session_id: Some(session_id),
+                msg_id: Some(data.msg_id.as_str()),
+                turn_id: data.turn_id.as_deref(),
+                input,
+                resolved_context,
+            },
+        ) {
+            Ok(path) => {
+                debug!(
+                    conversation_id = %self.params.conversation_id,
+                    msg_id = %data.msg_id,
+                    path = %path.display(),
+                    "DEV agent final input dump written"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    conversation_id = %self.params.conversation_id,
+                    msg_id = %data.msg_id,
+                    error = %error,
+                    "DEV agent final input dump failed"
+                );
+            }
+        }
     }
 
     /// Pre-open the ACP session without sending a prompt. Called by the
@@ -1292,16 +1368,20 @@ impl AcpAgentManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_status_parts, user_facing_message};
+    use super::{
+        build_acp_final_input_dump_value, exit_status_parts, normalize_config_option_request_value, user_facing_message,
+    };
     use crate::agent_runtime::AgentRuntime;
     use crate::error::AgentError;
+    use crate::manager::acp::config_options::ConfigSnapshot;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::{AcpError, CloseReason};
     use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, SessionId as DomainSessionId};
     use agent_client_protocol::schema::{
         AvailableCommand, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     };
-    use aionui_api_types::AgentHandshake;
+    use aionui_api_types::{AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};
+    use aionui_common::AgentType;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -1339,6 +1419,137 @@ mod tests {
         tracing::subscriber::with_default(subscriber, f);
 
         String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
+    fn codex_metadata(yolo_id: Option<&str>) -> AgentMetadata {
+        AgentMetadata {
+            id: "codex".into(),
+            icon: None,
+            name: "Codex".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("codex".into()),
+            agent_type: AgentType::Acp,
+            agent_source: AgentSource::Builtin,
+            agent_source_info: AgentSourceInfo::default(),
+            enabled: true,
+            available: true,
+            command: None,
+            resolved_command: None,
+            args: vec![],
+            env: vec![],
+            native_skills_dirs: None,
+            behavior_policy: BehaviorPolicy::default(),
+            yolo_id: yolo_id.map(ToOwned::to_owned),
+            sort_order: 0,
+            team_capable: false,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_error_details: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            handshake: AgentHandshake::default(),
+            has_command_override: false,
+            env_override_key_count: 0,
+        }
+    }
+
+    fn mode_snapshot(values: &[&'static str]) -> ConfigSnapshot {
+        ConfigSnapshot::from_real_options(vec![
+            SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "auto",
+                values
+                    .iter()
+                    .map(|value| SessionConfigSelectOption::new(*value, *value))
+                    .collect::<Vec<_>>(),
+            )
+            .category(SessionConfigOptionCategory::Mode),
+        ])
+    }
+
+    #[test]
+    fn set_config_option_request_maps_full_access_to_agent_full_access() {
+        let metadata = codex_metadata(Some("agent-full-access"));
+        let snapshot = mode_snapshot(&["auto", "agent-full-access"]);
+
+        assert_eq!(
+            normalize_config_option_request_value(&metadata, &snapshot, "mode", "full-access"),
+            "agent-full-access"
+        );
+    }
+
+    #[test]
+    fn set_config_option_request_falls_back_to_legacy_full_access_when_catalog_requires_it() {
+        let metadata = codex_metadata(Some("agent-full-access"));
+        let snapshot = mode_snapshot(&["auto", "full-access"]);
+
+        assert_eq!(
+            normalize_config_option_request_value(&metadata, &snapshot, "mode", "agent-full-access"),
+            "full-access"
+        );
+    }
+
+    #[test]
+    fn set_config_option_request_preserves_unmapped_mode_for_local_value_not_selectable_error() {
+        let metadata = codex_metadata(Some("agent-full-access"));
+        let snapshot = mode_snapshot(&["auto", "read-only"]);
+
+        assert_eq!(
+            normalize_config_option_request_value(&metadata, &snapshot, "mode", "full-access"),
+            "agent-full-access"
+        );
+    }
+
+    #[test]
+    fn acp_final_input_dump_value_contains_post_hook_prompt_and_context() {
+        let data = crate::types::SendMessageData {
+            content: "original team wake".into(),
+            msg_id: "msg-acp-final".into(),
+            turn_id: Some("turn-acp-final".into()),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+        };
+        let resolved_context = serde_json::json!({
+            "agent_id": "agent-claude",
+            "agent_backend": "claude",
+            "workspace": {
+                "path": "/tmp",
+                "is_custom": true,
+            },
+            "preset_context": "Rule A",
+            "skills": [],
+            "mcp_servers": [],
+        });
+
+        let value = build_acp_final_input_dump_value(
+            "conv-acp-final",
+            "session-acp-final",
+            &data,
+            "[Assistant Rules]\nRule A\n[/Assistant Rules]\n\noriginal team wake",
+            resolved_context,
+        );
+
+        assert_eq!(value["kind"], "acp-final-input");
+        assert_eq!(value["backend"], "acp");
+        assert_eq!(value["conversation_id"], "conv-acp-final");
+        assert_eq!(value["session_id"], "session-acp-final");
+        assert_eq!(value["msg_id"], "msg-acp-final");
+        assert_eq!(value["turn_id"], "turn-acp-final");
+        assert_eq!(
+            value["input"]["content"],
+            "[Assistant Rules]\nRule A\n[/Assistant Rules]\n\noriginal team wake"
+        );
+        assert_eq!(value["resolved_context"]["workspace"]["path"], "/tmp");
+        assert_eq!(value["resolved_context"]["skills"], serde_json::json!([]));
+        assert!(value["resolved_context"]["mcp_servers"].is_array());
     }
 
     #[test]

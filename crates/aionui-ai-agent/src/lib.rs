@@ -35,7 +35,7 @@ pub use capability::skill_manager::{
 };
 pub use error::AgentError;
 pub use factory::{AgentFactoryDeps, build_agent_factory};
-pub use idle_scanner::start_idle_scanner;
+pub use idle_scanner::{IdleCleanupCoordinator, start_idle_scanner, start_idle_scanner_with_coordinator};
 pub use persistence::AcpSessionSyncService;
 pub use protocol::error::AcpError;
 pub use protocol::events::AgentStreamEvent;

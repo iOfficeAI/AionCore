@@ -381,7 +381,17 @@ impl AcpSession {
             .push(PendingStartupConfigSeed { category, value });
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_pending_startup_config_seeds(&mut self) -> Vec<PendingStartupConfigSeedResult> {
+        self.resolve_pending_startup_config_seeds_with_mode_normalizer(|requested, _available_values| {
+            requested.to_owned()
+        })
+    }
+
+    pub(crate) fn resolve_pending_startup_config_seeds_with_mode_normalizer(
+        &mut self,
+        mode_normalizer: impl Fn(&str, Vec<&str>) -> String,
+    ) -> Vec<PendingStartupConfigSeedResult> {
         let seeds = std::mem::take(&mut self.desired.pending_startup_config);
         if seeds.is_empty() {
             return Vec::new();
@@ -405,7 +415,13 @@ impl AcpSession {
                 continue;
             };
 
-            if !select_option_contains_value(&option.kind, seed.value.as_str()) {
+            let resolved_value = if seed.category == SessionConfigOptionCategory::Mode {
+                ConfigValue::new(mode_normalizer(seed.value.as_str(), select_option_values(&option.kind)))
+            } else {
+                seed.value.clone()
+            };
+
+            if !select_option_contains_value(&option.kind, resolved_value.as_str()) {
                 self.handle_unresolved_startup_config_seed(&seed, true);
                 results.push(PendingStartupConfigSeedResult::ValueNotSelectable {
                     category: seed.category,
@@ -415,7 +431,7 @@ impl AcpSession {
 
             let option_id = ConfigKey::new(option.id.to_string());
             self.clear_legacy_desired_for_config_category(&seed.category);
-            self.set_desired_config(option_id.clone(), seed.value);
+            self.set_desired_config(option_id.clone(), resolved_value);
             results.push(PendingStartupConfigSeedResult::Applied {
                 category: seed.category,
                 option_id,
@@ -986,6 +1002,23 @@ fn select_option_contains_value(kind: &SessionConfigKind, value: &str) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+fn select_option_values(kind: &SessionConfigKind) -> Vec<&str> {
+    match kind {
+        SessionConfigKind::Select(select) => match &select.options {
+            SessionConfigSelectOptions::Ungrouped(options) => {
+                options.iter().map(|option| option.value.0.as_ref()).collect()
+            }
+            SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .map(|option| option.value.0.as_ref())
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
     }
 }
 

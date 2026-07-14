@@ -62,6 +62,9 @@ pub enum ConversationError {
         requested: String,
     },
 
+    #[error("Team runtime is required for conversation: {conversation_id}")]
+    TeamRuntimeRequired { conversation_id: String, team_id: String },
+
     #[error("Unprocessable entity: {reason}")]
     Unprocessable { reason: String },
 
@@ -111,6 +114,9 @@ impl ConversationError {
             Self::Timeout { reason } => AgentError::timeout(reason.clone()),
             Self::ConfigConfirmationTimeout { .. } => AgentError::timeout("ACP config option confirmation timed out"),
             Self::ConfigUpdateInProgress { .. } => AgentError::conflict("ACP config update is already in progress"),
+            Self::TeamRuntimeRequired { .. } => {
+                AgentError::conflict("This conversation belongs to a team; use the team runtime session")
+            }
             Self::Unprocessable { reason } => AgentError::bad_request(reason.clone()),
             Self::Internal { reason } => AgentError::internal(reason.clone()),
             Self::WorkspacePathUnavailable { path } => {
@@ -141,6 +147,7 @@ impl ConversationError {
             Self::Timeout { .. } => "TIMEOUT",
             Self::ConfigConfirmationTimeout { .. } => "confirmation_timeout",
             Self::ConfigUpdateInProgress { .. } => "config_update_in_progress",
+            Self::TeamRuntimeRequired { .. } => "TEAM_RUNTIME_REQUIRED",
             Self::Unprocessable { .. } => "UNPROCESSABLE_ENTITY",
             Self::Archived { .. } => "CONVERSATION_ARCHIVED",
             Self::WorkspacePathUnavailable { .. } => "WORKSPACE_PATH_UNAVAILABLE",

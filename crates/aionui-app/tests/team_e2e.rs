@@ -258,9 +258,34 @@ async fn tc3b_create_team_writes_legacy_extra_shape() {
     assert_eq!(extra["current_model_id"], "claude");
 }
 
-// TC-4: First assistant defaults to lead
 #[tokio::test]
-async fn tc4_first_agent_is_lead() {
+async fn tc3c_team_conversation_rejects_standalone_runtime_ensure() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{conversation_id}/runtime/ensure"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert_eq!(body["success"], false);
+    assert_eq!(body["code"], "TEAM_RUNTIME_REQUIRED");
+    assert_eq!(body["details"]["conversation_id"], conversation_id);
+    assert_eq!(body["details"]["team_id"], data["id"]);
+}
+
+// TC-4: Explicit lead role is returned first
+#[tokio::test]
+async fn tc4_explicit_lead_is_returned_first() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
@@ -269,13 +294,16 @@ async fn tc4_first_agent_is_lead() {
         "name": "T",
         "agents": [
             team_agent("A", "teammate"),
-            team_agent("B", "teammate")
+            team_agent("B", "lead")
         ]
     });
     let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     let json = body_json(resp).await;
+    assert_eq!(json["data"]["assistants"][0]["name"], "B");
     assert_eq!(json["data"]["assistants"][0]["role"], "lead");
+    assert_eq!(json["data"]["assistants"][1]["name"], "A");
+    assert_eq!(json["data"]["assistants"][1]["role"], "teammate");
     assert_eq!(
         json["data"]["leader_assistant_id"],
         json["data"]["assistants"][0]["slot_id"]
@@ -551,7 +579,11 @@ async fn trs2_run_state_returns_active_run_payload() {
     let send_resp = app.clone().oneshot(send_req).await.unwrap();
     assert_eq!(send_resp.status(), StatusCode::OK);
     let send_body = body_json(send_resp).await;
-    let team_run_id = send_body["data"]["team_run_id"].as_str().unwrap();
+    let team_run_id = send_body["data"]["run"]["team_run_id"].as_str().unwrap();
+    assert!(matches!(
+        send_body["data"]["enqueue_status"].as_str(),
+        Some("accepted" | "queued" | "blocked_runtime_starting")
+    ));
 
     let req = get_with_token(&format!("/api/teams/{team_id}/run-state"), &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -562,9 +594,12 @@ async fn trs2_run_state_returns_active_run_payload() {
     assert_eq!(body["data"]["active_run"]["team_id"], team_id);
     assert_eq!(body["data"]["active_run"]["team_run_id"], team_run_id);
     assert_eq!(body["data"]["active_run"]["source"], "user_message");
-    assert_eq!(body["data"]["active_run"]["has_user_intervention"], true);
+    assert_eq!(body["data"]["active_run"]["has_user_intervention"], false);
     assert_eq!(body["data"]["active_run"]["status"], "accepted");
-    assert_eq!(body["data"]["active_run"]["pending_wake_count"], 1);
+    assert!(body["data"]["active_run"]["queued_intent_count"].is_number());
+    assert!(body["data"]["active_run"]["starting_batch_count"].is_number());
+    assert!(body["data"]["active_run"]["running_batch_count"].is_number());
+    assert!(body["data"]["active_run"]["active_enqueue_lease_count"].is_number());
     assert!(body["data"]["active_run"]["slot_work"].as_array().unwrap().len() >= 1);
 }
 

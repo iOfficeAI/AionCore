@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+mod wake_summary;
 
 pub use aionui_team_prompts::AvailableAssistant;
 
-use crate::types::{MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask};
+use crate::types::{MailboxMessage, MailboxMessageType, TeamAgent, TeamTask};
 
 fn to_prompt_role(role: crate::types::TeammateRole) -> aionui_team_prompts::TeamPromptRole {
     match role {
@@ -32,14 +34,17 @@ fn to_prompt_agent(agent: &TeamAgent) -> aionui_team_prompts::TeamPromptAgent {
 /// staffing the team. Callers should only include assistants that are both
 /// enabled and team-selectable.
 pub fn build_lead_prompt(
+    agent: &TeamAgent,
     team_name: &str,
     members: &[TeamAgent],
     available_assistants: &[AvailableAssistant],
 ) -> String {
+    let prompt_agent = to_prompt_agent(agent);
     let prompt_members: Vec<_> = members.iter().map(to_prompt_agent).collect();
     let renamed: HashMap<String, String> = HashMap::new();
 
     let body = aionui_team_prompts::build_lead_prompt(&aionui_team_prompts::LeadPromptParams {
+        agent: &prompt_agent,
         team_name,
         teammates: &prompt_members,
         available_agent_types: &[],
@@ -82,7 +87,12 @@ pub fn build_teammate_prompt(agent: &TeamAgent, team_name: &str, members: &[Team
     })
 }
 
-pub fn build_wake_payload(agent: &TeamAgent, tasks: &[TeamTask], unread_messages: &[MailboxMessage]) -> String {
+pub fn build_wake_payload(
+    agent: &TeamAgent,
+    tasks: &[TeamTask],
+    unread_messages: &[MailboxMessage],
+    current_slot_ids: &HashSet<String>,
+) -> String {
     let mut payload = String::with_capacity(2048);
 
     if !unread_messages.is_empty() {
@@ -106,33 +116,7 @@ pub fn build_wake_payload(agent: &TeamAgent, tasks: &[TeamTask], unread_messages
         payload.push_str("## New Messages\n\nNo new messages.\n\n");
     }
 
-    if !tasks.is_empty() {
-        payload.push_str("## Current Task Board\n\n");
-        payload.push_str("| ID | Subject | Status | Owner | Blocked By |\n");
-        payload.push_str("|---|---|---|---|---|\n");
-        for task in tasks {
-            let status = match task.status {
-                TaskStatus::Pending => "pending",
-                TaskStatus::InProgress => "in_progress",
-                TaskStatus::Completed => "completed",
-                TaskStatus::Deleted => "deleted",
-            };
-            let owner = task.owner.as_deref().unwrap_or("-");
-            let blocked = if task.blocked_by.is_empty() {
-                "-".to_owned()
-            } else {
-                task.blocked_by.join(", ")
-            };
-            let short_id = if task.id.len() > 8 { &task.id[..8] } else { &task.id };
-            payload.push_str(&format!(
-                "| {short_id}… | {} | {status} | {owner} | {blocked} |\n",
-                task.subject,
-            ));
-        }
-        payload.push('\n');
-    } else {
-        payload.push_str("## Current Task Board\n\nNo tasks on the board.\n\n");
-    }
+    payload.push_str(&wake_summary::render_task_board_summary(agent, tasks, current_slot_ids));
 
     payload.push_str(&format!(
         "You are **{}** (role: {}). Proceed with your work.\n",
@@ -145,7 +129,7 @@ pub fn build_wake_payload(agent: &TeamAgent, tasks: &[TeamTask], unread_messages
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TeammateRole;
+    use crate::types::{TaskStatus, TeammateRole};
 
     fn make_lead() -> TeamAgent {
         TeamAgent {
@@ -208,6 +192,10 @@ mod tests {
         }
     }
 
+    fn roster(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
     // -- Lead prompt ----------------------------------------------------------
 
     fn default_assistants() -> Vec<AvailableAssistant> {
@@ -223,36 +211,37 @@ mod tests {
     #[test]
     fn lead_prompt_contains_team_name() {
         let assistants = default_assistants();
-        let prompt = build_lead_prompt("Alpha", &[], &assistants);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &assistants);
         assert!(prompt.contains("\"Alpha\""));
     }
 
     #[test]
-    fn lead_prompt_contains_member_list() {
+    fn lead_prompt_uses_tool_for_member_list() {
         let assistants = default_assistants();
         let members = vec![make_lead(), make_teammate("w1", "Worker1")];
-        let prompt = build_lead_prompt("Alpha", &members, &assistants);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &members, &assistants);
 
-        // AionUi bullet format: `- {name} ({backend}, status: {status})`
-        assert!(prompt.contains("- Lead (acp, status:"));
-        assert!(prompt.contains("- Worker1 (acp, status:"));
+        assert!(!prompt.contains("- Lead (acp, status:"));
+        assert!(!prompt.contains("- Worker1 (acp, status:"));
+        assert!(prompt.contains("team_members"));
     }
 
     #[test]
     fn lead_prompt_contains_core_sections() {
         let assistants = default_assistants();
-        let prompt = build_lead_prompt("Alpha", &[], &assistants);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &assistants);
 
-        // Workflow — 15-step procedure with model listing at step 3
+        // Workflow uses tools for dynamic state.
         assert!(prompt.contains("## Workflow"));
-        assert!(prompt.contains("FIRST call `team_list_assistants`"));
+        assert!(prompt.contains("FIRST call `team_members`"));
+        assert!(prompt.contains("call `team_list_assistants`"));
         assert!(prompt.contains("Wait for explicit confirmation before using team_spawn_agent"));
         assert!(prompt.contains("End your turn after the proposal"));
 
-        // Model Selection Guidelines
-        assert!(prompt.contains("## Model Selection Guidelines"));
-        assert!(prompt.contains("exact model ID strings"));
-        assert!(prompt.contains("omit the model parameter"));
+        // Assistant selection, not model selection.
+        assert!(prompt.contains("## Assistant Selection Guidelines"));
+        assert!(!prompt.contains("team_list_models"));
+        assert!(prompt.contains("Do not pass a model to `team_spawn_agent`"));
 
         // Conversation Style — don't pitch proposals up-front
         assert!(prompt.contains("## Conversation Style"));
@@ -274,42 +263,47 @@ mod tests {
     }
 
     #[test]
-    fn lead_prompt_includes_available_assistants_section() {
+    fn lead_prompt_omits_dynamic_available_assistants_section() {
         let assistants = default_assistants();
-        let prompt = build_lead_prompt("Alpha", &[], &assistants);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &assistants);
 
-        assert!(prompt.contains("## Available Assistants for Spawning"));
-        assert!(prompt.contains("- `word-creator` (Word Creator) — Drafts Word documents"));
-        assert!(prompt.contains("skills: docx, formatting"));
-        assert!(prompt.contains("Pass the assistant's ID as `assistant_id`"));
-        assert!(!prompt.contains("backend: claude"));
+        assert!(!prompt.contains("## Available Assistants for Spawning"));
+        assert!(!prompt.contains("- `word-creator` (Word Creator) — Drafts Word documents"));
+        assert!(prompt.contains("team_list_assistants"));
     }
 
     #[test]
     fn lead_prompt_omits_available_assistants_section_when_empty() {
-        let prompt = build_lead_prompt("Alpha", &[], &[]);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &[]);
         assert!(!prompt.contains("## Available Assistants for Spawning"));
     }
 
     #[test]
-    fn lead_prompt_no_members_shows_empty_lineup_copy() {
+    fn lead_prompt_does_not_include_dynamic_member_snapshot() {
         let assistants = default_assistants();
-        let prompt = build_lead_prompt("Solo", &[], &assistants);
-        assert!(prompt.contains("(no teammates yet"));
-        assert!(prompt.contains("propose the lineup to the user first"));
+        let prompt = build_lead_prompt(&make_lead(), "Solo", &[], &assistants);
+        assert!(!prompt.contains("## Your Teammates"));
+        assert!(!prompt.contains("(no teammates yet"));
+        assert!(prompt.to_lowercase().contains("first team turn"));
+        assert!(prompt.contains("team_members"));
     }
 
     #[test]
     fn lead_prompt_has_no_unsubstituted_placeholders() {
         let assistants = default_assistants();
         let members = vec![make_lead(), make_teammate("w1", "Worker1")];
-        let prompt = build_lead_prompt("Alpha", &members, &assistants);
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &members, &assistants);
         assert!(
             !prompt.contains("${"),
             "unsubstituted template placeholder leaked:\n{prompt}"
         );
         assert!(!prompt.contains("assistant or backend"));
         assert!(!prompt.contains("Available Generic Backends"));
+        assert!(!prompt.contains("## Your Teammates"));
+        assert!(!prompt.contains("## Available Assistants for Spawning"));
+        assert!(prompt.contains("Name: Lead"));
+        assert!(prompt.contains("Slot ID: lead-1"));
+        assert!(prompt.contains("Role: lead"));
     }
 
     // -- Teammate prompt ------------------------------------------------------
@@ -322,8 +316,10 @@ mod tests {
 
         assert!(prompt.contains("## Team Governance"));
         assert!(prompt.contains("Name: Worker1"));
+        assert!(prompt.contains("Slot ID: w1"));
         assert!(prompt.contains("Team: Alpha"));
         assert!(prompt.contains("Leader: Lead"));
+        assert!(!prompt.contains("Teammates:"));
     }
 
     #[test]
@@ -355,7 +351,7 @@ mod tests {
     fn wake_payload_with_messages() {
         let agent = make_lead();
         let msgs = vec![make_message("w1", "Task A done", MailboxMessageType::Message)];
-        let payload = build_wake_payload(&agent, &[], &msgs);
+        let payload = build_wake_payload(&agent, &[], &msgs, &roster(&["lead-1", "w1"]));
 
         assert!(payload.contains("New Messages"));
         assert!(payload.contains("`w1`"));
@@ -368,7 +364,7 @@ mod tests {
         let agent = make_lead();
         let mut msg = make_message("w1", "idle", MailboxMessageType::IdleNotification);
         msg.summary = Some("Finished feature X".into());
-        let payload = build_wake_payload(&agent, &[], &[msg]);
+        let payload = build_wake_payload(&agent, &[], &[msg], &roster(&["lead-1", "w1"]));
 
         assert!(payload.contains("[idle_notification]"));
         assert!(payload.contains("Summary: Finished feature X"));
@@ -378,7 +374,7 @@ mod tests {
     fn wake_payload_with_shutdown_request() {
         let agent = make_teammate("w1", "W");
         let msg = make_message("lead-1", "No longer needed", MailboxMessageType::ShutdownRequest);
-        let payload = build_wake_payload(&agent, &[], &[msg]);
+        let payload = build_wake_payload(&agent, &[], &[msg], &roster(&["lead-1", "w1"]));
 
         assert!(payload.contains("[shutdown_request]"));
         assert!(payload.contains("No longer needed"));
@@ -395,9 +391,10 @@ mod tests {
             ),
             make_task("bbbbbbbb-1234-5678-9abc-def012345678", "Test Y", TaskStatus::Pending),
         ];
-        let payload = build_wake_payload(&agent, &tasks, &[]);
+        let payload = build_wake_payload(&agent, &tasks, &[], &roster(&["lead-1", "worker-1"]));
 
-        assert!(payload.contains("Current Task Board"));
+        assert!(payload.contains("Current Task Board Summary"));
+        assert!(payload.contains("Showing 2 of 2 tasks."));
         assert!(payload.contains("Implement X"));
         assert!(payload.contains("in_progress"));
         assert!(payload.contains("Test Y"));
@@ -410,15 +407,17 @@ mod tests {
         let agent = make_lead();
         let mut task = make_task("cccccccc-1234-5678-9abc-def012345678", "Deploy", TaskStatus::Pending);
         task.blocked_by = vec!["task-a".into(), "task-b".into()];
-        let payload = build_wake_payload(&agent, &[task], &[]);
+        let payload = build_wake_payload(&agent, &[task], &[], &roster(&["lead-1", "worker-1"]));
 
-        assert!(payload.contains("task-a, task-b"));
+        assert!(payload.contains("task-a…"));
+        assert!(payload.contains("task-b…"));
+        assert!(!payload.contains("task-a, task-b"));
     }
 
     #[test]
     fn wake_payload_empty() {
         let agent = make_lead();
-        let payload = build_wake_payload(&agent, &[], &[]);
+        let payload = build_wake_payload(&agent, &[], &[], &roster(&["lead-1"]));
 
         assert!(payload.contains("No new messages"));
         assert!(payload.contains("No tasks on the board"));
@@ -428,7 +427,7 @@ mod tests {
     #[test]
     fn wake_payload_contains_agent_identity() {
         let agent = make_teammate("w1", "Worker1");
-        let payload = build_wake_payload(&agent, &[], &[]);
+        let payload = build_wake_payload(&agent, &[], &[], &roster(&["w1"]));
 
         assert!(payload.contains("**Worker1**"));
         assert!(payload.contains("teammate"));
@@ -438,7 +437,7 @@ mod tests {
     fn wake_payload_short_task_id_no_truncation() {
         let agent = make_lead();
         let task = make_task("short", "Short ID Task", TaskStatus::Pending);
-        let payload = build_wake_payload(&agent, &[task], &[]);
+        let payload = build_wake_payload(&agent, &[task], &[], &roster(&["lead-1", "worker-1"]));
         assert!(payload.contains("short…"));
     }
 }

@@ -159,9 +159,11 @@ impl SqliteFeedbackDiagnosticsRepository {
                 (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count, \
                 (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL))) AS error_message_count, \
                 (SELECT CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.code'), json_extract(m.content, '$.code')) END \
-                   FROM messages m \
+                  FROM messages m \
                   WHERE m.conversation_id = c.id \
                     AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
+                    AND json_valid(m.content) \
+                    AND COALESCE(json_extract(m.content, '$.error.code'), json_extract(m.content, '$.code')) IS NOT NULL \
                   ORDER BY m.created_at DESC, m.id DESC \
                   LIMIT 1) AS latest_error_code \
              FROM conversations c \
@@ -324,6 +326,55 @@ impl SqliteFeedbackDiagnosticsRepository {
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
+        let recent_error_detail_rows = sqlx::query(
+            "SELECT \
+                id, msg_id, type, status, position, hidden, created_at, length(content) AS content_bytes, content, \
+                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.code'), json_extract(content, '$.code')) END AS code, \
+                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.ownership'), json_extract(content, '$.ownership')) END AS ownership, \
+                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.retryable'), json_extract(content, '$.retryable')) END AS retryable \
+             FROM messages \
+             WHERE conversation_id = ? \
+               AND (status = 'error' OR type = 'tips' OR (json_valid(content) AND json_extract(content, '$.error.code') IS NOT NULL)) \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT 10",
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let recent_error_details = recent_error_detail_rows
+            .into_iter()
+            .map(|row| {
+                let content = row.try_get::<String, _>("content")?;
+                let content = json_value_or_string(&content);
+                let failure_summary = message_failure_summary(&content);
+                Ok(json!({
+                    "id": row.try_get::<String, _>("id")?,
+                    "msg_id": row.try_get::<Option<String>, _>("msg_id")?,
+                    "type": row.try_get::<String, _>("type")?,
+                    "status": row.try_get::<Option<String>, _>("status")?,
+                    "position": row.try_get::<Option<String>, _>("position")?,
+                    "hidden": row.try_get::<bool, _>("hidden")?,
+                    "created_at": row.try_get::<i64, _>("created_at")?,
+                    "content_bytes": row.try_get::<Option<i64>, _>("content_bytes")?,
+                    "content": content,
+                    "code": row.try_get::<Option<String>, _>("code")?,
+                    "ownership": row.try_get::<Option<String>, _>("ownership")?,
+                    "retryable": sqlite_bool_value(row.try_get::<Option<i64>, _>("retryable")?),
+                    "failure_summary": failure_summary,
+                }))
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+        let failure_summaries = recent_error_details
+            .iter()
+            .filter_map(|item| {
+                item.get("failure_summary")
+                    .filter(|summary| !summary.is_null())
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+
         Ok(json!({
             "total_count": total_count,
             "total_content_bytes": total_content_bytes,
@@ -332,6 +383,8 @@ impl SqliteFeedbackDiagnosticsRepository {
             "hidden": hidden,
             "recent_messages": recent_messages,
             "recent_errors": recent_errors,
+            "recent_error_details": recent_error_details,
+            "failure_summaries": failure_summaries,
         }))
     }
 
@@ -721,6 +774,161 @@ impl SqliteFeedbackDiagnosticsRepository {
         ))
     }
 
+    async fn collect_client_ui_settings(&self) -> Result<FeedbackDiagnosticsProfileResult, DbError> {
+        let preference_rows = sqlx::query(
+            "SELECT key, value, updated_at \
+             FROM client_preferences \
+             WHERE key LIKE 'appearance.%' \
+                OR key LIKE 'window.%' \
+                OR key LIKE 'display.%' \
+                OR key LIKE 'workspace.%' \
+                OR key LIKE 'settings.%' \
+             ORDER BY updated_at DESC, key ASC \
+             LIMIT 50",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let preferences = preference_rows
+            .into_iter()
+            .map(|row| {
+                let value = row.try_get::<String, _>("value")?;
+                Ok(json!({
+                    "key": row.try_get::<String, _>("key")?,
+                    "value": json_value_or_string(&value),
+                    "value_bytes": value.len(),
+                    "updated_at": row.try_get::<i64, _>("updated_at")?,
+                }))
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+        let settings = sqlx::query(
+            "SELECT language, notification_enabled, cron_notification_enabled, command_queue_enabled, save_upload_to_workspace, updated_at \
+             FROM system_settings \
+             WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let system_settings = if let Some(row) = settings {
+            Some(json!({
+                    "language": row.try_get::<String, _>("language")?,
+                    "notification_enabled": row.try_get::<bool, _>("notification_enabled")?,
+                    "cron_notification_enabled": row.try_get::<bool, _>("cron_notification_enabled")?,
+                    "command_queue_enabled": row.try_get::<bool, _>("command_queue_enabled")?,
+                    "save_upload_to_workspace": row.try_get::<bool, _>("save_upload_to_workspace")?,
+                    "updated_at": row.try_get::<i64, _>("updated_at")?,
+            }))
+        } else {
+            None
+        };
+
+        Ok(profile_result(
+            FeedbackDiagnosticsProfile::ClientUiSettings,
+            "summary",
+            json!({
+                "preferences": {
+                    "limit": 50,
+                    "items": preferences,
+                },
+                "system_settings": system_settings,
+            }),
+        ))
+    }
+
+    async fn collect_workspace_summary(
+        &self,
+        request: &FeedbackDiagnosticsRequest,
+    ) -> Result<FeedbackDiagnosticsProfileResult, DbError> {
+        let Some(conversation_id) = request.context.conversation_id.as_deref() else {
+            return Ok(profile_result(
+                FeedbackDiagnosticsProfile::WorkspaceSummary,
+                "summary",
+                json!({
+                    "conversation": Value::Null,
+                    "team": Value::Null,
+                    "runtime_checks": workspace_runtime_checks_boundary(),
+                }),
+            ));
+        };
+
+        let conversation = sqlx::query(
+            "SELECT \
+                id, name AS title, extra, model, status, source, updated_at, \
+                CASE WHEN json_valid(extra) THEN COALESCE(json_extract(extra, '$.teamId'), json_extract(extra, '$.team_id')) END AS extra_team_id, \
+                CASE WHEN json_valid(extra) THEN COALESCE(json_extract(extra, '$.workspace'), json_extract(extra, '$.workspacePath'), json_extract(extra, '$.workspace_path')) END AS extra_workspace \
+             FROM conversations \
+             WHERE id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(&request.user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(conversation) = conversation else {
+            return Ok(profile_result(
+                FeedbackDiagnosticsProfile::WorkspaceSummary,
+                "not_found",
+                json!({
+                    "conversation": Value::Null,
+                    "team": Value::Null,
+                    "runtime_checks": workspace_runtime_checks_boundary(),
+                }),
+            ));
+        };
+
+        let team_id = request.context.team_id.clone().or_else(|| {
+            conversation
+                .try_get::<Option<String>, _>("extra_team_id")
+                .ok()
+                .flatten()
+        });
+
+        let team = if let Some(team_id) = team_id.as_deref() {
+            sqlx::query(
+                "SELECT id, name, workspace, workspace_mode, session_mode, lead_agent_id, updated_at \
+                 FROM teams \
+                 WHERE id = ? AND user_id = ?",
+            )
+            .bind(team_id)
+            .bind(&request.user_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| {
+                Ok::<Value, sqlx::Error>(json!({
+                    "team_id": row.try_get::<String, _>("id")?,
+                    "name": row.try_get::<String, _>("name")?,
+                    "workspace": row.try_get::<String, _>("workspace")?,
+                    "workspace_mode": row.try_get::<String, _>("workspace_mode")?,
+                    "session_mode": row.try_get::<Option<String>, _>("session_mode")?,
+                    "lead_agent_id": row.try_get::<Option<String>, _>("lead_agent_id")?,
+                    "updated_at": row.try_get::<i64, _>("updated_at")?,
+                }))
+            })
+            .transpose()?
+        } else {
+            None
+        };
+
+        Ok(profile_result(
+            FeedbackDiagnosticsProfile::WorkspaceSummary,
+            "detail",
+            json!({
+                "conversation": {
+                    "id": conversation.try_get::<String, _>("id")?,
+                    "title": conversation.try_get::<String, _>("title")?,
+                    "status": conversation.try_get::<Option<String>, _>("status")?,
+                    "source": conversation.try_get::<Option<String>, _>("source")?,
+                    "updated_at": conversation.try_get::<i64, _>("updated_at")?,
+                    "extra_team_id": conversation.try_get::<Option<String>, _>("extra_team_id")?,
+                    "extra_workspace": conversation.try_get::<Option<String>, _>("extra_workspace")?,
+                },
+                "team": team,
+                "runtime_checks": workspace_runtime_checks_boundary(),
+            }),
+        ))
+    }
+
     async fn collect_global_summary(
         &self,
         request: &FeedbackDiagnosticsRequest,
@@ -872,9 +1080,11 @@ impl SqliteFeedbackDiagnosticsRepository {
                 (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count, \
                 (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL))) AS error_message_count, \
                 (SELECT CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.code'), json_extract(m.content, '$.code')) END \
-                   FROM messages m \
+                  FROM messages m \
                   WHERE m.conversation_id = c.id \
                     AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
+                    AND json_valid(m.content) \
+                    AND COALESCE(json_extract(m.content, '$.error.code'), json_extract(m.content, '$.code')) IS NOT NULL \
                   ORDER BY m.created_at DESC, m.id DESC \
                   LIMIT 1) AS latest_error_code, \
                 t.id AS team_row_id, t.name AS team_name, t.workspace_mode AS team_workspace_mode, \
@@ -1058,6 +1268,8 @@ impl SqliteFeedbackDiagnosticsRepository {
             .into_iter()
             .map(|row| {
                 let content = row.try_get::<String, _>("content")?;
+                let content = json_value_or_string(&content);
+                let failure_summary = message_failure_summary(&content);
                 Ok(json!({
                     "id": row.try_get::<String, _>("id")?,
                     "msg_id": row.try_get::<Option<String>, _>("msg_id")?,
@@ -1067,13 +1279,14 @@ impl SqliteFeedbackDiagnosticsRepository {
                     "hidden": row.try_get::<bool, _>("hidden")?,
                     "created_at": row.try_get::<i64, _>("created_at")?,
                     "content_bytes": row.try_get::<Option<i64>, _>("content_bytes")?,
-                    "content": json_value_or_string(&content),
+                    "content": content,
                     "code": row.try_get::<Option<String>, _>("code")?,
                     "ownership": row.try_get::<Option<String>, _>("ownership")?,
                     "retryable": sqlite_bool_value(row.try_get::<Option<i64>, _>("retryable")?),
                     "resolution_kind": row.try_get::<Option<String>, _>("resolution_kind")?,
                     "resolution_target_id": row.try_get::<Option<String>, _>("resolution_target_id")?,
                     "feedback_recommended": sqlite_bool_value(row.try_get::<Option<i64>, _>("feedback_recommended")?),
+                    "failure_summary": failure_summary,
                 }))
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()?;
@@ -1157,6 +1370,9 @@ impl SqliteFeedbackDiagnosticsRepository {
         let items = rows
             .into_iter()
             .map(|row| {
+                let content = row.try_get::<String, _>("content")?;
+                let content = json_value_or_string(&content);
+                let failure_summary = message_failure_summary(&content);
                 Ok(json!({
                     "conversation_id": row.try_get::<String, _>("conversation_id")?,
                     "conversation_title": row.try_get::<String, _>("conversation_title")?,
@@ -1170,13 +1386,14 @@ impl SqliteFeedbackDiagnosticsRepository {
                     "position": row.try_get::<Option<String>, _>("position")?,
                     "created_at": row.try_get::<i64, _>("created_at")?,
                     "content_bytes": row.try_get::<Option<i64>, _>("content_bytes")?,
-                    "content": json_value_or_string(&row.try_get::<String, _>("content")?),
+                    "content": content,
                     "code": row.try_get::<Option<String>, _>("code")?,
                     "ownership": row.try_get::<Option<String>, _>("ownership")?,
                     "retryable": sqlite_bool_value(row.try_get::<Option<i64>, _>("retryable")?),
                     "resolution_kind": row.try_get::<Option<String>, _>("resolution_kind")?,
                     "resolution_target_id": row.try_get::<Option<String>, _>("resolution_target_id")?,
                     "feedback_recommended": sqlite_bool_value(row.try_get::<Option<i64>, _>("feedback_recommended")?),
+                    "failure_summary": failure_summary,
                 }))
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()?;
@@ -1297,6 +1514,8 @@ impl IFeedbackDiagnosticsRepository for SqliteFeedbackDiagnosticsRepository {
                 FeedbackDiagnosticsProfile::ModelAuth => self.collect_model_auth(request).await?,
                 FeedbackDiagnosticsProfile::AgentTeam => self.collect_agent_team(request).await?,
                 FeedbackDiagnosticsProfile::McpTools => self.collect_mcp_tools(request).await?,
+                FeedbackDiagnosticsProfile::ClientUiSettings => self.collect_client_ui_settings().await?,
+                FeedbackDiagnosticsProfile::WorkspaceSummary => self.collect_workspace_summary(request).await?,
                 FeedbackDiagnosticsProfile::GlobalSummary => self.collect_global_summary(request).await?,
             };
             profiles.push(result);
@@ -1329,6 +1548,72 @@ fn sqlite_bool_value(value: Option<i64>) -> Value {
 
 fn json_value_or_string(raw: &str) -> Value {
     serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
+}
+
+fn message_failure_summary(content: &Value) -> Option<Value> {
+    let tool_name = content
+        .pointer("/_meta/claudeCode/toolName")
+        .and_then(Value::as_str)
+        .or_else(|| content.pointer("/raw_input/tool").and_then(Value::as_str))
+        .or_else(|| content.pointer("/update/title").and_then(Value::as_str));
+    let exit_code = content
+        .pointer("/_meta/terminal_exit/exit_code")
+        .and_then(Value::as_i64)
+        .or_else(|| extract_exit_code_from_text(content));
+    let error_code = content
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .or_else(|| content.pointer("/code").and_then(Value::as_str));
+
+    if tool_name.is_none() && exit_code.is_none() && error_code.is_none() {
+        return None;
+    }
+
+    Some(json!({
+        "kind": if tool_name.is_some() || exit_code.is_some() { "tool" } else { "error" },
+        "tool_name": tool_name,
+        "exit_code": exit_code,
+        "error_code": error_code,
+        "stderr_class": classify_error_text(content),
+        "terminal_id": content.pointer("/_meta/terminal_exit/terminal_id").and_then(Value::as_str),
+        "cwd_present": content.pointer("/_meta/terminal_info/cwd").is_some(),
+    }))
+}
+
+fn extract_exit_code_from_text(value: &Value) -> Option<i64> {
+    let text = value.to_string().to_ascii_lowercase();
+    let marker = "exit code ";
+    let start = text.find(marker)? + marker.len();
+    let digits = text[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn classify_error_text(value: &Value) -> Option<&'static str> {
+    let text = value.to_string().to_ascii_lowercase();
+    if text.contains("command not found") || text.contains("not recognized") {
+        Some("command_not_found")
+    } else if text.contains("permission denied") || text.contains("access is denied") {
+        Some("permission_denied")
+    } else if text.contains("rate limit") || text.contains("too many requests") {
+        Some("rate_limited")
+    } else if text.contains("connection error") || text.contains("network") {
+        Some("network")
+    } else {
+        None
+    }
+}
+
+fn workspace_runtime_checks_boundary() -> Value {
+    json!({
+        "path_exists": Value::Null,
+        "os_errno": Value::Null,
+        "watcher_state": Value::Null,
+        "file_lock_owner": Value::Null,
+        "source": "not-db-backed",
+    })
 }
 
 fn sanitized_message_content(raw: &str) -> Value {

@@ -1,9 +1,19 @@
 use aionui_api_types::AgentMetadata;
 
+pub(crate) const CODEX_CANONICAL_FULL_ACCESS_MODE: &str = "agent-full-access";
+pub(crate) const CODEX_LEGACY_FULL_ACCESS_MODE: &str = "full-access";
+
 pub(crate) fn normalize_requested_mode(metadata: &AgentMetadata, mode: &str) -> String {
     let trimmed = mode.trim();
     if trimmed.is_empty() {
         return String::new();
+    }
+
+    if is_codex(metadata) && is_codex_full_access_semantic_value(trimmed) {
+        return metadata
+            .yolo_id
+            .clone()
+            .unwrap_or_else(|| CODEX_CANONICAL_FULL_ACCESS_MODE.to_owned());
     }
 
     // AionUi persists the legacy aliases `yolo` / `yoloNoSandbox` while
@@ -23,11 +33,49 @@ pub(crate) fn normalize_requested_mode(metadata: &AgentMetadata, mode: &str) -> 
     // native `auto` mode. Keep the mapping data-driven by keying on the
     // vendor backend label rather than re-introducing an AcpBackend
     // enum variant.
-    if matches!(metadata.backend.as_deref(), Some("codex")) && matches!(trimmed, "default" | "autoEdit") {
+    if is_codex(metadata) && matches!(trimmed, "default" | "autoEdit") {
         return "auto".to_owned();
     }
 
     trimmed.to_owned()
+}
+
+pub(crate) fn normalize_requested_mode_for_available_values<'a>(
+    metadata: &AgentMetadata,
+    mode: &str,
+    available_values: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let trimmed = mode.trim();
+    if is_codex(metadata) && is_codex_full_access_semantic_value(trimmed) {
+        let mut has_canonical = false;
+        let mut has_legacy = false;
+        for value in available_values {
+            match value {
+                CODEX_CANONICAL_FULL_ACCESS_MODE => has_canonical = true,
+                CODEX_LEGACY_FULL_ACCESS_MODE => has_legacy = true,
+                _ => {}
+            }
+        }
+        if has_canonical {
+            return CODEX_CANONICAL_FULL_ACCESS_MODE.to_owned();
+        }
+        if has_legacy {
+            return CODEX_LEGACY_FULL_ACCESS_MODE.to_owned();
+        }
+    }
+
+    normalize_requested_mode(metadata, mode)
+}
+
+fn is_codex(metadata: &AgentMetadata) -> bool {
+    matches!(metadata.backend.as_deref(), Some("codex"))
+}
+
+fn is_codex_full_access_semantic_value(mode: &str) -> bool {
+    matches!(
+        mode,
+        CODEX_CANONICAL_FULL_ACCESS_MODE | CODEX_LEGACY_FULL_ACCESS_MODE | "yolo" | "yoloNoSandbox"
+    )
 }
 
 /// Whether the agent resumes a session by calling `session/new` again
@@ -95,6 +143,74 @@ mod tests {
     }
 
     #[test]
+    fn normalize_requested_mode_rewrites_codex_full_access_alias_to_metadata_yolo_id() {
+        let mut meta = metadata_with_yolo_id(Some("agent-full-access"));
+        meta.backend = Some("codex".into());
+
+        assert_eq!(normalize_requested_mode(&meta, "full-access"), "agent-full-access");
+        assert_eq!(
+            normalize_requested_mode(&meta, "agent-full-access"),
+            "agent-full-access"
+        );
+        assert_eq!(normalize_requested_mode(&meta, "yolo"), "agent-full-access");
+        assert_eq!(normalize_requested_mode(&meta, "yoloNoSandbox"), "agent-full-access");
+
+        meta.yolo_id = None;
+        assert_eq!(normalize_requested_mode(&meta, "full-access"), "agent-full-access");
+    }
+
+    #[test]
+    fn normalize_requested_mode_for_available_values_prefers_agent_full_access() {
+        let mut meta = metadata_with_yolo_id(Some("full-access"));
+        meta.backend = Some("codex".into());
+
+        assert_eq!(
+            normalize_requested_mode_for_available_values(
+                &meta,
+                "full-access",
+                ["full-access", "agent-full-access"].into_iter()
+            ),
+            "agent-full-access"
+        );
+    }
+
+    #[test]
+    fn normalize_requested_mode_for_available_values_falls_back_to_legacy_full_access() {
+        let mut meta = metadata_with_yolo_id(Some("agent-full-access"));
+        meta.backend = Some("codex".into());
+
+        assert_eq!(
+            normalize_requested_mode_for_available_values(&meta, "agent-full-access", ["full-access"].into_iter()),
+            "full-access"
+        );
+    }
+
+    #[test]
+    fn normalize_requested_mode_for_available_values_leaves_unselectable_value_for_local_error() {
+        let mut meta = metadata_with_yolo_id(Some("agent-full-access"));
+        meta.backend = Some("codex".into());
+
+        assert_eq!(
+            normalize_requested_mode_for_available_values(&meta, "full-access", ["auto", "read-only"].into_iter()),
+            "agent-full-access"
+        );
+    }
+
+    #[test]
+    fn normalize_requested_mode_for_available_values_does_not_rewrite_non_codex_full_access() {
+        let meta = metadata_with_yolo_id(Some("bypassPermissions"));
+
+        assert_eq!(
+            normalize_requested_mode_for_available_values(
+                &meta,
+                "full-access",
+                ["agent-full-access", "full-access"].into_iter()
+            ),
+            "full-access"
+        );
+    }
+
+    #[test]
     fn normalize_requested_mode_passes_through_when_no_yolo_id() {
         let meta = metadata_with_yolo_id(None);
         // No mapping configured — aliases flow through unchanged.
@@ -142,7 +258,7 @@ mod tests {
     /// Other backends must leave `default` / `autoEdit` untouched.
     #[test]
     fn normalize_requested_mode_rewrites_codex_default_and_auto_edit() {
-        let mut codex_meta = metadata_with_yolo_id(Some("full-access"));
+        let mut codex_meta = metadata_with_yolo_id(Some("agent-full-access"));
         codex_meta.backend = Some("codex".into());
         assert_eq!(normalize_requested_mode(&codex_meta, "default"), "auto");
         assert_eq!(normalize_requested_mode(&codex_meta, "autoEdit"), "auto");

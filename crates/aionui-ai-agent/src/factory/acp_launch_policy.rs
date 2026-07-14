@@ -98,7 +98,7 @@ fn push_codex_config_arg(command_spec: &mut CommandSpec, value: &str) {
 
 fn codex_sandbox_mode_for_requested_mode(mode: Option<&str>) -> &'static str {
     match mode.map(str::trim) {
-        Some("full-access" | "yoloNoSandbox") => "danger-full-access",
+        Some("agent-full-access" | "full-access" | "yoloNoSandbox") => "danger-full-access",
         _ => "workspace-write",
     }
 }
@@ -127,7 +127,7 @@ mod tests {
             env: vec![],
             native_skills_dirs: None,
             behavior_policy: aionui_api_types::BehaviorPolicy::default(),
-            yolo_id: Some("full-access".into()),
+            yolo_id: Some("agent-full-access".into()),
             sort_order: 0,
             team_capable: false,
             last_check_status: None,
@@ -193,6 +193,82 @@ mod tests {
     }
 
     #[test]
+    fn apply_acp_launch_policy_adds_codex_full_access_config_for_agent_full_access() {
+        let mut command_spec = CommandSpec {
+            command: "node".into(),
+            args: vec!["codex-acp.js".into()],
+            env: vec![],
+            cwd: None,
+        };
+        let metadata = agent_metadata_with_backend(Some("codex"));
+        let config = AcpBuildExtra {
+            session_mode: Some("agent-full-access".into()),
+            ..Default::default()
+        };
+
+        apply_acp_launch_policy(
+            &mut command_spec,
+            AcpLaunchPolicyInput {
+                metadata: &metadata,
+                config: &config,
+                session_snapshot: None,
+                runtime_env: &[],
+            },
+        );
+
+        assert!(
+            command_spec
+                .args
+                .iter()
+                .any(|arg| arg == "sandbox_mode=\"danger-full-access\"")
+        );
+        assert!(
+            command_spec
+                .args
+                .iter()
+                .any(|arg| arg == CODEX_WINDOWS_UNELEVATED_SANDBOX)
+        );
+    }
+
+    #[test]
+    fn apply_acp_launch_policy_keeps_legacy_full_access_dangerous_for_persisted_snapshots() {
+        let mut command_spec = CommandSpec {
+            command: "node".into(),
+            args: vec!["codex-acp.js".into()],
+            env: vec![],
+            cwd: None,
+        };
+        let metadata = agent_metadata_with_backend(Some("codex"));
+        let snapshot = PersistedSessionState {
+            current_mode_id: Some(crate::shared_kernel::ModeId::new("full-access")),
+            ..Default::default()
+        };
+
+        apply_acp_launch_policy(
+            &mut command_spec,
+            AcpLaunchPolicyInput {
+                metadata: &metadata,
+                config: &AcpBuildExtra::default(),
+                session_snapshot: Some(&snapshot),
+                runtime_env: &[],
+            },
+        );
+
+        assert!(
+            command_spec
+                .args
+                .iter()
+                .any(|arg| arg == "sandbox_mode=\"danger-full-access\"")
+        );
+        assert!(
+            command_spec
+                .args
+                .iter()
+                .any(|arg| arg == CODEX_WINDOWS_UNELEVATED_SANDBOX)
+        );
+    }
+
+    #[test]
     fn apply_acp_launch_policy_skips_codex_config_for_non_codex_agents() {
         let mut command_spec = CommandSpec {
             command: "node".into(),
@@ -230,6 +306,6 @@ mod tests {
         let mode =
             initial_mode_from_build_context(&agent_metadata_with_backend(Some("codex")), &config, Some(&snapshot));
 
-        assert_eq!(mode.as_deref(), Some("full-access"));
+        assert_eq!(mode.as_deref(), Some("agent-full-access"));
     }
 }

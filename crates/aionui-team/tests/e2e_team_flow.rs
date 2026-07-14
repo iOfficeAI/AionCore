@@ -29,8 +29,8 @@ use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, FinishEventData};
 use aionui_ai_agent::shared_kernel::approval_key;
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+use aionui_api_types::AgentModeResponse;
 use aionui_api_types::WebSocketMessage;
-use aionui_api_types::{AgentModeResponse, TeamRunTargetRole};
 use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
@@ -79,7 +79,7 @@ impl AgentTurnExecutionPort for RecordingTurnPort {
         let turn_id = format!("turn-test-{turn_index}");
         if let Some(on_started) = request.on_started.as_ref() {
             on_started(AgentTurnStarted {
-                team_run_id: request.team_run_id.clone().expect("team run id"),
+                team_run_id: request.team_run_id.clone(),
                 slot_id: request.slot_id.clone(),
                 role: request.role.clone(),
                 conversation_id: request.conversation_id.clone(),
@@ -149,7 +149,7 @@ impl AgentTurnExecutionPort for StartedThenFailedTurnPort {
     async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
         if let Some(on_started) = request.on_started.as_ref() {
             on_started(AgentTurnStarted {
-                team_run_id: request.team_run_id.clone().expect("team run id"),
+                team_run_id: request.team_run_id.clone(),
                 slot_id: request.slot_id.clone(),
                 role: request.role.clone(),
                 conversation_id: request.conversation_id.clone(),
@@ -169,6 +169,63 @@ impl AgentTurnExecutionPort for StartedThenFailedTurnPort {
 struct BlockingStartTurnPort {
     claimed_tx: Mutex<Option<oneshot::Sender<()>>>,
     release_rx: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+struct HoldFirstRunningTurnPort {
+    requests: Arc<Mutex<Vec<AgentTurnRequest>>>,
+    first_started_tx: Mutex<Option<oneshot::Sender<()>>>,
+    first_release_rx: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl HoldFirstRunningTurnPort {
+    fn new(first_started_tx: oneshot::Sender<()>, first_release_rx: oneshot::Receiver<()>) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            first_started_tx: Mutex::new(Some(first_started_tx)),
+            first_release_rx: Mutex::new(Some(first_release_rx)),
+        }
+    }
+
+    fn requests(&self) -> Arc<Mutex<Vec<AgentTurnRequest>>> {
+        self.requests.clone()
+    }
+}
+
+#[async_trait]
+impl AgentTurnExecutionPort for HoldFirstRunningTurnPort {
+    async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        let turn_index = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            requests.len()
+        };
+        let turn_id = format!("turn-coalesced-{turn_index}");
+        if let Some(on_started) = request.on_started.as_ref() {
+            on_started(AgentTurnStarted {
+                team_run_id: request.team_run_id.clone(),
+                slot_id: request.slot_id.clone(),
+                role: request.role.clone(),
+                conversation_id: request.conversation_id.clone(),
+                turn_id: turn_id.clone(),
+            })
+            .await;
+        }
+        if turn_index == 1 {
+            if let Some(tx) = self.first_started_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let release_rx = self.first_release_rx.lock().unwrap().take();
+            if let Some(rx) = release_rx {
+                let _ = rx.await;
+            }
+        }
+        Ok(AgentTurnOutcome {
+            conversation_id: request.conversation_id,
+            turn_id,
+            status: AgentTurnStatus::Completed,
+            runtime: None,
+        })
+    }
 }
 
 impl BlockingStartTurnPort {
@@ -192,7 +249,7 @@ impl AgentTurnExecutionPort for BlockingStartTurnPort {
         }
         if let Some(on_started) = request.on_started.as_ref() {
             on_started(AgentTurnStarted {
-                team_run_id: request.team_run_id.clone().expect("team run id"),
+                team_run_id: request.team_run_id.clone(),
                 slot_id: request.slot_id.clone(),
                 role: request.role.clone(),
                 conversation_id: request.conversation_id.clone(),
@@ -729,6 +786,16 @@ async fn wait_for_turn_request_count(requests: &Arc<Mutex<Vec<AgentTurnRequest>>
     panic!("timed out waiting for {count} turn requests");
 }
 
+async fn wait_for_cancelled_turn_count(cancelled: &Arc<Mutex<Vec<String>>>, count: usize) {
+    for _ in 0..100 {
+        if cancelled.lock().unwrap().len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {count} cancelled turns");
+}
+
 fn register_test_event_loops(session: &Arc<TeamSession>) {
     let registry = session.event_loops().clone();
     for agent in two_agents() {
@@ -742,7 +809,7 @@ fn register_test_event_loops(session: &Arc<TeamSession>) {
             turn_port: session.turn_port().clone(),
             registry: registry.clone(),
         };
-        registry.spawn(&agent.slot_id, ctx);
+        registry.spawn(&agent.slot_id, ctx).expect("register test event loop");
     }
 }
 
@@ -765,7 +832,7 @@ async fn wait_until_turn_count(turn_requests: &Arc<Mutex<Vec<AgentTurnRequest>>>
 /// Verifies:
 /// - TeamSession::start succeeds
 /// - MCP TCP server is reachable
-/// - tools/list returns all 11 expected tools
+/// - tools/list returns all expected tools
 #[tokio::test]
 async fn s1a_mcp_server_starts_and_tools_available() {
     let (session, _tm, _repo, _sent) = setup_session().await;
@@ -781,13 +848,17 @@ async fn s1a_mcp_server_starts_and_tools_available() {
     let resp = tcp_recv(&mut stream).await;
 
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 11, "expected exactly 11 MCP tools, got {}", tools.len());
+    assert_eq!(tools.len(), 10, "expected exactly 10 MCP tools, got {}", tools.len());
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"team_send_message"), "missing team_send_message");
     assert!(names.contains(&"team_members"), "missing team_members");
     assert!(names.contains(&"team_task_create"), "missing team_task_create");
     assert!(names.contains(&"team_list_assistants"), "missing team_list_assistants");
+    assert!(
+        !names.contains(&"team_list_models"),
+        "team_list_models should not be exposed"
+    );
 
     session.stop();
 }
@@ -1092,19 +1163,21 @@ async fn s4_dynamic_agent_added_then_finish_propagates() {
     // Add the agent to the session's scheduler
     session.add_agent(&new_agent).await;
     let registry = session.event_loops().clone();
-    registry.spawn(
-        &new_agent.slot_id,
-        AgentLoopContext {
-            team_id: session.team_id().to_owned(),
-            slot_id: new_agent.slot_id.clone(),
-            user_id: session.user_id().to_owned(),
-            session: session.clone(),
-            scheduler: session.scheduler().clone(),
-            mailbox: session.mailbox().clone(),
-            turn_port: session.turn_port().clone(),
-            registry: registry.clone(),
-        },
-    );
+    registry
+        .spawn(
+            &new_agent.slot_id,
+            AgentLoopContext {
+                team_id: session.team_id().to_owned(),
+                slot_id: new_agent.slot_id.clone(),
+                user_id: session.user_id().to_owned(),
+                session: session.clone(),
+                scheduler: session.scheduler().clone(),
+                mailbox: session.mailbox().clone(),
+                turn_port: session.turn_port().clone(),
+                registry: registry.clone(),
+            },
+        )
+        .expect("register test event loop");
 
     // Verify the agent is in the roster
     let agents = session.scheduler().list_agents().await;
@@ -1144,15 +1217,8 @@ async fn s4_dynamic_agent_added_then_finish_propagates() {
     );
     drop(log);
 
-    // Simulate helper finishing → IdleNotification → lead should be wake target
-    let wake_target = session.on_agent_finish("conv-helper", false).await.unwrap();
-    assert_eq!(
-        wake_target.as_deref(),
-        Some("lead-1"),
-        "helper finish must return lead as wake target"
-    );
-
-    // Lead mailbox should have IdleNotification from helper
+    // EventLoop finalization owns the finish transition and writes the leader
+    // notification; calling on_agent_finish here would duplicate that terminal.
     let state = repo.state.lock().unwrap();
     let lead_notifs: Vec<_> = state
         .messages
@@ -1163,83 +1229,6 @@ async fn s4_dynamic_agent_added_then_finish_propagates() {
         !lead_notifs.is_empty(),
         "lead must receive idle_notification from helper; msgs={:?}",
         state.messages
-    );
-
-    session.stop();
-}
-
-#[tokio::test]
-async fn s4b_pending_wake_for_unregistered_dynamic_agent_survives_leader_empty_wake() {
-    let (session, task_manager, _repo, sent, turn_requests) = setup_session_with_turn_recorder().await;
-
-    let ack = session
-        .team_run_manager()
-        .accept_user_message("lead-1", TeamRunTargetRole::Lead, false, None)
-        .await
-        .expect("accept active Team Run");
-
-    let new_agent = TeamAgent {
-        slot_id: "helper-1".into(),
-        name: "Helper".into(),
-        role: TeammateRole::Teammate,
-        conversation_id: "conv-helper".into(),
-        backend: "acp".into(),
-        model: "claude".into(),
-        assistant_id: None,
-        status: None,
-        conversation_type: None,
-        cli_path: None,
-    };
-
-    let handle = AgentInstance::Mock(Arc::new(RecordingAgent::new("conv-helper", sent.clone())));
-    task_manager.insert("conv-helper", handle);
-    session.add_agent(&new_agent).await;
-
-    session
-        .send_message_to_agent("helper-1", "start your task", None)
-        .await
-        .expect("send to unregistered helper should record pending wake");
-
-    assert!(
-        session
-            .team_run_manager()
-            .record_empty_wake_observed("lead-1")
-            .await
-            .is_none(),
-        "leader empty wake must not complete while helper pending wake is retained"
-    );
-    assert_eq!(
-        session.team_run_manager().active_run_id().await.as_deref(),
-        Some(ack.team_run_id.as_str())
-    );
-
-    let registry = session.event_loops().clone();
-    registry.spawn(
-        &new_agent.slot_id,
-        AgentLoopContext {
-            team_id: session.team_id().to_owned(),
-            slot_id: new_agent.slot_id.clone(),
-            user_id: session.user_id().to_owned(),
-            session: session.clone(),
-            scheduler: session.scheduler().clone(),
-            mailbox: session.mailbox().clone(),
-            turn_port: session.turn_port().clone(),
-            registry: registry.clone(),
-        },
-    );
-    registry.notify("helper-1");
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let log = turn_requests.lock().unwrap();
-    assert!(
-        log.iter().any(|request| {
-            request.slot_id == "helper-1"
-                && request.conversation_id == "conv-helper"
-                && request.team_id == "e2e-team"
-                && request.team_run_id.as_deref() == Some(ack.team_run_id.as_str())
-        }),
-        "helper turn port must be called after delayed registration; requests: {log:?}"
     );
 
     session.stop();
@@ -1518,12 +1507,12 @@ async fn s8b_worker_cannot_call_spawn_agent() {
 // ===========================================================================
 
 #[tokio::test]
-async fn s8_paused_slot_user_intervention_runs_first_then_releases_background_backlog() {
+async fn turn_completion_reconciles_without_another_notify() {
     let (session, _task_manager, _repo, _sent, turn_requests) = setup_session_with_turn_recorder_without_loops().await;
 
     let ack = session.send_message("start team", None).await.unwrap();
     session
-        .pause_slot_work(&ack.team_run_id, "lead-1", Some("user stopped".into()))
+        .pause_slot_work(&ack.run.team_run_id, "lead-1", Some("user stopped".into()))
         .await
         .unwrap();
     session
@@ -1548,6 +1537,7 @@ async fn s8_paused_slot_user_intervention_runs_first_then_releases_background_ba
 
     wait_until_turn_count(&turn_requests, 1).await;
     let first = turn_requests.lock().unwrap()[0].clone();
+    assert!(first.content.contains("start team"));
     assert!(first.content.contains("user priority"));
     assert!(!first.content.contains("background backlog"));
     match first.source {
@@ -1555,8 +1545,8 @@ async fn s8_paused_slot_user_intervention_runs_first_then_releases_background_ba
             unread_message_ids,
             unread_count,
         } => {
-            assert_eq!(unread_count, 1);
-            assert_eq!(unread_message_ids, vec![user_ack.message_id.unwrap()]);
+            assert_eq!(unread_count, 2);
+            assert_eq!(unread_message_ids, vec![ack.message_id, user_ack.message_id]);
         }
     }
 
@@ -1605,7 +1595,88 @@ async fn s9_session_send_message_wakes_lead() {
 }
 
 #[tokio::test]
-async fn s9b_event_loop_fails_run_when_turn_errors_before_started() {
+async fn one_notify_drains_five_intents_after_busy_turn() {
+    let (first_started_tx, first_started_rx) = oneshot::channel();
+    let (first_release_tx, first_release_rx) = oneshot::channel();
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let turn_port = Arc::new(HoldFirstRunningTurnPort::new(first_started_tx, first_release_rx));
+    let requests = turn_port.requests();
+    let session =
+        setup_session_with_runtime_ports(turn_port, Arc::new(NoopCancellationPort), broadcaster.clone()).await;
+
+    let first = session.send_message("first", None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), first_started_rx)
+        .await
+        .expect("first turn should start")
+        .expect("first start signal should be sent");
+
+    let mut queued_message_ids = Vec::new();
+    for index in 1..=5 {
+        let ack = session.send_message(&format!("queued-{index}"), None).await.unwrap();
+        assert_eq!(ack.enqueue_status, aionui_api_types::TeamMessageEnqueueStatus::Queued);
+        assert_eq!(ack.run.team_run_id, first.run.team_run_id);
+        queued_message_ids.push(ack.message_id);
+    }
+
+    first_release_tx.send(()).unwrap();
+    wait_for_event(&broadcaster, "team.runCompleted").await;
+    wait_for_turn_request_count(&requests, 2).await;
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    match &requests[1].source {
+        AgentTurnSource::Mailbox {
+            unread_message_ids,
+            unread_count,
+        } => {
+            assert_eq!(*unread_count, 5);
+            assert_eq!(unread_message_ids, &queued_message_ids);
+        }
+    }
+    drop(requests);
+    assert!(
+        session
+            .mailbox()
+            .peek_unread("e2e-team", "lead-1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(session.team_run_manager().current_active_run_id().is_none());
+    session.stop();
+}
+
+#[tokio::test]
+async fn one_turn_claims_every_message_it_reads() {
+    let (session, _task_manager, _repo, _sent, requests) = setup_session_with_turn_recorder_without_loops().await;
+    let first = session.send_message("batch-1", None).await.unwrap();
+    let second = session.send_message("batch-2", None).await.unwrap();
+    let third = session.send_message("batch-3", None).await.unwrap();
+    register_test_event_loops(&session);
+
+    session.event_loops().notify("lead-1");
+    wait_for_turn_request_count(&requests, 1).await;
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    match &requests[0].source {
+        AgentTurnSource::Mailbox {
+            unread_message_ids,
+            unread_count,
+        } => {
+            assert_eq!(*unread_count, 3);
+            assert_eq!(
+                unread_message_ids,
+                &vec![first.message_id, second.message_id, third.message_id]
+            );
+        }
+    }
+    drop(requests);
+    session.stop();
+}
+
+#[tokio::test]
+async fn nonretryable_start_failure_is_terminal_and_not_recovered() {
     let broadcaster = Arc::new(RecordingBroadcaster::new());
     let session = setup_session_with_runtime_ports(
         Arc::new(ErrorBeforeStartTurnPort),
@@ -1620,13 +1691,21 @@ async fn s9b_event_loop_fails_run_when_turn_errors_before_started() {
         .expect("send_message must succeed");
 
     wait_for_event(&broadcaster, "team.runFailed").await;
-    assert_eq!(session.team_run_manager().active_run_id().await, None);
+    assert_eq!(session.team_run_manager().current_active_run_id(), None);
+    assert!(
+        session
+            .mailbox()
+            .peek_unread("e2e-team", "lead-1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     session.stop();
 }
 
 #[tokio::test]
-async fn s9b_retryable_busy_before_start_retains_team_run_without_timer_retry() {
+async fn retryable_start_requeues_without_marking_mailbox_read() {
     let broadcaster = Arc::new(RecordingBroadcaster::new());
     let turn_port = Arc::new(SkippedBusyTurnPort::default());
     let requests = turn_port.requests();
@@ -1654,18 +1733,14 @@ async fn s9b_retryable_busy_before_start_retains_team_run_without_timer_retry() 
     drop(request_log);
 
     assert_eq!(
-        session.team_run_manager().active_run_id().await,
+        session.team_run_manager().current_active_run_id(),
         Some(first_team_run_id.clone()),
         "run should remain active for a state-driven retry"
     );
-    let payload = session
-        .team_run_manager()
-        .current_payload()
-        .await
-        .expect("retryable busy skip should keep the active run");
-    assert_eq!(payload.team_run_id, first_team_run_id);
-    assert_eq!(payload.pending_wake_count, 1);
-    assert_eq!(payload.starting_child_count, 0);
+    assert_eq!(
+        session.mailbox().peek_unread("e2e-team", "lead-1").await.unwrap().len(),
+        1
+    );
 
     session.stop();
 }
@@ -1685,9 +1760,8 @@ async fn s9c_event_loop_fails_run_when_started_turn_returns_failed() {
         .await
         .expect("send_message must succeed");
 
-    wait_for_event(&broadcaster, "team.childTurnCompleted").await;
     wait_for_event(&broadcaster, "team.runFailed").await;
-    assert_eq!(session.team_run_manager().active_run_id().await, None);
+    assert_eq!(session.team_run_manager().current_active_run_id(), None);
 
     session.stop();
 }
@@ -1716,15 +1790,16 @@ async fn s9d_late_child_start_after_team_cancel_is_cancelled_without_reviving_ru
         .expect("claim signal should be sent");
 
     session
-        .cancel_run(&ack.team_run_id, None, Some("stop".into()))
+        .cancel_run(&ack.run.team_run_id, None, Some("stop".into()))
         .await
         .expect("team run cancel must succeed");
     release_tx.send(()).expect("release signal should be sent");
 
     wait_for_event(&broadcaster, "team.runCancelled").await;
+    wait_for_cancelled_turn_count(&cancelled, 1).await;
     let cancelled_turns = cancelled.lock().unwrap().clone();
     assert_eq!(cancelled_turns, vec!["turn-late-start".to_owned()]);
-    assert_eq!(session.team_run_manager().active_run_id().await, None);
+    assert_eq!(session.team_run_manager().current_active_run_id(), None);
 
     session.stop();
 }
@@ -1804,74 +1879,6 @@ async fn s11_shutdown_approved_interception() {
         raw_sentinel.is_empty(),
         "raw shutdown_approved sentinel must not land in lead mailbox; got {raw_sentinel:?}"
     );
-
-    session.stop();
-}
-
-// ===========================================================================
-// Scenario 12: compute_wake_input — role prompt injection on cold start
-// ===========================================================================
-
-/// Scenario 12a: Cold-start lead gets role prompt injected into first_message.
-#[tokio::test]
-async fn s12a_cold_start_lead_gets_role_prompt() {
-    let (session, _tm, _repo, _sent, _turn_requests) = setup_session_with_turn_recorder_without_loops().await;
-    session.send_message("kick off", None).await.unwrap();
-
-    let input = session
-        .compute_wake_input("lead-1")
-        .await
-        .unwrap()
-        .expect("WakeInput must be Some");
-
-    assert!(input.should_send, "should_send must be true when mailbox has messages");
-    assert!(
-        input.first_message.contains("You are the Team Leader"),
-        "cold-start lead must get role prompt; got: {}",
-        &input.first_message[..input.first_message.len().min(200)]
-    );
-    assert!(input.first_message.contains("kick off"));
-
-    session.stop();
-}
-
-/// Scenario 12b: Warm lead (role prompt already consumed) does not get role prompt again.
-///
-/// The cold-start flag is a one-shot: `take_needs_role_prompt` returns true
-/// only on the first call. To simulate a "warm" agent, we consume the flag
-/// on a first compute_wake_input call, then assert the second call omits it.
-#[tokio::test]
-async fn s12b_warm_lead_skips_role_prompt() {
-    let (session, _tm, _repo, _sent, _turn_requests) = setup_session_with_turn_recorder_without_loops().await;
-
-    // First: consume the cold-start role-prompt flag from a TeamRun-owned wake.
-    session.send_message("initial kick", None).await.unwrap();
-    let first_input = session
-        .compute_wake_input("lead-1")
-        .await
-        .unwrap()
-        .expect("first WakeInput");
-    assert!(
-        first_input.first_message.contains("You are the Team Leader"),
-        "first (cold) compute_wake_input must include role prompt"
-    );
-    // The flag is now consumed (take_needs_role_prompt returned true, set to false).
-
-    // Second call: write another message and compute again — no role prompt this time.
-    session.send_message("follow-up message", None).await.unwrap();
-
-    let input = session
-        .compute_wake_input("lead-1")
-        .await
-        .unwrap()
-        .expect("second WakeInput must be Some");
-
-    assert!(
-        !input.first_message.contains("You are the Team Leader"),
-        "warm lead (flag consumed) must NOT get role prompt on second call; got: {}",
-        &input.first_message[..input.first_message.len().min(300)]
-    );
-    assert!(input.first_message.contains("follow-up message"));
 
     session.stop();
 }
