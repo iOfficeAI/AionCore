@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use crate::cache;
 use crate::http_client;
 use crate::managed_resources::{self, ManagedResourceSourceKind};
+use crate::managed_resources_contract::{ManagedNodeResourceContract, relative_contract_path};
 
 use super::types::{
     NodeRuntimeError, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressReporter, NodeRuntimeSupport,
@@ -29,6 +30,8 @@ const MANAGED_NODE_PROGRESS_STEP_BYTES: u64 = 5 * 1024 * 1024;
 struct PlatformSpec {
     folder_suffix: &'static str,
     archive_ext: &'static str,
+    runtime_key: &'static str,
+    executable: &'static str,
 }
 
 impl PlatformSpec {
@@ -198,31 +201,74 @@ fn platform_spec() -> Result<PlatformSpec, NodeRuntimeError> {
         ("macos", "aarch64") => Ok(PlatformSpec {
             folder_suffix: "darwin-arm64",
             archive_ext: "tar.gz",
+            runtime_key: "darwin-arm64",
+            executable: "bin/node",
         }),
         ("macos", "x86_64") => Ok(PlatformSpec {
             folder_suffix: "darwin-x64",
             archive_ext: "tar.gz",
+            runtime_key: "darwin-x64",
+            executable: "bin/node",
         }),
         ("linux", "aarch64") => Ok(PlatformSpec {
             folder_suffix: "linux-arm64",
             archive_ext: "tar.gz",
+            runtime_key: "linux-arm64",
+            executable: "bin/node",
         }),
         ("linux", "x86_64") => Ok(PlatformSpec {
             folder_suffix: "linux-x64",
             archive_ext: "tar.gz",
+            runtime_key: "linux-x64",
+            executable: "bin/node",
         }),
         ("windows", "x86_64") => Ok(PlatformSpec {
             folder_suffix: "win-x64",
             archive_ext: "zip",
+            runtime_key: "win32-x64",
+            executable: "node.exe",
         }),
         ("windows", "aarch64") => Ok(PlatformSpec {
             folder_suffix: "win-arm64",
             archive_ext: "zip",
+            runtime_key: "win32-arm64",
+            executable: "node.exe",
         }),
         (os, arch) => Err(NodeRuntimeError::unsupported_platform(format!(
             "managed node runtime unsupported on {os}/{arch}"
         ))),
     }
+}
+
+pub fn managed_node_contract_for_export(
+    bundle_root: &Path,
+    exported_node_root: &Path,
+) -> Result<ManagedNodeResourceContract, NodeRuntimeError> {
+    managed_node_contract_for_export_with_spec(bundle_root, exported_node_root, platform_spec()?)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn managed_node_contract_for_export_with_spec(
+    bundle_root: &Path,
+    exported_node_root: &Path,
+    spec: PlatformSpec,
+) -> Result<ManagedNodeResourceContract, NodeRuntimeError> {
+    let root = relative_contract_path(bundle_root, exported_node_root)
+        .map_err(|error| NodeRuntimeError::managed_invalid(format!("managed Node contract path: {error}")))?;
+    let expected_suffix = spec.directory_name();
+    if !root.ends_with(&expected_suffix) {
+        return Err(NodeRuntimeError::managed_invalid(format!(
+            "exported managed Node root {} does not match expected {} for {}",
+            exported_node_root.display(),
+            expected_suffix,
+            spec.runtime_key
+        )));
+    }
+    Ok(ManagedNodeResourceContract {
+        version: MANAGED_NODE_VERSION.into(),
+        root,
+        executable: spec.executable.into(),
+    })
 }
 
 fn runtime_from_root(root: &Path, source: ResolvedNodeSource) -> Result<ResolvedNodeRuntime, NodeRuntimeError> {

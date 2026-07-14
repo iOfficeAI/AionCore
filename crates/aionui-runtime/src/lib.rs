@@ -14,6 +14,7 @@ mod embed;
 mod extract;
 mod http_client;
 pub mod managed_resources;
+pub mod managed_resources_contract;
 pub mod node_runtime;
 mod resolver;
 mod shell_env;
