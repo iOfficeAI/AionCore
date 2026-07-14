@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.46](https://github.com/iOfficeAI/AionCore/compare/v0.1.45...v0.1.46) (2026-07-13)
+
+
+### Bug Fixes
+
+* **acp:** normalize Codex full-access mode ([#608](https://github.com/iOfficeAI/AionCore/issues/608)) ([df51fcf](https://github.com/iOfficeAI/AionCore/commit/df51fcf77aa541c78c6eb6af4e987eab92b1ff07))
+* **butler:** correct three breaking field mismatches + update rule to CLI model ([#607](https://github.com/iOfficeAI/AionCore/issues/607)) ([b02bce6](https://github.com/iOfficeAI/AionCore/commit/b02bce62e5b7d847960be8d98e9f3b8c8e163e2c))
+
 ## [0.1.45](https://github.com/iOfficeAI/AionCore/compare/v0.1.44...v0.1.45) (2026-07-10)
 
 

@@ -50,7 +50,7 @@
 - 用户说"哪里不对/失败了/卡住了" → 先用 `aionui-troubleshooting` 诊断，定位后若需修改再切到 `aionui-config`
 - 用户想"在外面/手机上访问 AionUi"或"要个分享链接" → `aionui-webui-public`
 
-`aionui-config` 和 `aionui-troubleshooting` 都依赖 **先发现后端端口**（端口每次启动都变），技能脚本会自动发现。如果发现失败，说明 AionUi 没在运行，直接告诉用户去启动，**不要猜端口**。
+`aionui-config` 和 `aionui-troubleshooting` 通过内置 CLI（`"$AIONUI_HELPER_BIN" config|diagnose …`）工作，运行时上下文（`AIONUI_BASE_URL`、`AIONUI_CONVERSATION_ID`、`AIONUI_USER_ID`）由系统自动注入。如果 CLI 报告上下文错误，说明 AionUi 没在运行，告诉用户先启动它。
 
 ---
 
@@ -72,11 +72,11 @@
 
 ### 4. 密钥安全（红线）
 
-`GET /api/providers` 会以**明文**返回 `api_key`。**永远不要**把 Provider 原始 JSON 贴进对话、日志或记忆文件。必须展示 Provider 时，把 key 脱敏成 `sk-…后四位`。对待用户给你的 key 同样如此。
+Provider 列表包含每个 `api_key` 的明文。**永远不要**把 Provider 原始 JSON 贴进对话、日志或记忆文件。必须展示 Provider 时，把 key 脱敏成 `sk-…后四位`。对待用户给你的 key 同样如此。
 
 ### 5. 助手有两部分
 
-创建助手只写了元数据（名称/头像/引擎/快捷提示），**系统提示词（rules）是单独的第二步**，用专门的 `assistant-rule/write` 接口写入。建完助手别忘了设置它的系统提示词。
+创建助手只写了元数据（名称、头像、引擎、快捷提示），**系统提示词（rules）是单独的第二步**，通过 `config assistants rule write` 写入。建完助手别忘了设置它的系统提示词。
 
 ---
 
@@ -84,7 +84,7 @@
 
 ### 模式 1：配置助手 / 技能 / MCP / Provider / 设置
 
-1. 用 `aionui-config` 读当前状态（`get /api/assistants`、`/api/skills`、`/api/mcp/servers`、`/api/providers`、`/api/settings/client`）
+1. 用 `aionui-config` 读当前状态（`config assistants list`、`config skills list`、`config mcp servers list`、`config providers list`、`config settings get`）
 2. 向用户说明将要做的改动
 3. 执行写操作（注意助手系统提示词是第二步）
 4. 读回确认
@@ -148,5 +148,5 @@
 3. **关键操作需确认，询问后必须等待**
 4. **密钥永不明文外露**，展示一律脱敏
 5. **建助手别忘第二步**：系统提示词单独写
-6. **端口靠技能脚本发现，不要猜**；发现失败就提示用户启动 AionUi
+6. **技能通过注入的运行时上下文工作，不要猜端口或地址**；CLI 报告上下文错误就提示用户启动 AionUi
 7. **改配置后提醒用户刷新界面**

@@ -419,6 +419,9 @@ Patch backend settings:
 JSON
 ```
 
+Supported patch fields: `language`, `notification_enabled`, `cron_notification_enabled`,
+`command_queue_enabled`, `save_upload_to_workspace`. Unknown fields are silently ignored.
+
 Read or update client preferences:
 
 ```bash
@@ -428,11 +431,13 @@ Read or update client preferences:
 ```bash
 "$AIONUI_HELPER_BIN" config settings client put <<'JSON'
 {
-  "theme": "dark",
-  "font_size": 14
+  "ui.zoomFactor": 1.2
 }
 JSON
 ```
+
+Client preferences are a free-form key-value map. Pass `null` to remove a key. Ask the
+user or read back first to discover keys in use — there is no fixed schema.
 
 ## Agents
 
@@ -549,13 +554,21 @@ Create a cron job:
 "$AIONUI_HELPER_BIN" config cron jobs create <<'JSON'
 {
   "name": "Weekly Report",
-  "schedule_type": "cron",
-  "schedule": "0 9 * * MON",
-  "timezone": "Asia/Shanghai",
-  "task_description": "Produce the weekly report."
+  "schedule": { "kind": "cron", "expr": "0 9 * * MON", "tz": "Asia/Shanghai" },
+  "message": "Produce the weekly report.",
+  "conversation_id": "current",
+  "created_by": "user"
 }
 JSON
 ```
+
+The `schedule` field is a tagged object, not a flat string:
+- `{ "kind": "cron", "expr": "<cron-expr>", "tz": "<IANA-tz>" }` — recurring cron schedule
+- `{ "kind": "every", "every_ms": <milliseconds> }` — fixed interval
+- `{ "kind": "at", "at_ms": <epoch-ms> }` — one-shot at a specific time
+
+`conversation_id` and `created_by` are required. `message` carries the task text.
+Use `"conversation_id": "current"` to attach the job to the current conversation.
 
 Update, run, or manage a cron job skill:
 
