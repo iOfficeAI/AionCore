@@ -1,4 +1,6 @@
-CREATE TABLE cron_job_runs (
+ALTER TABLE cron_jobs ADD COLUMN queue_enabled INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS cron_job_runs (
     job_id          TEXT NOT NULL,
     scheduled_at    INTEGER NOT NULL,
     status          TEXT NOT NULL CHECK (status IN ('running', 'retrying', 'ok', 'error', 'skipped')),
@@ -14,6 +16,6 @@ CREATE TABLE cron_job_runs (
     FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_cron_job_runs_active
+CREATE INDEX IF NOT EXISTS idx_cron_job_runs_active
     ON cron_job_runs(job_id, lease_until)
     WHERE status IN ('running', 'retrying');
