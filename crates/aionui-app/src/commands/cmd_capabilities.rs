@@ -90,6 +90,21 @@ fn data() -> Value {
                     "redacted_by_default": true,
                     "escape_hatch": "diagnose http get"
                 }
+            },
+            {
+                "name": "team",
+                "mode": "team-collaboration",
+                "description": "Agent-facing Team collaboration CLI fallback for agents without MCP injection.",
+                "contract": "agent-facing-team-cli",
+                "contract_command": "team capabilities",
+                "invocation": "aioncore team capabilities",
+                "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID", "AIONUI_RUNTIME_TOKEN"],
+                "runtime_free_commands": ["team capabilities", "team help"],
+                "safety": {
+                    "can_write": true,
+                    "runtime_token_required_for_context_and_call": true,
+                    "does_not_accept_identity_authority_from_stdin": true
+                }
             }
         ],
         "non_agent_subcommands": [

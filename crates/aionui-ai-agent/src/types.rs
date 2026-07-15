@@ -48,11 +48,16 @@ impl BuildTaskOptions {
         conversation_id: &str,
         helper_bin: Option<&str>,
         base_url: Option<&str>,
+        runtime_token: Option<&str>,
     ) {
         self.context.runtime_env.retain(|(key, _)| {
             !matches!(
                 key.as_str(),
-                AIONUI_USER_ID_ENV | AIONUI_CONVERSATION_ID_ENV | AIONUI_HELPER_BIN_ENV | AIONUI_BASE_URL_ENV
+                AIONUI_USER_ID_ENV
+                    | AIONUI_CONVERSATION_ID_ENV
+                    | AIONUI_HELPER_BIN_ENV
+                    | AIONUI_BASE_URL_ENV
+                    | AIONUI_RUNTIME_TOKEN_ENV
             )
         });
         self.context
@@ -71,6 +76,11 @@ impl BuildTaskOptions {
                 .runtime_env
                 .push((AIONUI_BASE_URL_ENV.to_owned(), base_url.to_owned()));
         }
+        if let Some(runtime_token) = runtime_token {
+            self.context
+                .runtime_env
+                .push((AIONUI_RUNTIME_TOKEN_ENV.to_owned(), runtime_token.to_owned()));
+        }
         self.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
     }
 }
@@ -79,6 +89,7 @@ pub const AIONUI_USER_ID_ENV: &str = "AIONUI_USER_ID";
 pub const AIONUI_CONVERSATION_ID_ENV: &str = "AIONUI_CONVERSATION_ID";
 pub const AIONUI_HELPER_BIN_ENV: &str = "AIONUI_HELPER_BIN";
 pub const AIONUI_BASE_URL_ENV: &str = "AIONUI_BASE_URL";
+pub const AIONUI_RUNTIME_TOKEN_ENV: &str = "AIONUI_RUNTIME_TOKEN";
 pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -184,6 +195,7 @@ mod tests {
             runtime_env: vec![
                 (AIONUI_USER_ID_ENV.into(), "old-user".into()),
                 (AIONUI_CONVERSATION_ID_ENV.into(), "old-conv".into()),
+                (AIONUI_RUNTIME_TOKEN_ENV.into(), "old-token".into()),
                 ("EXISTING".into(), "1".into()),
             ],
             team: None,
@@ -202,6 +214,7 @@ mod tests {
             "conv-1",
             Some("/Applications/AionUi/aioncore"),
             Some("http://127.0.0.1:25808"),
+            Some("runtime-token-1"),
         );
 
         assert_eq!(
@@ -234,6 +247,21 @@ mod tests {
                 .context
                 .runtime_env
                 .contains(&(AIONUI_BASE_URL_ENV.to_owned(), "http://127.0.0.1:25808".to_owned()))
+        );
+        assert!(
+            options
+                .context
+                .runtime_env
+                .contains(&(AIONUI_RUNTIME_TOKEN_ENV.to_owned(), "runtime-token-1".to_owned()))
+        );
+        assert_eq!(
+            options
+                .context
+                .runtime_env
+                .iter()
+                .filter(|(key, _)| key == AIONUI_RUNTIME_TOKEN_ENV)
+                .count(),
+            1
         );
         assert!(options.context.runtime_env.contains(&("EXISTING".into(), "1".into())));
         assert_eq!(

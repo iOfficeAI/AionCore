@@ -1,33 +1,27 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::scheduler::SchedulerAction;
 use crate::types::TeammateRole;
 
-pub use aionui_team_prompts::tools::{
+pub use aionui_api_types::{
     TEAM_DESCRIBE_ASSISTANT_DESCRIPTION, TEAM_LIST_ASSISTANTS_DESCRIPTION, TEAM_SPAWN_AGENT_DESCRIPTION,
 };
+use aionui_api_types::{TeamToolPermission, TeamToolRole};
 
 // ---------------------------------------------------------------------------
 // Tool descriptors (returned by tools/list)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolDescriptor {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
-}
+pub type ToolDescriptor = aionui_api_types::TeamToolDescriptor;
 
 pub fn all_tool_descriptors_for_role(caller_role: TeammateRole) -> Vec<ToolDescriptor> {
-    aionui_team_prompts::visible_team_tool_descriptors(caller_role == TeammateRole::Lead)
-        .into_iter()
-        .map(|descriptor| ToolDescriptor {
-            name: descriptor.name,
-            description: descriptor.description,
-            input_schema: descriptor.input_schema,
-        })
-        .collect()
+    let role = if caller_role == TeammateRole::Lead {
+        TeamToolRole::Lead
+    } else {
+        TeamToolRole::Teammate
+    };
+    aionui_api_types::team_tool_descriptors_for_role(role)
 }
 
 pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
@@ -35,7 +29,13 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
 }
 
 pub fn authorize_tool(caller_role: TeammateRole, tool_name: &str) -> Result<(), String> {
-    aionui_team_prompts::authorize_team_tool(caller_role == TeammateRole::Lead, tool_name)
+    let Some(spec) = aionui_api_types::team_tool_descriptor(tool_name) else {
+        return Err(format!("Unknown tool: {tool_name}"));
+    };
+    if spec.permission == TeamToolPermission::LeadOnly && caller_role != TeammateRole::Lead {
+        return Err(format!("Only Lead can use {tool_name}"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use aionui_api_types::TeamToolTransport;
+
 mod wake_summary;
 
 pub use aionui_team_prompts::AvailableAssistant;
@@ -39,6 +41,16 @@ pub fn build_lead_prompt(
     members: &[TeamAgent],
     available_assistants: &[AvailableAssistant],
 ) -> String {
+    build_lead_prompt_for_transport(agent, team_name, members, available_assistants, TeamToolTransport::Mcp)
+}
+
+pub fn build_lead_prompt_for_transport(
+    agent: &TeamAgent,
+    team_name: &str,
+    members: &[TeamAgent],
+    available_assistants: &[AvailableAssistant],
+    tool_transport: TeamToolTransport,
+) -> String {
     let prompt_agent = to_prompt_agent(agent);
     let prompt_members: Vec<_> = members.iter().map(to_prompt_agent).collect();
     let renamed: HashMap<String, String> = HashMap::new();
@@ -51,11 +63,21 @@ pub fn build_lead_prompt(
         available_assistants,
         renamed_agents: &renamed,
         team_workspace: None,
+        tool_transport,
     });
     format!("Team: \"{team_name}\"\n\n{body}")
 }
 
 pub fn build_teammate_prompt(agent: &TeamAgent, team_name: &str, members: &[TeamAgent]) -> String {
+    build_teammate_prompt_for_transport(agent, team_name, members, TeamToolTransport::Mcp)
+}
+
+pub fn build_teammate_prompt_for_transport(
+    agent: &TeamAgent,
+    team_name: &str,
+    members: &[TeamAgent],
+    tool_transport: TeamToolTransport,
+) -> String {
     let prompt_agent = to_prompt_agent(agent);
     let prompt_members: Vec<_> = members.iter().map(to_prompt_agent).collect();
     let leader = prompt_members
@@ -84,6 +106,7 @@ pub fn build_teammate_prompt(agent: &TeamAgent, team_name: &str, members: &[Team
         teammates: &teammates,
         renamed_agents: &renamed,
         team_workspace: None,
+        tool_transport,
     })
 }
 

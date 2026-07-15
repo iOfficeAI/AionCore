@@ -6,7 +6,7 @@ use std::time::Instant;
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
     TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamMessageEnqueueStatus, TeamRunAckResponse, TeamRunStatus,
-    TeamRunTargetRole, TeamSlotWorkPayload,
+    TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
 use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
@@ -27,7 +27,7 @@ use crate::message_projection::{
 };
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
-use crate::prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
+use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload};
 use crate::provisioning::PersistSpawnedAgentRequest;
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
@@ -291,6 +291,13 @@ impl TeamSession {
         TeamMcpStdioServerSpec::from_config(binary_path.as_ref(), &self.mcp_stdio_config(slot_id))
     }
 
+    async fn team_tool_transport_for_agent(&self, agent: &TeamAgent) -> Result<TeamToolTransport, TeamError> {
+        let Some(service) = self.service.upgrade() else {
+            return Ok(TeamToolTransport::Mcp);
+        };
+        service.provisioner().team_tool_transport(agent).await
+    }
+
     pub(crate) async fn prepare_next_batch(&self, slot_id: &str) -> Result<PrepareBatchResult, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
         let runtime_constraint = match self.member_runtimes.snapshot(slot_id) {
@@ -351,13 +358,18 @@ impl TeamSession {
                 let wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
                 let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
                 let first_message = if needs_role_prompt {
+                    let tool_transport = self.team_tool_transport_for_agent(&agent).await?;
                     let role_prompt = match agent.role {
-                        TeammateRole::Lead => {
-                            build_lead_prompt(&agent, &self.team.name, &self.scheduler.list_agents().await, &[])
-                        }
+                        TeammateRole::Lead => build_lead_prompt_for_transport(
+                            &agent,
+                            &self.team.name,
+                            &self.scheduler.list_agents().await,
+                            &[],
+                            tool_transport,
+                        ),
                         TeammateRole::Teammate => {
                             let members = self.scheduler.list_agents().await;
-                            build_teammate_prompt(&agent, &self.team.name, &members)
+                            build_teammate_prompt_for_transport(&agent, &self.team.name, &members, tool_transport)
                         }
                     };
                     format!("{role_prompt}\n\n{wake_body}")

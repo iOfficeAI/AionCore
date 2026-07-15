@@ -38,6 +38,7 @@ use aionui_team::{TeamSessionService, team_routes};
 use crate::services::AppServices;
 
 use super::health::health_check;
+use super::runtime_team_tools::{RuntimeTeamToolsState, runtime_team_tools_routes};
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
 use super::trace::with_access_log;
 
@@ -200,7 +201,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     // Team routes protected by auth middleware
     let team_authenticated =
-        team_routes(states.team).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+        team_routes(states.team.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Cron routes protected by auth middleware
     let cron_authenticated =
@@ -226,6 +227,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // WebSocket upgrade route — exempt from CSRF (no cookie-based
     // double-submit) but still gets security response headers.
     let ws_routes = Router::new().route("/ws", get(ws_upgrade_handler)).with_state(ws_state);
+    let runtime_team_tools = runtime_team_tools_routes(RuntimeTeamToolsState {
+        team_service: states.team.service.clone(),
+        runtime_token_service: services.runtime_token_service.clone(),
+    });
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: route groups built");
 
     let router = Router::new()
@@ -262,6 +267,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         ))
     }
     .merge(ws_routes)
+    .merge(runtime_team_tools)
     .merge(office_proxy)
     .merge(public_assets)
     .layer(middleware::from_fn(security_headers_middleware));

@@ -10,8 +10,9 @@ use std::time::Instant;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionPhase, TeamSessionStatus,
-    TeamSessionStatusPayload, WebSocketMessage,
+    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
+    TeamSessionStatusPayload, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
+    TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -37,6 +38,9 @@ use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogPort};
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
+use crate::runtime_tools::{
+    ResolvedTeamToolContext, agent_for_conversation, error_payload, execute_with_scheduler, role_to_tool_role,
+};
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeammateRole};
@@ -1673,6 +1677,109 @@ impl TeamSessionService {
 
     pub fn get_session_scheduler(&self, team_id: &str) -> Option<Arc<crate::scheduler::TeammateManager>> {
         self.sessions.get(team_id).map(|e| e.session.scheduler().clone())
+    }
+
+    pub async fn resolve_team_tool_context(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ResolvedTeamToolContext, TeamToolErrorPayload> {
+        let Some(binding_lookup) = self
+            .conversation_port
+            .lookup_team_binding_by_conversation(conversation_id)
+            .await
+            .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?
+        else {
+            return Err(error_payload(
+                TeamToolErrorCode::ConversationNotFound,
+                "conversation not found",
+            ));
+        };
+
+        if binding_lookup.user_id != user_id {
+            return Err(error_payload(
+                TeamToolErrorCode::PermissionDenied,
+                "conversation does not belong to user",
+            ));
+        }
+
+        let Some(team_id) = binding_lookup.team_id.clone() else {
+            return Ok(ResolvedTeamToolContext {
+                response: TeamToolContextResponse {
+                    in_team: false,
+                    conversation_id: conversation_id.to_owned(),
+                    team_id: None,
+                    team_name: None,
+                    slot_id: None,
+                    role: None,
+                    agent_name: None,
+                    transport: None,
+                    allowed_tools: Vec::new(),
+                },
+                context: None,
+            });
+        };
+
+        let team_row = self
+            .repo
+            .get_team(&team_id)
+            .await
+            .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?
+            .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "team not found"))?;
+        if team_row.user_id != user_id {
+            return Err(error_payload(
+                TeamToolErrorCode::PermissionDenied,
+                "team does not belong to user",
+            ));
+        }
+
+        let binding = TeamSessionBinding {
+            team_id: team_id.clone(),
+            slot_id: binding_lookup.slot_id,
+            role: binding_lookup.role,
+            runtime_seed: Default::default(),
+            mcp: None,
+        };
+        let agents: Vec<crate::types::TeamAgent> = serde_json::from_str(&team_row.agents)
+            .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?;
+        let agent = agent_for_conversation(&agents, conversation_id, &binding)?;
+        let context = crate::tool_executor::TeamToolContext {
+            team_id: team_id.clone(),
+            caller_slot_id: agent.slot_id.clone(),
+            caller_role: agent.role,
+            user_id: Some(user_id.to_owned()),
+            conversation_id: Some(conversation_id.to_owned()),
+            transport: TeamToolTransport::CliAssumed,
+        };
+        let allowed_tools = aionui_api_types::team_tool_descriptors_for_role(role_to_tool_role(agent.role))
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+        Ok(ResolvedTeamToolContext {
+            response: TeamToolContextResponse {
+                in_team: true,
+                conversation_id: conversation_id.to_owned(),
+                team_id: Some(team_id),
+                team_name: Some(team_row.name),
+                slot_id: Some(agent.slot_id.clone()),
+                role: Some(role_to_tool_role(agent.role)),
+                agent_name: Some(agent.name.clone()),
+                transport: Some(TeamToolTransport::CliAssumed),
+                allowed_tools,
+            },
+            context: Some(context),
+        })
+    }
+
+    pub async fn execute_team_tool(
+        &self,
+        context: &crate::tool_executor::TeamToolContext,
+        call: TeamToolCall,
+    ) -> Result<serde_json::Value, TeamToolErrorPayload> {
+        let scheduler = self
+            .get_session_scheduler(&context.team_id)
+            .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "active team session not found"))?;
+        execute_with_scheduler(&scheduler, &self.self_ref, context, call).await
     }
 
     #[cfg(test)]

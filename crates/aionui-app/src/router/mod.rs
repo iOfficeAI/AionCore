@@ -2,6 +2,7 @@
 
 mod health;
 mod routes;
+mod runtime_team_tools;
 mod state;
 mod team_conversation_adapters;
 mod trace;

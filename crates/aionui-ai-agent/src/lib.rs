@@ -16,6 +16,7 @@ pub mod protocol;
 pub mod registry;
 pub mod routes;
 pub(crate) mod runtime_status;
+pub mod runtime_token;
 pub(crate) mod services;
 pub mod session_context;
 pub mod shared_kernel;
@@ -42,6 +43,9 @@ pub use protocol::events::AgentStreamEvent;
 pub use protocol::send_error::AgentSendError;
 pub use registry::{AgentRegistry, UnavailableReason};
 pub use routes::{AgentRouterState, RemoteAgentRouterState, agent_routes, remote_agent_routes};
+pub use runtime_token::{
+    RuntimeTokenClaims, RuntimeTokenError, RuntimeTokenIssue, RuntimeTokenScope, RuntimeTokenService,
+};
 pub use services::AgentAvailabilityFeedbackPort;
 pub use services::AgentService;
 pub use services::RemoteAgentService;

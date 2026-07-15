@@ -13,6 +13,7 @@ use crate::prompt_dump::{TeamPromptDumpConfig, TeamToolsListDump, dump_team_tool
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
+use crate::tool_executor::{TeamToolContext, TeamToolExecutor, team_tool_call_from_name};
 use crate::types::{TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
 use crate::work_source::WorkSource;
 
@@ -22,7 +23,7 @@ use super::protocol::{
 };
 use super::tools::{
     RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskListInput,
-    TaskListStatusInput, TaskUpdateInput, all_tool_descriptors_for_role,
+    TaskListStatusInput, TaskUpdateInput,
 };
 
 // ---------------------------------------------------------------------------
@@ -354,7 +355,17 @@ async fn handle_tools_list(
     prompt_dump: &TeamPromptDumpConfig,
 ) -> JsonRpcResponse {
     let caller_role = caller_role_for_tools_list(scheduler, caller_slot_id).await;
-    let tools = all_tool_descriptors_for_role(caller_role);
+    let empty_service = Weak::new();
+    let executor = TeamToolExecutor::new(scheduler, &empty_service);
+    let context = TeamToolContext {
+        team_id: team_id.to_owned(),
+        caller_slot_id: caller_slot_id.to_owned(),
+        caller_role,
+        user_id: None,
+        conversation_id: None,
+        transport: aionui_api_types::TeamToolTransport::Mcp,
+    };
+    let tools = executor.list_tools(&context);
     let tools_for_dump = tool_descriptors_to_mcp_json(&tools);
     if let Err(error) = dump_team_tools_list(
         prompt_dump,
@@ -427,16 +438,18 @@ async fn handle_tools_call(
         "MCP tools/call invoked"
     );
 
-    let result = dispatch_tool(
-        tool_name,
-        &arguments,
-        scheduler,
-        service,
-        team_id,
-        caller_slot_id,
+    let context = TeamToolContext {
+        team_id: team_id.to_owned(),
+        caller_slot_id: caller_slot_id.to_owned(),
         caller_role,
-    )
-    .await;
+        user_id: None,
+        conversation_id: None,
+        transport: aionui_api_types::TeamToolTransport::Mcp,
+    };
+    let result = match team_tool_call_from_name(tool_name, arguments) {
+        Ok(call) => TeamToolExecutor::new(scheduler, service).execute(&context, call).await,
+        Err(error) => Err(error),
+    };
 
     match &result {
         Ok(_) => info!(team_id = %team_id, tool = %tool_name, caller = %caller_slot_id, "MCP tool call succeeded"),
@@ -455,7 +468,7 @@ async fn handle_tools_call(
         Ok(content) => JsonRpcResponse::success(
             request.id,
             json!({
-                "content": [{ "type": "text", "text": content }]
+                "content": [{ "type": "text", "text": serde_json::to_string(&content).unwrap_or_else(|_| content.to_string()) }]
             }),
         ),
         Err(err) => {
@@ -463,16 +476,7 @@ async fn handle_tools_call(
                 "content": [{ "type": "text", "text": err.message }],
                 "isError": true
             });
-            if err.domain_code.is_some() || err.details.is_some() {
-                let mut structured = json!({});
-                if let Some(domain_code) = err.domain_code {
-                    structured["domainCode"] = json!(domain_code);
-                }
-                if let Some(details) = err.details {
-                    structured["details"] = details;
-                }
-                result["structuredContent"] = structured;
-            }
+            result["structuredContent"] = serde_json::to_value(&err).unwrap_or_else(|_| json!({}));
             JsonRpcResponse::success(request.id, result)
         }
     }
@@ -1086,7 +1090,15 @@ async fn http_mcp_loop(
                             return;
                         }
                         "tools/list" => {
-                            let descriptors = all_tool_descriptors_for_role(caller_role);
+                            let context = TeamToolContext {
+                                team_id: tid.clone(),
+                                caller_slot_id: caller_slot_id.to_owned(),
+                                caller_role,
+                                user_id: None,
+                                conversation_id: None,
+                                transport: aionui_api_types::TeamToolTransport::Mcp,
+                            };
+                            let descriptors = TeamToolExecutor::new(&sched, &svc).list_tools(&context);
                             let tools: Vec<Value> = tool_descriptors_to_mcp_json(&descriptors);
                             if let Err(error) = dump_team_tools_list(
                                 &dump,
@@ -1110,33 +1122,31 @@ async fn http_mcp_loop(
                             let params = value.get("params").cloned().unwrap_or(json!({}));
                             let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
                             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-                            match dispatch_tool(
-                                tool_name,
-                                &arguments,
-                                &sched,
-                                &svc,
-                                &tid,
-                                caller_slot_id,
+                            let context = TeamToolContext {
+                                team_id: tid.clone(),
+                                caller_slot_id: caller_slot_id.to_owned(),
                                 caller_role,
-                            )
-                            .await
-                            {
-                                Ok(text) => json!({ "content": [{"type": "text", "text": text}] }),
+                                user_id: None,
+                                conversation_id: None,
+                                transport: aionui_api_types::TeamToolTransport::Mcp,
+                            };
+                            let call_result = match team_tool_call_from_name(tool_name, arguments) {
+                                Ok(call) => TeamToolExecutor::new(&sched, &svc).execute(&context, call).await,
+                                Err(error) => Err(error),
+                            };
+                            match call_result {
+                                Ok(value) => json!({
+                                    "content": [{
+                                        "type": "text",
+                                        "text": serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
+                                    }]
+                                }),
                                 Err(err) => {
                                     let mut result = json!({
                                         "content": [{"type": "text", "text": err.message}],
                                         "isError": true,
                                     });
-                                    if err.domain_code.is_some() || err.details.is_some() {
-                                        let mut structured = json!({});
-                                        if let Some(domain_code) = err.domain_code {
-                                            structured["domainCode"] = json!(domain_code);
-                                        }
-                                        if let Some(details) = err.details {
-                                            structured["details"] = details;
-                                        }
-                                        result["structuredContent"] = structured;
-                                    }
+                                    result["structuredContent"] = serde_json::to_value(&err).unwrap_or_else(|_| json!({}));
                                     result
                                 }
                             }

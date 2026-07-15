@@ -1,5 +1,5 @@
 pub use aionui_common::constants::TEAM_CAPABLE_BACKENDS;
-use aionui_common::constants::is_team_capable;
+use aionui_common::constants::{is_team_capable, supports_team_cli_fallback, supports_team_mcp};
 
 /// Determine if a backend supports team mode.
 ///
@@ -7,6 +7,14 @@ use aionui_common::constants::is_team_capable;
 /// persisted `agent_capabilities` JSON for MCP capability metadata.
 pub fn is_team_capable_backend(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
     is_team_capable(backend, agent_capabilities)
+}
+
+pub fn supports_team_mcp_backend(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
+    supports_team_mcp(backend, agent_capabilities)
+}
+
+pub fn supports_team_cli_fallback_backend(agent_capabilities: Option<&serde_json::Value>) -> bool {
+    supports_team_cli_fallback(agent_capabilities)
 }
 
 #[cfg(test)]
@@ -22,6 +30,7 @@ mod tests {
         assert!(is_team_capable_backend("gemini", None));
         assert!(is_team_capable_backend("aionrs", None));
         assert!(is_team_capable_backend("codebuddy", None));
+        assert!(supports_team_mcp_backend("acp", None));
     }
 
     #[test]
@@ -43,10 +52,13 @@ mod tests {
     }
 
     #[test]
-    fn non_whitelist_backend_without_mcp_capabilities_is_not_capable() {
-        assert!(!is_team_capable_backend("custom", None));
-        assert!(!is_team_capable_backend("custom", Some(&json!({}))));
+    fn non_whitelist_backend_without_mcp_capabilities_is_cli_fallback_capable_by_default() {
+        assert!(is_team_capable_backend("custom", None));
+        assert!(is_team_capable_backend("custom", Some(&json!({}))));
+        assert!(!supports_team_mcp_backend("custom", None));
+        assert!(supports_team_cli_fallback_backend(None));
+        assert!(!is_team_capable_backend("custom", Some(&json!({"shell": false}))));
         assert!(!is_team_capable_backend("", None));
-        assert!(!is_team_capable_backend("Claude", None));
+        assert!(is_team_capable_backend("Claude", None));
     }
 }

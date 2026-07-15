@@ -870,6 +870,7 @@ dependencies = [
 name = "aionui-team-prompts"
 version = "0.1.47"
 dependencies = [
+ "aionui-api-types",
  "serde",
  "serde_json",
 ]

@@ -91,6 +91,8 @@ pub(crate) enum Command {
     Config(ConfigArgs),
     /// Agent-facing read-only troubleshooting CLI for AionUi diagnosis.
     Diagnose(DiagnoseArgs),
+    /// Agent-facing Team collaboration CLI fallback.
+    Team(TeamArgs),
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
     McpBridge,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
@@ -111,6 +113,7 @@ impl Command {
             Self::Capabilities => "capabilities",
             Self::Config(_) => "config",
             Self::Diagnose(_) => "diagnose",
+            Self::Team(_) => "team",
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
@@ -133,6 +136,41 @@ pub(crate) struct ConfigArgs {
 pub(crate) struct DiagnoseArgs {
     #[command(subcommand)]
     pub command: DiagnoseCommand,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(disable_help_subcommand = true)]
+pub(crate) struct TeamArgs {
+    #[command(subcommand)]
+    pub command: TeamCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum TeamCommand {
+    Capabilities,
+    Help,
+    Context,
+    Members,
+    SendMessage,
+    Task(TeamTaskArgs),
+    ListAssistants,
+    DescribeAssistant,
+    SpawnAgent,
+    RenameAgent,
+    ShutdownAgent,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct TeamTaskArgs {
+    #[command(subcommand)]
+    pub command: TeamTaskCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum TeamTaskCommand {
+    Create,
+    Update,
+    List,
 }
 
 #[derive(Subcommand, Debug, Clone)]
