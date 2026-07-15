@@ -644,8 +644,8 @@ mod tests {
     async fn seed_rows_populated_after_migrations() {
         let (repo, _db) = setup().await;
         let rows = repo.list_all().await.unwrap();
-        // 18 ACP vendors + 2 non-ACP builtins + 1 internal = 21.
-        assert_eq!(rows.len(), 21);
+        // 19 ACP vendors + 2 non-ACP builtins + 1 internal = 22.
+        assert_eq!(rows.len(), 22);
         assert!(
             rows.iter()
                 .any(|r| r.name == "Claude Code" && r.agent_source == "builtin")
@@ -674,6 +674,12 @@ mod tests {
             .find(|r| r.name == "Codex CLI" && r.backend.as_deref() == Some("codex") && r.agent_source == "builtin")
             .expect("seeded codex row");
         assert_eq!(codex.yolo_id.as_deref(), Some("agent-full-access"));
+        let pi = rows
+            .iter()
+            .find(|r| r.name == "Pi" && r.backend.as_deref() == Some("pi") && r.agent_source == "builtin")
+            .expect("seeded Pi ACP row");
+        assert_eq!(pi.command.as_deref(), Some("npx"));
+        assert_eq!(pi.args.as_deref(), Some(r#"["-y","pi-acp@0.0.31"]"#));
     }
 
     #[tokio::test]

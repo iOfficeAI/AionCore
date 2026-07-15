@@ -531,8 +531,9 @@ fn decode_row(
     };
 
     let backend_str = row.backend.as_deref().unwrap_or("");
-    let team_capable = behavior_policy.supports_team
+    let inferred_team_capable = behavior_policy.supports_team
         || aionui_common::constants::is_team_capable(backend_str, handshake.agent_capabilities.as_ref());
+    let team_capable = behavior_policy.team_capable_override.unwrap_or(inferred_team_capable);
 
     let mut meta = AgentMetadata {
         id: row.id,
@@ -1245,7 +1246,7 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 21);
+        assert_eq!(all.len(), 22);
     }
 
     #[tokio::test]
@@ -1285,6 +1286,28 @@ mod tests {
         assert_eq!(hermes.yolo_id, None);
     }
 
+    #[tokio::test]
+    async fn pi_builtin_uses_pinned_acp_adapter_and_requires_pi_cli() {
+        let reg = registry().await;
+        let pi = reg.find_builtin_by_backend("pi").await.unwrap();
+
+        assert_eq!(pi.command.as_deref(), Some("npx"));
+        assert_eq!(pi.args, ["-y", "pi-acp@0.0.31"]);
+        assert_eq!(pi.agent_source_info.binary_name.as_deref(), Some("pi"));
+        assert_eq!(pi.agent_source_info.bridge_binary.as_deref(), Some("npx"));
+        assert_eq!(pi.native_skills_dirs.as_deref(), Some(&[".pi/skills".to_owned()][..]));
+        assert!(!pi.team_capable);
+        assert_eq!(pi.yolo_id, None);
+        assert_eq!(
+            pi.handshake
+                .agent_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.get("load_session"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
     /// On a host that has *none* of the seeded CLIs installed, the
     /// public listing collapses to the rows that don't need one
     /// (Aion CLI is `agent_source = internal` with no `command`).
@@ -1317,7 +1340,7 @@ mod tests {
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
         let count = |t: AgentType| all.iter().filter(|m| m.agent_type == t).count();
-        assert_eq!(count(AgentType::Acp), 18);
+        assert_eq!(count(AgentType::Acp), 19);
         assert_eq!(count(AgentType::Nanobot), 1);
         assert_eq!(count(AgentType::OpenclawGateway), 1);
         assert_eq!(count(AgentType::Aionrs), 1);
@@ -1427,7 +1450,7 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 21, "every row appears once");
+        assert_eq!(snapshot.len(), 22, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {
