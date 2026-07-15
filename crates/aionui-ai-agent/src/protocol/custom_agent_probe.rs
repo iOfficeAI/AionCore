@@ -13,7 +13,6 @@
 //! Both paths produce identical outcomes / error text.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::time::Duration;
 
 use aionui_api_types::TryConnectCustomAgentResponse;
@@ -47,7 +46,6 @@ pub async fn try_connect_custom_agent(
     command: &str,
     args: &[String],
     env: &HashMap<String, String>,
-    data_dir: &Path,
     reporter: Option<&dyn NodeRuntimeProgressReporter>,
 ) -> TryConnectCustomAgentResponse {
     // ── Step 1 — which check ────────────────────────────────────────
@@ -63,7 +61,7 @@ pub async fn try_connect_custom_agent(
     debug!(program = %resolved.program.display(), "probe step 1 ok");
 
     // ── Step 2 — spawn + ACP initialize ─────────────────────────────
-    let proc = match spawn_probe_process(resolved, args, env, data_dir).await {
+    let proc = match spawn_probe_process(resolved, args, env).await {
         Ok(proc) => proc,
         Err(msg) => return TryConnectCustomAgentResponse::FailAcp { error: msg },
     };
@@ -94,7 +92,6 @@ async fn spawn_probe_process(
     resolved: ResolvedCommand,
     args: &[String],
     env: &HashMap<String, String>,
-    data_dir: &Path,
 ) -> Result<CliAgentProcess, String> {
     let mut final_args: Vec<String> = resolved
         .args_prefix
@@ -122,7 +119,7 @@ async fn spawn_probe_process(
         cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
     };
 
-    CliAgentProcess::spawn_for_sdk(spec, data_dir)
+    CliAgentProcess::spawn_for_sdk(spec)
         .await
         .map_err(|e| format!("spawn failed: {e}"))
 }
@@ -151,8 +148,8 @@ impl Drop for ProbeProcessGuard<'_> {
 /// `initialize` followed by `session/new` — so auth-gated builtin agents
 /// (e.g. gemini logged out) surface as [`TryConnectCustomAgentResponse::FailAuth`]
 /// rather than appearing online.
-pub(crate) async fn acp_probe_command_spec(spec: CommandSpec, data_dir: &Path) -> TryConnectCustomAgentResponse {
-    let proc = match CliAgentProcess::spawn_for_sdk(spec, data_dir).await {
+pub(crate) async fn acp_probe_command_spec(spec: CommandSpec) -> TryConnectCustomAgentResponse {
+    let proc = match CliAgentProcess::spawn_for_sdk(spec).await {
         Ok(proc) => proc,
         Err(e) => {
             return TryConnectCustomAgentResponse::FailAcp {
@@ -202,8 +199,8 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
     let (notification_tx, _notification_rx) = mpsc::channel(4);
 
     // Race the ACP initialize handshake against the child process exiting.
-    // A misconfigured CLI (e.g. `bun acp` with no script) exits almost
-    // immediately with a non-zero status; without this race the
+    // A misconfigured CLI (e.g. an invalid package launcher command) exits
+    // almost immediately with a non-zero status; without this race the
     // `AcpProtocol::connect` call would block on its internal 30 s
     // timeout waiting for an `initialize` reply that will never arrive.
     let connect = AcpProtocol::connect(stdin, stdout, event_tx, permission_tx, notification_tx);
@@ -254,9 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_returns_fail_cli_when_command_missing() {
-        let tmp = std::env::temp_dir();
-        let resp =
-            try_connect_custom_agent("aionui-definitely-does-not-exist-xyz", &[], &HashMap::new(), &tmp, None).await;
+        let resp = try_connect_custom_agent("aionui-definitely-does-not-exist-xyz", &[], &HashMap::new(), None).await;
         match resp {
             TryConnectCustomAgentResponse::FailCli { error } => {
                 let lower = error.to_lowercase();
@@ -302,8 +297,7 @@ mod tests {
         // racing a cold login-shell capture against our timeout.
         let _ = aionui_runtime::agent_process_env().await;
 
-        let tmp = std::env::temp_dir();
-        let result = tokio::time::timeout(Duration::from_secs(2), acp_probe_command_spec(spec, &tmp)).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), acp_probe_command_spec(spec)).await;
         assert!(
             result.is_err(),
             "handshake should not complete; outer timeout must fire"
@@ -353,8 +347,7 @@ mod tests {
             // `true` is a cmd builtin on Windows, not a standalone exe.
             return;
         }
-        let tmp = std::env::temp_dir();
-        let resp = try_connect_custom_agent("true", &[], &HashMap::new(), &tmp, None).await;
+        let resp = try_connect_custom_agent("true", &[], &HashMap::new(), None).await;
         assert!(
             matches!(resp, TryConnectCustomAgentResponse::FailAcp { .. }),
             "expected FailAcp, got {resp:?}"
@@ -391,14 +384,7 @@ mod tests {
         // FailAcp — the grandchild keeps running unless cleanup kills it.
         let script = format!("sleep 600 & printf '%s' \"$!\" > '{}'", marker_path.display());
 
-        let resp = try_connect_custom_agent(
-            "sh",
-            &["-c".to_string(), script],
-            &HashMap::new(),
-            &std::env::temp_dir(),
-            None,
-        )
-        .await;
+        let resp = try_connect_custom_agent("sh", &["-c".to_string(), script], &HashMap::new(), None).await;
         assert!(
             matches!(resp, TryConnectCustomAgentResponse::FailAcp { .. }),
             "wrapper exits before ACP handshake; expected FailAcp, got {resp:?}"

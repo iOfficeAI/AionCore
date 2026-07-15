@@ -6,6 +6,7 @@ pub(crate) mod agent_runtime;
 pub mod agent_task;
 pub mod capability;
 pub mod cc_switch;
+pub(crate) mod cli_probe;
 pub(crate) mod dev_prompt_dump;
 pub mod error;
 pub mod factory;

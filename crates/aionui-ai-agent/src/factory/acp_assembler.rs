@@ -28,9 +28,8 @@ pub struct AcpSessionParams {
     pub mcp_servers: Vec<McpServer>,
     pub preset_context: Option<String>,
     pub session_snapshot: Option<PersistedSessionState>,
-    /// Backend data directory (`AppConfig.data_dir`). Passed through to
-    /// `CliAgentProcess::spawn_for_sdk` so bun cache / tmp directories
-    /// land under the operator-chosen path rather than the OS default.
+    /// Backend data directory (`AppConfig.data_dir`) used for process
+    /// registration and optional prompt diagnostics.
     pub data_dir: PathBuf,
     /// Whether prompt diagnostics should be dumped under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,

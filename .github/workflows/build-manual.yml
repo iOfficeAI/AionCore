@@ -30,8 +30,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_HTTP_TIMEOUT: "600"
   CARGO_NET_RETRY: "10"
-  AIONUI_EMBED_BUN: "1"
-  BUN_VARIANT: default
   # cross commit used by the v0.1.39/v0.1.40 Linux ARM64 release builds.
   CROSS_GIT_REV: "29d00c7803f221f1b3f35e561b03792368fb8339"
   LINUX_X64_GLIBC_MAX: "GLIBC_2.34"

@@ -45,7 +45,7 @@ pub struct AgentSourceInfo {
     /// Primary CLI binary checked for availability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_name: Option<String>,
-    /// Extra binary required when the row spawns via a bridge (e.g. `bun`).
+    /// Extra binary required when the row spawns via a bridge (e.g. `npx`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge_binary: Option<String>,
     /// Hub package identifier when `agent_source = "extension"`.
