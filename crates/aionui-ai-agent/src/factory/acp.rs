@@ -11,6 +11,7 @@ use crate::session_context::AcpSessionBuildContext;
 use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
 use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
+use aionui_common::constants::get_ollama_launch_agent_name;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -50,8 +51,14 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
-    let mut command_spec =
-        resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
+    let mut command_spec = resolve_agent_command_spec_with_ollama(
+        &meta,
+        &config,
+        &ctx.workspace,
+        &ctx.conversation_id,
+        deps.broadcaster.clone(),
+    )
+    .await?;
     apply_acp_launch_policy(
         &mut command_spec,
         AcpLaunchPolicyInput {
@@ -165,6 +172,49 @@ pub(super) async fn build(
     deps.acp_agent_service.attach(ctx.conversation_id, domain_rx).await;
 
     Ok(instance)
+}
+
+/// Resolve the agent command spec, optionally using Ollama Launch when
+/// the session configuration requests it and the agent is compatible.
+///
+/// Falls back to the standard command resolution when:
+/// - `config.use_ollama` is not set
+/// - The agent is not `ollama_compatible`
+/// - Ollama is not installed on the system
+async fn resolve_agent_command_spec_with_ollama(
+    meta: &aionui_api_types::AgentMetadata,
+    config: &aionui_api_types::AcpBuildExtra,
+    workspace: &str,
+    conversation_id: &str,
+    broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
+) -> Result<CommandSpec, AgentError> {
+    if config.use_ollama && meta.ollama_compatible {
+        if let Some(ollama_name) = get_ollama_launch_agent_name(meta.backend.as_deref().unwrap_or("")) {
+            info!(
+                agent = %meta.name,
+                backend = ?meta.backend,
+                ollama_agent = ollama_name,
+                "Using Ollama Launch for agent"
+            );
+            return Ok(CommandSpec {
+                command: "ollama".into(),
+                args: vec!["launch".into(), ollama_name.into()],
+                env: vec![],
+                cwd: Some(workspace.to_owned()),
+            });
+        }
+        // If we get here, the agent claims ollama_compatible but wasn't in
+        // the launch map — fall through to native path. This shouldn't
+        // happen in practice because ollama_compatible is computed from
+        // the same map.
+        warn!(
+            agent = %meta.name,
+            backend = ?meta.backend,
+            "Agent marked ollama_compatible but not found in OLLAMA_LAUNCH_MAP; falling back to native launch"
+        );
+    }
+
+    resolve_agent_command_spec(meta, workspace, conversation_id, broadcaster).await
 }
 
 async fn resolve_agent_command_spec(
@@ -720,6 +770,7 @@ mod tests {
             handshake: aionui_api_types::AgentHandshake::default(),
             has_command_override: false,
             env_override_key_count: 0,
+            ollama_compatible: false,
         };
 
         let spec = resolve_agent_command_spec(

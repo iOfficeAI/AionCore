@@ -397,6 +397,7 @@ impl AgentRegistry {
                     last_failure_at: meta.last_failure_at,
                     has_command_override: meta.has_command_override,
                     env_override_key_count: meta.env_override_key_count,
+                    ollama_compatible: meta.ollama_compatible,
                 }
             })
             .collect();
@@ -448,6 +449,7 @@ impl AgentRegistry {
             last_failure_at: meta.last_failure_at,
             has_command_override: meta.has_command_override,
             env_override_key_count: meta.env_override_key_count,
+            ollama_compatible: meta.ollama_compatible,
         })
     }
 
@@ -557,6 +559,7 @@ fn decode_row(
     let inferred_team_capable = behavior_policy.supports_team
         || aionui_common::constants::is_team_capable(backend_str, handshake.agent_capabilities.as_ref());
     let team_capable = behavior_policy.team_capable_override.unwrap_or(inferred_team_capable);
+    let ollama_compatible = !backend_str.is_empty() && aionui_common::constants::is_ollama_supported_agent(backend_str);
 
     let mut meta = AgentMetadata {
         id: row.id,
@@ -593,6 +596,7 @@ fn decode_row(
         handshake,
         has_command_override: false,
         env_override_key_count: 0,
+        ollama_compatible,
     };
 
     // ── Self-repair overrides ──────────────────────────────────────

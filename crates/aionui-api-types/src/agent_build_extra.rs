@@ -73,6 +73,11 @@ pub struct AcpBuildExtra {
     pub session_mcp_servers: Vec<SessionMcpServer>,
     #[serde(default)]
     pub user_id: Option<String>,
+
+    /// When enabled, delegates agent spawning to `ollama launch <agent>`
+    /// instead of the agent's native command.
+    #[serde(default)]
+    pub use_ollama: bool,
 }
 
 /// Aionrs-specific fields extracted from `extra` in build task options.

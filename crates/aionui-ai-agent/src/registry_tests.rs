@@ -49,6 +49,7 @@ async fn probe_resolved_command_keeps_bridge_but_version_probe_targets_primary_c
         handshake: AgentHandshake::default(),
         has_command_override: false,
         env_override_key_count: 0,
+        ollama_compatible: false,
     };
 
     let resolved = probe_resolved_command(&meta).expect("probe");
@@ -108,6 +109,7 @@ fn probe_resolved_command_requires_primary_binary_for_builtin_managed_claude() {
         handshake: AgentHandshake::default(),
         has_command_override: false,
         env_override_key_count: 0,
+        ollama_compatible: false,
     };
 
     let reason = probe_resolved_command(&meta).expect_err("missing claude CLI must hide builtin row");
@@ -163,6 +165,7 @@ fn probe_resolved_command_requires_primary_binary_for_builtin_managed_codex() {
         handshake: AgentHandshake::default(),
         has_command_override: false,
         env_override_key_count: 0,
+        ollama_compatible: false,
     };
 
     let reason = probe_resolved_command(&meta).expect_err("missing codex CLI must hide builtin row");

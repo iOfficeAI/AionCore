@@ -12,6 +12,7 @@ pub mod error;
 pub mod factory;
 pub(crate) mod idle_scanner;
 pub mod manager;
+pub mod ollama;
 pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;

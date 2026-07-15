@@ -253,6 +253,11 @@ pub struct AgentMetadata {
     /// Computed in decode_row and projected to `AgentManagementRow`.
     #[serde(skip)]
     pub env_override_key_count: usize,
+
+    /// Whether this agent can be launched via Ollama Launch.
+    /// Computed in decode_row from the OLLAMA_LAUNCH_MAP constant.
+    #[serde(skip)]
+    pub ollama_compatible: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +328,10 @@ pub struct AgentManagementRow {
     pub has_command_override: bool,
     #[serde(default)]
     pub env_override_key_count: usize,
+
+    /// Whether this agent can be launched via Ollama Launch.
+    #[serde(default)]
+    pub ollama_compatible: bool,
 }
 
 #[cfg(test)]
@@ -382,6 +391,7 @@ mod tests {
             handshake: AgentHandshake::default(),
             has_command_override: false,
             env_override_key_count: 0,
+            ollama_compatible: false,
         };
         let v = serde_json::to_value(&meta).unwrap();
         assert_eq!(v["id"], "abc12345");

@@ -86,9 +86,71 @@ mod tests {
     }
 }
 
+// --- Ollama Launch ---
+
+pub const OLLAMA_COMMAND: &str = "ollama";
+/// Minimum Ollama version that supports the `launch` subcommand.
+pub const OLLAMA_MIN_LAUNCH_VERSION: &str = "0.15.0";
+
+/// Mapping of AionCore backend identifiers to Ollama launch agent names.
+///
+/// Each entry maps `(aioncore_backend, ollama_agent_name)`. Only agents
+/// that have a corresponding Ollama Launch integration are listed here.
+pub const OLLAMA_LAUNCH_MAP: &[(&str, &str)] = &[
+    ("claude", "claude"),
+    ("opencode", "opencode"),
+    ("codex", "codex"),
+    ("copilot", "copilot"),
+    ("pi", "pi"),
+    ("hermes", "hermes"),
+    ("droid", "droid"),
+    ("qwen", "qwen"),
+];
+
+/// Check whether a given agent backend is supported by Ollama Launch.
+pub fn is_ollama_supported_agent(backend: &str) -> bool {
+    OLLAMA_LAUNCH_MAP
+        .iter()
+        .any(|(aion_backend, _)| *aion_backend == backend)
+}
+
+/// Get the Ollama launch agent name for a given AionCore backend.
+pub fn get_ollama_launch_agent_name(backend: &str) -> Option<&'static str> {
+    OLLAMA_LAUNCH_MAP
+        .iter()
+        .find(|(aion_backend, _)| *aion_backend == backend)
+        .map(|(_, ollama_name)| *ollama_name)
+}
+
 // --- Image processing ---
 
 pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg"];
 /// Remote image download size limit (5 MB).
 pub const REMOTE_IMAGE_MAX_SIZE: usize = 5 * 1024 * 1024;
 pub const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 5;
+
+#[cfg(test)]
+mod ollama_tests {
+    use super::*;
+
+    #[test]
+    fn ollama_launch_map_covers_expected_agents() {
+        for agent in [
+            "claude", "opencode", "codex", "copilot", "pi", "hermes", "droid", "qwen",
+        ] {
+            assert!(
+                is_ollama_supported_agent(agent),
+                "{agent} should be in OLLAMA_LAUNCH_MAP"
+            );
+            assert!(get_ollama_launch_agent_name(agent).is_some());
+        }
+    }
+
+    #[test]
+    fn unsupported_agents_not_in_map() {
+        for agent in ["gemini", "cursor", "auggie", "kimi", "goose", "codebuddy"] {
+            assert!(!is_ollama_supported_agent(agent));
+            assert_eq!(get_ollama_launch_agent_name(agent), None);
+        }
+    }
+}

@@ -1457,6 +1457,7 @@ mod tests {
             handshake: AgentHandshake::default(),
             has_command_override: false,
             env_override_key_count: 0,
+            ollama_compatible: false,
         }
     }
 
