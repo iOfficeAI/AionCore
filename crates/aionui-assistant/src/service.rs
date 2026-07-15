@@ -1546,15 +1546,7 @@ impl AssistantService {
         let rules_dir = self.user_rules_dir();
         let content = read_assistant_md_with_legacy(&rules_dir, id, locale);
         if content.is_empty() {
-            let locale_less = locale
-                .filter(|value| !value.is_empty())
-                .map(|_| read_assistant_md_with_legacy(&rules_dir, id, None))
-                .unwrap_or_default();
-            if locale_less.is_empty() {
-                read_first_assistant_md(&rules_dir, id)
-            } else {
-                locale_less
-            }
+            read_first_assistant_md(&rules_dir, id)
         } else {
             content
         }
@@ -2839,21 +2831,29 @@ fn read_first_assistant_md(dir: &Path, id: &str) -> String {
     let encoded_exact = format!("{encoded_id}.md");
     let legacy_prefix = format!("{id}.");
     let legacy_exact = format!("{id}.md");
-    let mut fallback: Option<PathBuf> = None;
+    let mut candidates = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == encoded_exact || name == legacy_exact {
-            return read_file_or_empty(&entry.path());
-        }
-        if fallback.is_none()
-            && (name.starts_with(&encoded_prefix) || name.starts_with(&legacy_prefix))
-            && name.ends_with(".md")
-        {
-            fallback = Some(entry.path());
+        let name = name.to_string_lossy().into_owned();
+        let priority = if name == encoded_exact || name == legacy_exact {
+            0
+        } else if name.starts_with(&encoded_prefix) && name.ends_with(".md") {
+            1
+        } else if name.starts_with(&legacy_prefix) && name.ends_with(".md") {
+            2
+        } else {
+            continue;
+        };
+        candidates.push((priority, name, entry.path()));
+    }
+    candidates.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+    for (_, _, path) in candidates {
+        let content = read_file_or_empty(&path);
+        if !content.is_empty() {
+            return content;
         }
     }
-    fallback.map(|path| read_file_or_empty(&path)).unwrap_or_default()
+    String::new()
 }
 
 /// Remove encoded and pre-encoding legacy markdown files for an assistant.
@@ -5576,6 +5576,29 @@ mod tests {
         assert_eq!(fx.service.read_rule("u1", None).await.unwrap(), "rule body");
         // A different locale also falls back rather than returning empty.
         assert_eq!(fx.service.read_rule("u1", Some("en-US")).await.unwrap(), "rule body");
+    }
+
+    #[tokio::test]
+    async fn read_rule_user_fallback_skips_empty_files() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "A".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        fx.service.write_rule("u1", None, "").await.unwrap();
+        fx.service
+            .write_rule("u1", Some("zh-TW"), "available rule")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fx.service.read_rule("u1", Some("en-US")).await.unwrap(),
+            "available rule"
+        );
     }
 
     #[tokio::test]
