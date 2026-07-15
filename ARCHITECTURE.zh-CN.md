@@ -27,7 +27,7 @@ AionCore 是 AionUi 的后端服务，使用 Rust 构建（Axum + Tokio + SQLite
 │  （JWT、CSRF、中间件）  （WebSocket、事件广播）      │
 ├─────────────────────────────────────────────────┤
 │  aionui-db    aionui-api-types   aionui-runtime  │
-│  （仓库层）    （API 契约）       （子进程/bun）    │
+│  （仓库层）    （API 契约）       （运行时/子进程）   │
 ├─────────────────────────────────────────────────┤
 │       aionui-common          aionui-assets       │
 │  （错误类型、枚举、加密）      （嵌入式数据）        │
@@ -51,7 +51,7 @@ aionui-common 没有任何内部依赖。
 | `aionui-api-types` | 所有 HTTP/WebSocket 的请求和响应类型，是 API 契约的唯一定义处 |
 | `aionui-db` | SQLite 数据库层，定义 Repository trait 和实现 |
 | `aionui-assets` | 嵌入式静态资源（Agent 元数据、提示词） |
-| `aionui-runtime` | 子进程管理、bun 运行时解析、PATH 增强 |
+| `aionui-runtime` | 托管 Node、子进程管理、PATH 增强 |
 
 ### 能力层（Capability）
 
@@ -696,30 +696,21 @@ crates/aionui-my-feature/
 
 ## 运行时基础设施
 
-### 内嵌 bun 运行时
+### 托管 Node 运行时
 
-后端内嵌 bun 运行时以实现自包含分发。相关环境变量：
-
-- `AIONUI_EMBED_BUN=1` — 在 `cargo build` 时启用 bun 下载和嵌入。
-  Release CI 会设置此变量；本地开发构建跳过（更快，无网络依赖）。
-- `BUN_VARIANT=default|baseline` — 选择嵌入哪个 Linux x64 变体。
-  `baseline` 适用于不支持 AVX2 的 CPU。
-- `AIONUI_BUN_PATH=/abs/path/to/bun` — 运行时覆盖。设置后若指向
-  可执行文件，`resolve_bun()` 直接返回该路径，跳过内嵌 + `which` 回退链。
-  用于测试自定义 bun 构建或二分定位 bun 问题。
-
-bun 版本固定在 `crates/aionui-runtime/Cargo.toml` 的
-`[package.metadata.aionui-runtime] bun_version = "..."` 中。
-升级 bun 只需修改这一行，无需改动源码。
+内置 ACP adapter 通过 `crates/aionui-runtime/src/node_runtime/` 中的托管
+Node 运行时启动。打包版本从 managed-resources bundle 激活 Node；download
+模式将固定版本安装到 `{data_dir}/runtime/node`。Adapter 命令携带明确的
+Node 可执行文件路径，不依赖环境中的 `PATH`。
 
 ### 启动时 PATH 增强
 
 `fn main()` 在 tokio 运行时启动**之前**调用
 `aionui_runtime::enhance_process_path()`，使后续所有
 `which::which(...)` 和 `Command::new(...)` 继承增强后的 `PATH`。
-三层合并优先级：内嵌 bun 目录 → 平台额外 bin 目录（`~/.bun/bin`、
-`~/.cargo/bin`、`~/.local/bin`、Windows `%APPDATA%\npm`、Git、Scoop 等）→
-当前 PATH → login-shell `$PATH`（Unix，3 秒超时）。
+三层合并优先级：交互式 login-shell `$PATH`（Unix，3 秒超时）→ 当前继承的
+PATH → 平台 fallback 目录（`~/.cargo/bin`、`~/.local/bin`、版本管理器安装
+目录、Windows `%APPDATA%\npm`、Git、Scoop 等）。
 该调用标记为 `unsafe`，因为 Rust 2024 要求 `env::set_var` 在单线程环境执行；
 `main()` 将其作为第一条语句以满足此不变量。
 启动时会输出 `startup: PATH ready path_segments=… path_len=…` info 日志。

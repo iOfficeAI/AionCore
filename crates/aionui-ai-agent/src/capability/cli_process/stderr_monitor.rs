@@ -7,7 +7,7 @@ use tracing::{debug, error};
 /// Uses platform-native shell commands:
 /// * Unix: `kill -9 -<pid>` to target the spawned process group
 /// * Windows: `taskkill /F /T /PID <pid>` (`/T` walks the process tree —
-///   the ACP CLI typically spawns a node/bun child that must die with it)
+///   the ACP CLI typically spawns a Node child that must die with it)
 ///
 /// If the process has already exited, this is a no-op.
 pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), AgentError> {

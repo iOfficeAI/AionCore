@@ -4,8 +4,8 @@
 //! prints a per-agent availability table to stdout. Mirrors the
 //! server's PATH probing path exactly — `main` runs the same
 //! `aionui_runtime::init` + `enhance_process_path` for `Doctor` as it
-//! does for the server, so the bundled `bun` resolves through the
-//! same cache the server uses.
+//! does for the server, so managed runtimes and CLI commands resolve
+//! through the same paths the server uses.
 //!
 //! Writes to stdout (not the rolling aioncore.log) — the user
 //! typically runs `doctor` interactively after reporting "no agent

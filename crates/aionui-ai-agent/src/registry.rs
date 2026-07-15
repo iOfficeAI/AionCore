@@ -1182,8 +1182,8 @@ pub enum UnavailableReason {
     /// this bucket (handled in `decode_row`); for everyone else this
     /// is a seed-data bug.
     NoCommand,
-    /// Bridge binary (`agent_source_info.bridge_binary`, e.g. `bun`
-    /// for `bun x @pkg`) is not on `$PATH`.
+    /// Bridge binary (`agent_source_info.bridge_binary`, e.g. `npx`
+    /// for `npx --yes @pkg`) is not on `$PATH`.
     BridgeMissing { bridge: String },
     /// Primary CLI (`agent_source_info.binary_name`, e.g. `claude`
     /// for the bridged Claude row) is not on `$PATH`.
@@ -1224,8 +1224,8 @@ impl std::fmt::Display for UnavailableReason {
 /// source of truth for `available` — callers never re-run `which()`
 /// themselves.
 ///
-/// Bridge-based rows (e.g. `bun x @pkg`) require both `bun` (the spawn
-/// command) and the wrapped CLI (`claude`, recorded in
+/// Bridge-based rows (e.g. `npx --yes @pkg`) require both `npx` (the
+/// spawn command) and the wrapped CLI (`claude`, recorded in
 /// `agent_source_info.binary_name`) to be present. Direct-CLI rows
 /// have `spawn command == primary binary`, so the primary-binary check
 /// is a no-op for them.

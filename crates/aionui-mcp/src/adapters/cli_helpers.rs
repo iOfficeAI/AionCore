@@ -17,9 +17,9 @@ pub const MUTATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Check whether a CLI binary is available on `$PATH`.
 ///
 /// Uses `aionui_runtime::resolve_command_path` so the lookup respects
-/// the bundled-bun shim and Windows `PATHEXT` rules. Previously this
-/// shelled out to `which`, which does not exist on Windows and made
-/// every MCP adapter report "not installed" there.
+/// the startup-enhanced PATH and Windows `PATHEXT` rules. Previously
+/// this shelled out to `which`, which does not exist on Windows and
+/// made every MCP adapter report "not installed" there.
 pub async fn is_cli_installed(name: &str) -> Result<bool, McpError> {
     Ok(resolve_command_path(name).is_some())
 }

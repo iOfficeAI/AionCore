@@ -12,7 +12,6 @@
 //! manual "Test connection" button.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::error::AgentError;
 use aionui_api_types::{
@@ -43,19 +42,12 @@ impl AgentService {
             .runtime_scope_id
             .as_ref()
             .map(|scope_id| custom_agent_runtime_reporter(self.broadcaster().clone(), scope_id.clone()));
-        Ok(probe(
-            &req.command,
-            &req.acp_args,
-            &req.env,
-            self.data_dir(),
-            reporter.as_deref(),
-        )
-        .await)
+        Ok(probe(&req.command, &req.acp_args, &req.env, reporter.as_deref()).await)
     }
 
     pub async fn create_custom_agent(&self, req: CustomAgentUpsertRequest) -> Result<AgentMetadata, AgentError> {
         validate_upsert(&req)?;
-        probe_or_reject(&req, self.data_dir()).await?;
+        probe_or_reject(&req).await?;
 
         let id = generate_short_id();
         self.upsert_custom_row(&id, &req, /* keep_enabled = */ true).await
@@ -79,7 +71,7 @@ impl AgentService {
                 "Only custom agents can be edited via this endpoint",
             ));
         }
-        probe_or_reject(&req, self.data_dir()).await?;
+        probe_or_reject(&req).await?;
 
         let keep_enabled = existing.enabled;
         self.upsert_custom_row(id, &req, keep_enabled).await
@@ -216,7 +208,7 @@ fn validate_upsert(req: &CustomAgentUpsertRequest) -> Result<(), AgentError> {
     Ok(())
 }
 
-async fn probe_or_reject(req: &CustomAgentUpsertRequest, data_dir: &Path) -> Result<(), AgentError> {
+async fn probe_or_reject(req: &CustomAgentUpsertRequest) -> Result<(), AgentError> {
     // Test-only bypass — real probe spawns a child process and relies
     // on a working ACP CLI on PATH, which is not present in CI.
     // Gated behind cfg(test) / the `test-support` feature so production
@@ -228,7 +220,7 @@ async fn probe_or_reject(req: &CustomAgentUpsertRequest, data_dir: &Path) -> Res
     }
 
     let env_map: HashMap<String, String> = req.env.iter().map(|e| (e.name.clone(), e.value.clone())).collect();
-    match probe(&req.command, &req.args, &env_map, data_dir, None).await {
+    match probe(&req.command, &req.args, &env_map, None).await {
         TryConnectCustomAgentResponse::Success => Ok(()),
         // Reachable but not authorized is a valid agent the user simply hasn't
         // logged into yet — accept the save so it lands in the list (offline,
