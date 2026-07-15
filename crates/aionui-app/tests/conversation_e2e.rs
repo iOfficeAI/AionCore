@@ -113,7 +113,7 @@ async fn t1_3_create_with_optional_fields() {
 }
 
 #[tokio::test]
-async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
+async fn t1_3b_create_persists_locale_fallback_rule_in_assistant_snapshot() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
@@ -136,8 +136,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
         "/api/skills/assistant-rule/write",
         json!({
             "assistant_id": "u1",
-            "content": "assistant snapshot rule",
-            "locale": "en-US"
+            "content": "assistant snapshot rule"
         }),
         &token,
         &csrf,
@@ -159,8 +158,6 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             source: &definition.source,
             owner_type: &definition.owner_type,
             source_ref: definition.source_ref.as_deref(),
-            source_version: definition.source_version.as_deref(),
-            source_hash: definition.source_hash.as_deref(),
             name: &definition.name,
             name_i18n: &definition.name_i18n,
             description: definition.description.as_deref(),
@@ -170,7 +167,6 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             agent_id: &definition.agent_id,
             rule_resource_type: &definition.rule_resource_type,
             rule_resource_ref: definition.rule_resource_ref.as_deref(),
-            rule_inline_content: definition.rule_inline_content.as_deref(),
             recommended_prompts: &definition.recommended_prompts,
             recommended_prompts_i18n: &definition.recommended_prompts_i18n,
             default_model_mode: "auto",
@@ -219,7 +215,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             "name": "Snapshot Flow",
             "assistant": {
                 "id": "u1",
-                "locale": "en-US",
+                "locale": "zh-CN",
                 "conversation_overrides": {
                     "model": "override-model",
                     "skill_ids": ["override-skill"],
