@@ -27,6 +27,7 @@ use aionui_runtime::{
     ManagedAcpToolId, RuntimeCommandProbe, probe_managed_acp_tool_supported, probe_node_runtime_supported,
     probe_runtime_command, resolve_command_path,
 };
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
@@ -40,6 +41,7 @@ use crate::manager::acp::config_option_catalog::{
 /// drains it serially, so the bound just sizes the burst we can absorb
 /// before producers start to back off.
 const CATALOG_SYNC_CHANNEL_CAPACITY: usize = 256;
+const CLI_PROBE_CONCURRENCY: usize = 8;
 
 /// One unit of work submitted to the catalog sync consumer task.
 #[derive(Debug)]
@@ -190,8 +192,8 @@ impl AgentRegistry {
     }
     /// Reload every row from the database and refresh installation state.
     ///
-    /// Startup remains side-effect free: this only checks whether the required
-    /// command / managed runtime can be resolved. It does not start agents,
+    /// Startup checks whether required commands / managed runtimes resolve and
+    /// runs a bounded `<primary-cli> --version` probe for builtin agents. It does not start sessions,
     /// perform handshakes, fetch models, or overwrite persisted health-check
     /// snapshots. User-facing health checks stay explicit.
     pub async fn hydrate(&self) -> Result<(), AgentError> {
@@ -201,12 +203,15 @@ impl AgentRegistry {
             .await
             .map_err(|e| AgentError::internal(format!("load agent_metadata: {e}")))?;
 
-        let mut map = HashMap::with_capacity(rows.len());
+        let candidates: Vec<_> = rows
+            .into_iter()
+            .filter_map(|row| decode_row(row, AvailabilityProjection::Probe))
+            .collect();
+        let validated = validate_cli_candidates(candidates).await;
+
+        let mut map = HashMap::with_capacity(validated.len());
         let mut reasons = HashMap::new();
-        for row in rows {
-            let Some((meta, reason)) = decode_row(row, AvailabilityProjection::Probe) else {
-                continue;
-            };
+        for (meta, reason) in validated {
             if let Some(reason) = reason {
                 reasons.insert(meta.id.clone(), reason);
             }
@@ -224,16 +229,33 @@ impl AgentRegistry {
     /// Re-probe every row's command without refetching from the DB.
     /// Useful after PATH has changed (e.g. `launchctl setenv`).
     pub async fn refresh_availability(&self) {
-        let mut guard = self.by_id.write().await;
+        let snapshot: Vec<AgentMetadata> = self.by_id.read().await.values().cloned().collect();
+        let candidates: Vec<_> = snapshot
+            .into_iter()
+            .map(|mut meta| {
+                let (path, reason) = probe_with_reason(&meta);
+                meta.resolved_command = path;
+                meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(&meta);
+                let reason = if meta.available { None } else { reason };
+                (meta, reason)
+            })
+            .collect();
+        let validated = validate_cli_candidates(candidates).await;
+
+        let mut results = Vec::with_capacity(validated.len());
         let mut reasons = HashMap::new();
-        for meta in guard.values_mut() {
-            let (path, reason) = probe_with_reason(meta);
-            meta.resolved_command = path;
-            meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(meta);
-            let reason = if meta.available { None } else { reason };
-            log_probe_result(meta, &reason);
+        for (meta, reason) in validated {
+            log_probe_result(&meta, &reason);
+            results.push((meta.id.clone(), meta.available, meta.resolved_command.clone()));
             if let Some(reason) = reason {
                 reasons.insert(meta.id.clone(), reason);
+            }
+        }
+        let mut guard = self.by_id.write().await;
+        for (id, available, resolved_command) in results {
+            if let Some(meta) = guard.get_mut(&id) {
+                meta.available = available;
+                meta.resolved_command = resolved_command;
             }
         }
         log_availability_summary(guard.values(), "AgentRegistry refresh_availability complete");
@@ -258,6 +280,7 @@ impl AgentRegistry {
             self.unavailable_reasons.write().await.remove(id);
             return Ok(None);
         };
+        let (meta, reason) = validate_cli_availability(meta, reason).await;
         log_probe_result(&meta, &reason);
         self.update_cached_unavailable_reason(&meta.id, reason).await;
         self.by_id.write().await.insert(meta.id.clone(), meta.clone());
@@ -638,6 +661,38 @@ fn apply_probe_availability(meta: &mut AgentMetadata) -> Option<UnavailableReaso
     if meta.available { None } else { reason }
 }
 
+async fn validate_cli_availability(
+    mut meta: AgentMetadata,
+    reason: Option<UnavailableReason>,
+) -> (AgentMetadata, Option<UnavailableReason>) {
+    if !meta.available || meta.agent_source != AgentSource::Builtin {
+        return (meta, reason);
+    }
+
+    let Some(binary) = crate::cli_probe::command_name(&meta).map(str::to_owned) else {
+        return (meta, reason);
+    };
+
+    match crate::cli_probe::validate(&meta).await {
+        Ok(()) => (meta, None),
+        Err(detail) => {
+            meta.available = false;
+            meta.resolved_command = None;
+            (meta, Some(UnavailableReason::PrimaryUnusable { binary, detail }))
+        }
+    }
+}
+
+async fn validate_cli_candidates(
+    candidates: Vec<(AgentMetadata, Option<UnavailableReason>)>,
+) -> Vec<(AgentMetadata, Option<UnavailableReason>)> {
+    futures_util::stream::iter(candidates)
+        .map(|(meta, reason)| validate_cli_availability(meta, reason))
+        .buffer_unordered(CLI_PROBE_CONCURRENCY)
+        .collect()
+        .await
+}
+
 fn apply_cached_availability(meta: &mut AgentMetadata) -> Option<UnavailableReason> {
     if !meta.enabled {
         meta.available = false;
@@ -672,6 +727,10 @@ fn is_builtin_managed_agent(meta: &AgentMetadata) -> bool {
             .as_deref()
             .and_then(ManagedAcpToolId::from_backend)
             .is_some()
+}
+
+fn is_builtin_codex(meta: &AgentMetadata) -> bool {
+    meta.agent_source == AgentSource::Builtin && meta.backend.as_deref() == Some("codex")
 }
 
 fn has_availability_snapshot(meta: &AgentMetadata) -> bool {
@@ -961,6 +1020,10 @@ fn diagnostic_details_for_unavailable_reason(reason: &UnavailableReason) -> Opti
             "code": "primary_missing",
             "command": binary,
         })),
+        UnavailableReason::PrimaryUnusable { binary, .. } => Some(json!({
+            "code": "primary_unusable",
+            "command": binary,
+        })),
         UnavailableReason::CommandMissing { command } => Some(json!({
             "code": "command_missing",
             "command": command,
@@ -978,6 +1041,7 @@ fn unavailable_reason_code(reason: &UnavailableReason) -> String {
         UnavailableReason::NoCommand => "no_command",
         UnavailableReason::BridgeMissing { .. } => "bridge_missing",
         UnavailableReason::PrimaryMissing { .. } => "primary_missing",
+        UnavailableReason::PrimaryUnusable { .. } => "primary_unusable",
         UnavailableReason::CommandMissing { .. } => "command_missing",
         UnavailableReason::ManagedRuntimeUnavailable { .. } => "managed_runtime_unavailable",
     }
@@ -995,6 +1059,9 @@ fn guidance_for_unavailable_reason(reason: &UnavailableReason) -> String {
         }
         UnavailableReason::PrimaryMissing { binary } => {
             format!("Install `{binary}` and make sure it is available on PATH, then run Test Connection again.")
+        }
+        UnavailableReason::PrimaryUnusable { binary, .. } => {
+            format!("Repair or reinstall `{binary}`, then run Test Connection again.")
         }
         UnavailableReason::CommandMissing { command } => {
             format!("Install `{command}` and make sure it is available on PATH, then run Test Connection again.")
@@ -1121,6 +1188,9 @@ pub enum UnavailableReason {
     /// Primary CLI (`agent_source_info.binary_name`, e.g. `claude`
     /// for the bridged Claude row) is not on `$PATH`.
     PrimaryMissing { binary: String },
+    /// Primary CLI resolves on `$PATH`, but its lightweight version probe
+    /// failed, so the wrapper cannot be treated as runnable.
+    PrimaryUnusable { binary: String, detail: String },
     /// Spawn command itself (`command` field) is not on `$PATH`. For
     /// direct-CLI rows this is the same binary as `binary_name`; for
     /// bridge rows it's the bridge.
@@ -1137,6 +1207,9 @@ impl std::fmt::Display for UnavailableReason {
             Self::NoCommand => f.write_str("no spawn command configured"),
             Self::BridgeMissing { bridge } => write!(f, "bridge binary `{bridge}` not on $PATH"),
             Self::PrimaryMissing { binary } => write!(f, "primary binary `{binary}` not on $PATH"),
+            Self::PrimaryUnusable { binary, detail } => {
+                write!(f, "primary binary `{binary}` is not runnable: {detail}")
+            }
             Self::CommandMissing { command } => write!(f, "spawn command `{command}` not on $PATH"),
             Self::ManagedRuntimeUnavailable { resource, detail } => {
                 write!(f, "managed `{resource}` unavailable: {detail}")
@@ -1159,6 +1232,13 @@ impl std::fmt::Display for UnavailableReason {
 fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableReason> {
     if !meta.enabled {
         return Err(UnavailableReason::Disabled);
+    }
+
+    if is_builtin_codex(meta) {
+        let primary = crate::cli_probe::command_name(meta).unwrap_or("codex");
+        return probe_command_candidate(primary).ok_or_else(|| UnavailableReason::PrimaryMissing {
+            binary: primary.to_owned(),
+        });
     }
 
     if meta.agent_source == AgentSource::Builtin

@@ -5,10 +5,10 @@
 //! `std::env::var("PATH")` to include:
 //!
 //! 1. An explicit bun override directory, if configured.
-//! 2. Platform extra bins (`~/.bun/bin`, `~/.cargo/bin`, etc.).
-//! 3. The current `PATH` (inherited from the launching process).
-//! 4. The login-shell `PATH` (Unix only, 3s timeout) — fixes
+//! 2. The interactive login-shell `PATH` (Unix only, 3s timeout) — fixes
 //!    launchd / Finder / systemd-service starts.
+//! 3. The current `PATH` (inherited from the launching process).
+//! 4. Platform extra bins (`~/.bun/bin`, `~/.cargo/bin`, etc.) as fallbacks.
 //!
 //! After this runs, all downstream `which::which(...)` and
 //! `Command::new(...)` calls see the enhanced PATH with zero further
@@ -55,7 +55,9 @@ pub unsafe fn enhance_process_path() -> String {
 // Placeholder helpers — filled in by later tasks.
 
 fn merge_paths(bun_dir: Option<&Path>, extras: &[PathBuf], current: &str, login: Option<&str>) -> String {
-    // Order: bun_dir, extras, current, login. First-occurrence wins.
+    // Order: bun_dir, login, current, extras. First-occurrence wins.
+    // Scanned version-manager bins are fallbacks and must not override the
+    // Node version selected by the user's interactive login shell.
     // `env::split_paths` and `env::join_paths` honour the OS-specific
     // separator (':' on Unix, ';' on Windows) and handle quoting.
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -73,16 +75,16 @@ fn merge_paths(bun_dir: Option<&Path>, extras: &[PathBuf], current: &str, login:
     if let Some(p) = bun_dir {
         push(p.to_path_buf());
     }
-    for p in extras {
-        push(p.clone());
-    }
-    for p in std::env::split_paths(current) {
-        push(p);
-    }
     if let Some(l) = login {
         for p in std::env::split_paths(l) {
             push(p);
         }
+    }
+    for p in std::env::split_paths(current) {
+        push(p);
+    }
+    for p in extras {
+        push(p.clone());
     }
 
     std::env::join_paths(&parts)
@@ -177,7 +179,7 @@ fn login_shell_path() -> Option<String> {
     }
 
     let mut child = match Command::new(&shell)
-        .args(["-l", "-c", "printf %s \"$PATH\""])
+        .args(["-l", "-i", "-c", "printf %s \"$PATH\""])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -248,7 +250,24 @@ mod tests {
         let result = merge_paths(None, &extras, &current, Some(&login));
         let parts: Vec<&str> = result.split(s).collect();
 
-        assert_eq!(parts, vec!["/e", "/a", "/b", "/c", "/d"]);
+        assert_eq!(parts, vec!["/b", "/d", "/a", "/c", "/e"]);
+    }
+
+    #[test]
+    fn merge_paths_prefers_login_nvm_bin_over_inherited_and_scanned_versions() {
+        let s = sep();
+        let active = "/home/user/.nvm/versions/node/v22.22.0/bin";
+        let newer = PathBuf::from("/home/user/.nvm/versions/node/v25.1.0/bin");
+        let current = format!("/opt/homebrew/bin{s}/usr/bin");
+        let login = format!("{active}{s}/opt/homebrew/bin{s}/usr/bin");
+
+        let result = merge_paths(None, &[newer.clone(), PathBuf::from(active)], &current, Some(&login));
+        let parts: Vec<&str> = result.split(s).collect();
+
+        assert_eq!(
+            parts,
+            vec![active, "/opt/homebrew/bin", "/usr/bin", newer.to_str().unwrap()]
+        );
     }
 
     #[test]
