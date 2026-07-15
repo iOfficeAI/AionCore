@@ -27,7 +27,6 @@ use crate::registry::AgentRegistry;
 pub struct AgentService {
     registry: Arc<AgentRegistry>,
     broadcaster: Arc<dyn EventBroadcaster>,
-    data_dir: PathBuf,
     provider_health: ProviderHealthCheckService,
     availability: AgentAvailabilityService,
 }
@@ -41,20 +40,13 @@ impl AgentService {
         data_dir: PathBuf,
     ) -> Arc<Self> {
         let provider_health = ProviderHealthCheckService::new(provider_repo.clone(), encryption_key, data_dir.clone());
-        let availability = AgentAvailabilityService::new(registry.clone(), provider_repo, data_dir.clone());
+        let availability = AgentAvailabilityService::new(registry.clone(), provider_repo);
         Arc::new(Self {
             registry,
             broadcaster,
-            data_dir,
             provider_health,
             availability,
         })
-    }
-
-    /// Data directory used by the custom-agent probe to spawn CLI
-    /// processes with a stable cwd.
-    pub(crate) fn data_dir(&self) -> &std::path::Path {
-        &self.data_dir
     }
 
     /// Registry accessor consumed by the `services::custom` submodule

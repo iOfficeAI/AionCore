@@ -1,5 +1,6 @@
 use aionui_common::{CommandSpec, ErrorChain};
 use aionui_runtime::Builder as CmdBuilder;
+#[cfg(test)]
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -18,21 +19,15 @@ impl CliAgentProcess {
     /// Instead, the raw stdin/stdout handles are available via [`take_stdio`](Self::take_stdio)
     /// for the ACP SDK transport to own.
     ///
-    /// `data_dir` is the backend's `AppConfig.data_dir` — used as the root
-    /// for child-process bun cache / tmp directories so they honour the
-    /// operator's `--data-dir` choice instead of falling back to the OS
-    /// local data dir.
-    ///
     /// Background tasks are still spawned for:
     /// - stderr buffering
     /// - Process exit monitoring
-    pub async fn spawn_for_sdk(config: CommandSpec, data_dir: &Path) -> Result<Self, AgentError> {
+    pub async fn spawn_for_sdk(config: CommandSpec) -> Result<Self, AgentError> {
         let mut cmd = CmdBuilder::new(&config.command);
         let agent_env = aionui_runtime::agent_process_env().await;
         cmd.args(&config.args)
             .env_clear()
             .envs(agent_env)
-            .envs(Self::agent_spawn_env(data_dir))
             .envs(config.env.iter().map(|e| (&e.name, &e.value)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -116,23 +111,6 @@ impl CliAgentProcess {
         })
     }
 
-    /// Build environment variables for agent subprocess spawn.
-    /// Mirrors the frontend `acpConnectors.ts::getCleanAgentEnv` logic:
-    /// - Set BUN_INSTALL_CACHE_DIR / BUN_TMPDIR to stable paths under
-    ///   the backend's `AppConfig.data_dir`
-    ///
-    /// Claude SDK resolves its packaged native binary by default. Callers may
-    /// still provide `CLAUDE_CODE_EXECUTABLE` explicitly via `CommandSpec.env`.
-    fn agent_spawn_env(data_dir: &Path) -> Vec<(String, String)> {
-        let bun_cache = data_dir.join("bun-cache");
-        let bun_tmp = data_dir.join("bun-tmp");
-
-        vec![
-            ("BUN_INSTALL_CACHE_DIR".into(), bun_cache.to_string_lossy().into_owned()),
-            ("BUN_TMPDIR".into(), bun_tmp.to_string_lossy().into_owned()),
-        ]
-    }
-
     fn sdk_spawn_preview(config: &CommandSpec) -> String {
         let explicit_env_key_names: Vec<&str> = config.env.iter().map(|entry| entry.name.as_str()).collect();
         format!(
@@ -156,59 +134,6 @@ mod tests {
     use tokio::time::timeout;
 
     // ── SDK mode tests ───────────────────────────────────────────────
-
-    #[test]
-    fn agent_spawn_env_does_not_override_claude_code_executable_from_path() {
-        const CHILD_ENV: &str = "AIONUI_TEST_AGENT_SPAWN_ENV_CHILD";
-
-        if let Some(data_dir) = std::env::var_os(CHILD_ENV) {
-            let env = CliAgentProcess::agent_spawn_env(Path::new(&data_dir));
-
-            assert!(
-                !env.iter().any(|(name, _)| name == "CLAUDE_CODE_EXECUTABLE"),
-                "managed claude-agent-acp should use its packaged Claude SDK binary by default"
-            );
-            assert!(
-                env.iter()
-                    .any(|(name, value)| name == "BUN_INSTALL_CACHE_DIR" && value.contains("bun-cache")),
-                "non-Claude SDK spawn env entries should still be present"
-            );
-            assert!(
-                env.iter()
-                    .any(|(name, value)| name == "BUN_TMPDIR" && value.contains("bun-tmp")),
-                "non-Claude SDK spawn env entries should still be present"
-            );
-            return;
-        }
-
-        let temp = tempfile::tempdir().unwrap();
-        let fake_claude = temp.path().join(if cfg!(windows) { "claude.cmd" } else { "claude" });
-        std::fs::write(
-            &fake_claude,
-            if cfg!(windows) { "@echo off\r\n" } else { "#!/bin/sh\n" },
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("capability::cli_process::spawn_sdk::tests::agent_spawn_env_does_not_override_claude_code_executable_from_path")
-            .arg("--nocapture")
-            .env(CHILD_ENV, temp.path())
-            .env("PATH", temp.path())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "child test failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -252,15 +177,13 @@ printf '%s\n' \
             return;
         }
 
-        let data_dir = tempfile::tempdir().unwrap();
         let mut config = simple_script_config(
-            "printf 'shell=%s\nconfig=%s\noverlay=%s\nnpm=%s\nnode=%s\nbun=%s\n' \
+            "printf 'shell=%s\nconfig=%s\noverlay=%s\nnpm=%s\nnode=%s\n' \
              \"${AIONUI_SHELL_ONLY:-unset}\" \
              \"${AIONUI_CONFIG_ONLY:-unset}\" \
              \"${AIONUI_OVERLAY:-unset}\" \
              \"${npm_lifecycle_event:-unset}\" \
-             \"${NODE_OPTIONS:-unset}\" \
-             \"${BUN_INSTALL_CACHE_DIR:-unset}\"",
+             \"${NODE_OPTIONS:-unset}\"",
         );
         config.env.push(EnvVar {
             name: "AIONUI_CONFIG_ONLY".into(),
@@ -271,7 +194,7 @@ printf '%s\n' \
             value: "from-config".into(),
         });
 
-        let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
+        let proc = CliAgentProcess::spawn_for_sdk(config).await.unwrap();
         let (_stdin, mut stdout) = proc.take_stdio().await.unwrap();
         let mut output = String::new();
         stdout.read_to_string(&mut output).await.unwrap();
@@ -282,8 +205,6 @@ printf '%s\n' \
         assert!(output.contains("overlay=from-config"), "{output}");
         assert!(output.contains("npm=unset"), "{output}");
         assert!(output.contains("node=unset"), "{output}");
-        assert!(output.contains("bun="), "{output}");
-        assert!(output.contains("bun-cache"), "{output}");
     }
 
     #[cfg(unix)]
@@ -326,8 +247,7 @@ printf '%s\n' \
     #[tokio::test]
     async fn spawn_for_sdk_take_stdio() {
         let config = simple_script_config("read line && echo \"$line\"");
-        let tmp = std::env::temp_dir();
-        let proc = CliAgentProcess::spawn_for_sdk(config, &tmp).await.unwrap();
+        let proc = CliAgentProcess::spawn_for_sdk(config).await.unwrap();
 
         let stdio = proc.take_stdio().await;
         assert!(stdio.is_some(), "First take_stdio should succeed");

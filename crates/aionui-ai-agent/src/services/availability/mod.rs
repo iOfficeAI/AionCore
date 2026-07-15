@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,17 +36,15 @@ struct AvailabilitySnapshot {
 #[derive(Clone)]
 pub struct AgentAvailabilityService {
     registry: Arc<AgentRegistry>,
-    data_dir: PathBuf,
     // Used to decide aionrs (built-in, no external CLI) availability: it is
     // usable only when at least one model provider is configured & enabled.
     provider_repo: Arc<dyn IProviderRepository>,
 }
 
 impl AgentAvailabilityService {
-    pub fn new(registry: Arc<AgentRegistry>, provider_repo: Arc<dyn IProviderRepository>, data_dir: PathBuf) -> Self {
+    pub fn new(registry: Arc<AgentRegistry>, provider_repo: Arc<dyn IProviderRepository>) -> Self {
         Self {
             registry,
-            data_dir,
             provider_repo,
         }
     }
@@ -74,7 +71,6 @@ impl AgentAvailabilityService {
             &self.registry,
             &self.provider_repo,
             &meta,
-            &self.data_dir,
             AgentSnapshotCheckKind::Manual,
         )
         .await;
@@ -159,7 +155,6 @@ async fn run_probe(
     registry: &Arc<AgentRegistry>,
     provider_repo: &Arc<dyn IProviderRepository>,
     meta: &AgentMetadata,
-    data_dir: &std::path::Path,
     kind: AgentSnapshotCheckKind,
 ) -> AvailabilitySnapshot {
     let started_at = now_ms();
@@ -169,7 +164,7 @@ async fn run_probe(
         && let Some(backend) = meta.backend.as_deref()
         && let Some(tool) = ManagedAcpToolId::from_backend(backend)
     {
-        match try_connect_builtin_managed_agent(meta, data_dir, tool).await {
+        match try_connect_builtin_managed_agent(meta, tool).await {
             TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
             TryConnectCustomAgentResponse::FailCli { error } => (
                 AgentSnapshotCheckStatus::Offline,
@@ -195,7 +190,7 @@ async fn run_probe(
             .iter()
             .map(|entry| (entry.name.clone(), entry.value.clone()))
             .collect();
-        match custom_agent_probe::try_connect_custom_agent(command, &meta.args, &env, data_dir, None).await {
+        match custom_agent_probe::try_connect_custom_agent(command, &meta.args, &env, None).await {
             TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
             TryConnectCustomAgentResponse::FailCli { error } => (
                 AgentSnapshotCheckStatus::Offline,
@@ -284,7 +279,6 @@ async fn probe_aionrs_provider_readiness(
 
 async fn try_connect_builtin_managed_agent(
     meta: &AgentMetadata,
-    data_dir: &std::path::Path,
     tool: ManagedAcpToolId,
 ) -> TryConnectCustomAgentResponse {
     if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
@@ -340,7 +334,7 @@ async fn try_connect_builtin_managed_agent(
 
     match tokio::time::timeout(
         Duration::from_secs(35),
-        custom_agent_probe::acp_probe_command_spec(spec, data_dir),
+        custom_agent_probe::acp_probe_command_spec(spec),
     )
     .await
     {
@@ -458,7 +452,7 @@ mod tests {
         registry.hydrate().await.unwrap();
 
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
-        let service = AgentAvailabilityService::new(registry.clone(), provider_repo, std::env::temp_dir());
+        let service = AgentAvailabilityService::new(registry.clone(), provider_repo);
         service
             .record_session_failure(
                 "agent-session-failure",
@@ -530,7 +524,7 @@ mod tests {
         registry.hydrate().await.unwrap();
 
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
-        let service = AgentAvailabilityService::new(registry.clone(), provider_repo, std::env::temp_dir());
+        let service = AgentAvailabilityService::new(registry.clone(), provider_repo);
         service
             .record_session_failure(
                 "agent-session-success",
@@ -579,19 +573,15 @@ mod tests {
             agent_source: AgentSource::Builtin,
             agent_source_info: AgentSourceInfo {
                 binary_name: Some("definitely-missing-claude-cli".into()),
-                bridge_binary: Some("bun".into()),
+                bridge_binary: Some("npx".into()),
                 hub_package_id: None,
                 version: None,
             },
             enabled: true,
             available: true,
-            command: Some("bun".into()),
+            command: Some("npx".into()),
             resolved_command: None,
-            args: vec![
-                "x".into(),
-                "--bun".into(),
-                "@agentclientprotocol/claude-agent-acp@0.58.1".into(),
-            ],
+            args: vec!["--yes".into(), "@agentclientprotocol/claude-agent-acp@0.58.1".into()],
             env: vec![],
             native_skills_dirs: Some(vec![".claude/skills".into()]),
             behavior_policy: BehaviorPolicy::default(),
@@ -613,14 +603,7 @@ mod tests {
             env_override_key_count: 0,
         };
 
-        let snapshot = run_probe(
-            &registry,
-            &provider_repo,
-            &meta,
-            std::env::temp_dir().as_path(),
-            AgentSnapshotCheckKind::Manual,
-        )
-        .await;
+        let snapshot = run_probe(&registry, &provider_repo, &meta, AgentSnapshotCheckKind::Manual).await;
 
         assert_eq!(snapshot.status, "offline");
         assert_eq!(snapshot.error_code.as_deref(), Some("command_not_found"));

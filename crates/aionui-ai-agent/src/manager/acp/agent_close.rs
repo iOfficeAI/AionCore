@@ -187,8 +187,7 @@ mod tests {
     /// exits with `exit_code`. Used to simulate ACP CLI crashes/exits.
     async fn spawn_with_stderr_and_exit(stderr_payload: &str, exit_code: u8) -> Arc<CliAgentProcess> {
         let config = stderr_exit_command_spec(stderr_payload, exit_code);
-        let data_dir = tempfile::tempdir().unwrap();
-        let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
+        let proc = CliAgentProcess::spawn_for_sdk(config).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), proc.wait_for_exit())
             .await
             .unwrap();

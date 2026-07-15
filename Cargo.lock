@@ -776,7 +776,6 @@ dependencies = [
  "walkdir",
  "which 7.0.3",
  "zip 2.4.2",
- "zstd",
 ]
 
 [[package]]

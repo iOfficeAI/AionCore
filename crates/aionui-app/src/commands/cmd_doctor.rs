@@ -4,8 +4,8 @@
 //! prints a per-agent availability table to stdout. Mirrors the
 //! server's PATH probing path exactly — `main` runs the same
 //! `aionui_runtime::init` + `enhance_process_path` for `Doctor` as it
-//! does for the server, so the bundled `bun` resolves through the
-//! same cache the server uses.
+//! does for the server, so managed runtimes and CLI commands resolve
+//! through the same paths the server uses.
 //!
 //! Writes to stdout (not the rolling aioncore.log) — the user
 //! typically runs `doctor` interactively after reporting "no agent
@@ -139,7 +139,7 @@ fn print_snapshot(snapshot: &[(aionui_api_types::AgentMetadata, Option<Unavailab
 
     if unavailable > 0 {
         println!();
-        println!("Tip: rows marked `missing` could not resolve their CLI on $PATH from this shell.");
+        println!("Tip: rows marked `missing` could not resolve or run their CLI from this shell.");
         println!("     If a CLI is installed but missing here, the Electron app may inherit a different PATH —");
         println!("     reproduce by launching the app from this same shell or check launchctl/setenv setup.");
     }
@@ -151,6 +151,9 @@ fn describe_reason(reason: &UnavailableReason) -> String {
         UnavailableReason::NoCommand => "no spawn command configured (seed data bug)".to_owned(),
         UnavailableReason::BridgeMissing { bridge } => format!("bridge `{bridge}` not on $PATH"),
         UnavailableReason::PrimaryMissing { binary } => format!("CLI `{binary}` not on $PATH"),
+        UnavailableReason::PrimaryUnusable { binary, detail } => {
+            format!("CLI `{binary}` is not runnable: {detail}")
+        }
         UnavailableReason::CommandMissing { command } => format!("`{command}` not on $PATH"),
         UnavailableReason::ManagedRuntimeUnavailable { resource, detail } => {
             format!("managed `{resource}` unavailable: {detail}")

@@ -27,7 +27,7 @@ It provides HTTP REST APIs and WebSocket real-time events for the AionUi desktop
 │  (JWT, CSRF, middleware) (WebSocket, events)     │
 ├─────────────────────────────────────────────────┤
 │  aionui-db    aionui-api-types   aionui-runtime  │
-│ (repositories) (API contracts)  (subprocess/bun) │
+│ (repositories) (API contracts)  (runtime/process)│
 ├─────────────────────────────────────────────────┤
 │       aionui-common          aionui-assets       │
 │  (error types, enums, crypto)  (embedded data)   │
@@ -51,7 +51,7 @@ Depended on by nearly all other crates. Changes require careful impact assessmen
 | `aionui-api-types` | All HTTP/WebSocket request and response types — the single source of truth for API contracts |
 | `aionui-db` | SQLite database layer, defines Repository traits and implementations |
 | `aionui-assets` | Embedded static assets (agent metadata, prompts) |
-| `aionui-runtime` | Subprocess spawning, bun runtime resolution, PATH enhancement |
+| `aionui-runtime` | Managed Node, subprocess spawning, PATH enhancement |
 
 ### Capability
 
@@ -683,23 +683,13 @@ Before adding a new crate, confirm:
 
 ## Runtime Infrastructure
 
-### Bundled bun Runtime
+### Managed Node Runtime
 
-The backend embeds a bun runtime for self-contained distribution. Relevant env vars:
-
-- `AIONUI_EMBED_BUN=1` — enable bun download + embed during `cargo build`.
-  Release CI sets this; local dev builds skip it (faster, no network).
-- `BUN_VARIANT=default|baseline` — select which Linux x64 variant to
-  embed. `baseline` targets CPUs without AVX2.
-- `AIONUI_BUN_PATH=/abs/path/to/bun` — runtime override. When set and
-  pointing to an executable file, `resolve_bun()` returns it verbatim,
-  skipping the embedded + `which` fallback chain. Useful for testing
-  custom bun builds or bisecting bun regressions.
-
-The bun version is pinned in
-`crates/aionui-runtime/Cargo.toml` under
-`[package.metadata.aionui-runtime] bun_version = "..."`. Upgrading bun is
-a one-line change — no source edits required.
+Builtin ACP adapters run through the managed Node runtime in
+`crates/aionui-runtime/src/node_runtime/`. Packaged builds activate Node
+from the managed-resources bundle; download-mode builds install the pinned
+runtime under `{data_dir}/runtime/node`. Adapter commands carry an explicit
+Node executable and do not depend on the ambient `PATH`.
 
 ### Startup PATH Enhancement
 
@@ -707,9 +697,9 @@ a one-line change — no source edits required.
 tokio runtime starts, so every downstream `which::which(...)` and
 `Command::new(...)` — including the existing spawn sites across the
 workspace — inherits an enriched `PATH`. Three layers are merged in priority
-order: bundled bun directory → platform extra bins (`~/.bun/bin`,
-`~/.cargo/bin`, `~/.local/bin`, Windows `%APPDATA%\npm`, Git, Scoop, …) →
-current PATH → login-shell `$PATH` (Unix, 3 s timeout). The call is
+order: interactive login-shell `$PATH` (Unix, 3 s timeout) → current inherited
+PATH → platform fallback bins (`~/.cargo/bin`, `~/.local/bin`, version-manager
+installations, Windows `%APPDATA%\npm`, Git, Scoop, …). The call is
 `unsafe` because Rust 2024 requires a single-threaded precondition for
 `env::set_var`; `main()` runs this as its very first statement to
 satisfy the invariant. A `startup: PATH ready path_segments=… path_len=…`
