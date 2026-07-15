@@ -84,6 +84,7 @@ impl RuntimeTokenService {
             expires_at: now + ttl,
             session_generation: session_generation.into(),
         };
+        self.invalidate_conversation(&claims.user_id, &claims.conversation_id);
         self.tokens.insert(token_hash(&token), claims.clone());
         RuntimeTokenIssue { token, claims }
     }
@@ -233,6 +234,45 @@ mod tests {
             ),
             Err(RuntimeTokenError::Unknown)
         );
+    }
+
+    #[test]
+    fn issuing_replacement_token_invalidates_previous_conversation_token() {
+        let service = RuntimeTokenService::new();
+        let first = service.issue(
+            "user-1",
+            "conv-1",
+            "gen-1",
+            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+            Duration::from_secs(60),
+        );
+        let second = service.issue(
+            "user-1",
+            "conv-1",
+            "gen-2",
+            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+            Duration::from_secs(60),
+        );
+
+        assert_eq!(
+            service.validate(
+                Some(&first.token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::TeamCall,
+                "gen-1"
+            ),
+            Err(RuntimeTokenError::Unknown)
+        );
+        service
+            .validate(
+                Some(&second.token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::TeamCall,
+                "gen-2",
+            )
+            .unwrap();
     }
 
     #[test]

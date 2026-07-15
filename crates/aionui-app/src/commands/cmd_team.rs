@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
@@ -49,12 +50,14 @@ async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
             TeamTaskCommand::Create => call_tool(vec!["task", "create"]).await,
             TeamTaskCommand::Update => call_tool(vec!["task", "update"]).await,
             TeamTaskCommand::List => call_tool(vec!["task", "list"]).await,
+            TeamTaskCommand::Unknown(path) => Err(unknown_command("team task", path, "unknown team task command")),
         },
         TeamCommand::ListAssistants => call_tool(vec!["list-assistants"]).await,
         TeamCommand::DescribeAssistant => call_tool(vec!["describe-assistant"]).await,
         TeamCommand::SpawnAgent => call_tool(vec!["spawn-agent"]).await,
         TeamCommand::RenameAgent => call_tool(vec!["rename-agent"]).await,
         TeamCommand::ShutdownAgent => call_tool(vec!["shutdown-agent"]).await,
+        TeamCommand::Unknown(path) => Err(unknown_command("team", path, "unknown team command")),
     }
 }
 
@@ -216,6 +219,24 @@ fn runtime_error(command: &str, code: &'static str, message: String) -> ExitCode
         command,
         code,
         TeamToolErrorPayload::new(TeamToolErrorCode::TransportUnavailable, message),
+    )
+}
+
+fn unknown_command(prefix: &str, path: Vec<OsString>, message: &'static str) -> ExitCode {
+    let suffix = path
+        .into_iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let command = if suffix.is_empty() {
+        prefix.to_owned()
+    } else {
+        format!("{prefix} {suffix}")
+    };
+    print_failure(
+        &command,
+        "TEAM_CLI_UNKNOWN_COMMAND",
+        TeamToolErrorPayload::new(TeamToolErrorCode::UnknownTool, message),
     )
 }
 

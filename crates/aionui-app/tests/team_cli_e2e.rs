@@ -96,3 +96,43 @@ async fn tool_command_rejects_forged_identity_fields_before_http_call() {
     assert_eq!(stdout["error"]["code"], "schema_validation_failed");
     assert!(stdout["error"]["details"]["expected_schema"].is_object());
 }
+
+#[tokio::test]
+async fn team_context_requires_runtime_env_and_prints_json_error() {
+    let output = team_command()
+        .arg("context")
+        .env_remove("AIONUI_BASE_URL")
+        .env_remove("AIONUI_CONVERSATION_ID")
+        .env_remove("AIONUI_USER_ID")
+        .env_remove("AIONUI_RUNTIME_TOKEN")
+        .output()
+        .await
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("TEAM_CLI_ENV_MISSING"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stdout["success"], false);
+    assert_eq!(stdout["error"]["code"], "runtime_context_missing");
+    assert_eq!(stdout["meta"]["command"], "team context");
+}
+
+#[tokio::test]
+async fn unknown_team_command_returns_json_error_envelope() {
+    let output = team_command().arg("does-not-exist").output().await.unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("TEAM_CLI_UNKNOWN_COMMAND"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stdout["success"], false);
+    assert_eq!(stdout["error"]["code"], "unknown_tool");
+    assert_eq!(stdout["meta"]["command"], "team does-not-exist");
+}
