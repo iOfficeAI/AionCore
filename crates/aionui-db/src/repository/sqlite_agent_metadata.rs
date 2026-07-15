@@ -674,6 +674,12 @@ mod tests {
             .find(|r| r.name == "Codex CLI" && r.backend.as_deref() == Some("codex") && r.agent_source == "builtin")
             .expect("seeded codex row");
         assert_eq!(codex.yolo_id.as_deref(), Some("agent-full-access"));
+        let pi = rows
+            .iter()
+            .find(|r| r.name == "Pi" && r.backend.as_deref() == Some("pi") && r.agent_source == "builtin")
+            .expect("seeded Pi ACP row");
+        assert_eq!(pi.command.as_deref(), Some("npx"));
+        assert_eq!(pi.args.as_deref(), Some(r#"["-y","pi-acp@0.0.31"]"#));
     }
 
     #[tokio::test]
