@@ -24,13 +24,13 @@ async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
 }
 
 #[tokio::test]
-async fn migration_023_removes_unused_fields_and_preserves_definition() {
+async fn migration_024_removes_unused_fields_and_preserves_definition() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 22).await;
+    run_migrations_through(&pool, 23).await;
 
     sqlx::query(
         "INSERT INTO assistant_definitions (
@@ -82,7 +82,7 @@ async fn migration_023_removes_unused_fields_and_preserves_definition() {
     .await
     .unwrap();
 
-    run_migrations_through(&pool, 23).await;
+    run_migrations_through(&pool, 24).await;
 
     let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('assistant_definitions')")
         .fetch_all(&pool)
