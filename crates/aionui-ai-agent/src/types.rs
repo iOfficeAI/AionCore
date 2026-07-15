@@ -102,6 +102,11 @@ impl RuntimeCapabilities {
 pub struct AionrsCompatOverrides {
     pub max_tokens_field: Option<String>,
     pub api_path: Option<String>,
+    /// Explicit per-model image input capability override.
+    ///
+    /// When `Some`, it is forwarded to aionrs's `ProviderCompat.image_input`
+    /// and takes precedence over provider-family defaults.
+    pub image_input: Option<aion_types::message::ImageInputCapability>,
 }
 
 /// Fully resolved Aionrs configuration passed to the agent manager.

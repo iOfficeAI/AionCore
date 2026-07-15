@@ -16,7 +16,9 @@ use aionui_db::{IProviderRepository, models::Provider};
 use regex::Regex;
 use tracing::{info, warn};
 
-use crate::factory::aionrs::{map_aionrs_provider, resolve_aionrs_url_and_compat, resolve_bedrock_config};
+use crate::factory::aionrs::{
+    map_aionrs_provider, resolve_aionrs_url_and_compat, resolve_bedrock_config, resolve_image_input_capability,
+};
 use crate::types::AionrsResolvedConfig;
 
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,8 +69,9 @@ impl ProviderHealthCheckService {
         let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &self.encryption_key)
             .map_err(|e| AgentError::internal(e.to_string()))?;
         let provider = map_aionrs_provider(&row.platform, model_id, row.model_protocols.as_deref())?;
-        let (base_url, compat_overrides) =
+        let (base_url, mut compat_overrides) =
             resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, row.is_full_url);
+        compat_overrides.image_input = resolve_image_input_capability(&row.capabilities);
         let bedrock_config = if row.platform == "bedrock" {
             resolve_bedrock_config(row.bedrock_config.as_deref())
         } else {
@@ -219,6 +222,9 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
     }
     if let Some(path) = config_extra.compat_overrides.api_path {
         config.compat.transport.api_path = Some(path);
+    }
+    if let Some(capability) = config_extra.compat_overrides.image_input {
+        config.compat.image_input = Some(capability);
     }
 
     AgentBootstrap::new(config, workspace, sink)

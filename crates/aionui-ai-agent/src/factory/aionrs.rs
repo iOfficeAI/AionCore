@@ -4,7 +4,8 @@ use std::sync::Arc;
 use aion_agent::session::SessionManager;
 use aion_config::config::{McpServerConfig, TransportType};
 use aionui_api_types::{
-    AionrsBuildExtra, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
+    AionrsBuildExtra, ModelCapability, ModelType, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME,
+    TeamMcpStdioConfig,
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
@@ -95,8 +96,9 @@ pub(super) async fn build(
 
     let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref())?;
 
-    let (base_url, compat_overrides) =
+    let (base_url, mut compat_overrides) =
         resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, row.is_full_url);
+    compat_overrides.image_input = resolve_image_input_capability(&row.capabilities);
 
     let bedrock_config = if row.platform == "bedrock" {
         resolve_bedrock_config(row.bedrock_config.as_deref())
@@ -278,6 +280,26 @@ pub(crate) fn resolve_aionrs_url_and_compat(
     }
 
     (base_url, compat)
+}
+
+/// Resolve image input capability from the provider's stored capability list.
+///
+/// The UI stores provider capabilities as a JSON array of `ModelCapability`
+/// objects (e.g. `[{"type":"text"},{"type":"vision"}]`). When a `vision`
+/// capability is present, images are explicitly allowed. When the array is
+/// present but does not contain `vision`, images are explicitly disallowed.
+/// When capabilities are missing or unparseable, this returns `None` so
+/// aionrs falls back to provider-family defaults.
+pub(crate) fn resolve_image_input_capability(
+    capabilities_json: &str,
+) -> Option<aion_types::message::ImageInputCapability> {
+    let capabilities = serde_json::from_str::<Vec<ModelCapability>>(capabilities_json).ok()?;
+    let has_vision = capabilities.iter().any(|cap| cap.capability_type == ModelType::Vision);
+    Some(if has_vision {
+        aion_types::message::ImageInputCapability::Supported
+    } else {
+        aion_types::message::ImageInputCapability::Unsupported
+    })
 }
 
 fn resolve_model_protocol(model_id: &str, model_protocols: Option<&str>) -> Result<String, AgentError> {
@@ -1525,6 +1547,38 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn resolve_image_input_capability_vision_present_returns_supported() {
+        let caps = r#"[{"type":"text"},{"type":"vision"}]"#;
+        assert_eq!(
+            resolve_image_input_capability(caps),
+            Some(aion_types::message::ImageInputCapability::Supported)
+        );
+    }
+
+    #[test]
+    fn resolve_image_input_capability_no_vision_returns_unsupported() {
+        let caps = r#"[{"type":"text"},{"type":"function_calling"}]"#;
+        assert_eq!(
+            resolve_image_input_capability(caps),
+            Some(aion_types::message::ImageInputCapability::Unsupported)
+        );
+    }
+
+    #[test]
+    fn resolve_image_input_capability_empty_returns_unsupported() {
+        let caps = r#"[]"#;
+        assert_eq!(
+            resolve_image_input_capability(caps),
+            Some(aion_types::message::ImageInputCapability::Unsupported)
+        );
+    }
+
+    #[test]
+    fn resolve_image_input_capability_invalid_json_returns_none() {
+        assert_eq!(resolve_image_input_capability("not json"), None);
     }
 
     #[test]

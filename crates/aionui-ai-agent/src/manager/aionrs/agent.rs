@@ -346,6 +346,9 @@ impl AionrsAgentManager {
         if let Some(path) = config_extra.compat_overrides.api_path {
             config.compat.transport.api_path = Some(path);
         }
+        if let Some(capability) = config_extra.compat_overrides.image_input {
+            config.compat.image_input = Some(capability);
+        }
 
         if !config_extra.extra_mcp_servers.is_empty() {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());

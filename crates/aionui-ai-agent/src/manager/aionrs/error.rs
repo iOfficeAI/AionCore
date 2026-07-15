@@ -29,6 +29,14 @@ pub(super) fn aionrs_engine_error_to_send_error(error: &AionrsAgentError) -> Age
         ),
         AionrsAgentError::ApiError(_) => unknown_upstream_send_error(detail),
         AionrsAgentError::UserAborted => unknown_upstream_send_error(detail),
+        AionrsAgentError::ImageInputUnsupported { .. } => provider_send_error(
+            "The configured model does not support image input",
+            AgentErrorCode::UserLlmProviderUnsupportedModel,
+            detail,
+            false,
+            AgentErrorResolutionKind::ChangeModel,
+            Some(AgentErrorResolutionTarget::ProviderSettings),
+        ),
     }
 }
 
