@@ -111,23 +111,23 @@ pub(super) async fn build(
         }
     }
 
-    let params = Arc::new(
-        assemble_acp_params(
-            ctx.conversation_id.clone(),
-            WorkspaceInfo {
-                path: ctx.workspace,
-                is_custom: ctx.is_custom_workspace,
-            },
-            meta,
-            command_spec,
-            config,
-            session_mcp_servers,
-            session_snapshot,
-            deps.data_dir.clone(),
-            deps.dump_prompts,
-        )
-        .await,
-    );
+    let mut params = assemble_acp_params(
+        ctx.conversation_id.clone(),
+        WorkspaceInfo {
+            path: ctx.workspace,
+            is_custom: ctx.is_custom_workspace,
+        },
+        meta,
+        command_spec,
+        config,
+        session_mcp_servers,
+        session_snapshot,
+        deps.data_dir.clone(),
+        deps.dump_prompts,
+    )
+    .await;
+    params.dynamic_tool_session = deps.dynamic_tool_registry.session_for(&ctx.conversation_id);
+    let params = Arc::new(params);
 
     let skill_mgr = deps.skill_manager.clone();
     let catalog_tx = deps.agent_registry.catalog_sender();

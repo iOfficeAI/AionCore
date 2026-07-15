@@ -1,3 +1,4 @@
+use crate::protocol::dynamic_tools::DynamicToolSession;
 use crate::shared_kernel::PersistedSessionState;
 use agent_client_protocol::schema::{EnvVariable, McpServer, McpServerStdio, NewSessionRequest};
 use aionui_api_types::AgentMetadata;
@@ -34,16 +35,24 @@ pub struct AcpSessionParams {
     pub data_dir: PathBuf,
     /// Whether prompt diagnostics should be dumped under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,
+    /// Registration captured before the ACP session starts. The handle binds
+    /// the CLI-assigned thread id after session/new or session/load.
+    pub dynamic_tool_session: Option<DynamicToolSession>,
 }
 
 impl AcpSessionParams {
     /// Build a `NewSessionRequest` using the pre-computed MCP servers.
     pub fn new_session_request(&self) -> NewSessionRequest {
         let req = NewSessionRequest::new(&self.workspace.path);
-        if self.mcp_servers.is_empty() {
+        let req = if self.mcp_servers.is_empty() {
             req
         } else {
             req.mcp_servers(self.mcp_servers.clone())
+        };
+        if let Some(session) = &self.dynamic_tool_session {
+            req.meta(session.metadata())
+        } else {
+            req
         }
     }
 }
@@ -83,6 +92,7 @@ pub async fn assemble_acp_params(
         session_snapshot,
         data_dir,
         dump_prompts,
+        dynamic_tool_session: None,
     }
 }
 

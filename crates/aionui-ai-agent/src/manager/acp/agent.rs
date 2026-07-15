@@ -438,7 +438,14 @@ impl AcpAgentManager {
         // 70ms in — ELECTRON-1BT), so we explicitly watch the child. If
         // it dies before init completes, surface a `StartupCrash` carrying
         // the buffered stderr instead of waiting out the timeout.
-        let connect_fut = AcpProtocol::connect(stdin, stdout, runtime.event_sender(), permission_tx, notification_tx);
+        let connect_fut = AcpProtocol::connect(
+            stdin,
+            stdout,
+            runtime.event_sender(),
+            permission_tx,
+            notification_tx,
+            params.dynamic_tool_session.clone(),
+        );
         tokio::pin!(connect_fut);
         let protocol = tokio::select! {
             biased;

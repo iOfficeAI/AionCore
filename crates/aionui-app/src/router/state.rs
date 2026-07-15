@@ -36,7 +36,7 @@ use aionui_mcp::{
 use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
 };
-use aionui_realtime::{NoopMessageRouter, WsHandlerState};
+use aionui_realtime::WsHandlerState;
 use aionui_shell::ShellRouterState;
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
@@ -822,7 +822,7 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
     if services.local {
         return WsHandlerState {
             manager: services.ws_manager.clone(),
-            router: Arc::new(NoopMessageRouter),
+            router: Arc::new(services.dynamic_tool_registry.clone()),
             token_validator: Arc::new(|_| true),
             token_extractor: Arc::new(|_| Some("local".into())),
         };
@@ -835,7 +835,7 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
 
     WsHandlerState {
         manager: services.ws_manager.clone(),
-        router: Arc::new(NoopMessageRouter),
+        router: Arc::new(services.dynamic_tool_registry.clone()),
         token_validator,
         token_extractor,
     }

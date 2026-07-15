@@ -37,6 +37,7 @@ pub use error::AgentError;
 pub use factory::{AgentFactoryDeps, build_agent_factory};
 pub use idle_scanner::{IdleCleanupCoordinator, start_idle_scanner, start_idle_scanner_with_coordinator};
 pub use persistence::AcpSessionSyncService;
+pub use protocol::dynamic_tools::{DynamicToolRegistry, DynamicToolSession};
 pub use protocol::error::AcpError;
 pub use protocol::events::AgentStreamEvent;
 pub use protocol::send_error::AgentSendError;

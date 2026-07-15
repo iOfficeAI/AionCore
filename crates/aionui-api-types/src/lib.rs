@@ -14,6 +14,7 @@ mod connection_test;
 mod conversation;
 mod cron;
 mod custom_agent;
+mod dynamic_tools;
 mod extension;
 mod file;
 mod lifecycle;
@@ -92,6 +93,10 @@ pub use cron::{
 pub use custom_agent::{
     AgentOverridesResponse, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, DeleteCustomAgentResponse,
     SetAgentOverridesRequest, SetEnabledRequest,
+};
+pub use dynamic_tools::{
+    DynamicToolCallOutputContentItem, DynamicToolCallParams, DynamicToolCallPayload, DynamicToolCallResponse,
+    DynamicToolResultPayload, DynamicToolSpec, DynamicToolsRegisterRequest, DynamicToolsRegisteredPayload,
 };
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,

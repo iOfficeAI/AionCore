@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_api_types::WebSocketMessage;
+use aionui_api_types::{DynamicToolCallParams, WebSocketMessage};
 use aionui_app::{AppConfig, AppServices, create_router};
 use aionui_realtime::WebSocketManager;
 use futures_util::{SinkExt, StreamExt};
@@ -541,4 +541,204 @@ async fn t7_2_blacklisted_token_rejected() {
 
     let code = read_close(&mut rx).await;
     assert_eq!(code, Some(1008));
+}
+
+// ===========================================================================
+// T8 — Dynamic tool registration and callbacks
+// ===========================================================================
+
+fn dynamic_tools_register(request_id: &str, conversation_id: &str) -> Value {
+    json!({
+        "name": "agent.dynamicToolsRegister",
+        "data": {
+            "requestId": request_id,
+            "conversationId": conversation_id,
+            "tools": [{
+                "type": "function",
+                "name": "list_threads",
+                "description": "List tasks",
+                "inputSchema": {"type": "object"}
+            }]
+        }
+    })
+}
+
+fn dynamic_tool_result(call: &Value, registration_id: &str, success: bool) -> Value {
+    json!({
+        "name": "agent.dynamicToolResult",
+        "data": {
+            "conversationId": call["data"]["conversationId"],
+            "registrationId": registration_id,
+            "threadId": call["data"]["threadId"],
+            "turnId": call["data"]["turnId"],
+            "callId": call["data"]["callId"],
+            "namespace": call["data"]["namespace"],
+            "tool": call["data"]["tool"],
+            "contentItems": [{"type": "inputText", "text": "ready"}],
+            "success": success
+        }
+    })
+}
+
+#[tokio::test]
+async fn t8_1_dynamic_tool_round_trip_is_connection_and_identity_bound() {
+    let app = start_app().await;
+    let token = sign_token(&app, "user1");
+    let (mut owner_tx, mut owner_rx) = connect_bearer(app.addr, &token).await;
+    let (mut other_tx, mut other_rx) = connect_bearer(app.addr, &token).await;
+
+    let register = dynamic_tools_register("request-1", "conversation-1");
+    owner_tx.send(send_json(&register.to_string())).await.unwrap();
+    let ack = read_text(&mut owner_rx).await;
+    assert_eq!(ack["name"], "agent.dynamicToolsRegistered");
+    assert_eq!(ack["data"]["requestId"], "request-1");
+    assert_eq!(ack["data"]["accepted"], true);
+    let registration_id = ack["data"]["registrationId"].as_str().unwrap().to_owned();
+
+    let session = app
+        .services
+        .dynamic_tool_registry
+        .session_for("conversation-1")
+        .unwrap();
+    assert_eq!(session.metadata()["codex/dynamic_tools"]["version"], 1);
+    assert!(session.bind_thread("thread-1"));
+    let dispatch = tokio::spawn(async move {
+        session
+            .dispatch(DynamicToolCallParams {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                call_id: "call-1".into(),
+                namespace: None,
+                tool: "list_threads".into(),
+                arguments: json!({"scope": "current_project"}),
+            })
+            .await
+    });
+
+    let call = read_text(&mut owner_rx).await;
+    assert_eq!(call["name"], "agent.dynamicToolCall");
+    assert_eq!(call["data"]["registrationId"], registration_id);
+    assert_eq!(call["data"]["arguments"]["scope"], "current_project");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), other_rx.next())
+            .await
+            .is_err()
+    );
+
+    let result = dynamic_tool_result(&call, &registration_id, true);
+    other_tx.send(send_json(&result.to_string())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !dispatch.is_finished(),
+        "a result from another connection must be ignored"
+    );
+
+    owner_tx.send(send_json(&result.to_string())).await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(1), dispatch)
+        .await
+        .expect("dynamic tool dispatch timed out")
+        .unwrap();
+    assert!(response.success);
+    assert_eq!(response.content_items.len(), 1);
+}
+
+#[tokio::test]
+async fn t8_2_one_connection_routes_multiple_conversations_without_identity_loss() {
+    let app = start_app().await;
+    let token = sign_token(&app, "user1");
+    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+
+    let mut registration_ids = std::collections::HashMap::new();
+    for conversation_id in ["conversation-1", "conversation-2"] {
+        let register = dynamic_tools_register(&format!("request-{conversation_id}"), conversation_id);
+        tx.send(send_json(&register.to_string())).await.unwrap();
+        let ack = read_text(&mut rx).await;
+        assert_eq!(ack["data"]["accepted"], true);
+        registration_ids.insert(
+            conversation_id.to_owned(),
+            ack["data"]["registrationId"].as_str().unwrap().to_owned(),
+        );
+    }
+
+    let mut dispatches = Vec::new();
+    for (conversation_id, thread_id, call_id) in [
+        ("conversation-1", "thread-1", "call-1"),
+        ("conversation-2", "thread-2", "call-2"),
+    ] {
+        let session = app.services.dynamic_tool_registry.session_for(conversation_id).unwrap();
+        assert!(session.bind_thread(thread_id));
+        dispatches.push(tokio::spawn({
+            let thread_id = thread_id.to_owned();
+            let call_id = call_id.to_owned();
+            async move {
+                session
+                    .dispatch(DynamicToolCallParams {
+                        thread_id,
+                        turn_id: "turn-1".into(),
+                        call_id,
+                        namespace: None,
+                        tool: "list_threads".into(),
+                        arguments: json!({}),
+                    })
+                    .await
+            }
+        }));
+    }
+
+    for _ in 0..2 {
+        let call = read_text(&mut rx).await;
+        let conversation_id = call["data"]["conversationId"].as_str().unwrap();
+        let registration_id = registration_ids.get(conversation_id).unwrap();
+        let result = dynamic_tool_result(&call, registration_id, true);
+        tx.send(send_json(&result.to_string())).await.unwrap();
+    }
+    for dispatch in dispatches {
+        assert!(dispatch.await.unwrap().success);
+    }
+}
+
+#[tokio::test]
+async fn t8_3_websocket_disconnect_revokes_registration_and_pending_call() {
+    let app = start_app().await;
+    let token = sign_token(&app, "user1");
+    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+
+    let register = dynamic_tools_register("request-1", "conversation-1");
+    tx.send(send_json(&register.to_string())).await.unwrap();
+    let ack = read_text(&mut rx).await;
+    assert_eq!(ack["data"]["accepted"], true);
+
+    let session = app
+        .services
+        .dynamic_tool_registry
+        .session_for("conversation-1")
+        .unwrap();
+    assert!(session.bind_thread("thread-1"));
+    let dispatch = tokio::spawn(async move {
+        session
+            .dispatch(DynamicToolCallParams {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                call_id: "call-1".into(),
+                namespace: None,
+                tool: "list_threads".into(),
+                arguments: json!({}),
+            })
+            .await
+    });
+    let call = read_text(&mut rx).await;
+    assert_eq!(call["name"], "agent.dynamicToolCall");
+
+    tx.send(tungstenite::Message::Close(None)).await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(1), dispatch)
+        .await
+        .expect("disconnect did not release pending call")
+        .unwrap();
+    assert!(!response.success);
+    assert!(
+        app.services
+            .dynamic_tool_registry
+            .session_for("conversation-1")
+            .is_none()
+    );
 }

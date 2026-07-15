@@ -11,6 +11,9 @@ pub trait MessageRouter: Send + Sync {
     /// Called for any message whose `name` is not handled internally
     /// by the WebSocket layer (i.e. not `pong` or `subscribe-show-open`).
     fn route(&self, conn_id: ConnectionId, name: &str, data: serde_json::Value) -> bool;
+
+    /// Release any state owned by a WebSocket connection.
+    fn disconnected(&self, _conn_id: ConnectionId) {}
 }
 
 /// A no-op message router that reports every message as unhandled.

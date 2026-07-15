@@ -17,6 +17,7 @@ use crate::capability::skill_manager::AcpSkillManager;
 use crate::error::AgentError;
 use crate::factory::context::FactoryContext;
 use crate::persistence::AcpSessionSyncService;
+use crate::protocol::dynamic_tools::DynamicToolRegistry;
 use crate::registry::AgentRegistry;
 use crate::session_context::AgentSessionKind;
 use crate::task_manager::AgentFactory;
@@ -40,6 +41,8 @@ pub struct AgentFactoryDeps {
     /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
     /// `None` for tests/composition paths that do not need MCP injection.
     pub mcp_server_repo: Option<Arc<dyn IMcpServerRepository>>,
+    /// WebSocket-owned dynamic tools available to ordinary ACP conversations.
+    pub dynamic_tool_registry: DynamicToolRegistry,
 }
 
 /// Build a production agent factory that dispatches to concrete agent types.

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use aionui_ai_agent::AcpSessionSyncService;
 use aionui_ai_agent::AcpSkillManager;
+use aionui_ai_agent::DynamicToolRegistry;
 use aionui_ai_agent::factory::{AgentFactoryDeps, build_agent_factory};
 use aionui_ai_agent::registry::AgentRegistry;
 use aionui_ai_agent::session_context::{
@@ -15,7 +16,7 @@ use aionui_db::{
     CreateProviderParams, IAcpSessionRepository, IProviderRepository, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteProviderRepository, init_database_memory,
 };
-use aionui_realtime::BroadcastEventBus;
+use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
 fn test_encryption_key() -> [u8; 32] {
     [0xABu8; 32]
@@ -78,6 +79,7 @@ fn make_factory(
         broadcaster: Arc::new(BroadcastEventBus::new(16)),
         backend_binary_path: Arc::new(PathBuf::from("/tmp/aionrs-test/aioncore")),
         mcp_server_repo: None,
+        dynamic_tool_registry: DynamicToolRegistry::new(Arc::new(WebSocketManager::new())),
     })
 }
 

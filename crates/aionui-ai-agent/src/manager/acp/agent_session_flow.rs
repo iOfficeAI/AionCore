@@ -39,6 +39,9 @@ impl AcpAgentManager {
         let session_response = self.protocol.new_session(req).await?;
 
         let sid = session_response.session_id.to_string();
+        if let Some(dynamic_tools) = &self.params.dynamic_tool_session {
+            dynamic_tools.bind_thread(&sid);
+        }
 
         {
             let mut session = self.session.write().await;
@@ -122,6 +125,9 @@ impl AcpAgentManager {
             options.insert("resume".into(), Value::String(session_id.to_owned()));
             claude_code.insert("options".into(), Value::Object(options));
             meta.insert("claudeCode".into(), Value::Object(claude_code));
+            if let Some(dynamic_tools) = &self.params.dynamic_tool_session {
+                meta.extend(dynamic_tools.metadata());
+            }
 
             let req = self.params.new_session_request().meta(meta);
             let new_response = match self.protocol.new_session(req).await {
@@ -132,6 +138,9 @@ impl AcpAgentManager {
                 Err(e) => return Err(e.into()),
             };
             let new_sid = new_response.session_id.to_string();
+            if let Some(dynamic_tools) = &self.params.dynamic_tool_session {
+                dynamic_tools.bind_thread(&new_sid);
+            }
 
             {
                 let mut session = self.session.write().await;
@@ -176,6 +185,9 @@ impl AcpAgentManager {
             if !self.params.mcp_servers.is_empty() {
                 load_req = load_req.mcp_servers(self.params.mcp_servers.clone());
             }
+            if let Some(dynamic_tools) = &self.params.dynamic_tool_session {
+                load_req = load_req.meta(dynamic_tools.metadata());
+            }
             let load_response = match self.protocol.load_session(load_req).await {
                 Ok(r) => r,
                 Err(e) if is_acp_session_not_found(&e) => {
@@ -183,6 +195,9 @@ impl AcpAgentManager {
                 }
                 Err(e) => return Err(e.into()),
             };
+            if let Some(dynamic_tools) = &self.params.dynamic_tool_session {
+                dynamic_tools.bind_thread(session_id);
+            }
 
             {
                 let mut session = self.session.write().await;
@@ -214,6 +229,9 @@ impl AcpAgentManager {
         // session/load. Seed the aggregate with the stored id and let the
         // caller prompt — matches pre-refactor behaviour.
         {
+            if let Some(dynamic_tools) = &self.params.dynamic_tool_session {
+                dynamic_tools.bind_thread(session_id);
+            }
             let mut session = self.session.write().await;
             session.set_session_id(DomainSessionId::new(session_id.to_owned()));
             self.commit_session_changes(&mut session).await;

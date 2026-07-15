@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use crate::config::{AppConfig, derive_encryption_key};
 use aionui_ai_agent::{
-    AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
-    WorkerTaskManagerImpl, build_agent_factory,
+    AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, DynamicToolRegistry,
+    IWorkerTaskManager, WorkerTaskManagerImpl, build_agent_factory,
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
@@ -27,6 +27,7 @@ pub struct AppServices {
     pub cookie_config: Arc<CookieConfig>,
     pub qr_token_store: Arc<QrTokenStore>,
     pub ws_manager: Arc<WebSocketManager>,
+    pub dynamic_tool_registry: DynamicToolRegistry,
     pub event_bus: Arc<BroadcastEventBus>,
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
     pub active_lease_registry: Arc<ActiveLeaseRegistry>,
@@ -122,6 +123,8 @@ impl AppServices {
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
+        let ws_manager = Arc::new(WebSocketManager::new());
+        let dynamic_tool_registry = DynamicToolRegistry::new(ws_manager.clone());
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
@@ -175,6 +178,7 @@ impl AppServices {
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            dynamic_tool_registry: dynamic_tool_registry.clone(),
         });
 
         // Agent factory is now wired. Future extension/custom agents
@@ -208,7 +212,8 @@ impl AppServices {
             user_repo,
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
-            ws_manager: Arc::new(WebSocketManager::new()),
+            ws_manager,
+            dynamic_tool_registry,
             event_bus,
             worker_task_manager,
             active_lease_registry,

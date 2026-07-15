@@ -26,14 +26,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use agent_client_protocol::schema::{
-    AGENT_METHOD_NAMES, AuthenticateResponse, ClientNotification, ClientRequest, CloseSessionResponse, ExtResponse,
-    ForkSessionResponse, Implementation, InitializeRequest, LoadSessionResponse, PromptResponse, ProtocolVersion,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResumeSessionResponse,
-    SelectedPermissionOutcome, SessionNotification, SetSessionConfigOptionResponse, SetSessionModeResponse,
-    SetSessionModelResponse,
+    AGENT_METHOD_NAMES, AgentRequest, AuthenticateResponse, ClientNotification, ClientRequest, CloseSessionResponse,
+    ExtResponse, ForkSessionResponse, Implementation, InitializeRequest, LoadSessionResponse, PromptResponse,
+    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionResponse, SelectedPermissionOutcome, SessionNotification, SetSessionConfigOptionResponse,
+    SetSessionModeResponse, SetSessionModelResponse,
 };
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification, on_receive_request,
+    Agent, ByteStreams, Client, ConnectionTo, Handled, Responder, on_receive_notification, on_receive_request,
 };
 use aionui_common::ErrorChain;
 use tokio::process::{ChildStdin, ChildStdout};
@@ -41,6 +41,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::{debug, info, warn};
 
+use crate::protocol::dynamic_tools::{CODEX_DYNAMIC_TOOL_CALL_METHOD, DynamicToolSession, dynamic_tool_unavailable};
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{self as stream_event, AgentStreamEvent};
 
@@ -137,6 +138,7 @@ impl AcpProtocol {
         event_tx: broadcast::Sender<AgentStreamEvent>,
         permission_tx: mpsc::Sender<PermissionRequest>,
         notification_tx: mpsc::Sender<SessionNotification>,
+        dynamic_tool_session: Option<DynamicToolSession>,
     ) -> Result<Self, AcpError> {
         let alive = Arc::new(AtomicBool::new(true));
         let replay_suppression = Arc::new(AtomicBool::new(false));
@@ -160,6 +162,7 @@ impl AcpProtocol {
             event_tx,
             permission_tx,
             notification_tx,
+            dynamic_tool_session,
             init_tx,
             ready_tx,
             shutdown_rx,
@@ -406,6 +409,7 @@ async fn run_sdk_background(
     event_tx: broadcast::Sender<AgentStreamEvent>,
     permission_tx: mpsc::Sender<PermissionRequest>,
     notification_tx: mpsc::Sender<SessionNotification>,
+    dynamic_tool_session: Option<DynamicToolSession>,
     init_tx: oneshot::Sender<Result<InitializeResponse, AcpError>>,
     ready_tx: oneshot::Sender<ConnectionTo<Agent>>,
     shutdown_rx: oneshot::Receiver<()>,
@@ -456,6 +460,37 @@ async fn run_sdk_background(
                 async move |request: RequestPermissionRequest, responder, _cx| {
                     handle_permission_request(request, responder, &permission_tx).await;
                     Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                async move |request: AgentRequest, responder, _cx| {
+                    let AgentRequest::ExtMethodRequest(extension) = request else {
+                        return Ok(Handled::No {
+                            message: (request, responder),
+                            retry: false,
+                        });
+                    };
+                    if extension.method.as_ref() != CODEX_DYNAMIC_TOOL_CALL_METHOD {
+                        return Ok(Handled::No {
+                            message: (AgentRequest::ExtMethodRequest(extension), responder),
+                            retry: false,
+                        });
+                    }
+
+                    let response = match (
+                        dynamic_tool_session.as_ref(),
+                        serde_json::from_str(extension.params.get()),
+                    ) {
+                        (Some(session), Ok(params)) => session.dispatch(params).await,
+                        _ => dynamic_tool_unavailable(),
+                    };
+                    let response = serde_json::to_value(response)
+                        .unwrap_or_else(|_| serde_json::json!({"success": false, "contentItems": []}));
+                    responder.respond(response)?;
+                    Ok(Handled::Yes)
                 }
             },
             on_receive_request!(),

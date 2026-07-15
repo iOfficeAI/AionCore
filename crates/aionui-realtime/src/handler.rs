@@ -87,6 +87,7 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
 
     // Recv loop exited — client disconnected or errored.
     send_handle.abort();
+    state.router.disconnected(conn_id);
     state.manager.remove_client(conn_id);
     info!(%conn_id, "websocket connection closed");
 }
