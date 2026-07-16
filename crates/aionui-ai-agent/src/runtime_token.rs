@@ -5,6 +5,9 @@ use dashmap::DashMap;
 use getrandom::getrandom;
 use sha2::{Digest, Sha256};
 
+pub const TEAM_RUNTIME_TOKEN_SESSION_GENERATION: &str = "default";
+pub const TEAM_RUNTIME_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeTokenScope {
     TeamContext,
@@ -58,7 +61,13 @@ pub enum RuntimeTokenError {
 
 #[derive(Default)]
 pub struct RuntimeTokenService {
-    tokens: DashMap<String, RuntimeTokenClaims>,
+    tokens: DashMap<String, RuntimeTokenEntry>,
+}
+
+#[derive(Clone)]
+struct RuntimeTokenEntry {
+    token: String,
+    claims: RuntimeTokenClaims,
 }
 
 impl RuntimeTokenService {
@@ -74,19 +83,59 @@ impl RuntimeTokenService {
         scopes: impl IntoIterator<Item = RuntimeTokenScope>,
         ttl: Duration,
     ) -> RuntimeTokenIssue {
-        let token = generate_token();
+        let user_id = user_id.into();
+        let conversation_id = conversation_id.into();
+        let session_generation = session_generation.into();
+        let scopes = scopes.into_iter().collect::<HashSet<_>>();
         let now = SystemTime::now();
+        if let Some(existing) = self.existing_token(&user_id, &conversation_id, &session_generation, &scopes, now) {
+            return existing;
+        }
+        let token = generate_token();
         let claims = RuntimeTokenClaims {
-            user_id: user_id.into(),
-            conversation_id: conversation_id.into(),
-            scopes: scopes.into_iter().collect(),
+            user_id,
+            conversation_id,
+            scopes,
             issued_at: now,
             expires_at: now + ttl,
-            session_generation: session_generation.into(),
+            session_generation,
         };
         self.invalidate_conversation(&claims.user_id, &claims.conversation_id);
-        self.tokens.insert(token_hash(&token), claims.clone());
+        self.tokens.insert(
+            token_hash(&token),
+            RuntimeTokenEntry {
+                token: token.clone(),
+                claims: claims.clone(),
+            },
+        );
         RuntimeTokenIssue { token, claims }
+    }
+
+    fn existing_token(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        session_generation: &str,
+        scopes: &HashSet<RuntimeTokenScope>,
+        now: SystemTime,
+    ) -> Option<RuntimeTokenIssue> {
+        self.tokens.iter().find_map(|entry| {
+            let token_entry = entry.value();
+            let claims = &token_entry.claims;
+            if claims.user_id == user_id
+                && claims.conversation_id == conversation_id
+                && claims.session_generation == session_generation
+                && now < claims.expires_at
+                && scopes.is_subset(&claims.scopes)
+            {
+                Some(RuntimeTokenIssue {
+                    token: token_entry.token.clone(),
+                    claims: claims.clone(),
+                })
+            } else {
+                None
+            }
+        })
     }
 
     pub fn validate(
@@ -104,7 +153,7 @@ impl RuntimeTokenService {
         let Some(entry) = self.tokens.get(&token_hash(raw_token)) else {
             return Err(RuntimeTokenError::Unknown);
         };
-        let claims = entry.value().clone();
+        let claims = entry.value().claims.clone();
         drop(entry);
         if SystemTime::now() >= claims.expires_at {
             self.tokens.remove(&token_hash(raw_token));
@@ -127,12 +176,18 @@ impl RuntimeTokenService {
 
     pub fn invalidate_conversation(&self, user_id: &str, conversation_id: &str) {
         self.tokens
-            .retain(|_, claims| !(claims.user_id == user_id && claims.conversation_id == conversation_id));
+            .retain(|_, entry| !(entry.claims.user_id == user_id && entry.claims.conversation_id == conversation_id));
+    }
+
+    pub fn invalidate_conversation_id(&self, conversation_id: &str) {
+        self.tokens
+            .retain(|_, entry| entry.claims.conversation_id != conversation_id);
     }
 
     pub fn invalidate_generation(&self, conversation_id: &str, session_generation: &str) {
         self.tokens.retain(|_, claims| {
-            !(claims.conversation_id == conversation_id && claims.session_generation == session_generation)
+            !(claims.claims.conversation_id == conversation_id
+                && claims.claims.session_generation == session_generation)
         });
     }
 }
@@ -273,6 +328,61 @@ mod tests {
                 "gen-2",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn repeated_issue_for_same_runtime_generation_reuses_existing_token() {
+        let service = RuntimeTokenService::new();
+        let first = service.issue(
+            "user-1",
+            "conv-1",
+            "gen-1",
+            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+            Duration::from_secs(60),
+        );
+        let second = service.issue(
+            "user-1",
+            "conv-1",
+            "gen-1",
+            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+            Duration::from_secs(60),
+        );
+
+        assert_eq!(first.token, second.token);
+        service
+            .validate(
+                Some(&first.token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::TeamCall,
+                "gen-1",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn invalidate_conversation_id_revokes_tokens_for_conversation() {
+        let service = RuntimeTokenService::new();
+        let issue = service.issue(
+            "user-1",
+            "conv-1",
+            "gen-1",
+            [RuntimeTokenScope::TeamContext],
+            Duration::from_secs(60),
+        );
+
+        service.invalidate_conversation_id("conv-1");
+
+        assert_eq!(
+            service.validate(
+                Some(&issue.token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::TeamContext,
+                "gen-1"
+            ),
+            Err(RuntimeTokenError::Unknown)
+        );
     }
 
     #[test]

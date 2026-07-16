@@ -183,14 +183,14 @@ impl AppServices {
         // that get written to `agent_metadata` will show up after the
         // relevant service calls `AgentRegistry::hydrate`.
         let active_lease_registry = Arc::new(ActiveLeaseRegistry::new());
-        let task_manager_concrete = Arc::new(WorkerTaskManagerImpl::new_with_active_leases(
-            factory,
-            active_lease_registry.clone(),
-        ));
+        let runtime_token_service = Arc::new(RuntimeTokenService::new());
+        let task_manager_concrete = Arc::new(
+            WorkerTaskManagerImpl::new_with_active_leases(factory, active_lease_registry.clone())
+                .with_runtime_token_service(runtime_token_service.clone()),
+        );
         let worker_task_manager: Arc<dyn IWorkerTaskManager> = task_manager_concrete.clone();
         let task_manager_delete_hook: Arc<dyn OnConversationDelete> = task_manager_concrete;
         let conversation_runtime_state = Arc::new(ConversationRuntimeStateService::default());
-        let runtime_token_service = Arc::new(RuntimeTokenService::new());
         let conversation_service = build_conversation_service(ConversationServiceDeps {
             database: &database,
             work_dir: work_dir.clone(),

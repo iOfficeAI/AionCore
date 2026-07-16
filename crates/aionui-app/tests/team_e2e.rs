@@ -88,6 +88,27 @@ async fn ensure_default_team_assistant(
     );
 }
 
+async fn mark_claude_backend_team_mcp_stdio_capable(services: &aionui_app::AppServices) {
+    let capabilities = json!({
+        "mcp_capabilities": { "stdio": true },
+        "shell": true
+    })
+    .to_string();
+    let result = sqlx::query(
+        "UPDATE agent_metadata \
+         SET agent_capabilities = ?, updated_at = unixepoch('now','subsec') * 1000 \
+         WHERE agent_type = 'acp' AND backend = 'claude'",
+    )
+    .bind(capabilities)
+    .execute(services.database.pool())
+    .await
+    .expect("mark claude backend as team MCP capable");
+    assert!(
+        result.rows_affected() > 0,
+        "fixture must include claude ACP backend metadata"
+    );
+}
+
 async fn create_team(
     app: &mut axum::Router,
     services: &aionui_app::AppServices,
@@ -1023,6 +1044,7 @@ async fn es1_ensure_session() {
 async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    mark_claude_backend_team_mcp_stdio_capable(&services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
