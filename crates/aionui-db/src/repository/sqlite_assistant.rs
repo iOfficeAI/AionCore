@@ -427,9 +427,9 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
 
         sqlx::query(
             "INSERT INTO assistant_definitions (
-                id, assistant_id, source, owner_type, source_ref, source_version, source_hash,
+                id, assistant_id, source, owner_type, source_ref,
                 name, name_i18n, description, description_i18n, avatar_type, avatar_value,
-                agent_id, rule_resource_type, rule_resource_ref, rule_inline_content,
+                agent_id, rule_resource_type, rule_resource_ref,
                 recommended_prompts, recommended_prompts_i18n,
                 default_model_mode, default_model_value,
                 default_permission_mode, default_permission_value,
@@ -437,14 +437,12 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
                 default_skills_mode, default_skill_ids, custom_skill_names, default_disabled_builtin_skill_ids,
                 default_mcps_mode, default_mcp_ids,
                 created_at, updated_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             ON CONFLICT(id) DO UPDATE SET
                 assistant_id = excluded.assistant_id,
                 source = excluded.source,
                 owner_type = excluded.owner_type,
                 source_ref = excluded.source_ref,
-                source_version = excluded.source_version,
-                source_hash = excluded.source_hash,
                 name = excluded.name,
                 name_i18n = excluded.name_i18n,
                 description = excluded.description,
@@ -454,7 +452,6 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
                 agent_id = excluded.agent_id,
                 rule_resource_type = excluded.rule_resource_type,
                 rule_resource_ref = excluded.rule_resource_ref,
-                rule_inline_content = excluded.rule_inline_content,
                 recommended_prompts = excluded.recommended_prompts,
                 recommended_prompts_i18n = excluded.recommended_prompts_i18n,
                 default_model_mode = excluded.default_model_mode,
@@ -477,8 +474,6 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         .bind(params.source)
         .bind(params.owner_type)
         .bind(params.source_ref)
-        .bind(params.source_version)
-        .bind(params.source_hash)
         .bind(params.name)
         .bind(params.name_i18n)
         .bind(params.description)
@@ -488,7 +483,6 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         .bind(params.agent_id)
         .bind(params.rule_resource_type)
         .bind(params.rule_resource_ref)
-        .bind(params.rule_inline_content)
         .bind(params.recommended_prompts)
         .bind(params.recommended_prompts_i18n)
         .bind(params.default_model_mode)
@@ -727,8 +721,6 @@ mod tests {
             source: "user",
             owner_type: "user",
             source_ref: Some(id),
-            source_version: None,
-            source_hash: None,
             name,
             name_i18n: r#"{"zh-CN":"助手"}"#,
             description: Some("desc"),
@@ -736,9 +728,8 @@ mod tests {
             avatar_type: "emoji",
             avatar_value: Some("🤖"),
             agent_id: "gemini",
-            rule_resource_type: "inline",
+            rule_resource_type: "user_file",
             rule_resource_ref: None,
-            rule_inline_content: Some("# rule"),
             recommended_prompts: r#"["hello"]"#,
             recommended_prompts_i18n: "{}",
             default_model_mode: "auto",
@@ -1017,7 +1008,7 @@ mod tests {
 
         let fetched = d.get_by_assistant_id("u1").await.unwrap().unwrap();
         assert_eq!(fetched.name, "User One");
-        assert_eq!(fetched.rule_inline_content.as_deref(), Some("# rule"));
+        assert_eq!(fetched.rule_resource_type, "user_file");
         assert_eq!(fetched.avatar_type, "emoji");
         assert_eq!(fetched.avatar_value.as_deref(), Some("🤖"));
     }

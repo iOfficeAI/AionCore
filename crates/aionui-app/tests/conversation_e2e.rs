@@ -113,15 +113,16 @@ async fn t1_3_create_with_optional_fields() {
 }
 
 #[tokio::test]
-async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
+async fn t1_3b_create_persists_available_locale_fallback_rule_in_assistant_snapshot() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let assistant_id = "locale-fallback-u1";
 
     let create_assistant_req = json_with_token(
         "POST",
         "/api/assistants",
         json!({
-            "id": "u1",
+            "id": assistant_id,
             "name": "Snapshot Assistant",
             "agent_id": "8e1acf31"
         }),
@@ -135,9 +136,9 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
         "POST",
         "/api/skills/assistant-rule/write",
         json!({
-            "assistant_id": "u1",
-            "content": "assistant snapshot rule",
-            "locale": "en-US"
+            "assistant_id": assistant_id,
+            "content": "zh-TW fallback snapshot rule",
+            "locale": "zh-TW"
         }),
         &token,
         &csrf,
@@ -150,7 +151,11 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
     let state_repo = SqliteAssistantOverlayRepository::new(pool.clone());
     let preference_repo = SqliteAssistantPreferenceRepository::new(pool);
     let conversation_repo = SqliteConversationRepository::new(services.database.pool().clone());
-    let definition = definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
+    let definition = definition_repo
+        .get_by_assistant_id(assistant_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
@@ -159,8 +164,6 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             source: &definition.source,
             owner_type: &definition.owner_type,
             source_ref: definition.source_ref.as_deref(),
-            source_version: definition.source_version.as_deref(),
-            source_hash: definition.source_hash.as_deref(),
             name: &definition.name,
             name_i18n: &definition.name_i18n,
             description: definition.description.as_deref(),
@@ -170,7 +173,6 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             agent_id: &definition.agent_id,
             rule_resource_type: &definition.rule_resource_type,
             rule_resource_ref: definition.rule_resource_ref.as_deref(),
-            rule_inline_content: definition.rule_inline_content.as_deref(),
             recommended_prompts: &definition.recommended_prompts,
             recommended_prompts_i18n: &definition.recommended_prompts_i18n,
             default_model_mode: "auto",
@@ -218,7 +220,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             "type": "acp",
             "name": "Snapshot Flow",
             "assistant": {
-                "id": "u1",
+                "id": assistant_id,
                 "locale": "en-US",
                 "conversation_overrides": {
                     "model": "override-model",
@@ -237,7 +239,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
 
     let json = body_json(resp).await;
     let data = &json["data"];
-    assert_eq!(data["assistant"]["id"], "u1");
+    assert_eq!(data["assistant"]["id"], assistant_id);
     assert_eq!(data["assistant"]["backend"], "codex");
     assert!(data["extra"].get("assistant_id").is_none());
     assert!(data["extra"].get("preset_assistant_id").is_none());
@@ -260,9 +262,9 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(snapshot.assistant_id, "u1");
+    assert_eq!(snapshot.assistant_id, assistant_id);
     assert_eq!(snapshot.agent_id, "8e1acf31");
-    assert_eq!(snapshot.rules_content, "assistant snapshot rule");
+    assert_eq!(snapshot.rules_content, "zh-TW fallback snapshot rule");
     assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
     assert_eq!(snapshot.resolved_skill_ids, r#"["override-skill"]"#);
     assert_eq!(snapshot.resolved_mcp_ids, r#"["override-mcp"]"#);

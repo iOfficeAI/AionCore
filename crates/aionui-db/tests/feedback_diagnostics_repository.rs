@@ -464,21 +464,19 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     ] {
         sqlx::query(
             "INSERT INTO assistant_definitions \
-                (id, assistant_id, source, owner_type, source_ref, source_version, source_hash, \
+                (id, assistant_id, source, owner_type, source_ref, \
                  name, name_i18n, description, description_i18n, avatar_type, avatar_value, \
-                 agent_id, rule_resource_type, rule_resource_ref, rule_inline_content, \
+                 agent_id, rule_resource_type, rule_resource_ref, \
                  recommended_prompts, recommended_prompts_i18n, default_model_mode, default_model_value, \
                  default_permission_mode, default_permission_value, default_skills_mode, default_skill_ids, \
                  custom_skill_names, default_disabled_builtin_skill_ids, default_mcps_mode, default_mcp_ids, \
                  created_at, updated_at, deleted_at, default_thought_level_mode, default_thought_level_value) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(definition_id)
         .bind(assistant_id)
         .bind("user")
         .bind("user")
-        .bind(None::<String>)
-        .bind(None::<String>)
         .bind(None::<String>)
         .bind(assistant_id)
         .bind("{}")
@@ -488,7 +486,6 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
         .bind(None::<String>)
         .bind("opencode")
         .bind("none")
-        .bind(None::<String>)
         .bind(None::<String>)
         .bind("[]")
         .bind("{}")
