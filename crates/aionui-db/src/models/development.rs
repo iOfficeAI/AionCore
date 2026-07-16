@@ -22,6 +22,28 @@ pub struct DevelopmentRunRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevelopmentTaskRow {
+    pub id: String,
+    pub team_id: String,
+    pub run_id: Option<String>,
+    pub subject: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub owner: Option<String>,
+    pub blocked_by: String,
+    pub blocks: String,
+    pub metadata: Option<String>,
+    pub acceptance_criteria: String,
+    pub task_type: String,
+    pub risk_level: String,
+    pub assigned_workspace_lease_id: Option<String>,
+    pub review_status: String,
+    pub verification_status: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TaskArtifactRow {
     pub id: String,
     pub run_id: String,

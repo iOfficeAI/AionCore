@@ -27,14 +27,16 @@ use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::models::MessageRow;
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
-    IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
-    IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository, IProjectRepository,
-    IProviderRepository, ITeamRepository, MessagePageDirection, MessagePageParams, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteProjectRepository, SqliteProviderRepository,
+    IAgentWorkspaceLeaseRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
+    IDevelopmentRepository, IProjectRepository, IProviderRepository, ITeamRepository, MessagePageDirection,
+    MessagePageParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAgentWorkspaceLeaseRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
+    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
+    SqliteConversationRepository, SqliteDevelopmentRepository, SqliteProjectRepository, SqliteProviderRepository,
     SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteTeamRepository,
 };
+use aionui_development::{DevelopmentRouterState, DevelopmentService};
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
@@ -501,6 +503,7 @@ pub struct ModuleStates {
     pub team: TeamRouterState,
     pub cron: CronRouterState,
     pub project: ProjectRouterState,
+    pub development: DevelopmentRouterState,
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
@@ -635,6 +638,7 @@ pub async fn build_module_states(
     let project = build_module_state_phase(&boot, "project", || {
         build_project_state(services, agent_service.clone())
     });
+    let development = build_module_state_phase(&boot, "development", || build_development_state(services));
 
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -664,6 +668,7 @@ pub async fn build_module_states(
         team: team_state,
         cron,
         project,
+        development,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
@@ -694,6 +699,21 @@ fn build_project_state(services: &AppServices, agent_service: Arc<AgentService>)
             conversation_repo,
             team_repo,
             agent_port,
+        )),
+    }
+}
+
+fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
+    let pool = services.database.pool().clone();
+    let development_repo: Arc<dyn IDevelopmentRepository> = Arc::new(SqliteDevelopmentRepository::new(pool.clone()));
+    let project_repo: Arc<dyn IProjectRepository> = Arc::new(SqliteProjectRepository::new(pool.clone()));
+    let lease_repo: Arc<dyn IAgentWorkspaceLeaseRepository> = Arc::new(SqliteAgentWorkspaceLeaseRepository::new(pool));
+    DevelopmentRouterState {
+        service: Arc::new(DevelopmentService::new(
+            development_repo,
+            project_repo,
+            lease_repo,
+            services.data_dir.join("development-artifacts"),
         )),
     }
 }

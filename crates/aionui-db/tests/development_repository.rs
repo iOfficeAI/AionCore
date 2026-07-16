@@ -1,4 +1,6 @@
-use aionui_db::models::{DevelopmentRunRow, ProjectRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow};
+use aionui_db::models::{
+    DevelopmentRunRow, DevelopmentTaskRow, ProjectRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
+};
 use aionui_db::{
     IDevelopmentRepository, IProjectRepository, SqliteDevelopmentRepository, SqliteProjectRepository,
     init_database_memory,
@@ -137,9 +139,48 @@ async fn artifacts_gates_and_findings_roundtrip_by_task() {
         repo.list_findings("run-1", "task-1").await.unwrap()[0].severity,
         "major"
     );
-    repo.update_finding_status("finding-1", "resolved").await.unwrap();
+    repo.update_finding_status("run-1", "finding-1", "resolved")
+        .await
+        .unwrap();
     assert_eq!(
         repo.list_findings("run-1", "task-1").await.unwrap()[0].status,
         "resolved"
     );
+}
+
+#[tokio::test]
+async fn development_tasks_roundtrip_with_quality_state() {
+    let (repo, _db) = setup().await;
+    repo.create_run(&run()).await.unwrap();
+    repo.create_task(&DevelopmentTaskRow {
+        id: "task-2".into(),
+        team_id: "team-1".into(),
+        run_id: Some("run-1".into()),
+        subject: "Implement".into(),
+        description: None,
+        status: "ready".into(),
+        owner: Some("slot-1".into()),
+        blocked_by: "[]".into(),
+        blocks: "[]".into(),
+        metadata: None,
+        acceptance_criteria: r#"["tests pass"]"#.into(),
+        task_type: "implementation".into(),
+        risk_level: "high".into(),
+        assigned_workspace_lease_id: None,
+        review_status: "pending".into(),
+        verification_status: "pending".into(),
+        created_at: 2,
+        updated_at: 2,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(repo.list_tasks("run-1").await.unwrap().len(), 1);
+    repo.update_task_state("run-1", "task-2", "review", "in_review", "passed")
+        .await
+        .unwrap();
+    let task = repo.get_task("run-1", "task-2").await.unwrap().unwrap();
+    assert_eq!(task.status, "review");
+    assert_eq!(task.review_status, "in_review");
+    assert_eq!(task.verification_status, "passed");
 }

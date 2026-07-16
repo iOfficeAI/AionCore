@@ -36,7 +36,7 @@ pub use client_preference::ClientPreference;
 pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, UpsertConversationAssistantSnapshotParams};
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
-pub use development::{DevelopmentRunRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow};
+pub use development::{DevelopmentRunRow, DevelopmentTaskRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow};
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;

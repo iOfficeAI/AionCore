@@ -1,7 +1,7 @@
 use aionui_common::TimestampMs;
 
 use crate::error::DbError;
-use crate::models::{DevelopmentRunRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow};
+use crate::models::{DevelopmentRunRow, DevelopmentTaskRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow};
 
 #[async_trait::async_trait]
 pub trait IDevelopmentRepository: Send + Sync {
@@ -16,6 +16,18 @@ pub trait IDevelopmentRepository: Send + Sync {
         finished_at: Option<TimestampMs>,
     ) -> Result<bool, DbError>;
 
+    async fn create_task(&self, row: &DevelopmentTaskRow) -> Result<(), DbError>;
+    async fn get_task(&self, run_id: &str, task_id: &str) -> Result<Option<DevelopmentTaskRow>, DbError>;
+    async fn list_tasks(&self, run_id: &str) -> Result<Vec<DevelopmentTaskRow>, DbError>;
+    async fn update_task_state(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        status: &str,
+        review_status: &str,
+        verification_status: &str,
+    ) -> Result<bool, DbError>;
+
     async fn create_artifact(&self, row: &TaskArtifactRow) -> Result<(), DbError>;
     async fn list_artifacts(&self, run_id: &str, task_id: Option<&str>) -> Result<Vec<TaskArtifactRow>, DbError>;
 
@@ -25,5 +37,5 @@ pub trait IDevelopmentRepository: Send + Sync {
 
     async fn create_finding(&self, row: &ReviewFindingRow) -> Result<(), DbError>;
     async fn list_findings(&self, run_id: &str, task_id: &str) -> Result<Vec<ReviewFindingRow>, DbError>;
-    async fn update_finding_status(&self, finding_id: &str, status: &str) -> Result<bool, DbError>;
+    async fn update_finding_status(&self, run_id: &str, finding_id: &str, status: &str) -> Result<bool, DbError>;
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 pub use aionui_team_prompts::AvailableAssistant;
 
-use crate::types::{MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask};
+use crate::types::{MailboxMessage, MailboxMessageType, TeamAgent, TeamTask};
 
 fn to_prompt_role(role: crate::types::TeammateRole) -> aionui_team_prompts::TeamPromptRole {
     match role {

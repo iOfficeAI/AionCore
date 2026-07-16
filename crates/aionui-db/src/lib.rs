@@ -19,9 +19,9 @@ pub use error::DbError;
 pub use models::{
     AgentMetadataRow, AgentWorkspaceLeaseRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow,
     AssistantPreferenceRow, AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow,
-    CreateAssistantParams, DevelopmentRunRow, ProjectCommandProfileRow, ProjectResourceLinkRow, ProjectRow,
-    ProjectRuntimeProfileRow, QualityGateRunRow, ReviewFindingRow, SkillImportRecordRow, SkillRow, TaskArtifactRow,
-    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
+    CreateAssistantParams, DevelopmentRunRow, DevelopmentTaskRow, ProjectCommandProfileRow, ProjectResourceLinkRow,
+    ProjectRow, ProjectRuntimeProfileRow, QualityGateRunRow, ReviewFindingRow, SkillImportRecordRow, SkillRow,
+    TaskArtifactRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
     UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams,
 };

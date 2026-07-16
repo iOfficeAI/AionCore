@@ -2,7 +2,7 @@ use aionui_common::{TimestampMs, now_ms};
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{DevelopmentRunRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow};
+use crate::models::{DevelopmentRunRow, DevelopmentTaskRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow};
 use crate::repository::development::IDevelopmentRepository;
 
 #[derive(Clone, Debug)]
@@ -89,6 +89,75 @@ impl IDevelopmentRepository for SqliteDevelopmentRepository {
         .bind(now_ms())
         .bind(run_id)
         .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn create_task(&self, row: &DevelopmentTaskRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO team_tasks (id, team_id, run_id, subject, description, status, owner, blocked_by, blocks, \
+             metadata, acceptance_criteria, task_type, risk_level, assigned_workspace_lease_id, review_status, \
+             verification_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.team_id)
+        .bind(&row.run_id)
+        .bind(&row.subject)
+        .bind(&row.description)
+        .bind(&row.status)
+        .bind(&row.owner)
+        .bind(&row.blocked_by)
+        .bind(&row.blocks)
+        .bind(&row.metadata)
+        .bind(&row.acceptance_criteria)
+        .bind(&row.task_type)
+        .bind(&row.risk_level)
+        .bind(&row.assigned_workspace_lease_id)
+        .bind(&row.review_status)
+        .bind(&row.verification_status)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_task(&self, run_id: &str, task_id: &str) -> Result<Option<DevelopmentTaskRow>, DbError> {
+        Ok(sqlx::query_as("SELECT * FROM team_tasks WHERE run_id = ? AND id = ?")
+            .bind(run_id)
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    async fn list_tasks(&self, run_id: &str) -> Result<Vec<DevelopmentTaskRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM team_tasks WHERE run_id = ? ORDER BY created_at ASC, id ASC")
+                .bind(run_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn update_task_state(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        status: &str,
+        review_status: &str,
+        verification_status: &str,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE team_tasks SET status = ?, review_status = ?, verification_status = ?, updated_at = ? \
+             WHERE run_id = ? AND id = ?",
+        )
+        .bind(status)
+        .bind(review_status)
+        .bind(verification_status)
+        .bind(now_ms())
+        .bind(run_id)
+        .bind(task_id)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -207,11 +276,12 @@ impl IDevelopmentRepository for SqliteDevelopmentRepository {
         .await?)
     }
 
-    async fn update_finding_status(&self, finding_id: &str, status: &str) -> Result<bool, DbError> {
-        let result = sqlx::query("UPDATE review_findings SET status = ?, updated_at = ? WHERE id = ?")
+    async fn update_finding_status(&self, run_id: &str, finding_id: &str, status: &str) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE review_findings SET status = ?, updated_at = ? WHERE id = ? AND run_id = ?")
             .bind(status)
             .bind(now_ms())
             .bind(finding_id)
+            .bind(run_id)
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
