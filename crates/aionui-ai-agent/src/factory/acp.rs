@@ -199,13 +199,7 @@ async fn resolve_agent_command_spec_with_ollama(
                     backend = ?meta.backend,
                     "use_ollama=true but ollama_model is missing; falling back to native launch"
                 );
-                return resolve_agent_command_spec(
-                    meta,
-                    workspace,
-                    conversation_id,
-                    broadcaster,
-                )
-                .await;
+                return resolve_agent_command_spec(meta, workspace, conversation_id, broadcaster).await;
             };
 
             info!(
