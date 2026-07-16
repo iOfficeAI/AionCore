@@ -89,6 +89,8 @@ pub struct AionrsAgentManager {
     #[allow(dead_code)] // intentional: lifetime-extension only; see Drop impl
     mcp_managers: Vec<Arc<McpManager>>,
     approval_manager: Arc<ToolApprovalManager>,
+    /// Request-level thinking mode for models that expose the option.
+    thinking_mode: Option<Mutex<String>>,
     confirmations: Arc<std::sync::RwLock<Vec<Confirmation>>>,
     final_input_dump: Option<AionrsFinalInputDumpContext>,
     /// Signalled by `cancel()` to abort an in-flight `engine.run()` via
@@ -118,6 +120,7 @@ impl AionrsAgentManager {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
         let runtime_env = config_extra.runtime_env.clone();
+        let thinking_mode = config_extra.compat_overrides.thinking_mode.clone();
         let final_input_dump = config_extra
             .prompt_dump_dir
             .clone()
@@ -145,7 +148,7 @@ impl AionrsAgentManager {
             system_prompt: config_extra.system_prompt.clone(),
             profile: None,
             auto_approve: config_extra.session_mode.as_deref() == Some("yolo"),
-            thinking: None,
+            thinking: thinking_mode.clone(),
             thinking_budget: None,
             project_dir: Some(PathBuf::from(&workspace)),
         };
@@ -233,6 +236,7 @@ impl AionrsAgentManager {
             slash_commands,
             mcp_managers: result.mcp_managers,
             approval_manager,
+            thinking_mode: thinking_mode.map(Mutex::new),
             confirmations,
             final_input_dump,
             cancel_notify: Arc::new(Notify::new()),
@@ -515,27 +519,54 @@ impl AionrsAgentManager {
     }
 
     pub async fn config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
-        Ok(GetConfigOptionsResponse {
-            config_options: vec![aionrs_mode_config_option(self.approval_manager.current_mode())],
-        })
+        let mut config_options = vec![aionrs_mode_config_option(self.approval_manager.current_mode())];
+        if let Some(thinking_mode) = &self.thinking_mode {
+            config_options.push(aionrs_thinking_config_option(thinking_mode.lock().await.clone()));
+        }
+        Ok(GetConfigOptionsResponse { config_options })
     }
 
     pub async fn set_config_option(&self, option_id: &str, value: &str) -> Result<SetConfigOptionResponse, AgentError> {
         let option_id = option_id.trim();
         let value = value.trim();
 
-        if option_id != AIONRS_MODE_OPTION_ID {
-            return Err(AgentError::bad_request(format!(
-                "Config option '{option_id}' is not available"
-            )));
+        match option_id {
+            AIONRS_MODE_OPTION_ID => {
+                if !is_aionrs_session_mode(value) {
+                    return Err(AgentError::bad_request(format!(
+                        "Value '{value}' is not selectable for config option '{option_id}'"
+                    )));
+                }
+                self.set_mode(value).await?;
+            }
+            AIONRS_THINKING_OPTION_ID => {
+                if !is_aionrs_thinking_mode(value) {
+                    return Err(AgentError::bad_request(format!(
+                        "Value '{value}' is not selectable for config option '{option_id}'"
+                    )));
+                }
+                let Some(thinking_mode) = &self.thinking_mode else {
+                    return Err(AgentError::bad_request(format!(
+                        "Config option '{option_id}' is not available"
+                    )));
+                };
+                self.engine
+                    .lock()
+                    .await
+                    .apply_config_update(None, Some(value.to_owned()), None, None, None);
+                *thinking_mode.lock().await = value.to_owned();
+                info!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    thinking_mode = value,
+                    "Aionrs thinking mode switched"
+                );
+            }
+            _ => {
+                return Err(AgentError::bad_request(format!(
+                    "Config option '{option_id}' is not available"
+                )));
+            }
         }
-        if !is_aionrs_session_mode(value) {
-            return Err(AgentError::bad_request(format!(
-                "Value '{value}' is not selectable for config option '{option_id}'"
-            )));
-        }
-
-        self.set_mode(value).await?;
         Ok(SetConfigOptionResponse {
             confirmation: ConfigOptionConfirmation::Observed,
             config_options: Some(self.config_options().await?.config_options),
@@ -548,9 +579,14 @@ impl AionrsAgentManager {
 }
 
 const AIONRS_MODE_OPTION_ID: &str = "mode";
+const AIONRS_THINKING_OPTION_ID: &str = "thinking";
 
 fn is_aionrs_session_mode(s: &str) -> bool {
     matches!(s, "default" | "auto_edit" | "yolo")
+}
+
+fn is_aionrs_thinking_mode(s: &str) -> bool {
+    matches!(s, "enabled" | "disabled")
 }
 
 fn aionrs_mode_config_option(current_value: String) -> AcpConfigOptionDto {
@@ -576,6 +612,22 @@ fn aionrs_mode_select_option(value: &str, name: &str) -> AcpConfigSelectOptionDt
         name: Some(name.to_owned()),
         label: None,
         description: None,
+    }
+}
+
+fn aionrs_thinking_config_option(current_value: String) -> AcpConfigOptionDto {
+    AcpConfigOptionDto {
+        id: AIONRS_THINKING_OPTION_ID.to_owned(),
+        name: Some("Thinking".to_owned()),
+        label: None,
+        description: None,
+        category: Some("thought_level".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some(current_value),
+        options: vec![
+            aionrs_mode_select_option("enabled", "Enabled"),
+            aionrs_mode_select_option("disabled", "Disabled"),
+        ],
     }
 }
 
@@ -624,6 +676,74 @@ mod tests {
             runtime_env: Vec::new(),
             prompt_dump_dir: None,
         }
+    }
+
+    fn make_glm_52_test_config() -> AionrsResolvedConfig {
+        let mut config = make_test_config();
+        config.provider = "openai".into();
+        config.model = "glm-5.2".into();
+        config.base_url = Some("https://open.bigmodel.cn/api/paas/v4".into());
+        config.compat_overrides.thinking_mode = Some("enabled".into());
+        config
+    }
+
+    #[tokio::test]
+    async fn glm_52_exposes_enabled_thinking_by_default() {
+        let agent = AionrsAgentManager::new("conv-glm".into(), "/project".into(), make_glm_52_test_config(), None)
+            .await
+            .unwrap();
+
+        let options = agent.config_options().await.unwrap().config_options;
+        let thinking = options
+            .iter()
+            .find(|option| option.id == AIONRS_THINKING_OPTION_ID)
+            .unwrap();
+
+        assert_eq!(thinking.category.as_deref(), Some("thought_level"));
+        assert_eq!(thinking.current_value.as_deref(), Some("enabled"));
+        assert_eq!(
+            thinking
+                .options
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["enabled", "disabled"]
+        );
+    }
+
+    #[tokio::test]
+    async fn glm_52_thinking_can_be_disabled_for_the_next_request() {
+        let agent = AionrsAgentManager::new("conv-glm".into(), "/project".into(), make_glm_52_test_config(), None)
+            .await
+            .unwrap();
+
+        let response = agent
+            .set_config_option(AIONRS_THINKING_OPTION_ID, "disabled")
+            .await
+            .unwrap();
+        assert_eq!(response.confirmation, ConfigOptionConfirmation::Observed);
+        let thinking = response
+            .config_options
+            .unwrap()
+            .into_iter()
+            .find(|option| option.id == AIONRS_THINKING_OPTION_ID)
+            .unwrap();
+
+        assert_eq!(thinking.current_value.as_deref(), Some("disabled"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_thinking_values_are_rejected() {
+        let agent = AionrsAgentManager::new("conv-glm".into(), "/project".into(), make_glm_52_test_config(), None)
+            .await
+            .unwrap();
+
+        let error = agent
+            .set_config_option(AIONRS_THINKING_OPTION_ID, "auto")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("is not selectable"));
     }
 
     #[test]
