@@ -10,10 +10,12 @@ use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{
-    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, BuildTaskOptions, CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData,
+    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, AIONUI_RUNTIME_TOKEN_ENV, BuildTaskOptions,
+    CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData,
 };
 use aionui_ai_agent::{
     AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
+    RuntimeTokenService,
 };
 
 use aionui_api_types::{
@@ -5640,6 +5642,43 @@ async fn warmup_injects_conversation_runtime_context() {
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
     assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
+async fn warmup_injects_runtime_token_for_mcp_team_conversation() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let svc = svc.with_runtime_token_service(Arc::new(RuntimeTokenService::new()));
+    let mut req = make_create_req();
+    req.extra = serde_json::json!({
+        "teamId": "team-1",
+        "slot_id": "slot-1",
+        "role": "lead",
+        "team_mcp_stdio_config": {
+            "team_id": "team-1",
+            "port": 4242,
+            "token": "mcp-token",
+            "slot_id": "slot-1",
+            "binary_path": "/tmp/aioncore"
+        }
+    });
+    let conv = svc.create("user_1", req).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.warmup("user_1", &conv.id, &task_mgr_dyn).await.unwrap();
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    assert!(
+        options[0]
+            .context
+            .runtime_env
+            .iter()
+            .any(|(key, value)| key == AIONUI_RUNTIME_TOKEN_ENV && !value.is_empty()),
+        "MCP Team conversations should receive AIONUI_RUNTIME_TOKEN for CLI fallback"
+    );
 }
 
 #[tokio::test]

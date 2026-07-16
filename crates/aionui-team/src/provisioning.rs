@@ -971,10 +971,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn team_tool_transport_prefers_mcp_for_whitelisted_backend() {
+    async fn team_tool_transport_prefers_mcp_for_builtin_aionrs_backend() {
         let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
         let mut agent = test_agent();
-        agent.backend = "claude".into();
+        agent.backend = "aionrs".into();
 
         let transport = provisioner.team_tool_transport(&agent).await.unwrap();
 
@@ -1016,10 +1016,12 @@ mod tests {
             kill_started: kill_started_tx,
             release_kill: release_kill_rx,
         });
+        let mut agent = test_agent();
+        agent.backend = "aionrs".into();
 
         let attach = tokio::spawn(async move {
             provisioner
-                .attach_agent_process("user-1", &test_agent(), test_mcp_config(), &task_manager)
+                .attach_agent_process("user-1", &agent, test_mcp_config(), &task_manager)
                 .await
         });
         while !*kill_started_rx.borrow() {

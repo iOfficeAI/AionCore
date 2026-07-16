@@ -20,6 +20,9 @@ fn render_mcp_usage(role: TeamPromptRole, descriptors: &[TeamToolDescriptor]) ->
 Your platform may provide similarly named built-in tools. Do NOT use those.\n\
 Always use the `team_*` MCP tool versions.\n\
 Use `slot_id` values for all agent targets.\n\n\
+If a `team_*` MCP tool call fails due to schema, unknown tool, or permission errors,\n\
+use \"$AIONUI_HELPER_BIN\" team capabilities or \"$AIONUI_HELPER_BIN\" team help to inspect the Team CLI contract,\n\
+then retry the MCP tool call with corrected arguments.\n\n\
 For exact schema, run team capabilities.\n\n\
 | When | MCP tool | Input summary |\n\
 | --- | --- | --- |\n",
@@ -87,6 +90,7 @@ mod tests {
         let usage = build_team_tool_usage(TeamPromptRole::Lead, TeamToolTransport::Mcp);
         assert!(usage.contains("team_*` MCP tools"));
         assert!(usage.contains("team_spawn_agent"));
-        assert!(!usage.contains("\"$AIONUI_HELPER_BIN\" team"));
+        assert!(usage.contains("\"$AIONUI_HELPER_BIN\" team capabilities"));
+        assert!(usage.contains("retry the MCP tool call"));
     }
 }

@@ -1708,7 +1708,7 @@ async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
             "user1",
             CreateTeamRequest {
                 name: "Recover Teammate".into(),
-                agents: two_agent_input(),
+                agents: aionrs_two_agent_input(),
                 workspace: None,
             },
         )
@@ -2016,6 +2016,16 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
             conversation_id: None,
         },
     ]
+}
+
+fn aionrs_two_agent_input() -> Vec<TeamAgentInput> {
+    two_agent_input()
+        .into_iter()
+        .map(|mut agent| {
+            agent.backend = Some("aionrs".into());
+            agent
+        })
+        .collect()
 }
 
 fn team_agent_input(name: &str, role: &str, model: &str) -> TeamAgentInput {
@@ -5600,7 +5610,7 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
             "user1",
             CreateTeamRequest {
                 name: "T".into(),
-                agents: two_agent_input(),
+                agents: aionrs_two_agent_input(),
                 workspace: None,
             },
         )

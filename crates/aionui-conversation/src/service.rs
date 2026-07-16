@@ -3265,10 +3265,7 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
     ) -> Option<String> {
-        let team = build_opts.context.team.as_ref()?;
-        if team.mcp.is_some() {
-            return None;
-        }
+        build_opts.context.team.as_ref()?;
         let service = self.runtime_token_service.as_ref()?;
         let issue = service.issue(
             user_id,

@@ -111,12 +111,12 @@ pub struct ShutdownAgentInput {
 }
 
 // ---------------------------------------------------------------------------
-// Backend whitelist for spawn_agent (hard whitelist only — synchronous fast-path).
+// Built-in backend predicate for spawn_agent (synchronous fast-path).
 // Dynamic capability check (MCP-based) happens in TeamSession::spawn_agent.
 // ---------------------------------------------------------------------------
 
-pub fn is_whitelisted_backend(backend: &str) -> bool {
-    aionui_common::constants::TEAM_CAPABLE_BACKENDS.contains(&backend)
+pub fn is_builtin_mcp_backend(backend: &str) -> bool {
+    backend == aionui_common::constants::AIONRS_RUNTIME_BACKEND
 }
 
 // ---------------------------------------------------------------------------
@@ -343,11 +343,12 @@ mod tests {
     }
 
     #[test]
-    fn whitelist_check() {
-        assert!(is_whitelisted_backend("claude"));
-        assert!(is_whitelisted_backend("codex"));
-        assert!(!is_whitelisted_backend("gpt"));
-        assert!(!is_whitelisted_backend(""));
+    fn builtin_mcp_backend_check() {
+        assert!(is_builtin_mcp_backend("aionrs"));
+        assert!(!is_builtin_mcp_backend("claude"));
+        assert!(!is_builtin_mcp_backend("codex"));
+        assert!(!is_builtin_mcp_backend("gpt"));
+        assert!(!is_builtin_mcp_backend(""));
     }
 
     #[test]
