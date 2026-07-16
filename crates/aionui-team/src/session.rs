@@ -610,9 +610,11 @@ impl TeamSession {
             slot_id: to_slot_id.to_owned(),
             role: target_role_for(to_agent.role),
             source: WorkSource::McpSendMessage,
-            binding: CausalBinding::InheritRunningBatch {
-                caller_slot_id: from_slot_id.to_owned(),
-            },
+            // A teammate message must wake its target even after the previous
+            // user-visible run has settled. Preserve run causality when one
+            // exists, otherwise enqueue background work instead of rejecting
+            // the message for lacking an active run.
+            binding: CausalBinding::ActiveRunOrBackground,
         })?;
         let mailbox_message = match self
             .mailbox

@@ -39,7 +39,7 @@ use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
-use crate::types::{Team, TeamAgent, TeammateRole};
+use crate::types::{TaskStatus, Team, TeamAgent, TeammateRole};
 use crate::work_coordinator::RuntimeConstraint;
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
@@ -1751,6 +1751,29 @@ impl TeamSessionService {
                 continue;
             }
 
+            // A team may have no currently-running turn while work is still
+            // assigned on the task board. Do not tear down its session in
+            // that gap: task-board work needs the live MCP/event-loop path to
+            // deliver a wake message to its owner. Fail closed if the board
+            // cannot be read.
+            let has_active_board_work = session
+                .task_board()
+                .list_tasks(&team_id)
+                .await
+                .map(|tasks| {
+                    tasks
+                        .iter()
+                        .any(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::InProgress))
+                })
+                .unwrap_or(true);
+            if has_active_board_work {
+                debug!(
+                    team_id,
+                    matched_idle_count, "team idle cleanup skipped because task-board work is active"
+                );
+                continue;
+            }
+
             if !agents.iter().all(|agent| {
                 self.task_manager
                     .get_task(&agent.conversation_id)
@@ -1938,7 +1961,6 @@ impl TeamSessionService {
         to_slot_id: &str,
         content: &str,
     ) -> Result<AgentMessageQueueResult, TeamError> {
-        self.require_active_team_run_for_team_work(team_id).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1966,23 +1988,6 @@ impl TeamSessionService {
             Arc::clone(&entry.session)
         };
         session.shutdown_agent(caller_slot_id, target_slot_id, reason).await
-    }
-
-    /// Friendly pre-check used before invoking run-scoped team tools. This is
-    /// not a concurrency guarantee; any operation
-    /// that writes mailbox, projection, scheduler, spawn, shutdown, or wake state
-    /// must still acquire a TeamRun operation lease in TeamSession/TeamRunManager.
-    pub(crate) async fn require_active_team_run_for_team_work(&self, team_id: &str) -> Result<(), TeamError> {
-        let entry = self
-            .sessions
-            .get(team_id)
-            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-        if entry.session.team_run_manager().current_active_run_id().is_some() {
-            return Ok(());
-        }
-        Err(TeamError::InvalidRequest(
-            "no active team run for run-scoped wake".into(),
-        ))
     }
 
     pub(crate) async fn wake_leader_after_recovery_message(
