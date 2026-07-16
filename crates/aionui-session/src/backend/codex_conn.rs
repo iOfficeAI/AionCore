@@ -115,8 +115,15 @@ impl BackendConnection for CodexConnection {
         // not by mutating this open-time snapshot — §5.5.)
         backend.capabilities.current_model = config.model.clone();
         // Present the current mode in the SAME value space as the catalog (frontend-facing
-        // legacy bare token): a persisted colon id (`:danger-full-access` from older data)
-        // is mapped to its bare form so the picker highlights the matching catalog entry.
+        // legacy bare token). `config.mode` can arrive in ANY accepted vocabulary — the
+        // #608 canonical id `agent-full-access` (what `normalize_requested_mode` yields
+        // from a persisted full-access mode on Resume), a legacy alias, or an older
+        // persisted colon id (`:danger-full-access`) — so it must go through the full
+        // inbound→outbound round trip (`mode_to_catalog_value`), not the outbound leg
+        // alone: `profile_id_to_legacy_value` translates only colon ids and would pass
+        // `agent-full-access` through verbatim, a value the catalog never contains
+        // ([read-only, auto, full-access]) → the picker highlights nothing and the
+        // compact pill renders an empty label after "权限 ·".
         //
         // P9 (fresh-session parity): a fresh thread carries no requested tier
         // (`config.mode` None) and `thread/start` launches on codex's workspace-write
@@ -131,7 +138,7 @@ impl BackendConnection for CodexConnection {
         // seeding `auto` for a resumed thread that was actually on another tier would
         // mis-highlight until the notification lands (and Resume's fresh currentModeId is
         // not live-verified). Resume therefore keeps only the normalized persisted value.
-        let normalized_config_mode = config.mode.as_deref().map(codex_perm::profile_id_to_legacy_value);
+        let normalized_config_mode = config.mode.as_deref().map(codex_perm::mode_to_catalog_value);
         backend.capabilities.current_mode = match &spec {
             SessionSpec::Fresh { .. } => {
                 normalized_config_mode.or_else(|| Some(codex_perm::profile_id_to_legacy_value(":workspace")))
@@ -1568,6 +1575,23 @@ mod codex_perm {
             ":danger-full-access" => "full-access".to_owned(),
             other => other.to_owned(),
         }
+    }
+
+    /// Present a requested/persisted mode value in the CATALOG vocabulary (legacy bare
+    /// token), whichever accepted vocabulary it arrives in: the inbound leg
+    /// (`normalize_to_profile_id`) buckets canonical/legacy/colon values onto a colon
+    /// profile id, and the outbound leg (`profile_id_to_legacy_value`) maps that id onto
+    /// the bare token the catalog rows carry. Composing the two is what makes the
+    /// `capabilities.current_mode` seed land on a value the picker can highlight —
+    /// notably `agent-full-access` (the #608 canonical id `normalize_requested_mode`
+    /// emits for a resumed full-access conversation, which the outbound leg alone would
+    /// pass through as a token the catalog never contains) → `:danger-full-access` →
+    /// `full-access`. A custom colon profile id round-trips verbatim (both legs pass it
+    /// through), and an unknown bare token lands on the workspace tier's `auto` — the
+    /// same bucketing the SetMode APPLY path uses, so the displayed tier cannot drift
+    /// from the tier that would be applied.
+    pub(super) fn mode_to_catalog_value(mode: &str) -> String {
+        profile_id_to_legacy_value(&normalize_to_profile_id(mode))
     }
 
     /// Friendly display `(name, description)` for a built-in codex permission profile.
@@ -6075,6 +6099,37 @@ mod tests {
         assert_eq!(codex_perm::normalize_to_profile_id("  :read-only  "), ":read-only");
         // A degenerate bare colon is nonsense → safe default, not a passthrough of ":".
         assert_eq!(codex_perm::normalize_to_profile_id(":"), ":workspace");
+    }
+
+    /// UT-1c: `mode_to_catalog_value` — the `capabilities.current_mode` seed translation —
+    /// lands EVERY accepted mode vocabulary on a catalog value the picker can highlight.
+    /// Regression pin for the empty-permission-label bug: resuming an old codex
+    /// conversation feeds the #608 canonical id `agent-full-access` (produced by
+    /// `normalize_requested_mode` from the persisted mode) into the seed; the outbound
+    /// leg alone passed it through verbatim, the catalog only carries
+    /// [read-only, auto, full-access], and the frontend rendered "权限 ·" with an empty
+    /// label for a current value that matches no option.
+    #[test]
+    fn codex_perm_mode_to_catalog_value_lands_on_catalog_vocabulary() {
+        // The bug's exact input: canonical full-access id → the catalog's bare token.
+        assert_eq!(codex_perm::mode_to_catalog_value("agent-full-access"), "full-access");
+        // Legacy full-access aliases collapse onto the same catalog value.
+        for legacy in ["full-access", "yolo", "yoloNoSandbox"] {
+            assert_eq!(codex_perm::mode_to_catalog_value(legacy), "full-access");
+        }
+        // The other two built-in tiers, in both bare and colon form.
+        assert_eq!(codex_perm::mode_to_catalog_value("read-only"), "read-only");
+        assert_eq!(codex_perm::mode_to_catalog_value(":read-only"), "read-only");
+        assert_eq!(codex_perm::mode_to_catalog_value("auto"), "auto");
+        assert_eq!(codex_perm::mode_to_catalog_value("default"), "auto");
+        assert_eq!(codex_perm::mode_to_catalog_value(":workspace"), "auto");
+        // Older persisted colon id for full access (pre-existing seed behavior kept).
+        assert_eq!(codex_perm::mode_to_catalog_value(":danger-full-access"), "full-access");
+        // A custom profile id round-trips colon-and-all — it IS its own catalog value.
+        assert_eq!(codex_perm::mode_to_catalog_value(":team-review"), ":team-review");
+        // Unknown bare tokens land on the workspace tier's value, mirroring the SetMode
+        // apply path's bucketing so display and applied tier cannot drift.
+        assert_eq!(codex_perm::mode_to_catalog_value("anything-unknown"), "auto");
     }
 
     /// feature 012 UT-2: an empty `permissionProfile/list` (older codex or drift) leaves
