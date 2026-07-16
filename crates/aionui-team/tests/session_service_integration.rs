@@ -4676,6 +4676,85 @@ async fn an1_rename_agent() {
 }
 
 #[tokio::test]
+async fn observed_model_switch_updates_team_roster_runtime_seed_and_live_session() {
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), seeded_agent_metadata_repo());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .unwrap();
+
+    svc.update_agent_model("user1", &created.id, &worker.slot_id, "gpt-5.6-sol")
+        .await
+        .unwrap();
+
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, "gpt-5.6-sol");
+    let extra = conv_repo.get_extra(&worker.conversation_id).unwrap();
+    assert_eq!(extra["current_model_id"], "gpt-5.6-sol");
+    let live_worker = svc
+        .get_session_scheduler(&created.id)
+        .unwrap()
+        .get_agent(&worker.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(live_worker.model, "gpt-5.6-sol");
+}
+
+#[tokio::test]
+async fn update_agent_model_rejects_an_empty_model_without_changing_the_roster() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .unwrap();
+
+    let error = svc
+        .update_agent_model("user1", &created.id, &worker.slot_id, "  ")
+        .await
+        .expect_err("empty model must be rejected");
+
+    assert!(error.to_string().contains("model must not be empty"));
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, worker.model);
+}
+
+#[tokio::test]
 async fn an3_rename_nonexistent_agent() {
     let svc = setup();
     let created = svc
@@ -4887,7 +4966,7 @@ async fn leader_spawn_then_immediate_ensure_joins_the_same_attach_operation() {
 }
 
 #[tokio::test]
-async fn lead_send_agent_message_in_session_requires_active_team_run() {
+async fn lead_send_agent_message_in_session_queues_without_active_team_run() {
     let svc = setup();
     let created = svc
         .create_team(
@@ -4916,11 +4995,11 @@ async fn lead_send_agent_message_in_session_requires_active_team_run() {
         .map(|agent| agent.slot_id.clone())
         .expect("seeded teammate slot");
 
-    let err = svc
+    let queued = svc
         .send_agent_message_from_agent(&created.id, &lead_slot_id, &worker_slot_id, "Do this")
         .await
-        .expect_err("leader direct message should require active Team Run");
-    assert!(err.to_string().contains("no active team run"));
+        .expect("leader direct message should queue outside an active Team Run");
+    assert_eq!(queued.team_run_id, None);
 }
 
 #[tokio::test]

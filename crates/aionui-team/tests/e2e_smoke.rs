@@ -277,7 +277,7 @@ async fn smoke_mcp_tool_execution_not_noop() {
     let env = setup_team_with_lead().await;
     let mut stream = mcp_connect(&env, &env.lead_slot_id).await;
 
-    // --- team_send_message requires a live active Team Run ----------------
+    // --- team_send_message requires a live TeamSessionService -------------
     let msg_resp = mcp_call(
         &mut stream,
         10,
