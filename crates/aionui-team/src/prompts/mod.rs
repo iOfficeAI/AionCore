@@ -140,7 +140,7 @@ pub fn build_wake_payload(agent: &TeamAgent, tasks: &[TeamTask], unread_messages
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TeammateRole;
+    use crate::types::{TaskStatus, TeammateRole};
 
     fn make_lead() -> TeamAgent {
         TeamAgent {
