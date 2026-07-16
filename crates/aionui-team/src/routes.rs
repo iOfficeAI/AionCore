@@ -52,7 +52,7 @@ impl From<TeamError> for ApiError {
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
-            TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
+            TeamError::BlockedTaskNotFound(msg) | TeamError::TaskDependencyCycle(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
             TeamError::DuplicateAgentName(msg) => ApiError::BadRequest(format!("Agent name already taken: {msg}")),
             TeamError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),

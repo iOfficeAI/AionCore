@@ -111,12 +111,7 @@ pub fn build_wake_payload(agent: &TeamAgent, tasks: &[TeamTask], unread_messages
         payload.push_str("| ID | Subject | Status | Owner | Blocked By |\n");
         payload.push_str("|---|---|---|---|---|\n");
         for task in tasks {
-            let status = match task.status {
-                TaskStatus::Pending => "pending",
-                TaskStatus::InProgress => "in_progress",
-                TaskStatus::Completed => "completed",
-                TaskStatus::Deleted => "deleted",
-            };
+            let status = task.status.to_string();
             let owner = task.owner.as_deref().unwrap_or("-");
             let blocked = if task.blocked_by.is_empty() {
                 "-".to_owned()

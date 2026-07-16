@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aionui_common::{generate_id, now_ms};
@@ -79,6 +80,10 @@ impl TaskBoard {
             .await?
             .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
 
+        if let Some(blocked_by) = update.blocked_by.as_deref() {
+            self.validate_dependencies(team_id, task_id, blocked_by).await?;
+        }
+
         let params = UpdateTaskParams {
             status: update.status.map(|s| s.to_string()),
             description: update.description.clone(),
@@ -104,6 +109,31 @@ impl TaskBoard {
         TeamTask::from_row(&updated).map_err(TeamError::Json)
     }
 
+    async fn validate_dependencies(
+        &self,
+        team_id: &str,
+        task_id: &str,
+        blocked_by: &[String],
+    ) -> Result<(), TeamError> {
+        let rows = self.repo.list_tasks(team_id).await?;
+        let mut graph = HashMap::with_capacity(rows.len());
+        for row in rows {
+            graph.insert(row.id, serde_json::from_str::<Vec<String>>(&row.blocked_by)?);
+        }
+
+        for dependency_id in blocked_by {
+            if !graph.contains_key(dependency_id) {
+                return Err(TeamError::BlockedTaskNotFound(dependency_id.clone()));
+            }
+            if dependency_id == task_id || depends_on(&graph, dependency_id, task_id) {
+                return Err(TeamError::TaskDependencyCycle(format!(
+                    "adding {dependency_id} as a dependency of {task_id} would create a cycle"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTask>, TeamError> {
         let rows = self.repo.list_tasks(team_id).await?;
         let tasks = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
@@ -124,6 +154,24 @@ impl TaskBoard {
         }
         Ok(())
     }
+}
+
+fn depends_on(graph: &HashMap<String, Vec<String>>, start: &str, target: &str) -> bool {
+    let mut pending = vec![start.to_owned()];
+    let mut visited = HashSet::new();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        let Some(dependencies) = graph.get(&current) else {
+            continue;
+        };
+        if dependencies.iter().any(|dependency| dependency == target) {
+            return true;
+        }
+        pending.extend(dependencies.iter().cloned());
+    }
+    false
 }
 
 #[cfg(test)]
@@ -189,6 +237,54 @@ mod tests {
 
         let result = board.create_task("t1", "X", None, None, &["nonexistent".into()]).await;
         assert!(matches!(result, Err(TeamError::BlockedTaskNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn update_task_rejects_self_dependency() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let board = TaskBoard::new(repo);
+        let task = create_simple_task(&board, "t1", "Task A").await;
+
+        let result = board
+            .update_task(
+                "t1",
+                &task.id,
+                &TaskUpdate {
+                    blocked_by: Some(vec![task.id.clone()]),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(TeamError::TaskDependencyCycle(_))));
+    }
+
+    #[tokio::test]
+    async fn update_task_rejects_transitive_dependency_cycle() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let board = TaskBoard::new(repo);
+        let task_a = create_simple_task(&board, "t1", "Task A").await;
+        let task_b = board
+            .create_task("t1", "Task B", None, None, std::slice::from_ref(&task_a.id))
+            .await
+            .unwrap();
+        let task_c = board
+            .create_task("t1", "Task C", None, None, std::slice::from_ref(&task_b.id))
+            .await
+            .unwrap();
+
+        let result = board
+            .update_task(
+                "t1",
+                &task_a.id,
+                &TaskUpdate {
+                    blocked_by: Some(vec![task_c.id]),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(TeamError::TaskDependencyCycle(_))));
     }
 
     #[tokio::test]

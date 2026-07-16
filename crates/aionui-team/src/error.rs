@@ -29,6 +29,9 @@ pub enum TeamError {
     #[error("Blocked task not found: {0}")]
     BlockedTaskNotFound(String),
 
+    #[error("Task dependency cycle: {0}")]
+    TaskDependencyCycle(String),
+
     #[error("Backend not allowed: {0}")]
     BackendNotAllowed(String),
 

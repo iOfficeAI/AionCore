@@ -230,8 +230,16 @@ pub struct MailboxMessage {
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
+    Ready,
+    Claimed,
     InProgress,
+    WaitingApproval,
+    Verifying,
+    Review,
+    Rework,
     Completed,
+    Failed,
+    Cancelled,
     Deleted,
 }
 
@@ -239,8 +247,16 @@ impl fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pending => write!(f, "pending"),
+            Self::Ready => write!(f, "ready"),
+            Self::Claimed => write!(f, "claimed"),
             Self::InProgress => write!(f, "in_progress"),
+            Self::WaitingApproval => write!(f, "waiting_approval"),
+            Self::Verifying => write!(f, "verifying"),
+            Self::Review => write!(f, "review"),
+            Self::Rework => write!(f, "rework"),
             Self::Completed => write!(f, "completed"),
+            Self::Failed => write!(f, "failed"),
+            Self::Cancelled => write!(f, "cancelled"),
             Self::Deleted => write!(f, "deleted"),
         }
     }
@@ -250,8 +266,16 @@ impl TaskStatus {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),
+            "ready" => Some(Self::Ready),
+            "claimed" => Some(Self::Claimed),
             "in_progress" => Some(Self::InProgress),
+            "waiting_approval" => Some(Self::WaitingApproval),
+            "verifying" => Some(Self::Verifying),
+            "review" => Some(Self::Review),
+            "rework" => Some(Self::Rework),
             "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
             "deleted" => Some(Self::Deleted),
             _ => None,
         }
