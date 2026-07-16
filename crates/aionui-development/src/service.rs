@@ -210,6 +210,53 @@ impl DevelopmentService {
         Ok(self.development_repo.list_tasks(run_id).await?)
     }
 
+    pub async fn transition_task(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        task_id: &str,
+        target: &str,
+    ) -> Result<DevelopmentTaskRow, DevelopmentError> {
+        self.get_run(user_id, run_id).await?;
+        let task = self
+            .development_repo
+            .get_task(run_id, task_id)
+            .await?
+            .ok_or_else(|| DevelopmentError::NotFound(format!("task {task_id}")))?;
+        if target == "completed" {
+            return Err(DevelopmentError::BadRequest(
+                "use the completion endpoint so quality evidence can be verified".into(),
+            ));
+        }
+        if !valid_task_transition(&task.status, target) {
+            return Err(DevelopmentError::Conflict(format!(
+                "task cannot transition from {} to {target}",
+                task.status
+            )));
+        }
+        if matches!(target, "ready" | "claimed" | "in_progress") {
+            let dependencies: Vec<String> = serde_json::from_str(&task.blocked_by)
+                .map_err(|error| DevelopmentError::Internal(error.to_string()))?;
+            let all_tasks = self.development_repo.list_tasks(run_id).await?;
+            if dependencies.iter().any(|dependency| {
+                !all_tasks
+                    .iter()
+                    .any(|candidate| candidate.id == *dependency && candidate.status == "completed")
+            }) {
+                return Err(DevelopmentError::Conflict(
+                    "task still has incomplete dependencies".into(),
+                ));
+            }
+        }
+        self.development_repo
+            .update_task_state(run_id, task_id, target, &task.review_status, &task.verification_status)
+            .await?;
+        self.development_repo
+            .get_task(run_id, task_id)
+            .await?
+            .ok_or_else(|| DevelopmentError::NotFound(format!("task {task_id}")))
+    }
+
     pub async fn create_artifact(
         &self,
         user_id: &str,
@@ -714,6 +761,33 @@ fn validate_artifact_type(value: &str) -> Result<(), DevelopmentError> {
             "unsupported artifact type: {value}"
         )))
     }
+}
+
+fn valid_task_transition(current: &str, target: &str) -> bool {
+    matches!(
+        (current, target),
+        ("pending", "ready")
+            | ("pending", "cancelled")
+            | ("ready", "claimed")
+            | ("ready", "cancelled")
+            | ("claimed", "in_progress")
+            | ("claimed", "cancelled")
+            | ("in_progress", "waiting_approval")
+            | ("in_progress", "verifying")
+            | ("in_progress", "review")
+            | ("in_progress", "failed")
+            | ("in_progress", "cancelled")
+            | ("waiting_approval", "in_progress")
+            | ("waiting_approval", "cancelled")
+            | ("verifying", "review")
+            | ("verifying", "rework")
+            | ("verifying", "failed")
+            | ("review", "rework")
+            | ("review", "cancelled")
+            | ("rework", "claimed")
+            | ("rework", "in_progress")
+            | ("rework", "cancelled")
+    )
 }
 
 fn command_for_gate<'a>(profile: &'a ProjectCommandProfileRow, gate_type: &str) -> Option<&'a str> {

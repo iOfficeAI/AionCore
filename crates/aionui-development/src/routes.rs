@@ -14,7 +14,7 @@ use crate::error::DevelopmentError;
 use crate::service::{CompletionEvaluation, DevelopmentService};
 use crate::types::{
     AssignDevelopmentRoleInput, CreateArtifactInput, CreateDevelopmentRunInput, CreateDevelopmentTaskInput,
-    ExecuteQualityGateInput, ResolveFindingInput, SubmitReviewInput,
+    ExecuteQualityGateInput, ResolveFindingInput, SubmitReviewInput, TransitionDevelopmentTaskInput,
 };
 
 impl From<DevelopmentError> for ApiError {
@@ -58,6 +58,10 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
         .route(
             "/api/development-runs/{run_id}/tasks/{task_id}/completion",
             get(evaluate_completion).post(complete_task),
+        )
+        .route(
+            "/api/development-runs/{run_id}/tasks/{task_id}/transition",
+            post(transition_task),
         )
         .route(
             "/api/development-runs/{run_id}/artifacts",
@@ -197,6 +201,22 @@ async fn complete_task(
         state
             .service
             .complete_task(&user.id, &run_id, &task_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn transition_task(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((run_id, task_id)): Path<(String, String)>,
+    body: Result<Json<TransitionDevelopmentTaskInput>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentTaskRow>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .transition_task(&user.id, &run_id, &task_id, &input.status)
             .await
             .map_err(ApiError::from)?,
     )))

@@ -427,3 +427,69 @@ async fn artifact_registration_rejects_outside_paths_and_forged_checksums() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn task_state_machine_rejects_skips_and_completion_bypass() {
+    let project = tempfile::tempdir().unwrap();
+    let (service, _artifacts) = setup(project.path().to_str().unwrap()).await;
+    let run = service
+        .create_run(
+            "user-1",
+            CreateDevelopmentRunInput {
+                project_id: "project-1".into(),
+                team_id: None,
+                source_channel: None,
+                source_user_id: None,
+                execution_mode: "single".into(),
+                request_summary: "State machine".into(),
+                acceptance_criteria: vec!["controlled".into()],
+            },
+        )
+        .await
+        .unwrap();
+    let task = service
+        .create_task(
+            "user-1",
+            &run.id,
+            CreateDevelopmentTaskInput {
+                subject: "Implement".into(),
+                description: None,
+                owner: None,
+                blocked_by: vec![],
+                acceptance_criteria: vec!["controlled".into()],
+                task_type: "implementation".into(),
+                risk_level: "medium".into(),
+                assigned_workspace_lease_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        service
+            .transition_task("user-1", &run.id, &task.id, "in_progress")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        service
+            .transition_task("user-1", &run.id, &task.id, "claimed")
+            .await
+            .unwrap()
+            .status,
+        "claimed"
+    );
+    assert_eq!(
+        service
+            .transition_task("user-1", &run.id, &task.id, "in_progress")
+            .await
+            .unwrap()
+            .status,
+        "in_progress"
+    );
+    assert!(
+        service
+            .transition_task("user-1", &run.id, &task.id, "completed")
+            .await
+            .is_err()
+    );
+}

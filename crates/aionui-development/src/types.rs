@@ -88,3 +88,8 @@ pub struct AssignDevelopmentRoleInput {
     pub slot_id: String,
     pub role: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitionDevelopmentTaskInput {
+    pub status: String,
+}
