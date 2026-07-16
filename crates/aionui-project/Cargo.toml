@@ -7,7 +7,10 @@ license.workspace = true
 [dependencies]
 aionui-common.workspace = true
 aionui-db.workspace = true
+aionui-api-types.workspace = true
+aionui-auth.workspace = true
 async-trait.workspace = true
+axum.workspace = true
 git2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -17,5 +20,7 @@ uuid.workspace = true
 which.workspace = true
 
 [dev-dependencies]
+http-body-util.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
+tower = { workspace = true, features = ["util"] }

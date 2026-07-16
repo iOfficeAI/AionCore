@@ -28,11 +28,12 @@ use aionui_db::models::MessageRow;
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
-    IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository, IProviderRepository,
-    MessagePageDirection, MessagePageParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
-    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
-    SqliteConversationRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository, IProjectRepository,
+    IProviderRepository, ITeamRepository, MessagePageDirection, MessagePageParams, SqliteAcpSessionRepository,
+    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
+    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteProjectRepository, SqliteProviderRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteTeamRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -46,6 +47,9 @@ use aionui_mcp::{
 };
 use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
+};
+use aionui_project::{
+    AgentCapabilitySnapshot, ProjectAgentCapabilityPort, ProjectError, ProjectRouterState, ProjectService,
 };
 use aionui_realtime::{NoopMessageRouter, WsHandlerState};
 use aionui_shell::ShellRouterState;
@@ -70,6 +74,54 @@ struct ChannelTeamDirectoryAdapter {
 struct ChannelPersonalDirectoryAdapter {
     conversation_repo: Arc<dyn IConversationRepository>,
     owner_user_id: String,
+}
+
+struct ProjectAgentCapabilityAdapter {
+    service: Arc<AgentService>,
+}
+
+#[async_trait::async_trait]
+impl ProjectAgentCapabilityPort for ProjectAgentCapabilityAdapter {
+    async fn snapshot(&self, id: &str, refresh: bool) -> Result<Option<AgentCapabilitySnapshot>, ProjectError> {
+        let row = if refresh {
+            match self.service.health_check_agent_by_id(id).await {
+                Ok(row) => Some(row),
+                Err(aionui_ai_agent::AgentError::NotFound(_)) => None,
+                Err(error) => return Err(ProjectError::Internal(error.to_string())),
+            }
+        } else {
+            self.service
+                .list_management_agents()
+                .await
+                .map_err(|error| ProjectError::Internal(error.to_string()))?
+                .into_iter()
+                .find(|row| row.id == id)
+        };
+        Ok(row.map(agent_management_row_to_project_snapshot))
+    }
+}
+
+fn serialized_enum<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn agent_management_row_to_project_snapshot(row: aionui_api_types::AgentManagementRow) -> AgentCapabilitySnapshot {
+    AgentCapabilitySnapshot {
+        id: row.id,
+        enabled: row.enabled,
+        installed: row.installed,
+        status: serialized_enum(&row.status),
+        last_check_status: row.last_check_status.as_ref().map(serialized_enum),
+        last_check_at: row.last_check_at,
+        last_success_at: row.last_success_at,
+        agent_capabilities: row.agent_capabilities,
+        available_models: row.available_models,
+        available_modes: row.available_modes,
+        available_commands: row.available_commands,
+    }
 }
 
 #[async_trait::async_trait]
@@ -448,6 +500,7 @@ pub struct ModuleStates {
     pub channel: ChannelRouterState,
     pub team: TeamRouterState,
     pub cron: CronRouterState,
+    pub project: ProjectRouterState,
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
@@ -579,6 +632,10 @@ pub async fn build_module_states(
         .with_agent_availability_feedback(agent_service.availability_feedback_port());
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: agent service built");
 
+    let project = build_module_state_phase(&boot, "project", || {
+        build_project_state(services, agent_service.clone())
+    });
+
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module states bundle started"
@@ -595,7 +652,7 @@ pub async fn build_module_states(
         remote_agent: build_module_state_phase(&boot, "remote_agent", || build_remote_agent_state(services)),
         agent: build_module_state_phase(&boot, "agent", || AgentRouterState {
             agent_registry: services.agent_registry.clone(),
-            service: agent_service,
+            service: agent_service.clone(),
         }),
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
@@ -606,6 +663,7 @@ pub async fn build_module_states(
         channel: channel_state,
         team: team_state,
         cron,
+        project,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
@@ -621,6 +679,23 @@ pub async fn build_module_states(
         .await;
 
     Ok((states, channel_components))
+}
+
+fn build_project_state(services: &AppServices, agent_service: Arc<AgentService>) -> ProjectRouterState {
+    let pool = services.database.pool().clone();
+    let project_repo: Arc<dyn IProjectRepository> = Arc::new(SqliteProjectRepository::new(pool.clone()));
+    let conversation_repo: Arc<dyn IConversationRepository> = Arc::new(SqliteConversationRepository::new(pool.clone()));
+    let team_repo: Arc<dyn ITeamRepository> = Arc::new(SqliteTeamRepository::new(pool));
+    let agent_port: Arc<dyn ProjectAgentCapabilityPort> =
+        Arc::new(ProjectAgentCapabilityAdapter { service: agent_service });
+    ProjectRouterState {
+        service: Arc::new(ProjectService::new(
+            project_repo,
+            conversation_repo,
+            team_repo,
+            agent_port,
+        )),
+    }
 }
 
 /// Build the default `AssistantRouterState` from application services.

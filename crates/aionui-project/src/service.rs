@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aionui_common::now_ms;
-use aionui_db::models::{ProjectCommandProfileRow, ProjectRow, ProjectRuntimeProfileRow};
+use aionui_db::models::{ProjectCommandProfileRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow};
 use aionui_db::{IConversationRepository, IProjectRepository, ITeamRepository, UpdateProjectParams};
 
 use crate::error::ProjectError;
@@ -126,6 +126,17 @@ impl ProjectService {
         Ok(row)
     }
 
+    pub async fn get_command_profile(
+        &self,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<ProjectCommandProfileRow, ProjectError> {
+        self.project_repo
+            .get_command_profile(project_id, user_id)
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("command profile for project {project_id}")))
+    }
+
     pub async fn upsert_runtime_profile(
         &self,
         user_id: &str,
@@ -153,6 +164,17 @@ impl ProjectService {
         };
         self.project_repo.upsert_runtime_profile(&row).await?;
         Ok(row)
+    }
+
+    pub async fn get_runtime_profile(
+        &self,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<ProjectRuntimeProfileRow, ProjectError> {
+        self.project_repo
+            .get_runtime_profile(project_id, user_id)
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("runtime profile for project {project_id}")))
     }
 
     pub async fn bind_resource(
@@ -183,6 +205,32 @@ impl ProjectService {
             .bind_resource(project_id, user_id, resource_type, resource_id)
             .await?;
         Ok(())
+    }
+
+    pub async fn list_resource_links(
+        &self,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<Vec<ProjectResourceLinkRow>, ProjectError> {
+        self.get(user_id, project_id).await?;
+        Ok(self.project_repo.list_resource_links(project_id, user_id).await?)
+    }
+
+    pub async fn get_for_resource(
+        &self,
+        user_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<ProjectRow, ProjectError> {
+        if !matches!(resource_type, "conversation" | "team") {
+            return Err(ProjectError::BadRequest(format!(
+                "unsupported resource type: {resource_type}"
+            )));
+        }
+        self.project_repo
+            .get_for_resource(user_id, resource_type, resource_id)
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("project for {resource_type} {resource_id}")))
     }
 
     pub async fn preflight(
