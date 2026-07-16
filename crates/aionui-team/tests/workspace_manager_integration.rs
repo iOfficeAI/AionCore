@@ -142,6 +142,43 @@ async fn cleanup_preserves_dirty_worktree_and_reconcile_marks_missing_path() {
 }
 
 #[tokio::test]
+async fn cleanup_removes_clean_worktree_but_retains_branch_with_commits() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = initialized_repo(temp.path());
+    let (manager, _db) = manager(temp.path()).await;
+    let plan = manager
+        .prepare_team(
+            "user-1",
+            "team-commits",
+            source.to_str().unwrap(),
+            &[WorkspaceAgentSpec::new("slot-1", "Lead")],
+        )
+        .await
+        .unwrap();
+    let agent = &plan.agent_leases[0];
+    let worktree = Path::new(&agent.worktree_path);
+    fs::write(worktree.join("committed.txt"), "preserve branch\n").unwrap();
+    git(worktree, &["add", "committed.txt"]);
+    git(worktree, &["commit", "-m", "agent change"]);
+
+    let cleanup = manager.release_slot("team-commits", "slot-1").await.unwrap();
+    assert_eq!(cleanup.disposition, WorkspaceCleanupDisposition::BranchRetained);
+    assert!(!worktree.exists());
+    git(
+        &source,
+        &["show-ref", "--verify", &format!("refs/heads/{}", agent.branch_name)],
+    );
+    let lease = manager
+        .list_team_leases("team-commits")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|lease| lease.slot_id == "slot-1")
+        .unwrap();
+    assert_eq!(lease.cleanup_status, "branch_retained");
+}
+
+#[tokio::test]
 async fn owned_path_validation_rejects_traversal_and_sibling_worktree() {
     let temp = tempfile::tempdir().unwrap();
     let source = initialized_repo(temp.path());
@@ -176,4 +213,19 @@ async fn owned_path_validation_rejects_traversal_and_sibling_worktree() {
             .await
             .is_err()
     );
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            &plan.agent_leases[1].worktree_path,
+            Path::new(&plan.agent_leases[0].worktree_path).join("sibling-link"),
+        )
+        .unwrap();
+        assert!(
+            manager
+                .validate_owned_path("team-paths", "slot-a", Path::new("sibling-link/README.md"))
+                .await
+                .is_err()
+        );
+    }
 }
