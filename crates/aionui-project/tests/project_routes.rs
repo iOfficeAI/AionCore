@@ -192,3 +192,77 @@ async fn project_routes_bind_and_resolve_an_owned_conversation() {
         project_id
     );
 }
+
+#[tokio::test]
+async fn project_routes_replace_an_existing_resource_link() {
+    let (app, temp, db) = app().await;
+    let first_path = temp.path().join("first");
+    let second_path = temp.path().join("second");
+    std::fs::create_dir_all(&first_path).unwrap();
+    std::fs::create_dir_all(&second_path).unwrap();
+
+    async fn create_project(app: &Router, name: &str, local_path: &std::path::Path) -> String {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/projects")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "name": name,
+                    "local_path": local_path,
+                    "project_type": "unknown"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        json(app.clone().oneshot(request).await.unwrap()).await["data"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    let first_id = create_project(&app, "First", &first_path).await;
+    let second_id = create_project(&app, "Second", &second_path).await;
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at) \
+         VALUES ('replace-c1', 'system_default_user', 'Chat', 'chat', '{}', 'pending', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    for project_id in [&first_id, &second_id] {
+        let bind = Request::builder()
+            .method("POST")
+            .uri(format!("/api/projects/{project_id}/links"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"resource_type":"conversation","resource_id":"replace-c1"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(bind).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    let resolve = Request::builder()
+        .uri("/api/projects/by-resource?resource_type=conversation&resource_id=replace-c1")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        json(app.clone().oneshot(resolve).await.unwrap()).await["data"]["id"],
+        second_id
+    );
+
+    let first_links = Request::builder()
+        .uri(format!("/api/projects/{first_id}/links"))
+        .body(Body::empty())
+        .unwrap();
+    assert!(
+        json(app.oneshot(first_links).await.unwrap()).await["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
