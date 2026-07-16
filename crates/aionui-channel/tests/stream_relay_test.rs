@@ -62,7 +62,7 @@ async fn relay_sends_thinking_then_final_message() {
     let edits = recorder.take_edits();
     let last = edits.last().unwrap();
     assert!(last.text.as_deref().unwrap().contains("Hello World"));
-    assert!(last.buttons.is_some());
+    assert!(last.buttons.is_none());
 }
 
 #[tokio::test]

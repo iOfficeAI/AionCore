@@ -3,8 +3,8 @@ use crate::manager::acp::AcpAgentManager;
 use crate::manager::acp::mode_normalize::agent_metadata_uses_meta_resume;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{
-    AgentStreamEvent, AvailableCommandsEventData, ErrorEventData, SessionAssignedEventData, StartEventData, TipType,
-    TipsEventData,
+    AgentStreamEvent, AvailableCommandsEventData, ErrorEventData, SessionAssignedEventData, StartEventData,
+    TextEventData, TipType, TipsEventData,
 };
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::SessionId as DomainSessionId;
@@ -12,12 +12,58 @@ use crate::types::SendMessageData;
 use agent_client_protocol::schema::{ContentBlock, LoadSessionRequest, PromptRequest, SessionId, StopReason};
 use aionui_api_types::SlashCommandItem;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::TryRecvError;
+use tokio::time::sleep;
 
 use super::agent::sdk_to_snake_value;
 use super::agent_close::STDERR_PEEK_LINES;
 use super::error_mapping::{AcpSendFailure, is_acp_session_not_found};
 use tracing::warn;
+
+const OPENCLAW_ACP_FALLBACK_TIMEOUT: Duration = Duration::from_secs(600);
+const OPENCLAW_ACP_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Default)]
+struct OpenClawTrajectoryCheckpoint {
+    offsets: HashMap<PathBuf, u64>,
+}
+
+impl OpenClawTrajectoryCheckpoint {
+    fn capture() -> Self {
+        let mut checkpoint = Self::default();
+        let Some(sessions_dir) = openclaw_sessions_dir() else {
+            return checkpoint;
+        };
+        let Ok(entries) = std::fs::read_dir(sessions_dir) else {
+            return checkpoint;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !file_name.ends_with(".trajectory.jsonl") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            checkpoint.offsets.insert(path, metadata.len());
+        }
+
+        checkpoint
+    }
+
+    fn offset_for(&self, path: &Path) -> u64 {
+        self.offsets.get(path).copied().unwrap_or(0)
+    }
+}
 
 #[derive(Debug)]
 pub(super) enum PromptOutcome {
@@ -252,15 +298,36 @@ impl AcpAgentManager {
         // Scope stderr classification to this prompt so stale lines from an
         // earlier turn cannot override a later benign empty turn.
         self.process.clear_stderr().await;
+        let openclaw_checkpoint = self.is_openclaw_backend().then(OpenClawTrajectoryCheckpoint::capture);
 
-        let prompt_response = self
-            .protocol
-            .prompt(PromptRequest::new(
-                SessionId::new(sid),
-                vec![ContentBlock::from(content)],
-            ))
-            .await
-            .map_err(AcpSendFailure::from)?;
+        let prompt_request = PromptRequest::new(SessionId::new(sid), vec![ContentBlock::from(content)]);
+        let prompt_fut = self.protocol.prompt(prompt_request);
+        tokio::pin!(prompt_fut);
+
+        let prompt_response = if self.is_openclaw_backend() {
+            let fallback_fut = self.wait_for_openclaw_final_text(sid, openclaw_checkpoint.unwrap_or_default());
+            tokio::pin!(fallback_fut);
+
+            tokio::select! {
+                res = &mut prompt_fut => res.map_err(AcpSendFailure::from)?,
+                fallback_text = &mut fallback_fut => {
+                    if let Some(text) = fallback_text {
+                        warn!(
+                            conversation_id = %self.params.conversation_id,
+                            session_id = %sid,
+                            "OpenClaw ACP prompt did not return before runtime completed; using OpenClaw session log fallback"
+                        );
+                        self.runtime.emit(AgentStreamEvent::Text(TextEventData { content: text }));
+                        return Ok(PromptOutcome::Completed {
+                            session_id: sid.to_owned(),
+                        });
+                    }
+                    prompt_fut.await.map_err(AcpSendFailure::from)?
+                }
+            }
+        } else {
+            prompt_fut.await.map_err(AcpSendFailure::from)?
+        };
 
         let empty_turn = is_empty_turn(&mut probe_rx);
         if empty_turn && let Some(error) = self.empty_turn_terminal_error().await {
@@ -276,6 +343,38 @@ impl AcpAgentManager {
             empty_turn,
             matched_command,
         ))
+    }
+
+    fn is_openclaw_backend(&self) -> bool {
+        self.params.metadata.backend.as_deref() == Some("openclaw")
+    }
+
+    async fn wait_for_openclaw_final_text(
+        &self,
+        session_id: &str,
+        checkpoint: OpenClawTrajectoryCheckpoint,
+    ) -> Option<String> {
+        let deadline = Instant::now() + OPENCLAW_ACP_FALLBACK_TIMEOUT;
+        while Instant::now() < deadline {
+            let sid = session_id.to_owned();
+            let checkpoint = checkpoint.clone();
+            match tokio::task::spawn_blocking(move || find_openclaw_final_text_for_acp_session_after(&sid, &checkpoint))
+                .await
+            {
+                Ok(Some(text)) => return Some(text),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        conversation_id = %self.params.conversation_id,
+                        error = %err,
+                        "OpenClaw session log fallback task failed"
+                    );
+                    return None;
+                }
+            }
+            sleep(OPENCLAW_ACP_FALLBACK_POLL_INTERVAL).await;
+        }
+        None
     }
 
     /// Emit model/mode/config events from the session aggregate so the frontend
@@ -339,6 +438,93 @@ impl AcpAgentManager {
         let tail = self.process.peek_stderr_tail(STDERR_PEEK_LINES).await;
         let detail = super::stderr_error_extractor::extract_error_message(&tail)?;
         Some(classify_empty_turn_stderr_error(&detail))
+    }
+}
+
+fn find_openclaw_final_text_for_acp_session_after(
+    session_id: &str,
+    checkpoint: &OpenClawTrajectoryCheckpoint,
+) -> Option<String> {
+    let sessions_dir = openclaw_sessions_dir()?;
+    let mut entries = std::fs::read_dir(sessions_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| name.ends_with(".trajectory.jsonl"))
+                .unwrap_or(false)
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|(a, _), (b, _)| b.cmp(a));
+
+    for (_, path) in entries {
+        if let Some(text) =
+            extract_openclaw_final_text_from_trajectory_after(&path, session_id, checkpoint.offset_for(&path))
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn openclaw_sessions_dir() -> Option<PathBuf> {
+    if let Ok(state_dir) = std::env::var("OPENCLAW_STATE_DIR")
+        && !state_dir.trim().is_empty()
+    {
+        return Some(PathBuf::from(state_dir).join("agents/main/sessions"));
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".openclaw/agents/main/sessions"))
+}
+
+fn extract_openclaw_final_text_from_trajectory_after(path: &Path, session_id: &str, offset: u64) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let file_len = file.metadata().ok().map(|metadata| metadata.len()).unwrap_or(0);
+    let start = if offset <= file_len { offset } else { 0 };
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok) {
+        if !line.contains(session_id) || !line.contains("model.completed") {
+            continue;
+        }
+        if let Some(text) = extract_openclaw_final_text_from_trajectory_line(&line, session_id) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn extract_openclaw_final_text_from_trajectory_line(line: &str, session_id: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("model.completed") {
+        return None;
+    }
+    let session_key = value.get("sessionKey").and_then(Value::as_str)?;
+    if !session_key.contains(session_id) {
+        return None;
+    }
+    let texts = value
+        .get("data")
+        .and_then(|data| data.get("assistantTexts"))
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n\n"))
     }
 }
 
@@ -603,16 +789,21 @@ mod tests {
     }
 
     /// The `is_acp_session_not_found` discriminator powers
-    /// `open_session_resume`'s rescue path. Match strictly on the
-    /// structured `AcpError::SessionNotFound` variant; other ACP failures
-    /// must surface to callers instead of triggering a phantom session
-    /// rebuild.
+    /// `open_session_resume`'s rescue path. Some ACP backends report a
+    /// stale `session/load` target as ResourceNotFound rather than a
+    /// dedicated SessionNotFound, so both variants must trigger rebuild.
     #[test]
-    fn is_acp_session_not_found_matches_session_not_found_only() {
+    fn is_acp_session_not_found_matches_resume_not_found_errors() {
         let session_err = AcpError::SessionNotFound {
             session_id: "ses-1".into(),
         };
         assert!(super::is_acp_session_not_found(&session_err));
+
+        let resource_err = AcpError::ResourceNotFound {
+            resource: Some("Resource not found".into()),
+            message: "Resource not found".into(),
+        };
+        assert!(super::is_acp_session_not_found(&resource_err));
 
         let invalid_params = AcpError::InvalidParams {
             message: "Workspace not found".into(),
@@ -833,5 +1024,80 @@ mod tests {
         assert_eq!(error.code, Some(AgentErrorCode::UserLlmProviderBillingRequired));
         assert_eq!(error.retryable, Some(false));
         assert_eq!(error.feedback_recommended, Some(false));
+    }
+
+    #[test]
+    fn openclaw_final_text_extracts_matching_completed_session() {
+        let line = serde_json::json!({
+            "type": "model.completed",
+            "sessionKey": "agent:main:acp:sess-123",
+            "data": { "assistantTexts": ["OpenClaw OK", "Second paragraph"] }
+        })
+        .to_string();
+
+        assert_eq!(
+            super::extract_openclaw_final_text_from_trajectory_line(&line, "sess-123"),
+            Some("OpenClaw OK\n\nSecond paragraph".to_owned())
+        );
+    }
+
+    #[test]
+    fn openclaw_final_text_ignores_other_sessions_and_events() {
+        let other_session = serde_json::json!({
+            "type": "model.completed",
+            "sessionKey": "agent:main:acp:other-session",
+            "data": { "assistantTexts": ["Wrong"] }
+        })
+        .to_string();
+        let other_event = serde_json::json!({
+            "type": "session.ended",
+            "sessionKey": "agent:main:acp:sess-123",
+            "data": { "assistantTexts": ["Wrong"] }
+        })
+        .to_string();
+
+        assert_eq!(
+            super::extract_openclaw_final_text_from_trajectory_line(&other_session, "sess-123"),
+            None
+        );
+        assert_eq!(
+            super::extract_openclaw_final_text_from_trajectory_line(&other_event, "sess-123"),
+            None
+        );
+    }
+
+    #[test]
+    fn openclaw_final_text_after_checkpoint_ignores_old_completed_events() {
+        let path = std::env::temp_dir().join(format!(
+            "aionui-openclaw-checkpoint-{}-sess-123.trajectory.jsonl",
+            std::process::id()
+        ));
+        let old_line = serde_json::json!({
+            "type": "model.completed",
+            "sessionKey": "agent:main:acp:sess-123",
+            "data": { "assistantTexts": ["Old answer"] }
+        })
+        .to_string();
+        std::fs::write(&path, format!("{old_line}\n")).unwrap();
+        let checkpoint = std::fs::metadata(&path).unwrap().len();
+
+        let new_line = serde_json::json!({
+            "type": "model.completed",
+            "sessionKey": "agent:main:acp:sess-123",
+            "data": { "assistantTexts": ["New answer"] }
+        })
+        .to_string();
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, "{new_line}").unwrap();
+        }
+
+        assert_eq!(
+            super::extract_openclaw_final_text_from_trajectory_after(&path, "sess-123", checkpoint),
+            Some("New answer".to_owned())
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }

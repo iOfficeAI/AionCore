@@ -2,16 +2,18 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
 use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, SendMessageRequest};
-use aionui_common::{AgentType, ConversationSource};
+use aionui_common::{AgentType, ConversationSource, ProviderWithModel};
 use aionui_conversation::ConversationService;
 use aionui_db::models::AssistantSessionRow;
+use aionui_db::{ConversationRowUpdate, IConversationRepository};
+use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::channel_settings::{ChannelSettingsService, resolved_model_to_provider};
+use crate::channel_settings::{ChannelSettingsService, ResolvedAgentConfig, resolved_model_to_provider};
 use crate::constants::{STREAM_THROTTLE_INTERVAL, TOOL_CONFIRM_TIMEOUT};
 use crate::error::ChannelError;
-use crate::types::{ActionButton, OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
+use crate::types::{ChannelConversationTitleHint, OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
 
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 
@@ -27,7 +29,34 @@ pub struct ChannelMessageService {
     conversation_svc: Arc<ConversationService>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     settings: Arc<ChannelSettingsService>,
+    conversation_repo: Option<Arc<dyn IConversationRepository>>,
+    team_sender: Option<Arc<dyn ChannelTeamSender>>,
     owner_user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamChannelTarget {
+    Lead,
+    Agent { slot_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamChannelRoute {
+    pub team_id: String,
+    pub target: TeamChannelTarget,
+}
+
+#[async_trait]
+pub trait ChannelTeamSender: Send + Sync {
+    async fn send_team_lead_message(&self, user_id: &str, team_id: &str, content: &str) -> Result<(), ChannelError>;
+
+    async fn send_team_agent_message(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        content: &str,
+    ) -> Result<(), ChannelError>;
 }
 
 impl ChannelMessageService {
@@ -41,8 +70,20 @@ impl ChannelMessageService {
             conversation_svc,
             task_manager,
             settings,
+            conversation_repo: None,
+            team_sender: None,
             owner_user_id,
         }
+    }
+
+    pub fn with_conversation_repo(mut self, conversation_repo: Arc<dyn IConversationRepository>) -> Self {
+        self.conversation_repo = Some(conversation_repo);
+        self
+    }
+
+    pub fn with_team_sender(mut self, team_sender: Arc<dyn ChannelTeamSender>) -> Self {
+        self.team_sender = Some(team_sender);
+        self
     }
 
     /// Sends a text message from a channel user to the AI agent.
@@ -60,11 +101,42 @@ impl ChannelMessageService {
         text: &str,
         platform: PluginType,
     ) -> Result<SendResult, ChannelError> {
+        self.send_to_agent_with_title_hint(session, text, platform, None).await
+    }
+
+    pub async fn send_to_agent_with_title_hint(
+        &self,
+        session: &AssistantSessionRow,
+        text: &str,
+        platform: PluginType,
+        title_hint: Option<ChannelConversationTitleHint>,
+    ) -> Result<SendResult, ChannelError> {
         // Ensure conversation exists
         let conversation_id = match &session.conversation_id {
             Some(cid) => cid.clone(),
-            None => self.create_conversation_for_session(session, platform).await?,
+            None => {
+                self.create_conversation_for_session(session, platform, title_hint.as_ref())
+                    .await?
+            }
         };
+
+        if let Some(route) = self.resolve_team_channel_route(&conversation_id).await? {
+            self.send_to_team_route(&route, text).await?;
+            info!(
+                conversation_id = %conversation_id,
+                session_id = %session.id,
+                team_id = %route.team_id,
+                "channel message routed through team api"
+            );
+            return Ok(SendResult {
+                conversation_id,
+                stream_rx: None,
+                team_routed: true,
+            });
+        }
+
+        self.repair_existing_aionrs_conversation_model(&conversation_id, platform)
+            .await?;
 
         // Send message through ConversationService. `msg_id` is now
         // server-generated inside the service; channel plugins that need to
@@ -112,6 +184,7 @@ impl ChannelMessageService {
         Ok(SendResult {
             conversation_id,
             stream_rx: Some(stream_rx),
+            team_routed: false,
         })
     }
 
@@ -123,17 +196,30 @@ impl ChannelMessageService {
         &self,
         session: &AssistantSessionRow,
         platform: PluginType,
+        title_hint: Option<&ChannelConversationTitleHint>,
     ) -> Result<String, ChannelError> {
         let source = platform_to_source(platform);
-        let agent_config = self
-            .settings
-            .get_agent_config(platform)
-            .await
-            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
-        let assistant_setting = self.settings.get_assistant_setting(platform).await?;
+        let agent_config = if session.bound_agent_id.is_some() {
+            ResolvedAgentConfig {
+                agent_type: session.agent_type.clone(),
+                backend: session.bound_backend.clone(),
+            }
+        } else {
+            self.settings
+                .get_agent_config(platform)
+                .await
+                .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?
+        };
+        let assistant_setting = if session.bound_agent_id.is_some() {
+            None
+        } else {
+            self.settings.get_assistant_setting(platform).await?
+        };
         let assistant_id = assistant_setting
             .as_ref()
             .and_then(|setting| setting.assistant_id.as_deref())
+            .map(str::trim)
+            .filter(|assistant_id| !assistant_id.is_empty())
             .map(ToOwned::to_owned);
         let assistant_name = assistant_setting
             .as_ref()
@@ -143,31 +229,51 @@ impl ChannelMessageService {
             .map(ToOwned::to_owned);
         let model_config = self.settings.get_model_config(platform).await?;
         let agent_type = parse_agent_type(&agent_config.agent_type)?;
-        let model = resolved_model_to_provider(model_config.as_ref());
-        let mut extra = Self::build_channel_extra(if assistant_id.is_some() {
-            None
-        } else {
-            agent_config.backend.as_deref()
-        });
-        let name = assistant_name.unwrap_or_else(|| {
-            channel_conversation_name(
-                platform,
-                &agent_config.agent_type,
-                agent_config.backend.as_deref(),
-                session.chat_id.as_deref(),
-            )
-        });
-
-        // Top-level `model` is only accepted for aionrs; other types pass via `extra`.
-        let top_level_model = if agent_type == AgentType::Aionrs {
-            Some(model)
-        } else {
-            extra["model"] = serde_json::to_value(&model).unwrap_or_default();
-            None
+        let model = match (&session.bound_provider_id, &session.bound_model) {
+            (Some(provider_id), Some(model)) => ProviderWithModel {
+                provider_id: provider_id.clone(),
+                model: model.clone(),
+                use_model: None,
+            },
+            _ if session.bound_agent_id.is_some() && agent_type != AgentType::Aionrs => {
+                resolved_model_to_provider(None)
+            }
+            _ => resolved_model_to_provider(model_config.as_ref()),
         };
+        let mut extra = Self::build_channel_extra_for_platform(
+            platform,
+            agent_config.backend.as_deref(),
+            session.chat_id.as_deref().unwrap_or_default(),
+        );
+        if let Some(agent_id) = &session.bound_agent_id {
+            extra["bound_agent_id"] = serde_json::Value::String(agent_id.clone());
+        }
+        if let Some(thread_id) = session.message_thread_id {
+            extra["telegram_message_thread_id"] = serde_json::Value::Number(thread_id.into());
+        }
+        let name = title_hint
+            .map(|hint| hint.title.trim())
+            .filter(|title| !title.is_empty())
+            .map(ToOwned::to_owned)
+            .or(assistant_name)
+            .unwrap_or_else(|| {
+                channel_conversation_name(
+                    platform,
+                    &agent_config.agent_type,
+                    agent_config.backend.as_deref(),
+                    session.chat_id.as_deref(),
+                )
+            });
+        if let Some(hint) = title_hint {
+            extra["title_source"] = serde_json::Value::String(hint.source.clone());
+            extra["auto_title"] = serde_json::Value::Bool(hint.source.ends_with("_first_message"));
+            extra["first_user_message_title"] = serde_json::Value::String(hint.title.clone());
+        }
+
+        let top_level_model = Self::place_model_for_conversation(agent_type, model, &mut extra);
 
         let req = CreateConversationRequest {
-            r#type: if assistant_id.is_some() { None } else { Some(agent_type) },
+            r#type: Some(agent_type),
             name: Some(name),
             model: top_level_model,
             assistant: assistant_id.map(|assistant_id| AssistantConversationRequest {
@@ -177,6 +283,12 @@ impl ChannelMessageService {
             }),
             source: Some(source),
             channel_chat_id: session.chat_id.clone(),
+            source_channel: Some(platform_source_channel(platform).to_owned()),
+            source_channel_id: None,
+            source_chat_id: session.chat_id.clone(),
+            source_user_id: None,
+            source_label: Some(platform_source_label(platform).to_owned()),
+            created_from: Some(platform_source_channel(platform).to_owned()),
             extra,
         };
 
@@ -193,6 +305,95 @@ impl ChannelMessageService {
         );
 
         Ok(response.id)
+    }
+
+    async fn repair_existing_aionrs_conversation_model(
+        &self,
+        conversation_id: &str,
+        platform: PluginType,
+    ) -> Result<(), ChannelError> {
+        let Some(repo) = &self.conversation_repo else {
+            return Ok(());
+        };
+        let Some(row) = repo
+            .get(conversation_id)
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?
+        else {
+            return Ok(());
+        };
+        if !aionrs_model_needs_channel_default_repair(&row.r#type, row.model.as_deref()) {
+            return Ok(());
+        }
+
+        let Some(model_config) = self.settings.get_model_config(platform).await? else {
+            return Err(ChannelError::MessageSendFailed(
+                "Aion CLI conversation is missing a model and no channel/default model is configured".into(),
+            ));
+        };
+        let model = resolved_model_to_provider(Some(&model_config));
+        if provider_model_is_empty(&model) {
+            return Err(ChannelError::MessageSendFailed(
+                "Aion CLI conversation is missing a usable provider/model binding".into(),
+            ));
+        }
+        let model_json = serde_json::to_string(&model).map_err(|e| {
+            ChannelError::MessageSendFailed(format!("Failed to serialize repaired Aion CLI model: {e}"))
+        })?;
+
+        repo.update(
+            conversation_id,
+            &ConversationRowUpdate {
+                model: Some(Some(model_json)),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
+
+        info!(
+            conversation_id = %conversation_id,
+            provider_id = %model.provider_id,
+            model = %model.model,
+            "repaired stale aionrs channel conversation model"
+        );
+
+        Ok(())
+    }
+
+    async fn resolve_team_channel_route(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamChannelRoute>, ChannelError> {
+        let Some(repo) = &self.conversation_repo else {
+            return Ok(None);
+        };
+        let Some(row) = repo
+            .get(conversation_id)
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        Ok(team_channel_route_from_extra(&row.extra))
+    }
+
+    async fn send_to_team_route(&self, route: &TeamChannelRoute, text: &str) -> Result<(), ChannelError> {
+        let sender = self.team_sender.as_ref().ok_or_else(|| {
+            ChannelError::MessageSendFailed("Team-owned channel conversation requires Team API sender".into())
+        })?;
+        match &route.target {
+            TeamChannelTarget::Lead => {
+                sender
+                    .send_team_lead_message(&self.owner_user_id, &route.team_id, text)
+                    .await
+            }
+            TeamChannelTarget::Agent { slot_id } => {
+                sender
+                    .send_team_agent_message(&self.owner_user_id, &route.team_id, slot_id, text)
+                    .await
+            }
+        }
     }
 
     /// Processes a stream event from the AI agent and converts it to
@@ -250,33 +451,17 @@ impl ChannelMessageService {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         }
     }
 
-    /// Builds the final message after streaming completes, including
-    /// action buttons for the user.
+    /// Builds the final message after streaming completes.
     pub fn build_final_message(text: &str) -> UnifiedOutgoingMessage {
         UnifiedOutgoingMessage {
-            message_type: OutgoingMessageType::Buttons,
+            message_type: OutgoingMessageType::Text,
             text: Some(text.to_owned()),
             parse_mode: None,
-            buttons: Some(vec![vec![
-                ActionButton {
-                    label: "\u{1f504} Regenerate".into(),
-                    action: "chat.regenerate".into(),
-                    params: None,
-                },
-                ActionButton {
-                    label: "\u{25b6}\u{fe0f} Continue".into(),
-                    action: "chat.continue".into(),
-                    params: None,
-                },
-                ActionButton {
-                    label: "\u{2795} New Session".into(),
-                    action: "session.new".into(),
-                    params: None,
-                },
-            ]]),
+            buttons: None,
             keyboard: None,
             image_url: None,
             file_url: None,
@@ -284,6 +469,7 @@ impl ChannelMessageService {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         }
     }
 
@@ -301,6 +487,7 @@ impl ChannelMessageService {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         }
     }
 
@@ -327,6 +514,99 @@ impl ChannelMessageService {
         }
         extra
     }
+
+    pub fn build_channel_extra_for_platform(
+        platform: PluginType,
+        backend: Option<&str>,
+        chat_id: &str,
+    ) -> serde_json::Value {
+        let mut extra = Self::build_channel_extra(backend);
+        extra["source_channel"] = serde_json::Value::String(platform_source_channel(platform).to_owned());
+        if !chat_id.trim().is_empty() {
+            extra["source_chat_id"] = serde_json::Value::String(chat_id.to_owned());
+        }
+        extra["source_label"] = serde_json::Value::String(platform_source_label(platform).to_owned());
+        extra["created_from"] = serde_json::Value::String(platform_source_channel(platform).to_owned());
+        extra
+    }
+
+    /// Places model configuration where each conversation runtime expects it.
+    /// Aionrs accepts the typed top-level field. ACP keeps the provider metadata
+    /// in `extra.model` and also needs `current_model_id` to seed its startup
+    /// configuration before the first prompt is sent.
+    fn place_model_for_conversation(
+        agent_type: AgentType,
+        model: ProviderWithModel,
+        extra: &mut serde_json::Value,
+    ) -> Option<ProviderWithModel> {
+        if agent_type == AgentType::Aionrs {
+            return Some(model);
+        }
+
+        if agent_type == AgentType::Acp {
+            let runtime_model = model
+                .use_model
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(model.model.as_str())
+                .trim();
+            if !runtime_model.is_empty() {
+                extra["current_model_id"] = serde_json::Value::String(runtime_model.to_owned());
+            }
+        }
+        extra["model"] = serde_json::to_value(&model).unwrap_or_default();
+        None
+    }
+}
+
+fn platform_source_channel(platform: PluginType) -> &'static str {
+    match platform {
+        PluginType::Telegram => "telegram",
+        PluginType::Lark => "lark",
+        PluginType::Dingtalk => "dingtalk",
+        PluginType::Weixin => "weixin",
+        PluginType::Slack => "slack",
+        PluginType::Discord => "discord",
+    }
+}
+
+fn platform_source_label(platform: PluginType) -> &'static str {
+    match platform {
+        PluginType::Telegram => "Telegram",
+        PluginType::Lark => "Lark",
+        PluginType::Dingtalk => "DingTalk",
+        PluginType::Weixin => "WeCom",
+        PluginType::Slack => "Slack",
+        PluginType::Discord => "Discord",
+    }
+}
+
+pub fn team_channel_route_from_extra(extra: &str) -> Option<TeamChannelRoute> {
+    let value: serde_json::Value = serde_json::from_str(extra).ok()?;
+    let team_id = value
+        .get("teamId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())?
+        .to_owned();
+    let role = value
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let slot_id = value
+        .get("slot_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+
+    let target = if role == "lead" {
+        TeamChannelTarget::Lead
+    } else if let Some(slot_id) = slot_id {
+        TeamChannelTarget::Agent { slot_id }
+    } else {
+        TeamChannelTarget::Lead
+    };
+
+    Some(TeamChannelRoute { team_id, target })
 }
 
 /// Result of sending a message to the agent.
@@ -337,6 +617,7 @@ pub struct SendResult {
     /// `None` when the agent task could not be found after sending
     /// (should not happen in normal flow).
     pub stream_rx: Option<broadcast::Receiver<AgentStreamEvent>>,
+    pub team_routed: bool,
 }
 
 /// Actions derived from agent stream events.
@@ -388,6 +669,26 @@ fn parse_agent_type(s: &str) -> Result<AgentType, ChannelError> {
     }
 
     Ok(agent_type)
+}
+
+fn aionrs_model_needs_channel_default_repair(agent_type: &str, model: Option<&str>) -> bool {
+    agent_type == "aionrs" && stored_provider_model_is_empty(model)
+}
+
+fn stored_provider_model_is_empty(model: Option<&str>) -> bool {
+    let Some(raw) = model else {
+        return true;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "null" {
+        return true;
+    }
+
+    serde_json::from_str::<ProviderWithModel>(raw).map_or(true, |model| provider_model_is_empty(&model))
+}
+
+fn provider_model_is_empty(model: &ProviderWithModel) -> bool {
+    model.provider_id.trim().is_empty() || model.model.trim().is_empty()
 }
 
 fn channel_conversation_name(
@@ -566,13 +867,11 @@ mod tests {
     // ── build_final_message ────────────────────────────────────────────
 
     #[test]
-    fn final_message_has_buttons() {
+    fn final_message_has_no_legacy_buttons() {
         let msg = ChannelMessageService::build_final_message("Response text");
-        assert_eq!(msg.message_type, OutgoingMessageType::Buttons);
+        assert_eq!(msg.message_type, OutgoingMessageType::Text);
         assert_eq!(msg.text.as_deref(), Some("Response text"));
-        let buttons = msg.buttons.unwrap();
-        assert!(!buttons.is_empty());
-        assert!(buttons[0].len() >= 2);
+        assert!(msg.buttons.is_none());
     }
 
     // ── build_streaming_message ────────────────────────────────────────
@@ -619,6 +918,16 @@ mod tests {
         assert_eq!(extra["backend"], "claude");
     }
 
+    #[test]
+    fn channel_extra_includes_source_metadata() {
+        let extra =
+            ChannelMessageService::build_channel_extra_for_platform(PluginType::Telegram, Some("claude"), "chat-1");
+        assert_eq!(extra["source_channel"], "telegram");
+        assert_eq!(extra["source_chat_id"], "chat-1");
+        assert_eq!(extra["source_label"], "Telegram");
+        assert_eq!(extra["created_from"], "telegram");
+    }
+
     // ── model placement by agent_type (regression: non-aionrs must not
     //    use top-level model) ──────────────────────────────────────────
 
@@ -632,16 +941,26 @@ mod tests {
         };
         let mut extra = ChannelMessageService::build_channel_extra(Some("codex"));
 
-        let top_level_model = if agent_type == AgentType::Aionrs {
-            Some(model.clone())
-        } else {
-            extra["model"] = serde_json::to_value(&model).unwrap();
-            None
-        };
+        let top_level_model = ChannelMessageService::place_model_for_conversation(agent_type, model, &mut extra);
 
         assert!(top_level_model.is_none(), "acp must not have top-level model");
         assert_eq!(extra["model"]["provider_id"], "prov1");
         assert_eq!(extra["model"]["use_model"], "global.anthropic.claude-sonnet-4-6");
+        assert_eq!(extra["current_model_id"], "global.anthropic.claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn acp_runtime_model_falls_back_to_model_name() {
+        let model = ProviderWithModel {
+            provider_id: "prov1".into(),
+            model: "gpt-5.5".into(),
+            use_model: None,
+        };
+        let mut extra = ChannelMessageService::build_channel_extra(Some("codex"));
+
+        ChannelMessageService::place_model_for_conversation(AgentType::Acp, model, &mut extra);
+
+        assert_eq!(extra["current_model_id"], "gpt-5.5");
     }
 
     #[test]
@@ -663,6 +982,27 @@ mod tests {
 
         assert!(top_level_model.is_some(), "aionrs must use top-level model");
         assert!(extra.get("model").is_none() || extra["model"].is_null());
+    }
+
+    #[test]
+    fn stale_aionrs_empty_model_requires_default_repair() {
+        let stale_model = r#"{"provider_id":"","model":"","use_model":null}"#;
+
+        assert!(aionrs_model_needs_channel_default_repair("aionrs", Some(stale_model)));
+    }
+
+    #[test]
+    fn valid_aionrs_model_does_not_require_default_repair() {
+        let valid_model = r#"{"provider_id":"prov2","model":"gpt-4o","use_model":null}"#;
+
+        assert!(!aionrs_model_needs_channel_default_repair("aionrs", Some(valid_model)));
+    }
+
+    #[test]
+    fn non_aionrs_empty_model_does_not_require_top_level_repair() {
+        let stale_model = r#"{"provider_id":"","model":"","use_model":null}"#;
+
+        assert!(!aionrs_model_needs_channel_default_repair("acp", Some(stale_model)));
     }
 
     // ── channel_conversation_name ─────────────────────────────────────

@@ -46,6 +46,8 @@ pub(crate) struct TgUpdate {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct TgMessage {
     pub message_id: i64,
+    #[serde(default)]
+    pub message_thread_id: Option<i64>,
     pub from: Option<TgUser>,
     pub chat: TgChat,
     pub date: i64,
@@ -147,6 +149,8 @@ pub(crate) struct TgCallbackQuery {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SendMessageRequest {
     pub chat_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_thread_id: Option<i64>,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parse_mode: Option<String>,
@@ -156,6 +160,8 @@ pub(crate) struct SendMessageRequest {
     pub reply_markup: Option<ReplyMarkup>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_notification: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_web_page_preview: Option<bool>,
 }
 
 /// Request body for `editMessageText`.
@@ -178,6 +184,39 @@ pub(crate) struct AnswerCallbackQueryRequest {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_alert: Option<bool>,
+}
+
+/// Telegram bot command displayed in the `/` menu.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BotCommand {
+    pub command: String,
+    pub description: String,
+}
+
+/// Telegram audience used to resolve the native `/` command menu.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum BotCommandScope {
+    Default,
+    AllPrivateChats,
+    AllGroupChats,
+    AllChatAdministrators,
+}
+
+/// Request body for `setMyCommands`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SetMyCommandsRequest {
+    pub commands: Vec<BotCommand>,
+    pub scope: BotCommandScope,
+}
+
+/// Request body for `sendChatAction`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SendChatActionRequest {
+    pub chat_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_thread_id: Option<i64>,
+    pub action: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -327,17 +366,67 @@ mod tests {
     fn send_message_request_serializes() {
         let req = SendMessageRequest {
             chat_id: 42,
+            message_thread_id: None,
             text: "Hello".into(),
             parse_mode: Some("HTML".into()),
             reply_to_message_id: None,
             reply_markup: None,
             disable_notification: None,
+            disable_web_page_preview: Some(true),
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["chat_id"], 42);
         assert_eq!(json["text"], "Hello");
         assert_eq!(json["parse_mode"], "HTML");
+        assert_eq!(json["disable_web_page_preview"], true);
         assert!(json.get("reply_to_message_id").is_none());
+    }
+
+    #[test]
+    fn send_message_request_serializes_forum_thread() {
+        let req = SendMessageRequest {
+            chat_id: -1003977604085,
+            message_thread_id: Some(3),
+            text: "reply".into(),
+            parse_mode: None,
+            reply_to_message_id: None,
+            reply_markup: None,
+            disable_notification: None,
+            disable_web_page_preview: None,
+        };
+
+        assert_eq!(serde_json::to_value(req).unwrap()["message_thread_id"], 3);
+    }
+
+    #[test]
+    fn set_my_commands_request_serializes_group_scope() {
+        let req = SetMyCommandsRequest {
+            commands: vec![BotCommand {
+                command: "help".into(),
+                description: "查看帮助".into(),
+            }],
+            scope: BotCommandScope::AllGroupChats,
+        };
+
+        let json = serde_json::to_value(req).unwrap();
+        assert_eq!(json["scope"]["type"], "all_group_chats");
+        assert_eq!(json["commands"][0]["command"], "help");
+    }
+
+    #[test]
+    fn bot_command_scope_serializes_supported_menu_audiences() {
+        assert_eq!(
+            serde_json::to_value(BotCommandScope::Default).unwrap()["type"],
+            "default"
+        );
+        assert_eq!(
+            serde_json::to_value(BotCommandScope::AllPrivateChats).unwrap()["type"],
+            "all_private_chats"
+        );
+        assert_eq!(
+            serde_json::to_value(BotCommandScope::AllChatAdministrators).unwrap()["type"],
+            "all_chat_administrators"
+        );
     }
 
     #[test]
@@ -451,5 +540,19 @@ mod tests {
         let sticker = msg.sticker.unwrap();
         assert_eq!(sticker.file_id, "sticker_1");
         assert_eq!(sticker.emoji.as_deref(), Some("😀"));
+    }
+
+    #[test]
+    fn forum_message_deserializes_message_thread_id() {
+        let message: TgMessage = serde_json::from_value(json!({
+            "message_id": 9,
+            "message_thread_id": 3,
+            "date": 0,
+            "chat": { "id": -1003977604085i64, "type": "supergroup" },
+            "text": "/topic_info"
+        }))
+        .unwrap();
+
+        assert_eq!(message.message_thread_id, Some(3));
     }
 }

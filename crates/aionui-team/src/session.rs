@@ -1886,6 +1886,12 @@ mod tests {
                 },
             ],
             lead_agent_id: Some("lead-1".into()),
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             created_at: 1000,
             updated_at: 1000,
         }

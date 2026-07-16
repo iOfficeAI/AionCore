@@ -63,7 +63,10 @@ impl std::error::Error for AcpSendFailure {
 }
 
 pub(super) fn is_acp_session_not_found(err: &AcpError) -> bool {
-    matches!(err, AcpError::SessionNotFound { .. })
+    matches!(
+        err,
+        AcpError::SessionNotFound { .. } | AcpError::ResourceNotFound { .. }
+    )
 }
 
 fn acp_error_public_message(err: &AcpError) -> String {

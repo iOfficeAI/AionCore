@@ -49,8 +49,35 @@ pub struct AssistantSessionRow {
     pub conversation_id: Option<String>,
     pub workspace: Option<String>,
     pub chat_id: Option<String>,
+    pub message_thread_id: Option<i64>,
+    pub bound_agent_id: Option<String>,
+    pub bound_backend: Option<String>,
+    pub bound_provider_id: Option<String>,
+    pub bound_model: Option<String>,
     pub created_at: TimestampMs,
     pub last_activity: TimestampMs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TelegramTopicBindingRow {
+    pub chat_id: String,
+    pub message_thread_id: i64,
+    pub agent_id: String,
+    pub bound_by_user_id: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ChannelTopicModelOverrideRow {
+    pub platform: String,
+    pub internal_user_id: String,
+    pub chat_id: String,
+    pub message_thread_id: i64,
+    pub agent_id: String,
+    pub provider_id: String,
+    pub model: String,
+    pub updated_at: TimestampMs,
 }
 
 /// Row mapping for the `assistant_pairing_codes` table.

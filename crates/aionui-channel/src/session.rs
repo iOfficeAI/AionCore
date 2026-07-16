@@ -3,6 +3,7 @@ use std::sync::Arc;
 use aionui_common::{generate_id, now_ms};
 use aionui_db::IChannelRepository;
 use aionui_db::models::AssistantSessionRow;
+use aionui_db::models::{ChannelTopicModelOverrideRow, TelegramTopicBindingRow};
 use tracing::{debug, info};
 
 use crate::error::ChannelError;
@@ -20,6 +21,105 @@ pub struct SessionManager {
 impl SessionManager {
     pub fn new(repo: Arc<dyn IChannelRepository>) -> Self {
         Self { repo }
+    }
+
+    pub async fn get_topic_binding(
+        &self,
+        chat_id: &str,
+        message_thread_id: i64,
+    ) -> Result<Option<TelegramTopicBindingRow>, ChannelError> {
+        Ok(self.repo.get_telegram_topic_binding(chat_id, message_thread_id).await?)
+    }
+
+    pub async fn bind_topic(
+        &self,
+        chat_id: &str,
+        message_thread_id: i64,
+        agent_id: &str,
+        bound_by_user_id: &str,
+    ) -> Result<(), ChannelError> {
+        let existing = self.repo.get_telegram_topic_binding(chat_id, message_thread_id).await?;
+        let now = now_ms();
+        self.repo
+            .upsert_telegram_topic_binding(&TelegramTopicBindingRow {
+                chat_id: chat_id.to_owned(),
+                message_thread_id,
+                agent_id: agent_id.to_owned(),
+                bound_by_user_id: bound_by_user_id.to_owned(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        if existing.as_ref().is_some_and(|binding| binding.agent_id != agent_id) {
+            self.repo.delete_sessions_by_topic(chat_id, message_thread_id).await?;
+            self.repo
+                .delete_topic_model_overrides(chat_id, message_thread_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn unbind_topic(&self, chat_id: &str, message_thread_id: i64) -> Result<(), ChannelError> {
+        self.repo
+            .delete_telegram_topic_binding(chat_id, message_thread_id)
+            .await?;
+        self.repo
+            .delete_topic_model_overrides(chat_id, message_thread_id)
+            .await?;
+        self.repo.delete_sessions_by_topic(chat_id, message_thread_id).await?;
+        Ok(())
+    }
+
+    pub async fn set_topic_model(
+        &self,
+        internal_user_id: &str,
+        chat_id: &str,
+        message_thread_id: i64,
+        agent_id: &str,
+        provider_id: &str,
+        model: &str,
+    ) -> Result<(), ChannelError> {
+        self.repo
+            .upsert_topic_model_override(&ChannelTopicModelOverrideRow {
+                platform: "telegram".into(),
+                internal_user_id: internal_user_id.into(),
+                chat_id: chat_id.into(),
+                message_thread_id,
+                agent_id: agent_id.into(),
+                provider_id: provider_id.into(),
+                model: model.into(),
+                updated_at: now_ms(),
+            })
+            .await?;
+        self.repo
+            .delete_topic_session(internal_user_id, chat_id, message_thread_id)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn reset_topic_session(
+        &self,
+        user_id: &str,
+        chat_id: &str,
+        message_thread_id: i64,
+        agent_type: &str,
+        agent_id: &str,
+        backend: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<AssistantSessionRow, ChannelError> {
+        self.repo
+            .delete_topic_session(user_id, chat_id, message_thread_id)
+            .await?;
+        self.get_or_create_topic_session(
+            user_id,
+            chat_id,
+            message_thread_id,
+            agent_type,
+            agent_id,
+            backend,
+            workspace,
+        )
+        .await
     }
 
     /// Finds an existing session for the user+chat pair, or creates one.
@@ -44,6 +144,11 @@ impl SessionManager {
             conversation_id: None,
             workspace: workspace.map(String::from),
             chat_id: Some(chat_id.to_owned()),
+            message_thread_id: None,
+            bound_agent_id: None,
+            bound_backend: None,
+            bound_provider_id: None,
+            bound_model: None,
             created_at: now,
             last_activity: now,
         };
@@ -58,6 +163,43 @@ impl SessionManager {
         );
 
         Ok(session)
+    }
+
+    pub async fn get_or_create_topic_session(
+        &self,
+        user_id: &str,
+        chat_id: &str,
+        message_thread_id: i64,
+        agent_type: &str,
+        agent_id: &str,
+        backend: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<AssistantSessionRow, ChannelError> {
+        let now = now_ms();
+        let model_override = self
+            .repo
+            .get_topic_model_override("telegram", user_id, chat_id, message_thread_id)
+            .await?
+            .filter(|value| value.agent_id == agent_id);
+        let new_row = AssistantSessionRow {
+            id: generate_id(),
+            user_id: user_id.to_owned(),
+            agent_type: agent_type.to_owned(),
+            conversation_id: None,
+            workspace: workspace.map(String::from),
+            chat_id: Some(chat_id.to_owned()),
+            message_thread_id: Some(message_thread_id),
+            created_at: now,
+            last_activity: now,
+            bound_agent_id: Some(agent_id.to_owned()),
+            bound_backend: backend.map(str::to_owned),
+            bound_provider_id: model_override.as_ref().map(|value| value.provider_id.clone()),
+            bound_model: model_override.as_ref().map(|value| value.model.clone()),
+        };
+        Ok(self
+            .repo
+            .get_or_create_topic_session(user_id, chat_id, message_thread_id, &new_row)
+            .await?)
     }
 
     /// Returns all active sessions.
@@ -89,6 +231,11 @@ impl SessionManager {
             conversation_id: None,
             workspace: workspace.map(String::from),
             chat_id: Some(chat_id.to_owned()),
+            message_thread_id: None,
+            bound_agent_id: None,
+            bound_backend: None,
+            bound_provider_id: None,
+            bound_model: None,
             created_at: now,
             last_activity: now,
         };

@@ -58,6 +58,18 @@ pub struct CreateConversationRequest {
     pub assistant: Option<AssistantConversationRequest>,
     pub source: Option<ConversationSource>,
     pub channel_chat_id: Option<String>,
+    #[serde(default)]
+    pub source_channel: Option<String>,
+    #[serde(default)]
+    pub source_channel_id: Option<String>,
+    #[serde(default)]
+    pub source_chat_id: Option<String>,
+    #[serde(default)]
+    pub source_user_id: Option<String>,
+    #[serde(default)]
+    pub source_label: Option<String>,
+    #[serde(default)]
+    pub created_from: Option<String>,
     pub extra: serde_json::Value,
 }
 
@@ -215,6 +227,18 @@ pub struct ConversationResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_chat_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant: Option<ConversationAssistantIdentityResponse>,
     pub created_at: TimestampMs,
     pub modified_at: TimestampMs,
@@ -327,6 +351,12 @@ mod tests {
             },
             "source": "aionui",
             "channel_chat_id": "user:123",
+            "source_channel": "telegram",
+            "source_channel_id": "bot:main",
+            "source_chat_id": "chat:123",
+            "source_user_id": "user:456",
+            "source_label": "Telegram",
+            "created_from": "telegram",
             "extra": { "workspace": "/project" }
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
@@ -349,6 +379,12 @@ mod tests {
         );
         assert_eq!(req.source, Some(ConversationSource::Aionui));
         assert_eq!(req.channel_chat_id.as_deref(), Some("user:123"));
+        assert_eq!(req.source_channel.as_deref(), Some("telegram"));
+        assert_eq!(req.source_channel_id.as_deref(), Some("bot:main"));
+        assert_eq!(req.source_chat_id.as_deref(), Some("chat:123"));
+        assert_eq!(req.source_user_id.as_deref(), Some("user:456"));
+        assert_eq!(req.source_label.as_deref(), Some("Telegram"));
+        assert_eq!(req.created_from.as_deref(), Some("telegram"));
         assert_eq!(req.extra["workspace"], "/project");
     }
 
@@ -571,6 +607,12 @@ mod tests {
             pinned: false,
             pinned_at: None,
             channel_chat_id: None,
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             assistant: None,
             created_at: 1712345678000,
             modified_at: 1712345678000,
@@ -609,6 +651,12 @@ mod tests {
             pinned: false,
             pinned_at: None,
             channel_chat_id: None,
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             assistant: None,
             created_at: 1,
             modified_at: 1,
@@ -641,6 +689,12 @@ mod tests {
             pinned: true,
             pinned_at: Some(1712345678000),
             channel_chat_id: Some("group:42".into()),
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             assistant: None,
             created_at: 1000,
             modified_at: 2000,
@@ -725,6 +779,12 @@ mod tests {
                 pinned: false,
                 pinned_at: None,
                 channel_chat_id: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
                 assistant: None,
                 created_at: 1712345678000,
                 modified_at: 1712345678000,
@@ -762,6 +822,12 @@ mod tests {
                 pinned: false,
                 pinned_at: None,
                 channel_chat_id: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
                 assistant: None,
                 created_at: 9000,
                 modified_at: 9000,
@@ -833,6 +899,12 @@ mod tests {
                 pinned: false,
                 pinned_at: None,
                 channel_chat_id: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
                 assistant: None,
                 created_at: 1000,
                 modified_at: 1000,
@@ -885,6 +957,12 @@ mod tests {
                     pinned: false,
                     pinned_at: None,
                     channel_chat_id: None,
+                    source_channel: None,
+                    source_channel_id: None,
+                    source_chat_id: None,
+                    source_user_id: None,
+                    source_label: None,
+                    created_from: None,
                     assistant: None,
                     created_at: 5000,
                     modified_at: 5000,

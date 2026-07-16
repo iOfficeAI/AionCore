@@ -12,7 +12,7 @@ use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationCreateRequest,
     TeamConversationCreateResult, TeamConversationLookupPort, TeamConversationProvisioningPort, TeamError,
-    TeamProjectionMessageStore,
+    TeamProjectionMessageStore, TeamSourceMetadata,
 };
 use async_trait::async_trait;
 use tracing::info;
@@ -34,6 +34,28 @@ impl TeamConversationAdapters {
             conversation_repo,
             task_manager,
         }
+    }
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn source_label(source_channel: &str) -> &'static str {
+    match source_channel {
+        "telegram" => "Telegram",
+        "lark" => "Lark",
+        "dingtalk" => "DingTalk",
+        "weixin" | "wecom" => "WeCom",
+        "discord" => "Discord",
+        "desktop" => "Desktop",
+        "webui" | "aionui" => "WebUI",
+        _ => "本地历史",
     }
 }
 
@@ -180,8 +202,14 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
                         locale: None,
                         conversation_overrides: None,
                     }),
-                    source: None,
-                    channel_chat_id: None,
+                    source: request.source,
+                    channel_chat_id: request.channel_chat_id,
+                    source_channel: request.source_channel,
+                    source_channel_id: request.source_channel_id,
+                    source_chat_id: request.source_chat_id,
+                    source_user_id: request.source_user_id,
+                    source_label: request.source_label,
+                    created_from: request.created_from,
                     extra: request.extra,
                 },
             )
@@ -211,6 +239,52 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned))
+    }
+
+    async fn conversation_source_metadata(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamSourceMetadata>, TeamError> {
+        let Some(row) = self.conversation_repo.get(conversation_id).await? else {
+            return Ok(None);
+        };
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        let mut metadata = TeamSourceMetadata {
+            source_channel: row
+                .source_channel
+                .clone()
+                .or_else(|| json_string(&extra, "source_channel"))
+                .or_else(|| {
+                    row.source
+                        .clone()
+                        .map(|source| if source == "aionui" { "webui".into() } else { source })
+                }),
+            source_channel_id: row
+                .source_channel_id
+                .clone()
+                .or_else(|| json_string(&extra, "source_channel_id")),
+            source_chat_id: row
+                .source_chat_id
+                .clone()
+                .or_else(|| json_string(&extra, "source_chat_id"))
+                .or_else(|| row.channel_chat_id.clone()),
+            source_user_id: row
+                .source_user_id
+                .clone()
+                .or_else(|| json_string(&extra, "source_user_id")),
+            source_label: row.source_label.clone().or_else(|| json_string(&extra, "source_label")),
+            created_from: row.created_from.clone().or_else(|| json_string(&extra, "created_from")),
+        };
+        if metadata.source_label.is_none() {
+            metadata.source_label = metadata.source_channel.as_deref().map(source_label).map(str::to_owned);
+        }
+        if metadata.created_from.is_none() {
+            metadata.created_from = metadata.source_channel.clone();
+        }
+        if metadata.source_channel.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(metadata))
     }
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {

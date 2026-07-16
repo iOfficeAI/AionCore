@@ -78,10 +78,16 @@ impl AgentService {
 impl AgentService {
     pub async fn refresh_agents(&self) -> Result<Vec<AgentMetadata>, AgentError> {
         self.registry.refresh_availability().await;
-        Ok(self
-            .registry
-            .list_all()
-            .await
+        self.list_agents(false).await
+    }
+
+    pub async fn list_agents(&self, include_disabled: bool) -> Result<Vec<AgentMetadata>, AgentError> {
+        let rows = if include_disabled {
+            self.registry.list_all_including_hidden().await
+        } else {
+            self.registry.list_all().await
+        };
+        Ok(rows
             .into_iter()
             .filter(|agent| agent.agent_type.supports_new_conversation())
             .collect())

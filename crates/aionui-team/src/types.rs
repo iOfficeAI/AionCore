@@ -150,6 +150,18 @@ pub struct Team {
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_from: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -281,6 +293,12 @@ impl Team {
             workspace: row.workspace.clone(),
             agents,
             lead_agent_id: row.lead_agent_id.clone(),
+            source_channel: row.source_channel.clone(),
+            source_channel_id: row.source_channel_id.clone(),
+            source_chat_id: row.source_chat_id.clone(),
+            source_user_id: row.source_user_id.clone(),
+            source_label: row.source_label.clone(),
+            created_from: row.created_from.clone(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -293,6 +311,12 @@ impl Team {
             workspace: self.workspace.clone(),
             assistants: self.agents.iter().map(|a| a.to_response()).collect(),
             leader_assistant_id: self.lead_agent_id.clone(),
+            source_channel: self.source_channel.clone(),
+            source_channel_id: self.source_channel_id.clone(),
+            source_chat_id: self.source_chat_id.clone(),
+            source_user_id: self.source_user_id.clone(),
+            source_label: self.source_label.clone(),
+            created_from: self.created_from.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -641,6 +665,12 @@ mod tests {
             lead_agent_id: Some("s1".into()),
             session_mode: None,
             agents_version: "1.0.1".into(),
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             created_at: 1000,
             updated_at: 2000,
         };
@@ -670,6 +700,12 @@ mod tests {
                 cli_path: None,
             }],
             lead_agent_id: Some("s1".into()),
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             created_at: 1000,
             updated_at: 2000,
         };
@@ -695,6 +731,12 @@ mod tests {
             lead_agent_id: None,
             session_mode: None,
             agents_version: "1.0.1".into(),
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             created_at: 0,
             updated_at: 0,
         };

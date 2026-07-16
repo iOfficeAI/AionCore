@@ -36,6 +36,7 @@ use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification, on_receive_request,
 };
 use aionui_common::ErrorChain;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -395,6 +396,7 @@ async fn run_sdk_background(
     alive: Arc<AtomicBool>,
     replay_suppression: Arc<AtomicBool>,
 ) {
+    let stdout = filter_acp_stdout(stdout);
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
     // `init_tx` / `ready_tx` are consumed inside the main_fn closure; wrap
@@ -496,6 +498,71 @@ async fn run_sdk_background(
         Ok(_) => debug!(?close_phase, "ACP SDK connection closed normally"),
         Err(e) => warn!(?close_phase, error = %ErrorChain(&e), "ACP SDK connection closed with error"),
     }
+}
+
+fn filter_acp_stdout(stdout: ChildStdout) -> DuplexStream {
+    let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        let mut json_buffer = String::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if json_buffer.is_empty() && !is_jsonrpc_stdout_start_line(&line) {
+                if !line.trim().is_empty() {
+                    warn!(line = %line, "Dropping non-JSON ACP stdout line");
+                }
+                continue;
+            }
+
+            json_buffer.push_str(&line);
+            json_buffer.push('\n');
+
+            match serde_json::from_str::<serde_json::Value>(&json_buffer) {
+                Ok(_) => {
+                    if writer.write_all(json_buffer.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    json_buffer.clear();
+                }
+                Err(err) if err.is_eof() => {
+                    // Multi-line JSON-RPC frame: keep accumulating until the
+                    // full object is available, then forward the whole frame
+                    // unchanged to the SDK transport.
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        line = %line,
+                        "Dropping malformed ACP stdout JSON frame"
+                    );
+                    json_buffer.clear();
+                }
+            }
+
+            if json_buffer.len() > 1024 * 1024 {
+                warn!("Dropping oversized ACP stdout JSON frame");
+                json_buffer.clear();
+            }
+        }
+
+        if !json_buffer.trim().is_empty() {
+            match serde_json::from_str::<serde_json::Value>(&json_buffer) {
+                Ok(_) => {
+                    let _ = writer.write_all(json_buffer.as_bytes()).await;
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "Dropping incomplete ACP stdout JSON frame at EOF"
+                    );
+                }
+            }
+        }
+    });
+    reader
+}
+
+fn is_jsonrpc_stdout_start_line(line: &str) -> bool {
+    line.trim_start().starts_with('{')
 }
 
 /// Fan out a CLI session notification to the event broadcast channel.
@@ -747,6 +814,71 @@ impl std::fmt::Debug for AcpProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn filtered_acp_stdout_drops_non_json_preamble_lines() {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+        use tokio::process::Command;
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'Config warnings:\\n- plugin not installed\\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\\n'")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut filtered = filter_acp_stdout(stdout);
+
+        let mut output = String::new();
+        filtered
+            .read_to_string(&mut output)
+            .await
+            .expect("read filtered stdout");
+        child.wait().await.expect("wait child");
+
+        assert_eq!(output, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+    }
+
+    #[tokio::test]
+    async fn filtered_acp_stdout_preserves_multiline_json_frames() {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+        use tokio::process::Command;
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(
+                r#"cat <<'EOF'
+Config warnings:
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "content": "OpenClaw OK"
+  }
+}
+EOF
+"#,
+            )
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut filtered = filter_acp_stdout(stdout);
+
+        let mut output = String::new();
+        filtered
+            .read_to_string(&mut output)
+            .await
+            .expect("read filtered stdout");
+        child.wait().await.expect("wait child");
+
+        assert_eq!(
+            output,
+            "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"result\": {\n    \"content\": \"OpenClaw OK\"\n  }\n}\n"
+        );
+    }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
         use std::io::Write;

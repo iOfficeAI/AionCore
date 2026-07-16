@@ -1,7 +1,10 @@
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
+use crate::models::{
+    AssistantSessionRow, AssistantUserRow, ChannelPluginRow, ChannelTopicModelOverrideRow, PairingCodeRow,
+    TelegramTopicBindingRow,
+};
 use crate::repository::channel::{IChannelRepository, UpdatePluginStatusParams};
 
 /// SQLite-backed implementation of [`IChannelRepository`].
@@ -18,6 +21,54 @@ impl SqliteChannelRepository {
 
 #[async_trait::async_trait]
 impl IChannelRepository for SqliteChannelRepository {
+    async fn get_telegram_topic_binding(
+        &self,
+        chat_id: &str,
+        message_thread_id: i64,
+    ) -> Result<Option<TelegramTopicBindingRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM telegram_topic_bindings WHERE chat_id = ? AND message_thread_id = ?")
+                .bind(chat_id)
+                .bind(message_thread_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+    async fn upsert_telegram_topic_binding(&self, row: &TelegramTopicBindingRow) -> Result<(), DbError> {
+        sqlx::query("INSERT INTO telegram_topic_bindings (chat_id,message_thread_id,agent_id,bound_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(chat_id,message_thread_id) DO UPDATE SET agent_id=excluded.agent_id,bound_by_user_id=excluded.bound_by_user_id,updated_at=excluded.updated_at")
+            .bind(&row.chat_id).bind(row.message_thread_id).bind(&row.agent_id).bind(&row.bound_by_user_id).bind(row.created_at).bind(row.updated_at).execute(&self.pool).await?;
+        Ok(())
+    }
+    async fn delete_telegram_topic_binding(&self, chat_id: &str, message_thread_id: i64) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM telegram_topic_bindings WHERE chat_id = ? AND message_thread_id = ?")
+            .bind(chat_id)
+            .bind(message_thread_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn get_topic_model_override(
+        &self,
+        platform: &str,
+        internal_user_id: &str,
+        chat_id: &str,
+        message_thread_id: i64,
+    ) -> Result<Option<ChannelTopicModelOverrideRow>, DbError> {
+        Ok(sqlx::query_as("SELECT * FROM channel_topic_model_overrides WHERE platform=? AND internal_user_id=? AND chat_id=? AND message_thread_id=?").bind(platform).bind(internal_user_id).bind(chat_id).bind(message_thread_id).fetch_optional(&self.pool).await?)
+    }
+    async fn upsert_topic_model_override(&self, row: &ChannelTopicModelOverrideRow) -> Result<(), DbError> {
+        sqlx::query("INSERT INTO channel_topic_model_overrides (platform,internal_user_id,chat_id,message_thread_id,agent_id,provider_id,model,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(platform,internal_user_id,chat_id,message_thread_id) DO UPDATE SET agent_id=excluded.agent_id,provider_id=excluded.provider_id,model=excluded.model,updated_at=excluded.updated_at")
+            .bind(&row.platform).bind(&row.internal_user_id).bind(&row.chat_id).bind(row.message_thread_id).bind(&row.agent_id).bind(&row.provider_id).bind(&row.model).bind(row.updated_at).execute(&self.pool).await?;
+        Ok(())
+    }
+    async fn delete_topic_model_overrides(&self, chat_id: &str, message_thread_id: i64) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM channel_topic_model_overrides WHERE chat_id=? AND message_thread_id=?")
+            .bind(chat_id)
+            .bind(message_thread_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
     // ── Plugin CRUD ──────────────────────────────────────────────────
 
     async fn get_all_plugins(&self) -> Result<Vec<ChannelPluginRow>, DbError> {
@@ -262,6 +313,31 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(new_row.clone())
     }
 
+    async fn get_or_create_topic_session(
+        &self,
+        user_id: &str,
+        chat_id: &str,
+        message_thread_id: i64,
+        new_row: &AssistantSessionRow,
+    ) -> Result<AssistantSessionRow, DbError> {
+        if let Some(row) = sqlx::query_as::<_, AssistantSessionRow>(
+            "SELECT * FROM assistant_sessions WHERE user_id=? AND chat_id=? AND message_thread_id=?",
+        )
+        .bind(user_id)
+        .bind(chat_id)
+        .bind(message_thread_id)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            return Ok(row);
+        }
+        sqlx::query("INSERT INTO assistant_sessions (id,user_id,agent_type,conversation_id,workspace,chat_id,message_thread_id,bound_agent_id,bound_backend,bound_provider_id,bound_model,created_at,last_activity) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&new_row.id).bind(&new_row.user_id).bind(&new_row.agent_type).bind(&new_row.conversation_id)
+            .bind(&new_row.workspace).bind(&new_row.chat_id).bind(message_thread_id).bind(&new_row.bound_agent_id).bind(&new_row.bound_backend).bind(&new_row.bound_provider_id).bind(&new_row.bound_model).bind(new_row.created_at).bind(new_row.last_activity)
+            .execute(&self.pool).await?;
+        Ok(new_row.clone())
+    }
+
     async fn update_session_activity(
         &self,
         id: &str,
@@ -331,6 +407,25 @@ impl IChannelRepository for SqliteChannelRepository {
         .bind(chat_id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn delete_topic_session(&self, user_id: &str, chat_id: &str, message_thread_id: i64) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM assistant_sessions WHERE user_id=? AND chat_id=? AND message_thread_id=?")
+            .bind(user_id)
+            .bind(chat_id)
+            .bind(message_thread_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_sessions_by_topic(&self, chat_id: &str, message_thread_id: i64) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM assistant_sessions WHERE chat_id=? AND message_thread_id=?")
+            .bind(chat_id)
+            .bind(message_thread_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -462,6 +557,11 @@ mod tests {
             conversation_id: None,
             workspace: None,
             chat_id: Some("chat-abc".into()),
+            message_thread_id: None,
+            bound_agent_id: None,
+            bound_backend: None,
+            bound_provider_id: None,
+            bound_model: None,
             created_at: now,
             last_activity: now,
         }

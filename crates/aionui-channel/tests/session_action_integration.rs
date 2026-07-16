@@ -97,6 +97,7 @@ fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomin
             attachments: None,
         },
         timestamp: now_ms(),
+        topic: None,
         reply_to_message_id: None,
         action: None,
         raw: None,
@@ -125,6 +126,7 @@ fn make_action_message(
             attachments: None,
         },
         timestamp: now_ms(),
+        topic: None,
         reply_to_message_id: None,
         action: Some(UnifiedAction {
             action: action_name.into(),

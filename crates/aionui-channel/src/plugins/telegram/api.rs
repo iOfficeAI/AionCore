@@ -4,7 +4,8 @@ use tracing::{debug, warn};
 use crate::error::ChannelError;
 
 use super::types::{
-    AnswerCallbackQueryRequest, EditMessageTextRequest, SendMessageRequest, TgMessage, TgResponse, TgUpdate, TgUser,
+    AnswerCallbackQueryRequest, BotCommand, BotCommandScope, EditMessageTextRequest, SendChatActionRequest,
+    SendMessageRequest, SetMyCommandsRequest, TgMessage, TgResponse, TgUpdate, TgUser,
 };
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
@@ -20,6 +21,33 @@ pub(crate) struct TelegramApi {
 }
 
 impl TelegramApi {
+    pub async fn get_chat_member_status(&self, chat_id: i64, user_id: i64) -> Result<String, ChannelError> {
+        let url = format!("{}/getChatMember", self.base_url);
+        let resp: TgResponse<serde_json::Value> = self
+            .client
+            .get(&url)
+            .query(&[("chat_id", chat_id), ("user_id", user_id)])
+            .send()
+            .await
+            .map_err(|e| ChannelError::PlatformApi(format!("getChatMember request failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| ChannelError::PlatformApi(format!("getChatMember parse failed: {e}")))?;
+        if !resp.ok {
+            return Err(ChannelError::PlatformApi(
+                resp.description.unwrap_or_else(|| "getChatMember failed".into()),
+            ));
+        }
+        Ok(resp
+            .result
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(|status| status.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default())
+    }
     /// Create a new API client for the given bot token.
     pub fn new(client: Client, token: &str) -> Self {
         Self {
@@ -100,11 +128,27 @@ impl TelegramApi {
 
         if !resp.ok {
             let desc = resp.description.unwrap_or_default();
+            warn!(
+                chat_id = req.chat_id,
+                parse_mode = ?req.parse_mode,
+                text_len = req.text.chars().count(),
+                error = %desc,
+                "Telegram sendMessage error"
+            );
             return Err(ChannelError::MessageSendFailed(format!("sendMessage failed: {desc}")));
         }
 
-        resp.result
-            .ok_or_else(|| ChannelError::MessageSendFailed("sendMessage returned no result".into()))
+        let sent = resp
+            .result
+            .ok_or_else(|| ChannelError::MessageSendFailed("sendMessage returned no result".into()))?;
+        debug!(
+            chat_id = req.chat_id,
+            message_id = sent.message_id,
+            parse_mode = ?req.parse_mode,
+            text_len = req.text.chars().count(),
+            "Telegram message sent"
+        );
+        Ok(sent)
     }
 
     /// `editMessageText` — edit an existing text message.
@@ -155,6 +199,63 @@ impl TelegramApi {
         if !resp.ok {
             let desc = resp.description.unwrap_or_default();
             warn!("answerCallbackQuery error: {desc}");
+        }
+
+        Ok(())
+    }
+
+    /// `setMyCommands` — configure the Telegram slash-command menu.
+    pub async fn set_my_commands(&self, commands: Vec<BotCommand>, scope: BotCommandScope) -> Result<(), ChannelError> {
+        let url = format!("{}/setMyCommands", self.base_url);
+        let req = SetMyCommandsRequest { commands, scope };
+
+        let resp: TgResponse<bool> = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| ChannelError::PlatformApi(format!("setMyCommands request failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| ChannelError::PlatformApi(format!("setMyCommands parse failed: {e}")))?;
+
+        if !resp.ok {
+            let desc = resp.description.unwrap_or_default();
+            return Err(ChannelError::PlatformApi(format!("setMyCommands failed: {desc}")));
+        }
+
+        Ok(())
+    }
+
+    /// `sendChatAction` — show "typing..." or similar lightweight status.
+    pub async fn send_chat_action(
+        &self,
+        chat_id: i64,
+        action: &str,
+        message_thread_id: Option<i64>,
+    ) -> Result<(), ChannelError> {
+        let url = format!("{}/sendChatAction", self.base_url);
+        let req = SendChatActionRequest {
+            chat_id,
+            message_thread_id,
+            action: action.to_owned(),
+        };
+
+        let resp: TgResponse<bool> = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| ChannelError::PlatformApi(format!("sendChatAction request failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| ChannelError::PlatformApi(format!("sendChatAction parse failed: {e}")))?;
+
+        if !resp.ok {
+            let desc = resp.description.unwrap_or_default();
+            warn!("sendChatAction error: {desc}");
         }
 
         Ok(())

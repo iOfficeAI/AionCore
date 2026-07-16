@@ -7,17 +7,29 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, RemoteAgentService};
+use aionui_api_types::{CreateTeamRequest, TeamAgentInput};
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
 use aionui_auth::extract_token_from_ws_headers;
-use aionui_channel::ChannelRouterState;
+use aionui_channel::error::ChannelError;
+use aionui_channel::message_service::ChannelTeamSender;
+use aionui_channel::{
+    ChannelRouterState,
+    action::{
+        ChannelPersonalConversationSummary, ChannelPersonalDirectory, ChannelTeamCreateRequest, ChannelTeamDirectory,
+        ChannelTeamSummary,
+    },
+};
+use aionui_common::now_ms;
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
+use aionui_db::models::MessageRow;
 use aionui_db::{
-    IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
-    IProviderRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
+    IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository, IProviderRepository,
+    MessagePageDirection, MessagePageParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
     SqliteConversationRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
@@ -49,6 +61,329 @@ use aionui_team::{
 use crate::config::derive_encryption_key;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
+
+struct ChannelTeamDirectoryAdapter {
+    service: Arc<TeamSessionService>,
+    owner_user_id: String,
+}
+
+struct ChannelPersonalDirectoryAdapter {
+    conversation_repo: Arc<dyn IConversationRepository>,
+    owner_user_id: String,
+}
+
+#[async_trait::async_trait]
+impl ChannelTeamDirectory for ChannelTeamDirectoryAdapter {
+    async fn list_teams(&self, user_id: &str) -> Result<Vec<ChannelTeamSummary>, ChannelError> {
+        let teams = self
+            .service
+            .list_teams(user_id)
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
+        if teams.is_empty() && user_id != self.owner_user_id {
+            let owner_teams = self
+                .service
+                .list_teams(&self.owner_user_id)
+                .await
+                .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
+            return Ok(owner_teams.into_iter().map(team_response_to_channel_summary).collect());
+        }
+        Ok(teams.into_iter().map(team_response_to_channel_summary).collect())
+    }
+
+    async fn get_team(&self, user_id: &str, team_id: &str) -> Result<Option<ChannelTeamSummary>, ChannelError> {
+        Ok(self
+            .list_teams(user_id)
+            .await?
+            .into_iter()
+            .find(|team| team.id == team_id))
+    }
+
+    async fn ensure_team_session(&self, user_id: &str, team_id: &str) -> Result<(), ChannelError> {
+        match self.service.ensure_session(user_id, team_id).await {
+            Ok(()) => Ok(()),
+            Err(primary_error) if user_id != self.owner_user_id => self
+                .service
+                .ensure_session(&self.owner_user_id, team_id)
+                .await
+                .map_err(|fallback_error| {
+                    ChannelError::MessageSendFailed(format!(
+                        "primary user failed: {primary_error}; owner fallback failed: {fallback_error}"
+                    ))
+                }),
+            Err(error) => Err(ChannelError::MessageSendFailed(error.to_string())),
+        }
+    }
+
+    async fn create_team(
+        &self,
+        user_id: &str,
+        request: ChannelTeamCreateRequest,
+    ) -> Result<ChannelTeamSummary, ChannelError> {
+        let owner_user_id = if user_id == self.owner_user_id {
+            user_id
+        } else {
+            &self.owner_user_id
+        };
+        let team = self
+            .service
+            .create_team(
+                owner_user_id,
+                CreateTeamRequest {
+                    name: request.name,
+                    agents: vec![TeamAgentInput {
+                        name: request.lead_name,
+                        role: request.lead_role,
+                        backend: None,
+                        model: request.model,
+                        assistant_id: Some(request.assistant_id),
+                        conversation_id: None,
+                    }],
+                    workspace: None,
+                    source_channel: request.source_channel,
+                    source_channel_id: request.source_channel_id,
+                    source_chat_id: request.source_chat_id,
+                    source_user_id: request.source_user_id,
+                    source_label: request.source_label,
+                    created_from: request.created_from,
+                },
+            )
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
+        Ok(team_response_to_channel_summary(team))
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelPersonalDirectory for ChannelPersonalDirectoryAdapter {
+    async fn list_personal_conversations(
+        &self,
+        user_id: &str,
+        platform: aionui_channel::types::PluginType,
+        chat_id: &str,
+    ) -> Result<Vec<ChannelPersonalConversationSummary>, ChannelError> {
+        let conversations = self.list_for_user(user_id, platform, chat_id).await?;
+        if conversations.is_empty() && user_id != self.owner_user_id {
+            return self.list_for_user(&self.owner_user_id, platform, chat_id).await;
+        }
+        Ok(conversations)
+    }
+
+    async fn get_personal_conversation(
+        &self,
+        user_id: &str,
+        platform: aionui_channel::types::PluginType,
+        chat_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ChannelPersonalConversationSummary>, ChannelError> {
+        Ok(self
+            .list_personal_conversations(user_id, platform, chat_id)
+            .await?
+            .into_iter()
+            .find(|conversation| conversation.id == conversation_id))
+    }
+
+    async fn rename_personal_conversation(
+        &self,
+        user_id: &str,
+        platform: aionui_channel::types::PluginType,
+        chat_id: &str,
+        conversation_id: &str,
+        title: &str,
+    ) -> Result<Option<ChannelPersonalConversationSummary>, ChannelError> {
+        if self
+            .get_personal_conversation(user_id, platform, chat_id, conversation_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+
+        let Some(row) = self
+            .conversation_repo
+            .get(conversation_id)
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        if !extra.is_object() {
+            extra = serde_json::json!({});
+        }
+        extra["title_source"] = serde_json::Value::String("manual".to_owned());
+        extra["auto_title"] = serde_json::Value::Bool(false);
+
+        self.conversation_repo
+            .update(
+                conversation_id,
+                &ConversationRowUpdate {
+                    name: Some(title.to_owned()),
+                    extra: Some(extra.to_string()),
+                    updated_at: Some(now_ms()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
+
+        self.get_personal_conversation(user_id, platform, chat_id, conversation_id)
+            .await
+    }
+}
+
+impl ChannelPersonalDirectoryAdapter {
+    async fn list_for_user(
+        &self,
+        user_id: &str,
+        platform: aionui_channel::types::PluginType,
+        chat_id: &str,
+    ) -> Result<Vec<ChannelPersonalConversationSummary>, ChannelError> {
+        let platform_key = platform.to_string();
+        let page = self
+            .conversation_repo
+            .list_paginated(
+                user_id,
+                &ConversationFilters {
+                    limit: 50,
+                    source: Some(platform_key.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
+
+        let mut conversations = Vec::new();
+        for row in page.items {
+            let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+            if extra
+                .get("teamId")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                continue;
+            }
+
+            let source_channel = row
+                .source_channel
+                .as_deref()
+                .or_else(|| extra.get("source_channel").and_then(serde_json::Value::as_str))
+                .or(row.source.as_deref())
+                .unwrap_or_default();
+            if source_channel != platform_key {
+                continue;
+            }
+
+            let source_chat_id = row
+                .source_chat_id
+                .as_deref()
+                .or_else(|| extra.get("source_chat_id").and_then(serde_json::Value::as_str))
+                .or(row.channel_chat_id.as_deref());
+            if let Some(source_chat_id) = source_chat_id
+                && !source_chat_id.trim().is_empty()
+                && source_chat_id != chat_id
+            {
+                continue;
+            }
+
+            let backend = extra.get("backend").and_then(serde_json::Value::as_str);
+            let agent_label = agent_label_for_channel_conversation(&row.r#type, backend);
+            let recent_message = self.recent_user_message_for_conversation(&row.id).await?;
+            conversations.push(ChannelPersonalConversationSummary {
+                id: row.id,
+                name: row.name,
+                agent_type: row.r#type,
+                agent_label: Some(agent_label),
+                recent_message,
+            });
+        }
+
+        Ok(conversations)
+    }
+
+    async fn recent_user_message_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>, ChannelError> {
+        let page = self
+            .conversation_repo
+            .list_messages_page(
+                conversation_id,
+                &MessagePageParams {
+                    limit: 12,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
+        Ok(page.items.iter().rev().find_map(channel_user_message_preview))
+    }
+}
+
+fn channel_user_message_preview(row: &MessageRow) -> Option<String> {
+    if row.hidden || row.r#type != "text" || row.position.as_deref() != Some("right") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&row.content).ok()?;
+    value
+        .get("content")
+        .or_else(|| value.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(short_preview_text)
+}
+
+fn short_preview_text(raw: &str) -> Option<String> {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(trimmed, 48))
+}
+
+fn agent_label_for_channel_conversation(agent_type: &str, backend: Option<&str>) -> String {
+    match (agent_type, backend.map(str::trim).filter(|value| !value.is_empty())) {
+        ("aionrs", _) => "Aion CLI".to_owned(),
+        ("acp", Some("claude")) => "Claude Code".to_owned(),
+        ("acp", Some("codex")) => "Codex CLI".to_owned(),
+        ("acp", Some("cursor")) => "Cursor".to_owned(),
+        ("acp", Some("hermes")) => "Hermes".to_owned(),
+        ("acp", Some("openclaw")) => "OpenClaw".to_owned(),
+        ("acp", Some(other)) => other.to_owned(),
+        ("acp", None) => "ACP Agent".to_owned(),
+        (other, _) => other.to_owned(),
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars {
+        return value.to_owned();
+    }
+    let head: String = chars.into_iter().take(max_chars).collect();
+    format!("{head}...")
+}
+
+fn team_response_to_channel_summary(team: aionui_api_types::TeamResponse) -> ChannelTeamSummary {
+    let lead_conversation_id = team
+        .assistants
+        .iter()
+        .find(|agent| {
+            agent.role == "lead"
+                || team
+                    .leader_assistant_id
+                    .as_deref()
+                    .is_some_and(|leader| leader == agent.slot_id)
+        })
+        .or_else(|| team.assistants.first())
+        .map(|agent| agent.conversation_id.clone());
+    ChannelTeamSummary {
+        id: team.id,
+        name: team.name,
+        lead_conversation_id,
+        agent_count: team.assistants.len(),
+    }
+}
 
 #[derive(Debug)]
 pub struct RouterBuildError {
@@ -210,9 +545,6 @@ pub async fn build_module_states(
     let dispatcher: Arc<dyn AssistantRuleDispatcher> = assistant.service.clone();
     skill_state.assistant_dispatcher = Some(dispatcher);
 
-    let (channel_state, channel_components) = build_channel_state(services, ext_state.registry.clone()).await;
-    tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
-
     let backend_binary_path = Arc::new(
         std::env::current_exe()
             .ok()
@@ -223,6 +555,14 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: backend binary path resolved"
     );
+
+    let team_state = build_module_state_phase(&boot, "team", || {
+        build_team_state(services, Some(cron.cron_service.clone()), backend_binary_path.clone())
+    });
+
+    let (channel_state, channel_components) =
+        build_channel_state(services, ext_state.registry.clone(), Some(team_state.service.clone())).await;
+    tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
 
     let pool = services.database.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
@@ -264,9 +604,7 @@ pub async fn build_module_states(
         hub: hub_state,
         skill: skill_state,
         channel: channel_state,
-        team: build_module_state_phase(&boot, "team", || {
-            build_team_state(services, Some(cron.cron_service.clone()), backend_binary_path.clone())
-        }),
+        team: team_state,
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
@@ -455,6 +793,9 @@ fn build_channel_settings_service(
             .with_agent_metadata_repo(Arc::new(SqliteAgentMetadataRepository::new(
                 services.database.pool().clone(),
             )))
+            .with_provider_repo(Arc::new(SqliteProviderRepository::new(
+                services.database.pool().clone(),
+            )))
             .with_assistant_repos(
                 Arc::new(SqliteAssistantDefinitionRepository::new(
                     services.database.pool().clone(),
@@ -467,28 +808,44 @@ fn build_channel_settings_service(
 async fn build_channel_message_service(
     services: &AppServices,
     channel_settings: Arc<aionui_channel::channel_settings::ChannelSettingsService>,
+    team_service: Option<Arc<TeamSessionService>>,
 ) -> Arc<aionui_channel::message_service::ChannelMessageService> {
-    let owner_user_id = services
+    let owner_user_id = get_channel_owner_user_id(services).await;
+
+    let pool = services.database.pool().clone();
+    let mut service = aionui_channel::message_service::ChannelMessageService::new(
+        Arc::new(services.conversation_service.clone()),
+        services.worker_task_manager.clone(),
+        channel_settings,
+        owner_user_id,
+    )
+    .with_conversation_repo(Arc::new(SqliteConversationRepository::new(pool)));
+
+    if let Some(team_service) = &team_service {
+        service = service.with_team_sender(Arc::new(ChannelTeamSenderAdapter {
+            service: Arc::clone(team_service),
+        }));
+    }
+
+    Arc::new(service)
+}
+
+async fn get_channel_owner_user_id(services: &AppServices) -> String {
+    services
         .user_repo
         .get_primary_webui_user()
         .await
         .ok()
         .flatten()
         .map(|u| u.id)
-        .unwrap_or_else(|| "system_default_user".to_string());
-
-    Arc::new(aionui_channel::message_service::ChannelMessageService::new(
-        Arc::new(services.conversation_service.clone()),
-        services.worker_task_manager.clone(),
-        channel_settings,
-        owner_user_id,
-    ))
+        .unwrap_or_else(|| "system_default_user".to_string())
 }
 
 /// Build the default `ChannelRouterState` and orchestrator components.
 pub async fn build_channel_state(
     services: &AppServices,
     extension_registry: ExtensionRegistry,
+    team_service: Option<Arc<TeamSessionService>>,
 ) -> (ChannelRouterState, ChannelOrchestratorComponents) {
     let pool = services.database.pool().clone();
     let repo: Arc<dyn aionui_db::IChannelRepository> = Arc::new(aionui_db::SqliteChannelRepository::new(pool));
@@ -517,15 +874,37 @@ pub async fn build_channel_state(
 
     // Build channel settings service for per-plugin agent/model configuration.
     let channel_settings = build_channel_settings_service(services);
+    let owner_user_id = get_channel_owner_user_id(services).await;
 
     // Build orchestrator dependencies
-    let action_executor = Arc::new(aionui_channel::action::ActionExecutor::new(
+    let mut action_executor = aionui_channel::action::ActionExecutor::new(
         Arc::clone(&pairing_service),
         Arc::clone(&session_manager),
         Arc::clone(&channel_settings),
-    ));
+    );
+    if let Some(team_service) = &team_service {
+        let team_directory = Arc::new(ChannelTeamDirectoryAdapter {
+            service: Arc::clone(team_service),
+            owner_user_id: owner_user_id.clone(),
+        }) as Arc<dyn ChannelTeamDirectory>;
+        action_executor = action_executor.with_team_directory(team_directory);
+    }
+    let personal_directory = Arc::new(ChannelPersonalDirectoryAdapter {
+        conversation_repo: services.conversation_repo.clone(),
+        owner_user_id: owner_user_id.clone(),
+    }) as Arc<dyn ChannelPersonalDirectory>;
+    action_executor = action_executor.with_personal_directory(personal_directory);
+    let action_executor = Arc::new(action_executor);
 
-    let message_service = build_channel_message_service(services, Arc::clone(&channel_settings)).await;
+    let message_service = build_channel_message_service(services, Arc::clone(&channel_settings), team_service).await;
+
+    let team_event_relay = aionui_channel::team_event_relay::ChannelTeamEventRelay::new(
+        services.event_bus.subscribe(),
+        repo.clone(),
+        services.conversation_repo.clone(),
+        manager.clone() as Arc<dyn aionui_channel::stream_relay::ChannelSender>,
+    );
+    tokio::spawn(team_event_relay.run());
 
     let orchestrator = aionui_channel::orchestrator::ChannelOrchestrator::new(
         action_executor,
@@ -553,6 +932,35 @@ pub async fn build_channel_state(
     };
 
     (state, components)
+}
+
+struct ChannelTeamSenderAdapter {
+    service: Arc<TeamSessionService>,
+}
+
+#[async_trait::async_trait]
+impl ChannelTeamSender for ChannelTeamSenderAdapter {
+    async fn send_team_lead_message(&self, user_id: &str, team_id: &str, content: &str) -> Result<(), ChannelError> {
+        self.service
+            .send_message(user_id, team_id, content, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))
+    }
+
+    async fn send_team_agent_message(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        content: &str,
+    ) -> Result<(), ChannelError> {
+        self.service
+            .send_message_to_agent(user_id, team_id, slot_id, content, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))
+    }
 }
 
 /// Build the default `TeamRouterState` from application services.
@@ -922,7 +1330,7 @@ mod tests {
             .unwrap();
 
         let settings = build_channel_settings_service(&services);
-        let message_service = build_channel_message_service(&services, settings).await;
+        let message_service = build_channel_message_service(&services, settings, None).await;
         let session = AssistantSessionRow {
             id: "session-channel-state".to_owned(),
             user_id: "channel-user-state".to_owned(),

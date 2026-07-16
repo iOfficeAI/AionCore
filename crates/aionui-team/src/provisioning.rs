@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AddAgentRequest, TeamAgentInput};
-use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
+use aionui_api_types::{AddAgentRequest, CreateTeamRequest, TeamAgentInput};
+use aionui_common::{AgentKillReason, AgentType, ConversationSource, ProviderWithModel, generate_id};
 use aionui_db::models::TeamRow;
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
@@ -67,7 +67,102 @@ pub struct TeamConversationCreateRequest {
     pub name: String,
     pub top_level_model: Option<ProviderWithModel>,
     pub assistant_id: Option<String>,
+    pub source: Option<ConversationSource>,
+    pub channel_chat_id: Option<String>,
+    pub source_channel: Option<String>,
+    pub source_channel_id: Option<String>,
+    pub source_chat_id: Option<String>,
+    pub source_user_id: Option<String>,
+    pub source_label: Option<String>,
+    pub created_from: Option<String>,
     pub extra: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TeamSourceMetadata {
+    pub source_channel: Option<String>,
+    pub source_channel_id: Option<String>,
+    pub source_chat_id: Option<String>,
+    pub source_user_id: Option<String>,
+    pub source_label: Option<String>,
+    pub created_from: Option<String>,
+}
+
+impl TeamSourceMetadata {
+    pub fn from_create_request(req: &CreateTeamRequest) -> Self {
+        Self {
+            source_channel: clean_source(req.source_channel.as_deref()).or_else(|| Some("webui".into())),
+            source_channel_id: clean_source(req.source_channel_id.as_deref()),
+            source_chat_id: clean_source(req.source_chat_id.as_deref()),
+            source_user_id: clean_source(req.source_user_id.as_deref()),
+            source_label: clean_source(req.source_label.as_deref()).or_else(|| Some("WebUI".into())),
+            created_from: clean_source(req.created_from.as_deref()).or_else(|| Some("webui".into())),
+        }
+    }
+
+    pub fn top_level_source(&self) -> ConversationSource {
+        match self.source_channel.as_deref() {
+            Some("telegram") => ConversationSource::Telegram,
+            Some("lark") => ConversationSource::Lark,
+            Some("dingtalk") => ConversationSource::Dingtalk,
+            Some("weixin") | Some("wecom") => ConversationSource::Weixin,
+            _ => ConversationSource::Aionui,
+        }
+    }
+
+    pub fn apply_to_extra(&self, extra: &mut serde_json::Value) {
+        set_extra_string(extra, "source_channel", self.source_channel.as_deref());
+        set_extra_string(extra, "source_channel_id", self.source_channel_id.as_deref());
+        set_extra_string(extra, "source_chat_id", self.source_chat_id.as_deref());
+        set_extra_string(extra, "source_user_id", self.source_user_id.as_deref());
+        set_extra_string(extra, "source_label", self.source_label.as_deref());
+        set_extra_string(extra, "created_from", self.created_from.as_deref());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn team_source_metadata_applies_telegram_source_to_extra() {
+        let req = CreateTeamRequest {
+            name: "Telegram Team".into(),
+            agents: vec![],
+            workspace: None,
+            source_channel: Some("telegram".into()),
+            source_channel_id: Some("bot-1".into()),
+            source_chat_id: Some("chat-1".into()),
+            source_user_id: Some("user-1".into()),
+            source_label: Some("Telegram".into()),
+            created_from: Some("telegram".into()),
+        };
+        let metadata = TeamSourceMetadata::from_create_request(&req);
+        let mut extra = serde_json::json!({});
+
+        metadata.apply_to_extra(&mut extra);
+
+        assert_eq!(extra["source_channel"], "telegram");
+        assert_eq!(extra["source_channel_id"], "bot-1");
+        assert_eq!(extra["source_chat_id"], "chat-1");
+        assert_eq!(extra["source_user_id"], "user-1");
+        assert_eq!(extra["source_label"], "Telegram");
+        assert_eq!(extra["created_from"], "telegram");
+        assert_eq!(metadata.top_level_source(), ConversationSource::Telegram);
+    }
+}
+
+fn clean_source(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn set_extra_string(extra: &mut serde_json::Value, key: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        extra[key] = serde_json::Value::String(value.to_owned());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +181,13 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
+
+    async fn conversation_source_metadata(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<TeamSourceMetadata>, TeamError> {
+        Ok(None)
+    }
 
     async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError>;
 
@@ -139,6 +241,7 @@ impl TeamAgentProvisioner {
         team_id: &str,
         inputs: &[TeamAgentInput],
         shared_workspace: Option<&str>,
+        source_metadata: &TeamSourceMetadata,
     ) -> Result<InitialProvisioningResult, TeamError> {
         let Some((leader_input, teammate_inputs)) = inputs.split_first() else {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
@@ -161,6 +264,7 @@ impl TeamAgentProvisioner {
                 &leader_input.model,
                 leader_assistant_id.as_deref(),
                 shared_workspace,
+                source_metadata,
             )
             .await?;
 
@@ -208,6 +312,7 @@ impl TeamAgentProvisioner {
                     &input.model,
                     assistant_id.as_deref(),
                     Some(&team_workspace),
+                    source_metadata,
                 )
                 .await?;
             agents.push(TeamAgent {
@@ -401,6 +506,7 @@ impl TeamAgentProvisioner {
                 &input.model,
                 input.assistant_id.as_deref(),
                 input.workspace.as_deref(),
+                &TeamSourceMetadata::default(),
             )
             .await?;
         Ok(TeamAgent {
@@ -429,9 +535,19 @@ impl TeamAgentProvisioner {
         model: &str,
         assistant_id: Option<&str>,
         workspace: Option<&str>,
+        source_metadata: &TeamSourceMetadata,
     ) -> Result<ProvisionedConversation, TeamError> {
         let extra = self
-            .build_team_extra(team_id, slot_id, role, backend, model, assistant_id, workspace)
+            .build_team_extra(
+                team_id,
+                slot_id,
+                role,
+                backend,
+                model,
+                assistant_id,
+                workspace,
+                source_metadata,
+            )
             .await?;
 
         let agent_type = parse_agent_type(backend)?;
@@ -465,6 +581,14 @@ impl TeamAgentProvisioner {
                 name: name.to_owned(),
                 top_level_model,
                 assistant_id: assistant_id.map(str::to_owned),
+                source: Some(source_metadata.top_level_source()),
+                channel_chat_id: source_metadata.source_chat_id.clone(),
+                source_channel: source_metadata.source_channel.clone(),
+                source_channel_id: source_metadata.source_channel_id.clone(),
+                source_chat_id: source_metadata.source_chat_id.clone(),
+                source_user_id: source_metadata.source_user_id.clone(),
+                source_label: source_metadata.source_label.clone(),
+                created_from: source_metadata.created_from.clone(),
                 extra,
             })
             .await?;
@@ -533,6 +657,7 @@ impl TeamAgentProvisioner {
         model: &str,
         assistant_id: Option<&str>,
         workspace: Option<&str>,
+        source_metadata: &TeamSourceMetadata,
     ) -> Result<serde_json::Value, TeamError> {
         let mut extra = serde_json::json!({
             "teamId": team_id,
@@ -550,6 +675,7 @@ impl TeamAgentProvisioner {
         if let Some(workspace) = workspace {
             inherit_team_workspace(&mut extra, workspace);
         }
+        source_metadata.apply_to_extra(&mut extra);
         Ok(extra)
     }
 

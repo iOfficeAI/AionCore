@@ -25,7 +25,7 @@ use crate::event_loop::AgentLoopContext;
 use crate::events::{TEAM_CREATED_EVENT, TEAM_MCP_STATUS_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT};
 use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
-use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
+use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort, TeamSourceMetadata};
 use crate::session::{AgentMessageQueueResult, TeamSession};
 use crate::types::{Team, TeamAgent};
 use crate::wake::TeamWakeSource;
@@ -176,10 +176,17 @@ impl TeamSessionService {
 
         let team_id = generate_id();
         let now = now_ms();
+        let source_metadata = TeamSourceMetadata::from_create_request(&req);
 
         let provisioned = self
             .provisioner()
-            .provision_initial_agents(user_id, &team_id, &req.agents, shared_workspace.as_deref())
+            .provision_initial_agents(
+                user_id,
+                &team_id,
+                &req.agents,
+                shared_workspace.as_deref(),
+                &source_metadata,
+            )
             .await?;
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;
@@ -196,6 +203,12 @@ impl TeamSessionService {
             lead_agent_id: lead_agent_id.clone(),
             session_mode: None,
             agents_version: "1.0.1".into(),
+            source_channel: source_metadata.source_channel.clone(),
+            source_channel_id: source_metadata.source_channel_id.clone(),
+            source_chat_id: source_metadata.source_chat_id.clone(),
+            source_user_id: source_metadata.source_user_id.clone(),
+            source_label: source_metadata.source_label.clone(),
+            created_from: source_metadata.created_from.clone(),
             created_at: now,
             updated_at: now,
         };
@@ -207,6 +220,12 @@ impl TeamSessionService {
             workspace: team_workspace,
             agents,
             lead_agent_id,
+            source_channel: source_metadata.source_channel,
+            source_channel_id: source_metadata.source_channel_id,
+            source_chat_id: source_metadata.source_chat_id,
+            source_user_id: source_metadata.source_user_id,
+            source_label: source_metadata.source_label,
+            created_from: source_metadata.created_from,
             created_at: now,
             updated_at: now,
         };

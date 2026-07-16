@@ -23,8 +23,9 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, \
+             source_channel, source_channel_id, source_chat_id, source_user_id, source_label, created_from, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.user_id)
@@ -35,6 +36,12 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(&row.lead_agent_id)
         .bind(&row.session_mode)
         .bind(&row.agents_version)
+        .bind(&row.source_channel)
+        .bind(&row.source_channel_id)
+        .bind(&row.source_chat_id)
+        .bind(&row.source_user_id)
+        .bind(&row.source_label)
+        .bind(&row.created_from)
         .bind(row.created_at)
         .bind(row.updated_at)
         .execute(&self.pool)

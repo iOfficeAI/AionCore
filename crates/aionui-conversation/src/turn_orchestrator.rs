@@ -190,6 +190,15 @@ impl ConversationTurnOrchestrator {
 
         while let Some((current_send, msg_id)) = pending_send.take() {
             let lifecycle = runtime_state.lifecycle_for(&input.conv_id);
+            if lifecycle == RuntimeLifecycleState::Cancelling {
+                info!(
+                    conversation_id = %input.conv_id,
+                    turn_id = %input.turn_id,
+                    "Agent prompt dispatch skipped because turn was cancelled before send"
+                );
+                break;
+            }
+
             let defer_clean_terminal_errors = input.defer_clean_terminal_errors
                 && agent.agent_type() == AgentType::Acp
                 && lifecycle == RuntimeLifecycleState::Active

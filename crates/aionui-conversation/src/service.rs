@@ -640,8 +640,11 @@ impl ConversationService {
     ) -> Result<ConversationResponse, ConversationError> {
         let id = generate_short_id();
         let now = now_ms();
-        let source = req.source.unwrap_or(ConversationSource::Aionui);
+        let source = req.source.clone().unwrap_or(ConversationSource::Aionui);
+        let legacy_source = enum_to_db(&source)?;
 
+        let source_metadata =
+            ConversationSourceMetadata::from_request(&req, &req.extra, &legacy_source, req.channel_chat_id.as_deref());
         let mut extra = req.extra;
 
         let assistant_id = req
@@ -1048,8 +1051,14 @@ impl ConversationService {
                 .transpose()
                 .map_err(|e| ConversationError::internal(format!("Failed to serialize model: {e}")))?,
             status: Some(enum_to_db(&ConversationStatus::Pending)?),
-            source: Some(enum_to_db(&source)?),
+            source: Some(legacy_source),
             channel_chat_id: req.channel_chat_id,
+            source_channel: source_metadata.source_channel,
+            source_channel_id: source_metadata.source_channel_id,
+            source_chat_id: source_metadata.source_chat_id,
+            source_user_id: source_metadata.source_user_id,
+            source_label: source_metadata.source_label,
+            created_from: source_metadata.created_from,
             pinned: false,
             pinned_at: None,
             created_at: now,
@@ -2761,17 +2770,18 @@ impl ConversationService {
             });
         }
 
+        self.runtime_state.mark_cancelling(conversation_id);
+
         let Some(agent) = task_manager.get_task(conversation_id) else {
             info!(
                 conversation_id,
-                turn_id, "No active agent to cancel; returning runtime summary"
+                turn_id, "No active agent to cancel yet; marked pending turn cancellation"
             );
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,
             });
         };
 
-        self.runtime_state.mark_cancelling(conversation_id);
         if let Err(e) = agent.cancel().await {
             self.runtime_state.clear_cancelling(conversation_id);
             warn!(conversation_id, turn_id, error = %ErrorChain(&e), "Failed to cancel agent");
@@ -3439,6 +3449,89 @@ fn enum_to_db<T: serde::Serialize>(val: &T) -> Result<String, ConversationError>
         .ok_or_else(|| ConversationError::internal("Expected string enum value"))
 }
 
+#[derive(Debug, Clone, Default)]
+struct ConversationSourceMetadata {
+    source_channel: Option<String>,
+    source_channel_id: Option<String>,
+    source_chat_id: Option<String>,
+    source_user_id: Option<String>,
+    source_label: Option<String>,
+    created_from: Option<String>,
+}
+
+impl ConversationSourceMetadata {
+    fn from_request(
+        req: &CreateConversationRequest,
+        extra: &serde_json::Value,
+        legacy_source: &str,
+        channel_chat_id: Option<&str>,
+    ) -> Self {
+        let source_channel = clean_source(req.source_channel.as_deref())
+            .or_else(|| extra_string(extra, "source_channel"))
+            .or_else(|| source_channel_from_legacy(legacy_source));
+        let source_chat_id = clean_source(req.source_chat_id.as_deref())
+            .or_else(|| extra_string(extra, "source_chat_id"))
+            .or_else(|| clean_source(channel_chat_id));
+        let source_label = clean_source(req.source_label.as_deref())
+            .or_else(|| extra_string(extra, "source_label"))
+            .or_else(|| {
+                source_channel
+                    .as_deref()
+                    .map(source_label_for_channel)
+                    .map(str::to_owned)
+            });
+        let created_from = clean_source(req.created_from.as_deref())
+            .or_else(|| extra_string(extra, "created_from"))
+            .or_else(|| source_channel.clone());
+
+        Self {
+            source_channel,
+            source_channel_id: clean_source(req.source_channel_id.as_deref())
+                .or_else(|| extra_string(extra, "source_channel_id")),
+            source_chat_id,
+            source_user_id: clean_source(req.source_user_id.as_deref())
+                .or_else(|| extra_string(extra, "source_user_id")),
+            source_label,
+            created_from,
+        }
+    }
+}
+
+fn clean_source(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn extra_string(extra: &serde_json::Value, key: &str) -> Option<String> {
+    extra
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| clean_source(Some(value)))
+}
+
+fn source_channel_from_legacy(source: &str) -> Option<String> {
+    clean_source(Some(match source {
+        "aionui" => "webui",
+        other => other,
+    }))
+}
+
+fn source_label_for_channel(channel: &str) -> &'static str {
+    match channel {
+        "aionui" | "webui" => "WebUI",
+        "desktop" => "Desktop",
+        "telegram" => "Telegram",
+        "discord" => "Discord",
+        "lark" => "Lark",
+        "wecom" => "WeCom",
+        "weixin" => "Weixin",
+        "dingtalk" => "DingTalk",
+        _ => "Unknown Source",
+    }
+}
+
 /// Persist the agent's session key into `conversation.extra.sessionKey`.
 ///
 /// Called after send_message completes so the session can be resumed
@@ -3662,6 +3755,12 @@ mod tests {
             pinned: false,
             pinned_at: None,
             channel_chat_id: None,
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             assistant: None,
             created_at: 0,
             modified_at: 0,

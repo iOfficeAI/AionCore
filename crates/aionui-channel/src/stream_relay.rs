@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::error::ChannelError;
-use crate::formatter::format_text_for_platform;
+use crate::formatter::format_outgoing_text_for_platform;
 use crate::message_service::{ChannelMessageService, StreamAction};
 use crate::types::{OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
 
@@ -39,6 +39,20 @@ pub trait ChannelSender: Send + Sync {
         message_id: &str,
         message: UnifiedOutgoingMessage,
     ) -> Result<(), ChannelError>;
+
+    async fn send_chat_action(&self, _plugin_id: &str, _chat_id: &str, _action: &str) -> Result<(), ChannelError> {
+        Ok(())
+    }
+
+    async fn send_chat_action_in_topic(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        action: &str,
+        _message_thread_id: Option<i64>,
+    ) -> Result<(), ChannelError> {
+        self.send_chat_action(plugin_id, chat_id, action).await
+    }
 }
 
 /// Relays agent stream events to an IM platform.
@@ -51,11 +65,26 @@ pub trait ChannelSender: Send + Sync {
 pub struct ChannelStreamRelay {
     config: RelayConfig,
     sender: Arc<dyn ChannelSender>,
+    topic: Option<crate::types::ChannelTopicContext>,
 }
 
 impl ChannelStreamRelay {
     pub fn new(config: RelayConfig, sender: Arc<dyn ChannelSender>) -> Self {
-        Self { config, sender }
+        Self {
+            config,
+            sender,
+            topic: None,
+        }
+    }
+
+    pub fn with_topic(mut self, topic: Option<crate::types::ChannelTopicContext>) -> Self {
+        self.topic = topic;
+        self
+    }
+
+    fn attach_topic(&self, mut message: UnifiedOutgoingMessage) -> UnifiedOutgoingMessage {
+        message.topic = self.topic.clone();
+        message
     }
 
     /// Run the relay loop until the agent stream ends.
@@ -81,8 +110,10 @@ impl ChannelStreamRelay {
                     }
                     Some(StreamAction::Thinking(_)) => {}
                     Some(StreamAction::ToolCall { .. }) if has_content && !text_buffer.trim().is_empty() => {
-                        let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                        let flush_msg = ChannelMessageService::build_streaming_message(&formatted);
+                        let formatted = format_outgoing_text_for_platform(&text_buffer, self.config.platform);
+                        let mut flush_msg =
+                            self.attach_topic(ChannelMessageService::build_streaming_message(&formatted.text));
+                        flush_msg.parse_mode = formatted.parse_mode;
                         let _ = self
                             .sender
                             .send_message(&self.config.plugin_id, &self.config.chat_id, flush_msg)
@@ -93,8 +124,10 @@ impl ChannelStreamRelay {
                     Some(StreamAction::ToolCall { .. }) => {}
                     Some(StreamAction::Finish) => {
                         if has_content && !text_buffer.trim().is_empty() {
-                            let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                            let final_msg = ChannelMessageService::build_final_message(&formatted);
+                            let formatted = format_outgoing_text_for_platform(&text_buffer, self.config.platform);
+                            let mut final_msg =
+                                self.attach_topic(ChannelMessageService::build_final_message(&formatted.text));
+                            final_msg.parse_mode = formatted.parse_mode;
                             let _ = self
                                 .sender
                                 .send_message(&self.config.plugin_id, &self.config.chat_id, final_msg)
@@ -118,6 +151,7 @@ impl ChannelStreamRelay {
                             image_url: None,
                             file_url: None,
                             file_name: None,
+                            topic: self.topic.clone(),
                             media_actions: None,
                             reply_to_message_id: None,
                             silent: None,
@@ -132,8 +166,10 @@ impl ChannelStreamRelay {
                 },
                 Err(broadcast::error::RecvError::Closed) => {
                     if has_content && !text_buffer.trim().is_empty() {
-                        let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                        let final_msg = ChannelMessageService::build_final_message(&formatted);
+                        let formatted = format_outgoing_text_for_platform(&text_buffer, self.config.platform);
+                        let mut final_msg =
+                            self.attach_topic(ChannelMessageService::build_final_message(&formatted.text));
+                        final_msg.parse_mode = formatted.parse_mode;
                         let _ = self
                             .sender
                             .send_message(&self.config.plugin_id, &self.config.chat_id, final_msg)
@@ -158,7 +194,7 @@ impl ChannelStreamRelay {
     async fn run_editable(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
         let throttle = Duration::from_millis(self.config.throttle_ms);
 
-        let thinking_msg = ChannelMessageService::build_thinking_message();
+        let thinking_msg = self.attach_topic(ChannelMessageService::build_thinking_message());
         let thinking_msg_id = match self
             .sender
             .send_message(&self.config.plugin_id, &self.config.chat_id, thinking_msg)
@@ -182,8 +218,10 @@ impl ChannelStreamRelay {
                         text_buffer.push_str(&chunk);
                         has_content = true;
                         if last_edit.elapsed() >= throttle {
-                            let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                            let msg = ChannelMessageService::build_streaming_message(&formatted);
+                            let formatted = format_outgoing_text_for_platform(&text_buffer, self.config.platform);
+                            let mut msg =
+                                self.attach_topic(ChannelMessageService::build_streaming_message(&formatted.text));
+                            msg.parse_mode = formatted.parse_mode;
                             let _ = self
                                 .sender
                                 .edit_message(&self.config.plugin_id, &self.config.chat_id, &thinking_msg_id, msg)
@@ -193,7 +231,9 @@ impl ChannelStreamRelay {
                     }
                     Some(StreamAction::Thinking(_)) => {}
                     Some(StreamAction::ToolCall { name, .. }) => {
-                        let msg = ChannelMessageService::build_streaming_message(&format!("\u{23f3} {name}..."));
+                        let msg = self.attach_topic(ChannelMessageService::build_streaming_message(&format!(
+                            "\u{23f3} {name}..."
+                        )));
                         let _ = self
                             .sender
                             .edit_message(&self.config.plugin_id, &self.config.chat_id, &thinking_msg_id, msg)
@@ -219,6 +259,7 @@ impl ChannelStreamRelay {
                             image_url: None,
                             file_url: None,
                             file_name: None,
+                            topic: self.topic.clone(),
                             media_actions: None,
                             reply_to_message_id: None,
                             silent: None,
@@ -256,8 +297,9 @@ impl ChannelStreamRelay {
 
     async fn send_final_edit(&self, text_buffer: &str, has_content: bool, msg_id: &str) {
         if has_content {
-            let formatted = format_text_for_platform(text_buffer, self.config.platform);
-            let final_msg = ChannelMessageService::build_final_message(&formatted);
+            let formatted = format_outgoing_text_for_platform(text_buffer, self.config.platform);
+            let mut final_msg = self.attach_topic(ChannelMessageService::build_final_message(&formatted.text));
+            final_msg.parse_mode = formatted.parse_mode;
             let _ = self
                 .sender
                 .edit_message(&self.config.plugin_id, &self.config.chat_id, msg_id, final_msg)

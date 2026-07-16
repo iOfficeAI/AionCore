@@ -188,13 +188,17 @@ async fn management_list_marks_rows_with_unavailable_snapshot() {
 }
 
 #[tokio::test]
-async fn legacy_agents_endpoint_is_not_found() {
+async fn agents_endpoint_returns_visible_agents_for_frontend_bridge() {
     let (mut app, services) = build_app().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
     let req = get_with_token("/api/agents", &token);
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    let rows = body["data"].as_array().expect("data should be an array");
+    assert!(rows.iter().all(|item| item["id"].is_string()));
 }
 
 #[tokio::test]

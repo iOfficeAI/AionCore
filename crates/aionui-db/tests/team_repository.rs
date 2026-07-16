@@ -41,6 +41,12 @@ fn make_team_for_user(id: &str, user_id: &str, name: &str) -> TeamRow {
         lead_agent_id: Some("a1".into()),
         session_mode: None,
         agents_version: "1.0.1".into(),
+        source_channel: None,
+        source_channel_id: None,
+        source_chat_id: None,
+        source_user_id: None,
+        source_label: None,
+        created_from: None,
         created_at: now,
         updated_at: now,
     }
@@ -90,6 +96,26 @@ async fn create_and_get_team() {
     assert_eq!(fetched.id, "t1");
     assert_eq!(fetched.name, "Team Alpha");
     assert_eq!(fetched.lead_agent_id, Some("a1".into()));
+}
+
+#[tokio::test]
+async fn create_and_get_team_preserves_source_metadata() {
+    let (repo, _db) = repo().await;
+    let mut team = make_team("t1", "Telegram Team");
+    team.source_channel = Some("telegram".into());
+    team.source_chat_id = Some("chat:1".into());
+    team.source_user_id = Some("user:1".into());
+    team.source_label = Some("Telegram".into());
+    team.created_from = Some("telegram".into());
+
+    repo.create_team(&team).await.unwrap();
+
+    let fetched = repo.get_team("t1").await.unwrap().expect("team exists");
+    assert_eq!(fetched.source_channel.as_deref(), Some("telegram"));
+    assert_eq!(fetched.source_chat_id.as_deref(), Some("chat:1"));
+    assert_eq!(fetched.source_user_id.as_deref(), Some("user:1"));
+    assert_eq!(fetched.source_label.as_deref(), Some("Telegram"));
+    assert_eq!(fetched.created_from.as_deref(), Some("telegram"));
 }
 
 #[tokio::test]

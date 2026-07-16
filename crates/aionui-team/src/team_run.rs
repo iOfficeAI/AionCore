@@ -1269,21 +1269,19 @@ impl TeamRunManager {
     pub async fn record_empty_wake_observed(&self, slot_id: &str) -> Option<TeamRunPayload> {
         let mut guard = self.state.lock().await;
         let run = guard.as_mut()?;
-        let consumed = match run.pending_wakes.get_mut(slot_id).and_then(VecDeque::pop_front) {
-            Some(pending) => {
-                if run.pending_wakes.get(slot_id).is_some_and(VecDeque::is_empty) {
-                    run.pending_wakes.remove(slot_id);
-                }
-                Some(pending)
-            }
-            None => None,
-        };
+        let consumed = run.pending_wakes.remove(slot_id);
+        let consumed_count = consumed.as_ref().map(VecDeque::len).unwrap_or(0);
+        let consumed_source = consumed
+            .as_ref()
+            .and_then(|wakes| wakes.front())
+            .map(|wake| wake.source.as_str());
         let payload_before_completion = run.payload();
         debug!(
             team_id = %self.team_id,
             team_run_id = %run.team_run_id,
             slot_id,
-            consumed_wake_source = ?consumed.as_ref().map(|wake| wake.source.as_str()),
+            consumed_wake_source = ?consumed_source,
+            consumed_wake_count = consumed_count,
             slot_pending_wake_count = run.pending_wake_count_for_slot(slot_id),
             pending_wake_count = payload_before_completion.pending_wake_count,
             starting_child_count = payload_before_completion.starting_child_count,
@@ -3070,6 +3068,32 @@ mod tests {
                 .is_some(),
             "worker pending wake must remain"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_wake_drains_duplicate_same_slot_wakes_and_completes_run() {
+        let (manager, bc) = manager();
+        manager
+            .accept_user_message("lead", TeamRunTargetRole::Lead, false, None)
+            .await
+            .expect("accept run");
+
+        for _ in 0..3 {
+            manager
+                .record_pending_wake("lead", TeamRunTargetRole::Lead, TeamWakeSource::McpSendMessage)
+                .await
+                .expect("record duplicate lead pending wake");
+        }
+
+        let completed = manager
+            .record_empty_wake_observed("lead")
+            .await
+            .expect("empty mailbox should complete after draining duplicate lead wakes");
+
+        assert_eq!(completed.status, TeamRunStatus::Completed);
+        assert_eq!(completed.pending_wake_count, 0);
+        assert_eq!(manager.active_run_id().await, None);
+        assert!(bc.names().contains(&TEAM_RUN_COMPLETED_EVENT.to_owned()));
     }
 
     #[tokio::test]

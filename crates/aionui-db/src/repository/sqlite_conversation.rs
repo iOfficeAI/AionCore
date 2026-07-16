@@ -170,8 +170,9 @@ impl IConversationRepository for SqliteConversationRepository {
         sqlx::query(
             "INSERT INTO conversations \
                 (id, user_id, name, type, extra, model, status, source, \
-                 channel_chat_id, pinned, pinned_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 channel_chat_id, source_channel, source_channel_id, source_chat_id, \
+                 source_user_id, source_label, created_from, pinned, pinned_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.user_id)
@@ -182,6 +183,12 @@ impl IConversationRepository for SqliteConversationRepository {
         .bind(&row.status)
         .bind(&row.source)
         .bind(&row.channel_chat_id)
+        .bind(&row.source_channel)
+        .bind(&row.source_channel_id)
+        .bind(&row.source_chat_id)
+        .bind(&row.source_user_id)
+        .bind(&row.source_label)
+        .bind(&row.created_from)
         .bind(row.pinned)
         .bind(row.pinned_at)
         .bind(row.created_at)
@@ -1049,6 +1056,12 @@ mod tests {
             status: Some("pending".to_string()),
             source: Some("aionui".to_string()),
             channel_chat_id: None,
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             pinned: false,
             pinned_at: None,
             created_at: now,
