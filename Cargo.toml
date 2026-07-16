@@ -53,12 +53,12 @@ aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
-aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
-aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
-aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
-aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
-aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
+aion-agent = { git = "https://github.com/GodfatherPacino/aionrs.git", rev = "d91f2b2b70983ef4425f855543c627d4be9e3c0d" }
+aion-providers = { git = "https://github.com/GodfatherPacino/aionrs.git", rev = "d91f2b2b70983ef4425f855543c627d4be9e3c0d" }
+aion-types = { git = "https://github.com/GodfatherPacino/aionrs.git", rev = "d91f2b2b70983ef4425f855543c627d4be9e3c0d" }
+aion-protocol = { git = "https://github.com/GodfatherPacino/aionrs.git", rev = "d91f2b2b70983ef4425f855543c627d4be9e3c0d" }
+aion-config = { git = "https://github.com/GodfatherPacino/aionrs.git", rev = "d91f2b2b70983ef4425f855543c627d4be9e3c0d" }
+aion-mcp = { git = "https://github.com/GodfatherPacino/aionrs.git", rev = "d91f2b2b70983ef4425f855543c627d4be9e3c0d" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }

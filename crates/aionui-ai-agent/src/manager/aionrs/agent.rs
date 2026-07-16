@@ -26,7 +26,7 @@ use crate::capability::backend_protocol_sink::BackendProtocolSink;
 use crate::error::AgentError;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
-use crate::types::{AionrsResolvedConfig, SendMessageData};
+use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig, SendMessageData};
 
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
 
@@ -161,12 +161,7 @@ impl AionrsAgentManager {
         config.session.enabled = true;
         config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
 
-        if let Some(field) = config_extra.compat_overrides.max_tokens_field {
-            config.compat.transport.max_tokens_field = Some(field);
-        }
-        if let Some(path) = config_extra.compat_overrides.api_path {
-            config.compat.transport.api_path = Some(path);
-        }
+        apply_aionrs_compat_overrides(&mut config, &config_extra.compat_overrides);
 
         if !config_extra.extra_mcp_servers.is_empty() {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
@@ -310,6 +305,18 @@ impl AionrsAgentManager {
                 );
             }
         }
+    }
+}
+
+fn apply_aionrs_compat_overrides(config: &mut Config, overrides: &AionrsCompatOverrides) {
+    if let Some(field) = &overrides.max_tokens_field {
+        config.compat.transport.max_tokens_field = Some(field.clone());
+    }
+    if let Some(path) = &overrides.api_path {
+        config.compat.transport.api_path = Some(path.clone());
+    }
+    if overrides.emit_disabled_thinking {
+        config.compat.reasoning.emit_disabled_thinking = Some(true);
     }
 }
 
@@ -685,6 +692,34 @@ mod tests {
         config.base_url = Some("https://open.bigmodel.cn/api/paas/v4".into());
         config.compat_overrides.thinking_mode = Some("enabled".into());
         config
+    }
+
+    #[test]
+    fn glm_52_anthropic_compat_enables_explicit_disabled_thinking() {
+        let mut config = make_glm_52_test_config();
+        config.provider = "anthropic".into();
+        config.compat_overrides.emit_disabled_thinking = true;
+
+        let cli_args = CliArgs {
+            provider: Some(config.provider.clone()),
+            api_key: Some(config.api_key.clone()),
+            base_url: config.base_url.clone(),
+            model: Some(config.model.clone()),
+            max_tokens: config.max_tokens,
+            max_turns: config.max_turns,
+            max_tool_call_malformed_turns: config.max_tool_call_malformed_turns,
+            max_tool_call_failure_turns: config.max_tool_call_failure_turns,
+            system_prompt: config.system_prompt.clone(),
+            profile: None,
+            auto_approve: false,
+            thinking: config.compat_overrides.thinking_mode.clone(),
+            thinking_budget: None,
+            project_dir: Some(PathBuf::from("/project")),
+        };
+        let mut resolved = Config::resolve(&cli_args).unwrap();
+        apply_aionrs_compat_overrides(&mut resolved, &config.compat_overrides);
+
+        assert!(resolved.compat.emit_disabled_thinking());
     }
 
     #[tokio::test]
