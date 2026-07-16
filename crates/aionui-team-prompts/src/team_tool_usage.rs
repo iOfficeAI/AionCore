@@ -20,9 +20,11 @@ fn render_mcp_usage(role: TeamPromptRole, descriptors: &[TeamToolDescriptor]) ->
 Your platform may provide similarly named built-in tools. Do NOT use those.\n\
 Always use the `team_*` MCP tool versions.\n\
 Use `slot_id` values for all agent targets.\n\n\
-If a `team_*` MCP tool call fails due to schema, unknown tool, or permission errors,\n\
-use \"$AIONUI_HELPER_BIN\" team capabilities or \"$AIONUI_HELPER_BIN\" team help to inspect the Team CLI contract,\n\
-then retry the MCP tool call with corrected arguments.\n\n\
+If a single `team_*` MCP tool call fails because of invalid arguments, schema mismatch, or role/permission constraints,\n\
+use \"$AIONUI_HELPER_BIN\" team capabilities or \"$AIONUI_HELPER_BIN\" team help to inspect the Team contract,\n\
+then retry the MCP tool call with corrected arguments.\n\
+If the `team_*` MCP tools are unavailable, missing, disconnected, or continue to fail after correction,\n\
+use the Team CLI fallback through \"$AIONUI_HELPER_BIN\" team ... commands to continue Team coordination.\n\n\
 For exact schema, run team capabilities.\n\n\
 | When | MCP tool | Input summary |\n\
 | --- | --- | --- |\n",
@@ -91,6 +93,16 @@ mod tests {
         assert!(usage.contains("team_*` MCP tools"));
         assert!(usage.contains("team_spawn_agent"));
         assert!(usage.contains("\"$AIONUI_HELPER_BIN\" team capabilities"));
-        assert!(usage.contains("retry the MCP tool call"));
+        assert!(usage.contains("retry the MCP tool call with corrected arguments"));
+        assert!(usage.contains("use the Team CLI fallback"));
+    }
+
+    #[test]
+    fn mcp_teammate_usage_includes_shared_fallback_guidance() {
+        let usage = build_team_tool_usage(TeamPromptRole::Teammate, TeamToolTransport::Mcp);
+        assert!(usage.contains("\"$AIONUI_HELPER_BIN\" team capabilities"));
+        assert!(usage.contains("retry the MCP tool call with corrected arguments"));
+        assert!(usage.contains("use the Team CLI fallback"));
+        assert!(usage.contains("Lead-only tools are unavailable to teammates"));
     }
 }
