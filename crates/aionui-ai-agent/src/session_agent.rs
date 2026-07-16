@@ -1466,6 +1466,14 @@ fn spawn_event_pump(
         // survives — mirroring the reference `BackendOutputSink::emit_tool_result`,
         // which re-sends the name on completion. Cleared per turn with `tool_output`.
         let mut tool_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Tool calls of the CURRENT turn still awaiting their terminal `ToolResult`
+        // (call_id → name). If the turn ends without one — user cancel, process
+        // crash, or the CLI dropping the result — the persisted tool_call row would
+        // stay status "work" FOREVER and the frontend View-Steps spinner
+        // (`hasRunningToolMessages`) would never stop, surviving even reloads. The
+        // terminal arm below closes every remaining entry with a `Canceled` frame
+        // BEFORE the Finish (the relay stops forwarding a turn at Finish).
+        let mut open_tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         // Did the CURRENT turn emit any user-visible output (text / thinking / tool /
         // plan / permission)? Mirrors the ACP path's `is_empty_turn` (agent_session_flow.rs):
         // a clean terminal with this still `false` is a "blank reply" (ELECTRON-1JG) and
@@ -1679,8 +1687,39 @@ fn spawn_event_pump(
                     // New turn: the prior turn's terminal no longer applies.
                     terminal_result_seen = false;
                 }
+                // Track the call's open/closed lifecycle. Also remember the name for
+                // `stamp_tool_name` — the map was previously never populated, so
+                // ToolOutputDelta/ToolResult follow-up frames went out nameless.
+                SessionEvent::ToolCall { tool_use_id, name, .. } => {
+                    tool_name.insert(tool_use_id.clone(), name.clone());
+                    open_tools.insert(tool_use_id.clone(), name.clone());
+                }
+                SessionEvent::ToolResult { tool_use_id, .. } => {
+                    open_tools.remove(tool_use_id);
+                }
                 SessionEvent::TurnResult { .. } | SessionEvent::Detached { .. } if !suppress_intermediate_finish => {
                     runtime.set_status(ConversationStatus::Finished);
+                    // Close every tool call the turn left open (cancel/crash/dropped
+                    // result): emit a terminal `Canceled` frame per call so the
+                    // persisted row leaves "work" and the frontend spinner stops.
+                    // Must precede the Finish emitted by the translate loop below.
+                    for (call_id, name) in open_tools.drain() {
+                        tracing::info!(
+                            conv_id = %conversation_id,
+                            %call_id,
+                            tool = %name,
+                            "session-pump: closing tool call left open at turn end as canceled"
+                        );
+                        let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                            call_id,
+                            name,
+                            args: serde_json::Value::Null,
+                            status: ToolCallStatus::Canceled,
+                            input: None,
+                            output: None,
+                            description: None,
+                        }));
+                    }
                     // A terminal TurnResult decided this turn; a later Detached is then
                     // an absorbed teardown, not a mid-turn crash (see `crash_outcome`).
                     if matches!(env.event, SessionEvent::TurnResult { .. }) {
@@ -3765,6 +3804,84 @@ mod pump_tests {
             data.session_id.as_deref(),
             Some("sid-xyz"),
             "resume anchor rides Finish"
+        );
+    }
+
+    // THE FIX (stuck View-Steps spinner after interrupt): a tool call whose turn
+    // ends without a terminal `ToolResult` (user cancel / crash / dropped result)
+    // must be closed with a `Canceled` frame BEFORE the Finish — otherwise the
+    // persisted tool_call row stays status "work" forever and the frontend spinner
+    // (`hasRunningToolMessages`) never stops, surviving reloads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_turn_closes_open_tool_calls_as_canceled_before_finish() {
+        use aionui_session::{CancelReason, SubagentKind, TurnOutcome};
+        let script = vec![
+            env(SessionEvent::TurnStarted { epoch: 1 }),
+            env(SessionEvent::ToolCall {
+                tool_use_id: "call-1".into(),
+                name: "Bash".into(),
+                subagent: SubagentKind::Inline,
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: true,
+                api_error_status: None,
+                result_text: "error_during_execution".into(),
+                epoch: 1,
+                outcome: TurnOutcome::Cancelled {
+                    reason: CancelReason::UserCancel,
+                },
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let canceled_pos = frames.iter().position(|f| {
+            matches!(f, AgentStreamEvent::ToolCall(d)
+                if d.call_id == "call-1" && d.status == ToolCallStatus::Canceled && d.name == "Bash")
+        });
+        let finish_pos = frames.iter().position(|f| matches!(f, AgentStreamEvent::Finish(_)));
+        let canceled_pos = canceled_pos.expect("open tool call must be closed with a Canceled frame");
+        let finish_pos = finish_pos.expect("cancelled turn still finishes");
+        assert!(
+            canceled_pos < finish_pos,
+            "Canceled must precede Finish (relay breaks the turn on Finish)"
+        );
+    }
+
+    // A tool call that DID receive its ToolResult must NOT get a trailing Canceled
+    // frame at turn end — only calls left open are closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_tool_call_is_not_recanceled_at_turn_end() {
+        use aionui_session::SubagentKind;
+        let script = vec![
+            env(SessionEvent::TurnStarted { epoch: 1 }),
+            env(SessionEvent::ToolCall {
+                tool_use_id: "call-1".into(),
+                name: "Bash".into(),
+                subagent: SubagentKind::Inline,
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::ToolResult {
+                tool_use_id: "call-1".into(),
+                is_error: false,
+                content: vec![],
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: "done".into(),
+                epoch: 1,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        assert!(
+            !frames
+                .iter()
+                .any(|f| { matches!(f, AgentStreamEvent::ToolCall(d) if d.status == ToolCallStatus::Canceled) }),
+            "a resolved tool call must not be closed again as Canceled, got {frames:?}"
         );
     }
 

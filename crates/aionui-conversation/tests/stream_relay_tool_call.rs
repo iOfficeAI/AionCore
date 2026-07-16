@@ -179,6 +179,71 @@ async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
     assert_eq!(content["description"], "search files");
 }
 
+#[tokio::test]
+async fn run_tool_call_canceled_status_persists_as_terminal_finish() {
+    let (repo, _db) = setup_repo().await;
+    let bus = Arc::new(BroadcastEventBus::new(64));
+    let (tx, _) = broadcast::channel(64);
+
+    let relay = StreamRelay::new(
+        "conv-1".into(),
+        "asst-1".into(),
+        "turn-1".into(),
+        "system_default_user".into(),
+        repo.clone(),
+        bus,
+    );
+
+    let rx = tx.subscribe();
+    tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+        call_id: "bash-1".into(),
+        name: "Bash".into(),
+        args: json!({"command": "sleep 60"}),
+        status: ToolCallStatus::Running,
+        input: Some(json!({"command": "sleep 60"})),
+        output: None,
+        description: None,
+    }))
+    .unwrap();
+    // The turn was interrupted: the fold layer closes the still-open call as
+    // Canceled instead of a Completed/Error ToolResult ever arriving.
+    tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+        call_id: "bash-1".into(),
+        name: "Bash".into(),
+        args: serde_json::Value::Null,
+        status: ToolCallStatus::Canceled,
+        input: None,
+        output: None,
+        description: None,
+    }))
+    .unwrap();
+    tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+    relay.consume(rx).await;
+
+    let messages = repo
+        .list_messages_page(
+            "conv-1",
+            &MessagePageParams {
+                limit: 100,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    let msg = messages
+        .items
+        .iter()
+        .find(|row| row.id == "bash-1" && row.r#type == "tool_call")
+        .expect("tool call row should be persisted");
+    // Terminal row status must leave "work" so the frontend spinner
+    // (hasRunningToolMessages) stops after an interrupt.
+    assert_eq!(msg.status.as_deref(), Some("finish"));
+
+    let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
+    assert_eq!(content["status"], "canceled");
+}
+
 struct ToolCallAgent {
     conversation_id: String,
     event_tx: broadcast::Sender<AgentStreamEvent>,
