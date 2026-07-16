@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::{RuntimeTokenScope, RuntimeTokenService};
+use aionui_ai_agent::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use aionui_api_types::{
     TeamToolCliEnvelope, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolRuntimeCallRequest,
 };
@@ -14,7 +14,6 @@ use serde_json::Value;
 const HEADER_USER_ID: &str = "x-aionui-user-id";
 const HEADER_CONVERSATION_ID: &str = "x-aionui-conversation-id";
 const HEADER_RUNTIME_TOKEN: &str = "x-aionui-runtime-token";
-const DEFAULT_SESSION_GENERATION: &str = "default";
 
 #[derive(Clone)]
 pub struct RuntimeTeamToolsState {
@@ -138,7 +137,7 @@ fn runtime_headers(
             &user_id,
             &conversation_id,
             scope,
-            DEFAULT_SESSION_GENERATION,
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
         )
         .map_err(|_| ())?;
     Ok(RuntimeHeaders {

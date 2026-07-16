@@ -12,9 +12,7 @@ use tracing::{debug, info, warn};
 use crate::active_lease::ActiveLeaseRegistry;
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
-use crate::runtime_token::{
-    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, TEAM_RUNTIME_TOKEN_TTL,
-};
+use crate::runtime_token::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use crate::types::{AIONUI_RUNTIME_TOKEN_ENV, BuildTaskOptions, RuntimeCapabilities};
 
 /// Factory function that creates an [`AgentInstance`] from build options.
@@ -142,7 +140,6 @@ impl WorkerTaskManagerImpl {
             options.context.conversation.conversation_id.clone(),
             TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
             [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
-            TEAM_RUNTIME_TOKEN_TTL,
         );
         options
             .context
@@ -606,7 +603,6 @@ mod tests {
             "conv-1",
             TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
             [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
-            TEAM_RUNTIME_TOKEN_TTL,
         );
         let observed_tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
         let factory: AgentFactory = Arc::new({
@@ -788,7 +784,6 @@ mod tests {
             "conv-1",
             TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
             [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
-            TEAM_RUNTIME_TOKEN_TTL,
         );
         let mgr = make_manager().with_runtime_token_service(Arc::clone(&runtime_tokens));
         mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();

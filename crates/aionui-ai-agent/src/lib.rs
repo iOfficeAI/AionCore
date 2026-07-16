@@ -45,7 +45,7 @@ pub use registry::{AgentRegistry, UnavailableReason};
 pub use routes::{AgentRouterState, RemoteAgentRouterState, agent_routes, remote_agent_routes};
 pub use runtime_token::{
     RuntimeTokenClaims, RuntimeTokenError, RuntimeTokenIssue, RuntimeTokenScope, RuntimeTokenService,
-    TEAM_RUNTIME_TOKEN_SESSION_GENERATION, TEAM_RUNTIME_TOKEN_TTL,
+    TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 pub use services::AgentAvailabilityFeedbackPort;
 pub use services::AgentService;

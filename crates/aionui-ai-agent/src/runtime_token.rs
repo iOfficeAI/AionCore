@@ -1,12 +1,11 @@
 use std::collections::HashSet;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use dashmap::DashMap;
 use getrandom::getrandom;
 use sha2::{Digest, Sha256};
 
 pub const TEAM_RUNTIME_TOKEN_SESSION_GENERATION: &str = "default";
-pub const TEAM_RUNTIME_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeTokenScope {
@@ -44,7 +43,6 @@ pub struct RuntimeTokenClaims {
     pub conversation_id: String,
     pub scopes: HashSet<RuntimeTokenScope>,
     pub issued_at: SystemTime,
-    pub expires_at: SystemTime,
     pub session_generation: String,
 }
 
@@ -52,7 +50,6 @@ pub struct RuntimeTokenClaims {
 pub enum RuntimeTokenError {
     Missing,
     Unknown,
-    Expired,
     UserMismatch,
     ConversationMismatch,
     ScopeMissing,
@@ -81,14 +78,12 @@ impl RuntimeTokenService {
         conversation_id: impl Into<String>,
         session_generation: impl Into<String>,
         scopes: impl IntoIterator<Item = RuntimeTokenScope>,
-        ttl: Duration,
     ) -> RuntimeTokenIssue {
         let user_id = user_id.into();
         let conversation_id = conversation_id.into();
         let session_generation = session_generation.into();
         let scopes = scopes.into_iter().collect::<HashSet<_>>();
-        let now = SystemTime::now();
-        if let Some(existing) = self.existing_token(&user_id, &conversation_id, &session_generation, &scopes, now) {
+        if let Some(existing) = self.existing_token(&user_id, &conversation_id, &session_generation, &scopes) {
             return existing;
         }
         let token = generate_token();
@@ -96,8 +91,7 @@ impl RuntimeTokenService {
             user_id,
             conversation_id,
             scopes,
-            issued_at: now,
-            expires_at: now + ttl,
+            issued_at: SystemTime::now(),
             session_generation,
         };
         self.invalidate_conversation(&claims.user_id, &claims.conversation_id);
@@ -117,7 +111,6 @@ impl RuntimeTokenService {
         conversation_id: &str,
         session_generation: &str,
         scopes: &HashSet<RuntimeTokenScope>,
-        now: SystemTime,
     ) -> Option<RuntimeTokenIssue> {
         self.tokens.iter().find_map(|entry| {
             let token_entry = entry.value();
@@ -125,7 +118,6 @@ impl RuntimeTokenService {
             if claims.user_id == user_id
                 && claims.conversation_id == conversation_id
                 && claims.session_generation == session_generation
-                && now < claims.expires_at
                 && scopes.is_subset(&claims.scopes)
             {
                 Some(RuntimeTokenIssue {
@@ -155,10 +147,6 @@ impl RuntimeTokenService {
         };
         let claims = entry.value().claims.clone();
         drop(entry);
-        if SystemTime::now() >= claims.expires_at {
-            self.tokens.remove(&token_hash(raw_token));
-            return Err(RuntimeTokenError::Expired);
-        }
         if claims.user_id != user_id {
             return Err(RuntimeTokenError::UserMismatch);
         }
@@ -216,7 +204,6 @@ mod tests {
             "conv-1",
             "gen-1",
             [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
-            Duration::from_secs(60),
         );
 
         let claims = service
@@ -235,13 +222,7 @@ mod tests {
     #[test]
     fn rejects_missing_mismatched_scope_and_generation() {
         let service = RuntimeTokenService::new();
-        let issue = service.issue(
-            "user-1",
-            "conv-1",
-            "gen-1",
-            [RuntimeTokenScope::TeamContext],
-            Duration::from_secs(60),
-        );
+        let issue = service.issue("user-1", "conv-1", "gen-1", [RuntimeTokenScope::TeamContext]);
         assert_eq!(
             service.validate(None, "user-1", "conv-1", RuntimeTokenScope::TeamContext, "gen-1"),
             Err(RuntimeTokenError::Missing)
@@ -271,13 +252,7 @@ mod tests {
     #[test]
     fn invalidation_removes_matching_conversation_tokens() {
         let service = RuntimeTokenService::new();
-        let issue = service.issue(
-            "user-1",
-            "conv-1",
-            "gen-1",
-            [RuntimeTokenScope::TeamContext],
-            Duration::from_secs(60),
-        );
+        let issue = service.issue("user-1", "conv-1", "gen-1", [RuntimeTokenScope::TeamContext]);
         service.invalidate_conversation("user-1", "conv-1");
         assert_eq!(
             service.validate(
@@ -299,14 +274,12 @@ mod tests {
             "conv-1",
             "gen-1",
             [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
-            Duration::from_secs(60),
         );
         let second = service.issue(
             "user-1",
             "conv-1",
             "gen-2",
             [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
-            Duration::from_secs(60),
         );
 
         assert_eq!(
@@ -338,14 +311,12 @@ mod tests {
             "conv-1",
             "gen-1",
             [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
-            Duration::from_secs(60),
         );
         let second = service.issue(
             "user-1",
             "conv-1",
             "gen-1",
             [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
-            Duration::from_secs(60),
         );
 
         assert_eq!(first.token, second.token);
@@ -361,15 +332,25 @@ mod tests {
     }
 
     #[test]
+    fn token_lifetime_is_bound_to_explicit_invalidation_not_wall_clock_ttl() {
+        let service = RuntimeTokenService::new();
+        let issue = service.issue("user-1", "conv-1", "gen-1", [RuntimeTokenScope::TeamContext]);
+
+        service
+            .validate(
+                Some(&issue.token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::TeamContext,
+                "gen-1",
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn invalidate_conversation_id_revokes_tokens_for_conversation() {
         let service = RuntimeTokenService::new();
-        let issue = service.issue(
-            "user-1",
-            "conv-1",
-            "gen-1",
-            [RuntimeTokenScope::TeamContext],
-            Duration::from_secs(60),
-        );
+        let issue = service.issue("user-1", "conv-1", "gen-1", [RuntimeTokenScope::TeamContext]);
 
         service.invalidate_conversation_id("conv-1");
 
@@ -388,13 +369,7 @@ mod tests {
     #[test]
     fn debug_redacts_raw_token() {
         let service = RuntimeTokenService::new();
-        let issue = service.issue(
-            "user-1",
-            "conv-1",
-            "gen-1",
-            [RuntimeTokenScope::TeamContext],
-            Duration::from_secs(60),
-        );
+        let issue = service.issue("user-1", "conv-1", "gen-1", [RuntimeTokenScope::TeamContext]);
         let debug = format!("{issue:?}");
         assert!(!debug.contains(&issue.token));
         assert!(debug.contains("<redacted>"));

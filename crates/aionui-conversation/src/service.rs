@@ -7,7 +7,7 @@ use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
-    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, TEAM_RUNTIME_TOKEN_TTL,
+    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
@@ -3272,7 +3272,6 @@ impl ConversationService {
             conversation_id,
             TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
             [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
-            TEAM_RUNTIME_TOKEN_TTL,
         );
         Some(issue.token)
     }
