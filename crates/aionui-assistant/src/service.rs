@@ -1545,11 +1545,18 @@ impl AssistantService {
     fn read_user_rule_with_fallback(&self, id: &str, locale: Option<&str>) -> String {
         let rules_dir = self.user_rules_dir();
         let content = read_assistant_md_with_legacy(&rules_dir, id, locale);
-        if content.is_empty() {
-            read_first_assistant_md(&rules_dir, id)
-        } else {
-            content
+        if !content.is_empty() {
+            return content;
         }
+
+        if locale.is_some_and(|value| !value.is_empty()) {
+            let locale_less = read_assistant_md_with_legacy(&rules_dir, id, None);
+            if !locale_less.is_empty() {
+                return locale_less;
+            }
+        }
+
+        read_first_assistant_md(&rules_dir, id)
     }
 
     /// Write an assistant rule file. User-authored and generated assistants
