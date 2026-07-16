@@ -1,13 +1,22 @@
 //! Ollama integration for AionCore.
 //!
-//! This module provides Ollama Launch support, allowing AionCore to delegate
-//! agent spawning to Ollama for supported agents. When enabled, AionCore runs
-//! `ollama launch <agent>` instead of the agent's native command, leveraging
-//! Ollama's automatic model configuration.
+//! This module lets compatible ACP agents run against a local Ollama
+//! server without provider API keys. It works by injecting the same
+//! provider environment variables that `ollama launch <agent>` injects
+//! into the agent's *native ACP command*.
+//!
+//! Why not spawn `ollama launch <agent>` directly? `ollama launch`
+//! starts the agent's interactive TUI (verified empirically with Ollama
+//! 0.32.0: it resolves the agent binary on PATH and execs it with the
+//! provider env applied). A TUI spawned without a TTY never answers the
+//! ACP `initialize` request on stdio, so the handshake times out.
+//! Injecting the environment into the native ACP bridge command keeps
+//! the ACP transport intact while routing model calls to Ollama.
 
 use std::sync::OnceLock;
 
-use aionui_common::constants::{OLLAMA_COMMAND, get_ollama_launch_agent_name, is_ollama_supported_agent};
+use aionui_common::EnvVar;
+use aionui_common::constants::{OLLAMA_COMMAND, OLLAMA_DEFAULT_BASE_URL, is_ollama_supported_agent};
 
 /// Cached result of Ollama availability check
 static OLLAMA_AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -45,28 +54,38 @@ pub fn refresh_ollama_availability() {
     // an acceptable trade-off.
 }
 
-/// Check if a given agent backend is supported by Ollama Launch.
-///
-/// This checks the OLLAMA_LAUNCH_MAP to see if the agent has an Ollama
-/// launch integration available.
+/// Check if a given agent backend can run against Ollama.
 pub fn is_agent_ollama_supported(backend: &str) -> bool {
     is_ollama_supported_agent(backend)
 }
 
-/// Get the Ollama launch command for a given agent backend.
-///
-/// Returns the full command to use for launching the agent via Ollama,
-/// or None if the agent is not supported by Ollama Launch.
-pub fn get_ollama_launch_command(backend: &str) -> Option<String> {
-    get_ollama_launch_agent_name(backend).map(|name| format!("{OLLAMA_COMMAND} launch {name}"))
+fn env_var(name: &str, value: impl Into<String>) -> EnvVar {
+    EnvVar {
+        name: name.to_owned(),
+        value: value.into(),
+    }
 }
 
-/// Get the Ollama launch agent name for a given backend.
+/// Build the environment variables that route a backend's model calls to
+/// the local Ollama server, mirroring what `ollama launch <backend>`
+/// injects (captured from Ollama 0.32.0).
 ///
-/// Returns the agent name that Ollama understands, or None if the
-/// backend is not supported.
-pub fn get_ollama_agent_name(backend: &str) -> Option<&'static str> {
-    get_ollama_launch_agent_name(backend)
+/// Returns `None` for backends without a verified mapping.
+pub fn build_ollama_env(backend: &str, model: &str) -> Option<Vec<EnvVar>> {
+    match backend {
+        "claude" => Some(vec![
+            env_var("ANTHROPIC_BASE_URL", OLLAMA_DEFAULT_BASE_URL),
+            env_var("ANTHROPIC_AUTH_TOKEN", "ollama"),
+            // Cleared on purpose so a configured real key cannot take
+            // precedence over the Ollama route (matches `ollama launch`).
+            env_var("ANTHROPIC_API_KEY", ""),
+            env_var("ANTHROPIC_DEFAULT_OPUS_MODEL", model),
+            env_var("ANTHROPIC_DEFAULT_SONNET_MODEL", model),
+            env_var("ANTHROPIC_DEFAULT_HAIKU_MODEL", model),
+            env_var("CLAUDE_CODE_SUBAGENT_MODEL", model),
+        ]),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -74,37 +93,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ollama_launch_map_coverage() {
-        // Test that all expected agents are in the mapping
-        let expected_agents = [
-            "claude", "opencode", "codex", "copilot", "pi", "hermes", "droid", "qwen",
-        ];
-        for agent in expected_agents {
+    fn test_ollama_compatible_backend_coverage() {
+        assert!(is_agent_ollama_supported("claude"));
+        assert!(!is_agent_ollama_supported("gemini"));
+        assert!(!is_agent_ollama_supported("codex"));
+    }
+
+    #[test]
+    fn test_build_ollama_env_for_claude() {
+        let env = build_ollama_env("claude", "qwen3:14b").expect("claude must have an env mapping");
+        let get = |name: &str| env.iter().find(|var| var.name == name).map(|var| var.value.clone());
+        assert_eq!(get("ANTHROPIC_BASE_URL").as_deref(), Some(OLLAMA_DEFAULT_BASE_URL));
+        assert_eq!(get("ANTHROPIC_AUTH_TOKEN").as_deref(), Some("ollama"));
+        assert_eq!(get("ANTHROPIC_API_KEY").as_deref(), Some(""));
+        assert_eq!(get("ANTHROPIC_DEFAULT_SONNET_MODEL").as_deref(), Some("qwen3:14b"));
+        assert_eq!(get("CLAUDE_CODE_SUBAGENT_MODEL").as_deref(), Some("qwen3:14b"));
+    }
+
+    #[test]
+    fn test_build_ollama_env_unsupported_backends() {
+        assert!(build_ollama_env("gemini", "qwen3:14b").is_none());
+        assert!(build_ollama_env("codex", "qwen3:14b").is_none());
+        assert!(build_ollama_env("unknown", "qwen3:14b").is_none());
+    }
+
+    #[test]
+    fn test_env_mapping_exists_for_every_compatible_backend() {
+        // Every backend advertised as ollama_compatible must have an env
+        // mapping, otherwise the factory would silently fall back.
+        for backend in aionui_common::constants::OLLAMA_COMPATIBLE_BACKENDS {
             assert!(
-                is_agent_ollama_supported(agent),
-                "Agent {} should be supported by Ollama Launch",
-                agent
+                build_ollama_env(backend, "m").is_some(),
+                "{backend} is marked compatible but has no env mapping"
             );
         }
-    }
-
-    #[test]
-    fn test_ollama_launch_command_generation() {
-        assert_eq!(
-            get_ollama_launch_command("claude"),
-            Some("ollama launch claude".to_string())
-        );
-        assert_eq!(
-            get_ollama_launch_command("opencode"),
-            Some("ollama launch opencode".to_string())
-        );
-        assert_eq!(get_ollama_launch_command("nonexistent"), None);
-    }
-
-    #[test]
-    fn test_ollama_agent_name() {
-        assert_eq!(get_ollama_agent_name("claude"), Some("claude"));
-        assert_eq!(get_ollama_agent_name("codex"), Some("codex"));
-        assert_eq!(get_ollama_agent_name("unknown"), None);
     }
 }

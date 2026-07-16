@@ -1,34 +1,38 @@
-//! Integration tests for Ollama Launch functionality.
+//! Integration tests for the Ollama integration.
 //!
 //! These tests exercise the public API of the ollama module
-//! and the OLLAMA_LAUNCH_MAP constant from aionui-common.
+//! and the OLLAMA_COMPATIBLE_BACKENDS constant from aionui-common.
 
-use aionui_ai_agent::ollama::{
-    get_ollama_agent_name, get_ollama_launch_command, is_agent_ollama_supported, is_ollama_available,
-};
+use aionui_ai_agent::ollama::{build_ollama_env, is_agent_ollama_supported, is_ollama_available};
 use aionui_api_types::AcpBuildExtra;
-use aionui_common::constants::{OLLAMA_COMMAND, get_ollama_launch_agent_name, is_ollama_supported_agent};
+use aionui_common::constants::{
+    OLLAMA_COMMAND, OLLAMA_COMPATIBLE_BACKENDS, OLLAMA_DEFAULT_BASE_URL, is_ollama_supported_agent,
+};
 
 #[test]
-fn supported_agents_have_consistent_names() {
-    // Every supported agent should have a non-empty Ollama name
-    let supported = [
-        "claude", "opencode", "codex", "copilot", "pi", "hermes", "droid", "qwen",
-    ];
-    for agent in supported {
-        assert!(is_agent_ollama_supported(agent));
-        let name = get_ollama_agent_name(agent).expect("supported agent must have a name");
-        assert!(!name.is_empty());
+fn compatible_backends_have_env_mappings() {
+    // Every backend advertised as ollama_compatible must produce a
+    // non-empty env mapping, otherwise the factory silently falls back.
+    for backend in OLLAMA_COMPATIBLE_BACKENDS {
+        assert!(is_agent_ollama_supported(backend));
+        let env = build_ollama_env(backend, "qwen3:14b").expect("compatible backend must have an env mapping");
+        assert!(!env.is_empty());
     }
 }
 
 #[test]
-fn launch_command_contains_ollama_and_agent_name() {
-    for agent in ["claude", "codex", "opencode"] {
-        let cmd = get_ollama_launch_command(agent).expect("must produce a command");
-        assert!(cmd.starts_with("ollama launch "));
-        assert!(!cmd.ends_with(' '));
-    }
+fn claude_env_routes_to_local_ollama() {
+    let env = build_ollama_env("claude", "llama3.2").expect("claude mapping");
+    let get = |name: &str| env.iter().find(|var| var.name == name).map(|var| var.value.as_str());
+
+    // Mirrors what `ollama launch claude` injects (captured on 0.32.0).
+    assert_eq!(get("ANTHROPIC_BASE_URL"), Some(OLLAMA_DEFAULT_BASE_URL));
+    assert_eq!(get("ANTHROPIC_AUTH_TOKEN"), Some("ollama"));
+    assert_eq!(get("ANTHROPIC_API_KEY"), Some(""));
+    assert_eq!(get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some("llama3.2"));
+    assert_eq!(get("ANTHROPIC_DEFAULT_SONNET_MODEL"), Some("llama3.2"));
+    assert_eq!(get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), Some("llama3.2"));
+    assert_eq!(get("CLAUDE_CODE_SUBAGENT_MODEL"), Some("llama3.2"));
 }
 
 #[test]
@@ -41,23 +45,28 @@ fn unsupported_agents_are_consistent() {
         "goose",
         "codebuddy",
         "unknown_agent",
+        // `ollama launch` supports these interactively, but AionCore has
+        // no verified headless env mapping for them yet.
+        "opencode",
+        "codex",
+        "copilot",
+        "pi",
+        "hermes",
+        "droid",
+        "qwen",
     ];
     for agent in unsupported {
         assert!(!is_agent_ollama_supported(agent));
-        assert_eq!(get_ollama_agent_name(agent), None);
-        assert_eq!(get_ollama_launch_command(agent), None);
+        assert!(build_ollama_env(agent, "qwen3:14b").is_none());
     }
 }
 
 #[test]
 fn module_delegates_to_common_constants() {
     // The ollama module functions should agree with the aionui-common
-    // helper functions for every supported agent.
-    for agent in [
-        "claude", "opencode", "codex", "copilot", "pi", "hermes", "droid", "qwen",
-    ] {
-        assert_eq!(is_agent_ollama_supported(agent), is_ollama_supported_agent(agent));
-        assert_eq!(get_ollama_agent_name(agent), get_ollama_launch_agent_name(agent));
+    // helper functions for every compatible backend.
+    for backend in OLLAMA_COMPATIBLE_BACKENDS {
+        assert_eq!(is_agent_ollama_supported(backend), is_ollama_supported_agent(backend));
     }
 }
 
@@ -116,7 +125,7 @@ fn acp_build_extra_ollama_model_deserializes() {
 fn acp_build_extra_ollama_model_with_tagged_model() {
     // Tagged models like "qwen3:14b" should be preserved verbatim.
     let extra: AcpBuildExtra =
-        serde_json::from_str(r#"{"backend":"opencode","use_ollama":true,"ollama_model":"qwen3:14b"}"#).unwrap();
+        serde_json::from_str(r#"{"backend":"claude","use_ollama":true,"ollama_model":"qwen3:14b"}"#).unwrap();
     assert!(extra.use_ollama);
     assert_eq!(extra.ollama_model.as_deref(), Some("qwen3:14b"));
 }

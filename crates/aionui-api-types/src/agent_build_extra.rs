@@ -62,17 +62,17 @@ pub struct AcpBuildExtra {
     pub session_mcp_servers: Vec<SessionMcpServer>,
     pub user_id: Option<String>,
 
-    /// When enabled, delegates agent spawning to `ollama launch <agent>`
-    /// instead of the agent's native command.
+    /// When enabled, routes the agent's model calls to a local Ollama
+    /// server by injecting provider environment variables into the
+    /// agent's native ACP command (the same variables `ollama launch`
+    /// would inject interactively).
     pub use_ollama: bool,
 
-    /// Model to use with Ollama Launch (e.g. `"llama3.2"`, `"qwen3:14b"`).
+    /// Ollama model to route to (e.g. `"llama3.2"`, `"qwen3:14b"`).
     ///
-    /// Required when `use_ollama` is `true` — Ollama Launch cannot run
-    /// in headless mode (no TTY) without an explicit model selection.
-    /// When set, AionCore passes `--model <ollama_model> -y` to
-    /// `ollama launch`. When absent, the backend falls back to the
-    /// agent's native command.
+    /// Required when `use_ollama` is `true` — the injected environment
+    /// maps the agent's default model aliases onto this model. When
+    /// absent, the backend keeps the agent's native launch untouched.
     pub ollama_model: Option<String>,
 }
 

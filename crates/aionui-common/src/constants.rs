@@ -89,37 +89,26 @@ mod tests {
 // --- Ollama Launch ---
 
 pub const OLLAMA_COMMAND: &str = "ollama";
-/// Minimum Ollama version that supports the `launch` subcommand.
-pub const OLLAMA_MIN_LAUNCH_VERSION: &str = "0.15.0";
+/// Default local Ollama server address used for environment injection.
+pub const OLLAMA_DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
 
-/// Mapping of AionCore backend identifiers to Ollama launch agent names.
+/// Backends that can run against a local Ollama server.
 ///
-/// Each entry maps `(aioncore_backend, ollama_agent_name)`. Only agents
-/// that have a corresponding Ollama Launch integration are listed here.
-pub const OLLAMA_LAUNCH_MAP: &[(&str, &str)] = &[
-    ("claude", "claude"),
-    ("opencode", "opencode"),
-    ("codex", "codex"),
-    ("copilot", "copilot"),
-    ("pi", "pi"),
-    ("hermes", "hermes"),
-    ("droid", "droid"),
-    ("qwen", "qwen"),
-];
+/// AionCore enables this by injecting the same provider environment
+/// variables that `ollama launch <agent>` injects (verified empirically
+/// against Ollama 0.32.0) into the agent's *native ACP command*. Wrapping
+/// `ollama launch` itself does not work for AionCore: it starts the
+/// agent's interactive TUI, which never speaks ACP on stdio, so the
+/// initialize handshake times out.
+///
+/// Extend this list only together with a verified environment mapping in
+/// `aionui-ai-agent/src/ollama` (each backend has its own provider
+/// variables and some, e.g. codex, use config files instead of env).
+pub const OLLAMA_COMPATIBLE_BACKENDS: &[&str] = &["claude"];
 
-/// Check whether a given agent backend is supported by Ollama Launch.
+/// Check whether a given agent backend can run against Ollama.
 pub fn is_ollama_supported_agent(backend: &str) -> bool {
-    OLLAMA_LAUNCH_MAP
-        .iter()
-        .any(|(aion_backend, _)| *aion_backend == backend)
-}
-
-/// Get the Ollama launch agent name for a given AionCore backend.
-pub fn get_ollama_launch_agent_name(backend: &str) -> Option<&'static str> {
-    OLLAMA_LAUNCH_MAP
-        .iter()
-        .find(|(aion_backend, _)| *aion_backend == backend)
-        .map(|(_, ollama_name)| *ollama_name)
+    OLLAMA_COMPATIBLE_BACKENDS.contains(&backend)
 }
 
 // --- Image processing ---
@@ -134,23 +123,31 @@ mod ollama_tests {
     use super::*;
 
     #[test]
-    fn ollama_launch_map_covers_expected_agents() {
-        for agent in [
-            "claude", "opencode", "codex", "copilot", "pi", "hermes", "droid", "qwen",
-        ] {
-            assert!(
-                is_ollama_supported_agent(agent),
-                "{agent} should be in OLLAMA_LAUNCH_MAP"
-            );
-            assert!(get_ollama_launch_agent_name(agent).is_some());
-        }
+    fn ollama_compatible_backends_cover_expected_agents() {
+        assert!(is_ollama_supported_agent("claude"));
     }
 
     #[test]
-    fn unsupported_agents_not_in_map() {
-        for agent in ["gemini", "cursor", "auggie", "kimi", "goose", "codebuddy"] {
+    fn unsupported_agents_not_in_list() {
+        // Agents without a verified env mapping must not be flagged
+        // ollama_compatible — including agents `ollama launch` supports
+        // interactively but that AionCore has not verified headless.
+        for agent in [
+            "gemini",
+            "cursor",
+            "auggie",
+            "kimi",
+            "goose",
+            "codebuddy",
+            "opencode",
+            "codex",
+            "copilot",
+            "pi",
+            "hermes",
+            "droid",
+            "qwen",
+        ] {
             assert!(!is_ollama_supported_agent(agent));
-            assert_eq!(get_ollama_launch_agent_name(agent), None);
         }
     }
 }

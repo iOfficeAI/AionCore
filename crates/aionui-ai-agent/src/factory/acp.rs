@@ -7,11 +7,11 @@ use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
 use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_policy};
 use crate::factory::context::FactoryContext;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
+use crate::ollama::build_ollama_env;
 use crate::session_context::AcpSessionBuildContext;
 use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
 use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
-use aionui_common::constants::get_ollama_launch_agent_name;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -174,13 +174,20 @@ pub(super) async fn build(
     Ok(instance)
 }
 
-/// Resolve the agent command spec, optionally using Ollama Launch when
-/// the session configuration requests it and the agent is compatible.
+/// Resolve the agent command spec, optionally routing the agent's model
+/// calls to a local Ollama server when the session configuration requests
+/// it and the agent is compatible.
+///
+/// The Ollama path keeps the agent's native ACP command (so the stdio
+/// handshake still works) and injects the provider environment variables
+/// that `ollama launch` would inject. Spawning `ollama launch` itself does
+/// not work here: it starts the agent's interactive TUI, which never
+/// answers the ACP initialize request, so the handshake times out.
 ///
 /// Falls back to the standard command resolution when:
 /// - `config.use_ollama` is not set
 /// - The agent is not `ollama_compatible`
-/// - Ollama is not installed on the system
+/// - No `ollama_model` was supplied
 async fn resolve_agent_command_spec_with_ollama(
     meta: &aionui_api_types::AgentMetadata,
     config: &aionui_api_types::AcpBuildExtra,
@@ -188,52 +195,46 @@ async fn resolve_agent_command_spec_with_ollama(
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<CommandSpec, AgentError> {
-    if config.use_ollama && meta.ollama_compatible {
-        if let Some(ollama_name) = get_ollama_launch_agent_name(meta.backend.as_deref().unwrap_or("")) {
-            // Ollama Launch requires an explicit model when running
-            // headless (no TTY). If the caller didn't supply one, fall
-            // back to the native launch path so the agent can still start.
-            let Some(ref model) = config.ollama_model else {
-                warn!(
-                    agent = %meta.name,
-                    backend = ?meta.backend,
-                    "use_ollama=true but ollama_model is missing; falling back to native launch"
-                );
-                return resolve_agent_command_spec(meta, workspace, conversation_id, broadcaster).await;
-            };
+    let mut spec = resolve_agent_command_spec(meta, workspace, conversation_id, broadcaster).await?;
 
+    if config.use_ollama && meta.ollama_compatible {
+        // Routing to Ollama requires an explicit model: the injected
+        // provider variables map the agent's default model aliases onto
+        // it. If the caller didn't supply one, keep the native launch so
+        // the agent can still start.
+        let Some(ref model) = config.ollama_model else {
+            warn!(
+                agent = %meta.name,
+                backend = ?meta.backend,
+                "use_ollama=true but ollama_model is missing; falling back to native launch"
+            );
+            return Ok(spec);
+        };
+
+        let backend = meta.backend.as_deref().unwrap_or("");
+        if let Some(ollama_env) = build_ollama_env(backend, model) {
             info!(
                 agent = %meta.name,
                 backend = ?meta.backend,
-                ollama_agent = ollama_name,
                 model = %model,
-                "Using Ollama Launch for agent"
+                "Routing agent model calls to local Ollama via env injection"
             );
-            return Ok(CommandSpec {
-                command: "ollama".into(),
-                args: vec![
-                    "launch".into(),
-                    ollama_name.into(),
-                    "--model".into(),
-                    model.clone(),
-                    "-y".into(),
-                ],
-                env: vec![],
-                cwd: Some(workspace.to_owned()),
-            });
+            // Appended last so the Ollama route overrides any same-name
+            // variables from the catalog or user overrides.
+            spec.env.extend(ollama_env);
+        } else {
+            // Shouldn't happen in practice because ollama_compatible is
+            // computed from the same backend list that build_ollama_env
+            // covers (enforced by a unit test in crate::ollama).
+            warn!(
+                agent = %meta.name,
+                backend = ?meta.backend,
+                "Agent marked ollama_compatible but no env mapping found; falling back to native launch"
+            );
         }
-        // If we get here, the agent claims ollama_compatible but wasn't in
-        // the launch map — fall through to native path. This shouldn't
-        // happen in practice because ollama_compatible is computed from
-        // the same map.
-        warn!(
-            agent = %meta.name,
-            backend = ?meta.backend,
-            "Agent marked ollama_compatible but not found in OLLAMA_LAUNCH_MAP; falling back to native launch"
-        );
     }
 
-    resolve_agent_command_spec(meta, workspace, conversation_id, broadcaster).await
+    Ok(spec)
 }
 
 async fn resolve_agent_command_spec(
