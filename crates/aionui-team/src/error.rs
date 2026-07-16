@@ -41,6 +41,9 @@ pub enum TeamError {
     #[error("Workspace path is unavailable during execution: {0}")]
     WorkspacePathRuntimeUnavailable(String),
 
+    #[error("Workspace operation failed: {0}")]
+    WorkspaceOperation(String),
+
     #[error("{0}")]
     Database(#[from] aionui_db::DbError),
 

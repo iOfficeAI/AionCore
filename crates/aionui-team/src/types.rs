@@ -1,6 +1,6 @@
 use std::fmt;
 
-use aionui_api_types::{TeamAgentResponse, TeamResponse};
+use aionui_api_types::{TeamAgentResponse, TeamResponse, TeamWorkspaceMode};
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
@@ -147,6 +147,8 @@ pub struct Team {
     pub id: String,
     pub name: String,
     pub workspace: String,
+    #[serde(default)]
+    pub workspace_mode: TeamWorkspaceMode,
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
@@ -291,6 +293,10 @@ impl Team {
             id: row.id.clone(),
             name: row.name.clone(),
             workspace: row.workspace.clone(),
+            workspace_mode: match row.workspace_mode.as_str() {
+                "isolated" | "isolated_worktree" => TeamWorkspaceMode::IsolatedWorktree,
+                _ => TeamWorkspaceMode::Shared,
+            },
             agents,
             lead_agent_id: row.lead_agent_id.clone(),
             source_channel: row.source_channel.clone(),
@@ -309,6 +315,8 @@ impl Team {
             id: self.id.clone(),
             name: self.name.clone(),
             workspace: self.workspace.clone(),
+            workspace_mode: self.workspace_mode,
+            workspace_leases: vec![],
             assistants: self.agents.iter().map(|a| a.to_response()).collect(),
             leader_assistant_id: self.lead_agent_id.clone(),
             source_channel: self.source_channel.clone(),
@@ -687,6 +695,7 @@ mod tests {
             id: "t1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team".into(),
+            workspace_mode: TeamWorkspaceMode::Shared,
             agents: vec![TeamAgent {
                 slot_id: "s1".into(),
                 name: "Lead".into(),

@@ -15,6 +15,8 @@ impl TeamSessionService {
             id: team.id.clone(),
             name: team.name.clone(),
             workspace: team.workspace.clone(),
+            workspace_mode: team.workspace_mode,
+            workspace_leases: vec![],
             assistants: agents,
             leader_assistant_id: team.lead_agent_id.clone(),
             source_channel: source_metadata

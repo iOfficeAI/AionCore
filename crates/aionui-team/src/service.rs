@@ -218,6 +218,7 @@ impl TeamSessionService {
             id: team_id,
             name: req.name,
             workspace: team_workspace,
+            workspace_mode: aionui_api_types::TeamWorkspaceMode::Shared,
             agents,
             lead_agent_id,
             source_channel: source_metadata.source_channel,

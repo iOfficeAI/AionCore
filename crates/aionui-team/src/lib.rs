@@ -6,6 +6,7 @@ pub mod crash_detection;
 pub mod error;
 pub mod event_loop;
 pub mod events;
+mod git_workspace;
 pub mod mailbox;
 pub mod mcp;
 pub mod message_projection;
@@ -29,6 +30,10 @@ mod workspace;
 pub use crash_detection::{CrashReason, detect_crash, is_rate_limited};
 pub use error::TeamError;
 pub use events::TeamEventEmitter;
+pub use git_workspace::{
+    GitTeamWorkspaceManager, INTEGRATION_SLOT_ID, PreparedTeamWorkspaces, TeamWorkspaceManager, WorkspaceAgentSpec,
+    WorkspaceCleanupDisposition, WorkspaceCleanupResult,
+};
 pub use mailbox::Mailbox;
 pub use mcp::{TEAM_MCP_SERVER_NAME, TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
 pub use message_projection::{

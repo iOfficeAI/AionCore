@@ -88,6 +88,35 @@ pub struct CreateTeamRequest {
     pub created_from: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamWorkspaceMode {
+    #[default]
+    Shared,
+    #[serde(alias = "isolated")]
+    IsolatedWorktree,
+}
+
+impl TeamWorkspaceMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::IsolatedWorktree => "isolated_worktree",
+        }
+    }
+}
+
+/// HTTP request contract for Team creation. `CreateTeamRequest` remains the
+/// reusable source/agent payload used by channel integrations, while the Web
+/// endpoint adds the workspace lifecycle selection.
+#[derive(Debug, Deserialize)]
+pub struct CreateTeamHttpRequest {
+    #[serde(flatten)]
+    pub team: CreateTeamRequest,
+    #[serde(default)]
+    pub workspace_mode: TeamWorkspaceMode,
+}
+
 /// Request body for `PATCH /api/teams/:id/name`.
 #[derive(Debug, Deserialize)]
 pub struct RenameTeamRequest {
@@ -486,6 +515,10 @@ pub struct TeamResponse {
     pub name: String,
     #[serde(default)]
     pub workspace: String,
+    #[serde(default)]
+    pub workspace_mode: TeamWorkspaceMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_leases: Vec<AgentWorkspaceLeaseResponse>,
     #[serde(alias = "agents")]
     pub assistants: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "lead_agent_id")]
@@ -504,6 +537,22 @@ pub struct TeamResponse {
     pub created_from: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkspaceLeaseResponse {
+    pub id: String,
+    pub slot_id: String,
+    pub worktree_path: String,
+    pub branch_name: String,
+    pub base_commit: String,
+    pub allowed_paths: Vec<String>,
+    pub lease_status: String,
+    pub cleanup_status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Type alias for team list responses.
@@ -615,6 +664,40 @@ mod tests {
     use serde_json::json;
 
     // -- A. Team management requests ------------------------------------------
+
+    #[test]
+    fn create_team_http_request_defaults_to_shared_workspace() {
+        let req: CreateTeamHttpRequest = serde_json::from_value(json!({
+            "name": "Legacy",
+            "agents": [{
+                "name": "Lead",
+                "role": "lead",
+                "model": "default",
+                "assistant_id": "assistant-x"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(req.workspace_mode, TeamWorkspaceMode::Shared);
+    }
+
+    #[test]
+    fn create_team_http_request_canonicalizes_isolated_alias() {
+        for value in ["isolated", "isolated_worktree"] {
+            let req: CreateTeamHttpRequest = serde_json::from_value(json!({
+                "name": "Isolated",
+                "workspace_mode": value,
+                "agents": [{
+                    "name": "Lead",
+                    "role": "lead",
+                    "model": "default",
+                    "assistant_id": "assistant-x"
+                }]
+            }))
+            .unwrap();
+            assert_eq!(req.workspace_mode, TeamWorkspaceMode::IsolatedWorktree);
+            assert_eq!(req.workspace_mode.as_str(), "isolated_worktree");
+        }
+    }
 
     #[test]
     fn deserialize_create_team_request_full() {
@@ -1013,6 +1096,8 @@ mod tests {
             id: "team-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            workspace_mode: TeamWorkspaceMode::Shared,
+            workspace_leases: vec![],
             assistants: vec![TeamAgentResponse {
                 slot_id: "slot-1".into(),
                 assistant_name: "Lead".into(),
@@ -1056,6 +1141,8 @@ mod tests {
             id: "team-2".into(),
             name: "Beta".into(),
             workspace: String::new(),
+            workspace_mode: TeamWorkspaceMode::Shared,
+            workspace_leases: vec![],
             assistants: vec![],
             leader_assistant_id: None,
             source_channel: None,
@@ -1168,6 +1255,8 @@ mod tests {
             id: "team-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            workspace_mode: TeamWorkspaceMode::Shared,
+            workspace_leases: vec![],
             assistants: vec![
                 TeamAgentResponse {
                     slot_id: "s1".into(),

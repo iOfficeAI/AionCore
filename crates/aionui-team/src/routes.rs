@@ -57,6 +57,7 @@ impl From<TeamError> for ApiError {
             TeamError::DuplicateAgentName(msg) => ApiError::BadRequest(format!("Agent name already taken: {msg}")),
             TeamError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
             TeamError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
+            TeamError::WorkspaceOperation(message) => ApiError::BadRequest(message),
             TeamError::Database(db_err) => db_error_to_api_error(db_err),
             TeamError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
         }
