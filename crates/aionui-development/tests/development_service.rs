@@ -11,6 +11,14 @@ use aionui_development::{
 use sha2::{Digest, Sha256};
 
 async fn setup(project_path: &str) -> (DevelopmentService, tempfile::TempDir) {
+    setup_with_command(project_path, "printf gate-ok", 10).await
+}
+
+async fn setup_with_command(
+    project_path: &str,
+    unit_test_command: &str,
+    timeout_seconds: i64,
+) -> (DevelopmentService, tempfile::TempDir) {
     let db = init_database_memory().await.unwrap();
     sqlx::query(
         "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
@@ -41,12 +49,12 @@ async fn setup(project_path: &str) -> (DevelopmentService, tempfile::TempDir) {
             format_command: None,
             lint_command: None,
             typecheck_command: None,
-            unit_test_command: Some("printf gate-ok".into()),
+            unit_test_command: Some(unit_test_command.into()),
             integration_test_command: None,
             e2e_command: None,
             build_command: None,
             security_scan_command: None,
-            command_timeout_seconds: 10,
+            command_timeout_seconds: timeout_seconds,
             updated_at: 1,
         })
         .await
@@ -317,4 +325,105 @@ async fn configured_reviewer_role_is_enforced_and_separated_from_implementer() {
         .await
         .unwrap();
     assert!(service.submit_review("user-1", &run.id, review()).await.is_ok());
+}
+
+#[tokio::test]
+async fn gate_failure_timeout_and_output_bounds_are_persisted() {
+    let project = tempfile::tempdir().unwrap();
+    let (failed_service, _artifacts) =
+        setup_with_command(project.path().to_str().unwrap(), "printf failure >&2; exit 7", 10).await;
+    let input = || CreateDevelopmentRunInput {
+        project_id: "project-1".into(),
+        team_id: None,
+        source_channel: None,
+        source_user_id: None,
+        execution_mode: "single".into(),
+        request_summary: "Verify".into(),
+        acceptance_criteria: vec!["verified".into()],
+    };
+    let run = failed_service.create_run("user-1", input()).await.unwrap();
+    let failed = failed_service
+        .execute_gate("user-1", &run.id, None, "unit_test", None, true)
+        .await
+        .unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.exit_code, Some(7));
+
+    let project = tempfile::tempdir().unwrap();
+    let (timeout_service, _artifacts) = setup_with_command(project.path().to_str().unwrap(), "sleep 2", 1).await;
+    let run = timeout_service.create_run("user-1", input()).await.unwrap();
+    let timed_out = timeout_service
+        .execute_gate("user-1", &run.id, None, "unit_test", None, true)
+        .await
+        .unwrap();
+    assert_eq!(timed_out.status, "timed_out");
+
+    let project = tempfile::tempdir().unwrap();
+    let (bounded_service, _artifacts) =
+        setup_with_command(project.path().to_str().unwrap(), "head -c 1100000 /dev/zero", 10).await;
+    let run = bounded_service.create_run("user-1", input()).await.unwrap();
+    let gate = bounded_service
+        .execute_gate("user-1", &run.id, None, "unit_test", None, true)
+        .await
+        .unwrap();
+    let stdout = bounded_service
+        .list_artifacts("user-1", &run.id, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|artifact| Some(&artifact.id) == gate.stdout_artifact_id.as_ref())
+        .unwrap();
+    assert_eq!(std::fs::metadata(stdout.path_or_uri).unwrap().len(), 1024 * 1024);
+}
+
+#[tokio::test]
+async fn artifact_registration_rejects_outside_paths_and_forged_checksums() {
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    let (service, _artifacts) = setup(project.path().to_str().unwrap()).await;
+    let run = service
+        .create_run(
+            "user-1",
+            CreateDevelopmentRunInput {
+                project_id: "project-1".into(),
+                team_id: None,
+                source_channel: None,
+                source_user_id: None,
+                execution_mode: "single".into(),
+                request_summary: "Evidence".into(),
+                acceptance_criteria: vec!["valid evidence".into()],
+            },
+        )
+        .await
+        .unwrap();
+    let artifact = |path: String, checksum: &str| CreateArtifactInput {
+        task_id: None,
+        artifact_type: "test".into(),
+        path_or_uri: path,
+        checksum: checksum.into(),
+        producer_agent_id: None,
+        metadata: None,
+    };
+    assert!(
+        service
+            .create_artifact(
+                "user-1",
+                &run.id,
+                artifact(outside.path().to_string_lossy().into_owned(), "sha256:forged"),
+            )
+            .await
+            .is_err()
+    );
+    let inside = project.path().join("report.txt");
+    std::fs::write(&inside, b"passed").unwrap();
+    assert!(
+        service
+            .create_artifact(
+                "user-1",
+                &run.id,
+                artifact(inside.to_string_lossy().into_owned(), "sha256:forged"),
+            )
+            .await
+            .is_err()
+    );
 }
