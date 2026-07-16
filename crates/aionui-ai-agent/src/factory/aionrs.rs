@@ -213,7 +213,8 @@ pub(super) async fn build(
 
 fn glm_52_default_thinking_mode(model_id: &str) -> Option<String> {
     let normalized = model_id.trim().to_ascii_lowercase();
-    (normalized == "glm-5.2" || normalized.starts_with("glm-5.2-")).then(|| "enabled".to_owned())
+    let model_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    (model_name == "glm-5.2" || model_name.starts_with("glm-5.2-")).then(|| "enabled".to_owned())
 }
 
 /// Map AionUi DB platform/protocol settings to the aionrs provider identifier.
@@ -1719,6 +1720,14 @@ mod tests {
         assert_eq!(glm_52_default_thinking_mode("glm-5.2").as_deref(), Some("enabled"));
         assert_eq!(
             glm_52_default_thinking_mode("GLM-5.2-20260701").as_deref(),
+            Some("enabled")
+        );
+        assert_eq!(
+            glm_52_default_thinking_mode("zhanlu/glm-5.2").as_deref(),
+            Some("enabled")
+        );
+        assert_eq!(
+            glm_52_default_thinking_mode("z-ai/glm-5.2-20260701").as_deref(),
             Some("enabled")
         );
     }
