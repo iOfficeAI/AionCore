@@ -729,6 +729,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "aionui-project"
+version = "0.1.39"
+dependencies = [
+ "aionui-common",
+ "aionui-db",
+ "async-trait",
+ "git2",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+ "which 7.0.3",
+]
+
+[[package]]
 name = "aionui-realtime"
 version = "0.1.39"
 dependencies = [
