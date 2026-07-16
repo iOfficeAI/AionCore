@@ -93,3 +93,47 @@ fn acp_build_extra_use_ollama_deserializes_true() {
     assert!(extra.use_ollama);
     assert_eq!(extra.backend.as_deref(), Some("claude"));
 }
+
+#[test]
+fn acp_build_extra_ollama_model_defaults_to_none() {
+    // When ollama_model is absent from the JSON payload (all existing
+    // frontend versions), it must default to None.
+    let extra: AcpBuildExtra =
+        serde_json::from_str(r#"{"backend":"claude","use_ollama":true}"#).unwrap();
+    assert!(extra.use_ollama);
+    assert_eq!(extra.ollama_model, None);
+}
+
+#[test]
+fn acp_build_extra_ollama_model_deserializes() {
+    // When the frontend supplies ollama_model, it must be preserved.
+    let extra: AcpBuildExtra =
+        serde_json::from_str(
+            r#"{"backend":"claude","use_ollama":true,"ollama_model":"llama3.2"}"#,
+        )
+        .unwrap();
+    assert!(extra.use_ollama);
+    assert_eq!(extra.ollama_model.as_deref(), Some("llama3.2"));
+}
+
+#[test]
+fn acp_build_extra_ollama_model_with_tagged_model() {
+    // Tagged models like "qwen3:14b" should be preserved verbatim.
+    let extra: AcpBuildExtra =
+        serde_json::from_str(
+            r#"{"backend":"opencode","use_ollama":true,"ollama_model":"qwen3:14b"}"#,
+        )
+        .unwrap();
+    assert!(extra.use_ollama);
+    assert_eq!(extra.ollama_model.as_deref(), Some("qwen3:14b"));
+}
+
+#[test]
+fn acp_build_extra_ollama_model_without_use_ollama() {
+    // Sending ollama_model without use_ollama should parse but
+    // effectively be ignored at runtime (native launch path).
+    let extra: AcpBuildExtra =
+        serde_json::from_str(r#"{"backend":"claude","ollama_model":"llama3.2"}"#).unwrap();
+    assert!(!extra.use_ollama);
+    assert_eq!(extra.ollama_model.as_deref(), Some("llama3.2"));
+}

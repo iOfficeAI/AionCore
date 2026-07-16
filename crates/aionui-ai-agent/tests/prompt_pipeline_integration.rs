@@ -52,6 +52,7 @@ async fn fixture_params(
         session_mcp_servers: vec![],
         user_id: None,
         use_ollama: false,
+        ollama_model: None,
     };
 
     Arc::new(

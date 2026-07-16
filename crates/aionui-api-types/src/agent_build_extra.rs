@@ -78,6 +78,16 @@ pub struct AcpBuildExtra {
     /// instead of the agent's native command.
     #[serde(default)]
     pub use_ollama: bool,
+
+    /// Model to use with Ollama Launch (e.g. `"llama3.2"`, `"qwen3:14b"`).
+    ///
+    /// Required when `use_ollama` is `true` — Ollama Launch cannot run
+    /// in headless mode (no TTY) without an explicit model selection.
+    /// When set, AionCore passes `--model <ollama_model> -y` to
+    /// `ollama launch`. When absent, the backend falls back to the
+    /// agent's native command.
+    #[serde(default)]
+    pub ollama_model: Option<String>,
 }
 
 /// Aionrs-specific fields extracted from `extra` in build task options.

@@ -76,6 +76,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
         session_mcp_servers: vec![],
         user_id: None,
         use_ollama: false,
+        ollama_model: None,
     };
 
     let tmp_skills = tempfile::TempDir::new().unwrap();

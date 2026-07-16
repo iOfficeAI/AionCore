@@ -190,15 +190,40 @@ async fn resolve_agent_command_spec_with_ollama(
 ) -> Result<CommandSpec, AgentError> {
     if config.use_ollama && meta.ollama_compatible {
         if let Some(ollama_name) = get_ollama_launch_agent_name(meta.backend.as_deref().unwrap_or("")) {
+            // Ollama Launch requires an explicit model when running
+            // headless (no TTY). If the caller didn't supply one, fall
+            // back to the native launch path so the agent can still start.
+            let Some(ref model) = config.ollama_model else {
+                warn!(
+                    agent = %meta.name,
+                    backend = ?meta.backend,
+                    "use_ollama=true but ollama_model is missing; falling back to native launch"
+                );
+                return resolve_agent_command_spec(
+                    meta,
+                    workspace,
+                    conversation_id,
+                    broadcaster,
+                )
+                .await;
+            };
+
             info!(
                 agent = %meta.name,
                 backend = ?meta.backend,
                 ollama_agent = ollama_name,
+                model = %model,
                 "Using Ollama Launch for agent"
             );
             return Ok(CommandSpec {
                 command: "ollama".into(),
-                args: vec!["launch".into(), ollama_name.into()],
+                args: vec![
+                    "launch".into(),
+                    ollama_name.into(),
+                    "--model".into(),
+                    model.clone(),
+                    "-y".into(),
+                ],
                 env: vec![],
                 cwd: Some(workspace.to_owned()),
             });
