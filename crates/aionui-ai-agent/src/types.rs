@@ -102,6 +102,10 @@ impl RuntimeCapabilities {
 pub struct AionrsCompatOverrides {
     pub max_tokens_field: Option<String>,
     pub api_path: Option<String>,
+    /// Initial request-level thinking mode for models with a compatible API.
+    pub thinking_mode: Option<String>,
+    /// Emit an explicit disabled thinking block instead of omitting it.
+    pub emit_disabled_thinking: bool,
 }
 
 /// Fully resolved Aionrs configuration passed to the agent manager.

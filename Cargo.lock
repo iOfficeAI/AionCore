@@ -117,8 +117,8 @@ dependencies = [
 
 [[package]]
 name = "aion-agent"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -148,8 +148,8 @@ dependencies = [
 
 [[package]]
 name = "aion-compact"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "regex",
  "serde",
@@ -160,8 +160,8 @@ dependencies = [
 
 [[package]]
 name = "aion-config"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "aion-compact",
  "aion-process",
@@ -185,8 +185,8 @@ dependencies = [
 
 [[package]]
 name = "aion-mcp"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -206,8 +206,8 @@ dependencies = [
 
 [[package]]
 name = "aion-memory"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "aion-config",
  "chrono",
@@ -220,8 +220,8 @@ dependencies = [
 
 [[package]]
 name = "aion-process"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "libc",
  "tokio",
@@ -231,8 +231,8 @@ dependencies = [
 
 [[package]]
 name = "aion-protocol"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "aion-types",
  "serde",
@@ -244,8 +244,8 @@ dependencies = [
 
 [[package]]
 name = "aion-providers"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -272,8 +272,8 @@ dependencies = [
 
 [[package]]
 name = "aion-skills"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -299,8 +299,8 @@ dependencies = [
 
 [[package]]
 name = "aion-tools"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "aion-config",
  "aion-process",
@@ -320,8 +320,8 @@ dependencies = [
 
 [[package]]
 name = "aion-types"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.4"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6547,7 +6547,7 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+source = "git+https://github.com/GodfatherPacino/aionrs.git?rev=d91f2b2b70983ef4425f855543c627d4be9e3c0d#d91f2b2b70983ef4425f855543c627d4be9e3c0d"
 dependencies = [
  "bitflags",
  "cc",

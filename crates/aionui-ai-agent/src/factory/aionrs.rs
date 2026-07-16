@@ -95,8 +95,9 @@ pub(super) async fn build(
 
     let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref())?;
 
-    let (base_url, compat_overrides) =
+    let (base_url, mut compat_overrides) =
         resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, row.is_full_url);
+    configure_glm_52_thinking_compat(&mut compat_overrides, &provider, &model_id);
 
     let bedrock_config = if row.platform == "bedrock" {
         resolve_bedrock_config(row.bedrock_config.as_deref())
@@ -208,6 +209,17 @@ pub(super) async fn build(
 
     let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
+}
+
+fn glm_52_default_thinking_mode(model_id: &str) -> Option<String> {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    let model_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    (model_name == "glm-5.2" || model_name.starts_with("glm-5.2-")).then(|| "enabled".to_owned())
+}
+
+fn configure_glm_52_thinking_compat(compat_overrides: &mut AionrsCompatOverrides, provider: &str, model_id: &str) {
+    compat_overrides.thinking_mode = glm_52_default_thinking_mode(model_id);
+    compat_overrides.emit_disabled_thinking = provider == "anthropic" && compat_overrides.thinking_mode.is_some();
 }
 
 /// Map AionUi DB platform/protocol settings to the aionrs provider identifier.
@@ -1706,5 +1718,48 @@ mod tests {
         }
 
         assert_eq!(overrides.system_prompt.as_deref(), Some("Be concise."));
+    }
+
+    #[test]
+    fn glm_52_defaults_to_enabled_thinking() {
+        assert_eq!(glm_52_default_thinking_mode("glm-5.2").as_deref(), Some("enabled"));
+        assert_eq!(
+            glm_52_default_thinking_mode("GLM-5.2-20260701").as_deref(),
+            Some("enabled")
+        );
+        assert_eq!(
+            glm_52_default_thinking_mode("zhanlu/glm-5.2").as_deref(),
+            Some("enabled")
+        );
+        assert_eq!(
+            glm_52_default_thinking_mode("z-ai/glm-5.2-20260701").as_deref(),
+            Some("enabled")
+        );
+    }
+
+    #[test]
+    fn non_glm_52_models_do_not_receive_a_thinking_override() {
+        assert!(glm_52_default_thinking_mode("glm-5.1").is_none());
+        assert!(glm_52_default_thinking_mode("claude-sonnet-4").is_none());
+    }
+
+    #[test]
+    fn anthropic_glm_52_emits_explicit_disabled_thinking() {
+        let mut compat = AionrsCompatOverrides::default();
+
+        configure_glm_52_thinking_compat(&mut compat, "anthropic", "zhanlu/glm-5.2-anthropic");
+
+        assert_eq!(compat.thinking_mode.as_deref(), Some("enabled"));
+        assert!(compat.emit_disabled_thinking);
+    }
+
+    #[test]
+    fn openai_glm_52_keeps_default_disabled_serialization() {
+        let mut compat = AionrsCompatOverrides::default();
+
+        configure_glm_52_thinking_compat(&mut compat, "openai", "glm-5.2");
+
+        assert_eq!(compat.thinking_mode.as_deref(), Some("enabled"));
+        assert!(!compat.emit_disabled_thinking);
     }
 }
