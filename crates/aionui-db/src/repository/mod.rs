@@ -28,8 +28,10 @@ mod sqlite_settings;
 mod sqlite_skill;
 mod sqlite_team;
 mod sqlite_user;
+mod sqlite_workspace_lease;
 pub mod team;
 mod user;
+pub mod workspace_lease;
 
 pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
 pub use agent_metadata::IAgentMetadataRepository;
@@ -67,5 +69,7 @@ pub use sqlite_settings::SqliteSettingsRepository;
 pub use sqlite_skill::SqliteSkillRepository;
 pub use sqlite_team::SqliteTeamRepository;
 pub use sqlite_user::SqliteUserRepository;
+pub use sqlite_workspace_lease::SqliteAgentWorkspaceLeaseRepository;
 pub use team::ITeamRepository;
 pub use user::IUserRepository;
+pub use workspace_lease::{AgentWorkspaceLeaseUpdate, IAgentWorkspaceLeaseRepository};
