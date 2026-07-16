@@ -1,5 +1,6 @@
 use aionui_db::models::{
-    DevelopmentRunRow, DevelopmentTaskRow, ProjectRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
+    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, ProjectRow, QualityGateRunRow, ReviewFindingRow,
+    TaskArtifactRow,
 };
 use aionui_db::{
     IDevelopmentRepository, IProjectRepository, SqliteDevelopmentRepository, SqliteProjectRepository,
@@ -183,4 +184,20 @@ async fn development_tasks_roundtrip_with_quality_state() {
     assert_eq!(task.status, "review");
     assert_eq!(task.review_status, "in_review");
     assert_eq!(task.verification_status, "passed");
+}
+
+#[tokio::test]
+async fn development_roles_are_idempotent_and_run_scoped() {
+    let (repo, _db) = setup().await;
+    repo.create_run(&run()).await.unwrap();
+    let role = DevelopmentRunRoleRow {
+        run_id: "run-1".into(),
+        slot_id: "reviewer-slot".into(),
+        role: "reviewer".into(),
+        assigned_at: 2,
+    };
+    repo.assign_role(&role).await.unwrap();
+    repo.assign_role(&role).await.unwrap();
+    assert_eq!(repo.list_roles("run-1").await.unwrap(), vec![role]);
+    assert!(repo.list_roles("other-run").await.unwrap().is_empty());
 }

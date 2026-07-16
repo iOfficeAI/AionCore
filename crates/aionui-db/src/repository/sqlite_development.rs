@@ -2,7 +2,9 @@ use aionui_common::{TimestampMs, now_ms};
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{DevelopmentRunRow, DevelopmentTaskRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow};
+use crate::models::{
+    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
+};
 use crate::repository::development::IDevelopmentRepository;
 
 #[derive(Clone, Debug)]
@@ -92,6 +94,29 @@ impl IDevelopmentRepository for SqliteDevelopmentRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn assign_role(&self, row: &DevelopmentRunRoleRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO development_run_roles (run_id, slot_id, role, assigned_at) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(run_id, slot_id, role) DO NOTHING",
+        )
+        .bind(&row.run_id)
+        .bind(&row.slot_id)
+        .bind(&row.role)
+        .bind(row.assigned_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_roles(&self, run_id: &str) -> Result<Vec<DevelopmentRunRoleRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM development_run_roles WHERE run_id = ? ORDER BY role ASC, slot_id ASC")
+                .bind(run_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     async fn create_task(&self, row: &DevelopmentTaskRow) -> Result<(), DbError> {

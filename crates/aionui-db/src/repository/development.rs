@@ -1,7 +1,9 @@
 use aionui_common::TimestampMs;
 
 use crate::error::DbError;
-use crate::models::{DevelopmentRunRow, DevelopmentTaskRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow};
+use crate::models::{
+    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
+};
 
 #[async_trait::async_trait]
 pub trait IDevelopmentRepository: Send + Sync {
@@ -15,6 +17,9 @@ pub trait IDevelopmentRepository: Send + Sync {
         status: &str,
         finished_at: Option<TimestampMs>,
     ) -> Result<bool, DbError>;
+
+    async fn assign_role(&self, row: &DevelopmentRunRoleRow) -> Result<(), DbError>;
+    async fn list_roles(&self, run_id: &str) -> Result<Vec<DevelopmentRunRoleRow>, DbError>;
 
     async fn create_task(&self, row: &DevelopmentTaskRow) -> Result<(), DbError>;
     async fn get_task(&self, run_id: &str, task_id: &str) -> Result<Option<DevelopmentTaskRow>, DbError>;

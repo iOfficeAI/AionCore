@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use aionui_common::now_ms;
 use aionui_db::models::{
-    DevelopmentRunRow, DevelopmentTaskRow, ProjectCommandProfileRow, QualityGateRunRow, ReviewFindingRow,
-    TaskArtifactRow,
+    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, ProjectCommandProfileRow, QualityGateRunRow,
+    ReviewFindingRow, TaskArtifactRow,
 };
 use aionui_db::{IAgentWorkspaceLeaseRepository, IDevelopmentRepository, IProjectRepository};
 use serde::{Deserialize, Serialize};
@@ -116,6 +116,38 @@ impl DevelopmentService {
         project_id: Option<&str>,
     ) -> Result<Vec<DevelopmentRunRow>, DevelopmentError> {
         Ok(self.development_repo.list_runs(user_id, project_id).await?)
+    }
+
+    pub async fn assign_role(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        slot_id: &str,
+        role: &str,
+    ) -> Result<DevelopmentRunRoleRow, DevelopmentError> {
+        self.get_run(user_id, run_id).await?;
+        if !matches!(role, "implementer" | "tester" | "reviewer" | "integrator") {
+            return Err(DevelopmentError::BadRequest(format!(
+                "unsupported development role: {role}"
+            )));
+        }
+        let row = DevelopmentRunRoleRow {
+            run_id: run_id.into(),
+            slot_id: required_text(slot_id.into(), "slot_id")?,
+            role: role.into(),
+            assigned_at: now_ms(),
+        };
+        self.development_repo.assign_role(&row).await?;
+        Ok(row)
+    }
+
+    pub async fn list_roles(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<DevelopmentRunRoleRow>, DevelopmentError> {
+        self.get_run(user_id, run_id).await?;
+        Ok(self.development_repo.list_roles(run_id).await?)
     }
 
     pub async fn create_task(
@@ -286,15 +318,38 @@ impl DevelopmentService {
             .ok_or_else(|| DevelopmentError::BadRequest("project command profile is not configured".into()))?;
         let command = command_for_gate(&profile, gate_type)
             .ok_or_else(|| DevelopmentError::BadRequest(format!("gate {gate_type} has no configured command")))?;
-        let working_directory = match workspace_lease_id {
-            Some(lease_id) => self.validate_lease(user_id, &run, lease_id).await?.worktree_path,
+        let lease = match workspace_lease_id {
+            Some(lease_id) => Some(self.validate_lease(user_id, &run, lease_id).await?),
             None if run.execution_mode == "team" => {
                 return Err(DevelopmentError::BadRequest(
                     "team quality gates require an assigned workspace lease".into(),
                 ));
             }
-            None => project.local_path,
+            None => None,
         };
+        let working_directory = lease
+            .as_ref()
+            .map(|lease| lease.worktree_path.clone())
+            .unwrap_or(project.local_path);
+        if let Some(lease) = lease.as_ref() {
+            let roles = self.development_repo.list_roles(run_id).await?;
+            if !roles.is_empty() {
+                let allowed_roles: &[&str] = if task_id.is_some() {
+                    &["implementer", "tester"]
+                } else {
+                    &["integrator"]
+                };
+                if !roles
+                    .iter()
+                    .any(|role| role.slot_id == lease.slot_id && allowed_roles.contains(&role.role.as_str()))
+                {
+                    return Err(DevelopmentError::BadRequest(format!(
+                        "slot {} is not assigned an allowed quality role",
+                        lease.slot_id
+                    )));
+                }
+            }
+        }
         let started_at = now_ms();
         let started = Instant::now();
         let output = run_command(command, Path::new(&working_directory), profile.command_timeout_seconds).await?;
@@ -353,6 +408,17 @@ impl DevelopmentService {
             return Err(DevelopmentError::BadRequest(
                 "reviewer must be different from the task implementer".into(),
             ));
+        }
+        let roles = self.development_repo.list_roles(run_id).await?;
+        if !roles.is_empty()
+            && !roles
+                .iter()
+                .any(|role| role.slot_id == input.reviewer_agent_id && role.role == "reviewer")
+        {
+            return Err(DevelopmentError::BadRequest(format!(
+                "slot {} is not assigned the reviewer role",
+                input.reviewer_agent_id
+            )));
         }
         let reviewer_agent_id = input.reviewer_agent_id.clone();
         let producer_agent_id = input.producer_agent_id.clone();

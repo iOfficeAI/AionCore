@@ -13,8 +13,8 @@ use serde::Deserialize;
 use crate::error::DevelopmentError;
 use crate::service::{CompletionEvaluation, DevelopmentService};
 use crate::types::{
-    CreateArtifactInput, CreateDevelopmentRunInput, CreateDevelopmentTaskInput, ExecuteQualityGateInput,
-    ResolveFindingInput, SubmitReviewInput,
+    AssignDevelopmentRoleInput, CreateArtifactInput, CreateDevelopmentRunInput, CreateDevelopmentTaskInput,
+    ExecuteQualityGateInput, ResolveFindingInput, SubmitReviewInput,
 };
 
 impl From<DevelopmentError> for ApiError {
@@ -48,6 +48,10 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
         .route("/api/development-runs", post(create_run).get(list_runs))
         .route("/api/development-runs/{run_id}", get(get_run))
         .route(
+            "/api/development-runs/{run_id}/roles",
+            post(assign_role).get(list_roles),
+        )
+        .route(
             "/api/development-runs/{run_id}/tasks",
             post(create_task).get(list_tasks),
         )
@@ -72,6 +76,35 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
             post(resolve_finding),
         )
         .with_state(state)
+}
+
+async fn assign_role(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    body: Result<Json<AssignDevelopmentRoleInput>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<aionui_db::models::DevelopmentRunRoleRow>>), ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    let row = state
+        .service
+        .assign_role(&user.id, &run_id, &input.slot_id, &input.role)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(row))))
+}
+
+async fn list_roles(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<aionui_db::models::DevelopmentRunRoleRow>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .list_roles(&user.id, &run_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
 }
 
 async fn create_run(

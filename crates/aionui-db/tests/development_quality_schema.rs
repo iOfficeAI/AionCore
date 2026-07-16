@@ -8,6 +8,7 @@ async fn phase_three_migration_creates_evidence_and_gate_tables() {
         "task_artifacts",
         "quality_gate_runs",
         "review_findings",
+        "development_run_roles",
     ] {
         let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
             .bind(table)
@@ -15,6 +16,19 @@ async fn phase_three_migration_creates_evidence_and_gate_tables() {
             .await
             .unwrap();
         assert_eq!(exists, 1, "missing table {table}");
+    }
+}
+
+#[tokio::test]
+async fn development_run_roles_are_limited_to_separated_quality_roles() {
+    let db = init_database_memory().await.unwrap();
+    let schema: String =
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'development_run_roles'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    for role in ["implementer", "tester", "reviewer", "integrator"] {
+        assert!(schema.contains(role));
     }
 }
 

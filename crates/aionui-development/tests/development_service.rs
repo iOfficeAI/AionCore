@@ -263,3 +263,58 @@ async fn completion_succeeds_with_gate_review_acceptance_and_commit_evidence() {
         "completed"
     );
 }
+
+#[tokio::test]
+async fn configured_reviewer_role_is_enforced_and_separated_from_implementer() {
+    let project = tempfile::tempdir().unwrap();
+    let (service, _artifacts) = setup(project.path().to_str().unwrap()).await;
+    let run = service
+        .create_run(
+            "user-1",
+            CreateDevelopmentRunInput {
+                project_id: "project-1".into(),
+                team_id: None,
+                source_channel: None,
+                source_user_id: None,
+                execution_mode: "single".into(),
+                request_summary: "Review".into(),
+                acceptance_criteria: vec!["reviewed".into()],
+            },
+        )
+        .await
+        .unwrap();
+    let task = service
+        .create_task(
+            "user-1",
+            &run.id,
+            CreateDevelopmentTaskInput {
+                subject: "Implement".into(),
+                description: None,
+                owner: Some("implementer".into()),
+                blocked_by: vec![],
+                acceptance_criteria: vec!["reviewed".into()],
+                task_type: "implementation".into(),
+                risk_level: "high".into(),
+                assigned_workspace_lease_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .assign_role("user-1", &run.id, "tester", "tester")
+        .await
+        .unwrap();
+    let review = || SubmitReviewInput {
+        task_id: task.id.clone(),
+        reviewer_agent_id: "reviewer".into(),
+        producer_agent_id: Some("implementer".into()),
+        findings: vec![],
+        approved: true,
+    };
+    assert!(service.submit_review("user-1", &run.id, review()).await.is_err());
+    service
+        .assign_role("user-1", &run.id, "reviewer", "reviewer")
+        .await
+        .unwrap();
+    assert!(service.submit_review("user-1", &run.id, review()).await.is_ok());
+}

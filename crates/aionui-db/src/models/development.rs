@@ -44,6 +44,14 @@ pub struct DevelopmentTaskRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevelopmentRunRoleRow {
+    pub run_id: String,
+    pub slot_id: String,
+    pub role: String,
+    pub assigned_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TaskArtifactRow {
     pub id: String,
     pub run_id: String,

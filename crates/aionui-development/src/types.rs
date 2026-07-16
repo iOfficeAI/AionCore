@@ -82,3 +82,9 @@ pub struct ReviewFindingInput {
 pub struct ResolveFindingInput {
     pub status: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignDevelopmentRoleInput {
+    pub slot_id: String,
+    pub role: String,
+}
