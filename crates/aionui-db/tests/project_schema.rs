@@ -1,0 +1,54 @@
+use aionui_db::init_database_memory;
+
+#[tokio::test]
+async fn project_migration_creates_all_phase_one_tables() {
+    let db = init_database_memory().await.unwrap();
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (\
+         'projects', 'project_command_profiles', 'project_runtime_profiles', 'project_resource_links') \
+         ORDER BY name",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        names,
+        vec![
+            "project_command_profiles",
+            "project_resource_links",
+            "project_runtime_profiles",
+            "projects",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn project_schema_enforces_owner_path_uniqueness_and_resource_types() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool();
+
+    sqlx::query(
+        "INSERT INTO projects (id, user_id, name, local_path, project_type, created_at, updated_at) \
+         VALUES ('p1', 'system_default_user', 'One', '/tmp/project', 'unknown', 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let duplicate = sqlx::query(
+        "INSERT INTO projects (id, user_id, name, local_path, project_type, created_at, updated_at) \
+         VALUES ('p2', 'system_default_user', 'Two', '/tmp/project', 'unknown', 1, 1)",
+    )
+    .execute(pool)
+    .await;
+    assert!(duplicate.is_err());
+
+    let invalid_link = sqlx::query(
+        "INSERT INTO project_resource_links (project_id, resource_type, resource_id, created_at) \
+         VALUES ('p1', 'cron', 'c1', 1)",
+    )
+    .execute(pool)
+    .await;
+    assert!(invalid_link.is_err());
+}
