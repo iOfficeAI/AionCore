@@ -87,6 +87,13 @@ pub struct GitTeamWorkspaceManager {
 
 impl GitTeamWorkspaceManager {
     pub fn new(leases: Arc<dyn IAgentWorkspaceLeaseRepository>, managed_root: PathBuf) -> Self {
+        let managed_root = if managed_root.is_absolute() {
+            managed_root
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(managed_root)
+        };
         Self { leases, managed_root }
     }
 

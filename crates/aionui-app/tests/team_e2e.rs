@@ -1,5 +1,8 @@
 mod common;
 
+use std::path::Path;
+use std::process::Command;
+
 use aionui_db::{IConversationRepository, MessagePageDirection, MessagePageParams};
 use axum::http::StatusCode;
 use serde_json::json;
@@ -29,6 +32,25 @@ fn two_agent_body() -> serde_json::Value {
             team_agent("Worker", "teammate")
         ]
     })
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_git_repo(root: &Path) {
+    git(root, &["init", "-b", "main"]);
+    git(root, &["config", "user.email", "aion@example.test"]);
+    git(root, &["config", "user.name", "Aion Test"]);
+    std::fs::write(root.join("README.md"), "baseline\n").unwrap();
+    git(root, &["add", "README.md"]);
+    git(root, &["commit", "-m", "baseline"]);
 }
 
 async fn ensure_default_team_assistant(app: &mut axum::Router, token: &str, csrf: &str) {
@@ -275,6 +297,54 @@ async fn tc6c_create_team_rejects_missing_workspace_path() {
         json["data"].as_array().unwrap().is_empty(),
         "invalid team should not be persisted"
     );
+}
+
+#[tokio::test]
+async fn tc6d_isolated_worktree_request_returns_persisted_lease_status() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &token, &csrf).await;
+    let repository = tempfile::tempdir().unwrap();
+    init_git_repo(repository.path());
+
+    let req = json_with_token(
+        "POST",
+        "/api/teams",
+        json!({
+            "name": "Isolated",
+            "workspace": repository.path().to_string_lossy(),
+            "workspace_mode": "isolated_worktree",
+            "agents": [team_agent("Lead", "lead"), team_agent("Worker", "teammate")]
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let json = body_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "response: {json}");
+    let team = &json["data"];
+    assert_eq!(team["workspace_mode"], "isolated_worktree");
+    assert_eq!(team["workspace_leases"].as_array().unwrap().len(), 3);
+    assert!(
+        team["workspace_leases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|lease| lease["lease_status"] == "active")
+    );
+    assert_ne!(
+        team["workspace_leases"][1]["worktree_path"],
+        team["workspace_leases"][2]["worktree_path"]
+    );
+
+    let team_id = team["id"].as_str().unwrap();
+    let req = get_with_token(&format!("/api/teams/{team_id}"), &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["workspace_mode"], "isolated_worktree");
+    assert_eq!(json["data"]["workspace_leases"].as_array().unwrap().len(), 3);
 }
 
 // TC-7: Unauthenticated returns 401

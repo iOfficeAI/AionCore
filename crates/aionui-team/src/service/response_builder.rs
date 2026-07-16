@@ -10,13 +10,37 @@ impl TeamSessionService {
             Some(metadata) => Some(metadata),
             None => self.resolve_team_source_metadata(team).await?,
         };
+        let workspace_leases = if team.workspace_mode == aionui_api_types::TeamWorkspaceMode::IsolatedWorktree {
+            match &self.workspace_manager {
+                Some(manager) => manager
+                    .list_team_leases(&team.id)
+                    .await?
+                    .into_iter()
+                    .map(|lease| aionui_api_types::AgentWorkspaceLeaseResponse {
+                        id: lease.id,
+                        slot_id: lease.slot_id,
+                        worktree_path: lease.worktree_path,
+                        branch_name: lease.branch_name,
+                        base_commit: lease.base_commit,
+                        allowed_paths: serde_json::from_str(&lease.allowed_paths).unwrap_or_else(|_| vec![".".into()]),
+                        lease_status: lease.lease_status,
+                        cleanup_status: lease.cleanup_status,
+                        conflict_files: serde_json::from_str(&lease.conflict_files).unwrap_or_default(),
+                        last_error: lease.last_error,
+                    })
+                    .collect(),
+                None => vec![],
+            }
+        } else {
+            vec![]
+        };
 
         Ok(TeamResponse {
             id: team.id.clone(),
             name: team.name.clone(),
             workspace: team.workspace.clone(),
             workspace_mode: team.workspace_mode,
-            workspace_leases: vec![],
+            workspace_leases,
             assistants: agents,
             leader_assistant_id: team.lead_agent_id.clone(),
             source_channel: source_metadata

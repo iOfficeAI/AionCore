@@ -141,6 +141,7 @@ pub struct AddAgentRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddAgentRequestCompat {
     #[serde(default)]
     assistant: Option<TeamAgentInput>,

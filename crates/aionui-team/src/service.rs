@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 use aionui_ai_agent::{AgentError, AgentInstance, IWorkerTaskManager};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload, TeamResponse,
-    TeamRunAckResponse, TeamRunTargetRole, WebSocketMessage,
+    TeamRunAckResponse, TeamRunTargetRole, TeamWorkspaceMode, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -30,6 +30,7 @@ use crate::session::{AgentMessageQueueResult, TeamSession};
 use crate::types::{Team, TeamAgent};
 use crate::wake::TeamWakeSource;
 use crate::workspace::validate_create_workspace_path;
+use crate::{TeamWorkspaceManager, WorkspaceAgentSpec};
 
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
     if !workspace.trim().is_empty() {
@@ -55,6 +56,7 @@ pub struct TeamSessionService {
     turn_port: Arc<dyn AgentTurnExecutionPort>,
     cancellation_port: Arc<dyn AgentTurnCancellationPort>,
     backend_binary_path: Arc<PathBuf>,
+    workspace_manager: Option<Arc<dyn TeamWorkspaceManager>>,
     sessions: Arc<DashMap<String, SessionEntry>>,
     /// Per-team mutex serializing `add_agent` so concurrent callers cannot
     /// read-modify-write the `agents` JSON with stale state (last-writer-wins
@@ -88,6 +90,72 @@ impl TeamSessionService {
         cancellation_port: Arc<dyn AgentTurnCancellationPort>,
         backend_binary_path: Arc<PathBuf>,
     ) -> Arc<Self> {
+        Self::new_inner(
+            repo,
+            agent_metadata_repo,
+            assistant_definition_repo,
+            assistant_overlay_repo,
+            provider_repo,
+            conversation_port,
+            projection_store,
+            broadcaster,
+            task_manager,
+            turn_port,
+            cancellation_port,
+            backend_binary_path,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_workspace_manager(
+        repo: Arc<dyn ITeamRepository>,
+        agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+        provider_repo: Arc<dyn IProviderRepository>,
+        conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+        projection_store: Arc<dyn TeamProjectionMessageStore>,
+        broadcaster: Arc<dyn EventBroadcaster>,
+        task_manager: Arc<dyn IWorkerTaskManager>,
+        turn_port: Arc<dyn AgentTurnExecutionPort>,
+        cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+        backend_binary_path: Arc<PathBuf>,
+        workspace_manager: Arc<dyn TeamWorkspaceManager>,
+    ) -> Arc<Self> {
+        Self::new_inner(
+            repo,
+            agent_metadata_repo,
+            assistant_definition_repo,
+            assistant_overlay_repo,
+            provider_repo,
+            conversation_port,
+            projection_store,
+            broadcaster,
+            task_manager,
+            turn_port,
+            cancellation_port,
+            backend_binary_path,
+            Some(workspace_manager),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        repo: Arc<dyn ITeamRepository>,
+        agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+        provider_repo: Arc<dyn IProviderRepository>,
+        conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+        projection_store: Arc<dyn TeamProjectionMessageStore>,
+        broadcaster: Arc<dyn EventBroadcaster>,
+        task_manager: Arc<dyn IWorkerTaskManager>,
+        turn_port: Arc<dyn AgentTurnExecutionPort>,
+        cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+        backend_binary_path: Arc<PathBuf>,
+        workspace_manager: Option<Arc<dyn TeamWorkspaceManager>>,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
             repo,
             agent_metadata_repo,
@@ -101,6 +169,7 @@ impl TeamSessionService {
             turn_port,
             cancellation_port,
             backend_binary_path,
+            workspace_manager,
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
@@ -116,6 +185,7 @@ impl TeamSessionService {
             self.assistant_overlay_repo.clone(),
             self.provider_repo.clone(),
             self.conversation_port.clone(),
+            self.workspace_manager.clone(),
         )
     }
 
@@ -136,6 +206,11 @@ impl TeamSessionService {
     /// Restore sessions for all existing teams. Called once at app startup
     /// so that MCP servers are available before any user sends a message.
     pub async fn restore_all_sessions(&self) {
+        if let Some(manager) = &self.workspace_manager
+            && let Err(error) = manager.reconcile_all().await
+        {
+            tracing::warn!(error = %error, "failed to reconcile Team workspaces on startup");
+        }
         let teams = match self.repo.list_teams().await {
             Ok(t) => t,
             Err(e) => {
@@ -155,6 +230,16 @@ impl TeamSessionService {
     }
 
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {
+        self.create_team_with_workspace_mode(user_id, req, TeamWorkspaceMode::Shared)
+            .await
+    }
+
+    pub async fn create_team_with_workspace_mode(
+        &self,
+        user_id: &str,
+        req: CreateTeamRequest,
+        workspace_mode: TeamWorkspaceMode,
+    ) -> Result<TeamResponse, TeamError> {
         if req.agents.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
         }
@@ -169,7 +254,7 @@ impl TeamSessionService {
             ));
         }
 
-        let shared_workspace = match req.workspace.as_deref() {
+        let requested_workspace = match req.workspace.as_deref() {
             Some(workspace) if !workspace.is_empty() => Some(validate_create_workspace_path(workspace)?),
             _ => None,
         };
@@ -177,17 +262,52 @@ impl TeamSessionService {
         let team_id = generate_id();
         let now = now_ms();
         let source_metadata = TeamSourceMetadata::from_create_request(&req);
+        let slot_specs = req
+            .agents
+            .iter()
+            .map(|agent| WorkspaceAgentSpec::new(generate_id(), &agent.name))
+            .collect::<Vec<_>>();
+        let prepared_workspaces = match workspace_mode {
+            TeamWorkspaceMode::Shared => None,
+            TeamWorkspaceMode::IsolatedWorktree => {
+                let repository = requested_workspace.as_deref().ok_or_else(|| {
+                    TeamError::InvalidRequest("workspace is required for isolated_worktree mode".into())
+                })?;
+                let manager = self
+                    .workspace_manager
+                    .as_ref()
+                    .ok_or_else(|| TeamError::WorkspaceOperation("isolated worktree support is unavailable".into()))?;
+                Some(manager.prepare_team(user_id, &team_id, repository, &slot_specs).await?)
+            }
+        };
+        let shared_workspace = if workspace_mode == TeamWorkspaceMode::Shared {
+            requested_workspace.as_deref()
+        } else {
+            None
+        };
 
-        let provisioned = self
+        let provisioned_result = self
             .provisioner()
             .provision_initial_agents(
                 user_id,
                 &team_id,
                 &req.agents,
                 shared_workspace.as_deref(),
+                prepared_workspaces.as_ref(),
                 &source_metadata,
             )
-            .await?;
+            .await;
+        let provisioned = match provisioned_result {
+            Ok(provisioned) => provisioned,
+            Err(error) => {
+                if prepared_workspaces.is_some()
+                    && let Some(manager) = &self.workspace_manager
+                {
+                    let _ = manager.release_team(&team_id).await;
+                }
+                return Err(error);
+            }
+        };
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;
         let team_workspace = provisioned.team_workspace;
@@ -198,7 +318,7 @@ impl TeamSessionService {
             user_id: user_id.to_owned(),
             name: req.name.clone(),
             workspace: team_workspace.clone(),
-            workspace_mode: "shared".into(),
+            workspace_mode: workspace_mode.as_str().into(),
             agents: agents_json,
             lead_agent_id: lead_agent_id.clone(),
             session_mode: None,
@@ -212,13 +332,20 @@ impl TeamSessionService {
             created_at: now,
             updated_at: now,
         };
-        self.repo.create_team(&row).await?;
+        if let Err(error) = self.repo.create_team(&row).await {
+            if prepared_workspaces.is_some()
+                && let Some(manager) = &self.workspace_manager
+            {
+                let _ = manager.release_team(&team_id).await;
+            }
+            return Err(error.into());
+        }
 
         let team = Team {
             id: team_id,
             name: req.name,
             workspace: team_workspace,
-            workspace_mode: aionui_api_types::TeamWorkspaceMode::Shared,
+            workspace_mode,
             agents,
             lead_agent_id,
             source_channel: source_metadata.source_channel,
@@ -305,6 +432,25 @@ impl TeamSessionService {
                 .await;
         }
 
+        if team.workspace_mode == TeamWorkspaceMode::IsolatedWorktree
+            && let Some(manager) = &self.workspace_manager
+        {
+            let cleanup = manager.release_team(team_id).await?;
+            let preserved = cleanup
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result.disposition,
+                        crate::WorkspaceCleanupDisposition::DirtyPreserved
+                            | crate::WorkspaceCleanupDisposition::MissingPreserved
+                    )
+                })
+                .count();
+            if preserved > 0 {
+                warn!(team_id, preserved, "Team removed with workspace diagnostics preserved");
+            }
+        }
+
         self.repo.delete_mailbox_by_team(team_id).await?;
         self.repo.delete_tasks_by_team(team_id).await?;
         self.repo.delete_team(team_id).await?;
@@ -376,6 +522,24 @@ impl TeamSessionService {
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.into()))?;
 
         let removed = team.agents.remove(idx);
+
+        let _ = self
+            .task_manager
+            .kill_and_wait(&removed.conversation_id, Some(AgentKillReason::TeamDeleted))
+            .await;
+
+        if team.workspace_mode == TeamWorkspaceMode::IsolatedWorktree
+            && let Some(manager) = &self.workspace_manager
+        {
+            let cleanup = manager.release_slot(team_id, slot_id).await?;
+            if matches!(
+                cleanup.disposition,
+                crate::WorkspaceCleanupDisposition::DirtyPreserved
+                    | crate::WorkspaceCleanupDisposition::MissingPreserved
+            ) {
+                warn!(team_id, slot_id, "Agent workspace preserved during removal");
+            }
+        }
 
         let _ = self
             .conversation_port

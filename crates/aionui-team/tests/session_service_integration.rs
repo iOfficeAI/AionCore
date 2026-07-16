@@ -3,6 +3,7 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::{fs, path::Path, process::Command};
 
 use aionui_ai_agent::session_context::{
     AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
@@ -10,7 +11,9 @@ use aionui_ai_agent::session_context::{
 use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
-use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
+use aionui_api_types::{
+    AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, TeamWorkspaceMode, WebSocketMessage,
+};
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow,
@@ -20,10 +23,11 @@ use aionui_db::models::{
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
     IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessagePageParams,
-    MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    MessagePageResult, MessageRowUpdate, MessageSearchRow, SqliteAgentWorkspaceLeaseRepository,
 };
 use aionui_realtime::EventBroadcaster;
 
+use aionui_team::GitTeamWorkspaceManager;
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
@@ -1422,6 +1426,134 @@ fn setup_with_recording_turn_port() -> (
 
 fn setup() -> Arc<TeamSessionService> {
     setup_with_factory(success_factory()).0
+}
+
+fn git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn init_git_repo(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("project");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "aion@example.test"]);
+    git(&repo, &["config", "user.name", "Aion Test"]);
+    fs::write(repo.join("README.md"), "baseline\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-m", "baseline"]);
+    repo
+}
+
+async fn setup_with_real_workspace_manager(
+    managed_root: std::path::PathBuf,
+) -> (Arc<TeamSessionService>, Arc<MockConversationRepo>, aionui_db::Database) {
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
+    let database = aionui_db::init_database_memory().await.unwrap();
+    let workspace_manager = Arc::new(GitTeamWorkspaceManager::new(
+        Arc::new(SqliteAgentWorkspaceLeaseRepository::new(database.pool().clone())),
+        managed_root,
+    ));
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
+    let service = TeamSessionService::new_with_workspace_manager(
+        team_repo,
+        Arc::new(StubAgentMetadataRepo::empty()),
+        Arc::new(EmptyAssistantDefinitionRepo),
+        Arc::new(EmptyAssistantOverlayRepo),
+        Arc::new(EmptyProviderRepo),
+        conversation_ports.clone(),
+        conversation_ports,
+        Arc::new(NullBroadcaster),
+        task_manager,
+        noop_turn_port(),
+        noop_cancellation_port(),
+        Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+        workspace_manager,
+    );
+    (service, conv_repo, database)
+}
+
+#[tokio::test]
+async fn isolated_team_assigns_distinct_leases_and_cleans_removed_agent() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = init_git_repo(temp.path());
+    let (service, conversations, _database) = setup_with_real_workspace_manager(temp.path().join("managed")).await;
+
+    let created = service
+        .create_team_with_workspace_mode(
+            "user1",
+            CreateTeamRequest {
+                name: "Isolated".into(),
+                agents: two_agent_input(),
+                workspace: Some(repository.to_string_lossy().into_owned()),
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
+            },
+            TeamWorkspaceMode::IsolatedWorktree,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(created.workspace_mode, TeamWorkspaceMode::IsolatedWorktree);
+    assert_eq!(created.workspace_leases.len(), 3);
+    let first_workspace = conversations.get_extra(&created.assistants[0].conversation_id).unwrap()["workspace"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_workspace = conversations.get_extra(&created.assistants[1].conversation_id).unwrap()["workspace"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(first_workspace, second_workspace);
+    assert_ne!(created.workspace, first_workspace);
+
+    let added = service
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Third".into(),
+                role: "teammate".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let added_workspace = conversations.get_extra(&added.conversation_id).unwrap()["workspace"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(added_workspace, first_workspace);
+    assert_ne!(added_workspace, second_workspace);
+    assert!(Path::new(&added_workspace).is_dir());
+
+    service
+        .remove_agent("user1", &created.id, &added.slot_id)
+        .await
+        .unwrap();
+    assert!(!Path::new(&added_workspace).exists());
+    let updated = service.get_team("user1", &created.id).await.unwrap();
+    let released = updated
+        .workspace_leases
+        .iter()
+        .find(|lease| lease.slot_id == added.slot_id)
+        .unwrap();
+    assert_eq!(released.lease_status, "released");
+    assert_eq!(released.cleanup_status, "removed");
 }
 
 #[tokio::test]

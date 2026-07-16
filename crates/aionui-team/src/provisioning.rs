@@ -17,6 +17,7 @@ use crate::service::inherit_team_workspace;
 use crate::service::spawn_support::{parse_agent_type, resolve_full_auto_mode, resolve_runtime_backend};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::workspace::TeamWorkspaceResolver;
+use crate::{PreparedTeamWorkspaces, TeamWorkspaceManager, WorkspaceAgentSpec};
 
 #[derive(Clone)]
 pub struct TeamAgentProvisioner {
@@ -26,6 +27,7 @@ pub struct TeamAgentProvisioner {
     assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
     provider_repo: Arc<dyn IProviderRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+    workspace_manager: Option<Arc<dyn TeamWorkspaceManager>>,
 }
 
 pub(crate) struct InitialProvisioningResult {
@@ -220,6 +222,7 @@ impl TeamAgentProvisioner {
         assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
         conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+        workspace_manager: Option<Arc<dyn TeamWorkspaceManager>>,
     ) -> Self {
         Self {
             repo,
@@ -228,6 +231,7 @@ impl TeamAgentProvisioner {
             assistant_overlay_repo,
             provider_repo,
             conversation_port,
+            workspace_manager,
         }
     }
 
@@ -241,13 +245,17 @@ impl TeamAgentProvisioner {
         team_id: &str,
         inputs: &[TeamAgentInput],
         shared_workspace: Option<&str>,
+        isolated_workspaces: Option<&PreparedTeamWorkspaces>,
         source_metadata: &TeamSourceMetadata,
     ) -> Result<InitialProvisioningResult, TeamError> {
         let Some((leader_input, teammate_inputs)) = inputs.split_first() else {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
         };
 
-        let leader_slot_id = generate_id();
+        let leader_slot_id = isolated_workspaces
+            .and_then(|plan| plan.agent_leases.first())
+            .map(|lease| lease.slot_id.clone())
+            .unwrap_or_else(generate_id);
         let leader_role = TeammateRole::Lead;
         let leader_assistant_id = Self::effective_assistant_id(leader_input.assistant_id.as_deref());
         let leader_backend = self
@@ -263,21 +271,27 @@ impl TeamAgentProvisioner {
                 &leader_backend,
                 &leader_input.model,
                 leader_assistant_id.as_deref(),
-                shared_workspace,
+                isolated_workspaces
+                    .and_then(|plan| plan.agent_leases.first())
+                    .map(|lease| lease.worktree_path.as_str())
+                    .or(shared_workspace),
                 source_metadata,
             )
             .await?;
 
-        let team_workspace = match shared_workspace {
-            Some(workspace) => workspace.to_owned(),
-            None => {
-                self.resolve_initial_leader_workspace(
-                    team_id,
-                    &leader_conversation.conversation_id,
-                    leader_conversation.workspace,
-                )
-                .await?
-            }
+        let team_workspace = match isolated_workspaces {
+            Some(plan) => plan.integration.worktree_path.clone(),
+            None => match shared_workspace {
+                Some(workspace) => workspace.to_owned(),
+                None => {
+                    self.resolve_initial_leader_workspace(
+                        team_id,
+                        &leader_conversation.conversation_id,
+                        leader_conversation.workspace,
+                    )
+                    .await?
+                }
+            },
         };
 
         let mut agents = Vec::with_capacity(inputs.len());
@@ -294,8 +308,11 @@ impl TeamAgentProvisioner {
             cli_path: None,
         });
 
-        for input in teammate_inputs {
-            let slot_id = generate_id();
+        for (index, input) in teammate_inputs.iter().enumerate() {
+            let isolated_lease = isolated_workspaces.and_then(|plan| plan.agent_leases.get(index + 1));
+            let slot_id = isolated_lease
+                .map(|lease| lease.slot_id.clone())
+                .unwrap_or_else(generate_id);
             let role = TeammateRole::parse(&input.role).unwrap_or(TeammateRole::Teammate);
             let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
             let backend = self
@@ -311,7 +328,9 @@ impl TeamAgentProvisioner {
                     &backend,
                     &input.model,
                     assistant_id.as_deref(),
-                    Some(&team_workspace),
+                    isolated_lease
+                        .map(|lease| lease.worktree_path.as_str())
+                        .or(Some(&team_workspace)),
                     source_metadata,
                 )
                 .await?;
@@ -355,7 +374,10 @@ impl TeamAgentProvisioner {
         req: AddAgentRequest,
     ) -> Result<TeamAgent, TeamError> {
         let role = TeammateRole::parse(&req.role).unwrap_or(TeammateRole::Teammate);
-        let workspace = self.workspace_resolver().resolve_for_new_agent(row, team).await?;
+        let slot_id = generate_id();
+        let workspace = self
+            .resolve_workspace_for_new_agent(user_id, row, team, &slot_id, &req.name)
+            .await?;
         let assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref());
         let backend = self
             .resolve_requested_backend(req.backend.as_deref(), assistant_id.as_deref())
@@ -364,7 +386,7 @@ impl TeamAgentProvisioner {
             .provision_new_agent(NewAgentProvisioning {
                 user_id: user_id.to_owned(),
                 team_id: team.id.clone(),
-                slot_id: generate_id(),
+                slot_id: slot_id.clone(),
                 name: req.name,
                 role,
                 backend,
@@ -372,7 +394,14 @@ impl TeamAgentProvisioner {
                 assistant_id,
                 workspace: Some(workspace),
             })
-            .await?;
+            .await;
+        let agent = match agent {
+            Ok(agent) => agent,
+            Err(error) => {
+                self.release_failed_isolated_slot(row, &slot_id).await;
+                return Err(error);
+            }
+        };
         team.agents.push(agent.clone());
         self.persist_agents(&team.id, &team.agents).await?;
         Ok(agent)
@@ -413,7 +442,10 @@ impl TeamAgentProvisioner {
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(req.team_id.clone()))?;
         let mut team = Team::from_row(&row)?;
-        let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
+        let slot_id = req.slot_id.clone();
+        let workspace = self
+            .resolve_workspace_for_new_agent(&req.user_id, &row, &team, &slot_id, &req.name)
+            .await?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
                 user_id: req.user_id,
@@ -426,7 +458,14 @@ impl TeamAgentProvisioner {
                 assistant_id: req.assistant_id,
                 workspace: Some(workspace),
             })
-            .await?;
+            .await;
+        let agent = match agent {
+            Ok(agent) => agent,
+            Err(error) => {
+                self.release_failed_isolated_slot(&row, &slot_id).await;
+                return Err(error);
+            }
+        };
         team.agents.push(agent.clone());
         self.persist_agents(&req.team_id, &team.agents).await?;
         Ok(agent)
@@ -705,5 +744,34 @@ impl TeamAgentProvisioner {
             }
         }
         None
+    }
+
+    async fn resolve_workspace_for_new_agent(
+        &self,
+        user_id: &str,
+        row: &TeamRow,
+        team: &Team,
+        slot_id: &str,
+        name: &str,
+    ) -> Result<String, TeamError> {
+        if matches!(row.workspace_mode.as_str(), "isolated" | "isolated_worktree") {
+            let manager = self
+                .workspace_manager
+                .as_ref()
+                .ok_or_else(|| TeamError::WorkspaceOperation("isolated worktree support is unavailable".into()))?;
+            return Ok(manager
+                .allocate_agent(user_id, &row.id, &WorkspaceAgentSpec::new(slot_id, name))
+                .await?
+                .worktree_path);
+        }
+        self.workspace_resolver().resolve_for_new_agent(row, team).await
+    }
+
+    async fn release_failed_isolated_slot(&self, row: &TeamRow, slot_id: &str) {
+        if matches!(row.workspace_mode.as_str(), "isolated" | "isolated_worktree")
+            && let Some(manager) = &self.workspace_manager
+        {
+            let _ = manager.release_slot(&row.id, slot_id).await;
+        }
     }
 }

@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 
 use aionui_api_types::{
-    AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
+    AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamHttpRequest,
     PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest,
     SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
 };
@@ -94,10 +94,13 @@ pub fn team_routes(state: TeamRouterState) -> Router {
 async fn create_team(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
-    body: Result<Json<CreateTeamRequest>, JsonRejection>,
+    body: Result<Json<CreateTeamHttpRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<TeamResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let team = state.service.create_team(&user.id, req).await?;
+    let team = state
+        .service
+        .create_team_with_workspace_mode(&user.id, req.team, req.workspace_mode)
+        .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(team))))
 }
 

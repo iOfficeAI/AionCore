@@ -1061,7 +1061,14 @@ pub fn build_team_state(
     let projection_store: Arc<dyn TeamProjectionMessageStore> = adapters.clone();
     let turn_port: Arc<dyn AgentTurnExecutionPort> = adapters.clone();
     let cancellation_port: Arc<dyn AgentTurnCancellationPort> = adapters;
-    let service = TeamSessionService::new(
+    let workspace_manager: Arc<dyn aionui_team::TeamWorkspaceManager> =
+        Arc::new(aionui_team::GitTeamWorkspaceManager::new(
+            Arc::new(aionui_db::SqliteAgentWorkspaceLeaseRepository::new(
+                services.database.pool().clone(),
+            )),
+            services.data_dir.join("team-worktrees"),
+        ));
+    let service = TeamSessionService::new_with_workspace_manager(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
         Arc::new(SqliteAssistantDefinitionRepository::new(
@@ -1076,6 +1083,7 @@ pub fn build_team_state(
         turn_port,
         cancellation_port,
         backend_binary_path,
+        workspace_manager,
     );
     TeamRouterState { service }
 }
