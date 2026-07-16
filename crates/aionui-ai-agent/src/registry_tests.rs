@@ -289,8 +289,8 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
         native_skills_dirs: None,
         behavior_policy: None,
         yolo_id: None,
-        agent_capabilities: None,
-        auth_methods: None,
+        agent_capabilities: Some(r#"{"loadSession":true,"promptCapabilities":{"image":true}}"#),
+        auth_methods: Some(r#"[{"id":"oauth","name":"OAuth"}]"#),
         config_options: Some(
             r#"{"config_options":[{"id":"model","type":"select","category":"model","options":[{"value":"claude-opus","label":"Claude Opus"}],"current_value":"claude-opus"}]}"#,
         ),
@@ -300,7 +300,7 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
         available_models: Some(
             r#"{"current_model_id":"claude-opus","current_model_label":"Claude Opus","available_models":[{"id":"claude-opus","label":"Claude Opus"}]}"#,
         ),
-        available_commands: None,
+        available_commands: Some(r#"[{"name":"review","description":"Review changes"}]"#),
         sort_order: 100,
     })
     .await
@@ -326,6 +326,9 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
         row_json["config_options"]["config_options"][0]["current_value"].as_str(),
         Some("claude-opus")
     );
+    assert_eq!(row_json["agent_capabilities"]["loadSession"].as_bool(), Some(true));
+    assert_eq!(row_json["auth_methods"][0]["id"].as_str(), Some("oauth"));
+    assert_eq!(row_json["available_commands"][0]["name"].as_str(), Some("review"));
 }
 
 #[tokio::test]

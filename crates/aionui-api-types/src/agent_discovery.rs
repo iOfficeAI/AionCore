@@ -278,11 +278,17 @@ pub struct AgentManagementRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yolo_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_capabilities: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_methods: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_options: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_modes: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_models: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_commands: Option<serde_json::Value>,
     pub sort_order: i64,
     #[serde(default)]
     pub team_capable: bool,
