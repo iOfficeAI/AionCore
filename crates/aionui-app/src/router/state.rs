@@ -95,6 +95,8 @@ struct ApprovalAgentResolver {
 struct ChannelApprovalAdapter {
     service: Arc<ApprovalService>,
     owner_user_id: String,
+    project_repo: Arc<dyn IProjectRepository>,
+    development_service: Arc<DevelopmentService>,
 }
 
 struct ChannelDevelopmentAdapter {
@@ -131,6 +133,23 @@ impl ChannelApprovalPort for ChannelApprovalAdapter {
         context: ChannelApprovalContext,
         confirmation: aionui_common::Confirmation,
     ) -> Result<String, ChannelError> {
+        let project = self
+            .project_repo
+            .get_for_resource(&self.owner_user_id, "conversation", &context.conversation_id)
+            .await
+            .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+        let project_id = project.as_ref().map(|project| project.id.clone());
+        let run_id = if let Some(project) = project.as_ref() {
+            self.development_service
+                .list_runs(&self.owner_user_id, Some(&project.id))
+                .await
+                .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?
+                .into_iter()
+                .find(|run| !matches!(run.status.as_str(), "succeeded" | "failed" | "cancelled"))
+                .map(|run| run.id)
+        } else {
+            None
+        };
         let risk_level = match confirmation.command_type.as_deref() {
             Some("read") => "low",
             Some("edit") | Some("execute") => "high",
@@ -141,8 +160,8 @@ impl ChannelApprovalPort for ChannelApprovalAdapter {
             .service
             .create(ApprovalRequestInput {
                 requester_user_id: self.owner_user_id.clone(),
-                project_id: None,
-                run_id: None,
+                project_id,
+                run_id,
                 task_id: None,
                 conversation_id: context.conversation_id,
                 agent_id: context.agent_id,
@@ -386,7 +405,7 @@ impl ChannelDevelopmentPort for ChannelDevelopmentAdapter {
                 Ok(format!("已重试 {} 门禁，结果：{}。", gate.gate_type, gate.status))
             }
             ChannelDevelopmentCommand::Handoff => Ok(format!(
-                "Web 接力入口：/projects?projectId={}&runId={}\n打开后可查看任务、证据、审批和质量门禁。",
+                "Web 接力入口：/#/projects?projectId={}&runId={}\n打开后可查看任务、证据、审批和质量门禁。",
                 project.id, run.id
             )),
         }
@@ -1292,16 +1311,21 @@ pub async fn build_channel_state(
     // Build channel settings service for per-plugin agent/model configuration.
     let channel_settings = build_channel_settings_service(services);
     let owner_user_id = get_channel_owner_user_id(services).await;
+    let project_repo: Arc<dyn IProjectRepository> =
+        Arc::new(SqliteProjectRepository::new(services.database.pool().clone()));
+    let development_state = build_development_state(services);
     let approval_port: Arc<dyn ChannelApprovalPort> = Arc::new(ChannelApprovalAdapter {
         service: build_approval_state(services).service,
         owner_user_id: owner_user_id.clone(),
+        project_repo: project_repo.clone(),
+        development_service: development_state.service.clone(),
     });
     let development_port: Arc<dyn ChannelDevelopmentPort> = Arc::new(ChannelDevelopmentAdapter {
         owner_user_id: owner_user_id.clone(),
-        project_repo: Arc::new(SqliteProjectRepository::new(services.database.pool().clone())),
+        project_repo,
         development_repo: Arc::new(SqliteDevelopmentRepository::new(services.database.pool().clone())),
         approval_repo: Arc::new(SqliteApprovalRepository::new(services.database.pool().clone())),
-        service: build_development_state(services).service,
+        service: development_state.service,
     });
 
     // Build orchestrator dependencies
@@ -1761,10 +1785,16 @@ mod tests {
 
         let pref_repo = SqliteClientPreferenceRepository::new(pool.clone());
         pref_repo
-            .upsert_batch(&[(
-                "assistant.weixin.agent",
-                r#"{"assistant_id":"bare-channel-aionrs","name":"Weixin Aionrs"}"#,
-            )])
+            .upsert_batch(&[
+                (
+                    "assistant.weixin.agent",
+                    r#"{"assistant_id":"bare-channel-aionrs","name":"Weixin Aionrs"}"#,
+                ),
+                (
+                    "assistant.weixin.defaultModel",
+                    r#"{"id":"test-provider","use_model":"test-model"}"#,
+                ),
+            ])
             .await
             .unwrap();
 
@@ -1954,7 +1984,129 @@ mod tests {
             .execute(context, ChannelDevelopmentCommand::Handoff)
             .await
             .unwrap();
-        assert!(handoff.contains("projectId=project-channel&runId=run-channel"));
+        assert!(handoff.contains("/#/projects?projectId=project-channel&runId=run-channel"));
+    }
+
+    #[tokio::test]
+    async fn channel_approval_adapter_links_bound_project_and_active_run() {
+        struct NoopApprovalResolver;
+
+        #[async_trait::async_trait]
+        impl ApprovalResolver for NoopApprovalResolver {
+            async fn resolve(
+                &self,
+                _conversation_id: &str,
+                _call_id: &str,
+                _value: serde_json::Value,
+                _always_allow: bool,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO conversations \
+             (id, user_id, name, type, extra, pinned, created_at, updated_at) \
+             VALUES ('conversation-approval', 'system_default_user', 'Approval', 'acp', '{}', 0, 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let project_repo = Arc::new(SqliteProjectRepository::new(db.pool().clone()));
+        project_repo
+            .create(&aionui_db::models::ProjectRow {
+                id: "project-approval".into(),
+                user_id: "system_default_user".into(),
+                name: "Aion".into(),
+                local_path: project_dir.path().to_string_lossy().into_owned(),
+                repository_url: None,
+                default_branch: Some("main".into()),
+                project_type: "single".into(),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        project_repo
+            .bind_resource(
+                "project-approval",
+                "system_default_user",
+                "conversation",
+                "conversation-approval",
+            )
+            .await
+            .unwrap();
+        let development_repo = Arc::new(SqliteDevelopmentRepository::new(db.pool().clone()));
+        development_repo
+            .create_run(&aionui_db::models::DevelopmentRunRow {
+                id: "run-approval".into(),
+                user_id: "system_default_user".into(),
+                project_id: "project-approval".into(),
+                team_id: None,
+                source_channel: Some("telegram".into()),
+                source_user_id: Some("telegram-user".into()),
+                execution_mode: "single".into(),
+                status: "running".into(),
+                request_summary: "Exercise remote approval".into(),
+                acceptance_criteria: "[]".into(),
+                baseline_commit: None,
+                integration_branch: None,
+                started_at: Some(1),
+                finished_at: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        let approval_repo = Arc::new(SqliteApprovalRepository::new(db.pool().clone()));
+        let development_service = Arc::new(DevelopmentService::new(
+            development_repo,
+            project_repo.clone(),
+            Arc::new(SqliteAgentWorkspaceLeaseRepository::new(db.pool().clone())),
+            project_dir.path().join("artifacts"),
+        ));
+        let adapter = ChannelApprovalAdapter {
+            service: Arc::new(ApprovalService::new(
+                approval_repo.clone(),
+                Arc::new(NoopApprovalResolver),
+            )),
+            owner_user_id: "system_default_user".into(),
+            project_repo,
+            development_service,
+        };
+
+        let approval_id = adapter
+            .create(
+                ChannelApprovalContext {
+                    source_user_id: "telegram-user".into(),
+                    conversation_id: "conversation-approval".into(),
+                    agent_id: Some("codex".into()),
+                    platform: PluginType::Telegram,
+                    chat_id: "chat".into(),
+                    message_thread_id: Some(3),
+                },
+                aionui_common::Confirmation {
+                    id: "confirmation-1".into(),
+                    call_id: "call-1".into(),
+                    title: Some("Run tests?".into()),
+                    action: None,
+                    description: "cargo test".into(),
+                    command_type: Some("execute".into()),
+                    options: vec![aionui_common::ConfirmationOption {
+                        label: "Allow once".into(),
+                        value: serde_json::json!(true),
+                        params: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        let row = approval_repo.get(&approval_id).await.unwrap().unwrap();
+        assert_eq!(row.project_id.as_deref(), Some("project-approval"));
+        assert_eq!(row.run_id.as_deref(), Some("run-approval"));
     }
 
     #[test]
