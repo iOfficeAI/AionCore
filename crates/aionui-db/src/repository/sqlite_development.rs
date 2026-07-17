@@ -3,7 +3,8 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{
-    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
+    DevelopmentCiCheckRow, DevelopmentDeliveryRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
+    QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
 };
 use crate::repository::development::IDevelopmentRepository;
 
@@ -310,5 +311,90 @@ impl IDevelopmentRepository for SqliteDevelopmentRepository {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn upsert_delivery(&self, row: &DevelopmentDeliveryRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO development_deliveries (id, run_id, project_id, user_id, provider, repository, branch, \
+             base_branch, commit_sha, status, push_status, pr_number, pr_url, pr_status, ci_status, review_status, \
+             merge_status, report_json, last_error, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(run_id) DO UPDATE SET provider=excluded.provider, repository=excluded.repository, \
+             branch=excluded.branch, base_branch=excluded.base_branch, commit_sha=excluded.commit_sha, \
+             status=excluded.status, push_status=excluded.push_status, pr_number=excluded.pr_number, \
+             pr_url=excluded.pr_url, pr_status=excluded.pr_status, ci_status=excluded.ci_status, \
+             review_status=excluded.review_status, merge_status=excluded.merge_status, \
+             report_json=excluded.report_json, last_error=excluded.last_error, updated_at=excluded.updated_at",
+        )
+        .bind(&row.id)
+        .bind(&row.run_id)
+        .bind(&row.project_id)
+        .bind(&row.user_id)
+        .bind(&row.provider)
+        .bind(&row.repository)
+        .bind(&row.branch)
+        .bind(&row.base_branch)
+        .bind(&row.commit_sha)
+        .bind(&row.status)
+        .bind(&row.push_status)
+        .bind(row.pr_number)
+        .bind(&row.pr_url)
+        .bind(&row.pr_status)
+        .bind(&row.ci_status)
+        .bind(&row.review_status)
+        .bind(&row.merge_status)
+        .bind(&row.report_json)
+        .bind(&row.last_error)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_delivery(&self, user_id: &str, run_id: &str) -> Result<Option<DevelopmentDeliveryRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM development_deliveries WHERE user_id = ? AND run_id = ?")
+                .bind(user_id)
+                .bind(run_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn upsert_ci_check(&self, row: &DevelopmentCiCheckRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO development_ci_checks (id, delivery_id, provider_check_id, name, status, details_url, \
+             summary, rework_task_id, started_at, completed_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(delivery_id, provider_check_id) DO UPDATE SET name=excluded.name, status=excluded.status, \
+             details_url=excluded.details_url, summary=excluded.summary, \
+             rework_task_id=COALESCE(excluded.rework_task_id, development_ci_checks.rework_task_id), \
+             started_at=excluded.started_at, completed_at=excluded.completed_at, updated_at=excluded.updated_at",
+        )
+        .bind(&row.id)
+        .bind(&row.delivery_id)
+        .bind(&row.provider_check_id)
+        .bind(&row.name)
+        .bind(&row.status)
+        .bind(&row.details_url)
+        .bind(&row.summary)
+        .bind(&row.rework_task_id)
+        .bind(row.started_at)
+        .bind(row.completed_at)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_ci_checks(&self, delivery_id: &str) -> Result<Vec<DevelopmentCiCheckRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM development_ci_checks WHERE delivery_id = ? ORDER BY name ASC, provider_check_id ASC",
+        )
+        .bind(delivery_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 }

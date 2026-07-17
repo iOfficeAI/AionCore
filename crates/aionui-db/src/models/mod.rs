@@ -39,7 +39,8 @@ pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, Upsert
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
 pub use development::{
-    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
+    DevelopmentCiCheckRow, DevelopmentDeliveryRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
+    QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
 };
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;

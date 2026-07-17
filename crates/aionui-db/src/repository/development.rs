@@ -2,7 +2,8 @@ use aionui_common::TimestampMs;
 
 use crate::error::DbError;
 use crate::models::{
-    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
+    DevelopmentCiCheckRow, DevelopmentDeliveryRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
+    QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
 };
 
 #[async_trait::async_trait]
@@ -43,4 +44,9 @@ pub trait IDevelopmentRepository: Send + Sync {
     async fn create_finding(&self, row: &ReviewFindingRow) -> Result<(), DbError>;
     async fn list_findings(&self, run_id: &str, task_id: &str) -> Result<Vec<ReviewFindingRow>, DbError>;
     async fn update_finding_status(&self, run_id: &str, finding_id: &str, status: &str) -> Result<bool, DbError>;
+
+    async fn upsert_delivery(&self, row: &DevelopmentDeliveryRow) -> Result<(), DbError>;
+    async fn get_delivery(&self, user_id: &str, run_id: &str) -> Result<Option<DevelopmentDeliveryRow>, DbError>;
+    async fn upsert_ci_check(&self, row: &DevelopmentCiCheckRow) -> Result<(), DbError>;
+    async fn list_ci_checks(&self, delivery_id: &str) -> Result<Vec<DevelopmentCiCheckRow>, DbError>;
 }

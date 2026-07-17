@@ -99,3 +99,44 @@ pub struct ReviewFindingRow {
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevelopmentDeliveryRow {
+    pub id: String,
+    pub run_id: String,
+    pub project_id: String,
+    pub user_id: String,
+    pub provider: String,
+    pub repository: Option<String>,
+    pub branch: String,
+    pub base_branch: String,
+    pub commit_sha: Option<String>,
+    pub status: String,
+    pub push_status: String,
+    pub pr_number: Option<i64>,
+    pub pr_url: Option<String>,
+    pub pr_status: String,
+    pub ci_status: String,
+    pub review_status: String,
+    pub merge_status: String,
+    pub report_json: String,
+    pub last_error: Option<String>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevelopmentCiCheckRow {
+    pub id: String,
+    pub delivery_id: String,
+    pub provider_check_id: String,
+    pub name: String,
+    pub status: String,
+    pub details_url: Option<String>,
+    pub summary: Option<String>,
+    pub rework_task_id: Option<String>,
+    pub started_at: Option<TimestampMs>,
+    pub completed_at: Option<TimestampMs>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
