@@ -338,12 +338,21 @@ impl AssistantService {
                 .await
                 .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?;
 
+            // The legacy `assistant_overrides` table only seeds first-time
+            // migration. Once an overlay row exists it is authoritative — it
+            // reflects the user's toggles written via `set_state`. Re-applying
+            // the (never-updated) legacy row on every startup would clobber
+            // those toggles, so skip any assistant that already has an overlay.
+            if existing_state.is_some() {
+                continue;
+            }
+
             self.state_repo
                 .upsert(&UpsertAssistantOverlayParams {
                     assistant_definition_id: &definition.id,
                     enabled: override_row.enabled,
                     sort_order: override_row.sort_order,
-                    agent_id_override: existing_state.as_ref().and_then(|row| row.agent_id_override.as_deref()),
+                    agent_id_override: None,
                     last_used_at: override_row.last_used_at,
                 })
                 .await
@@ -2952,7 +2961,7 @@ mod tests {
     use aionui_db::{
         CreateProviderParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
         SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-        SqliteProviderRepository, init_database_memory,
+        SqliteProviderRepository, UpsertOverrideParams, init_database_memory,
     };
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -2963,6 +2972,7 @@ mod tests {
         state_repo: Arc<dyn IAssistantOverlayRepository>,
         preference_repo: Arc<dyn IAssistantPreferenceRepository>,
         repo: Arc<dyn IAssistantRepository>,
+        override_repo: Arc<dyn IAssistantOverrideRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
         agent_rows: Arc<Mutex<Vec<aionui_api_types::AgentManagementRow>>>,
         _tmp: TempDir,
@@ -3075,7 +3085,7 @@ mod tests {
                 state_repo: state_repo.clone(),
                 preference_repo: preference_repo.clone(),
                 repo: repo.clone(),
-                override_repo: orepo,
+                override_repo: orepo.clone(),
                 provider_repo: provider_repo.clone(),
                 builtin: builtin_reg,
                 agent_catalog: Some(Arc::new(StubAgentCatalog {
@@ -3092,6 +3102,7 @@ mod tests {
             state_repo,
             preference_repo,
             repo,
+            override_repo: orepo,
             provider_repo,
             agent_rows,
             _tmp: tmp,
@@ -3357,6 +3368,64 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// Regression for the legacy-override clobber bug: once the user has
+    /// toggled an assistant (writing the authoritative `assistant_overlays`
+    /// row), a subsequent restart must NOT overwrite that value back to the
+    /// stale `assistant_overrides` row. The legacy sync only seeds first-time
+    /// migration; an existing overlay is authoritative.
+    #[tokio::test]
+    async fn bootstrap_does_not_clobber_user_toggle_with_stale_legacy_override() {
+        let fx = fixture_with_builtins(vec![mk_builtin("assistant-a", "Assistant A")]).await;
+
+        // Legacy row written by an older app version: disabled.
+        fx.override_repo
+            .upsert(&UpsertOverrideParams {
+                assistant_id: "assistant-a",
+                enabled: false,
+                sort_order: 0,
+                last_used_at: None,
+            })
+            .await
+            .unwrap();
+
+        // First launch after upgrade: legacy row seeds the overlay (disabled).
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("assistant-a")
+            .await
+            .unwrap()
+            .expect("definition exists");
+        let seeded_enabled = fx.state_repo.get(&definition.id).await.unwrap().unwrap().enabled;
+        assert!(
+            !seeded_enabled,
+            "legacy override should seed the overlay on first migration"
+        );
+
+        // User toggles the assistant ON — writes the authoritative overlay.
+        fx.service
+            .set_state(
+                "assistant-a",
+                SetAssistantStateRequest {
+                    enabled: Some(true),
+                    sort_order: None,
+                    last_used_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        let toggled_enabled = fx.state_repo.get(&definition.id).await.unwrap().unwrap().enabled;
+        assert!(toggled_enabled, "user toggle should be reflected in the overlay");
+
+        // Restart: bootstrap runs again. It must NOT revert the user's toggle.
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+        let after_restart_enabled = fx.state_repo.get(&definition.id).await.unwrap().unwrap().enabled;
+        assert!(
+            after_restart_enabled,
+            "restart must not clobber the user's toggle with the stale legacy override"
         );
     }
 
