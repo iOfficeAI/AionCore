@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use aionui_common::now_ms;
 use aionui_db::models::{
-    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, ProjectCommandProfileRow, QualityGateRunRow,
-    ReviewFindingRow, TaskArtifactRow,
+    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, DevelopmentUsageEventRow, ProjectCommandProfileRow,
+    QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
 };
 use aionui_db::{IAgentWorkspaceLeaseRepository, IDevelopmentRepository, IProjectRepository};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::error::DevelopmentError;
+use crate::operations::DevelopmentOperationsService;
 use crate::types::{
     CreateArtifactInput, CreateDevelopmentRunInput, CreateDevelopmentTaskInput, ReviewFindingInput, SubmitReviewInput,
 };
@@ -34,6 +35,7 @@ pub struct DevelopmentService {
     project_repo: Arc<dyn IProjectRepository>,
     lease_repo: Arc<dyn IAgentWorkspaceLeaseRepository>,
     artifact_root: PathBuf,
+    operations: Option<Arc<DevelopmentOperationsService>>,
 }
 
 impl DevelopmentService {
@@ -48,7 +50,13 @@ impl DevelopmentService {
             project_repo,
             lease_repo,
             artifact_root,
+            operations: None,
         }
+    }
+
+    pub fn with_operations(mut self, operations: Arc<DevelopmentOperationsService>) -> Self {
+        self.operations = Some(operations);
+        self
     }
 
     pub async fn create_run(
@@ -100,6 +108,24 @@ impl DevelopmentService {
             updated_at: now,
         };
         self.development_repo.create_run(&row).await?;
+        if let Some(operations) = &self.operations {
+            operations
+                .audit(
+                    user_id,
+                    "user",
+                    user_id,
+                    "development_run.create",
+                    "development_run",
+                    &row.id,
+                    &row.project_id,
+                    Some(&row.id),
+                    None,
+                    "success",
+                    serde_json::json!({"execution_mode": row.execution_mode}),
+                    &[],
+                )
+                .await?;
+        }
         Ok(row)
     }
 
@@ -126,6 +152,9 @@ impl DevelopmentService {
         role: &str,
     ) -> Result<DevelopmentRunRoleRow, DevelopmentError> {
         self.get_run(user_id, run_id).await?;
+        if let Some(operations) = &self.operations {
+            operations.require_budget(user_id, run_id, "assign_role", 0).await?;
+        }
         if !matches!(role, "implementer" | "tester" | "reviewer" | "integrator") {
             return Err(DevelopmentError::BadRequest(format!(
                 "unsupported development role: {role}"
@@ -365,6 +394,18 @@ impl DevelopmentService {
             .ok_or_else(|| DevelopmentError::BadRequest("project command profile is not configured".into()))?;
         let command = command_for_gate(&profile, gate_type)
             .ok_or_else(|| DevelopmentError::BadRequest(format!("gate {gate_type} has no configured command")))?;
+        let previous_attempts = self
+            .development_repo
+            .list_gates(run_id, task_id)
+            .await?
+            .into_iter()
+            .filter(|gate| gate.gate_type == gate_type)
+            .count() as i64;
+        if let Some(operations) = &self.operations {
+            operations
+                .require_budget(user_id, run_id, "quality_gate", previous_attempts)
+                .await?;
+        }
         let lease = match workspace_lease_id {
             Some(lease_id) => Some(self.validate_lease(user_id, &run, lease_id).await?),
             None if run.execution_mode == "team" => {
@@ -425,6 +466,31 @@ impl DevelopmentService {
             created_at: started_at,
         };
         self.development_repo.create_gate(&row).await?;
+        if let Some(operations) = &self.operations {
+            operations
+                .record_usage(DevelopmentUsageEventRow {
+                    id: format!("gate:{}", row.id),
+                    user_id: user_id.into(),
+                    project_id: run.project_id.clone(),
+                    run_id: Some(run_id.into()),
+                    task_id: task_id.map(str::to_owned),
+                    usage_type: "quality_gate".into(),
+                    source: "platform".into(),
+                    confidence: "measured".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_microunits: 0,
+                    duration_ms: row.duration_ms.unwrap_or_default().max(0),
+                    retry_count: i64::from(previous_attempts > 0),
+                    metadata_json: serde_json::json!({
+                        "gate_type": gate_type,
+                        "status": row.status,
+                    })
+                    .to_string(),
+                    created_at: now_ms(),
+                })
+                .await?;
+        }
         if let Some(task_id) = task_id {
             let task = self
                 .development_repo

@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
 use crate::DevelopmentError;
+use crate::operations::{DevelopmentOperationsService, redact_sensitive};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderPullRequest {
@@ -72,6 +73,7 @@ pub struct DeliveryService {
     development_repo: Arc<dyn IDevelopmentRepository>,
     project_repo: Arc<dyn IProjectRepository>,
     provider: Arc<dyn DeliveryProvider>,
+    operations: Option<Arc<DevelopmentOperationsService>>,
 }
 
 impl DeliveryService {
@@ -84,7 +86,13 @@ impl DeliveryService {
             development_repo,
             project_repo,
             provider,
+            operations: None,
         }
+    }
+
+    pub fn with_operations(mut self, operations: Arc<DevelopmentOperationsService>) -> Self {
+        self.operations = Some(operations);
+        self
     }
 
     pub async fn get(&self, user_id: &str, run_id: &str) -> Result<DevelopmentDeliveryRow, DevelopmentError> {
@@ -108,6 +116,7 @@ impl DeliveryService {
         }
 
         let run = self.get_run(user_id, run_id).await?;
+        self.require_budget(user_id, run_id, "delivery.prepare").await?;
         let project = self.get_project(user_id, &run).await?;
         let reasons = self.delivery_blockers(&run).await?;
         if !reasons.is_empty() {
@@ -203,6 +212,7 @@ impl DeliveryService {
                 "delivery has no candidate commit to push".into(),
             ));
         }
+        self.require_budget(user_id, run_id, "delivery.push").await?;
         validate_delivery_branch(&delivery.branch, &delivery.base_branch)?;
         let path = self.repository_path(user_id, run_id).await?;
         if let Err(error) = self.provider.preflight(&path).await {
@@ -234,6 +244,7 @@ impl DeliveryService {
                 "delivery branch must be pushed first".into(),
             ));
         }
+        self.require_budget(user_id, run_id, "delivery.pull_request").await?;
         let run = self.get_run(user_id, run_id).await?;
         let path = self.repository_path(user_id, run_id).await?;
         let title = input
@@ -262,6 +273,7 @@ impl DeliveryService {
     }
 
     pub async fn sync(&self, user_id: &str, run_id: &str) -> Result<DevelopmentDeliveryRow, DevelopmentError> {
+        self.require_budget(user_id, run_id, "delivery.sync").await?;
         let mut delivery = self.get(user_id, run_id).await?;
         let number = delivery
             .pr_number
@@ -366,6 +378,7 @@ impl DeliveryService {
         if !blockers.is_empty() {
             return Err(DevelopmentError::Conflict(blockers.join("; ")));
         }
+        self.require_budget(user_id, run_id, "delivery.merge").await?;
         let number = delivery
             .pr_number
             .ok_or_else(|| DevelopmentError::Conflict("pull request has not been created".into()))?;
@@ -387,6 +400,13 @@ impl DeliveryService {
     pub async fn report(&self, user_id: &str, run_id: &str) -> Result<Value, DevelopmentError> {
         let delivery = self.get(user_id, run_id).await?;
         self.report_value(user_id, run_id, &delivery).await
+    }
+
+    async fn require_budget(&self, user_id: &str, run_id: &str, operation: &str) -> Result<(), DevelopmentError> {
+        if let Some(operations) = &self.operations {
+            operations.require_budget(user_id, run_id, operation, 0).await?;
+        }
+        Ok(())
     }
 
     async fn get_run(&self, user_id: &str, run_id: &str) -> Result<DevelopmentRunRow, DevelopmentError> {
@@ -809,23 +829,7 @@ fn aggregate_ci_status(checks: &[ProviderCiCheck]) -> &'static str {
 }
 
 fn redact_secret(value: &str) -> String {
-    let mut redact_next = false;
-    let mut output = Vec::new();
-    for word in value.split_whitespace() {
-        let lower = word.to_ascii_lowercase();
-        let authorization = lower.contains("authorization:") || lower == "bearer";
-        let sensitive = redact_next
-            || authorization
-            || ["token=", "password=", "secret=", "apikey=", "api_key="]
-                .iter()
-                .any(|marker| lower.contains(marker))
-            || lower.contains("ghp_")
-            || lower.contains("github_pat_")
-            || (word.contains("://") && word.contains('@'));
-        output.push(if sensitive { "[REDACTED]" } else { word });
-        redact_next = authorization;
-    }
-    let mut words = output.join(" ");
+    let mut words = redact_sensitive(value, &[]);
     if words.len() > 2000 {
         words.truncate(2000);
     }
