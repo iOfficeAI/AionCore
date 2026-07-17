@@ -3892,6 +3892,75 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
 }
 
 #[tokio::test]
+async fn set_config_option_does_not_persist_preference_on_error() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo, definition_repo, overlay_repo, preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_acp_auto",
+        "assistant-acp-auto",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_acp_auto",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            assistant_definition_id: "asstdef_acp_auto",
+            last_model_id: Some("original-model"),
+            last_permission_value: Some("original-mode"),
+            last_thought_level_value: Some("original-low"),
+            last_skill_ids: "[]",
+            last_disabled_builtin_skill_ids: "[]",
+            last_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-auto").await;
+
+    // Agent reports a session-change conflict (mirrors the legacy ACK-then-
+    // session-changed race): the service must return the error and leave the
+    // persisted preference untouched.
+    let agent = Arc::new(
+        MockAgent::new(&conv.id).with_set_config_option_error(AgentError::conflict(
+            "Active ACP session changed while applying config option",
+        )),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+
+    let result = svc
+        .set_config_option(
+            &conv.id,
+            "model",
+            SetConfigOptionRequest {
+                value: "gpt-5.5".to_owned(),
+            },
+        )
+        .await;
+    assert!(result.is_err(), "conflict from agent must surface as error");
+
+    let pref_after = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
+    assert_eq!(
+        pref_after.last_model_id.as_deref(),
+        Some("original-model"),
+        "preference must not be written when set_config_option errors"
+    );
+}
+
+#[tokio::test]
 async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixed() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
