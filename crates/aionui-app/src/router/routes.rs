@@ -25,7 +25,7 @@ use aionui_channel::weixin_login_route;
 use aionui_common::ApiErrorLogContext;
 use aionui_conversation::{conversation_ops_routes, conversation_routes};
 use aionui_cron::cron_routes;
-use aionui_development::development_routes;
+use aionui_development::{approval_routes, development_routes};
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
@@ -39,7 +39,7 @@ use aionui_team::team_routes;
 use crate::services::AppServices;
 
 use super::health::health_check;
-use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
+use super::state::{ModuleStates, RouterBuildError, build_approval_state, build_module_states, build_ws_state};
 use super::trace::with_access_log;
 
 /// Create the application router with all routes and global middleware.
@@ -201,6 +201,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let development_authenticated =
         development_routes(states.development).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    let approval_authenticated = approval_routes(build_approval_state(services))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Office routes protected by auth middleware
     let office_authenticated =
         office_routes(states.office.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -242,6 +245,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(cron_authenticated)
         .merge(project_authenticated)
         .merge(development_authenticated)
+        .merge(approval_authenticated)
         .merge(office_authenticated)
         .merge(shell_authenticated)
         .merge(assistant_authenticated);

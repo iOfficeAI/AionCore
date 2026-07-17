@@ -18,5 +18,6 @@ pub trait IApprovalRepository: Send + Sync {
         run_id: Option<&str>,
     ) -> Result<Vec<ApprovalRequestRow>, DbError>;
     async fn consume(&self, id: &str, approver_user_id: &str, status: &str, now: TimestampMs) -> Result<bool, DbError>;
+    async fn cancel_consumed(&self, id: &str, approver_user_id: &str, now: TimestampMs) -> Result<bool, DbError>;
     async fn mark_expired(&self, now: TimestampMs) -> Result<u64, DbError>;
 }

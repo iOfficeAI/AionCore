@@ -118,6 +118,19 @@ impl IApprovalRepository for SqliteApprovalRepository {
         Ok(result.rows_affected() == 1)
     }
 
+    async fn cancel_consumed(&self, id: &str, approver_user_id: &str, now: TimestampMs) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE approval_requests SET status = 'cancelled', updated_at = ? \
+             WHERE id = ? AND approver_user_id = ? AND status IN ('approved', 'rejected')",
+        )
+        .bind(now)
+        .bind(id)
+        .bind(approver_user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn mark_expired(&self, now: TimestampMs) -> Result<u64, DbError> {
         Ok(sqlx::query(
             "UPDATE approval_requests SET status = 'expired', updated_at = ? \

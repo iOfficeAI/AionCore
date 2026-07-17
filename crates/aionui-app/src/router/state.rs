@@ -27,16 +27,19 @@ use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::models::MessageRow;
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
-    IAgentWorkspaceLeaseRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IAgentWorkspaceLeaseRepository, IApprovalRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
     IDevelopmentRepository, IProjectRepository, IProviderRepository, ITeamRepository, MessagePageDirection,
     MessagePageParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAgentWorkspaceLeaseRepository,
-    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
-    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
-    SqliteConversationRepository, SqliteDevelopmentRepository, SqliteProjectRepository, SqliteProviderRepository,
-    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteTeamRepository,
+    SqliteApprovalRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
+    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteDevelopmentRepository,
+    SqliteProjectRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    SqliteTeamRepository,
 };
-use aionui_development::{DevelopmentRouterState, DevelopmentService};
+use aionui_development::{
+    ApprovalResolver, ApprovalRouterState, ApprovalService, DevelopmentRouterState, DevelopmentService,
+};
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
@@ -80,6 +83,29 @@ struct ChannelPersonalDirectoryAdapter {
 
 struct ProjectAgentCapabilityAdapter {
     service: Arc<AgentService>,
+}
+
+struct ApprovalAgentResolver {
+    task_manager: Arc<dyn aionui_ai_agent::IWorkerTaskManager>,
+}
+
+#[async_trait::async_trait]
+impl ApprovalResolver for ApprovalAgentResolver {
+    async fn resolve(
+        &self,
+        conversation_id: &str,
+        call_id: &str,
+        value: serde_json::Value,
+        always_allow: bool,
+    ) -> Result<(), String> {
+        let agent = self
+            .task_manager
+            .get_task(conversation_id)
+            .ok_or_else(|| "Conversation agent is no longer running".to_owned())?;
+        agent
+            .confirm(call_id, call_id, value, always_allow)
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[async_trait::async_trait]
@@ -715,6 +741,17 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
             lease_repo,
             services.data_dir.join("development-artifacts"),
         )),
+    }
+}
+
+pub fn build_approval_state(services: &AppServices) -> ApprovalRouterState {
+    let repository: Arc<dyn IApprovalRepository> =
+        Arc::new(SqliteApprovalRepository::new(services.database.pool().clone()));
+    let resolver: Arc<dyn ApprovalResolver> = Arc::new(ApprovalAgentResolver {
+        task_manager: services.worker_task_manager.clone(),
+    });
+    ApprovalRouterState {
+        service: Arc::new(ApprovalService::new(repository, resolver)),
     }
 }
 
