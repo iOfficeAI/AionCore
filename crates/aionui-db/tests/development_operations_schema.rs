@@ -17,6 +17,15 @@ async fn phase_six_migration_creates_operations_tables_and_constraints() {
             .unwrap();
         assert_eq!(count, 1, "missing table {table}");
     }
+    for column in ["isolation_mode", "execution_id"] {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('quality_gate_runs') WHERE name = ?")
+                .bind(column)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "missing quality gate column {column}");
+    }
 
     seed_project(&db).await;
     let invalid_mode = sqlx::query(

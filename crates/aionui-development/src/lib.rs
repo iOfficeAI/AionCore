@@ -2,6 +2,7 @@ mod approval;
 mod approval_routes;
 mod delivery;
 mod error;
+mod executor;
 mod operations;
 mod routes;
 mod service;
@@ -17,6 +18,10 @@ pub use delivery::{
     PrepareDeliveryInput, ProviderCiCheck, ProviderPullRequest,
 };
 pub use error::DevelopmentError;
+pub use executor::{
+    CommandExecutionInput, CommandExecutionOutput, CommandExecutionPlan, ExecutionCommandSpec, build_execution_plan,
+    execute_command,
+};
 pub use operations::{
     BudgetEvaluation, DevelopmentOperationsService, DevelopmentOperationsSnapshot, DevelopmentPolicyInput,
     RecoveryDecisionInput, default_policy, redact_sensitive,

@@ -256,6 +256,8 @@ async fn delivery_routes_prepare_and_require_confirmation_for_push() {
         stdout_artifact_id: None,
         stderr_artifact_id: None,
         duration_ms: Some(1),
+        isolation_mode: "host".into(),
+        execution_id: Some("gate-route".into()),
         required: true,
         started_at: Some(1),
         finished_at: Some(2),

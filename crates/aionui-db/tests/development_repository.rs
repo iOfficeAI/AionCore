@@ -106,6 +106,8 @@ async fn artifacts_gates_and_findings_roundtrip_by_task() {
         stdout_artifact_id: Some("artifact-1".into()),
         stderr_artifact_id: None,
         duration_ms: Some(10),
+        isolation_mode: "host".into(),
+        execution_id: Some("gate-1".into()),
         required: true,
         started_at: Some(3),
         finished_at: Some(4),

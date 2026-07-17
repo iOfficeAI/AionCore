@@ -126,3 +126,6 @@ CREATE INDEX idx_development_recovery_owner_project
     ON development_recovery_records(user_id, project_id, created_at DESC);
 CREATE INDEX idx_development_recovery_run ON development_recovery_records(run_id, created_at DESC);
 
+ALTER TABLE quality_gate_runs ADD COLUMN isolation_mode TEXT NOT NULL DEFAULT 'host'
+    CHECK (isolation_mode IN ('host', 'docker', 'devcontainer'));
+ALTER TABLE quality_gate_runs ADD COLUMN execution_id TEXT;

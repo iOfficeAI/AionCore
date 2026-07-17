@@ -1,6 +1,6 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,10 +13,10 @@ use aionui_db::{IAgentWorkspaceLeaseRepository, IDevelopmentRepository, IProject
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 use crate::error::DevelopmentError;
-use crate::operations::DevelopmentOperationsService;
+use crate::executor::{CommandExecutionInput, execute_command};
+use crate::operations::{DevelopmentOperationsService, default_policy};
 use crate::types::{
     CreateArtifactInput, CreateDevelopmentRunInput, CreateDevelopmentTaskInput, ReviewFindingInput, SubmitReviewInput,
 };
@@ -440,13 +440,29 @@ impl DevelopmentService {
         }
         let started_at = now_ms();
         let started = Instant::now();
-        let output = run_command(command, Path::new(&working_directory), profile.command_timeout_seconds).await?;
         let gate_id = uuid::Uuid::now_v7().to_string();
+        let policy = match &self.operations {
+            Some(operations) => operations.get_policy(user_id, &run.project_id).await?,
+            None => default_policy(user_id, &run.project_id),
+        };
+        let runtime_profile = self.project_repo.get_runtime_profile(&run.project_id, user_id).await?;
+        let environment = runtime_environment(runtime_profile.as_ref())?;
+        let output = execute_command(CommandExecutionInput {
+            execution_id: &gate_id,
+            run_id,
+            command,
+            working_directory: Path::new(&working_directory),
+            timeout_seconds: profile.command_timeout_seconds,
+            policy: &policy,
+            runtime_profile: runtime_profile.as_ref(),
+            environment,
+        })
+        .await?;
         let stdout = self
-            .persist_gate_output(run_id, task_id, &gate_id, "stdout", &output.stdout)
+            .persist_gate_output(run_id, task_id, &gate_id, "stdout", output.stdout.as_bytes())
             .await?;
         let stderr = self
-            .persist_gate_output(run_id, task_id, &gate_id, "stderr", &output.stderr)
+            .persist_gate_output(run_id, task_id, &gate_id, "stderr", output.stderr.as_bytes())
             .await?;
         let row = QualityGateRunRow {
             id: gate_id,
@@ -460,6 +476,8 @@ impl DevelopmentService {
             stdout_artifact_id: Some(stdout.id),
             stderr_artifact_id: Some(stderr.id),
             duration_ms: Some(started.elapsed().as_millis().min(i64::MAX as u128) as i64),
+            isolation_mode: output.isolation_mode,
+            execution_id: Some(output.execution_id),
             required,
             started_at: Some(started_at),
             finished_at: Some(now_ms()),
@@ -489,6 +507,27 @@ impl DevelopmentService {
                     .to_string(),
                     created_at: now_ms(),
                 })
+                .await?;
+            operations
+                .audit(
+                    user_id,
+                    "system",
+                    "development-command-executor",
+                    "quality_gate.execute",
+                    "quality_gate",
+                    &row.id,
+                    &run.project_id,
+                    Some(run_id),
+                    task_id,
+                    if row.status == "passed" { "success" } else { "failed" },
+                    serde_json::json!({
+                        "gate_type": gate_type,
+                        "status": row.status,
+                        "isolation_mode": row.isolation_mode,
+                        "duration_ms": row.duration_ms,
+                    }),
+                    &[],
+                )
                 .await?;
         }
         if let Some(task_id) = task_id {
@@ -871,86 +910,18 @@ fn command_for_gate<'a>(profile: &'a ProjectCommandProfileRow, gate_type: &str) 
     }
 }
 
-struct CommandOutput {
-    status: String,
-    exit_code: Option<i64>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-async fn run_command(command: &str, cwd: &Path, timeout_seconds: i64) -> Result<CommandOutput, DevelopmentError> {
-    if timeout_seconds <= 0 {
-        return Err(DevelopmentError::BadRequest("command timeout must be positive".into()));
-    }
-    #[cfg(unix)]
-    let mut child = Command::new("sh")
-        .arg("-lc")
-        .arg(command)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-    #[cfg(windows)]
-    let mut child = Command::new("cmd")
-        .arg("/C")
-        .arg(command)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| DevelopmentError::Internal("stdout pipe missing".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| DevelopmentError::Internal("stderr pipe missing".into()))?;
-    let stdout_task = tokio::spawn(read_bounded(stdout));
-    let stderr_task = tokio::spawn(read_bounded(stderr));
-    let wait = tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds as u64), child.wait()).await;
-    let (status, exit_code) = match wait {
-        Ok(result) => {
-            let status = result?;
-            (
-                if status.success() { "passed" } else { "failed" }.into(),
-                status.code().map(i64::from),
-            )
-        }
-        Err(_) => {
-            child.kill().await?;
-            let _ = child.wait().await;
-            ("timed_out".into(), None)
-        }
+fn runtime_environment(
+    profile: Option<&aionui_db::models::ProjectRuntimeProfileRow>,
+) -> Result<BTreeMap<String, String>, DevelopmentError> {
+    let keys: Vec<String> = match profile {
+        Some(profile) => serde_json::from_str(&profile.env_keys)
+            .map_err(|error| DevelopmentError::BadRequest(format!("invalid runtime env keys: {error}")))?,
+        None => Vec::new(),
     };
-    let stdout = stdout_task
-        .await
-        .map_err(|error| DevelopmentError::Internal(error.to_string()))??;
-    let stderr = stderr_task
-        .await
-        .map_err(|error| DevelopmentError::Internal(error.to_string()))??;
-    Ok(CommandOutput {
-        status,
-        exit_code,
-        stdout,
-        stderr,
-    })
-}
-
-async fn read_bounded(mut reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>, std::io::Error> {
-    let mut retained = Vec::new();
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let count = reader.read(&mut chunk).await?;
-        if count == 0 {
-            break;
-        }
-        let remaining = MAX_GATE_OUTPUT_BYTES.saturating_sub(retained.len());
-        retained.extend_from_slice(&chunk[..count.min(remaining)]);
-    }
-    Ok(retained)
+    Ok(keys
+        .into_iter()
+        .filter_map(|key| std::env::var(&key).ok().map(|value| (key, value)))
+        .collect())
 }
 
 async fn checksum_file(path: &Path) -> Result<String, DevelopmentError> {

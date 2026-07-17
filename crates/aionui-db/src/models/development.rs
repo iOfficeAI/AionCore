@@ -77,6 +77,8 @@ pub struct QualityGateRunRow {
     pub stdout_artifact_id: Option<String>,
     pub stderr_artifact_id: Option<String>,
     pub duration_ms: Option<i64>,
+    pub isolation_mode: String,
+    pub execution_id: Option<String>,
     pub required: bool,
     pub started_at: Option<TimestampMs>,
     pub finished_at: Option<TimestampMs>,

@@ -232,25 +232,44 @@ impl IDevelopmentRepository for SqliteDevelopmentRepository {
     async fn create_gate(&self, row: &QualityGateRunRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO quality_gate_runs (id, run_id, task_id, gate_type, command, working_directory, exit_code, \
-             status, stdout_artifact_id, stderr_artifact_id, duration_ms, required, started_at, finished_at, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ).bind(&row.id).bind(&row.run_id).bind(&row.task_id).bind(&row.gate_type).bind(&row.command)
-        .bind(&row.working_directory).bind(row.exit_code).bind(&row.status).bind(&row.stdout_artifact_id)
-        .bind(&row.stderr_artifact_id).bind(row.duration_ms).bind(row.required).bind(row.started_at)
-        .bind(row.finished_at).bind(row.created_at).execute(&self.pool).await?;
+             status, stdout_artifact_id, stderr_artifact_id, duration_ms, isolation_mode, execution_id, required, \
+             started_at, finished_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.run_id)
+        .bind(&row.task_id)
+        .bind(&row.gate_type)
+        .bind(&row.command)
+        .bind(&row.working_directory)
+        .bind(row.exit_code)
+        .bind(&row.status)
+        .bind(&row.stdout_artifact_id)
+        .bind(&row.stderr_artifact_id)
+        .bind(row.duration_ms)
+        .bind(&row.isolation_mode)
+        .bind(&row.execution_id)
+        .bind(row.required)
+        .bind(row.started_at)
+        .bind(row.finished_at)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     async fn update_gate(&self, row: &QualityGateRunRow) -> Result<bool, DbError> {
         let result = sqlx::query(
             "UPDATE quality_gate_runs SET exit_code = ?, status = ?, stdout_artifact_id = ?, stderr_artifact_id = ?, \
-             duration_ms = ?, required = ?, started_at = ?, finished_at = ? WHERE id = ? AND run_id = ?",
+             duration_ms = ?, isolation_mode = ?, execution_id = ?, required = ?, started_at = ?, finished_at = ? \
+             WHERE id = ? AND run_id = ?",
         )
         .bind(row.exit_code)
         .bind(&row.status)
         .bind(&row.stdout_artifact_id)
         .bind(&row.stderr_artifact_id)
         .bind(row.duration_ms)
+        .bind(&row.isolation_mode)
+        .bind(&row.execution_id)
         .bind(row.required)
         .bind(row.started_at)
         .bind(row.finished_at)
