@@ -8,6 +8,7 @@ mod conversation;
 mod conversation_artifact;
 mod cron_job;
 mod development;
+mod development_operations;
 mod mcp_server;
 mod message;
 mod oauth_token;
@@ -41,6 +42,10 @@ pub use cron_job::CronJobRow;
 pub use development::{
     DevelopmentCiCheckRow, DevelopmentDeliveryRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
     QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
+};
+pub use development_operations::{
+    DevelopmentAlertRow, DevelopmentAuditEventRow, DevelopmentPolicyRow, DevelopmentRecoveryRecordRow,
+    DevelopmentUsageEventRow, DevelopmentUsageSummary,
 };
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
