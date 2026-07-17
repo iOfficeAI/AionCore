@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aionui_api_types::{
     ChannelAssistantSettingRequest, ChannelAssistantSettingResponse, ChannelDefaultModelSetting,
-    ChannelPlatformSettingsResponse,
+    ChannelPlatformSettingsResponse, ChannelWorkspaceSetting,
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::{
@@ -16,11 +16,12 @@ use crate::types::PluginType;
 
 const DEFAULT_AGENT_TYPE: &str = "aionrs";
 
-/// Per-plugin agent/model configuration read from `client_preferences`.
+/// Per-plugin agent/model/workspace configuration read from `client_preferences`.
 ///
 /// Keys follow the pattern established by the old Electron frontend:
 /// - `assistant.{platform}.agent`       → JSON `{"backend":"claude","name":"Claude"}`
 /// - `assistant.{platform}.defaultModel` → JSON `{"id":"provider_id","use_model":"model_name"}`
+/// - `assistant.{platform}.workspace`   → JSON `{"path":"/abs/path"}`
 pub struct ChannelSettingsService {
     pref_repo: Arc<dyn IClientPreferenceRepository>,
     agent_metadata_repo: Option<Arc<dyn IAgentMetadataRepository>>,
@@ -208,10 +209,15 @@ impl ChannelSettingsService {
     ) -> Result<ChannelPlatformSettingsResponse, ChannelError> {
         let key_agent = agent_key(platform);
         let key_model = model_key(platform);
-        let prefs = self.pref_repo.get_by_keys(user_id, &[&key_agent, &key_model]).await?;
+        let key_workspace = workspace_key(platform);
+        let prefs = self
+            .pref_repo
+            .get_by_keys(user_id, &[&key_agent, &key_model, &key_workspace])
+            .await?;
 
         let mut assistant = None;
         let mut default_model = None;
+        let mut workspace = None;
 
         for pref in prefs {
             if pref.key == key_agent {
@@ -223,6 +229,8 @@ impl ChannelSettingsService {
                 }
             } else if pref.key == key_model {
                 default_model = parse_channel_model_setting(&pref.value);
+            } else if pref.key == key_workspace {
+                workspace = parse_channel_workspace_setting(&pref.value);
             }
         }
 
@@ -234,6 +242,7 @@ impl ChannelSettingsService {
             platform: platform.to_string(),
             assistant,
             default_model,
+            workspace,
         })
     }
 
@@ -284,6 +293,47 @@ impl ChannelSettingsService {
     ) -> Result<(), ChannelError> {
         let payload = serde_json::to_string(model).map_err(ChannelError::Json)?;
         let key = model_key(platform);
+        self.pref_repo
+            .upsert_batch(user_id, &[(&key, payload.as_str())])
+            .await?;
+        Ok(())
+    }
+
+    /// Returns the configured workspace path for a platform, if any.
+    pub async fn get_workspace_path(
+        &self,
+        user_id: &str,
+        platform: PluginType,
+    ) -> Result<Option<String>, ChannelError> {
+        let key = workspace_key(platform);
+        let prefs = self.pref_repo.get_by_keys(user_id, &[&key]).await?;
+        let Some(pref) = prefs.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(parse_channel_workspace_setting(&pref.value).map(|setting| setting.path))
+    }
+
+    /// Persists or clears the workspace path for a platform.
+    ///
+    /// Empty / whitespace-only paths clear the preference so new channel
+    /// conversations fall back to auto-provisioned temporary workspaces.
+    pub async fn set_workspace_setting(
+        &self,
+        user_id: &str,
+        platform: PluginType,
+        workspace: &ChannelWorkspaceSetting,
+    ) -> Result<(), ChannelError> {
+        let key = workspace_key(platform);
+        let trimmed = workspace.path.trim();
+        if trimmed.is_empty() {
+            self.pref_repo.delete_keys(user_id, &[&key]).await?;
+            return Ok(());
+        }
+
+        let payload = serde_json::to_string(&ChannelWorkspaceSetting {
+            path: trimmed.to_owned(),
+        })
+        .map_err(ChannelError::Json)?;
         self.pref_repo
             .upsert_batch(user_id, &[(&key, payload.as_str())])
             .await?;
@@ -482,6 +532,21 @@ fn agent_key(platform: PluginType) -> String {
 
 fn model_key(platform: PluginType) -> String {
     format!("assistant.{platform}.defaultModel")
+}
+
+fn workspace_key(platform: PluginType) -> String {
+    format!("assistant.{platform}.workspace")
+}
+
+fn parse_channel_workspace_setting(value: &str) -> Option<ChannelWorkspaceSetting> {
+    let parsed: ChannelWorkspaceSetting = serde_json::from_str(value).ok()?;
+    let path = parsed.path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(ChannelWorkspaceSetting {
+        path: path.to_owned(),
+    })
 }
 
 fn default_agent_config() -> ResolvedAgentConfig {
@@ -1314,6 +1379,73 @@ mod tests {
         assert!(assistant.backend.is_none());
         assert!(assistant.agent_type.is_none());
         assert_eq!(assistant.name.as_deref(), Some("Codex"));
+    }
+
+    #[tokio::test]
+    async fn workspace_setting_roundtrip_and_clear() {
+        let repo = Arc::new(MockPrefRepo::new());
+        let svc = ChannelSettingsService::new(repo);
+
+        assert!(svc
+            .get_workspace_path(TEST_USER_ID, PluginType::Telegram)
+            .await
+            .unwrap()
+            .is_none());
+
+        svc.set_workspace_setting(
+            TEST_USER_ID,
+            PluginType::Telegram,
+            &ChannelWorkspaceSetting {
+                path: "  /projects/demo  ".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            svc.get_workspace_path(TEST_USER_ID, PluginType::Telegram)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("/projects/demo")
+        );
+
+        let settings = svc
+            .get_platform_settings(TEST_USER_ID, PluginType::Telegram)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings.workspace.as_ref().map(|ws| ws.path.as_str()),
+            Some("/projects/demo")
+        );
+
+        svc.set_workspace_setting(
+            TEST_USER_ID,
+            PluginType::Telegram,
+            &ChannelWorkspaceSetting { path: "   ".into() },
+        )
+        .await
+        .unwrap();
+
+        assert!(svc
+            .get_workspace_path(TEST_USER_ID, PluginType::Telegram)
+            .await
+            .unwrap()
+            .is_none());
+        let cleared = svc
+            .get_platform_settings(TEST_USER_ID, PluginType::Telegram)
+            .await
+            .unwrap();
+        assert!(cleared.workspace.is_none());
+    }
+
+    #[test]
+    fn parse_channel_workspace_setting_rejects_empty_path() {
+        assert!(parse_channel_workspace_setting(r#"{"path":"   "}"#).is_none());
+        assert_eq!(
+            parse_channel_workspace_setting(r#"{"path":"/tmp/work"}"#).map(|ws| ws.path),
+            Some("/tmp/work".into())
+        );
     }
 
     // ── resolved_model_to_provider ────────────────────────────────────

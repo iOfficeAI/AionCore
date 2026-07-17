@@ -144,6 +144,11 @@ impl ChannelMessageService {
             .filter(|name| !name.is_empty())
             .map(ToOwned::to_owned);
         let model_config = self.settings.get_model_config(owner_user_id, platform).await?;
+        let workspace_path = self
+            .settings
+            .get_workspace_path(owner_user_id, platform)
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
         let agent_type = parse_agent_type(&agent_config.agent_type)?;
         let model = resolved_model_to_provider(model_config.as_ref());
         let mut extra = Self::build_channel_extra(if assistant_id.is_some() {
@@ -151,6 +156,11 @@ impl ChannelMessageService {
         } else {
             agent_config.backend.as_deref()
         });
+        // Prefer the platform-configured workspace over ConversationService's
+        // auto-provisioned temporary directory.
+        if let Some(path) = workspace_path {
+            extra["workspace"] = serde_json::Value::String(path);
+        }
         let name = assistant_name.unwrap_or_else(|| {
             channel_conversation_name(
                 platform,

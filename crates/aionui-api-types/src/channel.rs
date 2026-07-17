@@ -124,6 +124,15 @@ pub struct ChannelDefaultModelSetting {
     pub use_model: String,
 }
 
+/// Default workspace path for a channel platform.
+///
+/// When set, new channel conversations use this path instead of an
+/// auto-provisioned temporary workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelWorkspaceSetting {
+    pub path: String,
+}
+
 /// Aggregated settings payload for one channel platform.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChannelPlatformSettingsResponse {
@@ -132,6 +141,8 @@ pub struct ChannelPlatformSettingsResponse {
     pub assistant: Option<ChannelAssistantSettingResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<ChannelDefaultModelSetting>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<ChannelWorkspaceSetting>,
 }
 
 // ---------------------------------------------------------------------------
