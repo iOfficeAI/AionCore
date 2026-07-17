@@ -265,6 +265,7 @@ async fn recovery_scan_and_decisions_are_idempotent_and_audited() {
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
     assert_eq!(first[0].id, second[0].id);
+    assert!(first[0].finding.contains("workspace lease"));
     assert_eq!(
         fixture.development_repo.list_gates("run-ops", None).await.unwrap()[0].status,
         "interrupted"

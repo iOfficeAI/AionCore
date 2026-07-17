@@ -64,7 +64,6 @@ pub struct DevelopmentOperationsService {
     operations_repo: Arc<dyn IDevelopmentOperationsRepository>,
     development_repo: Arc<dyn IDevelopmentRepository>,
     project_repo: Arc<dyn IProjectRepository>,
-    #[allow(dead_code)]
     lease_repo: Arc<dyn IAgentWorkspaceLeaseRepository>,
 }
 
@@ -402,7 +401,7 @@ impl DevelopmentOperationsService {
                 }
             }
             let project = self.project_repo.get_for_user(&run.project_id, &run.user_id).await?;
-            let mut finding = match project {
+            let mut findings = vec![match project {
                 None => "project registration is missing".to_owned(),
                 Some(project) if !Path::new(&project.local_path).is_dir() => {
                     "project working directory is missing".to_owned()
@@ -411,11 +410,41 @@ impl DevelopmentOperationsService {
                     "project Git repository is unavailable".to_owned()
                 }
                 Some(_) => "run heartbeat is stale and requires an explicit recovery decision".to_owned(),
-            };
-            if interrupted_gate_count > 0 {
-                finding =
-                    format!("{finding}; marked {interrupted_gate_count} unfinished quality gate(s) as interrupted");
+            }];
+            if let Some(team_id) = run.team_id.as_deref() {
+                let leases = self.lease_repo.list_for_team(team_id).await?;
+                let relevant = leases
+                    .iter()
+                    .filter(|lease| lease.lease_status != "released")
+                    .collect::<Vec<_>>();
+                if relevant.is_empty() {
+                    findings.push("team run has no active workspace lease registered".into());
+                }
+                for lease in relevant {
+                    if lease.lease_status != "active" {
+                        findings.push(format!(
+                            "workspace lease {} is in {} state",
+                            lease.id, lease.lease_status
+                        ));
+                    } else if !Path::new(&lease.worktree_path).is_dir() {
+                        findings.push(format!("workspace lease {} worktree is missing", lease.id));
+                    } else if git2::Repository::discover(&lease.worktree_path).is_err() {
+                        findings.push(format!("workspace lease {} Git worktree is unavailable", lease.id));
+                    }
+                    if lease.cleanup_status != "not_started" && lease.cleanup_status != "completed" {
+                        findings.push(format!(
+                            "workspace lease {} cleanup is {}",
+                            lease.id, lease.cleanup_status
+                        ));
+                    }
+                }
             }
+            if interrupted_gate_count > 0 {
+                findings.push(format!(
+                    "marked {interrupted_gate_count} unfinished quality gate(s) as interrupted"
+                ));
+            }
+            let finding = findings.join("; ");
             let recovery_key = format!("run:{}:stale", run.id);
             let existing = self
                 .operations_repo
