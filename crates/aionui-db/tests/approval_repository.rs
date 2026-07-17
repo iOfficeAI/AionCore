@@ -41,6 +41,7 @@ fn approval(id: &str, expires_at: i64) -> ApprovalRequestRow {
         status: "pending".into(),
         approver_user_id: None,
         source_channel: Some("telegram".into()),
+        source_user_id: Some("telegram-user-1".into()),
         source_chat_id: Some("-1003977604085".into()),
         source_thread_id: Some(5),
         expires_at,

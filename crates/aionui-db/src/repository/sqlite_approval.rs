@@ -22,8 +22,8 @@ impl IApprovalRepository for SqliteApprovalRepository {
         sqlx::query(
             "INSERT INTO approval_requests (id, requester_user_id, project_id, run_id, task_id, conversation_id, \
              agent_id, call_id, action_type, command, working_directory, risk_level, options, status, \
-             approver_user_id, source_channel, source_chat_id, source_thread_id, expires_at, consumed_at, \
-             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             approver_user_id, source_channel, source_user_id, source_chat_id, source_thread_id, expires_at, consumed_at, \
+             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.requester_user_id)
@@ -41,6 +41,7 @@ impl IApprovalRepository for SqliteApprovalRepository {
         .bind(&row.status)
         .bind(&row.approver_user_id)
         .bind(&row.source_channel)
+        .bind(&row.source_user_id)
         .bind(&row.source_chat_id)
         .bind(row.source_thread_id)
         .bind(row.expires_at)

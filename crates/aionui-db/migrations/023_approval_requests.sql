@@ -17,6 +17,7 @@ CREATE TABLE approval_requests (
                         CHECK (status IN ('pending', 'approved', 'rejected', 'expired', 'cancelled')),
     approver_user_id    TEXT,
     source_channel      TEXT,
+    source_user_id      TEXT,
     source_chat_id      TEXT,
     source_thread_id    INTEGER,
     expires_at          INTEGER NOT NULL,

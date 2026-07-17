@@ -2,6 +2,7 @@ use agent_client_protocol::schema::Meta as SdkMeta;
 use aionui_common::{Confirmation, ConfirmationOption};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 use super::tool_call::{AcpToolCallContentItem, AcpToolCallKind, AcpToolCallLocationItem, AcpToolCallStatus};
 
@@ -101,9 +102,58 @@ impl AcpPermissionRequestData {
                 .map(|opt| ConfirmationOption {
                     label: opt.name.clone(),
                     value: Value::String(opt.option_id.clone()),
-                    params: None,
+                    params: match opt.kind {
+                        AcpPermissionOptionKind::AllowAlways => {
+                            Some(HashMap::from([("always_allow".into(), "true".into())]))
+                        }
+                        AcpPermissionOptionKind::RejectOnce | AcpPermissionOptionKind::RejectAlways => {
+                            Some(HashMap::from([("decision".into(), "reject".into())]))
+                        }
+                        AcpPermissionOptionKind::AllowOnce => None,
+                    },
                 })
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_preserves_approval_semantics() {
+        let request = AcpPermissionRequestData {
+            session_id: "session".into(),
+            tool_call: AcpPermissionToolCall {
+                tool_call_id: "call".into(),
+                status: None,
+                title: None,
+                kind: Some(AcpToolCallKind::Execute),
+                raw_input: None,
+                raw_output: None,
+                content: None,
+                locations: None,
+                meta: None,
+            },
+            options: vec![
+                AcpPermissionOptionData {
+                    option_id: "always".into(),
+                    name: "Always allow".into(),
+                    kind: AcpPermissionOptionKind::AllowAlways,
+                    meta: None,
+                },
+                AcpPermissionOptionData {
+                    option_id: "reject".into(),
+                    name: "Reject".into(),
+                    kind: AcpPermissionOptionKind::RejectOnce,
+                    meta: None,
+                },
+            ],
+            meta: None,
+        };
+        let options = request.to_confirmation().options;
+        assert_eq!(options[0].params.as_ref().unwrap()["always_allow"], "true");
+        assert_eq!(options[1].params.as_ref().unwrap()["decision"], "reject");
     }
 }

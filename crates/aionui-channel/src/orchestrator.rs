@@ -7,6 +7,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
 use crate::action::{ActionExecutor, MessageResult};
+use crate::approval::{ChannelApprovalContext, ChannelApprovalPort};
 use crate::formatter::format_outgoing_text_for_platform;
 use crate::message_service::ChannelMessageService;
 use crate::session::SessionManager;
@@ -28,6 +29,7 @@ pub struct ChannelOrchestrator {
     message_service: Arc<ChannelMessageService>,
     session_manager: Arc<SessionManager>,
     sender: Arc<dyn ChannelSender>,
+    approval_port: Option<Arc<dyn ChannelApprovalPort>>,
     chat_sequencer: ChatMessageSequencer,
 }
 
@@ -84,8 +86,14 @@ impl ChannelOrchestrator {
             message_service,
             session_manager,
             sender,
+            approval_port: None,
             chat_sequencer: ChatMessageSequencer::default(),
         }
+    }
+
+    pub fn with_approval_port(mut self, approval_port: Arc<dyn ChannelApprovalPort>) -> Self {
+        self.approval_port = Some(approval_port);
+        self
     }
 
     /// Start the message loop. Runs until both channels close.
@@ -122,6 +130,7 @@ impl ChannelOrchestrator {
         let msg_svc = Arc::clone(&self.message_service);
         let session_mgr = Arc::clone(&self.session_manager);
         let sender = Arc::clone(&self.sender);
+        let approval_port = self.approval_port.clone();
         let chat_sequencer = self.chat_sequencer.clone();
 
         chat_sequencer
@@ -143,6 +152,7 @@ impl ChannelOrchestrator {
                                 &msg_svc,
                                 &session_mgr,
                                 &sender,
+                                approval_port,
                                 &session_id,
                                 conversation_id.as_deref(),
                                 title_hint,
@@ -212,6 +222,7 @@ async fn handle_dispatched(
     msg_svc: &Arc<ChannelMessageService>,
     session_mgr: &Arc<SessionManager>,
     sender: &Arc<dyn ChannelSender>,
+    approval_port: Option<Arc<dyn ChannelApprovalPort>>,
     session_id: &str,
     conversation_id: Option<&str>,
     title_hint: Option<crate::types::ChannelConversationTitleHint>,
@@ -287,7 +298,20 @@ async fn handle_dispatched(
             chat_id: chat_id.to_owned(),
             throttle_ms: 500,
         };
-        let relay = ChannelStreamRelay::new(relay_config, Arc::clone(sender)).with_topic(topic.clone());
+        let mut relay = ChannelStreamRelay::new(relay_config, Arc::clone(sender)).with_topic(topic.clone());
+        if let Some(approval_port) = approval_port {
+            relay = relay.with_approval_port(
+                approval_port,
+                ChannelApprovalContext {
+                    source_user_id: session.user_id.clone(),
+                    conversation_id: send_result.conversation_id.clone(),
+                    agent_id: session.bound_agent_id.clone(),
+                    platform,
+                    chat_id: chat_id.to_owned(),
+                    message_thread_id: topic.as_ref().map(|value| value.message_thread_id),
+                },
+            );
+        }
         tokio::spawn(relay.run(rx));
     } else {
         if send_result.team_routed {

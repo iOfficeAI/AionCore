@@ -43,6 +43,7 @@ pub struct ApprovalOption {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalSource {
     pub channel: String,
+    pub user_id: String,
     pub chat_id: String,
     pub thread_id: Option<i64>,
 }
@@ -72,6 +73,7 @@ pub enum ResolveApprovalContext {
     Channel {
         user_id: String,
         channel: String,
+        source_user_id: String,
         chat_id: String,
         thread_id: Option<i64>,
     },
@@ -142,6 +144,7 @@ impl ApprovalService {
             status: "pending".into(),
             approver_user_id: None,
             source_channel: source.map(|value| value.channel.clone()),
+            source_user_id: source.map(|value| value.user_id.clone()),
             source_chat_id: source.map(|value| value.chat_id.clone()),
             source_thread_id: source.and_then(|value| value.thread_id),
             expires_at: now + APPROVAL_TTL_MS,
@@ -256,6 +259,7 @@ fn ensure_owner(row: &ApprovalRequestRow, user_id: &str) -> Result<(), ApprovalE
 fn ensure_source(row: &ApprovalRequestRow, context: &ResolveApprovalContext) -> Result<(), ApprovalError> {
     let ResolveApprovalContext::Channel {
         channel,
+        source_user_id,
         chat_id,
         thread_id,
         ..
@@ -264,6 +268,7 @@ fn ensure_source(row: &ApprovalRequestRow, context: &ResolveApprovalContext) -> 
         return Ok(());
     };
     if row.source_channel.as_deref() != Some(channel.as_str())
+        || row.source_user_id.as_deref() != Some(source_user_id.as_str())
         || row.source_chat_id.as_deref() != Some(chat_id.as_str())
         || row.source_thread_id != *thread_id
     {

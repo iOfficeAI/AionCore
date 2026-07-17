@@ -86,6 +86,7 @@ fn request() -> ApprovalRequestInput {
         ],
         source: Some(ApprovalSource {
             channel: "telegram".into(),
+            user_id: "telegram-user-1".into(),
             chat_id: "-1003977604085".into(),
             thread_id: Some(5),
         }),
@@ -118,6 +119,7 @@ async fn telegram_resolution_requires_matching_user_chat_and_thread() {
             ResolveApprovalContext::Channel {
                 user_id: "system_default_user".into(),
                 channel: "telegram".into(),
+                source_user_id: "telegram-user-1".into(),
                 chat_id: "-1003977604085".into(),
                 thread_id: Some(7),
             },
@@ -132,6 +134,7 @@ async fn telegram_resolution_requires_matching_user_chat_and_thread() {
             ResolveApprovalContext::Channel {
                 user_id: "system_default_user".into(),
                 channel: "telegram".into(),
+                source_user_id: "telegram-user-1".into(),
                 chat_id: "-1003977604085".into(),
                 thread_id: Some(5),
             },

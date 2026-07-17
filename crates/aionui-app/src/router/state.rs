@@ -20,6 +20,7 @@ use aionui_channel::{
         ChannelPersonalConversationSummary, ChannelPersonalDirectory, ChannelTeamCreateRequest, ChannelTeamDirectory,
         ChannelTeamSummary,
     },
+    approval::{ChannelApprovalContext, ChannelApprovalPort},
 };
 use aionui_common::now_ms;
 use aionui_conversation::{ConversationRouterState, ConversationService};
@@ -38,7 +39,8 @@ use aionui_db::{
     SqliteTeamRepository,
 };
 use aionui_development::{
-    ApprovalResolver, ApprovalRouterState, ApprovalService, DevelopmentRouterState, DevelopmentService,
+    ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
+    DevelopmentRouterState, DevelopmentService, ResolveApprovalContext,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -89,6 +91,11 @@ struct ApprovalAgentResolver {
     task_manager: Arc<dyn aionui_ai_agent::IWorkerTaskManager>,
 }
 
+struct ChannelApprovalAdapter {
+    service: Arc<ApprovalService>,
+    owner_user_id: String,
+}
+
 #[async_trait::async_trait]
 impl ApprovalResolver for ApprovalAgentResolver {
     async fn resolve(
@@ -105,6 +112,81 @@ impl ApprovalResolver for ApprovalAgentResolver {
         agent
             .confirm(call_id, call_id, value, always_allow)
             .map_err(|error| error.to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelApprovalPort for ChannelApprovalAdapter {
+    async fn create(
+        &self,
+        context: ChannelApprovalContext,
+        confirmation: aionui_common::Confirmation,
+    ) -> Result<String, ChannelError> {
+        let risk_level = match confirmation.command_type.as_deref() {
+            Some("read") => "low",
+            Some("edit") | Some("execute") => "high",
+            _ => "medium",
+        };
+        let action_type = confirmation.command_type.clone().unwrap_or_else(|| "tool_call".into());
+        let row = self
+            .service
+            .create(ApprovalRequestInput {
+                requester_user_id: self.owner_user_id.clone(),
+                project_id: None,
+                run_id: None,
+                task_id: None,
+                conversation_id: context.conversation_id,
+                agent_id: context.agent_id,
+                call_id: confirmation.call_id,
+                action_type,
+                command: Some(confirmation.description),
+                working_directory: None,
+                risk_level: risk_level.into(),
+                options: confirmation
+                    .options
+                    .into_iter()
+                    .map(|option| ApprovalOption {
+                        label: option.label,
+                        value: option.value,
+                        params: option.params.map(|params| serde_json::json!(params)),
+                    })
+                    .collect(),
+                source: Some(ApprovalSource {
+                    channel: context.platform.to_string(),
+                    user_id: context.source_user_id,
+                    chat_id: context.chat_id,
+                    thread_id: context.message_thread_id,
+                }),
+            })
+            .await
+            .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+        Ok(row.id)
+    }
+
+    async fn resolve(
+        &self,
+        source_user_id: &str,
+        platform: aionui_channel::types::PluginType,
+        chat_id: &str,
+        message_thread_id: Option<i64>,
+        approval_id: &str,
+        option_index: usize,
+    ) -> Result<String, ChannelError> {
+        self.service
+            .resolve(
+                approval_id,
+                option_index,
+                ResolveApprovalContext::Channel {
+                    user_id: self.owner_user_id.clone(),
+                    channel: platform.to_string(),
+                    source_user_id: source_user_id.to_owned(),
+                    chat_id: chat_id.to_owned(),
+                    thread_id: message_thread_id,
+                },
+            )
+            .await
+            .map(|row| row.status)
+            .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))
     }
 }
 
@@ -1007,13 +1089,18 @@ pub async fn build_channel_state(
     // Build channel settings service for per-plugin agent/model configuration.
     let channel_settings = build_channel_settings_service(services);
     let owner_user_id = get_channel_owner_user_id(services).await;
+    let approval_port: Arc<dyn ChannelApprovalPort> = Arc::new(ChannelApprovalAdapter {
+        service: build_approval_state(services).service,
+        owner_user_id: owner_user_id.clone(),
+    });
 
     // Build orchestrator dependencies
     let mut action_executor = aionui_channel::action::ActionExecutor::new(
         Arc::clone(&pairing_service),
         Arc::clone(&session_manager),
         Arc::clone(&channel_settings),
-    );
+    )
+    .with_approval_port(approval_port.clone());
     if let Some(team_service) = &team_service {
         let team_directory = Arc::new(ChannelTeamDirectoryAdapter {
             service: Arc::clone(team_service),
@@ -1043,7 +1130,8 @@ pub async fn build_channel_state(
         message_service,
         Arc::clone(&session_manager),
         manager.clone() as Arc<dyn aionui_channel::stream_relay::ChannelSender>,
-    );
+    )
+    .with_approval_port(approval_port);
 
     let state = ChannelRouterState {
         manager: Arc::clone(&manager),

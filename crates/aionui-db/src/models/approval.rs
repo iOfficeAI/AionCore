@@ -20,6 +20,7 @@ pub struct ApprovalRequestRow {
     pub status: String,
     pub approver_user_id: Option<String>,
     pub source_channel: Option<String>,
+    pub source_user_id: Option<String>,
     pub source_chat_id: Option<String>,
     pub source_thread_id: Option<i64>,
     pub expires_at: TimestampMs,

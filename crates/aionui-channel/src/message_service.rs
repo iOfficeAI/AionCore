@@ -503,8 +503,8 @@ impl ChannelMessageService {
 
     /// Build the `extra` JSON for channel conversations.
     ///
-    /// Sets `session_mode` to `"yolo"` so the agent auto-approves tool calls —
-    /// channel users have no interactive UI for confirmations.
+    /// Builds the channel runtime defaults. Callers that know the platform
+    /// can tighten the permission mode before creating a conversation.
     pub fn build_channel_extra(backend: Option<&str>) -> serde_json::Value {
         let mut extra = serde_json::json!({
             "session_mode": "yolo",
@@ -521,6 +521,9 @@ impl ChannelMessageService {
         chat_id: &str,
     ) -> serde_json::Value {
         let mut extra = Self::build_channel_extra(backend);
+        if platform == PluginType::Telegram {
+            extra["session_mode"] = serde_json::Value::String("default".into());
+        }
         extra["source_channel"] = serde_json::Value::String(platform_source_channel(platform).to_owned());
         if !chat_id.trim().is_empty() {
             extra["source_chat_id"] = serde_json::Value::String(chat_id.to_owned());
@@ -926,6 +929,13 @@ mod tests {
         assert_eq!(extra["source_chat_id"], "chat-1");
         assert_eq!(extra["source_label"], "Telegram");
         assert_eq!(extra["created_from"], "telegram");
+        assert_eq!(extra["session_mode"], "default");
+    }
+
+    #[test]
+    fn non_telegram_channel_extra_preserves_yolo_compatibility() {
+        let extra = ChannelMessageService::build_channel_extra_for_platform(PluginType::Lark, None, "chat-1");
+        assert_eq!(extra["session_mode"], "yolo");
     }
 
     // ── model placement by agent_type (regression: non-aionrs must not

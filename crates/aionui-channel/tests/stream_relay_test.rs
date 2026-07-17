@@ -1,12 +1,45 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aionui_ai_agent::AgentStreamEvent;
 use aionui_ai_agent::protocol::events::{
-    ErrorEventData, FinishEventData, TextEventData, ToolCallEventData, ToolCallStatus,
+    AcpPermissionEventData, ErrorEventData, FinishEventData, TextEventData, ToolCallEventData, ToolCallStatus,
 };
+use aionui_channel::approval::{ChannelApprovalContext, ChannelApprovalPort};
+use aionui_channel::error::ChannelError;
 use aionui_channel::stream_relay::{ChannelStreamRelay, MessageRecorder, RelayConfig};
 use aionui_channel::types::PluginType;
+use aionui_common::{Confirmation, ConfirmationOption};
+use async_trait::async_trait;
 use tokio::sync::broadcast;
+
+#[derive(Default)]
+struct RecordingApprovalPort {
+    created: Mutex<Vec<(ChannelApprovalContext, Confirmation)>>,
+}
+
+#[async_trait]
+impl ChannelApprovalPort for RecordingApprovalPort {
+    async fn create(
+        &self,
+        context: ChannelApprovalContext,
+        confirmation: Confirmation,
+    ) -> Result<String, ChannelError> {
+        self.created.lock().unwrap().push((context, confirmation));
+        Ok("approval1234567".into())
+    }
+
+    async fn resolve(
+        &self,
+        _source_user_id: &str,
+        _platform: PluginType,
+        _chat_id: &str,
+        _message_thread_id: Option<i64>,
+        _approval_id: &str,
+        _option_index: usize,
+    ) -> Result<String, ChannelError> {
+        Ok("approved".into())
+    }
+}
 
 // ── RelayConfig construction ─────────────────────────────────────
 
@@ -253,4 +286,71 @@ async fn relay_handles_channel_closed() {
     let edits = recorder.take_edits();
     assert!(!edits.is_empty());
     assert!(edits.last().unwrap().text.as_deref().unwrap().contains("partial"));
+}
+
+#[tokio::test]
+async fn telegram_permission_event_creates_topic_scoped_approval_buttons() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+    let approvals = Arc::new(RecordingApprovalPort::default());
+    let config = RelayConfig {
+        platform: PluginType::Telegram,
+        plugin_id: "telegram".into(),
+        chat_id: "chat_1".into(),
+        throttle_ms: 10,
+    };
+    let context = ChannelApprovalContext {
+        source_user_id: "assistant-user-1".into(),
+        conversation_id: "conversation-1".into(),
+        agent_id: Some("claude-code".into()),
+        platform: PluginType::Telegram,
+        chat_id: "chat_1".into(),
+        message_thread_id: Some(5),
+    };
+    let relay = ChannelStreamRelay::new(config, recorder.clone())
+        .with_approval_port(approvals.clone(), context)
+        .with_topic(Some(aionui_channel::types::ChannelTopicContext {
+            message_thread_id: 5,
+        }));
+    let rx = event_tx.subscribe();
+    event_tx
+        .send(AgentStreamEvent::AcpPermission(AcpPermissionEventData::Confirmation(
+            Confirmation {
+                id: "confirmation-1".into(),
+                call_id: "call-1".into(),
+                title: Some("Run tests?".into()),
+                action: None,
+                description: "cargo test".into(),
+                command_type: Some("execute".into()),
+                options: vec![
+                    ConfirmationOption {
+                        label: "Allow once".into(),
+                        value: serde_json::json!("allow_once"),
+                        params: None,
+                    },
+                    ConfirmationOption {
+                        label: "Reject".into(),
+                        value: serde_json::json!("reject"),
+                        params: None,
+                    },
+                ],
+            },
+        )))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    assert_eq!(approvals.created.lock().unwrap().len(), 1);
+    let sends = recorder.take_sends();
+    let prompt = sends
+        .iter()
+        .find(|message| message.buttons.is_some())
+        .expect("approval prompt");
+    assert_eq!(prompt.topic.as_ref().unwrap().message_thread_id, 5);
+    let buttons = prompt.buttons.as_ref().unwrap();
+    assert_eq!(buttons[0][0].action, "approval.resolve");
+    assert_eq!(buttons[0][0].params.as_ref().unwrap()["id"], "approval1234567");
 }

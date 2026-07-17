@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use aionui_api_types::{ChannelAssistantSettingRequest, ChannelDefaultModelSetting};
 use tracing::{debug, info, warn};
 
+use crate::approval::ChannelApprovalPort;
 use crate::channel_settings::{ChannelAgentOption, ChannelSettingsService};
 use crate::error::ChannelError;
 use crate::pairing::PairingService;
@@ -115,6 +116,7 @@ pub struct ActionExecutor {
     settings: Arc<ChannelSettingsService>,
     team_directory: Option<Arc<dyn ChannelTeamDirectory>>,
     personal_directory: Option<Arc<dyn ChannelPersonalDirectory>>,
+    approval_port: Option<Arc<dyn ChannelApprovalPort>>,
     pending_flows: Arc<Mutex<HashMap<String, PendingFlow>>>,
     personal_title_hints: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -137,6 +139,7 @@ impl ActionExecutor {
             settings,
             team_directory: None,
             personal_directory: None,
+            approval_port: None,
             pending_flows: Arc::new(Mutex::new(HashMap::new())),
             personal_title_hints: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -149,6 +152,11 @@ impl ActionExecutor {
 
     pub fn with_personal_directory(mut self, personal_directory: Arc<dyn ChannelPersonalDirectory>) -> Self {
         self.personal_directory = Some(personal_directory);
+        self
+    }
+
+    pub fn with_approval_port(mut self, approval_port: Arc<dyn ChannelApprovalPort>) -> Self {
+        self.approval_port = Some(approval_port);
         self
     }
 
@@ -402,6 +410,47 @@ impl ActionExecutor {
         msg: &UnifiedIncomingMessage,
     ) -> Result<ActionResponse, ChannelError> {
         match action.action.as_str() {
+            "approval.resolve" => {
+                let params = action
+                    .params
+                    .as_ref()
+                    .ok_or_else(|| ChannelError::InvalidConfig("Missing approval callback parameters".into()))?;
+                let approval_id = params
+                    .get("id")
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| ChannelError::InvalidConfig("Missing approval ID".into()))?;
+                let option_index = params
+                    .get("o")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .ok_or_else(|| ChannelError::InvalidConfig("Invalid approval option".into()))?;
+                let approval_port = self
+                    .approval_port
+                    .as_ref()
+                    .ok_or_else(|| ChannelError::InvalidConfig("Approval service is unavailable".into()))?;
+                let status = approval_port
+                    .resolve(
+                        internal_user_id,
+                        msg.platform,
+                        &msg.chat_id,
+                        msg.topic.as_ref().map(|topic| topic.message_thread_id),
+                        approval_id,
+                        option_index,
+                    )
+                    .await?;
+                Ok(ActionResponse {
+                    text: None,
+                    parse_mode: None,
+                    buttons: None,
+                    keyboard: None,
+                    behavior: ActionBehavior::Answer,
+                    toast: Some(if status == "rejected" {
+                        "审批已拒绝".into()
+                    } else {
+                        "审批已处理".into()
+                    }),
+                    edit_message_id: None,
+                })
+            }
             "session.new" => {
                 let user_id = internal_user_id;
                 let chat_id = &action.context.chat_id;
@@ -517,7 +566,7 @@ impl ActionExecutor {
                 text: Some(
                     "Features:\n\
                          • AI chat through your configured assistant\n\
-                         • Tool execution with auto-approval\n\
+                         • Tool execution with explicit approval\n\
                          • Session isolation per chat"
                         .into(),
                 ),
@@ -2323,6 +2372,42 @@ mod tests {
     use aionui_realtime::EventBroadcaster;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingApprovalPort {
+        resolutions: Mutex<Vec<(String, PluginType, String, Option<i64>, String, usize)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::approval::ChannelApprovalPort for RecordingApprovalPort {
+        async fn create(
+            &self,
+            _context: crate::approval::ChannelApprovalContext,
+            _confirmation: aionui_common::Confirmation,
+        ) -> Result<String, ChannelError> {
+            Ok("approval".into())
+        }
+
+        async fn resolve(
+            &self,
+            source_user_id: &str,
+            platform: PluginType,
+            chat_id: &str,
+            message_thread_id: Option<i64>,
+            approval_id: &str,
+            option_index: usize,
+        ) -> Result<String, ChannelError> {
+            self.resolutions.lock().unwrap().push((
+                source_user_id.into(),
+                platform,
+                chat_id.into(),
+                message_thread_id,
+                approval_id.into(),
+                option_index,
+            ));
+            Ok("approved".into())
+        }
+    }
 
     // ── Mock EventBroadcaster ──────────────────────────────────────────
 
@@ -4243,6 +4328,38 @@ mod tests {
             }
             _ => panic!("Expected Action result"),
         }
+    }
+
+    #[tokio::test]
+    async fn approval_callback_is_resolved_with_authorized_topic_identity() {
+        let (executor, repo) = setup();
+        repo.add_authorized_user("tg_42", "telegram");
+        let approvals = Arc::new(RecordingApprovalPort::default());
+        let executor = executor.with_approval_port(approvals.clone());
+        let mut msg = make_action_message(
+            "tg_42",
+            "chat_1",
+            "approval.resolve",
+            ActionCategory::System,
+            PluginType::Telegram,
+            Some(HashMap::from([
+                ("id".into(), "approval1234567".into()),
+                ("o".into(), "1".into()),
+            ])),
+        );
+        msg.topic = Some(crate::types::ChannelTopicContext { message_thread_id: 5 });
+
+        let result = executor.handle_incoming_message(&msg).await.unwrap();
+        match result {
+            MessageResult::Action(response) => assert_eq!(response.toast.as_deref(), Some("审批已处理")),
+            _ => panic!("Expected Action result"),
+        }
+        let calls = approvals.resolutions.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "user_tg_42");
+        assert_eq!(calls[0].3, Some(5));
+        assert_eq!(calls[0].4, "approval1234567");
+        assert_eq!(calls[0].5, 1);
     }
 
     #[tokio::test]
