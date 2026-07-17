@@ -12,6 +12,9 @@ use serde::Deserialize;
 
 use crate::delivery::{CreatePullRequestInput, DeliveryService, PrepareDeliveryInput};
 use crate::error::DevelopmentError;
+use crate::operations::{
+    DevelopmentOperationsService, DevelopmentOperationsSnapshot, DevelopmentPolicyInput, RecoveryDecisionInput,
+};
 use crate::service::{CompletionEvaluation, DevelopmentService};
 use crate::types::{
     AssignDevelopmentRoleInput, CreateArtifactInput, CreateDevelopmentRunInput, CreateDevelopmentTaskInput,
@@ -33,6 +36,7 @@ impl From<DevelopmentError> for ApiError {
 pub struct DevelopmentRouterState {
     pub service: Arc<DevelopmentService>,
     pub delivery_service: Arc<DeliveryService>,
+    pub operations_service: Arc<DevelopmentOperationsService>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -43,6 +47,21 @@ struct RunListQuery {
 #[derive(Debug, Default, Deserialize)]
 struct EvidenceQuery {
     task_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OperationsQuery {
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReconcileInput {
+    #[serde(default = "default_stale_after_ms")]
+    stale_after_ms: i64,
+}
+
+fn default_stale_after_ms() -> i64 {
+    30 * 60 * 1000
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,7 +119,115 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
         .route("/api/development-runs/{run_id}/delivery/sync", post(sync_delivery))
         .route("/api/development-runs/{run_id}/delivery/merge", post(merge_delivery))
         .route("/api/development-runs/{run_id}/delivery/report", get(delivery_report))
+        .route(
+            "/api/development-projects/{project_id}/operations/policy",
+            get(get_operations_policy).put(update_operations_policy),
+        )
+        .route(
+            "/api/development-projects/{project_id}/operations",
+            get(get_operations_snapshot),
+        )
+        .route(
+            "/api/development-projects/{project_id}/operations/alerts/{alert_id}/ack",
+            post(acknowledge_operations_alert),
+        )
+        .route("/api/development-operations/reconcile", post(reconcile_operations))
+        .route("/api/development-runs/{run_id}/recovery", post(decide_recovery))
         .with_state(state)
+}
+
+async fn get_operations_policy(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentPolicyRow>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .operations_service
+            .get_policy(&user.id, &project_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn update_operations_policy(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+    body: Result<Json<DevelopmentPolicyInput>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentPolicyRow>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .operations_service
+            .upsert_policy(&user.id, &project_id, input)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_operations_snapshot(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+    Query(query): Query<OperationsQuery>,
+) -> Result<Json<ApiResponse<DevelopmentOperationsSnapshot>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .operations_service
+            .snapshot(&user.id, &project_id, query.run_id.as_deref())
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn acknowledge_operations_alert(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((project_id, alert_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    state
+        .operations_service
+        .get_policy(&user.id, &project_id)
+        .await
+        .map_err(ApiError::from)?;
+    state
+        .operations_service
+        .acknowledge_alert(&user.id, &project_id, &alert_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(serde_json::json!({"acknowledged": true}))))
+}
+
+async fn reconcile_operations(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ReconcileInput>, JsonRejection>,
+) -> Result<Json<ApiResponse<Vec<aionui_db::models::DevelopmentRecoveryRecordRow>>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .operations_service
+            .reconcile_stale_runs_for_user(&user.id, input.stale_after_ms)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn decide_recovery(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    body: Result<Json<RecoveryDecisionInput>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentRecoveryRecordRow>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .operations_service
+            .decide_recovery(&user.id, &run_id, input)
+            .await
+            .map_err(ApiError::from)?,
+    )))
 }
 
 async fn get_delivery(

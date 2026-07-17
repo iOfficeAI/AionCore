@@ -126,6 +126,46 @@ CREATE INDEX idx_development_recovery_owner_project
     ON development_recovery_records(user_id, project_id, created_at DESC);
 CREATE INDEX idx_development_recovery_run ON development_recovery_records(run_id, created_at DESC);
 
-ALTER TABLE quality_gate_runs ADD COLUMN isolation_mode TEXT NOT NULL DEFAULT 'host'
-    CHECK (isolation_mode IN ('host', 'docker', 'devcontainer'));
-ALTER TABLE quality_gate_runs ADD COLUMN execution_id TEXT;
+DROP INDEX idx_quality_gate_runs_task;
+DROP INDEX idx_quality_gate_runs_run;
+ALTER TABLE quality_gate_runs RENAME TO _quality_gate_runs_phase6_legacy;
+
+CREATE TABLE quality_gate_runs (
+    id                 TEXT PRIMARY KEY NOT NULL,
+    run_id             TEXT NOT NULL,
+    task_id            TEXT,
+    gate_type          TEXT NOT NULL,
+    command            TEXT NOT NULL,
+    working_directory  TEXT NOT NULL,
+    exit_code           INTEGER,
+    status              TEXT NOT NULL CHECK (status IN (
+        'queued', 'running', 'passed', 'failed', 'timed_out', 'cancelled', 'interrupted'
+    )),
+    stdout_artifact_id  TEXT,
+    stderr_artifact_id  TEXT,
+    duration_ms         INTEGER,
+    isolation_mode     TEXT NOT NULL DEFAULT 'host'
+        CHECK (isolation_mode IN ('host', 'docker', 'devcontainer')),
+    execution_id       TEXT,
+    required            INTEGER NOT NULL DEFAULT 1,
+    started_at          INTEGER,
+    finished_at         INTEGER,
+    created_at          INTEGER NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES development_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY(task_id) REFERENCES team_tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY(stdout_artifact_id) REFERENCES task_artifacts(id) ON DELETE SET NULL,
+    FOREIGN KEY(stderr_artifact_id) REFERENCES task_artifacts(id) ON DELETE SET NULL
+);
+
+INSERT INTO quality_gate_runs (
+    id, run_id, task_id, gate_type, command, working_directory, exit_code, status,
+    stdout_artifact_id, stderr_artifact_id, duration_ms, required, started_at, finished_at, created_at
+)
+SELECT
+    id, run_id, task_id, gate_type, command, working_directory, exit_code, status,
+    stdout_artifact_id, stderr_artifact_id, duration_ms, required, started_at, finished_at, created_at
+FROM _quality_gate_runs_phase6_legacy;
+
+DROP TABLE _quality_gate_runs_phase6_legacy;
+CREATE INDEX idx_quality_gate_runs_task ON quality_gate_runs(task_id, gate_type, created_at DESC);
+CREATE INDEX idx_quality_gate_runs_run ON quality_gate_runs(run_id, created_at DESC);

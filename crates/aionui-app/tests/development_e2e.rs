@@ -19,6 +19,21 @@ async fn development_routes_require_authentication() {
         response.status(),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
     ));
+
+    let (app, _services) = build_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/development-projects/project/operations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ));
 }
 
 #[tokio::test]
@@ -43,6 +58,63 @@ async fn authenticated_user_can_create_an_evidence_backed_development_board() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     let project_id = body_json(response).await["data"]["id"].as_str().unwrap().to_owned();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/development-projects/{project_id}/operations/policy"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    json!({
+                        "isolation_mode": "host",
+                        "container_cpu_millis": 1000,
+                        "container_memory_mb": 2048,
+                        "container_pids_limit": 256,
+                        "network_mode": "none",
+                        "allowed_secret_keys": [],
+                        "max_duration_ms": 14400000,
+                        "max_parallel_agents": 4,
+                        "max_retries": 3,
+                        "max_cost_microunits": 0,
+                        "alert_percent": 80,
+                        "over_limit_action": "pause"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/development-projects/{project_id}/operations/policy"),
+            json!({
+                "isolation_mode": "host",
+                "container_cpu_millis": 1000,
+                "container_memory_mb": 2048,
+                "container_pids_limit": 256,
+                "network_mode": "none",
+                "allowed_secret_keys": [],
+                "max_duration_ms": 14400000,
+                "max_parallel_agents": 4,
+                "max_retries": 3,
+                "max_cost_microunits": 0,
+                "alert_percent": 80,
+                "over_limit_action": "pause"
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 
     let response = app
         .clone()

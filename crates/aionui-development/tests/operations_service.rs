@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use aionui_common::now_ms;
-use aionui_db::models::{DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentUsageEventRow, ProjectRow};
+use aionui_db::models::{
+    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentUsageEventRow, ProjectRow, QualityGateRunRow,
+};
 use aionui_db::{
     IDevelopmentOperationsRepository, IDevelopmentRepository, IProjectRepository, SqliteAgentWorkspaceLeaseRepository,
     SqliteDevelopmentOperationsRepository, SqliteDevelopmentRepository, SqliteProjectRepository, init_database_memory,
@@ -235,11 +237,38 @@ fn shared_redaction_removes_named_secrets_and_common_credentials() {
 #[tokio::test]
 async fn recovery_scan_and_decisions_are_idempotent_and_audited() {
     let fixture = setup(1).await;
+    fixture
+        .development_repo
+        .create_gate(&QualityGateRunRow {
+            id: "gate-interrupted".into(),
+            run_id: "run-ops".into(),
+            task_id: None,
+            gate_type: "unit_test".into(),
+            command: "sleep 100".into(),
+            working_directory: fixture._project.path().to_string_lossy().into_owned(),
+            exit_code: None,
+            status: "running".into(),
+            stdout_artifact_id: None,
+            stderr_artifact_id: None,
+            duration_ms: None,
+            isolation_mode: "host".into(),
+            execution_id: Some("gate-interrupted".into()),
+            required: true,
+            started_at: Some(1),
+            finished_at: None,
+            created_at: 1,
+        })
+        .await
+        .unwrap();
     let first = fixture.service.reconcile_stale_runs(10).await.unwrap();
     let second = fixture.service.reconcile_stale_runs(10).await.unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
     assert_eq!(first[0].id, second[0].id);
+    assert_eq!(
+        fixture.development_repo.list_gates("run-ops", None).await.unwrap()[0].status,
+        "interrupted"
+    );
 
     let resumed = fixture
         .service

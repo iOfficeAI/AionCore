@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use aionui_auth::CurrentUser;
 use aionui_db::models::ProjectRow;
 use aionui_db::{
-    IDevelopmentRepository, IProjectRepository, SqliteAgentWorkspaceLeaseRepository, SqliteDevelopmentRepository,
-    SqliteProjectRepository, init_database_memory,
+    IDevelopmentRepository, IProjectRepository, SqliteAgentWorkspaceLeaseRepository,
+    SqliteDevelopmentOperationsRepository, SqliteDevelopmentRepository, SqliteProjectRepository, init_database_memory,
 };
 use aionui_development::{
-    DeliveryProvider, DeliveryProviderSnapshot, DeliveryService, DevelopmentRouterState, DevelopmentService,
-    ProviderPullRequest, development_routes,
+    DeliveryProvider, DeliveryProviderSnapshot, DeliveryService, DevelopmentOperationsService, DevelopmentRouterState,
+    DevelopmentService, ProviderPullRequest, development_routes,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -96,17 +96,31 @@ async fn app() -> (
         .await
         .unwrap();
     let development_repo = Arc::new(SqliteDevelopmentRepository::new(db.pool().clone()));
-    let service = Arc::new(DevelopmentService::new(
+    let lease_repo = Arc::new(SqliteAgentWorkspaceLeaseRepository::new(db.pool().clone()));
+    let operations_service = Arc::new(DevelopmentOperationsService::new(
+        Arc::new(SqliteDevelopmentOperationsRepository::new(db.pool().clone())),
         development_repo.clone(),
         project_repo.clone(),
-        Arc::new(SqliteAgentWorkspaceLeaseRepository::new(db.pool().clone())),
-        project.path().join("artifacts"),
+        lease_repo.clone(),
     ));
+    let service = Arc::new(
+        DevelopmentService::new(
+            development_repo.clone(),
+            project_repo.clone(),
+            lease_repo,
+            project.path().join("artifacts"),
+        )
+        .with_operations(operations_service.clone()),
+    );
     let provider = Arc::new(FakeDeliveryProvider::default());
-    let delivery_service = Arc::new(DeliveryService::new(development_repo, project_repo, provider.clone()));
+    let delivery_service = Arc::new(
+        DeliveryService::new(development_repo, project_repo, provider.clone())
+            .with_operations(operations_service.clone()),
+    );
     let router = development_routes(DevelopmentRouterState {
         service,
         delivery_service,
+        operations_service,
     })
     .layer(Extension(CurrentUser {
         id: "system_default_user".into(),
@@ -118,6 +132,129 @@ async fn app() -> (
 async fn json(response: axum::response::Response) -> serde_json::Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn operations_routes_manage_policy_snapshot_and_recovery() {
+    let (app, _project, db, _provider) = app().await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/development-projects/project-1/operations/policy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json(response).await["data"]["isolation_mode"], "host");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/development-projects/project-1/operations/policy")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "isolation_mode": "docker",
+                        "container_image": "node:24-alpine",
+                        "container_cpu_millis": 1000,
+                        "container_memory_mb": 2048,
+                        "container_pids_limit": 256,
+                        "network_mode": "none",
+                        "allowed_secret_keys": ["NPM_TOKEN"],
+                        "max_duration_ms": 14400000,
+                        "max_parallel_agents": 4,
+                        "max_retries": 3,
+                        "max_cost_microunits": 0,
+                        "alert_percent": 80,
+                        "over_limit_action": "pause"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json(response).await;
+    assert_eq!(body["data"]["isolation_mode"], "docker");
+    assert_eq!(body["data"]["allowed_secret_keys_json"], "[\"NPM_TOKEN\"]");
+
+    let run = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/development-runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "execution_mode": "single",
+                        "request_summary": "recover",
+                        "acceptance_criteria": ["safe"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(run.status(), StatusCode::CREATED);
+    let run_id = json(run).await["data"]["id"].as_str().unwrap().to_owned();
+    sqlx::query("UPDATE development_runs SET updated_at = 1, started_at = 1 WHERE id = ?")
+        .bind(&run_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/development-operations/reconcile")
+                .header("content-type", "application/json")
+                .body(Body::from("{\"stale_after_ms\":10}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json(response).await["data"].as_array().unwrap().len(), 1);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/development-projects/project-1/operations?run_id={run_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json(response).await["data"]["recovery"].as_array().unwrap().len(), 1);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/development-runs/{run_id}/recovery"))
+                .header("content-type", "application/json")
+                .body(Body::from("{\"action\":\"terminate\"}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json(response).await["data"]["status_after"], "cancelled");
 }
 
 #[tokio::test]
@@ -201,6 +338,7 @@ async fn malformed_run_payload_is_rejected() {
 #[tokio::test]
 async fn delivery_routes_prepare_and_require_confirmation_for_push() {
     let (app, project, db, provider) = app().await;
+    let now = aionui_common::now_ms();
     let repo = SqliteDevelopmentRepository::new(db.pool().clone());
     repo.create_run(&aionui_db::models::DevelopmentRunRow {
         id: "run-route-delivery".into(),
@@ -215,10 +353,10 @@ async fn delivery_routes_prepare_and_require_confirmation_for_push() {
         acceptance_criteria: r#"["tests pass"]"#.into(),
         baseline_commit: Some(git(project.path(), &["rev-parse", "HEAD"])),
         integration_branch: None,
-        started_at: Some(1),
+        started_at: Some(now),
         finished_at: None,
-        created_at: 1,
-        updated_at: 1,
+        created_at: now,
+        updated_at: now,
     })
     .await
     .unwrap();

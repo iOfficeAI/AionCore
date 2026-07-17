@@ -35,13 +35,14 @@ use aionui_db::{
     MessagePageParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAgentWorkspaceLeaseRepository,
     SqliteApprovalRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteDevelopmentRepository,
-    SqliteProjectRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
-    SqliteTeamRepository,
+    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteDevelopmentOperationsRepository,
+    SqliteDevelopmentRepository, SqliteProjectRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteSettingsRepository, SqliteTeamRepository,
 };
 use aionui_development::{
     ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
-    DeliveryService, DevelopmentRouterState, DevelopmentService, GhCliDeliveryProvider, ResolveApprovalContext,
+    DeliveryService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentService, GhCliDeliveryProvider,
+    ResolveApprovalContext,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -1012,6 +1013,14 @@ pub async fn build_module_states(
         .service
         .recover_stale_runtime_state_on_startup()
         .await;
+    if let Err(error) = states
+        .development
+        .operations_service
+        .reconcile_stale_runs(30 * 60 * 1000)
+        .await
+    {
+        tracing::warn!(error = %error, "development recovery reconciliation failed");
+    }
 
     Ok((states, channel_components))
 }
@@ -1037,19 +1046,30 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
     let pool = services.database.pool().clone();
     let development_repo: Arc<dyn IDevelopmentRepository> = Arc::new(SqliteDevelopmentRepository::new(pool.clone()));
     let project_repo: Arc<dyn IProjectRepository> = Arc::new(SqliteProjectRepository::new(pool.clone()));
-    let lease_repo: Arc<dyn IAgentWorkspaceLeaseRepository> = Arc::new(SqliteAgentWorkspaceLeaseRepository::new(pool));
+    let lease_repo: Arc<dyn IAgentWorkspaceLeaseRepository> =
+        Arc::new(SqliteAgentWorkspaceLeaseRepository::new(pool.clone()));
+    let operations_repo = Arc::new(SqliteDevelopmentOperationsRepository::new(pool));
+    let operations_service = Arc::new(DevelopmentOperationsService::new(
+        operations_repo,
+        development_repo.clone(),
+        project_repo.clone(),
+        lease_repo.clone(),
+    ));
     DevelopmentRouterState {
-        service: Arc::new(DevelopmentService::new(
-            development_repo.clone(),
-            project_repo.clone(),
-            lease_repo,
-            services.data_dir.join("development-artifacts"),
-        )),
-        delivery_service: Arc::new(DeliveryService::new(
-            development_repo,
-            project_repo,
-            Arc::new(GhCliDeliveryProvider),
-        )),
+        service: Arc::new(
+            DevelopmentService::new(
+                development_repo.clone(),
+                project_repo.clone(),
+                lease_repo,
+                services.data_dir.join("development-artifacts"),
+            )
+            .with_operations(operations_service.clone()),
+        ),
+        delivery_service: Arc::new(
+            DeliveryService::new(development_repo, project_repo, Arc::new(GhCliDeliveryProvider))
+                .with_operations(operations_service.clone()),
+        ),
+        operations_service,
     }
 }
 

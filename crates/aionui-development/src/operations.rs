@@ -316,7 +316,22 @@ impl DevelopmentOperationsService {
         })
     }
 
-    pub async fn acknowledge_alert(&self, user_id: &str, alert_id: &str) -> Result<(), DevelopmentError> {
+    pub async fn acknowledge_alert(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        alert_id: &str,
+    ) -> Result<(), DevelopmentError> {
+        self.require_project(user_id, project_id).await?;
+        let belongs_to_project = self
+            .operations_repo
+            .list_alerts(user_id, project_id, None, false)
+            .await?
+            .iter()
+            .any(|alert| alert.id == alert_id);
+        if !belongs_to_project {
+            return Err(DevelopmentError::NotFound(format!("alert {alert_id}")));
+        }
         if !self
             .operations_repo
             .update_alert_status(user_id, alert_id, "acknowledged", None)
@@ -324,11 +339,42 @@ impl DevelopmentOperationsService {
         {
             return Err(DevelopmentError::NotFound(format!("alert {alert_id}")));
         }
+        self.audit(
+            user_id,
+            "user",
+            user_id,
+            "alert.acknowledge",
+            "development_alert",
+            alert_id,
+            project_id,
+            None,
+            None,
+            "success",
+            json!({}),
+            &[],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn reconcile_stale_runs(
         &self,
+        stale_after_ms: i64,
+    ) -> Result<Vec<DevelopmentRecoveryRecordRow>, DevelopmentError> {
+        self.reconcile_stale_runs_scoped(None, stale_after_ms).await
+    }
+
+    pub async fn reconcile_stale_runs_for_user(
+        &self,
+        user_id: &str,
+        stale_after_ms: i64,
+    ) -> Result<Vec<DevelopmentRecoveryRecordRow>, DevelopmentError> {
+        self.reconcile_stale_runs_scoped(Some(user_id), stale_after_ms).await
+    }
+
+    async fn reconcile_stale_runs_scoped(
+        &self,
+        user_id: Option<&str>,
         stale_after_ms: i64,
     ) -> Result<Vec<DevelopmentRecoveryRecordRow>, DevelopmentError> {
         if stale_after_ms <= 0 {
@@ -340,8 +386,23 @@ impl DevelopmentOperationsService {
             .await?;
         let mut records = Vec::with_capacity(candidates.len());
         for run in candidates {
+            if user_id.is_some_and(|user_id| user_id != run.user_id) {
+                continue;
+            }
+            let mut interrupted_gate_count = 0_usize;
+            for mut gate in self.development_repo.list_gates(&run.id, None).await? {
+                if gate.status == "running" {
+                    gate.status = "interrupted".into();
+                    gate.finished_at = Some(now_ms());
+                    gate.duration_ms = gate
+                        .started_at
+                        .map(|started_at| now_ms().saturating_sub(started_at).max(0));
+                    self.development_repo.update_gate(&gate).await?;
+                    interrupted_gate_count += 1;
+                }
+            }
             let project = self.project_repo.get_for_user(&run.project_id, &run.user_id).await?;
-            let finding = match project {
+            let mut finding = match project {
                 None => "project registration is missing".to_owned(),
                 Some(project) if !Path::new(&project.local_path).is_dir() => {
                     "project working directory is missing".to_owned()
@@ -351,6 +412,10 @@ impl DevelopmentOperationsService {
                 }
                 Some(_) => "run heartbeat is stale and requires an explicit recovery decision".to_owned(),
             };
+            if interrupted_gate_count > 0 {
+                finding =
+                    format!("{finding}; marked {interrupted_gate_count} unfinished quality gate(s) as interrupted");
+            }
             let recovery_key = format!("run:{}:stale", run.id);
             let existing = self
                 .operations_repo
@@ -375,6 +440,21 @@ impl DevelopmentOperationsService {
                 created_at: existing.map(|row| row.created_at).unwrap_or_else(now_ms),
             };
             self.operations_repo.append_recovery(&record).await?;
+            self.audit(
+                &run.user_id,
+                "system",
+                "development-recovery-reconciler",
+                "recovery.detect",
+                "development_run",
+                &run.id,
+                &run.project_id,
+                Some(&run.id),
+                None,
+                "success",
+                json!({"finding": finding, "decision": "manual_required"}),
+                &[],
+            )
+            .await?;
             self.upsert_alert(
                 &run,
                 "recovery",

@@ -447,7 +447,27 @@ impl DevelopmentService {
         };
         let runtime_profile = self.project_repo.get_runtime_profile(&run.project_id, user_id).await?;
         let environment = runtime_environment(runtime_profile.as_ref())?;
-        let output = execute_command(CommandExecutionInput {
+        let mut row = QualityGateRunRow {
+            id: gate_id.clone(),
+            run_id: run_id.into(),
+            task_id: task_id.map(str::to_owned),
+            gate_type: gate_type.into(),
+            command: command.into(),
+            working_directory: working_directory.clone(),
+            exit_code: None,
+            status: "running".into(),
+            stdout_artifact_id: None,
+            stderr_artifact_id: None,
+            duration_ms: None,
+            isolation_mode: policy.isolation_mode.clone(),
+            execution_id: Some(gate_id.clone()),
+            required,
+            started_at: Some(started_at),
+            finished_at: None,
+            created_at: started_at,
+        };
+        self.development_repo.create_gate(&row).await?;
+        let output = match execute_command(CommandExecutionInput {
             execution_id: &gate_id,
             run_id,
             command,
@@ -457,33 +477,54 @@ impl DevelopmentService {
             runtime_profile: runtime_profile.as_ref(),
             environment,
         })
-        .await?;
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                row.status = "failed".into();
+                row.duration_ms = Some(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
+                row.finished_at = Some(now_ms());
+                self.development_repo.update_gate(&row).await?;
+                if let Some(operations) = &self.operations {
+                    operations
+                        .audit(
+                            user_id,
+                            "system",
+                            "development-command-executor",
+                            "quality_gate.execute",
+                            "quality_gate",
+                            &row.id,
+                            &run.project_id,
+                            Some(run_id),
+                            task_id,
+                            "failed",
+                            serde_json::json!({
+                                "gate_type": gate_type,
+                                "isolation_mode": row.isolation_mode,
+                                "error": error.to_string(),
+                            }),
+                            &[],
+                        )
+                        .await?;
+                }
+                return Err(error);
+            }
+        };
         let stdout = self
             .persist_gate_output(run_id, task_id, &gate_id, "stdout", output.stdout.as_bytes())
             .await?;
         let stderr = self
             .persist_gate_output(run_id, task_id, &gate_id, "stderr", output.stderr.as_bytes())
             .await?;
-        let row = QualityGateRunRow {
-            id: gate_id,
-            run_id: run_id.into(),
-            task_id: task_id.map(str::to_owned),
-            gate_type: gate_type.into(),
-            command: command.into(),
-            working_directory,
-            exit_code: output.exit_code,
-            status: output.status,
-            stdout_artifact_id: Some(stdout.id),
-            stderr_artifact_id: Some(stderr.id),
-            duration_ms: Some(started.elapsed().as_millis().min(i64::MAX as u128) as i64),
-            isolation_mode: output.isolation_mode,
-            execution_id: Some(output.execution_id),
-            required,
-            started_at: Some(started_at),
-            finished_at: Some(now_ms()),
-            created_at: started_at,
-        };
-        self.development_repo.create_gate(&row).await?;
+        row.exit_code = output.exit_code;
+        row.status = output.status;
+        row.stdout_artifact_id = Some(stdout.id);
+        row.stderr_artifact_id = Some(stderr.id);
+        row.duration_ms = Some(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
+        row.isolation_mode = output.isolation_mode;
+        row.execution_id = Some(output.execution_id);
+        row.finished_at = Some(now_ms());
+        self.development_repo.update_gate(&row).await?;
         if let Some(operations) = &self.operations {
             operations
                 .record_usage(DevelopmentUsageEventRow {
