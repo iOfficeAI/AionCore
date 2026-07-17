@@ -1,5 +1,6 @@
 pub mod acp_session;
 pub mod agent_metadata;
+pub mod approval;
 pub mod assistant;
 pub mod channel;
 mod client_preference;
@@ -15,6 +16,7 @@ mod settings;
 pub mod skill;
 mod sqlite_acp_session;
 mod sqlite_agent_metadata;
+mod sqlite_approval;
 mod sqlite_assistant;
 mod sqlite_channel;
 mod sqlite_client_preference;
@@ -37,6 +39,7 @@ pub mod workspace_lease;
 
 pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
 pub use agent_metadata::IAgentMetadataRepository;
+pub use approval::IApprovalRepository;
 pub use assistant::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
     IAssistantPreferenceRepository, IAssistantRepository,
@@ -55,6 +58,7 @@ pub use settings::ISettingsRepository;
 pub use skill::ISkillRepository;
 pub use sqlite_acp_session::SqliteAcpSessionRepository;
 pub use sqlite_agent_metadata::SqliteAgentMetadataRepository;
+pub use sqlite_approval::SqliteApprovalRepository;
 pub use sqlite_assistant::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, rebuild_legacy_assistant_mirror,

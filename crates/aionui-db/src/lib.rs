@@ -17,12 +17,13 @@ pub use database::{
 };
 pub use error::DbError;
 pub use models::{
-    AgentMetadataRow, AgentWorkspaceLeaseRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow,
-    AssistantPreferenceRow, AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow,
-    CreateAssistantParams, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, ProjectCommandProfileRow,
-    ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow, QualityGateRunRow, ReviewFindingRow,
-    SkillImportRecordRow, SkillRow, TaskArtifactRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
-    UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    AgentMetadataRow, AgentWorkspaceLeaseRow, ApprovalRequestRow, AssistantDefinitionRow, AssistantOverlayRow,
+    AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, ConversationArtifactRow,
+    ConversationAssistantSnapshotRow, CreateAssistantParams, DevelopmentRunRoleRow, DevelopmentRunRow,
+    DevelopmentTaskRow, ProjectCommandProfileRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
+    QualityGateRunRow, ReviewFindingRow, SkillImportRecordRow, SkillRow, TaskArtifactRow,
+    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
+    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams,
 };
 pub use repository::channel::UpdatePluginStatusParams;
@@ -40,18 +41,18 @@ pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
     AgentWorkspaceLeaseUpdate, CreateAcpSessionParams, IAcpSessionRepository, IAgentMetadataRepository,
-    IAgentWorkspaceLeaseRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IAgentWorkspaceLeaseRepository, IApprovalRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository,
     IClientPreferenceRepository, IConversationRepository, ICronRepository, IDevelopmentRepository,
     IMcpServerRepository, IOAuthTokenRepository, IProjectRepository, IProviderRepository, IRemoteAgentRepository,
     ISettingsRepository, ISkillRepository, ITeamRepository, IUserRepository, PersistedSessionState,
     SaveRuntimeStateParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAgentWorkspaceLeaseRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
-    SqliteDevelopmentRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectRepository,
-    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSkillRepository,
-    SqliteTeamRepository, SqliteUserRepository, rebuild_legacy_assistant_mirror,
+    SqliteAgentWorkspaceLeaseRepository, SqliteApprovalRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
+    SqliteAssistantRepository, SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
+    SqliteCronRepository, SqliteDevelopmentRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository,
+    SqliteProjectRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    SqliteSkillRepository, SqliteTeamRepository, SqliteUserRepository, rebuild_legacy_assistant_mirror,
 };
 
 // Re-export sqlx pool type for downstream crates
