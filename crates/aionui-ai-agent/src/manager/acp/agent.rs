@@ -777,8 +777,14 @@ impl AcpAgentManager {
                     method,
                     "acp_config_option_command_ack"
                 );
-                self.apply_legacy_config_ack(&session_id, &ConfigSetPath::LegacyMode, option_id, &resolved_value, method)
-                    .await
+                self.apply_legacy_config_ack(
+                    &session_id,
+                    &ConfigSetPath::LegacyMode,
+                    option_id,
+                    &resolved_value,
+                    method,
+                )
+                .await
             }
             ConfigSetPath::LegacyModel => {
                 self.protocol
@@ -809,8 +815,14 @@ impl AcpAgentManager {
                     method,
                     "acp_config_option_command_ack"
                 );
-                self.apply_legacy_config_ack(&session_id, &ConfigSetPath::LegacyModel, option_id, &resolved_value, method)
-                    .await
+                self.apply_legacy_config_ack(
+                    &session_id,
+                    &ConfigSetPath::LegacyModel,
+                    option_id,
+                    &resolved_value,
+                    method,
+                )
+                .await
             }
         }
         .map(|snapshot| SetConfigOptionResponse {
