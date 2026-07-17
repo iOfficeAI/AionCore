@@ -41,7 +41,7 @@ use aionui_db::{
 };
 use aionui_development::{
     ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
-    DevelopmentRouterState, DevelopmentService, ResolveApprovalContext,
+    DeliveryService, DevelopmentRouterState, DevelopmentService, GhCliDeliveryProvider, ResolveApprovalContext,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -1040,10 +1040,15 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
     let lease_repo: Arc<dyn IAgentWorkspaceLeaseRepository> = Arc::new(SqliteAgentWorkspaceLeaseRepository::new(pool));
     DevelopmentRouterState {
         service: Arc::new(DevelopmentService::new(
-            development_repo,
-            project_repo,
+            development_repo.clone(),
+            project_repo.clone(),
             lease_repo,
             services.data_dir.join("development-artifacts"),
+        )),
+        delivery_service: Arc::new(DeliveryService::new(
+            development_repo,
+            project_repo,
+            Arc::new(GhCliDeliveryProvider),
         )),
     }
 }

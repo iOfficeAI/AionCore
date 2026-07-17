@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::Deserialize;
 
+use crate::delivery::{CreatePullRequestInput, DeliveryService, PrepareDeliveryInput};
 use crate::error::DevelopmentError;
 use crate::service::{CompletionEvaluation, DevelopmentService};
 use crate::types::{
@@ -31,6 +32,7 @@ impl From<DevelopmentError> for ApiError {
 #[derive(Clone)]
 pub struct DevelopmentRouterState {
     pub service: Arc<DevelopmentService>,
+    pub delivery_service: Arc<DeliveryService>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -41,6 +43,12 @@ struct RunListQuery {
 #[derive(Debug, Default, Deserialize)]
 struct EvidenceQuery {
     task_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfirmedInput {
+    #[serde(default)]
+    confirmed: bool,
 }
 
 pub fn development_routes(state: DevelopmentRouterState) -> Router {
@@ -79,7 +87,126 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
             "/api/development-runs/{run_id}/findings/{finding_id}",
             post(resolve_finding),
         )
+        .route("/api/development-runs/{run_id}/delivery", get(get_delivery))
+        .route(
+            "/api/development-runs/{run_id}/delivery/prepare",
+            post(prepare_delivery),
+        )
+        .route("/api/development-runs/{run_id}/delivery/push", post(push_delivery))
+        .route(
+            "/api/development-runs/{run_id}/delivery/pull-request",
+            post(create_pull_request),
+        )
+        .route("/api/development-runs/{run_id}/delivery/sync", post(sync_delivery))
+        .route("/api/development-runs/{run_id}/delivery/merge", post(merge_delivery))
+        .route("/api/development-runs/{run_id}/delivery/report", get(delivery_report))
         .with_state(state)
+}
+
+async fn get_delivery(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentDeliveryRow>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .delivery_service
+            .get(&user.id, &run_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn prepare_delivery(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    body: Result<Json<PrepareDeliveryInput>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentDeliveryRow>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .delivery_service
+            .prepare(&user.id, &run_id, input)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn push_delivery(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    body: Result<Json<ConfirmedInput>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentDeliveryRow>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .delivery_service
+            .push(&user.id, &run_id, input.confirmed)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn create_pull_request(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    body: Result<Json<CreatePullRequestInput>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentDeliveryRow>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .delivery_service
+            .create_pull_request(&user.id, &run_id, input)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn sync_delivery(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentDeliveryRow>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .delivery_service
+            .sync(&user.id, &run_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn merge_delivery(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    body: Result<Json<ConfirmedInput>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentDeliveryRow>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .delivery_service
+            .merge(&user.id, &run_id, input.confirmed)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn delivery_report(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .delivery_service
+            .report(&user.id, &run_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
 }
 
 async fn assign_role(

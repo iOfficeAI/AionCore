@@ -1,5 +1,6 @@
 mod approval;
 mod approval_routes;
+mod delivery;
 mod error;
 mod routes;
 mod service;
@@ -10,6 +11,10 @@ pub use approval::{
     ResolveApprovalContext,
 };
 pub use approval_routes::{ApprovalRouterState, approval_routes};
+pub use delivery::{
+    CreatePullRequestInput, DeliveryProvider, DeliveryProviderSnapshot, DeliveryService, GhCliDeliveryProvider,
+    PrepareDeliveryInput, ProviderCiCheck, ProviderPullRequest,
+};
 pub use error::DevelopmentError;
 pub use routes::{DevelopmentRouterState, development_routes};
 pub use service::{CompletionEvaluation, DevelopmentService};
