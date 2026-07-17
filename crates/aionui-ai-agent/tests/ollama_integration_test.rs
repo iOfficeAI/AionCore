@@ -25,14 +25,22 @@ fn claude_env_routes_to_local_ollama() {
     let env = build_ollama_env("claude", "llama3.2").expect("claude mapping");
     let get = |name: &str| env.iter().find(|var| var.name == name).map(|var| var.value.as_str());
 
-    // Mirrors what `ollama launch claude` injects (captured on 0.32.0).
+    // Mirrors what `ollama launch claude` injects (captured on 0.32.1)
+    // plus ANTHROPIC_MODEL, required headless (see build_ollama_env docs).
     assert_eq!(get("ANTHROPIC_BASE_URL"), Some(OLLAMA_DEFAULT_BASE_URL));
     assert_eq!(get("ANTHROPIC_AUTH_TOKEN"), Some("ollama"));
     assert_eq!(get("ANTHROPIC_API_KEY"), Some(""));
+    assert_eq!(get("ANTHROPIC_MODEL"), Some("llama3.2"));
     assert_eq!(get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some("llama3.2"));
     assert_eq!(get("ANTHROPIC_DEFAULT_SONNET_MODEL"), Some("llama3.2"));
     assert_eq!(get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), Some("llama3.2"));
     assert_eq!(get("CLAUDE_CODE_SUBAGENT_MODEL"), Some("llama3.2"));
+    assert_eq!(get("CLAUDE_CODE_ATTRIBUTION_HEADER"), Some("0"));
+    assert_eq!(get("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"), Some("1"));
+    assert_eq!(get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"), Some("1"));
+    assert_eq!(get("DISABLE_ERROR_REPORTING"), Some("1"));
+    assert_eq!(get("DISABLE_FEEDBACK_COMMAND"), Some("1"));
+    assert_eq!(get("DISABLE_TELEMETRY"), Some("1"));
 }
 
 #[test]

@@ -68,7 +68,8 @@ fn env_var(name: &str, value: impl Into<String>) -> EnvVar {
 
 /// Build the environment variables that route a backend's model calls to
 /// the local Ollama server, mirroring what `ollama launch <backend>`
-/// injects (captured from Ollama 0.32.0).
+/// injects (captured empirically from Ollama 0.32.1 via a PATH shim),
+/// plus `ANTHROPIC_MODEL` which headless operation requires (see below).
 ///
 /// Returns `None` for backends without a verified mapping.
 pub fn build_ollama_env(backend: &str, model: &str) -> Option<Vec<EnvVar>> {
@@ -79,10 +80,30 @@ pub fn build_ollama_env(backend: &str, model: &str) -> Option<Vec<EnvVar>> {
             // Cleared on purpose so a configured real key cannot take
             // precedence over the Ollama route (matches `ollama launch`).
             env_var("ANTHROPIC_API_KEY", ""),
+            // Pin the session model. `ollama launch` does not set this
+            // because it runs the interactive TUI where the user can pick
+            // a model; headless ACP has no picker. Without it the ACP
+            // bridge falls back to the user's persisted `settings.model`
+            // (~/.claude/settings.json), which typically names a provider
+            // model that does not exist on Ollama and fails the prompt
+            // turn with JSON-RPC -32603 `model_not_found` (verified
+            // against @agentclientprotocol/claude-agent-acp 0.58.1, whose
+            // model priority is ANTHROPIC_MODEL > settings.model).
+            env_var("ANTHROPIC_MODEL", model),
             env_var("ANTHROPIC_DEFAULT_OPUS_MODEL", model),
             env_var("ANTHROPIC_DEFAULT_SONNET_MODEL", model),
             env_var("ANTHROPIC_DEFAULT_HAIKU_MODEL", model),
             env_var("CLAUDE_CODE_SUBAGENT_MODEL", model),
+            // Telemetry/nonessential-traffic suppression, matching the
+            // exact env `ollama launch claude` injects (Ollama 0.32.1).
+            // Keeps the agent from calling Anthropic endpoints with the
+            // placeholder credentials above.
+            env_var("CLAUDE_CODE_ATTRIBUTION_HEADER", "0"),
+            env_var("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY", "1"),
+            env_var("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+            env_var("DISABLE_ERROR_REPORTING", "1"),
+            env_var("DISABLE_FEEDBACK_COMMAND", "1"),
+            env_var("DISABLE_TELEMETRY", "1"),
         ]),
         _ => None,
     }
@@ -106,8 +127,27 @@ mod tests {
         assert_eq!(get("ANTHROPIC_BASE_URL").as_deref(), Some(OLLAMA_DEFAULT_BASE_URL));
         assert_eq!(get("ANTHROPIC_AUTH_TOKEN").as_deref(), Some("ollama"));
         assert_eq!(get("ANTHROPIC_API_KEY").as_deref(), Some(""));
+        assert_eq!(get("ANTHROPIC_MODEL").as_deref(), Some("qwen3:14b"));
         assert_eq!(get("ANTHROPIC_DEFAULT_SONNET_MODEL").as_deref(), Some("qwen3:14b"));
         assert_eq!(get("CLAUDE_CODE_SUBAGENT_MODEL").as_deref(), Some("qwen3:14b"));
+        // Telemetry suppression parity with `ollama launch` (0.32.1).
+        assert_eq!(get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").as_deref(), Some("1"));
+        assert_eq!(get("DISABLE_TELEMETRY").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn test_build_ollama_env_pins_session_model() {
+        // ANTHROPIC_MODEL must always be present and equal to the chosen
+        // Ollama model: it is the highest-priority model source in the
+        // claude ACP bridge and shields the session from any provider
+        // model persisted in the user's ~/.claude settings (which would
+        // otherwise fail the prompt turn with -32603 model_not_found).
+        let env = build_ollama_env("claude", "llama3.2:3b").expect("claude mapping");
+        let pinned = env
+            .iter()
+            .find(|var| var.name == "ANTHROPIC_MODEL")
+            .expect("ANTHROPIC_MODEL must be set");
+        assert_eq!(pinned.value, "llama3.2:3b");
     }
 
     #[test]
