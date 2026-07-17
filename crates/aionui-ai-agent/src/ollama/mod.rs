@@ -18,6 +18,10 @@ use std::sync::OnceLock;
 use aionui_common::EnvVar;
 use aionui_common::constants::{OLLAMA_COMMAND, OLLAMA_DEFAULT_BASE_URL, is_ollama_supported_agent};
 
+/// OpenAI-compatible endpoint of the local Ollama server, used by backends
+/// that speak the OpenAI wire protocol (e.g. qwen-code).
+const OLLAMA_OPENAI_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+
 /// Cached result of Ollama availability check
 static OLLAMA_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
@@ -105,6 +109,19 @@ pub fn build_ollama_env(backend: &str, model: &str) -> Option<Vec<EnvVar>> {
             env_var("DISABLE_FEEDBACK_COMMAND", "1"),
             env_var("DISABLE_TELEMETRY", "1"),
         ]),
+        "qwen" => Some(vec![
+            // Captured from `ollama launch qwen` (Ollama 0.32.1): it starts
+            // the qwen-code TUI with these variables plus `--model <m>` and
+            // `--auth-type openai` CLI flags. The flags are redundant for
+            // headless ACP: with OPENAI_API_KEY set, `qwen --acp` resolves
+            // the openai auth path and OPENAI_MODEL pins the session model
+            // (verified end-to-end against qwen-code 0.19.10 with a clean
+            // HOME — the session reports the runtime-derived model id
+            // `$runtime|openai|<model>(openai)`).
+            env_var("OPENAI_API_KEY", "ollama"),
+            env_var("OPENAI_BASE_URL", OLLAMA_OPENAI_BASE_URL),
+            env_var("OPENAI_MODEL", model),
+        ]),
         _ => None,
     }
 }
@@ -116,6 +133,7 @@ mod tests {
     #[test]
     fn test_ollama_compatible_backend_coverage() {
         assert!(is_agent_ollama_supported("claude"));
+        assert!(is_agent_ollama_supported("qwen"));
         assert!(!is_agent_ollama_supported("gemini"));
         assert!(!is_agent_ollama_supported("codex"));
     }
@@ -148,6 +166,22 @@ mod tests {
             .find(|var| var.name == "ANTHROPIC_MODEL")
             .expect("ANTHROPIC_MODEL must be set");
         assert_eq!(pinned.value, "llama3.2:3b");
+    }
+
+    #[test]
+    fn test_build_ollama_env_for_qwen() {
+        let env = build_ollama_env("qwen", "llama3.2:3b").expect("qwen must have an env mapping");
+        let get = |name: &str| env.iter().find(|var| var.name == name).map(|var| var.value.clone());
+        assert_eq!(get("OPENAI_API_KEY").as_deref(), Some("ollama"));
+        assert_eq!(get("OPENAI_BASE_URL").as_deref(), Some("http://127.0.0.1:11434/v1"));
+        assert_eq!(get("OPENAI_MODEL").as_deref(), Some("llama3.2:3b"));
+    }
+
+    #[test]
+    fn test_openai_base_url_derives_from_default_base_url() {
+        // Keep the OpenAI-compat endpoint in sync with the canonical
+        // Ollama base URL constant if it ever changes.
+        assert_eq!(OLLAMA_OPENAI_BASE_URL, format!("{OLLAMA_DEFAULT_BASE_URL}/v1"));
     }
 
     #[test]

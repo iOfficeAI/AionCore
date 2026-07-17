@@ -44,6 +44,18 @@ fn claude_env_routes_to_local_ollama() {
 }
 
 #[test]
+fn qwen_env_routes_to_local_ollama() {
+    let env = build_ollama_env("qwen", "llama3.2").expect("qwen mapping");
+    let get = |name: &str| env.iter().find(|var| var.name == name).map(|var| var.value.as_str());
+
+    // Mirrors what `ollama launch qwen` injects (captured on 0.32.1);
+    // qwen-code speaks the OpenAI wire protocol, hence the /v1 endpoint.
+    assert_eq!(get("OPENAI_API_KEY"), Some("ollama"));
+    assert_eq!(get("OPENAI_BASE_URL"), Some("http://127.0.0.1:11434/v1"));
+    assert_eq!(get("OPENAI_MODEL"), Some("llama3.2"));
+}
+
+#[test]
 fn unsupported_agents_are_consistent() {
     let unsupported = [
         "gemini",
@@ -61,7 +73,6 @@ fn unsupported_agents_are_consistent() {
         "pi",
         "hermes",
         "droid",
-        "qwen",
     ];
     for agent in unsupported {
         assert!(!is_agent_ollama_supported(agent));

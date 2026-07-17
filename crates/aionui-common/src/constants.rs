@@ -96,15 +96,20 @@ pub const OLLAMA_DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
 ///
 /// AionCore enables this by injecting the same provider environment
 /// variables that `ollama launch <agent>` injects (verified empirically
-/// against Ollama 0.32.0) into the agent's *native ACP command*. Wrapping
+/// against Ollama 0.32.1) into the agent's *native ACP command*. Wrapping
 /// `ollama launch` itself does not work for AionCore: it starts the
 /// agent's interactive TUI, which never speaks ACP on stdio, so the
 /// initialize handshake times out.
 ///
 /// Extend this list only together with a verified environment mapping in
-/// `aionui-ai-agent/src/ollama` (each backend has its own provider
-/// variables and some, e.g. codex, use config files instead of env).
-pub const OLLAMA_COMPATIBLE_BACKENDS: &[&str] = &["claude"];
+/// `aionui-ai-agent/src/ollama`. Each backend has its own provider
+/// variables, and several `ollama launch` integrations cannot be driven
+/// by environment alone (verified with a PATH shim on Ollama 0.32.1):
+/// codex receives `-c model_providers.*` CLI overrides, kimi a
+/// `--config <json>` flag its `acp` subcommand does not accept, and
+/// pi/droid get no injection at all (their launchers rewrite user
+/// config files interactively).
+pub const OLLAMA_COMPATIBLE_BACKENDS: &[&str] = &["claude", "qwen"];
 
 /// Check whether a given agent backend can run against Ollama.
 pub fn is_ollama_supported_agent(backend: &str) -> bool {
@@ -125,6 +130,7 @@ mod ollama_tests {
     #[test]
     fn ollama_compatible_backends_cover_expected_agents() {
         assert!(is_ollama_supported_agent("claude"));
+        assert!(is_ollama_supported_agent("qwen"));
     }
 
     #[test]
@@ -145,7 +151,6 @@ mod ollama_tests {
             "pi",
             "hermes",
             "droid",
-            "qwen",
         ] {
             assert!(!is_ollama_supported_agent(agent));
         }
