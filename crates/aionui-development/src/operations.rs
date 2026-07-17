@@ -574,6 +574,9 @@ impl DevelopmentOperationsService {
         Ok(record)
     }
 
+    // Keep the audit schema explicit at call sites so security-relevant actor, target,
+    // ownership and scope fields cannot be silently inherited from ambient state.
+    #[allow(clippy::too_many_arguments)]
     pub async fn audit(
         &self,
         user_id: &str,

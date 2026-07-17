@@ -235,7 +235,7 @@ async fn completion_succeeds_with_gate_review_acceptance_and_commit_evidence() {
                 CreateArtifactInput {
                     task_id: Some(task.id.clone()),
                     artifact_type: artifact_type.into(),
-                    path_or_uri: value.into(),
+                    path_or_uri: value,
                     checksum,
                     producer_agent_id: Some("implementer".into()),
                     metadata: None,
