@@ -147,6 +147,28 @@ pub(crate) enum ConfigSetPath {
     LegacyModel,
 }
 
+impl ConfigSetPath {
+    /// Stable structured-log label so a single log line identifies which
+    /// write path handled the request (avoids inferring the path from a
+    /// sequence of events). Values are a logging contract — do not rename.
+    pub(crate) fn log_label(&self) -> &'static str {
+        match self {
+            ConfigSetPath::ConfigOption { .. } => "config_option",
+            ConfigSetPath::LegacyMode => "legacy_mode",
+            ConfigSetPath::LegacyModel => "legacy_model",
+        }
+    }
+
+    /// The ACP RPC method this path invokes. Logged alongside `log_label`.
+    pub(crate) fn acp_method(&self) -> &'static str {
+        match self {
+            ConfigSetPath::ConfigOption { .. } => "session/set_config_option",
+            ConfigSetPath::LegacyMode => "session/set_mode",
+            ConfigSetPath::LegacyModel => "session/set_model",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConfigSetPathError {
     OptionNotFound,
@@ -292,6 +314,21 @@ mod tests {
         ModelInfo, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode,
         SessionModeState, SessionModelState,
     };
+
+    #[test]
+    fn config_set_path_log_label_and_method_are_stable() {
+        let config_option = ConfigSetPath::ConfigOption {
+            option_id: "mode".to_owned(),
+        };
+        assert_eq!(config_option.log_label(), "config_option");
+        assert_eq!(config_option.acp_method(), "session/set_config_option");
+
+        assert_eq!(ConfigSetPath::LegacyMode.log_label(), "legacy_mode");
+        assert_eq!(ConfigSetPath::LegacyMode.acp_method(), "session/set_mode");
+
+        assert_eq!(ConfigSetPath::LegacyModel.log_label(), "legacy_model");
+        assert_eq!(ConfigSetPath::LegacyModel.acp_method(), "session/set_model");
+    }
 
     #[test]
     fn dto_uses_snake_case_current_value() {
