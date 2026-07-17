@@ -9,6 +9,7 @@ mod http_client;
 pub mod managed_resources;
 pub mod managed_resources_contract;
 pub mod node_runtime;
+mod registry_npx_lock;
 mod resolver;
 mod shell_env;
 
@@ -28,6 +29,7 @@ pub use node_runtime::{
     doctor_snapshot_for_test, ensure_node_runtime, ensure_node_runtime_with_reporter, ensure_runtime_command,
     ensure_runtime_command_with_reporter, probe_node_runtime_supported, probe_runtime_command,
 };
+pub use registry_npx_lock::{RegistryNpxLockError, pin_registry_npx_args, should_skip_registry_npx_version_probe};
 pub use resolver::{resolve_command_in, resolve_command_path};
 pub use shell_env::enhance_process_path;
 mod spawn;

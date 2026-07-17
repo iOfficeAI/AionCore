@@ -117,6 +117,37 @@ mod tests {
     }
 
     #[test]
+    fn registry_agent_logos_are_embedded_as_svg() {
+        let service = AssetService;
+        for name in [
+            "autohand",
+            "deepagents",
+            "dimcode",
+            "dirac",
+            "glm-acp-agent",
+            "grok",
+            "kilo",
+            "nova",
+            "sigit",
+            "amp-acp",
+            "cortex-code",
+            "corust-agent",
+            "devin",
+            "harn",
+            "junie",
+            "poolside",
+            "stakpak",
+            "vtcode",
+        ] {
+            let asset = service
+                .get_logo(&format!("acp-registry/{name}.svg"))
+                .unwrap_or_else(|error| panic!("missing {name} Registry logo: {error}"));
+            assert_eq!(asset.content_type, HeaderValue::from_static("image/svg+xml"));
+            assert!(!asset.bytes.is_empty());
+        }
+    }
+
+    #[test]
     fn etag_matches_supports_exact_and_star_values() {
         let service = AssetService;
         let etag = HeaderValue::from_static("\"abc\"");

@@ -195,7 +195,16 @@ async fn resolve_agent_command_spec(
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    args.extend(meta.args.iter().cloned());
+    let launch_args = if meta.agent_source == aionui_api_types::AgentSource::Builtin
+        && meta.agent_source_info.bridge_binary.as_deref() == Some("npx")
+        && let Some(backend) = meta.backend.as_deref()
+    {
+        aionui_runtime::pin_registry_npx_args(backend, &meta.args)
+            .map_err(|error| AgentError::bad_request(format!("Agent '{}' package lock invalid: {error}", meta.name)))?
+    } else {
+        meta.args.clone()
+    };
+    args.extend(launch_args);
 
     let mut env: Vec<aionui_common::EnvVar> = meta
         .env
@@ -681,7 +690,7 @@ mod tests {
         let _runtime_data_dir = test_runtime_data_dir();
         let _runtime_mode = BundledRuntimeModeGuard::install(runtime.path());
 
-        let meta = aionui_api_types::AgentMetadata {
+        let mut meta = aionui_api_types::AgentMetadata {
             id: "agent-1".into(),
             icon: None,
             name: "Test ACP".into(),
@@ -737,6 +746,21 @@ mod tests {
         assert_eq!(spec.args, vec!["-y".to_owned(), "@scope/test-agent".to_owned()]);
         assert!(spec.env.iter().any(|entry| entry.name == "K" && entry.value == "V"));
         assert_eq!(spec.cwd.as_deref(), Some("/tmp/workspace"));
+
+        meta.name = "Pi".into();
+        meta.backend = Some("pi".into());
+        meta.agent_source = aionui_api_types::AgentSource::Builtin;
+        meta.agent_source_info.bridge_binary = Some("npx".into());
+        meta.args = vec!["-y".into(), "pi-acp".into()];
+        let spec = resolve_agent_command_spec(
+            &meta,
+            "/tmp/workspace",
+            "conv-acp",
+            Arc::new(BroadcastEventBus::new(16)),
+        )
+        .await
+        .expect("resolved release-pinned builtin command spec");
+        assert_eq!(spec.args, vec!["-y", "pi-acp@0.0.31"]);
     }
 
     #[cfg(unix)]

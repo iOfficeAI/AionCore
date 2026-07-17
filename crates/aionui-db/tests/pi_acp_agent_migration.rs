@@ -12,10 +12,10 @@ async fn pi_acp_builtin_metadata_is_seeded() {
     assert_eq!(pi.agent_type, "acp");
     assert_eq!(pi.agent_source, "builtin");
     assert_eq!(pi.command.as_deref(), Some("npx"));
-    assert_eq!(pi.args.as_deref(), Some(r#"["-y","pi-acp@0.0.31"]"#));
+    assert_eq!(pi.args.as_deref(), Some(r#"["-y","pi-acp"]"#));
     assert_eq!(
         pi.agent_source_info.as_deref(),
-        Some(r#"{"binary_name":"pi","bridge_binary":"npx","version":"0.0.31"}"#)
+        Some(r#"{"binary_name":"pi","bridge_binary":"npx"}"#)
     );
     assert_eq!(pi.native_skills_dirs.as_deref(), Some(r#"[".pi/skills"]"#));
     assert_eq!(pi.yolo_id, None);

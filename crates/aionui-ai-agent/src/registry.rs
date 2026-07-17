@@ -1326,7 +1326,7 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 22);
+        assert_eq!(all.len(), 40);
     }
 
     #[tokio::test]
@@ -1367,12 +1367,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pi_builtin_uses_pinned_acp_adapter_and_requires_pi_cli() {
+    async fn pi_builtin_uses_stable_acp_adapter_and_requires_pi_cli() {
         let reg = registry().await;
         let pi = reg.find_builtin_by_backend("pi").await.unwrap();
 
         assert_eq!(pi.command.as_deref(), Some("npx"));
-        assert_eq!(pi.args, ["-y", "pi-acp@0.0.31"]);
+        assert_eq!(pi.args, ["-y", "pi-acp"]);
         assert_eq!(pi.agent_source_info.binary_name.as_deref(), Some("pi"));
         assert_eq!(pi.agent_source_info.bridge_binary.as_deref(), Some("npx"));
         assert_eq!(pi.native_skills_dirs.as_deref(), Some(&[".pi/skills".to_owned()][..]));
@@ -1386,6 +1386,23 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn every_builtin_npx_agent_has_a_release_lock() {
+        let reg = registry().await;
+        let all = reg.list_all_including_hidden().await;
+        let mut locked = 0;
+        for meta in all
+            .iter()
+            .filter(|meta| meta.agent_source == AgentSource::Builtin && meta.command.as_deref() == Some("npx"))
+        {
+            let backend = meta.backend.as_deref().expect("builtin npx backend");
+            aionui_runtime::pin_registry_npx_args(backend, &meta.args)
+                .unwrap_or_else(|error| panic!("missing release lock for {backend}: {error}"));
+            locked += 1;
+        }
+        assert_eq!(locked, 11);
     }
 
     /// On a host that has *none* of the seeded CLIs installed, the
@@ -1420,7 +1437,7 @@ mod tests {
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
         let count = |t: AgentType| all.iter().filter(|m| m.agent_type == t).count();
-        assert_eq!(count(AgentType::Acp), 19);
+        assert_eq!(count(AgentType::Acp), 37);
         assert_eq!(count(AgentType::Nanobot), 1);
         assert_eq!(count(AgentType::OpenclawGateway), 1);
         assert_eq!(count(AgentType::Aionrs), 1);
@@ -1530,7 +1547,7 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 22, "every row appears once");
+        assert_eq!(snapshot.len(), 40, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {

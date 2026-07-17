@@ -190,25 +190,32 @@ async fn run_probe(
             .iter()
             .map(|entry| (entry.name.clone(), entry.value.clone()))
             .collect();
-        match custom_agent_probe::try_connect_custom_agent(command, &meta.args, &env, None).await {
-            TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
-            TryConnectCustomAgentResponse::FailCli { error } => (
+        match explicit_probe_args(meta) {
+            Err(error) => (
                 AgentSnapshotCheckStatus::Offline,
-                Some("command_not_found".to_owned()),
+                Some("package_lock_invalid".to_owned()),
                 Some(error),
             ),
-            TryConnectCustomAgentResponse::FailAcp { error } => (
-                AgentSnapshotCheckStatus::Offline,
-                Some("acp_init_failed".to_owned()),
-                Some(error),
-            ),
-            // Reachable but not authorized: still offline (unusable), but a
-            // dedicated code lets the UI guide the user to log in.
-            TryConnectCustomAgentResponse::FailAuth { error } => (
-                AgentSnapshotCheckStatus::Offline,
-                Some("auth_required".to_owned()),
-                Some(error),
-            ),
+            Ok(args) => match custom_agent_probe::try_connect_custom_agent(command, &args, &env, None).await {
+                TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
+                TryConnectCustomAgentResponse::FailCli { error } => (
+                    AgentSnapshotCheckStatus::Offline,
+                    Some("command_not_found".to_owned()),
+                    Some(error),
+                ),
+                TryConnectCustomAgentResponse::FailAcp { error } => (
+                    AgentSnapshotCheckStatus::Offline,
+                    Some("acp_init_failed".to_owned()),
+                    Some(error),
+                ),
+                // Reachable but not authorized: still offline (unusable), but a
+                // dedicated code lets the UI guide the user to log in.
+                TryConnectCustomAgentResponse::FailAuth { error } => (
+                    AgentSnapshotCheckStatus::Offline,
+                    Some("auth_required".to_owned()),
+                    Some(error),
+                ),
+            },
         }
     } else if let Some(backend) = meta.backend.as_deref() {
         let result = cli_detect::health_check(registry, backend).await;
@@ -250,6 +257,17 @@ async fn run_probe(
         latency_ms,
         checked_at: started_at,
     }
+}
+
+fn explicit_probe_args(meta: &AgentMetadata) -> Result<Vec<String>, String> {
+    if meta.agent_source == AgentSource::Builtin && meta.agent_source_info.bridge_binary.as_deref() == Some("npx") {
+        let backend = meta
+            .backend
+            .as_deref()
+            .ok_or_else(|| "builtin npx agent has no backend".to_owned())?;
+        return aionui_runtime::pin_registry_npx_args(backend, &meta.args).map_err(|error| error.to_string());
+    }
+    Ok(meta.args.clone())
 }
 
 /// Readiness check for the built-in aionrs agent.
@@ -360,7 +378,7 @@ impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
 mod tests {
     use std::sync::Arc;
 
-    use super::{AgentAvailabilityService, probe_aionrs_provider_readiness, run_probe};
+    use super::{AgentAvailabilityService, explicit_probe_args, probe_aionrs_provider_readiness, run_probe};
     use crate::registry::AgentRegistry;
     use aionui_api_types::{
         AgentHandshake, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
@@ -615,5 +633,13 @@ mod tests {
             "expected missing primary binary message, got {:?}",
             snapshot.error_message
         );
+
+        let mut pi = meta.clone();
+        pi.name = "Pi".into();
+        pi.backend = Some("pi".into());
+        pi.agent_source_info.binary_name = Some("pi".into());
+        pi.agent_source_info.bridge_binary = Some("npx".into());
+        pi.args = vec!["-y".into(), "pi-acp".into()];
+        assert_eq!(explicit_probe_args(&pi).unwrap(), ["-y", "pi-acp@0.0.31"]);
     }
 }
