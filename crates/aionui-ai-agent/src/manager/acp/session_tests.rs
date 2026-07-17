@@ -239,6 +239,53 @@ fn confirm_model_aligns_desired_and_current() {
 }
 
 #[test]
+fn confirm_mode_preserves_available_mode_catalog() {
+    let mut session = make_session();
+    session.apply_advertised_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Default"), SessionMode::new("plan", "Plan")],
+    ));
+    session.drain_events();
+
+    session.confirm_mode(ModeId::new("plan"));
+
+    let snapshot = session.config_snapshot();
+    let mode = snapshot
+        .options
+        .iter()
+        .find(|option| option.id == "mode")
+        .expect("mode option present");
+    assert_eq!(mode.current_value.as_deref(), Some("plan"));
+    // Confirming a value must not shrink the advertised catalog.
+    assert_eq!(mode.options.len(), 2);
+}
+
+#[test]
+fn confirm_model_preserves_available_model_catalog() {
+    use agent_client_protocol::schema::ModelInfo;
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.apply_advertised_models(SessionModelState::new(
+        "claude-sonnet-4",
+        vec![
+            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
+            ModelInfo::new("claude-opus-4", "Opus 4"),
+        ],
+    ));
+    session.drain_events();
+
+    session.confirm_model(ModelId::new("claude-opus-4"));
+
+    let snapshot = session.config_snapshot();
+    let model = snapshot
+        .options
+        .iter()
+        .find(|option| option.id == "model")
+        .expect("model option present");
+    assert_eq!(model.current_value.as_deref(), Some("claude-opus-4"));
+    assert_eq!(model.options.len(), 2);
+}
+
+#[test]
 fn apply_observed_config_emits_on_change_and_is_idempotent() {
     let mut session = make_session();
     session.apply_observed_config(ConfigKey::new("reasoning"), ConfigValue::new("high"));
