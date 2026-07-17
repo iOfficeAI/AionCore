@@ -433,6 +433,11 @@ async fn put_channel_assistant_setting_clears_active_sessions() {
         conversation_id: None,
         workspace: None,
         chat_id: Some("chat-channel-assistant".to_owned()),
+        message_thread_id: None,
+        bound_agent_id: None,
+        bound_backend: None,
+        bound_provider_id: None,
+        bound_model: None,
         created_at: now,
         last_activity: now,
     };
@@ -482,6 +487,11 @@ async fn put_channel_default_model_setting_clears_active_sessions() {
         conversation_id: None,
         workspace: None,
         chat_id: Some("chat-channel-model".to_owned()),
+        message_thread_id: None,
+        bound_agent_id: None,
+        bound_backend: None,
+        bound_provider_id: None,
+        bound_model: None,
         created_at: now,
         last_activity: now,
     };

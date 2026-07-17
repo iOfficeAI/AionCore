@@ -21,6 +21,7 @@ use aionui_channel::{
         ChannelTeamSummary,
     },
     approval::{ChannelApprovalContext, ChannelApprovalPort},
+    development::{ChannelDevelopmentCommand, ChannelDevelopmentContext, ChannelDevelopmentPort},
 };
 use aionui_common::now_ms;
 use aionui_conversation::{ConversationRouterState, ConversationService};
@@ -94,6 +95,14 @@ struct ApprovalAgentResolver {
 struct ChannelApprovalAdapter {
     service: Arc<ApprovalService>,
     owner_user_id: String,
+}
+
+struct ChannelDevelopmentAdapter {
+    owner_user_id: String,
+    project_repo: Arc<dyn IProjectRepository>,
+    development_repo: Arc<dyn IDevelopmentRepository>,
+    approval_repo: Arc<dyn IApprovalRepository>,
+    service: Arc<DevelopmentService>,
 }
 
 #[async_trait::async_trait]
@@ -187,6 +196,200 @@ impl ChannelApprovalPort for ChannelApprovalAdapter {
             .await
             .map(|row| row.status)
             .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))
+    }
+}
+
+impl ChannelDevelopmentAdapter {
+    async fn project_for_context(
+        &self,
+        context: &ChannelDevelopmentContext,
+    ) -> Result<aionui_db::models::ProjectRow, ChannelError> {
+        if let Some(conversation_id) = context.conversation_id.as_deref()
+            && let Some(project) = self
+                .project_repo
+                .get_for_resource(&self.owner_user_id, "conversation", conversation_id)
+                .await
+                .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?
+        {
+            return Ok(project);
+        }
+        let projects = self
+            .project_repo
+            .list_for_user(&self.owner_user_id)
+            .await
+            .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+        match projects.as_slice() {
+            [project] => Ok(project.clone()),
+            [] => Err(ChannelError::InvalidConfig(
+                "当前没有项目，请先在 Web 中创建项目并绑定当前会话。".into(),
+            )),
+            _ => Err(ChannelError::InvalidConfig(
+                "当前会话尚未绑定项目，请先在 Web 项目页完成绑定。".into(),
+            )),
+        }
+    }
+
+    async fn active_run(&self, project_id: &str) -> Result<Option<aionui_db::models::DevelopmentRunRow>, ChannelError> {
+        Ok(self
+            .service
+            .list_runs(&self.owner_user_id, Some(project_id))
+            .await
+            .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?
+            .into_iter()
+            .find(|run| !matches!(run.status.as_str(), "succeeded" | "failed" | "cancelled")))
+    }
+
+    fn require_run(
+        run: Option<aionui_db::models::DevelopmentRunRow>,
+    ) -> Result<aionui_db::models::DevelopmentRunRow, ChannelError> {
+        run.ok_or_else(|| ChannelError::InvalidConfig("当前项目没有进行中的开发运行。".into()))
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelDevelopmentPort for ChannelDevelopmentAdapter {
+    async fn execute(
+        &self,
+        context: ChannelDevelopmentContext,
+        command: ChannelDevelopmentCommand,
+    ) -> Result<String, ChannelError> {
+        let project = self.project_for_context(&context).await?;
+        let active_run = self.active_run(&project.id).await?;
+        if command == ChannelDevelopmentCommand::Project {
+            return Ok(format!(
+                "项目：{}\n类型：{}\n目录：{}\n当前运行：{}",
+                project.name,
+                project.project_type,
+                project.local_path,
+                active_run.as_ref().map(|run| run.status.as_str()).unwrap_or("无")
+            ));
+        }
+        let run = Self::require_run(active_run)?;
+        let tasks = self
+            .service
+            .list_tasks(&self.owner_user_id, &run.id)
+            .await
+            .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+        match command {
+            ChannelDevelopmentCommand::Project => unreachable!(),
+            ChannelDevelopmentCommand::RunInfo => {
+                let pending = self
+                    .approval_repo
+                    .list_for_user(&self.owner_user_id, Some(&run.id))
+                    .await
+                    .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?
+                    .into_iter()
+                    .filter(|approval| approval.status == "pending")
+                    .count();
+                let completed = tasks.iter().filter(|task| task.status == "completed").count();
+                Ok(format!(
+                    "运行：{}\n状态：{}\n模式：{}\n任务：{}/{} 已完成\n待审批：{}\n目标：{}",
+                    run.id,
+                    run.status,
+                    run.execution_mode,
+                    completed,
+                    tasks.len(),
+                    pending,
+                    run.request_summary
+                ))
+            }
+            ChannelDevelopmentCommand::DiffSummary => {
+                let artifacts = self
+                    .service
+                    .list_artifacts(&self.owner_user_id, &run.id, None)
+                    .await
+                    .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+                let gates = self
+                    .service
+                    .list_gates(&self.owner_user_id, &run.id, None)
+                    .await
+                    .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+                let passed = gates.iter().filter(|gate| gate.status == "passed").count();
+                let failed = gates
+                    .iter()
+                    .filter(|gate| matches!(gate.status.as_str(), "failed" | "timed_out"))
+                    .count();
+                let evidence = artifacts
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .map(|artifact| format!("- {}: {}", artifact.artifact_type, artifact.path_or_uri))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(format!(
+                    "变更证据：{} 项\n质量门禁：{} 通过 / {} 失败\n{}",
+                    artifacts.len(),
+                    passed,
+                    failed,
+                    if evidence.is_empty() { "暂无证据" } else { &evidence }
+                ))
+            }
+            ChannelDevelopmentCommand::Test => {
+                let task = tasks
+                    .iter()
+                    .find(|task| !matches!(task.status.as_str(), "completed" | "cancelled" | "deleted"));
+                let gate = self
+                    .service
+                    .execute_gate(
+                        &self.owner_user_id,
+                        &run.id,
+                        task.map(|task| task.id.as_str()),
+                        "unit_test",
+                        task.and_then(|task| task.assigned_workspace_lease_id.as_deref()),
+                        true,
+                    )
+                    .await
+                    .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+                Ok(format!(
+                    "单元测试门禁：{}\n退出码：{}\n耗时：{} ms",
+                    gate.status,
+                    gate.exit_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "无".into()),
+                    gate.duration_ms.unwrap_or_default()
+                ))
+            }
+            ChannelDevelopmentCommand::Stop => {
+                self.development_repo
+                    .update_run_status(&run.id, &self.owner_user_id, "cancelled", Some(now_ms()))
+                    .await
+                    .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+                Ok(format!("运行 {} 已停止。", run.id))
+            }
+            ChannelDevelopmentCommand::Retry => {
+                let gates = self
+                    .service
+                    .list_gates(&self.owner_user_id, &run.id, None)
+                    .await
+                    .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+                let previous = gates
+                    .iter()
+                    .rev()
+                    .find(|gate| matches!(gate.status.as_str(), "failed" | "timed_out"))
+                    .ok_or_else(|| ChannelError::InvalidConfig("没有可重试的失败门禁。".into()))?;
+                let task = previous
+                    .task_id
+                    .as_deref()
+                    .and_then(|task_id| tasks.iter().find(|task| task.id == task_id));
+                let gate = self
+                    .service
+                    .execute_gate(
+                        &self.owner_user_id,
+                        &run.id,
+                        previous.task_id.as_deref(),
+                        &previous.gate_type,
+                        task.and_then(|task| task.assigned_workspace_lease_id.as_deref()),
+                        previous.required,
+                    )
+                    .await
+                    .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+                Ok(format!("已重试 {} 门禁，结果：{}。", gate.gate_type, gate.status))
+            }
+            ChannelDevelopmentCommand::Handoff => Ok(format!(
+                "Web 接力入口：/projects?projectId={}&runId={}\n打开后可查看任务、证据、审批和质量门禁。",
+                project.id, run.id
+            )),
+        }
     }
 }
 
@@ -1093,6 +1296,13 @@ pub async fn build_channel_state(
         service: build_approval_state(services).service,
         owner_user_id: owner_user_id.clone(),
     });
+    let development_port: Arc<dyn ChannelDevelopmentPort> = Arc::new(ChannelDevelopmentAdapter {
+        owner_user_id: owner_user_id.clone(),
+        project_repo: Arc::new(SqliteProjectRepository::new(services.database.pool().clone())),
+        development_repo: Arc::new(SqliteDevelopmentRepository::new(services.database.pool().clone())),
+        approval_repo: Arc::new(SqliteApprovalRepository::new(services.database.pool().clone())),
+        service: build_development_state(services).service,
+    });
 
     // Build orchestrator dependencies
     let mut action_executor = aionui_channel::action::ActionExecutor::new(
@@ -1100,7 +1310,8 @@ pub async fn build_channel_state(
         Arc::clone(&session_manager),
         Arc::clone(&channel_settings),
     )
-    .with_approval_port(approval_port.clone());
+    .with_approval_port(approval_port.clone())
+    .with_development_port(development_port);
     if let Some(team_service) = &team_service {
         let team_directory = Arc::new(ChannelTeamDirectoryAdapter {
             service: Arc::clone(team_service),
@@ -1566,6 +1777,11 @@ mod tests {
             conversation_id: None,
             workspace: None,
             chat_id: Some("wx-chat-state".to_owned()),
+            message_thread_id: None,
+            bound_agent_id: None,
+            bound_backend: None,
+            bound_provider_id: None,
+            bound_model: None,
             created_at: 1,
             last_activity: 1,
         };
@@ -1650,6 +1866,95 @@ mod tests {
         assert_eq!(loaded[0].name, "demo-ext");
 
         services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn channel_development_adapter_reports_bound_project_and_run() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let project_repo = Arc::new(SqliteProjectRepository::new(db.pool().clone()));
+        project_repo
+            .create(&aionui_db::models::ProjectRow {
+                id: "project-channel".into(),
+                user_id: "system_default_user".into(),
+                name: "Aion".into(),
+                local_path: project_dir.path().to_string_lossy().into_owned(),
+                repository_url: None,
+                default_branch: Some("main".into()),
+                project_type: "single".into(),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        project_repo
+            .bind_resource(
+                "project-channel",
+                "system_default_user",
+                "conversation",
+                "conversation-channel",
+            )
+            .await
+            .unwrap();
+        let development_repo = Arc::new(SqliteDevelopmentRepository::new(db.pool().clone()));
+        development_repo
+            .create_run(&aionui_db::models::DevelopmentRunRow {
+                id: "run-channel".into(),
+                user_id: "system_default_user".into(),
+                project_id: "project-channel".into(),
+                team_id: None,
+                source_channel: Some("telegram".into()),
+                source_user_id: Some("assistant-user".into()),
+                execution_mode: "single".into(),
+                status: "running".into(),
+                request_summary: "Implement approvals".into(),
+                acceptance_criteria: "[]".into(),
+                baseline_commit: None,
+                integration_branch: None,
+                started_at: Some(1),
+                finished_at: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        let service = Arc::new(DevelopmentService::new(
+            development_repo.clone(),
+            project_repo.clone(),
+            Arc::new(SqliteAgentWorkspaceLeaseRepository::new(db.pool().clone())),
+            project_dir.path().join("artifacts"),
+        ));
+        let adapter = ChannelDevelopmentAdapter {
+            owner_user_id: "system_default_user".into(),
+            project_repo,
+            development_repo,
+            approval_repo: Arc::new(SqliteApprovalRepository::new(db.pool().clone())),
+            service,
+        };
+        let context = ChannelDevelopmentContext {
+            source_user_id: "assistant-user".into(),
+            conversation_id: Some("conversation-channel".into()),
+            platform: PluginType::Telegram,
+            chat_id: "chat".into(),
+            message_thread_id: Some(5),
+        };
+
+        let project = adapter
+            .execute(context.clone(), ChannelDevelopmentCommand::Project)
+            .await
+            .unwrap();
+        assert!(project.contains("项目：Aion"));
+        assert!(project.contains("当前运行：running"));
+        let run = adapter
+            .execute(context.clone(), ChannelDevelopmentCommand::RunInfo)
+            .await
+            .unwrap();
+        assert!(run.contains("运行：run-channel"));
+        let handoff = adapter
+            .execute(context, ChannelDevelopmentCommand::Handoff)
+            .await
+            .unwrap();
+        assert!(handoff.contains("projectId=project-channel&runId=run-channel"));
     }
 
     #[test]

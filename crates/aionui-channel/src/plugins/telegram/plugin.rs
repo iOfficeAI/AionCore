@@ -130,6 +130,34 @@ fn default_bot_commands() -> Vec<BotCommand> {
             description: "新建当前入口的会话".into(),
         },
         BotCommand {
+            command: "project".into(),
+            description: "查看当前项目".into(),
+        },
+        BotCommand {
+            command: "run_info".into(),
+            description: "查看当前开发运行".into(),
+        },
+        BotCommand {
+            command: "diff_summary".into(),
+            description: "查看变更和证据摘要".into(),
+        },
+        BotCommand {
+            command: "test".into(),
+            description: "执行项目配置的单元测试门禁".into(),
+        },
+        BotCommand {
+            command: "stop".into(),
+            description: "停止当前开发运行".into(),
+        },
+        BotCommand {
+            command: "retry".into(),
+            description: "重试最近失败的质量门禁".into(),
+        },
+        BotCommand {
+            command: "handoff".into(),
+            description: "获取 Web 接力入口".into(),
+        },
+        BotCommand {
             command: "help".into(),
             description: "查看 Telegram 使用帮助".into(),
         },
@@ -181,6 +209,34 @@ fn private_bot_commands() -> Vec<BotCommand> {
         BotCommand {
             command: "new_session".into(),
             description: "新建个人会话".into(),
+        },
+        BotCommand {
+            command: "project".into(),
+            description: "查看当前项目".into(),
+        },
+        BotCommand {
+            command: "run_info".into(),
+            description: "查看当前开发运行".into(),
+        },
+        BotCommand {
+            command: "diff_summary".into(),
+            description: "查看变更和证据摘要".into(),
+        },
+        BotCommand {
+            command: "test".into(),
+            description: "执行项目配置的单元测试门禁".into(),
+        },
+        BotCommand {
+            command: "stop".into(),
+            description: "停止当前开发运行".into(),
+        },
+        BotCommand {
+            command: "retry".into(),
+            description: "重试最近失败的质量门禁".into(),
+        },
+        BotCommand {
+            command: "handoff".into(),
+            description: "获取 Web 接力入口".into(),
         },
         BotCommand {
             command: "help".into(),
@@ -1520,6 +1576,13 @@ mod tests {
         assert!(names.contains(&"model"));
         assert!(names.contains(&"new_session"));
         assert!(names.contains(&"help"));
+        assert!(names.contains(&"project"));
+        assert!(names.contains(&"run_info"));
+        assert!(names.contains(&"diff_summary"));
+        assert!(names.contains(&"test"));
+        assert!(names.contains(&"stop"));
+        assert!(names.contains(&"retry"));
+        assert!(names.contains(&"handoff"));
         assert!(!names.iter().any(|name| name.starts_with("team")));
         assert!(!names.contains(&"agent"));
         assert!(!names.iter().any(|name| name.starts_with("personal")));
@@ -1539,6 +1602,22 @@ mod tests {
         assert!(names.contains(&"team_new"));
         assert!(names.contains(&"personal"));
         assert!(names.contains(&"personal_list"));
+    }
+
+    #[test]
+    fn approval_callback_stays_within_telegram_limit() {
+        let button = ActionButton {
+            label: "Allow once".into(),
+            action: "approval.resolve".into(),
+            params: Some(HashMap::from([
+                ("id".into(), "019f7b93e1b27c42".into()),
+                ("o".into(), "7".into()),
+            ])),
+        };
+        let callback = format_callback_data(&button);
+        assert!(callback.len() <= 64, "callback too long: {callback}");
+        let parsed = parse_callback_data(&callback).unwrap();
+        assert_eq!(parsed.action, "approval.resolve");
     }
 
     #[test]

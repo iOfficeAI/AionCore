@@ -6,6 +6,7 @@ use tracing::{debug, info, warn};
 
 use crate::approval::ChannelApprovalPort;
 use crate::channel_settings::{ChannelAgentOption, ChannelSettingsService};
+use crate::development::{ChannelDevelopmentCommand, ChannelDevelopmentContext, ChannelDevelopmentPort};
 use crate::error::ChannelError;
 use crate::pairing::PairingService;
 use crate::session::SessionManager;
@@ -117,6 +118,7 @@ pub struct ActionExecutor {
     team_directory: Option<Arc<dyn ChannelTeamDirectory>>,
     personal_directory: Option<Arc<dyn ChannelPersonalDirectory>>,
     approval_port: Option<Arc<dyn ChannelApprovalPort>>,
+    development_port: Option<Arc<dyn ChannelDevelopmentPort>>,
     pending_flows: Arc<Mutex<HashMap<String, PendingFlow>>>,
     personal_title_hints: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -140,6 +142,7 @@ impl ActionExecutor {
             team_directory: None,
             personal_directory: None,
             approval_port: None,
+            development_port: None,
             pending_flows: Arc::new(Mutex::new(HashMap::new())),
             personal_title_hints: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -157,6 +160,11 @@ impl ActionExecutor {
 
     pub fn with_approval_port(mut self, approval_port: Arc<dyn ChannelApprovalPort>) -> Self {
         self.approval_port = Some(approval_port);
+        self
+    }
+
+    pub fn with_development_port(mut self, development_port: Arc<dyn ChannelDevelopmentPort>) -> Self {
+        self.development_port = Some(development_port);
         self
     }
 
@@ -839,7 +847,7 @@ impl ActionExecutor {
                 if matches!(command.as_str(), "help" | "start" | "") {
                     return Ok(html_response(
                         &format!(
-                            "<b>单 Agent 话题</b>\n当前 Agent：<b>{}</b>\n\n可用命令：\n/model — 查看并切换此 Agent 可用模型\n/status — 查看当前话题会话状态\n/new 或 /new_session — 新建当前话题会话\n/topic_info — 查看绑定信息\n\n管理员命令：\n/topic_bind &lt;agent-id&gt;\n/topic_unbind\n\n此话题不支持 Agent 切换或 Team/集群功能。",
+                            "<b>单 Agent 话题</b>\n当前 Agent：<b>{}</b>\n\n可用命令：\n/model — 查看并切换此 Agent 可用模型\n/status — 查看当前话题会话状态\n/new 或 /new_session — 新建当前话题会话\n/topic_info — 查看绑定信息\n/project — 当前项目\n/run_info — 当前开发运行\n/diff_summary — 变更与证据摘要\n/test — 执行配置的单元测试门禁\n/stop — 停止当前运行\n/retry — 重试最近失败门禁\n/handoff — Web 接力入口\n\n管理员命令：\n/topic_bind &lt;agent-id&gt;\n/topic_unbind\n\n此话题不支持 Agent 切换或 Team/集群功能。",
                             html_escape(&option.name),
                         ),
                         None,
@@ -941,9 +949,74 @@ impl ActionExecutor {
             "team_select" => self.select_team_command(internal_user_id, msg, args).await,
             "team_help" => Ok(build_team_help_response()),
             "team_new" => self.create_team_command(internal_user_id, msg, args).await,
+            "project" => {
+                self.execute_development_command(internal_user_id, msg, ChannelDevelopmentCommand::Project)
+                    .await
+            }
+            "run_info" => {
+                self.execute_development_command(internal_user_id, msg, ChannelDevelopmentCommand::RunInfo)
+                    .await
+            }
+            "diff_summary" => {
+                self.execute_development_command(internal_user_id, msg, ChannelDevelopmentCommand::DiffSummary)
+                    .await
+            }
+            "test" => {
+                self.execute_development_command(internal_user_id, msg, ChannelDevelopmentCommand::Test)
+                    .await
+            }
+            "stop" => {
+                self.execute_development_command(internal_user_id, msg, ChannelDevelopmentCommand::Stop)
+                    .await
+            }
+            "retry" => {
+                self.execute_development_command(internal_user_id, msg, ChannelDevelopmentCommand::Retry)
+                    .await
+            }
+            "handoff" => {
+                self.execute_development_command(internal_user_id, msg, ChannelDevelopmentCommand::Handoff)
+                    .await
+            }
             "" => Ok(build_command_help_response()),
             _ => Ok(html_response("未知命令。发送 /help 查看可用命令。", None)),
         }
+    }
+
+    async fn execute_development_command(
+        &self,
+        internal_user_id: &str,
+        msg: &UnifiedIncomingMessage,
+        command: ChannelDevelopmentCommand,
+    ) -> Result<ActionResponse, ChannelError> {
+        let port = self
+            .development_port
+            .as_ref()
+            .ok_or_else(|| ChannelError::InvalidConfig("Development command service is unavailable".into()))?;
+        let thread_id = msg.topic.as_ref().map(|topic| topic.message_thread_id);
+        let conversation_id = self
+            .session_mgr
+            .get_active_sessions()
+            .await?
+            .into_iter()
+            .find(|session| {
+                session.user_id == internal_user_id
+                    && session.chat_id.as_deref() == Some(msg.chat_id.as_str())
+                    && session.message_thread_id == thread_id
+            })
+            .and_then(|session| session.conversation_id);
+        let text = port
+            .execute(
+                ChannelDevelopmentContext {
+                    source_user_id: internal_user_id.to_owned(),
+                    conversation_id,
+                    platform: msg.platform,
+                    chat_id: msg.chat_id.clone(),
+                    message_thread_id: thread_id,
+                },
+                command,
+            )
+            .await?;
+        Ok(html_response(&html_escape(&text), None))
     }
 
     async fn build_status_command(
@@ -2014,7 +2087,7 @@ fn build_help_response() -> ActionResponse {
 
 fn build_command_help_response() -> ActionResponse {
     html_response(
-        "<b>Telegram 可用命令</b>\n/status - 查看当前绑定\n/agent - 按钮切换 Telegram 本地 Agent\n/model - 按钮切换当前 Agent 可用模型\n/team - 查看团队会话状态\n/team_help - 查看 Team 功能说明\n/team_list - 团队列表入口\n/team_select - 按钮选择团队\n/team_new - 交互式创建 Team\n/team_new &lt;主题&gt; - 快速创建真实 Team\n/personal - 切换到新的个人会话\n/personal_list - 按钮选择已有个人会话\n/new_session - 新建个人会话\n/new_session &lt;标题&gt; - 新建带标题的个人会话\n/rename &lt;标题&gt; - 重命名当前个人会话\n/help - 查看帮助",
+        "<b>Telegram 可用命令</b>\n/status - 查看当前绑定\n/agent - 按钮切换 Telegram 本地 Agent\n/model - 按钮切换当前 Agent 可用模型\n/project - 当前项目\n/run_info - 当前开发运行\n/diff_summary - 变更和证据摘要\n/test - 执行单元测试门禁\n/stop - 停止当前运行\n/retry - 重试最近失败门禁\n/handoff - Web 接力入口\n/team - 查看团队会话状态\n/team_help - 查看 Team 功能说明\n/team_list - 团队列表入口\n/team_select - 按钮选择团队\n/team_new - 交互式创建 Team\n/team_new &lt;主题&gt; - 快速创建真实 Team\n/personal - 切换到新的个人会话\n/personal_list - 按钮选择已有个人会话\n/new_session - 新建个人会话\n/new_session &lt;标题&gt; - 新建带标题的个人会话\n/rename &lt;标题&gt; - 重命名当前个人会话\n/help - 查看帮助",
         Some(vec![
             vec![
                 ActionButton {
@@ -2376,6 +2449,28 @@ mod tests {
     #[derive(Default)]
     struct RecordingApprovalPort {
         resolutions: Mutex<Vec<(String, PluginType, String, Option<i64>, String, usize)>>,
+    }
+
+    #[derive(Default)]
+    struct RecordingDevelopmentPort {
+        calls: Mutex<
+            Vec<(
+                crate::development::ChannelDevelopmentContext,
+                crate::development::ChannelDevelopmentCommand,
+            )>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::development::ChannelDevelopmentPort for RecordingDevelopmentPort {
+        async fn execute(
+            &self,
+            context: crate::development::ChannelDevelopmentContext,
+            command: crate::development::ChannelDevelopmentCommand,
+        ) -> Result<String, ChannelError> {
+            self.calls.lock().unwrap().push((context, command));
+            Ok("Project: Aion\nRun: running".into())
+        }
     }
 
     #[async_trait::async_trait]
@@ -4360,6 +4455,26 @@ mod tests {
         assert_eq!(calls[0].3, Some(5));
         assert_eq!(calls[0].4, "approval1234567");
         assert_eq!(calls[0].5, 1);
+    }
+
+    #[tokio::test]
+    async fn project_command_uses_authorized_channel_context() {
+        let (executor, repo) = setup();
+        repo.add_authorized_user("tg_42", "telegram");
+        let development = Arc::new(RecordingDevelopmentPort::default());
+        let executor = executor.with_development_port(development.clone());
+        let msg = make_command_message("tg_42", "chat_1", "/project", PluginType::Telegram);
+
+        let result = executor.handle_incoming_message(&msg).await.unwrap();
+        match result {
+            MessageResult::Action(response) => assert!(response.text.unwrap().contains("Project: Aion")),
+            _ => panic!("Expected Action result"),
+        }
+        let calls = development.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.source_user_id, "user_tg_42");
+        assert_eq!(calls[0].0.chat_id, "chat_1");
+        assert_eq!(calls[0].1, crate::development::ChannelDevelopmentCommand::Project);
     }
 
     #[tokio::test]
