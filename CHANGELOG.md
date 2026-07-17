@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.1.48](https://github.com/iOfficeAI/AionCore/compare/v0.1.47...v0.1.48) (2026-07-17)
+
+
+### Features
+
+* **agents:** add Pi coding agent as builtin ACP agent ([#618](https://github.com/iOfficeAI/AionCore/issues/618)) ([0b9b3a8](https://github.com/iOfficeAI/AionCore/commit/0b9b3a882712f555e60fd33c027b604471df25c7))
+* **ai-agent:** route image attachments by model capability ([82c5bc1](https://github.com/iOfficeAI/AionCore/commit/82c5bc14bcb1fcf4396e033764732adbe63966ef))
+* **aionrs:** inline image attachments for Aion CLI ([aff870b](https://github.com/iOfficeAI/AionCore/commit/aff870bb1d3328abfc3d0c24d8898f0e148790ab))
+* **team:** add CLI fallback collaboration transport ([#629](https://github.com/iOfficeAI/AionCore/issues/629)) ([bbb6fec](https://github.com/iOfficeAI/AionCore/commit/bbb6fec08f7fd818375664bc5bf206805013f7d0))
+
+
+### Bug Fixes
+
+* **acp:** confirm legacy mode/model on ACK instead of awaiting observed update ([#635](https://github.com/iOfficeAI/AionCore/issues/635)) ([ded7a5c](https://github.com/iOfficeAI/AionCore/commit/ded7a5ce7951cad942852488f30382ed7fb909da))
+* **agents:** honor login PATH and validate builtin CLIs ([#622](https://github.com/iOfficeAI/AionCore/issues/622)) ([3190be1](https://github.com/iOfficeAI/AionCore/commit/3190be1fae7e15be98f5f963e57a54fdee87029e))
+* **ai-agent:** pin image-capable aionrs revision ([6687805](https://github.com/iOfficeAI/AionCore/commit/6687805f09042b9a34b4e5ac22900374358d2671))
+* **assistant:** canonicalize rule file storage ([#625](https://github.com/iOfficeAI/AionCore/issues/625)) ([020a27a](https://github.com/iOfficeAI/AionCore/commit/020a27a77aeb2b5be7a2b4380aab8ae2686311c4))
+* **assistant:** stop legacy override sync from clobbering user toggles ([#634](https://github.com/iOfficeAI/AionCore/issues/634)) ([346700e](https://github.com/iOfficeAI/AionCore/commit/346700e1d62470f84eec94b1c58fd3516d1ea90e))
+
+
+### Code Refactoring
+
+* **runtime:** remove legacy Bun runtime support ([#623](https://github.com/iOfficeAI/AionCore/issues/623)) ([01b5eed](https://github.com/iOfficeAI/AionCore/commit/01b5eed0db886e05b652c4633c9acd337087e1ab))
+
 ## [0.1.47](https://github.com/iOfficeAI/AionCore/compare/v0.1.46...v0.1.47) (2026-07-14)
 
 
