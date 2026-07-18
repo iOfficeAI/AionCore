@@ -299,8 +299,17 @@ impl CronService {
 
         let mut jobs = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut job = cron_job_from_row(row)?;
-            self.resolve_job_agent_type(&mut job).await?;
+            let mut job = match cron_job_from_row(row) {
+                Ok(job) => job,
+                Err(err) => {
+                    warn!(error = %err, "Skipping cron job with invalid stored data");
+                    continue;
+                }
+            };
+            if let Err(err) = self.resolve_job_agent_type(&mut job).await {
+                warn!(job_id = %job.id, name = %job.name, error = %err, "Skipping cron job with unresolvable agent type");
+                continue;
+            }
             jobs.push(job);
         }
         Ok(jobs)
@@ -550,6 +559,15 @@ impl CronService {
             .and_then(|config| config.assistant_id.as_deref().or(config.custom_agent_id.as_deref()))
             .filter(|value| !value.trim().is_empty())
         {
+            // Remote agents don't have assistant definitions; resolve from the
+            // remote agent catalog first.
+            if let Some(repo) = self.remote_agent_repo.as_ref()
+                && let Some(remote_agent) = repo.find_by_id(assistant_id).await?
+            {
+                job.agent_type = remote_agent_type_from_protocol(&remote_agent.protocol);
+                return Ok(());
+            }
+
             job.agent_type = self.resolve_agent_type_for_assistant_id(assistant_id).await?;
             return Ok(());
         }
