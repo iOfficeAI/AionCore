@@ -528,6 +528,14 @@ impl CronService {
             ));
         };
 
+        // Remote agents don't have assistant definitions; resolve the runtime
+        // type from the remote agent catalog instead.
+        if let Some(repo) = self.remote_agent_repo.as_ref()
+            && let Some(remote_agent) = repo.find_by_id(assistant_id).await?
+        {
+            return Ok(remote_agent_type_from_protocol(&remote_agent.protocol));
+        }
+
         self.resolve_agent_type_for_assistant_id(assistant_id).await
     }
 
@@ -1171,13 +1179,21 @@ impl CronService {
             ));
         };
 
-        self.resolve_assistant_backend(Some(assistant_id))
-            .await?
-            .ok_or_else(|| {
-                CronError::InvalidAgentConfig(format!(
-                    "assistant '{assistant_id}' could not resolve a runtime backend"
-                ))
-            })?;
+        if is_remote_like_runtime(runtime_agent_type) {
+            if let Some(repo) = self.remote_agent_repo.as_ref() {
+                repo.find_by_id(assistant_id)
+                    .await?
+                    .ok_or_else(|| CronError::InvalidAgentConfig(format!("remote agent '{assistant_id}' not found")))?;
+            }
+        } else {
+            self.resolve_assistant_backend(Some(assistant_id))
+                .await?
+                .ok_or_else(|| {
+                    CronError::InvalidAgentConfig(format!(
+                        "assistant '{assistant_id}' could not resolve a runtime backend"
+                    ))
+                })?;
+        }
 
         Ok(CronAgentConfig {
             name: config.name,
@@ -1483,6 +1499,10 @@ fn remote_agent_type_from_protocol(protocol: &str) -> String {
     } else {
         "remote".to_owned()
     }
+}
+
+fn is_remote_like_runtime(runtime_agent_type: &str) -> bool {
+    runtime_agent_type.eq_ignore_ascii_case("remote") || runtime_agent_type.eq_ignore_ascii_case("openclaw-gateway")
 }
 
 fn normalize_model(
