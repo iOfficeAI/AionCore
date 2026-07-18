@@ -869,6 +869,7 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
         conversation_title: Some("Test Conv".into()),
         created_by: "user".into(),
         execution_mode: None,
+        agent_type: None,
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
             name: "Default Assistant".into(),
             cli_path: None,
@@ -878,6 +879,10 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
             model: None,
             config_options: None,
             workspace: None,
+            backend: None,
+            is_preset: None,
+            preset_agent_type: None,
+            custom_agent_id: None,
         }),
     }
 }
@@ -1030,6 +1035,10 @@ async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
         model: None,
         config_options: None,
         workspace: None,
+        backend: None,
+        is_preset: None,
+        preset_agent_type: None,
+        custom_agent_id: None,
     });
 
     let job = svc.add_job(req).await.unwrap();
@@ -1046,7 +1055,7 @@ async fn create_job_rejects_deprecated_agent_types() {
 
     for agent_type in ["nanobot", "gemini", "codex"] {
         let mut req = make_create_req(&format!("Deprecated {agent_type}"), every_60s());
-        req.agent_type = agent_type.to_owned();
+        req.agent_type = Some(agent_type.to_owned());
 
         let err = svc.add_job(req).await.unwrap_err();
         assert!(
@@ -1086,6 +1095,10 @@ async fn create_job_derives_runtime_type_from_aionrs_assistant() {
         }),
         config_options: None,
         workspace: None,
+        backend: None,
+        is_preset: None,
+        preset_agent_type: None,
+        custom_agent_id: None,
     });
 
     let job = svc.add_job(req).await.unwrap();
@@ -1119,6 +1132,10 @@ async fn create_job_derives_runtime_type_from_assistant_overlay_override() {
         }),
         config_options: None,
         workspace: None,
+        backend: None,
+        is_preset: None,
+        preset_agent_type: None,
+        custom_agent_id: None,
     });
 
     let job = svc.add_job(req).await.unwrap();
@@ -1141,6 +1158,10 @@ async fn create_job_allows_assistant_backed_acp_jobs_without_backend_hint() {
         model: None,
         config_options: None,
         workspace: None,
+        backend: None,
+        is_preset: None,
+        preset_agent_type: None,
+        custom_agent_id: None,
     });
 
     let job = svc.add_job(req).await.unwrap();
@@ -1164,6 +1185,10 @@ async fn create_job_rejects_backend_fallback_when_assistant_id_cannot_resolve() 
         model: None,
         config_options: None,
         workspace: None,
+        backend: None,
+        is_preset: None,
+        preset_agent_type: None,
+        custom_agent_id: None,
     });
 
     let err = svc
@@ -1383,6 +1408,10 @@ async fn update_existing_conversation_job_rejects_agent_config_changes() {
             model: None,
             config_options: None,
             workspace: None,
+            backend: None,
+            is_preset: None,
+            preset_agent_type: None,
+            custom_agent_id: None,
         }),
         conversation_title: None,
         max_retries: None,
@@ -1421,6 +1450,10 @@ async fn update_existing_conversation_job_rejects_agent_config_even_when_switchi
             model: None,
             config_options: None,
             workspace: None,
+            backend: None,
+            is_preset: None,
+            preset_agent_type: None,
+            custom_agent_id: None,
         }),
         conversation_title: None,
         max_retries: None,
@@ -1456,6 +1489,10 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
             model: None,
             config_options: None,
             workspace: None,
+            backend: None,
+            is_preset: None,
+            preset_agent_type: None,
+            custom_agent_id: None,
         }),
         conversation_title: None,
         max_retries: None,
@@ -1492,6 +1529,10 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
             model: None,
             config_options: None,
             workspace: None,
+            backend: None,
+            is_preset: None,
+            preset_agent_type: None,
+            custom_agent_id: None,
         }),
         conversation_title: None,
         max_retries: None,

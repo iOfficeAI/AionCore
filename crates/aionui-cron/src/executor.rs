@@ -988,7 +988,8 @@ async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[Str
                 );
             }
             // Remote agent factory expects `remote_agent_id` in the extra.
-            if job.agent_type.eq_ignore_ascii_case("remote") || job.agent_type.eq_ignore_ascii_case("openclaw-gateway") {
+            if job.agent_type.eq_ignore_ascii_case("remote") || job.agent_type.eq_ignore_ascii_case("openclaw-gateway")
+            {
                 extra.insert(
                     "remote_agent_id".to_owned(),
                     serde_json::Value::String(custom_agent_id.clone()),
@@ -1107,7 +1108,8 @@ async fn build_conversation_extra(
                 );
             }
             // Remote agent factory expects `remote_agent_id` in the extra.
-            if job.agent_type.eq_ignore_ascii_case("remote") || job.agent_type.eq_ignore_ascii_case("openclaw-gateway") {
+            if job.agent_type.eq_ignore_ascii_case("remote") || job.agent_type.eq_ignore_ascii_case("openclaw-gateway")
+            {
                 extra.insert(
                     "remote_agent_id".to_owned(),
                     serde_json::Value::String(custom_agent_id.clone()),
@@ -1457,11 +1459,7 @@ mod tests {
     #[test]
     fn build_prompt_acp_with_remote_backend_uses_raw_message() {
         let job = CronJob {
-            agent_type: "acp".into(),
-            agent_config: Some(CronAgentConfig {
-                backend: "remote".into(),
-                ..sample_job().agent_config.unwrap()
-            }),
+            agent_type: "remote".into(),
             ..sample_job()
         };
         let prompt = build_prompt(&job, None);

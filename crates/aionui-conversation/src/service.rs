@@ -3004,10 +3004,10 @@ impl ConversationService {
         reject_deprecated_runtime_row(row)?;
         let mut builder =
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo);
-        if let Ok(guard) = self.remote_agent_repo.read() {
-            if let Some(repo) = guard.as_ref() {
-                builder = builder.with_remote_agent_repo(Arc::clone(repo));
-            }
+        if let Ok(guard) = self.remote_agent_repo.read()
+            && let Some(repo) = guard.as_ref()
+        {
+            builder = builder.with_remote_agent_repo(Arc::clone(repo));
         }
         builder.build_options(row).await
     }
@@ -3020,10 +3020,10 @@ impl ConversationService {
         reject_deprecated_runtime_row(row)?;
         let mut builder =
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo);
-        if let Ok(guard) = self.remote_agent_repo.read() {
-            if let Some(repo) = guard.as_ref() {
-                builder = builder.with_remote_agent_repo(Arc::clone(repo));
-            }
+        if let Ok(guard) = self.remote_agent_repo.read()
+            && let Some(repo) = guard.as_ref()
+        {
+            builder = builder.with_remote_agent_repo(Arc::clone(repo));
         }
         builder
             .build_options_with_workspace_override(row, workspace_override)

@@ -209,10 +209,7 @@ impl OpenClawAgentManager {
         }
     }
 
-    pub async fn set_weak_self(
-        &self,
-        weak: std::sync::Weak<OpenClawAgentManager>,
-    ) {
+    pub async fn set_weak_self(&self, weak: std::sync::Weak<OpenClawAgentManager>) {
         *self.weak_self.lock().await = Some(weak);
     }
 
@@ -234,20 +231,16 @@ impl OpenClawAgentManager {
         );
 
         let identity = load_or_create_identity(None)?;
-        let (connection, hello) = OpenClawConnection::connect(
-            &self.ws_url,
-            self.auth.clone(),
-            &identity,
-        )
-        .await
-        .inspect_err(|e| {
-            error!(
-                conversation_id = %self.runtime.conversation_id(),
-                url = %self.ws_url,
-                error = %ErrorChain(e),
-                "Failed to reconnect to OpenClaw gateway"
-            );
-        })?;
+        let (connection, hello) = OpenClawConnection::connect(&self.ws_url, self.auth.clone(), &identity)
+            .await
+            .inspect_err(|e| {
+                error!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    url = %self.ws_url,
+                    error = %ErrorChain(e),
+                    "Failed to reconnect to OpenClaw gateway"
+                );
+            })?;
 
         if let Some(ref auth_info) = hello.auth
             && let Some(ref device_token) = auth_info.device_token
@@ -265,10 +258,10 @@ impl OpenClawAgentManager {
             *guard = connection;
         }
 
-        if let Ok(mut guard) = self.event_relay_handle.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
+        if let Ok(mut guard) = self.event_relay_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.abort();
         }
 
         if let Some(arc_self) = self.self_arc().await {
@@ -364,10 +357,7 @@ impl OpenClawAgentManager {
         }
     }
 
-    async fn do_send_message(&self,
-        is_first: bool,
-        data: SendMessageData,
-    ) -> Result<(), AgentError> {
+    async fn do_send_message(&self, is_first: bool, data: SendMessageData) -> Result<(), AgentError> {
         if !self.current_connection().await.is_connected() {
             self.reconnect().await?;
         }

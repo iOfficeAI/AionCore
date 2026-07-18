@@ -95,25 +95,65 @@ impl CronService {
     ) -> Result<CronJob, CronError> {
         let schedule = schedule_from_dto(&req.schedule);
         validate_schedule(&schedule)?;
+
+        // Backward compatibility: older AionUi clients send `agent_type` and the
+        // legacy `backend` / `custom_agent_id` / `preset_agent_type` fields.
+        // Normalize those into the v0.1.39 shape (`assistant_id`) before the
+        // new-job agent-type resolver runs.
+        let mut config = req.agent_config.map(sanitize_agent_config_dto);
+        if let Some(ref mut c) = config
+            && c.assistant_id
+                .as_deref()
+                .map(str::trim)
+                .map(str::is_empty)
+                .unwrap_or(true)
+        {
+            if let Some(id) = c
+                .custom_agent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                c.assistant_id = Some(id.to_owned());
+            } else if let Some(label) = c.preset_agent_type.as_deref().or(c.backend.as_deref()) {
+                // Aionrs historically stored the provider id in `backend`;
+                // the agent type is the reliable label to resolve an aionrs
+                // assistant.
+                let effective_label = if req.agent_type.as_deref() == Some("aionrs") {
+                    "aionrs"
+                } else {
+                    label
+                };
+                c.assistant_id = self.resolve_assistant_id_for_agent_label(effective_label).await;
+            }
+        }
+
         let resolved_agent_type = match runtime_agent_type {
             Some(agent_type) => agent_type,
-            None => self.resolve_new_job_agent_type(req.agent_config.as_ref()).await?,
+            None => {
+                if let Some(agent_type) = req
+                    .agent_type
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    agent_type.to_owned()
+                } else {
+                    self.resolve_new_job_agent_type(config.as_ref()).await?
+                }
+            }
         };
         reject_deprecated_new_conversation_agent_type(&resolved_agent_type)?;
-        validate_aionrs_agent_config(&resolved_agent_type, req.agent_config.as_ref())?;
+        validate_aionrs_agent_config(&resolved_agent_type, config.as_ref())?;
 
         let execution_mode = parse_execution_mode(req.execution_mode.as_deref())?;
         let created_by = CreatedBy::from_str(&req.created_by)?;
         let message = req.message.or(req.prompt).unwrap_or_default();
 
-        let agent_config = match req.agent_config {
+        let agent_config = match config {
             Some(config) => Some(
-                self.build_cron_agent_config(
-                    &resolved_agent_type,
-                    sanitize_agent_config_dto(config),
-                    assistant_backend_override.as_deref(),
-                )
-                .await?,
+                self.build_cron_agent_config(&resolved_agent_type, config, assistant_backend_override.as_deref())
+                    .await?,
             ),
             None => None,
         };
@@ -511,14 +551,14 @@ impl CronService {
         // Recover them by matching the name against the remote_agents table.
         if let Some(config) = job.agent_config.as_mut() {
             let agent_name = config.name.trim();
-            if !agent_name.is_empty() {
-                if let Some(repo) = self.remote_agent_repo.as_ref() {
-                    let rows = repo.list().await?;
-                    if let Some(remote_agent) = rows.into_iter().find(|row| row.name == agent_name) {
-                        config.custom_agent_id = Some(remote_agent.id.clone());
-                        job.agent_type = remote_agent_type_from_protocol(&remote_agent.protocol);
-                        return Ok(());
-                    }
+            if !agent_name.is_empty()
+                && let Some(repo) = self.remote_agent_repo.as_ref()
+            {
+                let rows = repo.list().await?;
+                if let Some(remote_agent) = rows.into_iter().find(|row| row.name == agent_name) {
+                    config.custom_agent_id = Some(remote_agent.id.clone());
+                    job.agent_type = remote_agent_type_from_protocol(&remote_agent.protocol);
+                    return Ok(());
                 }
             }
         }
@@ -1108,6 +1148,12 @@ impl CronService {
             model: (row.r#type == "aionrs").then(|| model.cloned()).flatten(),
             config_options: None,
             workspace: get_string(&extra, &["workspace"]),
+            // These legacy fields are only used for backward compatibility with
+            // older clients; internal code paths always populate `assistant_id`.
+            backend: None,
+            is_preset: None,
+            preset_agent_type: None,
+            custom_agent_id: None,
         };
 
         (row.r#type.clone(), Some(agent_config), snapshot_backend)
@@ -1268,6 +1314,7 @@ impl aionui_conversation::response_middleware::ICronService for CronService {
             message: Some(params.message.clone()),
             conversation_id: conversation_id.to_owned(),
             conversation_title,
+            agent_type: None,
             created_by: "agent".to_owned(),
             execution_mode: Some("existing".to_owned()),
             agent_config,
@@ -1698,6 +1745,10 @@ mod tests {
             }),
             config_options: None,
             workspace: None,
+            backend: None,
+            is_preset: None,
+            preset_agent_type: None,
+            custom_agent_id: None,
         }
     }
 
@@ -1746,6 +1797,10 @@ mod tests {
             model: None,
             config_options: None,
             workspace: None,
+            backend: None,
+            is_preset: None,
+            preset_agent_type: None,
+            custom_agent_id: None,
         };
 
         let sanitized = sanitize_agent_config_dto(config);
@@ -1754,16 +1809,17 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_agent_config_dto_rejects_legacy_custom_agent_id_without_assistant_id() {
-        let err = serde_json::from_value::<aionui_api_types::CronAgentConfigWriteDto>(serde_json::json!({
+    fn sanitize_agent_config_dto_accepts_legacy_custom_agent_id_without_assistant_id() {
+        let config = serde_json::from_value::<aionui_api_types::CronAgentConfigWriteDto>(serde_json::json!({
             "name": "Helper",
             "custom_agent_id": "legacy-assistant",
             "mode": "default",
             "model_id": "claude-sonnet-4",
         }))
-        .expect_err("legacy custom_agent_id must be rejected");
+        .expect("legacy custom_agent_id should be accepted for backward compatibility");
 
-        assert!(err.to_string().contains("custom_agent_id"));
+        assert_eq!(config.custom_agent_id.as_deref(), Some("legacy-assistant"));
+        assert!(config.assistant_id.is_none());
     }
 
     // -- parse_execution_mode -------------------------------------------------
@@ -1908,6 +1964,10 @@ mod tests {
                 model: None,
                 config_options: None,
                 workspace: None,
+                backend: None,
+                is_preset: None,
+                preset_agent_type: None,
+                custom_agent_id: None,
             }),
             conversation_title: None,
             max_retries: None,
@@ -1923,16 +1983,17 @@ mod tests {
     }
 
     #[test]
-    fn build_update_params_rejects_legacy_custom_agent_id_without_assistant_id() {
-        let err = serde_json::from_value::<aionui_api_types::CronAgentConfigWriteDto>(serde_json::json!({
+    fn build_update_params_accepts_legacy_custom_agent_id_without_assistant_id() {
+        let config = serde_json::from_value::<aionui_api_types::CronAgentConfigWriteDto>(serde_json::json!({
             "name": "Helper",
             "custom_agent_id": "legacy-assistant",
             "mode": "default",
             "model_id": "claude-sonnet-4",
         }))
-        .expect_err("legacy custom_agent_id must be rejected");
+        .expect("legacy custom_agent_id should be accepted for backward compatibility");
 
-        assert!(err.to_string().contains("custom_agent_id"));
+        assert_eq!(config.custom_agent_id.as_deref(), Some("legacy-assistant"));
+        assert!(config.assistant_id.is_none());
     }
 
     #[test]

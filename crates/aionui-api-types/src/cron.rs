@@ -77,6 +77,16 @@ pub struct CronAgentConfigWriteDto {
     pub config_options: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// Legacy fields kept for backward compatibility with AionUi clients that
+    /// still send them. New clients should set `assistant_id` and omit these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_preset: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_agent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_agent_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +166,11 @@ pub struct CreateCronJobRequest {
     pub conversation_id: String,
     #[serde(default)]
     pub conversation_title: Option<String>,
+    /// Legacy field kept for backward compatibility with AionUi clients that
+    /// still send it. New clients should omit this and let the backend resolve
+    /// the runtime type from `agent_config.assistant_id`.
+    #[serde(default)]
+    pub agent_type: Option<String>,
     pub created_by: String,
     #[serde(default)]
     pub execution_mode: Option<String>,

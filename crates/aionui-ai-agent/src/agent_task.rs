@@ -111,6 +111,9 @@ pub trait IMockAgent: IAgentTask {
             initialized: false,
         })
     }
+    async fn set_mode(&self, _mode: &str) -> Result<(), AgentError> {
+        Ok(())
+    }
     async fn get_model(&self) -> Result<GetModelInfoResponse, AgentError> {
         Ok(GetModelInfoResponse { model_info: None })
     }

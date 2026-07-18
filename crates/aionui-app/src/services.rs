@@ -13,7 +13,7 @@ use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    ISkillRepository, IRemoteAgentRepository, IUserRepository, SqliteAcpSessionRepository,
+    IRemoteAgentRepository, ISkillRepository, IUserRepository, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository,
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSkillRepository, SqliteUserRepository,
