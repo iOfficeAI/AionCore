@@ -39,33 +39,49 @@ pub struct SessionMcpServer {
 }
 
 /// ACP-specific fields extracted from `extra` in build task options.
-///
-/// `use_ollama` deserialization follows priority:
-/// 1. If JSON includes an explicit `use_ollama` field → use that value.
-/// 2. Otherwise, `use_ollama` defaults to `false`.
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AcpBuildExtra {
+    #[serde(default)]
     pub agent_id: Option<String>,
+    #[serde(default)]
     pub backend: Option<String>,
+    #[serde(default)]
     pub cli_path: Option<String>,
+    #[serde(default)]
     pub agent_name: Option<String>,
+    #[serde(default)]
     pub custom_agent_id: Option<String>,
+    #[serde(default)]
     pub preset_context: Option<String>,
+    #[serde(default)]
     pub skills: Vec<String>,
+    #[serde(default)]
     pub preset_assistant_id: Option<String>,
+    #[serde(default)]
     pub session_mode: Option<String>,
+    #[serde(default)]
     pub current_model_id: Option<String>,
+    #[serde(default)]
     pub thought_level: Option<String>,
+    #[serde(default)]
     pub cron_job_id: Option<String>,
+    #[serde(default)]
     pub team_mcp_stdio_config: Option<TeamMcpStdioConfig>,
+    #[serde(default)]
     pub mcp_server_ids: Option<Vec<String>>,
+    #[serde(default)]
     pub session_mcp_servers: Vec<SessionMcpServer>,
+    #[serde(default)]
     pub user_id: Option<String>,
 
     /// When enabled, routes the agent's model calls to a local Ollama
     /// server by injecting provider environment variables into the
     /// agent's native ACP command (the same variables `ollama launch`
     /// would inject interactively).
+    ///
+    /// Absent from the payload → `false`; supplying `ollama_model` alone
+    /// never enables it.
+    #[serde(default)]
     pub use_ollama: bool,
 
     /// Ollama model to route to (e.g. `"llama3.2"`, `"qwen3:14b"`).
@@ -73,64 +89,8 @@ pub struct AcpBuildExtra {
     /// Required when `use_ollama` is `true` — the injected environment
     /// maps the agent's default model aliases onto this model. When
     /// absent, the backend keeps the agent's native launch untouched.
+    #[serde(default)]
     pub ollama_model: Option<String>,
-}
-
-// Custom Deserialize to ensure `use_ollama` is only true when explicitly
-// set by the caller. The presence of `ollama_model` alone must not toggle
-// `use_ollama`. This avoids ambiguity in CI environments where serde
-// derive behavior may differ across toolchain versions.
-impl<'de> serde::Deserialize<'de> for AcpBuildExtra {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(serde::Deserialize, Default)]
-        #[serde(default)]
-        struct Raw {
-            agent_id: Option<String>,
-            backend: Option<String>,
-            cli_path: Option<String>,
-            agent_name: Option<String>,
-            custom_agent_id: Option<String>,
-            preset_context: Option<String>,
-            skills: Vec<String>,
-            preset_assistant_id: Option<String>,
-            session_mode: Option<String>,
-            current_model_id: Option<String>,
-            thought_level: Option<String>,
-            cron_job_id: Option<String>,
-            team_mcp_stdio_config: Option<TeamMcpStdioConfig>,
-            mcp_server_ids: Option<Vec<String>>,
-            session_mcp_servers: Vec<SessionMcpServer>,
-            user_id: Option<String>,
-            use_ollama: Option<bool>,
-            ollama_model: Option<String>,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-
-        Ok(AcpBuildExtra {
-            agent_id: raw.agent_id,
-            backend: raw.backend,
-            cli_path: raw.cli_path,
-            agent_name: raw.agent_name,
-            custom_agent_id: raw.custom_agent_id,
-            preset_context: raw.preset_context,
-            skills: raw.skills,
-            preset_assistant_id: raw.preset_assistant_id,
-            session_mode: raw.session_mode,
-            current_model_id: raw.current_model_id,
-            thought_level: raw.thought_level,
-            cron_job_id: raw.cron_job_id,
-            team_mcp_stdio_config: raw.team_mcp_stdio_config,
-            mcp_server_ids: raw.mcp_server_ids,
-            session_mcp_servers: raw.session_mcp_servers,
-            user_id: raw.user_id,
-            use_ollama: raw.use_ollama.unwrap_or(false),
-            ollama_model: raw.ollama_model,
-        })
-    }
 }
 
 /// Aionrs-specific fields extracted from `extra` in build task options.
