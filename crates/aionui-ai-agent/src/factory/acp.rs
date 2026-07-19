@@ -1068,4 +1068,170 @@ mod tests {
         let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
         assert!(servers.is_empty());
     }
+
+    /// Metadata fixture for the Ollama env-injection tests: a custom ACP
+    /// agent whose command is the test executable itself (resolved through
+    /// the explicit-path probe, so no Node runtime is involved) and whose
+    /// catalog env pre-seeds `ANTHROPIC_BASE_URL` to prove the appended
+    /// Ollama route overrides same-name variables.
+    fn ollama_test_meta(backend: &str, ollama_compatible: bool) -> aionui_api_types::AgentMetadata {
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        aionui_api_types::AgentMetadata {
+            id: format!("agent-{backend}"),
+            icon: None,
+            name: format!("Test {backend}"),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some(backend.into()),
+            agent_type: aionui_common::AgentType::Acp,
+            agent_source: aionui_api_types::AgentSource::Custom,
+            agent_source_info: aionui_api_types::AgentSourceInfo::default(),
+            enabled: true,
+            available: true,
+            command: Some(command),
+            resolved_command: None,
+            args: vec!["--acp".into()],
+            env: vec![aionui_api_types::AgentEnvEntry {
+                name: "ANTHROPIC_BASE_URL".into(),
+                value: "https://api.anthropic.com".into(),
+                description: None,
+            }],
+            native_skills_dirs: None,
+            behavior_policy: aionui_api_types::BehaviorPolicy::default(),
+            yolo_id: None,
+            sort_order: 0,
+            team_capable: false,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_error_details: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            handshake: aionui_api_types::AgentHandshake::default(),
+            has_command_override: false,
+            env_override_key_count: 0,
+            ollama_compatible,
+        }
+    }
+
+    fn ollama_config(use_ollama: bool, ollama_model: Option<&str>) -> aionui_api_types::AcpBuildExtra {
+        aionui_api_types::AcpBuildExtra {
+            use_ollama,
+            ollama_model: ollama_model.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    fn anthropic_base_urls(spec: &CommandSpec) -> Vec<&str> {
+        spec.env
+            .iter()
+            .filter(|var| var.name == "ANTHROPIC_BASE_URL")
+            .map(|var| var.value.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn resolve_with_ollama_injects_env_and_overrides_catalog_vars() {
+        let meta = ollama_test_meta("claude", true);
+        let spec = resolve_agent_command_spec_with_ollama(
+            &meta,
+            &ollama_config(true, Some("qwen3:14b")),
+            "/tmp/workspace",
+            "conv-ollama",
+            Arc::new(BroadcastEventBus::new(16)),
+        )
+        .await
+        .expect("resolved command spec");
+
+        // The native ACP command and args stay untouched — only env changes.
+        assert_eq!(spec.args, vec!["--acp".to_owned()]);
+
+        // Catalog value first, Ollama route appended last so it wins when
+        // the environment is applied in order.
+        assert_eq!(
+            anthropic_base_urls(&spec),
+            vec![
+                "https://api.anthropic.com",
+                aionui_common::constants::OLLAMA_DEFAULT_BASE_URL
+            ]
+        );
+
+        let last = |name: &str| {
+            spec.env
+                .iter()
+                .rev()
+                .find(|var| var.name == name)
+                .map(|var| var.value.as_str())
+        };
+        assert_eq!(last("ANTHROPIC_MODEL"), Some("qwen3:14b"));
+        assert_eq!(last("ANTHROPIC_AUTH_TOKEN"), Some("ollama"));
+        // The claude mapping must not leak OpenAI-flavoured variables.
+        assert_eq!(last("OPENAI_MODEL"), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_with_ollama_missing_model_keeps_native_launch() {
+        let meta = ollama_test_meta("claude", true);
+        let spec = resolve_agent_command_spec_with_ollama(
+            &meta,
+            &ollama_config(true, None),
+            "/tmp/workspace",
+            "conv-ollama",
+            Arc::new(BroadcastEventBus::new(16)),
+        )
+        .await
+        .expect("resolved command spec");
+
+        // Without an explicit model the factory must keep the native
+        // launch: catalog env only, no Ollama variables appended.
+        assert_eq!(anthropic_base_urls(&spec), vec!["https://api.anthropic.com"]);
+        assert!(spec.env.iter().all(|var| var.name != "ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn resolve_with_ollama_incompatible_agent_keeps_native_launch() {
+        let meta = ollama_test_meta("gemini", false);
+        let spec = resolve_agent_command_spec_with_ollama(
+            &meta,
+            &ollama_config(true, Some("qwen3:14b")),
+            "/tmp/workspace",
+            "conv-ollama",
+            Arc::new(BroadcastEventBus::new(16)),
+        )
+        .await
+        .expect("resolved command spec");
+
+        assert_eq!(anthropic_base_urls(&spec), vec!["https://api.anthropic.com"]);
+        assert!(
+            spec.env
+                .iter()
+                .all(|var| var.name != "ANTHROPIC_AUTH_TOKEN" && var.name != "OPENAI_MODEL")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_without_ollama_flag_keeps_native_launch() {
+        let meta = ollama_test_meta("claude", true);
+        let spec = resolve_agent_command_spec_with_ollama(
+            &meta,
+            &ollama_config(false, Some("qwen3:14b")),
+            "/tmp/workspace",
+            "conv-ollama",
+            Arc::new(BroadcastEventBus::new(16)),
+        )
+        .await
+        .expect("resolved command spec");
+
+        // Supplying a model alone must never toggle the Ollama route.
+        assert_eq!(anthropic_base_urls(&spec), vec!["https://api.anthropic.com"]);
+        assert!(spec.env.iter().all(|var| var.name != "ANTHROPIC_AUTH_TOKEN"));
+    }
 }
