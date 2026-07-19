@@ -86,9 +86,8 @@ mod tests {
     }
 }
 
-// --- Ollama Launch ---
+// --- Ollama ---
 
-pub const OLLAMA_COMMAND: &str = "ollama";
 /// Default local Ollama server address used for environment injection.
 pub const OLLAMA_DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
 

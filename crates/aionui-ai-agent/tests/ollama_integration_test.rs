@@ -3,18 +3,16 @@
 //! These tests exercise the public API of the ollama module
 //! and the OLLAMA_COMPATIBLE_BACKENDS constant from aionui-common.
 
-use aionui_ai_agent::ollama::{build_ollama_env, is_agent_ollama_supported, is_ollama_available};
+use aionui_ai_agent::ollama::build_ollama_env;
 use aionui_api_types::AcpBuildExtra;
-use aionui_common::constants::{
-    OLLAMA_COMMAND, OLLAMA_COMPATIBLE_BACKENDS, OLLAMA_DEFAULT_BASE_URL, is_ollama_supported_agent,
-};
+use aionui_common::constants::{OLLAMA_COMPATIBLE_BACKENDS, OLLAMA_DEFAULT_BASE_URL, is_ollama_supported_agent};
 
 #[test]
 fn compatible_backends_have_env_mappings() {
     // Every backend advertised as ollama_compatible must produce a
     // non-empty env mapping, otherwise the factory silently falls back.
     for backend in OLLAMA_COMPATIBLE_BACKENDS {
-        assert!(is_agent_ollama_supported(backend));
+        assert!(is_ollama_supported_agent(backend));
         let env = build_ollama_env(backend, "qwen3:14b").expect("compatible backend must have an env mapping");
         assert!(!env.is_empty());
     }
@@ -75,35 +73,9 @@ fn unsupported_agents_are_consistent() {
         "droid",
     ];
     for agent in unsupported {
-        assert!(!is_agent_ollama_supported(agent));
+        assert!(!is_ollama_supported_agent(agent));
         assert!(build_ollama_env(agent, "qwen3:14b").is_none());
     }
-}
-
-#[test]
-fn module_delegates_to_common_constants() {
-    // The ollama module functions should agree with the aionui-common
-    // helper functions for every compatible backend.
-    for backend in OLLAMA_COMPATIBLE_BACKENDS {
-        assert_eq!(is_agent_ollama_supported(backend), is_ollama_supported_agent(backend));
-    }
-}
-
-#[test]
-fn ollama_constant_is_correct() {
-    assert_eq!(OLLAMA_COMMAND, "ollama");
-}
-
-#[test]
-fn is_ollama_available_does_not_panic() {
-    // The function should return a bool without side effects.
-    // We cannot assert a specific value because it depends on the
-    // test environment, but we can verify it returns a consistent
-    // result and doesn't panic.
-    let first = is_ollama_available();
-    let second = is_ollama_available();
-    // OnceLock guarantees the same result every call
-    assert_eq!(first, second);
 }
 
 #[test]

@@ -13,55 +13,12 @@
 //! Injecting the environment into the native ACP bridge command keeps
 //! the ACP transport intact while routing model calls to Ollama.
 
-use std::sync::OnceLock;
-
 use aionui_common::EnvVar;
-use aionui_common::constants::{OLLAMA_COMMAND, OLLAMA_DEFAULT_BASE_URL, is_ollama_supported_agent};
+use aionui_common::constants::OLLAMA_DEFAULT_BASE_URL;
 
 /// OpenAI-compatible endpoint of the local Ollama server, used by backends
 /// that speak the OpenAI wire protocol (e.g. qwen-code).
 const OLLAMA_OPENAI_BASE_URL: &str = "http://127.0.0.1:11434/v1";
-
-/// Cached result of Ollama availability check
-static OLLAMA_AVAILABLE: OnceLock<bool> = OnceLock::new();
-
-/// Check if Ollama is installed and available on the system PATH.
-///
-/// This function caches the result after the first call to avoid repeated
-/// filesystem lookups during agent discovery.
-pub fn is_ollama_available() -> bool {
-    *OLLAMA_AVAILABLE.get_or_init(|| {
-        // Check if ollama command exists on PATH.
-        // Uses split_paths for cross-platform PATH separator handling.
-        if let Ok(path) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&path) {
-                let ollama_path = dir.join(OLLAMA_COMMAND);
-                if ollama_path.exists() && ollama_path.is_file() {
-                    return true;
-                }
-            }
-        }
-        false
-    })
-}
-
-/// Refresh the Ollama availability cache.
-///
-/// Call this after PATH changes (e.g., after Ollama installation) to force
-/// a re-check of Ollama availability. Note: `OnceLock` cannot be reset, so
-/// this function will only take effect if the cache has not yet been
-/// initialised. In practice, Ollama detection happens early and PATH changes
-/// during a single process lifetime are rare, making this acceptable.
-pub fn refresh_ollama_availability() {
-    // OnceLock has no clear() method. The cache is set once per process
-    // lifetime. PATH changes mid-process are rare enough that this is
-    // an acceptable trade-off.
-}
-
-/// Check if a given agent backend can run against Ollama.
-pub fn is_agent_ollama_supported(backend: &str) -> bool {
-    is_ollama_supported_agent(backend)
-}
 
 fn env_var(name: &str, value: impl Into<String>) -> EnvVar {
     EnvVar {
@@ -129,14 +86,6 @@ pub fn build_ollama_env(backend: &str, model: &str) -> Option<Vec<EnvVar>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_ollama_compatible_backend_coverage() {
-        assert!(is_agent_ollama_supported("claude"));
-        assert!(is_agent_ollama_supported("qwen"));
-        assert!(!is_agent_ollama_supported("gemini"));
-        assert!(!is_agent_ollama_supported("codex"));
-    }
 
     #[test]
     fn test_build_ollama_env_for_claude() {

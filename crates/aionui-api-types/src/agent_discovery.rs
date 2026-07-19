@@ -254,8 +254,9 @@ pub struct AgentMetadata {
     #[serde(skip)]
     pub env_override_key_count: usize,
 
-    /// Whether this agent can be launched via Ollama Launch.
-    /// Computed in decode_row from the OLLAMA_LAUNCH_MAP constant.
+    /// Whether this agent can route model calls to a local Ollama server
+    /// via provider env injection.
+    /// Computed in decode_row from `aionui_common::constants::OLLAMA_COMPATIBLE_BACKENDS`.
     #[serde(skip)]
     pub ollama_compatible: bool,
 }
