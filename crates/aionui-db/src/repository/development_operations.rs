@@ -14,6 +14,13 @@ pub trait IDevelopmentOperationsRepository: Send + Sync {
     async fn upsert_policy(&self, row: &DevelopmentPolicyRow) -> Result<(), DbError>;
 
     async fn append_usage(&self, row: &DevelopmentUsageEventRow) -> Result<(), DbError>;
+    async fn list_usage(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        run_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<DevelopmentUsageEventRow>, DbError>;
     async fn summarize_usage(
         &self,
         user_id: &str,

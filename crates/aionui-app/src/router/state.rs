@@ -20,8 +20,10 @@ use aionui_channel::{
         ChannelPersonalConversationSummary, ChannelPersonalDirectory, ChannelTeamCreateRequest, ChannelTeamDirectory,
         ChannelTeamSummary,
     },
-    approval::{ChannelApprovalContext, ChannelApprovalPort},
-    development::{ChannelDevelopmentCommand, ChannelDevelopmentContext, ChannelDevelopmentPort},
+    approval::{ChannelApprovalContext, ChannelApprovalPort, ChannelApprovalResolutionContext},
+    development::{
+        ChannelDevelopmentCommand, ChannelDevelopmentContext, ChannelDevelopmentPort, DevelopmentHandoffSigner,
+    },
 };
 use aionui_common::now_ms;
 use aionui_conversation::{ConversationRouterState, ConversationService};
@@ -109,6 +111,7 @@ struct ChannelDevelopmentAdapter {
     development_repo: Arc<dyn IDevelopmentRepository>,
     approval_repo: Arc<dyn IApprovalRepository>,
     service: Arc<DevelopmentService>,
+    handoff_signer: DevelopmentHandoffSigner,
 }
 
 struct DevelopmentWorkspaceAdapter {
@@ -229,10 +232,7 @@ impl ChannelApprovalPort for ChannelApprovalAdapter {
 
     async fn resolve(
         &self,
-        source_user_id: &str,
-        platform: aionui_channel::types::PluginType,
-        chat_id: &str,
-        message_thread_id: Option<i64>,
+        context: ChannelApprovalResolutionContext,
         approval_id: &str,
         option_index: usize,
     ) -> Result<String, ChannelError> {
@@ -242,10 +242,11 @@ impl ChannelApprovalPort for ChannelApprovalAdapter {
                 option_index,
                 ResolveApprovalContext::Channel {
                     user_id: self.owner_user_id.clone(),
-                    channel: platform.to_string(),
-                    source_user_id: source_user_id.to_owned(),
-                    chat_id: chat_id.to_owned(),
-                    thread_id: message_thread_id,
+                    channel: context.platform.to_string(),
+                    source_user_id: context.source_user_id,
+                    chat_id: context.chat_id,
+                    thread_id: context.message_thread_id,
+                    is_admin: context.is_admin,
                 },
             )
             .await
@@ -364,19 +365,14 @@ impl ChannelDevelopmentPort for ChannelDevelopmentAdapter {
                     .iter()
                     .filter(|gate| matches!(gate.status.as_str(), "failed" | "timed_out"))
                     .count();
-                let evidence = artifacts
-                    .iter()
-                    .rev()
-                    .take(5)
-                    .map(|artifact| format!("- {}: {}", artifact.artifact_type, artifact.path_or_uri))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let expires_at = now_ms().saturating_add(15 * 60 * 1000);
+                let link = self.handoff_signer.sign(&project.id, &run.id, expires_at);
                 Ok(format!(
-                    "变更证据：{} 项\n质量门禁：{} 通过 / {} 失败\n{}",
+                    "变更证据：{} 项\n质量门禁：{} 通过 / {} 失败\n详细文件、日志与冲突内容请使用 15 分钟有效的 Web 接力入口：{}",
                     artifacts.len(),
                     passed,
                     failed,
-                    if evidence.is_empty() { "暂无证据" } else { &evidence }
+                    link,
                 ))
             }
             ChannelDevelopmentCommand::Test => {
@@ -405,10 +401,29 @@ impl ChannelDevelopmentPort for ChannelDevelopmentAdapter {
                 ))
             }
             ChannelDevelopmentCommand::Stop => {
-                self.development_repo
-                    .update_run_status(&run.id, &self.owner_user_id, "cancelled", Some(now_ms()))
-                    .await
-                    .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+                let single_workspace = if run.execution_mode == "single" {
+                    self.service
+                        .get_single_workspace(&self.owner_user_id, &run.id)
+                        .await
+                        .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?
+                } else {
+                    None
+                };
+                if single_workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.workspace_lease_id.as_ref())
+                    .is_some()
+                {
+                    self.service
+                        .cancel_single_workspace(&self.owner_user_id, &run.id)
+                        .await
+                        .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+                } else {
+                    self.development_repo
+                        .update_run_status(&run.id, &self.owner_user_id, "cancelled", Some(now_ms()))
+                        .await
+                        .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+                }
                 Ok(format!("运行 {} 已停止。", run.id))
             }
             ChannelDevelopmentCommand::Retry => {
@@ -440,10 +455,13 @@ impl ChannelDevelopmentPort for ChannelDevelopmentAdapter {
                     .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
                 Ok(format!("已重试 {} 门禁，结果：{}。", gate.gate_type, gate.status))
             }
-            ChannelDevelopmentCommand::Handoff => Ok(format!(
-                "Web 接力入口：/#/projects?projectId={}&runId={}\n打开后可查看任务、证据、审批和质量门禁。",
-                project.id, run.id
-            )),
+            ChannelDevelopmentCommand::Handoff => {
+                let expires_at = now_ms().saturating_add(15 * 60 * 1000);
+                let link = self.handoff_signer.sign(&project.id, &run.id, expires_at);
+                Ok(format!(
+                    "Web 接力入口（15 分钟内有效）：{link}\n打开后仍需登录，可查看任务、证据、审批和质量门禁。"
+                ))
+            }
         }
     }
 }
@@ -1137,12 +1155,19 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
             .with_operations(operations_service.clone()),
         ),
         deployment_service: Arc::new(
-            DeploymentService::new(development_repo, project_repo, Arc::new(UnconfiguredDeploymentProvider))
-                .with_operations(operations_service.clone()),
+            DeploymentService::new(
+                development_repo.clone(),
+                project_repo,
+                Arc::new(UnconfiguredDeploymentProvider),
+            )
+            .with_operations(operations_service.clone()),
         ),
         operations_service,
         secret_service,
         pricing_service,
+        development_repo,
+        operations_repo,
+        approval_repo: Arc::new(SqliteApprovalRepository::new(services.database.pool().clone())),
     }
 }
 
@@ -1420,10 +1445,11 @@ pub async fn build_channel_state(
     });
     let development_port: Arc<dyn ChannelDevelopmentPort> = Arc::new(ChannelDevelopmentAdapter {
         owner_user_id: owner_user_id.clone(),
-        project_repo,
+        project_repo: project_repo.clone(),
         development_repo: Arc::new(SqliteDevelopmentRepository::new(services.database.pool().clone())),
         approval_repo: Arc::new(SqliteApprovalRepository::new(services.database.pool().clone())),
         service: development_state.service,
+        handoff_signer: DevelopmentHandoffSigner::new(encryption_key, "/#/projects"),
     });
 
     // Build orchestrator dependencies
@@ -1457,6 +1483,18 @@ pub async fn build_channel_state(
         manager.clone() as Arc<dyn aionui_channel::stream_relay::ChannelSender>,
     );
     tokio::spawn(team_event_relay.run());
+    let development_notifier = aionui_channel::team_event_relay::ChannelDevelopmentNotifier::new(
+        owner_user_id.clone(),
+        repo.clone(),
+        project_repo,
+        Arc::new(SqliteDevelopmentRepository::new(services.database.pool().clone())),
+        Arc::new(SqliteDevelopmentOperationsRepository::new(
+            services.database.pool().clone(),
+        )),
+        Arc::new(SqliteApprovalRepository::new(services.database.pool().clone())),
+        manager.clone() as Arc<dyn aionui_channel::stream_relay::ChannelSender>,
+    );
+    tokio::spawn(development_notifier.run());
 
     let orchestrator = aionui_channel::orchestrator::ChannelOrchestrator::new(
         action_executor,
@@ -2058,6 +2096,7 @@ mod tests {
             development_repo,
             approval_repo: Arc::new(SqliteApprovalRepository::new(db.pool().clone())),
             service,
+            handoff_signer: DevelopmentHandoffSigner::new([9; 32], "/#/projects"),
         };
         let context = ChannelDevelopmentContext {
             source_user_id: "assistant-user".into(),
@@ -2083,6 +2122,8 @@ mod tests {
             .await
             .unwrap();
         assert!(handoff.contains("/#/projects?projectId=project-channel&runId=run-channel"));
+        assert!(handoff.contains("&expires="));
+        assert!(handoff.contains("&signature="));
     }
 
     #[tokio::test]

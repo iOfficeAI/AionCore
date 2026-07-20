@@ -125,7 +125,7 @@ async fn app_for(
         service,
         delivery_service,
         deployment_service: Arc::new(DeploymentService::new(
-            development_repo,
+            development_repo.clone(),
             project_repo,
             Arc::new(UnconfiguredDeploymentProvider),
         )),
@@ -135,7 +135,10 @@ async fn app_for(
             Arc::new(SqliteProjectRepository::new(db.pool().clone())),
             Arc::new([9_u8; 32]),
         )),
-        pricing_service: Arc::new(PricingService::new(operations_repo)),
+        pricing_service: Arc::new(PricingService::new(operations_repo.clone())),
+        development_repo,
+        operations_repo,
+        approval_repo: Arc::new(aionui_db::SqliteApprovalRepository::new(db.pool().clone())),
     })
     .layer(Extension(CurrentUser {
         id: current_user_id.into(),
@@ -420,6 +423,99 @@ async fn routes_create_and_read_a_development_board() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json(response).await["data"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn timeline_merges_run_and_task_events_and_controls_are_server_validated() {
+    let (app, _project, _db, _provider) = app().await;
+    let run = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/development-runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "execution_mode": "single",
+                        "request_summary": "Timeline fixture",
+                        "acceptance_criteria": ["events are correlated"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let run_id = json(run).await["data"]["id"].as_str().unwrap().to_owned();
+    let task = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/development-runs/{run_id}/tasks"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "subject": "Timeline task",
+                        "blocked_by": [],
+                        "acceptance_criteria": ["events are correlated"],
+                        "task_type": "implementation",
+                        "risk_level": "medium"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(task.status(), StatusCode::CREATED);
+
+    let timeline = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/development-runs/{run_id}/timeline"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(timeline.status(), StatusCode::OK);
+    let body = json(timeline).await;
+    let events = body["data"]["events"].as_array().unwrap();
+    assert!(events.iter().any(|event| event["kind"] == "run"));
+    assert!(events.iter().any(|event| event["kind"] == "task"));
+    assert_eq!(body["data"]["controls"]["allowed_run_actions"][0], "pause");
+
+    let paused = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/development-runs/{run_id}/control"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"action":"pause","task_id":null,"target_slot_id":null}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(paused.status(), StatusCode::OK);
+    assert_eq!(json(paused).await["data"]["run_status"], "paused");
+
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/development-runs/{run_id}/control"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"action":"pause","task_id":null,"target_slot_id":null}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]

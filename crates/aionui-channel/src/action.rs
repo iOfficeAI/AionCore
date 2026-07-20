@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use aionui_api_types::{ChannelAssistantSettingRequest, ChannelDefaultModelSetting};
 use tracing::{debug, info, warn};
 
-use crate::approval::ChannelApprovalPort;
+use crate::approval::{ChannelApprovalPort, ChannelApprovalResolutionContext};
 use crate::channel_settings::{ChannelAgentOption, ChannelSettingsService};
 use crate::development::{ChannelDevelopmentCommand, ChannelDevelopmentContext, ChannelDevelopmentPort};
 use crate::error::ChannelError;
@@ -437,10 +437,18 @@ impl ActionExecutor {
                     .ok_or_else(|| ChannelError::InvalidConfig("Approval service is unavailable".into()))?;
                 let status = approval_port
                     .resolve(
-                        internal_user_id,
-                        msg.platform,
-                        &msg.chat_id,
-                        msg.topic.as_ref().map(|topic| topic.message_thread_id),
+                        ChannelApprovalResolutionContext {
+                            source_user_id: internal_user_id.to_owned(),
+                            platform: msg.platform,
+                            chat_id: msg.chat_id.clone(),
+                            message_thread_id: msg.topic.as_ref().map(|topic| topic.message_thread_id),
+                            is_admin: msg
+                                .raw
+                                .as_ref()
+                                .and_then(|raw| raw.get("telegram_chat_member_status"))
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|status| matches!(status, "creator" | "administrator")),
+                        },
                         approval_id,
                         option_index,
                     )
@@ -2488,18 +2496,15 @@ mod tests {
 
         async fn resolve(
             &self,
-            source_user_id: &str,
-            platform: PluginType,
-            chat_id: &str,
-            message_thread_id: Option<i64>,
+            context: crate::approval::ChannelApprovalResolutionContext,
             approval_id: &str,
             option_index: usize,
         ) -> Result<String, ChannelError> {
             self.resolutions.lock().unwrap().push((
-                source_user_id.into(),
-                platform,
-                chat_id.into(),
-                message_thread_id,
+                context.source_user_id,
+                context.platform,
+                context.chat_id,
+                context.message_thread_id,
                 approval_id.into(),
                 option_index,
             ));

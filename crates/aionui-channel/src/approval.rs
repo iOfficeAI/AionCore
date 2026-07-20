@@ -14,6 +14,15 @@ pub struct ChannelApprovalContext {
     pub message_thread_id: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelApprovalResolutionContext {
+    pub source_user_id: String,
+    pub platform: PluginType,
+    pub chat_id: String,
+    pub message_thread_id: Option<i64>,
+    pub is_admin: bool,
+}
+
 #[async_trait]
 pub trait ChannelApprovalPort: Send + Sync {
     async fn create(&self, context: ChannelApprovalContext, confirmation: Confirmation)
@@ -21,10 +30,7 @@ pub trait ChannelApprovalPort: Send + Sync {
 
     async fn resolve(
         &self,
-        source_user_id: &str,
-        platform: PluginType,
-        chat_id: &str,
-        message_thread_id: Option<i64>,
+        context: ChannelApprovalResolutionContext,
         approval_id: &str,
         option_index: usize,
     ) -> Result<String, ChannelError>;

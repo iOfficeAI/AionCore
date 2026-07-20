@@ -113,6 +113,41 @@ impl IDevelopmentOperationsRepository for SqliteDevelopmentOperationsRepository 
         Ok(())
     }
 
+    async fn list_usage(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        run_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<DevelopmentUsageEventRow>, DbError> {
+        let limit = limit.clamp(1, 500);
+        Ok(match run_id {
+            Some(run_id) => {
+                sqlx::query_as(
+                    "SELECT * FROM development_usage_events WHERE user_id = ? AND project_id = ? AND run_id = ? \
+                     ORDER BY created_at DESC, id DESC LIMIT ?",
+                )
+                .bind(user_id)
+                .bind(project_id)
+                .bind(run_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT * FROM development_usage_events WHERE user_id = ? AND project_id = ? \
+                     ORDER BY created_at DESC, id DESC LIMIT ?",
+                )
+                .bind(user_id)
+                .bind(project_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        })
+    }
+
     async fn summarize_usage(
         &self,
         user_id: &str,

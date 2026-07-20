@@ -122,6 +122,7 @@ async fn telegram_resolution_requires_matching_user_chat_and_thread() {
                 source_user_id: "telegram-user-1".into(),
                 chat_id: "-1003977604085".into(),
                 thread_id: Some(7),
+                is_admin: false,
             },
         )
         .await;
@@ -137,6 +138,7 @@ async fn telegram_resolution_requires_matching_user_chat_and_thread() {
                 source_user_id: "telegram-user-1".into(),
                 chat_id: "-1003977604085".into(),
                 thread_id: Some(5),
+                is_admin: false,
             },
         )
         .await
@@ -144,6 +146,47 @@ async fn telegram_resolution_requires_matching_user_chat_and_thread() {
     assert_eq!(row.status, "approved");
     assert_eq!(resolver.calls.lock().unwrap().len(), 1);
     assert!(resolver.calls.lock().unwrap()[0].3);
+}
+
+#[tokio::test]
+async fn telegram_topic_admin_can_resolve_for_requester_but_other_members_cannot() {
+    let resolver = Arc::new(RecordingResolver::default());
+    let (service, _db) = setup(resolver.clone()).await;
+    let approval = service.create(request()).await.unwrap();
+
+    let member = service
+        .resolve(
+            &approval.id,
+            0,
+            ResolveApprovalContext::Channel {
+                user_id: "system_default_user".into(),
+                channel: "telegram".into(),
+                source_user_id: "different-member".into(),
+                chat_id: "-1003977604085".into(),
+                thread_id: Some(5),
+                is_admin: false,
+            },
+        )
+        .await;
+    assert!(matches!(member, Err(ApprovalError::Forbidden(_))));
+
+    let resolved = service
+        .resolve(
+            &approval.id,
+            0,
+            ResolveApprovalContext::Channel {
+                user_id: "system_default_user".into(),
+                channel: "telegram".into(),
+                source_user_id: "topic-admin".into(),
+                chat_id: "-1003977604085".into(),
+                thread_id: Some(5),
+                is_admin: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved.status, "approved");
+    assert_eq!(resolver.calls.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

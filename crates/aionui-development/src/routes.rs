@@ -3,16 +3,20 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ApiResponse, DevelopmentConfirmationRequest, DevelopmentDeploymentRequest, DevelopmentTagRequest,
+    ApiResponse, DevelopmentConfirmationRequest, DevelopmentDeploymentRequest, DevelopmentRunControlRequest,
+    DevelopmentRunControlState, DevelopmentRunTimeline, DevelopmentTagRequest, DevelopmentTimelineEvent,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
+use aionui_db::{IApprovalRepository, IDevelopmentOperationsRepository, IDevelopmentRepository};
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::Deserialize;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 use crate::delivery::{CreatePullRequestInput, CreateTagInput, DeliveryService, PrepareDeliveryInput};
 use crate::deployment::{DeploymentRequestInput, DeploymentService};
@@ -48,6 +52,9 @@ pub struct DevelopmentRouterState {
     pub operations_service: Arc<DevelopmentOperationsService>,
     pub secret_service: Arc<SecretService>,
     pub pricing_service: Arc<PricingService>,
+    pub development_repo: Arc<dyn IDevelopmentRepository>,
+    pub operations_repo: Arc<dyn IDevelopmentOperationsRepository>,
+    pub approval_repo: Arc<dyn IApprovalRepository>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -91,6 +98,8 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
     Router::new()
         .route("/api/development-runs", post(create_run).get(list_runs))
         .route("/api/development-runs/{run_id}", get(get_run))
+        .route("/api/development-runs/{run_id}/timeline", get(get_timeline))
+        .route("/api/development-runs/{run_id}/control", post(control_run))
         .route(
             "/api/development-runs/{run_id}/requirements",
             get(get_requirements).post(append_requirement_revision),
@@ -205,6 +214,459 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
         .route("/api/development-operations/reconcile", post(reconcile_operations))
         .route("/api/development-runs/{run_id}/recovery", post(decide_recovery))
         .with_state(state)
+}
+
+async fn get_timeline(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<DevelopmentRunTimeline>>, ApiError> {
+    let run = state.service.get_run(&user.id, &run_id).await.map_err(ApiError::from)?;
+    let tasks = state
+        .service
+        .list_tasks(&user.id, &run_id)
+        .await
+        .map_err(ApiError::from)?;
+    let mut events = vec![DevelopmentTimelineEvent {
+        id: format!("run:{}", run.id),
+        kind: "run".into(),
+        correlation_id: run.id.clone(),
+        task_id: None,
+        title: run.request_summary.clone(),
+        status: run.status.clone(),
+        actor_id: run.source_user_id.clone(),
+        occurred_at: run.created_at,
+        metadata: json!({"execution_mode": run.execution_mode}),
+    }];
+    for task in &tasks {
+        events.push(timeline_event(
+            format!("task:{}", task.id),
+            "task",
+            &run.id,
+            Some(task.id.clone()),
+            task.subject.clone(),
+            task.status.clone(),
+            task.owner.clone(),
+            task.updated_at,
+            json!({"blocked_by": task.blocked_by, "risk_level": task.risk_level}),
+        ));
+    }
+    for artifact in state
+        .development_repo
+        .list_artifacts(&run_id, None)
+        .await
+        .map_err(DevelopmentError::from)
+        .map_err(ApiError::from)?
+    {
+        events.push(timeline_event(
+            format!("artifact:{}", artifact.id),
+            "file",
+            &run.id,
+            artifact.task_id,
+            artifact.artifact_type,
+            "recorded".into(),
+            artifact.producer_agent_id,
+            artifact.created_at,
+            json!({"path_or_uri": artifact.path_or_uri, "checksum": artifact.checksum}),
+        ));
+    }
+    for gate in state
+        .development_repo
+        .list_gates(&run_id, None)
+        .await
+        .map_err(DevelopmentError::from)
+        .map_err(ApiError::from)?
+    {
+        events.push(timeline_event(
+            format!("gate:{}", gate.id),
+            "gate",
+            &run.id,
+            gate.task_id,
+            gate.gate_type,
+            gate.status,
+            None,
+            gate.finished_at.or(gate.started_at).unwrap_or(gate.created_at),
+            json!({"required": gate.required, "duration_ms": gate.duration_ms}),
+        ));
+    }
+    for task in &tasks {
+        for finding in state
+            .development_repo
+            .list_findings(&run_id, &task.id)
+            .await
+            .map_err(DevelopmentError::from)
+            .map_err(ApiError::from)?
+        {
+            events.push(timeline_event(
+                format!("finding:{}", finding.id),
+                "finding",
+                &run.id,
+                Some(finding.task_id),
+                finding.reason,
+                finding.status,
+                Some(finding.reviewer_agent_id),
+                finding.updated_at,
+                json!({"severity": finding.severity, "file_path": finding.file_path, "line_number": finding.line_number}),
+            ));
+        }
+    }
+    for approval in state
+        .approval_repo
+        .list_for_user(&user.id, Some(&run_id))
+        .await
+        .map_err(DevelopmentError::from)
+        .map_err(ApiError::from)?
+    {
+        events.push(timeline_event(
+            format!("approval:{}", approval.id),
+            "approval",
+            &run.id,
+            approval.task_id,
+            approval.action_type,
+            approval.status,
+            approval.approver_user_id.or(Some(approval.requester_user_id)),
+            approval.updated_at,
+            json!({"risk_level": approval.risk_level, "expires_at": approval.expires_at}),
+        ));
+    }
+    if let Some(delivery) = state
+        .development_repo
+        .get_delivery(&user.id, &run_id)
+        .await
+        .map_err(DevelopmentError::from)
+        .map_err(ApiError::from)?
+    {
+        events.push(timeline_event(
+            format!("commit:{}", delivery.id),
+            "commit",
+            &run.id,
+            None,
+            delivery.commit_sha.clone().unwrap_or_else(|| delivery.branch.clone()),
+            delivery.status.clone(),
+            None,
+            delivery.updated_at,
+            json!({"branch": delivery.branch, "base_branch": delivery.base_branch}),
+        ));
+        for check in state
+            .development_repo
+            .list_ci_checks(&delivery.id)
+            .await
+            .map_err(DevelopmentError::from)
+            .map_err(ApiError::from)?
+        {
+            events.push(timeline_event(
+                format!("ci:{}", check.id),
+                "ci",
+                &run.id,
+                None,
+                check.name,
+                check.status,
+                None,
+                check.completed_at.or(check.started_at).unwrap_or(check.created_at),
+                json!({"details_url": check.details_url, "rework_task_id": check.rework_task_id}),
+            ));
+        }
+        for tag in state
+            .development_repo
+            .list_delivery_tags(&user.id, &delivery.id)
+            .await
+            .map_err(DevelopmentError::from)
+            .map_err(ApiError::from)?
+        {
+            events.push(timeline_event(
+                format!("tag:{}", tag.id),
+                "commit",
+                &run.id,
+                None,
+                tag.name,
+                tag.status,
+                None,
+                tag.updated_at,
+                json!({"commit_sha": tag.commit_sha, "remote_url": tag.remote_url}),
+            ));
+        }
+    }
+    for deployment in state
+        .development_repo
+        .list_deployments(&user.id, &run_id)
+        .await
+        .map_err(DevelopmentError::from)
+        .map_err(ApiError::from)?
+    {
+        events.push(timeline_event(
+            format!("deployment:{}", deployment.id),
+            "deployment",
+            &run.id,
+            None,
+            deployment.environment,
+            deployment.status,
+            deployment.approved_by.or(Some(deployment.requested_by)),
+            deployment.updated_at,
+            json!({"commit_sha": deployment.commit_sha, "remote_id": deployment.remote_id}),
+        ));
+    }
+    for usage in state
+        .operations_repo
+        .list_usage(&user.id, &run.project_id, Some(&run_id), 200)
+        .await
+        .map_err(DevelopmentError::from)
+        .map_err(ApiError::from)?
+    {
+        events.push(timeline_event(
+            format!("usage:{}", usage.id),
+            "usage",
+            &run.id,
+            usage.task_id,
+            usage.usage_type,
+            usage.confidence,
+            Some(usage.source),
+            usage.created_at,
+            json!({"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens, "cost_microunits": usage.cost_microunits, "duration_ms": usage.duration_ms}),
+        ));
+    }
+    for audit in state
+        .operations_repo
+        .list_audit(&user.id, &run.project_id, Some(&run_id), 200)
+        .await
+        .map_err(DevelopmentError::from)
+        .map_err(ApiError::from)?
+    {
+        let kind = if audit.action.contains("turn") {
+            "turn"
+        } else if audit.action.contains("tool") || audit.action.contains("execute") {
+            "tool"
+        } else {
+            "audit"
+        };
+        events.push(timeline_event(
+            format!("audit:{}", audit.id),
+            kind,
+            &run.id,
+            audit.task_id,
+            audit.action,
+            audit.result,
+            Some(audit.actor_id),
+            audit.created_at,
+            serde_json::from_str(&audit.redacted_payload_json).unwrap_or(Value::Null),
+        ));
+    }
+    for alert in state
+        .operations_repo
+        .list_alerts(&user.id, &run.project_id, Some(&run_id), false)
+        .await
+        .map_err(DevelopmentError::from)
+        .map_err(ApiError::from)?
+    {
+        events.push(timeline_event(
+            format!("alert:{}", alert.id),
+            "alert",
+            &run.id,
+            None,
+            alert.message,
+            alert.status,
+            None,
+            alert.updated_at,
+            json!({"alert_type": alert.alert_type, "severity": alert.severity}),
+        ));
+    }
+    for recovery in state
+        .operations_repo
+        .list_recovery(&user.id, &run.project_id, Some(&run_id), 200)
+        .await
+        .map_err(DevelopmentError::from)
+        .map_err(ApiError::from)?
+    {
+        events.push(timeline_event(
+            format!("recovery:{}", recovery.id),
+            "recovery",
+            &run.id,
+            None,
+            recovery.finding,
+            recovery.decision,
+            None,
+            recovery.created_at,
+            serde_json::from_str(&recovery.details_json).unwrap_or(Value::Null),
+        ));
+    }
+    events.sort_by(|left, right| {
+        left.occurred_at
+            .cmp(&right.occurred_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(Json(ApiResponse::ok(DevelopmentRunTimeline {
+        run_id: run.id.clone(),
+        controls: control_state(&run, &tasks),
+        events,
+    })))
+}
+
+async fn control_run(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    Json(input): Json<DevelopmentRunControlRequest>,
+) -> Result<Json<ApiResponse<DevelopmentRunControlState>>, ApiError> {
+    let run = state.service.get_run(&user.id, &run_id).await.map_err(ApiError::from)?;
+    let tasks = state
+        .service
+        .list_tasks(&user.id, &run_id)
+        .await
+        .map_err(ApiError::from)?;
+    let controls = control_state(&run, &tasks);
+    if let Some(task_id) = input.task_id.as_deref() {
+        let allowed = controls.allowed_task_actions.get(task_id).cloned().unwrap_or_default();
+        if !allowed.iter().any(|action| action == &input.action) {
+            return Err(ApiError::Conflict(format!(
+                "task action {} is not allowed",
+                input.action
+            )));
+        }
+        let task = tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| ApiError::NotFound(format!("task {task_id}")))?;
+        if input.action == "reassign" {
+            let target = input
+                .target_slot_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| ApiError::BadRequest("target_slot_id is required".into()))?;
+            let roles = state
+                .service
+                .list_roles(&user.id, &run_id)
+                .await
+                .map_err(ApiError::from)?;
+            if !roles.iter().any(|role| role.slot_id == target) {
+                return Err(ApiError::BadRequest(
+                    "target_slot_id is not assigned to this run".into(),
+                ));
+            }
+            state
+                .development_repo
+                .update_task_owner(&run_id, task_id, Some(target))
+                .await
+                .map_err(DevelopmentError::from)
+                .map_err(ApiError::from)?;
+        } else {
+            let target = task_control_target(&input.action, &task.status)
+                .ok_or_else(|| ApiError::Conflict("task action has no valid target state".into()))?;
+            state
+                .development_repo
+                .update_task_state(&run_id, task_id, target, &task.review_status, &task.verification_status)
+                .await
+                .map_err(DevelopmentError::from)
+                .map_err(ApiError::from)?;
+        }
+    } else {
+        if !controls
+            .allowed_run_actions
+            .iter()
+            .any(|action| action == &input.action)
+        {
+            return Err(ApiError::Conflict(format!(
+                "run action {} is not allowed",
+                input.action
+            )));
+        }
+        let (status, finished_at) = match input.action.as_str() {
+            "pause" => ("paused", None),
+            "cancel" => ("cancelled", Some(aionui_common::now_ms())),
+            "retry" | "takeover" => ("running", None),
+            _ => return Err(ApiError::BadRequest("unsupported run action".into())),
+        };
+        state
+            .development_repo
+            .update_run_status(&run_id, &user.id, status, finished_at)
+            .await
+            .map_err(DevelopmentError::from)
+            .map_err(ApiError::from)?;
+    }
+    let updated_run = state.service.get_run(&user.id, &run_id).await.map_err(ApiError::from)?;
+    let updated_tasks = state
+        .service
+        .list_tasks(&user.id, &run_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(control_state(&updated_run, &updated_tasks))))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper mirrors the persisted timeline event schema so call sites keep every source field explicit"
+)]
+fn timeline_event(
+    id: String,
+    kind: &str,
+    correlation_id: &str,
+    task_id: Option<String>,
+    title: String,
+    status: String,
+    actor_id: Option<String>,
+    occurred_at: i64,
+    metadata: Value,
+) -> DevelopmentTimelineEvent {
+    DevelopmentTimelineEvent {
+        id,
+        kind: kind.into(),
+        correlation_id: correlation_id.into(),
+        task_id,
+        title,
+        status,
+        actor_id,
+        occurred_at,
+        metadata,
+    }
+}
+
+fn control_state(
+    run: &aionui_db::models::DevelopmentRunRow,
+    tasks: &[aionui_db::models::DevelopmentTaskRow],
+) -> DevelopmentRunControlState {
+    let allowed_run_actions = match run.status.as_str() {
+        "running" => vec!["pause", "cancel"],
+        "paused" => vec!["retry", "takeover", "cancel"],
+        "failed" => vec!["retry", "takeover"],
+        _ => vec![],
+    }
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let allowed_task_actions = tasks
+        .iter()
+        .map(|task| {
+            let actions: Vec<&str> = match task.status.as_str() {
+                "pending" | "ready" | "claimed" => vec!["advance", "reassign", "cancel"],
+                "in_progress" => vec!["pause", "reassign", "cancel"],
+                "waiting_approval" => vec!["retry", "reassign", "cancel"],
+                "verifying" | "review" => vec!["rework", "reassign", "cancel"],
+                "rework" | "failed" | "conflict" => vec!["retry", "rework", "reassign", "cancel"],
+                _ => vec![],
+            };
+            (task.id.clone(), actions.into_iter().map(str::to_owned).collect())
+        })
+        .collect::<BTreeMap<_, _>>();
+    DevelopmentRunControlState {
+        run_id: run.id.clone(),
+        run_status: run.status.clone(),
+        allowed_run_actions,
+        allowed_task_actions,
+    }
+}
+
+fn task_control_target<'a>(action: &str, current: &'a str) -> Option<&'a str> {
+    match action {
+        "advance" => match current {
+            "pending" => Some("ready"),
+            "ready" => Some("claimed"),
+            "claimed" => Some("in_progress"),
+            _ => None,
+        },
+        "pause" => Some("waiting_approval"),
+        "retry" => Some("in_progress"),
+        "rework" => Some("rework"),
+        "cancel" => Some("cancelled"),
+        _ => None,
+    }
 }
 
 async fn list_secrets(

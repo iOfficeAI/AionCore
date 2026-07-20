@@ -76,6 +76,7 @@ pub enum ResolveApprovalContext {
         source_user_id: String,
         chat_id: String,
         thread_id: Option<i64>,
+        is_admin: bool,
     },
 }
 
@@ -262,15 +263,16 @@ fn ensure_source(row: &ApprovalRequestRow, context: &ResolveApprovalContext) -> 
         source_user_id,
         chat_id,
         thread_id,
+        is_admin,
         ..
     } = context
     else {
         return Ok(());
     };
     if row.source_channel.as_deref() != Some(channel.as_str())
-        || row.source_user_id.as_deref() != Some(source_user_id.as_str())
         || row.source_chat_id.as_deref() != Some(chat_id.as_str())
         || row.source_thread_id != *thread_id
+        || (!*is_admin && row.source_user_id.as_deref() != Some(source_user_id.as_str()))
     {
         return Err(ApprovalError::Forbidden(
             "approval source does not match this channel topic".into(),

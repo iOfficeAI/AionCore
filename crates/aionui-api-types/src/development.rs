@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequirementVersion {
@@ -134,4 +136,40 @@ pub struct DevelopmentConfirmationRequest {
     pub confirmed: bool,
     #[serde(default)]
     pub confirmation_count: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DevelopmentTimelineEvent {
+    pub id: String,
+    pub kind: String,
+    pub correlation_id: String,
+    pub task_id: Option<String>,
+    pub title: String,
+    pub status: String,
+    pub actor_id: Option<String>,
+    pub occurred_at: i64,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DevelopmentRunControlState {
+    pub run_id: String,
+    pub run_status: String,
+    pub allowed_run_actions: Vec<String>,
+    pub allowed_task_actions: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DevelopmentRunTimeline {
+    pub run_id: String,
+    pub events: Vec<DevelopmentTimelineEvent>,
+    pub controls: DevelopmentRunControlState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevelopmentRunControlRequest {
+    pub action: String,
+    pub task_id: Option<String>,
+    pub target_slot_id: Option<String>,
 }

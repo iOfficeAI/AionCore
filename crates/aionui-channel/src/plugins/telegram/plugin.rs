@@ -527,6 +527,10 @@ async fn poll_loop(
     .await;
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the polling seam keeps transport, channels, shutdown, callback API, and retry policy independently injectable in tests"
+)]
 async fn poll_loop_with_get_updates<GetUpdates, GetUpdatesFuture>(
     mut get_updates: GetUpdates,
     message_tx: mpsc::Sender<UnifiedIncomingMessage>,

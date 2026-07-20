@@ -1,16 +1,21 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aionui_api_types::WebSocketMessage;
+use aionui_common::now_ms;
 use aionui_db::models::{AssistantSessionRow, AssistantUserRow};
-use aionui_db::{IChannelRepository, IConversationRepository};
+use aionui_db::{
+    IApprovalRepository, IChannelRepository, IConversationRepository, IDevelopmentOperationsRepository,
+    IDevelopmentRepository, IProjectRepository,
+};
 use tokio::sync::broadcast;
+use tokio::time::{Duration, interval};
 use tracing::{debug, warn};
 
 use crate::formatter::format_outgoing_text_for_platform;
 use crate::message_service::ChannelMessageService;
 use crate::stream_relay::ChannelSender;
-use crate::types::{OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
+use crate::types::{ActionButton, ChannelTopicContext, OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
 
 const MESSAGE_STREAM_EVENT: &str = "message.stream";
 const TEAMMATE_MESSAGE_EVENT: &str = "team.teammateMessage";
@@ -233,7 +238,10 @@ impl ChannelTeamEventRelay {
                 );
                 continue;
             };
-            let outgoing = format_outgoing_for_plugin(outgoing.clone(), &plugin_id);
+            let mut outgoing = format_outgoing_for_plugin(outgoing.clone(), &plugin_id);
+            outgoing.topic = session
+                .message_thread_id
+                .map(|message_thread_id| ChannelTopicContext { message_thread_id });
             match self.sender.send_message(&plugin_id, chat_id, outgoing.clone()).await {
                 Ok(_) => {
                     debug!(conversation_id = %conversation_id, chat_id = %chat_id, "team event relayed to channel")
@@ -243,6 +251,287 @@ impl ChannelTeamEventRelay {
                 }
             }
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct ChannelDevelopmentNotifier {
+    owner_user_id: String,
+    channel_repo: Arc<dyn IChannelRepository>,
+    project_repo: Arc<dyn IProjectRepository>,
+    development_repo: Arc<dyn IDevelopmentRepository>,
+    operations_repo: Arc<dyn IDevelopmentOperationsRepository>,
+    approval_repo: Arc<dyn IApprovalRepository>,
+    sender: Arc<dyn ChannelSender>,
+}
+
+impl ChannelDevelopmentNotifier {
+    pub fn new(
+        owner_user_id: String,
+        channel_repo: Arc<dyn IChannelRepository>,
+        project_repo: Arc<dyn IProjectRepository>,
+        development_repo: Arc<dyn IDevelopmentRepository>,
+        operations_repo: Arc<dyn IDevelopmentOperationsRepository>,
+        approval_repo: Arc<dyn IApprovalRepository>,
+        sender: Arc<dyn ChannelSender>,
+    ) -> Self {
+        Self {
+            owner_user_id,
+            channel_repo,
+            project_repo,
+            development_repo,
+            operations_repo,
+            approval_repo,
+            sender,
+        }
+    }
+
+    pub async fn run(self) {
+        let mut seen = HashSet::new();
+        let mut ticker = interval(Duration::from_secs(5));
+        loop {
+            ticker.tick().await;
+            if let Err(error) = self.scan(&mut seen).await {
+                warn!(error = %error, "development channel notification scan failed");
+            }
+        }
+    }
+
+    async fn scan(&self, seen: &mut HashSet<String>) -> Result<(), String> {
+        self.notify_pending_approvals(seen).await?;
+        for project in self
+            .project_repo
+            .list_for_user(&self.owner_user_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            let conversations = self
+                .project_repo
+                .list_resource_links(&project.id, &self.owner_user_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|link| link.resource_type == "conversation")
+                .map(|link| link.resource_id)
+                .collect::<Vec<_>>();
+            if conversations.is_empty() {
+                continue;
+            }
+            let runs = self
+                .development_repo
+                .list_runs(&self.owner_user_id, Some(&project.id))
+                .await
+                .map_err(|error| error.to_string())?;
+            for run in runs {
+                let mut notices = Vec::new();
+                if matches!(run.status.as_str(), "succeeded" | "failed") {
+                    notices.push((
+                        format!("run:{}:{}", run.id, run.status),
+                        if run.status == "succeeded" {
+                            "completion"
+                        } else {
+                            "crash"
+                        },
+                        format!("开发运行 {}：{}", run.id, run.status),
+                    ));
+                }
+                for gate in self
+                    .development_repo
+                    .list_gates(&run.id, None)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .filter(|gate| matches!(gate.status.as_str(), "failed" | "timed_out" | "interrupted"))
+                {
+                    let kind = if gate.status == "timed_out" {
+                        "timeout"
+                    } else {
+                        "test_failure"
+                    };
+                    notices.push((
+                        format!("gate:{}:{}", gate.id, gate.status),
+                        kind,
+                        format!("质量门禁 {}：{}", gate.gate_type, gate.status),
+                    ));
+                }
+                for task in self
+                    .development_repo
+                    .list_tasks(&run.id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .filter(|task| task.status == "conflict")
+                {
+                    notices.push((
+                        format!("task:{}:conflict", task.id),
+                        "conflict",
+                        format!("任务发生冲突：{}", task.subject),
+                    ));
+                }
+                for alert in self
+                    .operations_repo
+                    .list_alerts(&self.owner_user_id, &project.id, Some(&run.id), true)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    notices.push((
+                        format!("alert:{}:{}", alert.id, alert.updated_at),
+                        if alert.alert_type == "budget" {
+                            "budget"
+                        } else {
+                            "alert"
+                        },
+                        alert.message,
+                    ));
+                }
+                for recovery in self
+                    .operations_repo
+                    .list_recovery(&self.owner_user_id, &project.id, Some(&run.id), 20)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    notices.push((
+                        format!("recovery:{}:{}", recovery.id, recovery.decision),
+                        "crash",
+                        format!("运行恢复：{}（{}）", recovery.finding, recovery.decision),
+                    ));
+                }
+                for (key, kind, detail) in notices {
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let outgoing = notice_message(kind, &run.id, &detail);
+                    for conversation_id in &conversations {
+                        self.send_to_conversation(conversation_id, outgoing.clone()).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn notify_pending_approvals(&self, seen: &mut HashSet<String>) -> Result<(), String> {
+        let now = now_ms();
+        for approval in self
+            .approval_repo
+            .list_for_user(&self.owner_user_id, None)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|approval| approval.status == "pending" && approval.expires_at > now)
+        {
+            if !seen.insert(format!("approval:{}", approval.id)) {
+                continue;
+            }
+            let (Some(plugin_id), Some(chat_id)) =
+                (approval.source_channel.as_deref(), approval.source_chat_id.as_deref())
+            else {
+                continue;
+            };
+            let options = serde_json::from_str::<Vec<serde_json::Value>>(&approval.options).unwrap_or_default();
+            let buttons = options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    vec![ActionButton {
+                        label: option
+                            .get("label")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("选择")
+                            .to_owned(),
+                        action: "approval.resolve".into(),
+                        params: Some(HashMap::from([
+                            ("id".into(), approval.id.clone()),
+                            ("o".into(), index.to_string()),
+                        ])),
+                    }]
+                })
+                .collect::<Vec<_>>();
+            let mut outgoing = notice_message(
+                "approval",
+                approval.run_id.as_deref().unwrap_or("unknown"),
+                &format!("{} · 风险 {}", approval.action_type, approval.risk_level),
+            );
+            outgoing.message_type = OutgoingMessageType::Buttons;
+            outgoing.buttons = Some(buttons);
+            outgoing.topic = approval
+                .source_thread_id
+                .map(|message_thread_id| ChannelTopicContext { message_thread_id });
+            self.sender
+                .send_message(plugin_id, chat_id, format_outgoing_for_plugin(outgoing, plugin_id))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn send_to_conversation(
+        &self,
+        conversation_id: &str,
+        outgoing: UnifiedOutgoingMessage,
+    ) -> Result<(), String> {
+        let sessions = self
+            .channel_repo
+            .get_all_sessions()
+            .await
+            .map_err(|error| error.to_string())?;
+        let users = self
+            .channel_repo
+            .get_all_users()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|user| (user.id.clone(), user))
+            .collect::<HashMap<_, _>>();
+        for session in sessions
+            .into_iter()
+            .filter(|session| session.conversation_id.as_deref() == Some(conversation_id))
+        {
+            let Some(chat_id) = session.chat_id.as_deref() else {
+                continue;
+            };
+            let Some(plugin_id) = plugin_id_for_session(&session, &users, None) else {
+                continue;
+            };
+            let mut message = format_outgoing_for_plugin(outgoing.clone(), &plugin_id);
+            message.topic = session
+                .message_thread_id
+                .map(|message_thread_id| ChannelTopicContext { message_thread_id });
+            self.sender
+                .send_message(&plugin_id, chat_id, message)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+fn notice_message(kind: &str, run_id: &str, detail: &str) -> UnifiedOutgoingMessage {
+    let title = match kind {
+        "approval" => "⏳ 需要审批",
+        "test_failure" => "❌ 测试失败",
+        "timeout" => "⏱️ 执行超时",
+        "crash" => "💥 运行异常",
+        "conflict" => "⚠️ 发现冲突",
+        "budget" => "💰 预算提醒",
+        "completion" => "✅ 运行完成",
+        _ => "ℹ️ 开发运行通知",
+    };
+    UnifiedOutgoingMessage {
+        topic: None,
+        message_type: OutgoingMessageType::Text,
+        text: Some(format!(
+            "{title}\nRun: {run_id}\n{detail}\n使用 /run_info 查看状态，/handoff 转到 Web。"
+        )),
+        parse_mode: None,
+        buttons: None,
+        keyboard: None,
+        image_url: None,
+        file_url: None,
+        file_name: None,
+        media_actions: None,
+        reply_to_message_id: None,
+        silent: None,
     }
 }
 
@@ -388,5 +677,49 @@ mod tests {
         assert!(!is_team_owned_conversation_extra("{}"));
         assert!(!is_team_owned_conversation_extra(r#"{"teamId":""}"#));
         assert!(!is_team_owned_conversation_extra("not-json"));
+    }
+
+    #[test]
+    fn development_notices_cover_all_proactive_categories_without_payload_details() {
+        let cases = [
+            ("approval", "需要审批"),
+            ("test_failure", "测试失败"),
+            ("timeout", "执行超时"),
+            ("crash", "运行异常"),
+            ("conflict", "发现冲突"),
+            ("budget", "预算提醒"),
+            ("completion", "运行完成"),
+        ];
+        for (kind, expected) in cases {
+            let message = notice_message(kind, "run-1", "sanitized detail");
+            let text = message.text.unwrap();
+            assert!(text.contains(expected), "kind={kind}: {text}");
+            assert!(text.contains("Run: run-1"));
+            assert!(text.contains("/handoff"));
+        }
+    }
+
+    #[test]
+    fn team_relay_restores_the_session_topic_on_outgoing_messages() {
+        let mut message = notice_message("completion", "run-1", "done");
+        let session = AssistantSessionRow {
+            id: "session-topic".into(),
+            user_id: "user-1".into(),
+            agent_type: "acp".into(),
+            conversation_id: Some("conversation-1".into()),
+            workspace: None,
+            chat_id: Some("chat-1".into()),
+            message_thread_id: Some(7),
+            bound_agent_id: None,
+            bound_backend: None,
+            bound_provider_id: None,
+            bound_model: None,
+            created_at: 1,
+            last_activity: 1,
+        };
+        message.topic = session
+            .message_thread_id
+            .map(|message_thread_id| ChannelTopicContext { message_thread_id });
+        assert_eq!(message.topic.unwrap().message_thread_id, 7);
     }
 }

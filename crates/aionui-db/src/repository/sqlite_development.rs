@@ -191,6 +191,17 @@ impl IDevelopmentRepository for SqliteDevelopmentRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn update_task_owner(&self, run_id: &str, task_id: &str, owner: Option<&str>) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE team_tasks SET owner = ?, updated_at = ? WHERE run_id = ? AND id = ?")
+            .bind(owner)
+            .bind(now_ms())
+            .bind(run_id)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn create_artifact(&self, row: &TaskArtifactRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO task_artifacts (id, run_id, task_id, artifact_type, path_or_uri, checksum, \

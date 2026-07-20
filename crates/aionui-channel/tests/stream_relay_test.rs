@@ -4,7 +4,7 @@ use aionui_ai_agent::AgentStreamEvent;
 use aionui_ai_agent::protocol::events::{
     AcpPermissionEventData, ErrorEventData, FinishEventData, TextEventData, ToolCallEventData, ToolCallStatus,
 };
-use aionui_channel::approval::{ChannelApprovalContext, ChannelApprovalPort};
+use aionui_channel::approval::{ChannelApprovalContext, ChannelApprovalPort, ChannelApprovalResolutionContext};
 use aionui_channel::error::ChannelError;
 use aionui_channel::stream_relay::{ChannelStreamRelay, MessageRecorder, RelayConfig};
 use aionui_channel::types::PluginType;
@@ -30,10 +30,7 @@ impl ChannelApprovalPort for RecordingApprovalPort {
 
     async fn resolve(
         &self,
-        _source_user_id: &str,
-        _platform: PluginType,
-        _chat_id: &str,
-        _message_thread_id: Option<i64>,
+        _context: ChannelApprovalResolutionContext,
         _approval_id: &str,
         _option_index: usize,
     ) -> Result<String, ChannelError> {

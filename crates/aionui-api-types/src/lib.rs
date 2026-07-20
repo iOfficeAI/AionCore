@@ -96,9 +96,10 @@ pub use custom_agent::{
 };
 pub use development::{
     AcceptanceCriterion, CriterionCoverage, DevelopmentConfirmationRequest, DevelopmentDeploymentRequest,
-    DevelopmentModelPriceRequest, DevelopmentSecretCreateRequest, DevelopmentSecretGrantRequest,
-    DevelopmentSecretReference, DevelopmentTagRequest, DevelopmentUsageCost, PlanRevision, RequirementVersion,
-    RequirementsSnapshot, SingleRunWorkspace,
+    DevelopmentModelPriceRequest, DevelopmentRunControlRequest, DevelopmentRunControlState, DevelopmentRunTimeline,
+    DevelopmentSecretCreateRequest, DevelopmentSecretGrantRequest, DevelopmentSecretReference, DevelopmentTagRequest,
+    DevelopmentTimelineEvent, DevelopmentUsageCost, PlanRevision, RequirementVersion, RequirementsSnapshot,
+    SingleRunWorkspace,
 };
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,

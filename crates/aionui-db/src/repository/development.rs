@@ -35,6 +35,7 @@ pub trait IDevelopmentRepository: Send + Sync {
         review_status: &str,
         verification_status: &str,
     ) -> Result<bool, DbError>;
+    async fn update_task_owner(&self, run_id: &str, task_id: &str, owner: Option<&str>) -> Result<bool, DbError>;
 
     async fn create_artifact(&self, row: &TaskArtifactRow) -> Result<(), DbError>;
     async fn list_artifacts(&self, run_id: &str, task_id: Option<&str>) -> Result<Vec<TaskArtifactRow>, DbError>;
