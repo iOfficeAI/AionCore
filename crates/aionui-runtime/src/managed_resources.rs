@@ -54,17 +54,6 @@ pub fn node_sources(directory_name: &str) -> Vec<ManagedResourceSource> {
         .collect()
 }
 
-pub fn acp_tool_sources(tool_slug: &str, version: &str, platform_key: &str) -> Vec<ManagedResourceSource> {
-    resource_roots()
-        .into_iter()
-        .map(|source| ManagedResourceSource {
-            root: source.root.join("acp").join(tool_slug).join(version).join(platform_key),
-            ..source
-        })
-        .filter(|source| source.root.is_dir())
-        .collect()
-}
-
 pub fn cli_sources(name: &str, version: &str, target: &str) -> Vec<ManagedResourceSource> {
     resource_roots()
         .into_iter()

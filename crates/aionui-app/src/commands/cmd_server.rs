@@ -240,13 +240,7 @@ pub(crate) async fn run_server(
         let prepare_started = Instant::now();
         info!("startup: managed runtime background preparation started");
         let result = async {
-            runtime_prepare_service.ensure_node_runtime(scope.clone()).await?;
-            runtime_prepare_service
-                .ensure_managed_acp_tool(scope.clone(), "codex-acp")
-                .await?;
-            runtime_prepare_service
-                .ensure_managed_acp_tool(scope, "claude-agent-acp")
-                .await?;
+            runtime_prepare_service.ensure_node_runtime(scope).await?;
             Ok::<(), aionui_system::SystemError>(())
         }
         .await;

@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 use crate::managed_resources::{self, ManagedResourcesMode};
 
+mod prepare;
+pub use prepare::{ManagedCliError, PreparedCli, managed_cli_contract_for_export, prepare_managed_cli_to_root};
+
 /// Pinned CLI versions — the single source of truth. Bumping a CLI = change the
 /// constant and rebuild (managed-resources is replaced wholesale on app update).
 pub const CLAUDE_CLI_VERSION: &str = "2.1.215";
